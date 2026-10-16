@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,12 @@ BREAKS = (
 UNCITED = '{"outcome":"passed","reason":"trust me","citations":[]}'
 """The policy judge's Verdict for an answer containing ``UNCITED``: a pass citing nothing."""
 
+FOREIGN_CITE = (
+    '{"outcome":"passed","reason":"see the note",'
+    '"citations":[{"slot":"answer","locator":{"json_pointer":"/note"}}]}'
+)
+"""The policy judge's Verdict for ``JUDGE-FOREIGN-CITE``: a pass citing a pointer the answer lacks."""
+
 READ_POLICY = {
     "role": "assistant",
     "content": None,
@@ -76,27 +83,85 @@ READ_POLICY = {
 """The refund reader's first turn: read its workspace copy of the policy."""
 
 
-def completion(body: dict) -> dict:
-    """The local model's Chat Completions reply to ``body``.
+INVESTIGATE = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {
+            "id": id,
+            "type": "function",
+            "function": {"name": tool, "arguments": json.dumps(arguments)},
+        }
+        for id, tool, arguments in (
+            (
+                "call-card",
+                "cards.get_by_ref",
+                {
+                    "card_ref": {
+                        "kind": "Service",
+                        "name": "policy-desk",
+                        "version": "1.0.0",
+                        "space": "default",
+                    }
+                },
+            ),
+            (
+                "call-query",
+                "bifrost.query",
+                {"sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1},
+            ),
+            ("call-code", "code.run", {"code": "print(6 * 7)"}),
+        )
+    ],
+}
+"""The investigator's first turn: call the Card, Bifrost, and code tools at once."""
 
-    The refund reader first calls ``fs.read`` and, once the tool result is
-    back, answers a 100-dollar limit. The policy judge (its prompt carries
-    ``Rules:``) fails ``REFUSE-POLICY``, passes ``UNCITED`` without a citation,
-    and otherwise passes citing the answer text; every other judge agrees.
+SLOW_SECONDS = 15.0
+"""How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
+
+
+def completion(body: dict) -> tuple[int, dict]:
+    """The local model's Chat Completions status and reply to ``body``.
+
+    The refund reader fails its provider on ``PROVIDER-DOWN``, breaks its
+    schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
+    ``SLOW-READER``; otherwise it first calls ``fs.read`` and, once the tool
+    result is back, answers a 100-dollar limit. The investigator calls each
+    of its tools once and finishes once the results are back. The policy
+    judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
+    ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
+    Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
+    passes citing the answer text; every other judge agrees.
     """
     text = json.dumps(body)
+    returned = any(message.get("role") == "tool" for message in body.get("messages", []))
     if "REFUND RULES" in text:
-        read = any(message.get("role") == "tool" for message in body.get("messages", []))
-        message = {"role": "assistant", "content": '{"max_refund":100}'} if read else READ_POLICY
+        if "PROVIDER-DOWN" in text:
+            return 500, {}
+        message = (
+            {"role": "assistant", "content": '{"max_refund":100}'} if returned else READ_POLICY
+        )
+        if "OFF-SCHEMA" in text:
+            message = {"role": "assistant", "content": '{"wrong":1}'}
+        elif "SLOW-READER" in text:
+            time.sleep(SLOW_SECONDS)
+            message = {"role": "assistant", "content": '{"max_refund":100}'}
+    elif "INVESTIGATE" in text:
+        message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
     else:
         content = AGREES
         if "Rules:" in text:
             content = FOLLOWS
-            for marker, verdict in (("REFUSE-POLICY", BREAKS), ("UNCITED", UNCITED)):
+            for marker, verdict in (
+                ("REFUSE-POLICY", BREAKS),
+                ("UNCITED", UNCITED),
+                ("JUDGE-MALFORMED", "not a verdict"),
+                ("JUDGE-FOREIGN-CITE", FOREIGN_CITE),
+            ):
                 if marker in text:
                     content = verdict
         message = {"role": "assistant", "content": content}
-    return {
+    return 200, {
         "id": "chatcmpl-judge",
         "object": "chat.completion",
         "created": 1,
@@ -130,8 +195,8 @@ def serving() -> Iterator[Receiver]:
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)) or b"{}")
             headers = {name.lower(): value for name, value in self.headers.items()}
-            reply = completion(body) if self.path == "/v1/chat/completions" else {}
-            self.send_response(200)
+            status, reply = completion(body) if self.path == "/v1/chat/completions" else (200, {})
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
@@ -224,12 +289,13 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
     return hydrated(bundle, WyrdClient(credential=service_key("unfitted-assistant")))
 
 
-@pytest.fixture
-def latency_watch(tmp_path: Path) -> Iterator[Watch]:
-    """The ``latency-watch`` Service on a server of its own, its baseline fitted.
+@contextmanager
+def watching(tmp_path: Path, service: str, verifier: str) -> Iterator[Watch]:
+    """Deploy the scheduled-drift ``service`` on a server of its own until exit.
 
-    The server's ``on-call-hooks`` connection points at a hook of its own, and
-    the Service is hydrated with Bifrost started under its own key.
+    The server's ``on-call-hooks`` connection points at a hook of its own,
+    ``verifier``'s baseline is fitted, and the Service is hydrated with
+    Bifrost started under its own key.
     """
     with (
         serving() as hooks,
@@ -246,21 +312,33 @@ def latency_watch(tmp_path: Path) -> Iterator[Watch]:
         )
         cards = Cards(admin)
         register(cards, "cards/latency_baseline/latency-baseline.yaml")
-        registered = register(cards, "cards/scheduled_drift_alerts_operator/latency-watch.yaml")
-        server.wait_for_baseline(str(registered["latency-shift"].uid), BASELINE_TIMEOUT_SECONDS)
-        root = registered["latency-watch"]
+        registered = register(cards, f"cards/scheduled_drift_alerts_operator/{service}.yaml")
+        server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
+        root = registered[service]
         key = cli.issue_key(
-            kind="Service", name="latency-watch", version="1.0.0", space="default", client=admin
+            kind="Service", name=service, version="1.0.0", space="default", client=admin
         ).key
-        state = WyrdState.from_path(
-            download(cards, "latency-watch", tmp_path), client_of(server, key)
-        )
+        state = WyrdState.from_path(download(cards, service, tmp_path), client_of(server, key))
         state.start_bifrost()
         [binding_id] = binding_ids(cards, root)
         try:
-            yield Watch(server, state, root, binding_id, hooks)
+            yield Watch(server, state, root, binding_id, hooks, verifier)
         finally:
             state.shutdown()
+
+
+@pytest.fixture
+def latency_watch(tmp_path: Path) -> Iterator[Watch]:
+    """The ``latency-watch`` Service with its PSI ``latency-shift`` Verifier fitted."""
+    with watching(tmp_path, "latency-watch", "latency-shift") as watch:
+        yield watch
+
+
+@pytest.fixture
+def latency_steady(tmp_path: Path) -> Iterator[Watch]:
+    """The ``latency-steady`` Service with its SPC ``latency-control`` Verifier fitted."""
+    with watching(tmp_path, "latency-steady", "latency-control") as watch:
+        yield watch
 
 
 @pytest.fixture(scope="session")

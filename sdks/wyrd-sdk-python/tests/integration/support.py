@@ -196,11 +196,12 @@ def scheduled_result(
 
 @dataclass
 class Watch:
-    """The ``latency-watch`` deployment of one scheduled-drift story.
+    """The deployment of one scheduled-drift story.
 
     A server of its own, since a scheduled window spans every sample since
-    the last cron boundary, with the Service hydrated under its own key and
-    the ``on-call-hooks`` connection pointing at ``hooks``.
+    the last cron boundary, with the Service hydrated under its own key, the
+    ``on-call-hooks`` connection pointing at ``hooks``, and every sample
+    submitted to the scheduled ``verifier``.
     """
 
     server: WyrdTestServer
@@ -208,3 +209,4 @@ class Watch:
     root: CardRef
     binding_id: str
     hooks: Receiver
+    verifier: str

@@ -10,23 +10,41 @@ locked output. Drift checks run on schedules in
 
 The session's local model provider stands in for the gateway's upstream: the
 refund reader first calls ``fs.read`` on its workspace copy of the policy and
-then answers a 100-dollar limit, and the policy judge passes every answer
-with a citation unless the answer names a scripted case.
+then answers a 100-dollar limit, the policy judge passes every answer with a
+citation unless the answer names a scripted case, and the ``tool-review``
+investigator calls the Card, Bifrost, and code tools at once and then
+finishes. Scripted answer texts also fail the reader's provider, schema, and
+deadline and the code step and check; scoped and delegated principals
+exercise every tool grant.
 """
 
-from collections.abc import Iterator
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from opentelemetry import trace
+from pydantic import BaseModel
 from wyrd import WyrdError, verify
+from wyrd.auth import Principals
+from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .support import FIXTURES, Receiver, download, register, service_key, timeline
+from .support import (
+    FIXTURES,
+    Receiver,
+    client_of,
+    download,
+    register,
+    service_key,
+    timeline,
+)
 from .test_local_development import configure_gateway
 
 if TYPE_CHECKING:
@@ -42,6 +60,18 @@ POLICY = FIXTURES.parent / "examples/support-desk/service/refund-policy.pdf"
 
 CONFORMING = "Refunds follow our policy."
 """An answer naming no scripted case, which names the policy."""
+
+ANSWER_TEXT = [{"slot": "answer", "locator": {"json_pointer": "/text"}}]
+"""The citation of the answer's text, which every cited Verdict of the story names."""
+
+TOOLS = ("cards.get_by_ref", "bifrost.query", "code.run")
+"""The three built-ins the investigator calls, in call order."""
+
+DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
+"""The stable code of a permission denial, carried by every denied tool call's error."""
+
+VERIFIES = ["verifier:run", "gateway:invoke"]
+"""The permissions every ``tool-review`` principal holds."""
 
 DOCUMENTS = {
     "sample.pdf": {"format": "pdf", "pages": [{"number": 1, "text": "Refunds"}]},
@@ -137,21 +167,94 @@ def step(result: verify.VerificationResult, id: str) -> StepResult:
     return found
 
 
-def record_trace(desk: WyrdState, server: WyrdTestServer, name: str) -> str:
-    """Export one span named ``name`` as the Service and return its stored trace ID."""
+def record_trace(
+    desk: WyrdState, server: WyrdTestServer, outer: str, inner: str, policy_id: str
+) -> str:
+    """Export span ``outer``, carrying ``policy_id``, with child ``inner``, and return the trace ID.
+
+    Stored spans order by start time, so ``outer`` is the trace document's
+    ``spans[0]`` and ``inner`` its ``spans[1]``.
+    """
     desk.start_telemetry()
-    with trace.get_tracer("journey.policy").start_as_current_span(name) as span:
-        pass
+    tracer = trace.get_tracer("journey.policy")
+    with tracer.start_as_current_span(outer, attributes={"policy_id": policy_id}) as span:
+        with tracer.start_as_current_span(inner):
+            pass
     desk.flush()
     trace_id = format(span.get_span_context().trace_id, "032x")
-    assert timeline(server, trace_id), "the trace is stored"
+    assert len(timeline(server, trace_id)) == 2, "both spans are stored"
     return trace_id
+
+
+class Attribution(BaseModel):
+    """One retained result's subject and actor."""
+
+    sub_principal_id: str
+    act_principal_id: str
+
+
+def grants(tool_scope: str | dict[str, object]) -> list[str | dict[str, object]]:
+    """Verify, invoke the gateway, read Cards and Bifrost, and call the tools ``tool_scope`` covers."""
+    return [
+        {"resource": "verifier", "action": "run", "scope": "all"},
+        {"resource": "gateway", "action": "invoke", "scope": "all"},
+        {"resource": "tool", "action": "invoke", "scope": tool_scope},
+        {"resource": "cards", "action": "read", "scope": "all"},
+        {"resource": "bifrost_query", "action": "read", "scope": "all"},
+    ]
+
+
+def principal_id(name: str) -> str:
+    """The id of the principal named ``name``."""
+    return Principals.connect().list(name=name)["principals"][0]["principal_id"]
+
+
+def investigate(bundle: Path, client: WyrdClient, question: str) -> verify.VerificationResult:
+    """Ask the investigator ``question`` with ``tool-review`` now, as ``client``."""
+    return WyrdState.from_path(bundle, client).run().observe.verify("tool-review", question)
+
+
+def assert_tools(
+    result: verify.VerificationResult,
+    receiver: Receiver,
+    question: str,
+    allowed: Sequence[str],
+) -> None:
+    """Assert each of ``TOOLS`` was called once, in order, and only ``allowed`` returned output.
+
+    Every other call was denied with ``DENIED`` and returned nothing; the
+    model's tool turn shows the policy desk's Card only when its read was
+    allowed.
+    """
+    investigate = step(result, "investigate")
+    assert investigate["status"] == "succeeded", question
+    calls = investigate.get("tool_calls", [])
+    assert [call["tool"] for call in calls] == list(TOOLS), question
+    for call, tool in zip(calls, TOOLS, strict=True):
+        if tool in allowed:
+            assert "error" not in call, (question, call)
+            assert "output_sha256" in call, (question, tool)
+            assert call["returned_bytes"] > 0, (question, tool)
+        else:
+            assert DENIED in call.get("error", ""), (question, call)
+            assert (call.get("output_sha256"), call["returned_bytes"]) == (None, 0), (
+                question,
+                tool,
+            )
+    turn = next(
+        body
+        for body in (json.dumps(each.body) for each in receiver.to("/v1/chat/completions"))
+        if question in body and '"role": "tool"' in body
+    )
+    assert ("document-formats" in turn) == (TOOLS[0] in allowed), (
+        f"{question}: the Card reaches the model only when its read is allowed"
+    )
 
 
 def test_policy_review_runs_every_action_and_check_kind(
     desk: WyrdState, wyrd_server: WyrdTestServer, receiver: Receiver, fresh_tracer_provider: None
 ) -> None:
-    trace_id = record_trace(desk, wyrd_server, "lookup-policy")
+    trace_id = record_trace(desk, wyrd_server, "lookup-policy", "draft-answer", "refunds")
     asked = len(receiver.to("/v1/chat/completions"))
 
     result = review(desk, CONFORMING, 50, trace_id)
@@ -173,13 +276,14 @@ def test_policy_review_runs_every_action_and_check_kind(
         "limit-found",
         "refund-within-limit",
         "policy-looked-up",
+        "answer-drafted-after-lookup",
+        "lookup-read-refunds",
         "follows-policy",
         "names-the-policy",
     ):
         assert requirement(result, id)["outcome"] == "passed", id
-    cited = [{"slot": "answer", "locator": {"json_pointer": "/text"}}]
-    assert requirement(result, "follows-policy")["citations"] == cited
-    assert requirement(result, "names-the-policy")["citations"] == cited
+    assert requirement(result, "follows-policy")["citations"] == ANSWER_TEXT
+    assert requirement(result, "names-the-policy")["citations"] == ANSWER_TEXT
     [judge] = [
         each.body
         for each in receiver.to("/v1/chat/completions")[asked:]
@@ -230,7 +334,7 @@ def test_forbidden_code_access_cannot_pass_dependent_work(desk: WyrdState) -> No
 def test_trace_check_fails_a_guess_and_needs_its_trace(
     desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
 ) -> None:
-    guessed = record_trace(desk, wyrd_server, "guess-policy")
+    guessed = record_trace(desk, wyrd_server, "guess-policy", "draft-answer", "refunds")
 
     failed = review(desk, CONFORMING, 50, guessed)
     untraced = review(desk, CONFORMING, 50)
@@ -298,3 +402,115 @@ def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
 
         assert step(result, "read")["output"] == expected, name
         assert requirement(result, "extracted")["outcome"] == "passed", name
+
+
+def test_failed_reader_leaves_its_dependents_inconclusive(desk: WyrdState) -> None:
+    for marker in ("PROVIDER-DOWN", "OFF-SCHEMA", "SLOW-READER"):
+        result = review(desk, f"{marker}: refunds follow our policy.", 50)
+
+        rules = step(result, "refund-rules")
+        assert rules["status"] == "failed", (marker, rules)
+        assert rules.get("reason"), f"{marker}: the failure says why"
+        assert step(result, "answer-facts")["status"] == "skipped", marker
+        for id in ("limit-found", "refund-within-limit", "follows-policy"):
+            assert requirement(result, id)["outcome"] == "inconclusive", (marker, id)
+        assert result.verdict == "inconclusive", marker
+
+
+def test_failed_code_step_leaves_its_assertion_inconclusive(desk: WyrdState) -> None:
+    for text in ("fail the facts", "spin the facts"):
+        result = review(desk, text, 50)
+
+        facts = step(result, "answer-facts")
+        assert facts["status"] == "failed", (text, facts)
+        assert facts.get("reason"), f"{text}: the failure says why"
+        assert requirement(result, "refund-within-limit")["outcome"] == "inconclusive", text
+        assert result.verdict != "passed", text
+
+
+def test_trace_check_judges_span_order_and_attributes(
+    desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
+) -> None:
+    drafted_first = record_trace(desk, wyrd_server, "draft-answer", "lookup-policy", "refunds")
+    shipping = record_trace(desk, wyrd_server, "lookup-policy", "draft-answer", "shipping")
+
+    for trace_id, expected in (
+        (drafted_first, ["failed", "failed", "passed"]),
+        (shipping, ["passed", "passed", "failed"]),
+    ):
+        result = review(desk, CONFORMING, 50, trace_id)
+
+        judged = [
+            requirement(result, id)["outcome"]
+            for id in ("policy-looked-up", "answer-drafted-after-lookup", "lookup-read-refunds")
+        ]
+        assert judged == expected, trace_id
+        assert result.verdict == "failed"
+
+
+def test_invalid_judge_verdicts_are_inconclusive(desk: WyrdState) -> None:
+    for marker in ("JUDGE-MALFORMED", "JUDGE-FOREIGN-CITE"):
+        result = review(desk, f"{marker}: refunds follow our policy.", 50)
+
+        judged = requirement(result, "follows-policy")
+        assert judged["outcome"] == "inconclusive", (marker, judged)
+        assert judged["reason"], f"{marker}: it says why"
+        assert result.verdict == "inconclusive", marker
+
+
+def test_code_check_fails_with_citations_and_is_inconclusive_otherwise(desk: WyrdState) -> None:
+    failed = review(desk, "Refunds are fine.", 50)
+    named = requirement(failed, "names-the-policy")
+    assert (named["outcome"], named.get("citations")) == ("failed", ANSWER_TEXT)
+    assert failed.verdict == "failed"
+
+    for text in ("CODE-MALFORMED", "CODE-FOREIGN-CITE", "CODE-FORBIDDEN", "CODE-SPIN"):
+        result = review(desk, text, 50)
+
+        named = requirement(result, "names-the-policy")
+        assert named["outcome"] == "inconclusive", (text, named)
+        assert named["reason"], f"{text}: it says why"
+        assert result.verdict != "passed", text
+
+
+def test_hosted_tools_need_the_tool_and_domain_grants(
+    policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
+) -> None:
+    for name, extra, allowed in (
+        ("all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS),
+        ("no_tool_grant", ["cards:read", "bifrost_query:read"], ()),
+        ("no_domain_grant", ["tool:invoke"], (TOOLS[2],)),
+    ):
+        key = wyrd_server.scoped_api_key(name, [*VERIFIES, *extra])
+        result = investigate(policy_desk_bundle, WyrdClient(credential=key), name)
+        assert_tools(result, receiver, name, allowed)
+    key = wyrd_server.scoped_api_key("card_tool_only", grants({"tool": TOOLS[0]}))
+    result = investigate(policy_desk_bundle, WyrdClient(credential=key), "card_tool_only")
+    assert_tools(result, receiver, "card_tool_only", (TOOLS[0],))
+
+
+def test_delegated_tools_keep_the_narrower_authority(
+    policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
+) -> None:
+    subject = WyrdClient(credential=wyrd_server.scoped_api_key("tool_subject", grants("all")))
+    actor = WyrdClient(
+        credential=wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]}))
+    )
+    delegated = actor.on_behalf_of(subject.access_token())
+
+    result = investigate(policy_desk_bundle, delegated, "delegated")
+
+    assert_tools(result, receiver, "delegated", (TOOLS[0],))
+    wyrd_server.flush_bifrost()
+    attributed = Bifrost(client=client_of(wyrd_server)).sql(
+        "SELECT sub_principal_id, act_principal_id "
+        "FROM vala.verification.results WHERE execution_id = $1",
+        [result.execution_id],
+        model=Attribution,
+    )
+    assert attributed == [
+        Attribution(
+            sub_principal_id=principal_id("tool_subject"),
+            act_principal_id=principal_id("tool_delegate"),
+        )
+    ]

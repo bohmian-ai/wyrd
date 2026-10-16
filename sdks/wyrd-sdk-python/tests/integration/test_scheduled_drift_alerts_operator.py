@@ -5,7 +5,9 @@ The story follows the full scheduled lifecycle: register the baseline and the
 ``observe.submit`` the samples, make the schedule due, read the retained
 result back, and receive the ``alert-on-call`` Operator's delivery exactly
 once on the origin, and with the bearer token, of the ``on-call-hooks``
-connection. A passing or empty window alerts no one.
+connection. A passing or empty window alerts no one. A second Service,
+``latency-steady``, control-charts the same latency against its fitted SPC
+baseline.
 """
 
 import json
@@ -35,7 +37,7 @@ def submit(watch: Watch, latencies: Iterable[int]) -> None:
     """Submit every latency as the Service, each recorded for the schedule, and publish them."""
     observe = watch.state.run().observe
     for latency in latencies:
-        assert isinstance(observe.submit("latency-shift", {"latency": latency}), verify.Recorded)
+        assert isinstance(observe.submit(watch.verifier, {"latency": latency}), verify.Recorded)
     watch.state.flush()
     watch.server.flush_bifrost()
 
@@ -90,6 +92,28 @@ def test_empty_window_is_inconclusive_and_alerts_no_one(latency_watch: Watch) ->
 
     assert result.verdict == "inconclusive"
     assert_quiet(latency_watch)
+
+
+def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> None:
+    submit(latency_steady, [99] * 20)
+
+    result = scheduled_result(latency_steady.server, latency_steady.binding_id, WAIT_SECONDS)
+
+    assert result.verdict == "failed"
+    assert result.verifier.name == "latency-control"
+    [requirement] = result.requirements
+    assert (requirement["id"], requirement["outcome"]) == ("latency-in-control", "failed")
+    assert requirement["check"]["method"] == "Spc", requirement["check"]
+    latency = requirement["detail"]["drift"]["features"]["latency"]
+    assert (latency["score"], latency["threshold"]) == (4.0, 0.0), latency
+    chart = cast("dict[str, Any]", latency.get("evidence"))["Spc"]
+    assert (
+        chart["subgroup_size"],
+        chart["subgroups"],
+        chart["x_bar"]["center"],
+        chart["x_bar"]["signals"],
+        chart["s"]["signals"],
+    ) == (5, 4, 49.5, 4, 0), chart
 
 
 def test_path_only_operator_without_connection_is_refused(cards: Cards) -> None:

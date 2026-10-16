@@ -13,7 +13,7 @@ status: runnable
 
 ## Prerequisites
 
-- A Run Verifier bound to a component, such as `answer-behavior` from [Evaluate agent behavior](/build-and-verify/verify/evaluate-agent-behavior/).
+- A Verifier bound to the run's Card. Here `my-review` takes one file slot, `document`.
 - `verifier:run` to submit, and the same principal or `cards:read` plus `bifrost_query:read` to inspect.
 
 ## 1. Submit and keep the ID
@@ -22,55 +22,38 @@ status: runnable
 <LangTab lang="python">
 
 ```python
-import wyrd
+from wyrd import verify
 
-with state.run("agent") as run:
-    execution = run.observe.submit(
-        "answer-behavior",
-        answer={"text": answer},
-        policy=wyrd.verify.File("refund-policy.pdf"),
-        trace=run.trace_id,
-    )
-db.save(ticket_id=ticket_id, execution_id=execution.id)
+with state.run() as run:
+    execution = run.observe.submit("my-review", document=verify.File("report.pdf"))
+save(execution.id)
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::observe::{File, Input, Inputs, Submission};
+use wyrd_ai::verify::{File, Input, Inputs, Submission};
 
-let run = state.run_for_card("agent")?;
-let Submission::Queued(execution) = run
+let run = state.run();
+let submission = run
     .observe()
-    .submit(
-        "answer-behavior",
-        Inputs::named([
-            ("answer", Input::from(json!({ "text": answer }))),
-            ("policy", File::path("refund-policy.pdf").into()),
-            ("trace", Input::from(json!(trace_id.to_string()))),
-        ]),
-    )
-    .await?
-else {
-    unreachable!("answer-behavior judges Run evidence");
-};
-db.save(ticket_id, execution.id().to_string()).await?;
+    .submit("my-review", Inputs::named([("document", Input::from(File::path("report.pdf")))]))
+    .await?;
+if let Submission::Queued(execution) = submission {
+    save(execution.id().to_string());
+}
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-import { File } from "wyrd-ai";
+import { verify } from "wyrd-ai";
 
-const run = state.run("agent");
-const execution = await run.observe.submit("answer-behavior", {
-  answer: { text: answer },
-  policy: File.path("refund-policy.pdf"),
-  trace: traceId,
-});
-await db.save({ ticketId, executionId: execution.id });
+const run = state.run();
+const submitted = await run.observe.submit("my-review", { document: verify.File.path("report.pdf") });
+if (submitted.kind === "queued") save(submitted.execution.id);
 ```
 
 </LangTab>
@@ -99,7 +82,7 @@ import wyrd
 
 execution = wyrd.verify.Execution.connect(execution_id)
 result = execution.wait(900)
-print(result.outcome.verdict)
+print(result.verdict)
 ```
 
 </LangTab>
@@ -141,7 +124,7 @@ To read once without waiting, call `status()`:
 | `completed` | A verdict exists; `result` holds it once stored | Read `result.outcome` |
 | `errored`, `timed_out`, `cancelled` | The Verifier did not reach a verdict | Read `error.code` and `error.message`. No Operator runs |
 
-Status is not the verdict. A completed execution of a passing check and of a failing one look the same until you read `result.outcome.verdict`.
+Status is not the verdict. A completed execution of a passing check and of a failing one look the same until you read the verdict (`result.verdict` in Python, `result.outcome.verdict` in Rust and TypeScript).
 
 ## 3. Read the evidence
 
@@ -151,12 +134,10 @@ The result explains itself; you rarely need SQL:
 <LangTab lang="python">
 
 ```python
-for step in result.outcome.steps:
-    print(step.id, step.status, step.attempts, step.reason)
-    for call in step.tool_calls:
-        print("  ", call)
-for requirement in result.outcome.requirements:
-    print(requirement.id, requirement.outcome, requirement.reason, requirement.citations)
+for step in result.steps:
+    print(step["id"], step["status"], step["attempts"], step.get("reason"))
+for requirement in result.requirements:
+    print(requirement["id"], requirement["outcome"], requirement["reason"], requirement["citations"])
 ```
 
 </LangTab>

@@ -9,75 +9,79 @@ draft: true
 status: runnable
 ---
 
-Call `observe.verify` inside a run, get the result back in the same request, and decide what your service does next. Here the support desk checks every answer with two model-free Verifiers before it replies, and replaces an answer that promises a refund with a handoff to billing.
+Call `run.observe.verify` inside a request, get the verdict back before you reply, and decide what to send.
 
 ## Prerequisites
 
-- A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
-- Verifiers bound to the Card you call them on. The support desk binds `no-refund-promise` to the Service and `ticket-complete` to its `agent` component:
+- A running service with a loaded bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
+- A Verifier bound to the Card you call it on, such as this one:
 
-<Tabs>
-<Tab label="support-desk.yaml">
+```yaml title="my-check.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: my-check, version: 1.0.0}
+spec:
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}
+```
 
-<CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
+- `verifier:run` on it. The `workload` role a registered Service gets includes it.
 
-</Tab>
-<Tab label="no-refund-promise.yaml">
+## 1. Call the Verifier
 
-<CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
-
-</Tab>
-<Tab label="ticket-complete.yaml">
-
-<CodeFromFile file="examples/support-desk-app/service/ticket-complete.yaml" lang="yaml" title="service/ticket-complete.yaml" />
-
-</Tab>
-<Tab label="support-agent.yaml">
-
-<CodeFromFile file="examples/support-desk-app/service/support-agent.yaml" lang="yaml" title="service/support-agent.yaml" />
-
-</Tab>
-</Tabs>
-
-- `verifier:run` on those Verifiers. The `workload` role a registered Service gets includes it.
-
-## 1. Call the Verifiers
-
-Pass one keyword per input slot the Verifier declares. JSON is ordinary data; a file is a `verify.File`, covered [below](#files).
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="check" title="desk.py" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="check" title="lib.rs" />
-
-</LangTab>
-<LangTab lang="typescript">
-
-<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="check" title="server.ts" />
-
-</LangTab>
-</LangTabs>
-
-The name is the Verifier's Card name. The SDK looks it up among the Verifiers bound to the view's Card in your loaded bundle: `no-refund-promise` on the run itself, which is the Service, and `ticket-complete` on `run.for_card("agent")`. A Verifier with exactly one slot also takes one positional value instead of a keyword.
-
-Python blocks until the result arrives; Rust and TypeScript await it. The server allows 60 seconds.
-
-## 2. Act on the verdict
-
-A `failed` verdict is an ordinary return value, so read it rather than catching an exception:
+Pass one input per slot the Verifier declares:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-results = desk.check(run, ticket)
-if results["no-refund-promise"].verdict != "passed":
-    answer = HANDOFF  # "I've passed your question to our billing team..."
+with state.run() as run:
+    result = run.observe.verify("my-check", answer=answer)
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use serde_json::json;
+use wyrd_ai::verify::{Input, Inputs};
+
+let run = state.run();
+let result = run
+    .observe()
+    .verify("my-check", Inputs::named([("answer", Input::from(json!(answer)))]))
+    .await?;
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+const run = state.run();
+const result = await run.observe.verify("my-check", { answer });
+```
+
+</LangTab>
+</LangTabs>
+
+The name is the Verifier's Card name, looked up among the Verifiers bound to the run's Card. For a Verifier bound to a component, call it on `run.for_card("<alias>")`. A Verifier with one slot also takes one positional value.
+
+Python blocks until the result arrives; Rust and TypeScript await it. The server allows 60 seconds.
+
+## 2. Act on the verdict
+
+A `failed` verdict is a normal return value, not an exception:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+if result.verdict != "passed":
+    answer = "Let me pass this to our billing team."
 ```
 
 </LangTab>
@@ -86,8 +90,8 @@ if results["no-refund-promise"].verdict != "passed":
 ```rust
 use wyrd_ai::VerificationVerdict;
 
-if promise.outcome.verdict != VerificationVerdict::Passed {
-    answer = HANDOFF.to_owned();
+if result.outcome.verdict != VerificationVerdict::Passed {
+    answer = "Let me pass this to our billing team.".to_owned();
 }
 ```
 
@@ -95,8 +99,7 @@ if promise.outcome.verdict != VerificationVerdict::Passed {
 <LangTab lang="typescript">
 
 ```typescript
-const promised = promise.outcome.verdict !== "passed";
-return { run_id: wyrdRun.runId, answer: promised ? HANDOFF : text, checks };
+const reply = result.outcome.verdict === "passed" ? answer : "Let me pass this to our billing team.";
 ```
 
 </LangTab>
@@ -110,11 +113,11 @@ return { run_id: wyrdRun.runId, answer: promised ? HANDOFF : text, checks };
 
 | Language | From a path | From bytes |
 | --- | --- | --- |
-| Python | `wyrd.verify.File("letter.md")` | `wyrd.verify.File(data, format="pdf", filename="policy.pdf")` |
-| Rust | `wyrd_ai::verify::File::path("letter.md")` | `wyrd_ai::verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
-| TypeScript | `verify.File.path("letter.md")` | `verify.File.bytes(data, { format: "pdf" })` |
+| Python | `verify.File("report.pdf")` | `verify.File(data, format="pdf", filename="report.pdf")` |
+| Rust | `wyrd_ai::verify::File::path("report.pdf")` | `wyrd_ai::verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
+| TypeScript | `verify.File.path("report.pdf")` | `verify.File.bytes(data, { format: "pdf" })` |
 
-To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="refund-policy.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "refund-policy.pdf")`. It is read with the Artifact's own authorization.
+To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="report.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "report.pdf")`. It is read with the Artifact's own authorization.
 
 ## 3. Read the breakdown
 
@@ -134,7 +137,7 @@ To use a file already registered as an Artifact, pass an `ArtifactRef` instead: 
 ```python
 for requirement in result.requirements:
     print(requirement["id"], requirement["outcome"], requirement["reason"])
-# ticket-complete failed missing order_id
+# no-refund-promise passed ...
 ```
 
 </LangTab>
@@ -158,7 +161,7 @@ for (const requirement of result.outcome.requirements) {
 </LangTab>
 </LangTabs>
 
-Each citation names an original input slot and a location in it, such as `{ "slot": "ticket", "locator": { "json_pointer": "" } }` from `ticket-complete`, or `{ "slot": "policy", "locator": { "page": 2 } }` from a judge reading a PDF. A judge that passes without a valid citation is reported as `inconclusive`.
+Each citation names an original input slot and a location in it, such as `{ "slot": "answer", "locator": { "json_pointer": "" } }`, or `{ "slot": "report", "locator": { "page": 2 } }` from a judge reading a PDF. A judge that passes without a valid citation is reported as `inconclusive`.
 
 ## 4. Confirm the result was stored
 
@@ -215,7 +218,7 @@ The row appears shortly after the call returns. The server stores it in the back
 
 ## Checks that do not belong on the request path
 
-A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow review, such as the support desk's `follows-policy`, which reads a PDF and calls a model twice, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit).
+A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow check, such as a model judge, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit).
 
 ## What can go wrong
 

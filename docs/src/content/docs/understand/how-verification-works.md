@@ -178,31 +178,24 @@ The check kinds decide how evidence arrives. Registration refuses a Verifier tha
 
 ### verify: run now
 
-The support desk runs its two model-free Verifiers on every answer before it replies:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="check" title="desk.py" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="check" title="lib.rs" />
-
-</LangTab>
-<LangTab lang="typescript">
-
-<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="check" title="server.ts" />
-
-</LangTab>
-</LangTabs>
+```python
+result = run.observe.verify("no-refund-promise", answer=answer)
+if result.verdict != "passed":
+    ...  # your service decides what to send instead
+```
 
 `verify` returns within its 60-second deadline. A `failed` verdict is an ordinary value, not an exception. The server stores the inputs and result after it answers, but these inputs never start queued work and never run Operators. [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) covers it end to end.
 
 ### submit: queue it
 
-`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The support desk submits `follows-policy`, which calls a model twice, this way: see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit). The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
+`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID:
+
+```python
+execution = run.for_card("agent").observe.submit("follows-policy", letter=verify.File("letter.md"))
+result = execution.wait(60)  # here, or later from any process with execution.id
+```
+
+The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
 
 `202` means the server staged the evidence in memory, not that the queue has durably accepted it. The SDK sends one `Idempotency-Key` and reuses it on every transport retry. A conflicting reuse of a key is refused when the queue writer accepts the request, and you see it as an `errored` execution with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. Evidence lost before the queue accepts it, such as on an abrupt restart, has no outcome; `wait` ends with a timeout rather than an invented result.
 

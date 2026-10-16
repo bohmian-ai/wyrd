@@ -9,11 +9,11 @@ draft: true
 status: runnable
 ---
 
-A drift Verifier compares what a component sees in production with a baseline you register once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. The support desk has no trained model of its own, so this guide adds one: the `churn-classifier` from [Register Cards from code](/understand/cards-versions-and-relationships/#register-cards-from-code), which scores how likely a customer is to churn. Its inputs are checked against last quarter's healthy data every hour.
+A drift Verifier compares what a component sees in production with a baseline you register once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
 
 ## Prerequisites
 
-- The `support-desk` declaration from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/), with `churn-classifier@1.4.2` registered from code, and `editor` to register Cards.
+- A registered Model Card, here `churn-classifier@1.4.2` ([register one from code](/understand/cards-versions-and-relationships/#register-cards-from-code)), and `editor` to register Cards.
 - A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
 - A sample of healthy inputs, with the same column names your service will record.
 
@@ -85,27 +85,29 @@ Registration refuses a Verifier that mixes `samples` slots or `drift` checks wit
 
 ## 3. Bind it to a schedule and register
 
-Add the model to the Service as a new component and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
+List the model as a component of a Service and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
 
-```yaml title="service/support-desk.yaml (excerpt)"
-- alias: churn_model
-  ref: { kind: Model, name: churn-classifier, version: 1.4.2 }
-  verified_by:
-    - verifier: ./churn-input-drift.yaml
-      runs_on: { kind: schedule, cron: "0 * * * *" }
-      inputs:
-        current: { features: [tenure_months, monthly_spend] }
-      on_failure:
-        - ./page-support-oncall.yaml
+```yaml title="service/churn-service.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata: {name: churn-service, version: 1.0.0, space: default}
+spec:
+  service_type: model
+  components:
+    - alias: churn_model
+      ref: {kind: Model, name: churn-classifier, version: 1.4.2}
+      verified_by:
+        - verifier: ./churn-input-drift.yaml
+          runs_on: {kind: schedule, cron: "0 * * * *"}
+          inputs:
+            current: {features: [tenure_months, monthly_spend]}
 ```
 
-A `Custom` slot reads one metric instead, such as `latency: { metric: latency_p95 }`. Every required `samples` slot needs an entry, and the names must match the slot's `features`.
+A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, add `on_failure` with an Operator; see [Bind a Verifier to a schedule](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule).
 
 ```bash
-wyrd apply examples/support-desk/service/
+wyrd apply service/churn-service.yaml
 ```
-
-The new component changes the Service's content, so bump `metadata.version` in `support-desk.yaml` first, or `wyrd apply` fails with `WYRD_REGISTRY_409_SPEC_DRIFT`.
 
 `schedule` is the only Trigger that runs a Verifier on its own. `cron` is evaluated in UTC unless you set `tz`, such as `tz: America/Chicago`. Each due time judges the samples recorded since the previous one, so the hourly schedule above judges `[00:00, 01:00)` at 01:00.
 
@@ -174,7 +176,7 @@ with state.run("churn_model") as run:
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::observe::{Input, Inputs, Submission};
+use wyrd_ai::verify::{Input, Inputs, Submission};
 
 let run = state.run_for_card("churn_model")?;
 let features = json!({ "tenure_months": customer.tenure_months, "monthly_spend": customer.monthly_spend });

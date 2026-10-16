@@ -2,9 +2,8 @@ name: release
 
 # push to main = dry-run builds of the deliverables the change affects, chosen
 # by the same selector as lints-test (unknown impact builds every deliverable).
-# release published = every deliverable on every supported platform; server
-# binaries attach to the release at once, registry publishes wait for the
-# complete nightly gate.
+# release published = every deliverable on every supported platform, built and
+# published from the release commit.
 # Each build job records the SHA-256 of its outputs after
 # its package checks pass; publication verifies those exact bytes, attests
 # their provenance for this commit, and fails closed on a missing record,
@@ -55,12 +54,7 @@ jobs:
           WYRD_CHANGE_HEAD: ${{ github.sha }}
         run: .github/scripts/detect-changes.sh
 
-  # ── Release qualification ──────────────────────────────────────────────────
-
-  qualify:
-    name: qualify
-    if: github.event_name == 'release'
-    uses: ./.github/workflows/nightly.yml
+  # ── Release commit ─────────────────────────────────────────────────────────
 
   release-commit:
     name: release commit
@@ -290,7 +284,7 @@ jobs:
   publish-pypi:
     name: publish python
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, test-wheels]
+    needs: [release-commit, test-wheels]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -446,7 +440,7 @@ jobs:
   publish-npm:
     name: publish typescript
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-typescript]
+    needs: [release-commit, build-typescript]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -572,7 +566,7 @@ jobs:
   publish-docker:
     name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-server]
+    needs: [release-commit, build-server]
     runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
@@ -774,7 +768,7 @@ jobs:
   publish-crates:
     name: publish rust crates
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, package-crates, test-wheels, build-server]
+    needs: [release-commit, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release
     permissions:

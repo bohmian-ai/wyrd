@@ -451,4 +451,4 @@ fn invocation(detail: String) -> ToolError {
 }
 
 #[cfg(test)]
-mod tests;
+mod pg_tests;

@@ -47,7 +47,7 @@ pub(super) fn event(
             "severity": severity,
             "custom_details": {
                 "wyrd_route": route,
-                "run_id": context.run_id,
+                "execution_id": context.execution_id,
                 "result_id": context.result_id,
                 "binding_id": context.binding_id,
                 "verifier_ref": context.verifier_ref,

@@ -32,7 +32,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
-use wyrd_sql::queries::verifier_runs::RunAuthority;
+use wyrd_sql::queries::verifier_executions::ExecutionAuthority;
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::state::AppState;
@@ -233,7 +233,7 @@ impl BackgroundAuthority {
         &self,
         conn: &mut TenantConn<'_>,
         owner: PrincipalId,
-    ) -> Result<Option<RunAuthority>, SqlError> {
+    ) -> Result<Option<ExecutionAuthority>, SqlError> {
         let Some(issuer) = &self.issuer else {
             tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
             return Ok(None);
@@ -247,7 +247,7 @@ impl BackgroundAuthority {
             return Ok(None);
         };
         match issuer.recover(conn, owner.as_uuid()).await {
-            Ok(verified) => Ok(Some(RunAuthority::background(
+            Ok(verified) => Ok(Some(ExecutionAuthority::background(
                 AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
                 system,
             ))),

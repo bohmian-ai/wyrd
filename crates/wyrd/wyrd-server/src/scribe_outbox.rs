@@ -1,5 +1,5 @@
 //! The process's one Scribe-bound outbox: audit decisions, gateway capture,
-//! Verifier results, and tenant copies of server spans.
+//! Verifier execution inputs and results, and tenant copies of server spans.
 //!
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
@@ -21,6 +21,11 @@
 //! for the tenant continue. Work held here is process memory: abrupt process
 //! death or the shutdown deadline loses it without changing the operation
 //! that produced it.
+//!
+//! A submitted execution's inputs row carries its [`Submission`]; once the
+//! write that holds it returns with the row acknowledged, the sink stages the
+//! submission on the [`SubmissionOutbox`] that accepts it into the durable
+//! queue, so no execution is queued before its inputs are durable.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,7 +50,7 @@ use vala_bifrost_redux::tables::audit::projection::project_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
-    AuditLogTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
+    AuditLogTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, SpansTable,
 };
 use wyrd_runtime::outbox::{Outbox, OutboxSink, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -53,6 +58,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
+use wyrd_sql::queries::verifier_executions::Submission;
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
@@ -60,7 +66,8 @@ use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 
 use crate::components::gateway::{CallCapture, CaptureDrop};
-use crate::verification::results::ResultPayload;
+use crate::verification::results::{ResultBatch, ResultPayload};
+use crate::verification::submissions::SubmissionOutbox;
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
@@ -108,6 +115,16 @@ pub enum ScribeWrite {
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
+    },
+    /// One Verifier execution's pinned inputs row.
+    ExecutionInputs {
+        /// The `vala.verification.execution_inputs` row.
+        row: ResultBatch,
+        /// The execution's subject and actor, which Scribe stamps on the row.
+        attribution: Attribution,
+        /// A submitted execution and the outbox that queues it once Scribe
+        /// acknowledges the row; `None` for a direct execution.
+        queued: Option<(Arc<SubmissionOutbox>, Box<Submission>)>,
     },
     /// One server span's tenant copy, attributed to the operation that
     /// emitted it.
@@ -212,6 +229,16 @@ impl ScribeWrite {
                     })
                 })
                 .collect(),
+            Self::ExecutionInputs {
+                row, attribution, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::from_fqn(&row.table)
+                    .filter(|table| *table == ScribeTable::ExecutionInputs)
+                    .ok_or("projection")?,
+                attribution: *attribution,
+                request: None,
+                batch: row.batch.clone(),
+            }]),
             Self::ServerSpans {
                 attribution, spans, ..
             } => Ok(vec![Rows {
@@ -225,7 +252,8 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, and the three Verifier result tables.
+/// gateway capture tables, the two Verifier result tables, and the execution
+/// inputs table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
     /// `vala.system.audit_log`, one row per authorization decision.
@@ -236,10 +264,10 @@ pub enum ScribeTable {
     Spans,
     /// `vala.verification.results`, one canonical summary row per judgment.
     Results,
-    /// `vala.drift.result_features`, the Drift result's feature rows.
+    /// `vala.drift.result_features`, a result's drift feature rows.
     DriftFeatures,
-    /// `vala.eval.result_items`, the Eval result's task rows.
-    EvalItems,
+    /// `vala.verification.execution_inputs`, one row per execution's inputs.
+    ExecutionInputs,
 }
 
 impl ScribeTable {
@@ -250,7 +278,7 @@ impl ScribeTable {
         Self::Spans,
         Self::Results,
         Self::DriftFeatures,
-        Self::EvalItems,
+        Self::ExecutionInputs,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -262,7 +290,7 @@ impl ScribeTable {
             Self::Spans => "vala.traces.spans",
             Self::Results => "vala.verification.results",
             Self::DriftFeatures => "vala.drift.result_features",
-            Self::EvalItems => "vala.eval.result_items",
+            Self::ExecutionInputs => "vala.verification.execution_inputs",
         }
     }
 
@@ -274,7 +302,7 @@ impl ScribeTable {
 
     /// Whether this destination is a Verifier result table.
     pub(crate) const fn is_result(self) -> bool {
-        matches!(self, Self::Results | Self::DriftFeatures | Self::EvalItems)
+        matches!(self, Self::Results | Self::DriftFeatures)
     }
 
     /// Logical Bifrost table this destination names.
@@ -287,7 +315,9 @@ impl ScribeTable {
             Self::DriftFeatures => {
                 TableRef::new(BifrostNamespace::Drift, ResultFeaturesTable::NAME)
             }
-            Self::EvalItems => TableRef::new(BifrostNamespace::Eval, ResultItemsTable::NAME),
+            Self::ExecutionInputs => {
+                TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
+            }
         }
     }
 }
@@ -841,6 +871,8 @@ impl OutboxSink for ScribeSink {
     /// Writes that were projected away or whose frame was refused terminally
     /// are counted lost once the slice completes, never on a retried
     /// attempt. A process that reaches no Scribe drops the whole slice.
+    /// Once the slice completes, every submission whose inputs row was not
+    /// lost is staged on its [`SubmissionOutbox`]; a lost row queues nothing.
     ///
     /// # Errors
     ///
@@ -886,6 +918,16 @@ impl OutboxSink for ScribeSink {
             }
         }
         count_lost::<Self>(lost.len());
+        for (index, item) in items.iter().enumerate() {
+            if let ScribeWrite::ExecutionInputs {
+                queued: Some((outbox, submission)),
+                ..
+            } = item
+                && !lost.contains(&index)
+            {
+                outbox.stage(tenant, (**submission).clone());
+            }
+        }
         Ok(())
     }
 }

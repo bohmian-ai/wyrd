@@ -5,29 +5,27 @@
 //! composes up to four capability tasks, restarts any that exits or panics
 //! while the server is running, publishes their liveness through
 //! [`VerificationHealth`], and on shutdown lets each drain before returning.
-//! The durable queue in `wyrd.verifier_runs` is the only record of work; the
+//! The durable queue in `wyrd.verifier_executions` is the only record of work; the
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
 pub mod authority;
 mod cache;
 mod claims;
-pub mod direct;
 pub mod drift;
 pub mod engines;
-pub mod eval;
 #[cfg(feature = "test-support")]
 pub mod fault;
 pub mod fitter;
 pub mod health;
 pub mod hosted;
 mod leases;
-pub mod observations;
 pub mod operators;
 pub mod permits;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
+pub mod submissions;
 pub mod telemetry;
 
 use std::sync::Arc;
@@ -37,12 +35,11 @@ use std::time::Duration;
 
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
-use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 use crate::state::AppState;
 
 use self::authority::BackgroundAuthority;
-use self::drift::DriftEngine;
 #[cfg(feature = "test-support")]
 use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
@@ -50,7 +47,7 @@ use self::health::{RuntimeCapability, VerificationHealth};
 use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
 #[cfg(feature = "test-support")]
 use self::runner::EngineScript;
-use self::runner::{VerifierEngines, VerifierRunner};
+use self::runner::VerifierRunner;
 use self::scheduler::VerificationScheduler;
 
 /// Bounds every runtime loop, lease, and drain obeys.
@@ -74,11 +71,6 @@ pub struct RuntimeLimits {
     pub poll_interval: Duration,
     /// Wait before a crashed capability task is restarted.
     pub restart_backoff: Duration,
-    /// Wait before an Eval run whose trace has not landed is tried again.
-    pub trace_poll: Duration,
-    /// How long after its creation an Eval run waits for its trace before it
-    /// settles `timed_out`.
-    pub trace_deadline: Duration,
     /// Delivery attempts one Operator dispatch may make.
     pub operator_attempts: i32,
     /// Wall-clock budget of one Operator dispatch from its creation.
@@ -103,8 +95,7 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     /// Production bounds: 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
     /// renewed lease over a five-minute execution, a
-    /// thirty-second drain, Eval traces polled every five seconds for up to
-    /// five minutes, and a five-minute rewrap interval whose passes stop after
+    /// thirty-second drain, and a five-minute rewrap interval whose passes stop after
     /// two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
@@ -115,8 +106,6 @@ impl Default for RuntimeLimits {
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),
-            trace_poll: Duration::from_secs(5),
-            trace_deadline: Duration::from_mins(5),
             operator_attempts: 3,
             operator_deadline: Duration::from_mins(5),
             operator_lease: Duration::from_secs(45),
@@ -345,7 +334,7 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Consult `script` before the real engine arms.
+    /// Consult `script` before the real engine.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn engine_script(mut self, script: EngineScript) -> Self {
@@ -366,10 +355,10 @@ impl VerificationRuntimeBuilder<'_> {
     ///
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
-    /// runner additionally needs the process's Scribe outbox to reach a
-    /// Scribe, in-process or over the peer plane, and reads its inputs through
-    /// the ordinary query service, local or peer-forwarded; without a
-    /// reachable Scribe it is not composed and therefore not required, so
+    /// runner additionally needs the process's hosted Verifier blocks and its
+    /// Scribe outbox to reach a Scribe, in-process or over the peer plane, and
+    /// reads its inputs through the ordinary query service, local or
+    /// peer-forwarded; without both it is not composed and therefore not required, so
     /// health is not degraded by an intentionally absent capability. Every
     /// composed capability is marked required on the shared health.
     #[must_use]
@@ -379,7 +368,7 @@ impl VerificationRuntimeBuilder<'_> {
             return None;
         };
         let postgres = self.state.postgres.wyrd();
-        let queue = VerifierRunQueue::default();
+        let queue = VerifierExecutionQueue::default();
         let scheduler = VerificationScheduler::new(
             postgres.clone(),
             operator.clone(),
@@ -429,16 +418,15 @@ impl VerificationRuntimeBuilder<'_> {
             (Some(fault), Some(scribe)) => fault.outbox(Arc::clone(scribe.scribe()) as _),
             _ => outbox,
         };
-        if outbox.sink().reaches_scribe() {
+        if let Some(blocks) = &self.state.verification_blocks
+            && outbox.sink().reaches_scribe()
+        {
             let runner = VerifierRunner::new(
-                postgres.clone(),
+                self.state.clone(),
+                Arc::clone(blocks),
                 operator,
                 queue,
                 outbox,
-                VerifierEngines::new(
-                    DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
-                    self::eval::EvalEngine::new(self.state.clone(), self.limits.trace_deadline),
-                ),
                 self.limits,
             );
             #[cfg(feature = "test-support")]
@@ -453,7 +441,7 @@ impl VerificationRuntimeBuilder<'_> {
             };
             capabilities.push(Capability::Runner(Arc::new(runner)));
         } else {
-            tracing::warn!("Verifier runner not composed: this pod reaches no Scribe");
+            tracing::warn!("Verifier runner not composed: no hosted blocks or no reachable Scribe");
         }
         let health = Arc::clone(&self.state.verification);
         for capability in &capabilities {

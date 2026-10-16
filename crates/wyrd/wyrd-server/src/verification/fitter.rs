@@ -25,7 +25,6 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftSpec;
-use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::verification::VerificationError;
@@ -341,7 +340,8 @@ impl BaselineFitter {
         .map_err(|error| fit_error(BASELINE_FIT_FAILED, error.to_string()))?
     }
 
-    /// Resolve the pinned Verifier's Drift spec and the Data Card's artifact path.
+    /// Resolve the pinned Verifier requirement's drift spec and the Data
+    /// Card's artifact path.
     ///
     /// The Data Card must still be readable (`active` or `deprecated`) and
     /// hold a registered `data/data.parquet` within the in-memory bound.
@@ -369,10 +369,15 @@ impl BaselineFitter {
                 "the baseline owner is not a Verifier".to_owned(),
             ));
         };
-        let VerifierImplementation::Drift(spec) = verifier.implementation else {
-            return Err(unavailable(
-                "the baseline owner is not a Drift Verifier".to_owned(),
-            ));
+        let Some(spec) = verifier
+            .drift_checks()
+            .find(|(requirement, _)| **requirement == claimed.lease.requirement_id)
+            .map(|(_, check)| check.spec.clone())
+        else {
+            return Err(unavailable(format!(
+                "the baseline requirement {} is not a drift check of its Verifier",
+                claimed.lease.requirement_id.as_str()
+            )));
         };
         let data = get_card_by_uid(&mut conn, &claimed.data_card_uid)
             .await

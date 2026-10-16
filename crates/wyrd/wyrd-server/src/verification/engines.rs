@@ -1,376 +1,158 @@
-//! The closed Verifier implementation arms and the typed outcomes they return.
+//! The typed outcome of one queued Verifier execution.
 //!
-//! [`VerifierRunner`](super::runner::VerifierRunner) owns the one dispatch over
-//! [`VerifierImplementation`]: each arm receives the claimed run and its typed
-//! implementation spec and returns an [`EngineOutcome`]. Arms never read or
-//! write run rows, claim work, publish results, or create dispatches; the
-//! runner turns every outcome into exactly one fenced lifecycle transition.
-//! Drift runs through [`DriftEngine`](super::drift::DriftEngine); Eval runs
-//! through [`EvalEngine`](super::eval::EvalEngine).
+//! [`VerifierRunner`](super::runner::VerifierRunner) runs every claimed
+//! execution through the one building-block engine and maps its result to an
+//! [`EngineOutcome`]; the runner turns every outcome into exactly one fenced
+//! lifecycle transition. The helpers here derive the bounded Operator failure
+//! context from a completed [`VerificationOutcome`].
 
-use vala_drift::{DriftReport, DriftVerdict};
-use vala_eval::EvalExecError;
-use vala_eval::executor::EvalReport;
-use wyrd_spec::card::eval::EvalSpec;
-use wyrd_spec::card::operator::VerifierCounts;
-use wyrd_spec::vala::eval::AssertionResult;
-use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::{VerificationError, VerificationVerdict};
-use wyrd_sql::queries::verifier_runs::TerminalStatus;
-
-/// Stable error code of an implementation whose engine has not shipped.
-pub const IMPLEMENTATION_UNAVAILABLE: &str = "implementation_unavailable";
-
-/// What one completed Verifier execution produced, before publication.
-///
-/// Carries the existing engine report types unchanged so result publication
-/// maps them to the analytical tables without an intermediate copy.
-#[derive(Debug, Clone, PartialEq)]
-pub enum VerifierReport {
-    /// A Drift execution; `None` when valid input could not be scored, which
-    /// is recorded as an inconclusive result rather than a fabricated report.
-    Drift(Option<DriftReport>),
-    /// An Eval workflow execution over one committed record.
-    Eval {
-        /// Every task outcome, both executed and skipped; empty when sampled out.
-        report: EvalReport,
-        /// The workflow verdict the Eval engine's pass gate decided.
-        verdict: VerificationVerdict,
-        /// The application Run that wrote the judged record, recorded as the
-        /// result's managed `run_id`; `None` when the record names no Run.
-        run_id: Option<RunId>,
-    },
-    /// A task Verifier's one check, judged directly; it passes or fails.
-    /// Boxed because the result dwarfs every other report.
-    Task(Box<AssertionResult>),
-}
-
-impl VerifierReport {
-    /// The `implementation` discriminator the result row records.
-    #[must_use]
-    pub const fn implementation(&self) -> &'static str {
-        match self {
-            Self::Drift(_) => "drift",
-            Self::Eval { .. } => "eval",
-            Self::Task(_) => "task",
-        }
-    }
-
-    /// Map a scored one-record Eval report onto the common Eval result.
-    ///
-    /// Applies the spec's context capture first, the single capture point
-    /// before persistence. At least one attesting task with an authored gate
-    /// maps the gate's pass/fail; no gate, or nothing attesting (every task
-    /// skipped), is inconclusive regardless of the gate.
-    ///
-    /// # Errors
-    /// Returns the capture failure when an observed value cannot be hashed.
-    pub fn eval(report: EvalReport, spec: &EvalSpec) -> Result<Self, EvalExecError> {
-        let report = report.captured(spec.context_capture)?;
-        let verdict = match &spec.pass_gate {
-            Some(gate) if report.ran().next().is_some() => {
-                if report.pass_gate(gate).passed {
-                    VerificationVerdict::Passed
-                } else {
-                    VerificationVerdict::Failed
-                }
-            }
-            _ => VerificationVerdict::Inconclusive,
-        };
-        Ok(Self::Eval {
-            report,
-            verdict,
-            run_id: None,
-        })
-    }
-
-    /// The common verdict of this result.
-    ///
-    /// Drift maps its own verdict (`no_drift` passes, `drift` fails,
-    /// `inconclusive` stays inconclusive) and an unscored execution is
-    /// inconclusive; Eval reports the verdict its pass gate decided; a task
-    /// passes or fails with its one check.
-    #[must_use]
-    pub const fn verdict(&self) -> VerificationVerdict {
-        match self {
-            Self::Drift(None) => VerificationVerdict::Inconclusive,
-            Self::Drift(Some(report)) => match report.verdict {
-                DriftVerdict::NoDrift => VerificationVerdict::Passed,
-                DriftVerdict::Drift => VerificationVerdict::Failed,
-                DriftVerdict::Inconclusive => VerificationVerdict::Inconclusive,
-            },
-            Self::Eval { verdict, .. } => *verdict,
-            Self::Task(result) if result.passed => VerificationVerdict::Passed,
-            Self::Task(_) => VerificationVerdict::Failed,
-        }
-    }
-
-    /// The bounded human-readable summary frozen into each Operator failure
-    /// context.
-    ///
-    /// Only aggregate counts and verdicts: never feature rows, Eval context,
-    /// or task detail. Settlement clips it to the Operator summary bound.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        match self {
-            Self::Drift(None) => "Drift could not be scored for this window.".to_owned(),
-            Self::Drift(Some(report)) => {
-                let drifted = report
-                    .features
-                    .values()
-                    .filter(|feature| feature.verdict == DriftVerdict::Drift)
-                    .count();
-                format!(
-                    "Drift verdict {:?}: {drifted} of {} features drifted.",
-                    report.verdict,
-                    report.features.len()
-                )
-            }
-            Self::Eval {
-                report, verdict, ..
-            } => {
-                let rollup = report.workflow_summary();
-                format!(
-                    "Eval verdict {}: {} of {} tasks passed.",
-                    <&str>::from(verdict),
-                    rollup.passed_tasks,
-                    rollup.total_tasks
-                )
-            }
-            Self::Task(result) => format!(
-                "Task {} {}.",
-                result.task_id.as_str(),
-                if result.passed { "passed" } else { "failed" }
-            ),
-        }
-    }
-
-    /// The application Run an Eval report judged, if its record named one.
-    ///
-    /// Drift and task reports carry none: scheduled Drift has no application
-    /// Run and a direct execution takes it from its request.
-    #[must_use]
-    pub const fn run_id(&self) -> Option<&RunId> {
-        match self {
-            Self::Eval { run_id, .. } => run_id.as_ref(),
-            Self::Drift(_) | Self::Task(_) => None,
-        }
-    }
-
-    /// This report attributed to the application Run of its judged record.
-    ///
-    /// Only an Eval report records a Run; any other report is returned as is.
-    #[must_use]
-    pub fn with_run(mut self, run: Option<RunId>) -> Self {
-        if let Self::Eval { run_id, .. } = &mut self {
-            *run_id = run;
-        }
-        self
-    }
-
-    /// The count-only numbers frozen beside [`VerifierReport::summary`] into
-    /// each Operator failure context.
-    ///
-    /// Drift counts drifted and scored features; Eval counts passed and ran
-    /// tasks. An unscored Drift execution (never `failed`) reads zero of zero,
-    /// and a negative rollup count reads zero. A task has none: its one
-    /// check is fully described by its verdict.
-    #[must_use]
-    pub fn counts(&self) -> Option<VerifierCounts> {
-        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        Some(match self {
-            Self::Drift(None) => VerifierCounts::Drift {
-                drifted_features: 0,
-                total_features: 0,
-            },
-            Self::Drift(Some(report)) => VerifierCounts::Drift {
-                drifted_features: count(
-                    report
-                        .features
-                        .values()
-                        .filter(|feature| feature.verdict == DriftVerdict::Drift)
-                        .count(),
-                ),
-                total_features: count(report.features.len()),
-            },
-            Self::Eval { report, .. } => {
-                let rollup = report.workflow_summary();
-                VerifierCounts::eval(
-                    u32::try_from(rollup.passed_tasks).unwrap_or(0),
-                    u32::try_from(rollup.total_tasks).unwrap_or(0),
-                )
-            }
-            Self::Task(_) => return None,
-        })
-    }
-}
+use wyrd_spec::card::operator::DriftCounts;
+use wyrd_spec::verification::execution::{
+    RequirementDetail, RequirementOutcome, VerificationOutcome,
+};
+use wyrd_spec::verification::{DriftVerdict, VerificationError};
+use wyrd_sql::queries::verifier_executions::TerminalStatus;
 
 /// The typed result of one engine execution.
 ///
 /// The runner maps each variant to exactly one transition: `Completed`
-/// publishes and then completes, `Retry` reschedules the same run and input
-/// within its attempt budget, `AwaitingTrace` requeues without charging an
-/// attempt until the trace deadline, `Deferred` requeues after one poll
+/// stages the result and completes, `Retry` reschedules the same execution
+/// and input within its attempt budget, `Deferred` requeues after one poll
 /// interval without charging an attempt, and `Terminal` settles without a
 /// verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineOutcome {
-    /// The engine produced a verdict and its report.
-    Completed(VerifierReport),
-    /// A transient failure; the same run and frozen input may be attempted again.
+    /// The engine produced a verdict and its breakdown.
+    Completed(VerificationOutcome),
+    /// A transient failure; the same execution and frozen input may be
+    /// attempted again.
     Retry(VerificationError),
-    /// The Eval record's trace has not landed; wait and try again.
-    AwaitingTrace(VerificationError),
     /// Bifrost refused an input read at admission. That is backpressure from
-    /// shared query capacity, not a failure of this run, so the run waits one
+    /// shared query capacity, not a failure of this execution, so it waits one
     /// poll interval and tries again without spending an attempt.
     Deferred(VerificationError),
     /// A terminal failure that carries no verdict.
     Terminal(TerminalStatus, VerificationError),
 }
 
-impl EngineOutcome {
-    /// The terminal outcome of an implementation whose engine is not available.
-    ///
-    /// Never a verdict: the run settles `errored` with
-    /// [`IMPLEMENTATION_UNAVAILABLE`] so nothing downstream mistakes it for a
-    /// judgment.
-    #[must_use]
-    pub fn implementation_unavailable(implementation: &str) -> Self {
-        Self::Terminal(
-            TerminalStatus::Errored,
-            VerificationError {
-                code: IMPLEMENTATION_UNAVAILABLE.to_owned(),
-                message: format!("the {implementation} Verifier engine is not available"),
-            },
-        )
+/// The bounded human-readable summary frozen into each Operator failure
+/// context.
+///
+/// Only the verdict and requirement counts: never actual values, citations,
+/// or step output. Settlement clips it to the Operator summary bound.
+#[must_use]
+pub fn summary(outcome: &VerificationOutcome) -> String {
+    let failed = outcome
+        .requirements
+        .iter()
+        .filter(|requirement| requirement.outcome == RequirementOutcome::Failed)
+        .count();
+    format!(
+        "Verdict {}: {failed} of {} requirements failed.",
+        <&str>::from(outcome.verdict),
+        outcome.requirements.len()
+    )
+}
+
+/// The feature counts of the outcome's one drift requirement, frozen beside
+/// [`summary`] into each Operator failure context.
+///
+/// `None` unless exactly one requirement carries drift detail, since the
+/// `drift.*` template fields name a single check.
+#[must_use]
+pub fn drift_counts(outcome: &VerificationOutcome) -> Option<DriftCounts> {
+    let mut reports =
+        outcome
+            .requirements
+            .iter()
+            .filter_map(|requirement| match &requirement.detail {
+                Some(RequirementDetail::Drift(report)) => Some(report),
+                None => None,
+            });
+    let report = reports.next()?;
+    if reports.next().is_some() {
+        return None;
     }
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Some(DriftCounts {
+        drifted_features: count(
+            report
+                .features
+                .values()
+                .filter(|feature| feature.verdict == DriftVerdict::Drift)
+                .count(),
+        ),
+        total_features: count(report.features.len()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    //! Operator failure context derived from an outcome.
+
     use std::collections::BTreeMap;
 
-    use vala_eval::executor::{SkipReason, TaskRunOutcome};
     use wyrd_spec::card::drift::DriftMethod;
-    use wyrd_spec::vala::eval::{
-        AssertionResult, ComparisonOperator, EvalContextCapture, EvalPassGate, TaskId,
-    };
+    use wyrd_spec::card::verifier::Check;
+    use wyrd_spec::vala::eval::TaskId;
+    use wyrd_spec::verification::execution::RequirementResult;
+    use wyrd_spec::verification::{DriftReport, VerificationVerdict};
 
     use super::*;
 
-    /// Build a Drift report with `verdict` and no features.
-    fn drift_report(verdict: DriftVerdict) -> DriftReport {
-        DriftReport {
+    /// One failed requirement with optional drift detail.
+    fn requirement(id: &str, detail: Option<RequirementDetail>) -> RequirementResult {
+        RequirementResult {
+            id: TaskId::new(id).expect("valid task id"),
+            step: None,
+            statement: id.to_owned(),
+            outcome: RequirementOutcome::Failed,
+            reason: "failed".to_owned(),
+            actual: None,
+            citations: Vec::new(),
+            detail,
+            check: serde_json::from_value::<Check>(serde_json::json!({
+                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+            }))
+            .expect("assert check decodes"),
+            provenance: None,
+        }
+    }
+
+    /// An empty drift report detail.
+    fn drift() -> Option<RequirementDetail> {
+        Some(RequirementDetail::Drift(DriftReport {
             method: DriftMethod::Custom,
             features: BTreeMap::new(),
-            verdict,
-        }
+            verdict: DriftVerdict::Drift,
+        }))
     }
 
-    /// Drift verdicts map onto the common verdict and an unscored run is inconclusive.
+    /// The summary counts failed requirements, and drift counts exist only
+    /// for exactly one drift requirement.
+    ///
+    /// # Panics
+    /// Panics when the derived context differs.
     #[test]
-    fn drift_verdicts_map_to_the_common_verdict() {
-        let cases = [
-            (Some(DriftVerdict::NoDrift), VerificationVerdict::Passed),
-            (Some(DriftVerdict::Drift), VerificationVerdict::Failed),
-            (
-                Some(DriftVerdict::Inconclusive),
-                VerificationVerdict::Inconclusive,
-            ),
-            (None, VerificationVerdict::Inconclusive),
-        ];
-        for (drift, expected) in cases {
-            let report = VerifierReport::Drift(drift.map(drift_report));
-            assert_eq!(report.verdict(), expected, "{drift:?}");
-            assert_eq!(report.implementation(), "drift");
-        }
-    }
-
-    /// One Eval outcome: `Some(passed)` ran with that result, `None` skipped.
-    fn outcome(id: &str, passed: Option<bool>) -> TaskRunOutcome {
-        let task_id = TaskId::new(id).expect("task id");
-        match passed {
-            Some(passed) => TaskRunOutcome::Ran(Box::new(AssertionResult {
-                task_id,
-                passed,
-                actual: Some(serde_json::json!("observed")),
-                expected: serde_json::json!("observed"),
-                operator: ComparisonOperator::Equals,
-                message: None,
-                stage: 0,
-                started_at: chrono::Utc::now(),
-                duration_ms: 1,
-            })),
-            None => TaskRunOutcome::Skipped {
-                task_id,
-                reason: SkipReason::ConditionFalse,
-            },
-        }
-    }
-
-    /// The Eval terminal matrix: an authored gate over at least one attesting
-    /// task decides pass/fail; no gate or nothing attesting is inconclusive;
-    /// capture strips stored evidence without changing the verdict.
-    #[test]
-    fn eval_reports_map_to_the_common_verdict_after_capture() {
-        let gate = Some(EvalPassGate::AllPass);
-        let cases = [
-            (
-                gate.clone(),
-                vec![Some(true), None],
-                VerificationVerdict::Passed,
-            ),
-            (
-                gate.clone(),
-                vec![Some(false), None],
-                VerificationVerdict::Failed,
-            ),
-            (None, vec![Some(false)], VerificationVerdict::Inconclusive),
-            (gate, vec![None, None], VerificationVerdict::Inconclusive),
-        ];
-        for (pass_gate, outcomes, expected) in cases {
-            let spec = EvalSpec {
-                dataset: None,
-                tasks: BTreeMap::new(),
-                workflow: None,
-                sampling: None,
-                pass_gate,
-                context_capture: Some(EvalContextCapture::Redact),
-            };
-            let report = EvalReport {
-                outcomes: outcomes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, passed)| outcome(&format!("t{index}"), *passed))
-                    .collect(),
-            };
-            let mapped = VerifierReport::eval(report, &spec).expect("capture applies");
-            assert_eq!(mapped.verdict(), expected, "{outcomes:?}");
-            let VerifierReport::Eval { report, .. } = mapped else {
-                panic!("an Eval report maps to an Eval result");
-            };
-            assert_eq!(
-                report.outcomes.len(),
-                outcomes.len(),
-                "every outcome is kept"
-            );
-            assert!(
-                report.ran().all(|result| result.actual.is_none()),
-                "redacted"
-            );
-        }
-    }
-
-    /// The unavailable outcome is a terminal `errored` failure, never a verdict.
-    #[test]
-    fn unavailable_implementation_is_terminal_without_verdict() {
-        let EngineOutcome::Terminal(status, error) =
-            EngineOutcome::implementation_unavailable("drift")
-        else {
-            panic!("an unavailable implementation must be terminal");
+    fn failure_context_counts_requirements_and_the_one_drift_check() {
+        let mut outcome = VerificationOutcome {
+            verdict: VerificationVerdict::Failed,
+            requirements: vec![requirement("a", drift()), requirement("b", None)],
+            steps: Vec::new(),
+            evidence: BTreeMap::new(),
         };
-        assert_eq!(status, TerminalStatus::Errored);
-        assert_eq!(error.code, IMPLEMENTATION_UNAVAILABLE);
+        assert_eq!(
+            summary(&outcome),
+            "Verdict failed: 2 of 2 requirements failed."
+        );
+        assert_eq!(
+            drift_counts(&outcome),
+            Some(DriftCounts {
+                drifted_features: 0,
+                total_features: 0
+            })
+        );
+        outcome.requirements.push(requirement("c", drift()));
+        assert_eq!(drift_counts(&outcome), None);
     }
 }

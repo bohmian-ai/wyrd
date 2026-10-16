@@ -1,69 +1,57 @@
-//! Arrow payloads for one Verifier result: pure mapping, no transport.
+//! Arrow payloads for one Verifier execution: pure mapping, no transport.
 //!
-//! [`ResultPayloadBuilder`] maps an existing engine report onto the authored
-//! schemas of `vala.verification.results`, `vala.drift.result_features`, and
-//! `vala.eval.result_items`, taken from the tables' own declarations so the
-//! payload can never drift from the registered contract. Every batch also
+//! [`ResultPayloadBuilder`] maps one engine [`VerificationOutcome`] onto the
+//! authored schemas of `vala.verification.results` and
+//! `vala.drift.result_features`, and the execution's pinned inputs onto
+//! `vala.verification.execution_inputs`, taken from the tables' own declarations so
+//! the payload can never drift from the registered contract. Every batch also
 //! carries the two correlation columns Scribe admits from a native payload:
 //! `card_uid` (the Card verified; the Verifier is the authored
 //! `verifier_card_uid`) and `run_id` (the application Run judged, null when
-//! none, as for scheduled Drift).
+//! none, as for scheduled drift).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
-    TimestampMicrosecondArray,
-};
-use arrow::buffer::NullBuffer;
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{Error as JsonError, Value};
+use serde_json::Error as JsonError;
 use vala_bifrost_redux::tables::verification::{
-    ASSERTION_RESULT, DRIFT_REPORT, EVAL_SUMMARY, ResultsTable,
+    ACTIVATION, ExecutionInputsTable, INPUTS, OUTCOME, ResultsTable,
 };
-use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable};
-use vala_drift::{DriftReport, DriftVerdict};
-use vala_eval::executor::{EvalReport, EvalWorkflowSummary, SkipReason, TaskRunOutcome};
+use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
+use wyrd_runtime::request_context::AcceptedAuthority;
+use wyrd_spec::card::agent::ExecutionRoute;
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
+use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
-use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
-use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
+use wyrd_spec::verification::execution::{
+    CallProvenance, InputDeclaration, RequirementDetail, RequirementResult, VerificationOutcome,
+};
+use wyrd_spec::verification::{
+    DriftReport, DriftWindow, FeatureDriftReport, FrozenTarget, VerificationVerdict,
+};
+use wyrd_sql::queries::verifier_executions::Submission;
 
-use super::engines::VerifierReport;
-
-/// Why a report could not be mapped to result batches.
+/// Why an outcome could not be mapped to result batches.
 ///
-/// Every variant is a defect of the report or the claimed run, not of the
-/// transport, so the runner settles it `errored` rather than retrying.
+/// Every variant is a defect of the outcome, not of the transport, so the
+/// runner settles it `errored` rather than retrying.
 #[derive(Debug, thiserror::Error)]
 pub enum ResultPayloadError {
-    /// The report's implementation cannot consume the run's frozen input,
-    /// such as a Drift report for an Eval record run.
-    #[error("{implementation} result does not match the run's frozen input")]
-    InputMismatch {
-        /// The report's implementation.
-        implementation: &'static str,
-    },
-    /// A report value does not fit its Arrow column.
-    #[error("result value {column} is out of range")]
-    OutOfRange {
-        /// The column whose value overflowed.
-        column: &'static str,
-    },
-    /// A report value could not be encoded as canonical JSON.
+    /// An outcome value could not be encoded as canonical JSON.
     #[error("result JSON encoding failed")]
     Json(#[from] JsonError),
-    /// A report value exceeds a Variant limit and cannot be stored.
+    /// An outcome value exceeds a Variant limit and cannot be stored.
     #[error("result Variant value refused")]
     Variant(#[from] BifrostError),
     /// The mapped columns did not form a valid batch.
@@ -99,27 +87,27 @@ pub struct ResultBatch {
 
 /// Every batch of one result, in required write order.
 ///
-/// Non-empty detail batches precede the summary; a result with no detail rows
+/// Drift feature rows precede the summary; a result with no drift detail
 /// holds only the summary. Built once and staged on the Scribe outbox, which
 /// resends identical rows on every retry.
 #[derive(Debug, Clone)]
 pub struct ResultPayload {
     /// The result identity every row carries.
     result_id: VerificationResultId,
-    /// The common verdict the summary records.
+    /// The overall verdict the summary records.
     verdict: VerificationVerdict,
     /// Details first, summary last; never an empty batch.
     batches: Vec<ResultBatch>,
 }
 
 impl ResultPayload {
-    /// The result identity the run completes with.
+    /// The result identity the execution completes with.
     #[must_use]
     pub fn result_id(&self) -> VerificationResultId {
         self.result_id
     }
 
-    /// The common verdict of this result.
+    /// The overall verdict of this result.
     #[must_use]
     pub fn verdict(&self) -> VerificationVerdict {
         self.verdict
@@ -132,60 +120,69 @@ impl ResultPayload {
     }
 }
 
-/// The frozen identities and input of the run a result belongs to.
+/// The accepted request context of a submitted execution, recorded as its
+/// inputs row's `activation` Variant.
+#[derive(Serialize)]
+struct Activation<'a> {
+    /// Per-task Agent route overrides the submission carried.
+    route_overrides: &'a BTreeMap<TaskId, ExecutionRoute>,
+    /// The submission's `Idempotency-Key`, when it carried one.
+    idempotency_key: Option<&'a str>,
+    /// Hex SHA-256 of the canonical request, when keyed.
+    request_sha256: Option<String>,
+    /// The submitting caller's verified effective authority.
+    authority: &'a AcceptedAuthority,
+}
+
+/// The identities of the execution a result belongs to.
 ///
-/// A borrowed view of the fields of a [`ClaimedRun`] that result rows record,
-/// separated from the lease so the mapping can be exercised without a claim.
+/// A borrowed view of the fields result rows record, separated from the
+/// lease so the mapping can be exercised without a claim.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultRun<'a> {
-    /// The application Run judged, stored as the managed `run_id`: the
-    /// observed record's Run for continuous Eval, the caller's Run for a
-    /// direct execution, and `None` when there is none, as for scheduled Drift.
+    /// The Verifier execution, recorded as `execution_id`; the result
+    /// identity reuses its UUID, since one execution has one result.
+    pub execution_id: ExecutionId,
+    /// The application Run judged, stored as the managed `run_id`; `None`
+    /// when there is none, as for scheduled drift.
     pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
     /// The Card verified, stored as the managed `card_uid`.
     pub card_uid: &'a CardUid,
-    /// Binding owner; `None` for a direct run.
+    /// Binding owner; `None` for an execution with no binding.
     pub owner_card_uid: Option<&'a CardUid>,
-    /// Binding; `None` for a direct run.
+    /// Binding; `None` for an execution with no binding.
     pub binding_id: Option<BindingId>,
-    /// Frozen Trigger; `None` for a direct run.
+    /// Frozen Trigger; `None` for an execution with no binding.
     pub trigger: Option<&'a FrozenTarget>,
-    /// The frozen input the Verifier analyzed.
-    pub input: &'a RunInput,
+    /// The scheduled sample window; `None` for Run evidence.
+    pub window: Option<&'a DriftWindow>,
 }
 
-impl<'a> ResultRun<'a> {
-    /// Borrow the result-relevant identities of a claimed run judged for the
-    /// application Run `run_id`.
-    #[must_use]
-    pub fn claimed(run: &'a ClaimedRun, run_id: Option<&'a RunId>) -> Self {
-        Self {
-            run_id,
-            verifier_version: &run.verifier_version,
-            card_uid: &run.card_uid,
-            owner_card_uid: run.owner_card_uid.as_ref(),
-            binding_id: run.binding_id,
-            trigger: run.trigger.as_ref(),
-            input: &run.input,
-        }
-    }
+/// One `vala.drift.result_features` row before encoding.
+struct DriftRow<'r> {
+    /// The drift requirement that scored the feature.
+    requirement: &'r str,
+    /// The requirement's report, which names the method.
+    report: &'r DriftReport,
+    /// The window the feature was scored over.
+    window: DriftWindow,
+    /// The scored feature.
+    feature: &'r FeatureDriftReport,
 }
 
-/// Maps one completed run's report onto its result batches.
+/// Maps one completed execution's outcome onto its result batches.
 ///
-/// Owns the identities every row repeats — result, run, Verifier reference,
+/// Owns the identities every row repeats — result, execution, Verifier,
 /// subject, owner, binding — plus the execution interval, so each table
 /// mapping reads them from one place.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultPayloadBuilder<'a> {
-    /// The run whose frozen identities and input the rows record.
+    /// The execution whose identities the rows record.
     run: ResultRun<'a>,
     /// The Verifier's UID, recorded as `verifier_card_uid`.
     verifier_uid: &'a CardUid,
-    /// The new result's identity.
-    result_id: VerificationResultId,
     /// Verifier execution start.
     started_at: DateTime<Utc>,
     /// Verifier execution end.
@@ -193,122 +190,83 @@ pub struct ResultPayloadBuilder<'a> {
 }
 
 impl<'a> ResultPayloadBuilder<'a> {
-    /// Build a mapper for one result of `run`.
+    /// Build a mapper for the one result of `run`.
     #[must_use]
     pub fn new(
         run: ResultRun<'a>,
         verifier_uid: &'a CardUid,
-        result_id: VerificationResultId,
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
     ) -> Self {
         Self {
             run,
             verifier_uid,
-            result_id,
             started_at,
             ended_at,
         }
     }
 
-    /// Map `report` to its ordered batches.
+    /// The result identity: the execution's UUID.
     ///
-    /// Drift writes one `result_features` row per scored feature and records
-    /// the typed report (or null when unscored) as `drift_report`; Eval writes
-    /// one `result_items` row per task outcome and records the typed workflow
-    /// summary as `eval_summary`; a task writes only the summary, sourced from
-    /// the synthetic record, with its one `AssertionResult` as the
-    /// `assertion_result` Variant. The other summary columns stay null. A
-    /// report with no detail rows writes only the summary.
+    /// # Panics
+    /// Never in practice: an [`ExecutionId`] is a `UUIDv7`, which is always a
+    /// valid [`VerificationResultId`].
+    fn result_id(&self) -> VerificationResultId {
+        VerificationResultId::new(self.run.execution_id.as_uuid())
+            .expect("an ExecutionId is a UUIDv7, so it is a VerificationResultId")
+    }
+
+    /// Map `outcome` to its ordered batches.
+    ///
+    /// Every drift requirement writes one `result_features` row per scored
+    /// feature, keyed by its `requirement_id`, all in one batch before the
+    /// summary. The one `results` row records the overall verdict and the
+    /// whole outcome as the `outcome` Variant.
     ///
     /// # Errors
-    /// Returns [`ResultPayloadError::InputMismatch`] when the report's
-    /// implementation cannot consume the run's frozen input,
-    /// [`ResultPayloadError::OutOfRange`] when a value overflows its column,
-    /// [`ResultPayloadError::ColumnMismatch`] when authored columns do not
-    /// name each table field exactly once, [`ResultPayloadError::Variant`]
-    /// when a payload exceeds a Variant limit, and a JSON or Arrow error when
-    /// encoding fails.
-    pub fn build(&self, report: &VerifierReport) -> Result<ResultPayload, ResultPayloadError> {
-        let implementation = report.implementation();
-        let verdict = report.verdict();
+    /// Returns [`ResultPayloadError::ColumnMismatch`] when authored columns
+    /// do not name each table field exactly once,
+    /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
+    /// limit, and a JSON or Arrow error when encoding fails.
+    ///
+    /// # Panics
+    /// Never: the result identity reuses a UUIDv7 execution identity.
+    pub fn build(
+        &self,
+        outcome: &VerificationOutcome,
+    ) -> Result<ResultPayload, ResultPayloadError> {
         let mut batches = Vec::with_capacity(2);
-        let (window, record_id, drift, workflow, assertion) = match (report, self.run.input) {
-            (VerifierReport::Drift(drift), RunInput::DriftWindow(window)) => {
-                if let Some(drift) = drift
-                    && let Some(features) = self.drift_features(drift, window)?
-                {
-                    batches.push(self.finish::<ResultFeaturesTable>(features)?);
-                }
-                (
-                    Some(window),
-                    None,
-                    drift_report(drift.as_ref())?,
-                    None,
-                    assertion_result(None)?,
-                )
-            }
-            (VerifierReport::Eval { report, .. }, RunInput::EvalRecord { record_id, .. }) => {
-                if let Some(items) = self.eval_items(report, record_id)? {
-                    batches.push(self.finish::<ResultItemsTable>(items)?);
-                }
-                (
-                    None,
-                    Some(record_id.as_str()),
-                    drift_report(None)?,
-                    Some(report.workflow_summary()),
-                    assertion_result(None)?,
-                )
-            }
-            (VerifierReport::Task(result), RunInput::EvalRecord { record_id, .. }) => (
-                None,
-                Some(record_id.as_str()),
-                drift_report(None)?,
-                None,
-                assertion_result(Some(&serde_json::to_value(result)?))?,
-            ),
-            _ => return Err(ResultPayloadError::InputMismatch { implementation }),
-        };
-        let summary = self.summary(
-            implementation,
-            verdict,
-            window,
-            record_id,
-            [
-                (DRIFT_REPORT, drift),
-                (EVAL_SUMMARY, eval_summary(workflow.as_ref())),
-                (ASSERTION_RESULT, assertion),
-            ],
-        )?;
-        batches.push(self.finish::<ResultsTable>(summary)?);
+        if let Some(features) = self.drift_features(&outcome.requirements)? {
+            batches.push(self.finish::<ResultFeaturesTable>(features)?);
+        }
+        batches.push(self.finish::<ResultsTable>(self.summary(outcome)?)?);
         Ok(ResultPayload {
-            result_id: self.result_id,
-            verdict,
+            result_id: self.result_id(),
+            verdict: outcome.verdict,
             batches,
         })
     }
 
     /// Author the named columns of the one `vala.verification.results` row.
     ///
-    /// `reports` are the already-built one-row report columns: the Drift and
-    /// Eval summary Structs and a task's assertion Variant, appended after the
-    /// common columns.
-    ///
     /// # Errors
-    /// Returns a JSON error when the frozen Trigger cannot be encoded.
+    /// Returns a JSON error when the Trigger or outcome cannot be encoded and
+    /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
+    /// limit.
     fn summary(
         &self,
-        implementation: &'static str,
-        verdict: VerificationVerdict,
-        window: Option<&DriftWindow>,
-        record_id: Option<&str>,
-        reports: [NamedColumn; 3],
+        outcome: &VerificationOutcome,
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
-        let verdict: &'static str = verdict.into();
-        let mut columns = vec![
-            ("result_id", text([Some(self.result_id.to_string())])),
-            ("implementation", text([Some(implementation)])),
+        let verdict: &'static str = outcome.verdict.into();
+        let outcome = serde_json::to_value(outcome)?;
+        let window = self.run.window;
+        Ok(vec![
+            ("result_id", text([Some(self.result_id().to_string())])),
+            (
+                "execution_id",
+                text([Some(self.run.execution_id.to_string())]),
+            ),
             ("execution_status", text([Some("completed")])),
             ("verdict", text([Some(verdict)])),
             ("verifier_version", text([Some(self.run.verifier_version)])),
@@ -319,7 +277,6 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             ("binding_id", text([self.binding()])),
             ("trigger_identity", text([trigger])),
-            ("source_record_id", text([record_id])),
             (
                 "window_start",
                 timestamps([window.map(|window| window.start)]),
@@ -327,196 +284,175 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("window_end", timestamps([window.map(|window| window.end)])),
             ("started_at", timestamps([Some(self.started_at)])),
             ("ended_at", timestamps([Some(self.ended_at)])),
-        ];
-        columns.extend(reports);
-        Ok(columns)
+            (
+                OUTCOME,
+                VariantColumnBuilder::encode(OUTCOME, [Some(&outcome)], EncodedVariant::from_json)?,
+            ),
+        ])
     }
 
-    /// Author the named `vala.drift.result_features` columns, one row per
-    /// scored feature.
+    /// Map the execution's pinned `inputs` to its one
+    /// `vala.verification.execution_inputs` row, recorded at `started_at`.
     ///
-    /// Returns `None` for a report with no features, so no empty batch is
-    /// ever written. An engine `NaN` score or threshold becomes null.
+    /// A `submission` marks the row `queue_execution` and records its
+    /// accepted request context — route overrides, idempotency key and
+    /// request digest, and the accepted authority — as the `activation`
+    /// Variant; a direct execution passes `None` and its row can never queue
+    /// work.
     ///
     /// # Errors
-    /// Returns a JSON error when the method cannot be encoded.
-    fn drift_features(
+    /// Returns a JSON or Variant error when the inputs or activation cannot
+    /// be encoded, and the [`Self::finish`] errors.
+    pub fn inputs(
         &self,
-        report: &DriftReport,
-        window: &DriftWindow,
-    ) -> Result<Option<Vec<NamedColumn>>, ResultPayloadError> {
-        let rows = report.features.len();
-        if rows == 0 {
-            return Ok(None);
-        }
-        let method = serde_json::to_value(report.method)?;
-        let method = method.as_str().unwrap_or_default();
-        let features = report.features.values();
-        Ok(Some(vec![
+        inputs: &BTreeMap<SlotName, InputDeclaration>,
+        submission: Option<&Submission>,
+    ) -> Result<ResultBatch, ResultPayloadError> {
+        let activation = submission
+            .map(|submission| {
+                serde_json::to_value(Activation {
+                    route_overrides: &submission.request.execution_route_overrides,
+                    idempotency_key: submission.key.as_ref().map(|key| key.key.as_str()),
+                    request_sha256: submission
+                        .key
+                        .as_ref()
+                        .map(|key| hex::encode(key.request_sha256)),
+                    authority: &submission.authority,
+                })
+            })
+            .transpose()?;
+        let inputs = serde_json::to_value(inputs)?;
+        self.finish::<ExecutionInputsTable>(vec![
             (
-                "result_id",
-                text(std::iter::repeat_n(Some(self.result_id.to_string()), rows)),
-            ),
-            (
-                "owner_card_uid",
-                text(std::iter::repeat_n(self.owner(), rows)),
+                "execution_id",
+                text([Some(self.run.execution_id.to_string())]),
             ),
             (
                 "verifier_card_uid",
-                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), rows)),
+                text([Some(self.verifier_uid.as_str())]),
+            ),
+            ("binding_id", text([self.binding()])),
+            (
+                "queue_execution",
+                Arc::new(BooleanArray::from(vec![submission.is_some()])),
+            ),
+            (
+                INPUTS,
+                VariantColumnBuilder::encode(INPUTS, [Some(&inputs)], EncodedVariant::from_json)?,
+            ),
+            (
+                ACTIVATION,
+                VariantColumnBuilder::encode(
+                    ACTIVATION,
+                    [activation.as_ref()],
+                    EncodedVariant::from_json,
+                )?,
+            ),
+            ("recorded_at", timestamps([Some(self.started_at)])),
+        ])
+    }
+
+    /// Author the named `vala.drift.result_features` columns: one row per
+    /// scored feature of every drift requirement.
+    ///
+    /// A row's window is its requirement's scored window, else the
+    /// execution's scheduled window, else the execution interval. Returns
+    /// `None` when no requirement scored a feature, so no empty batch is ever
+    /// written. A non-finite score or threshold becomes null.
+    ///
+    /// # Errors
+    /// Returns a JSON error when a method or verdict cannot be encoded.
+    fn drift_features(
+        &self,
+        requirements: &[RequirementResult],
+    ) -> Result<Option<Vec<NamedColumn>>, ResultPayloadError> {
+        let mut rows: Vec<DriftRow<'_>> = Vec::new();
+        for requirement in requirements {
+            let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
+                continue;
+            };
+            let window = match &requirement.provenance {
+                Some(CallProvenance::Drift {
+                    window: Some(window),
+                }) => *window,
+                _ => self.run.window.copied().unwrap_or(DriftWindow {
+                    start: self.started_at,
+                    end: self.ended_at,
+                }),
+            };
+            rows.extend(report.features.values().map(|feature| DriftRow {
+                requirement: requirement.id.as_str(),
+                report,
+                window,
+                feature,
+            }));
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let count = rows.len();
+        let methods = rows
+            .iter()
+            .map(|row| serialized_name(&row.report.method))
+            .collect::<Result<Vec<_>, _>>()?;
+        let verdicts = rows
+            .iter()
+            .map(|row| serialized_name(&row.feature.verdict))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(vec![
+            (
+                "result_id",
+                text(std::iter::repeat_n(
+                    Some(self.result_id().to_string()),
+                    count,
+                )),
+            ),
+            (
+                "requirement_id",
+                text(rows.iter().map(|row| Some(row.requirement))),
+            ),
+            (
+                "owner_card_uid",
+                text(std::iter::repeat_n(self.owner(), count)),
+            ),
+            (
+                "verifier_card_uid",
+                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), count)),
             ),
             (
                 "binding_id",
-                text(std::iter::repeat_n(self.binding(), rows)),
+                text(std::iter::repeat_n(self.binding(), count)),
             ),
             (
                 "window_start",
-                timestamps(std::iter::repeat_n(Some(window.start), rows)),
+                timestamps(rows.iter().map(|row| Some(row.window.start))),
             ),
             (
                 "window_end",
-                timestamps(std::iter::repeat_n(Some(window.end), rows)),
+                timestamps(rows.iter().map(|row| Some(row.window.end))),
             ),
-            ("method", text(std::iter::repeat_n(Some(method), rows))),
+            ("method", text(methods)),
             (
                 "feature",
-                text(
-                    features
-                        .clone()
-                        .map(|feature| Some(feature.feature.as_str())),
-                ),
+                text(rows.iter().map(|row| Some(row.feature.feature.as_str()))),
             ),
             (
                 "score",
                 Arc::new(
-                    features
-                        .clone()
-                        .map(|feature| finite(feature.score))
+                    rows.iter()
+                        .map(|row| row.feature.score.filter(|score| score.is_finite()))
                         .collect::<Float64Array>(),
                 ),
             ),
             (
                 "threshold",
                 Arc::new(
-                    features
-                        .clone()
-                        .map(|feature| finite(feature.threshold))
+                    rows.iter()
+                        .map(|row| row.feature.threshold.filter(|value| value.is_finite()))
                         .collect::<Float64Array>(),
                 ),
             ),
-            (
-                "verdict",
-                text(features.map(|feature| Some(drift_verdict(feature.verdict)))),
-            ),
-        ]))
-    }
-
-    /// Author the named `vala.eval.result_items` columns, one row per task
-    /// outcome.
-    ///
-    /// Executed tasks fill the `Ran` columns and skipped tasks fill only
-    /// `skip_reason` and `upstream_task_id`. Returns `None` for a sampled-out
-    /// run with no outcomes, so no empty batch is ever written.
-    ///
-    /// # Errors
-    /// Returns [`ResultPayloadError::OutOfRange`] when a stage or duration
-    /// overflows its column, [`ResultPayloadError::Variant`] when a captured
-    /// value exceeds a Variant limit, or a JSON error when encoding fails.
-    fn eval_items(
-        &self,
-        report: &EvalReport,
-        record_id: &str,
-    ) -> Result<Option<Vec<NamedColumn>>, ResultPayloadError> {
-        let rows = report.outcomes.len();
-        if rows == 0 {
-            return Ok(None);
-        }
-        let items = report
-            .outcomes
-            .iter()
-            .map(EvalItem::from_outcome)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(vec![
-            (
-                "result_id",
-                text(std::iter::repeat_n(Some(self.result_id.to_string()), rows)),
-            ),
-            (
-                "owner_card_uid",
-                text(std::iter::repeat_n(self.owner(), rows)),
-            ),
-            (
-                "verifier_card_uid",
-                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), rows)),
-            ),
-            (
-                "binding_id",
-                text(std::iter::repeat_n(self.binding(), rows)),
-            ),
-            (
-                "source_record_id",
-                text(std::iter::repeat_n(Some(record_id), rows)),
-            ),
-            ("task_id", text(items.iter().map(|item| Some(item.task_id)))),
-            (
-                "outcome_kind",
-                text(items.iter().map(|item| Some(item.outcome_kind))),
-            ),
-            (
-                "passed",
-                Arc::new(
-                    items
-                        .iter()
-                        .map(|item| item.passed)
-                        .collect::<BooleanArray>(),
-                ),
-            ),
-            (
-                "actual",
-                VariantColumnBuilder::encode(
-                    "actual",
-                    items.iter().map(|item| item.actual.as_ref()),
-                    EncodedVariant::from_json,
-                )?,
-            ),
-            (
-                "expected",
-                VariantColumnBuilder::encode(
-                    "expected",
-                    items.iter().map(|item| item.expected.as_ref()),
-                    EncodedVariant::from_json,
-                )?,
-            ),
-            (
-                "operator",
-                text(items.iter().map(|item| item.operator.as_deref())),
-            ),
-            ("message", text(items.iter().map(|item| item.message))),
-            (
-                "stage",
-                Arc::new(items.iter().map(|item| item.stage).collect::<Int32Array>()),
-            ),
-            (
-                "started_at",
-                timestamps(items.iter().map(|item| item.started_at)),
-            ),
-            (
-                "duration_ms",
-                Arc::new(
-                    items
-                        .iter()
-                        .map(|item| item.duration_ms)
-                        .collect::<Int64Array>(),
-                ),
-            ),
-            (
-                "skip_reason",
-                text(items.iter().map(|item| item.skip_reason)),
-            ),
-            (
-                "upstream_task_id",
-                text(items.iter().map(|item| item.upstream_task_id)),
-            ),
+            ("verdict", text(verdicts)),
         ]))
     }
 
@@ -599,110 +535,20 @@ impl<'a> ResultPayloadBuilder<'a> {
         Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
     }
 
-    /// The binding owner Card UID, null for a direct run.
+    /// The binding owner Card UID, null for an execution with no binding.
     fn owner(&self) -> Option<String> {
         self.run.owner_card_uid.map(ToString::to_string)
     }
 
-    /// The binding identity, null for a direct run.
+    /// The binding identity, null for an execution with no binding.
     fn binding(&self) -> Option<String> {
         self.run.binding_id.map(|binding| binding.to_string())
     }
 }
 
-/// One `result_items` row derived from a task outcome.
-///
-/// Borrowed text stays borrowed; only JSON renderings are owned.
-struct EvalItem<'a> {
-    /// Executed or skipped task identity.
-    task_id: &'a str,
-    /// `ran` or `skipped`.
-    outcome_kind: &'static str,
-    /// Whether an executed task passed.
-    passed: Option<bool>,
-    /// The captured actual value; a captured null is `Some(Value::Null)`.
-    actual: Option<Value>,
-    /// The expected value.
-    expected: Option<Value>,
-    /// Canonical JSON of the comparison operator.
-    operator: Option<String>,
-    /// Executed task's message.
-    message: Option<&'a str>,
-    /// Executed task's topological stage.
-    stage: Option<i32>,
-    /// Executed task's start time.
-    started_at: Option<DateTime<Utc>>,
-    /// Executed task's duration.
-    duration_ms: Option<i64>,
-    /// `condition_false` or `dependency_skipped` for a skipped task.
-    skip_reason: Option<&'static str>,
-    /// The skipped upstream dependency, for a dependency skip.
-    upstream_task_id: Option<&'a str>,
-}
-
-impl<'a> EvalItem<'a> {
-    /// Map one executor outcome onto its row.
-    ///
-    /// # Errors
-    /// Returns [`ResultPayloadError::OutOfRange`] when the stage or duration
-    /// overflows its signed column, or a JSON error when a value cannot be
-    /// encoded.
-    fn from_outcome(outcome: &'a TaskRunOutcome) -> Result<Self, ResultPayloadError> {
-        Ok(match outcome {
-            TaskRunOutcome::Ran(result) => Self {
-                task_id: result.task_id.as_str(),
-                outcome_kind: "ran",
-                passed: Some(result.passed),
-                actual: result
-                    .actual
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()?,
-                expected: Some(serde_json::to_value(&result.expected)?),
-                operator: Some(canonical_json(&result.operator)?),
-                message: result.message.as_deref(),
-                stage: Some(
-                    i32::try_from(result.stage)
-                        .map_err(|_| ResultPayloadError::OutOfRange { column: "stage" })?,
-                ),
-                started_at: Some(result.started_at),
-                duration_ms: Some(i64::try_from(result.duration_ms).map_err(|_| {
-                    ResultPayloadError::OutOfRange {
-                        column: "duration_ms",
-                    }
-                })?),
-                skip_reason: None,
-                upstream_task_id: None,
-            },
-            TaskRunOutcome::Skipped { task_id, reason } => {
-                let (skip_reason, upstream) = match reason {
-                    SkipReason::ConditionFalse => ("condition_false", None),
-                    SkipReason::DependencySkipped { upstream } => {
-                        ("dependency_skipped", Some(upstream.as_str()))
-                    }
-                };
-                Self {
-                    task_id: task_id.as_str(),
-                    outcome_kind: "skipped",
-                    passed: None,
-                    actual: None,
-                    expected: None,
-                    operator: None,
-                    message: None,
-                    stage: None,
-                    started_at: None,
-                    duration_ms: None,
-                    skip_reason: Some(skip_reason),
-                    upstream_task_id: upstream,
-                }
-            }
-        })
-    }
-}
-
 /// Encode `value` as canonical (RFC 8785) JSON.
 ///
-/// Routes through [`Value`] first so a non-finite float, which
+/// Routes through [`serde_json::Value`] first so a non-finite float, which
 /// canonical JSON cannot represent, becomes `null` instead of failing.
 ///
 /// # Errors
@@ -711,97 +557,12 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
     serde_jcs::to_string(&serde_json::to_value(value)?)
 }
 
-/// Build the one-row `drift_report` Struct column; null when unscored.
-///
-/// `method` and `verdict` are the enums' serialized names and `features` is
-/// the per-feature map as a Variant, so the row decodes to the same JSON the
-/// report serializes to (a non-finite score becomes JSON null). An unscored
-/// row nulls every nullable child under its null parent, because DataFusion's
-/// `get_field` returns a child without the parent's validity, so a child
-/// projection must itself read SQL null rather than a placeholder.
-///
-/// # Errors
-/// Returns a JSON error when the report cannot be serialized and
-/// [`ResultPayloadError::Variant`] when the features exceed a Variant limit.
-fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadError> {
-    let (features, method, verdict) = match report {
-        Some(report) => (
-            Some(serde_json::to_value(&report.features)?),
-            serialized_name(&report.method)?,
-            serialized_name(&report.verdict)?,
-        ),
-        None => (None, None, None),
-    };
-    let features =
-        VariantColumnBuilder::encode(DRIFT_REPORT, [features.as_ref()], EncodedVariant::from_json)?;
-    Ok(Arc::new(StructArray::try_new(
-        ResultsTable::drift_report_fields(),
-        vec![text([method]), features, text([verdict])],
-        report.is_none().then(|| NullBuffer::new_null(1)),
-    )?))
-}
-
-/// Build the one-row `assertion_result` Variant column; null when absent.
-///
-/// # Errors
-/// Returns [`ResultPayloadError::Variant`] when the assertion exceeds a
-/// Variant limit.
-fn assertion_result(result: Option<&serde_json::Value>) -> Result<ArrayRef, ResultPayloadError> {
-    Ok(VariantColumnBuilder::encode(
-        ASSERTION_RESULT,
-        [result],
-        EncodedVariant::from_json,
-    )?)
-}
-
-/// Build the one-row `eval_summary` Struct column; null when absent.
-///
-/// An absent summary nulls every child under its null parent, as
-/// [`drift_report`] does, so a child projection reads SQL null.
-fn eval_summary(summary: Option<&EvalWorkflowSummary>) -> ArrayRef {
-    Arc::new(StructArray::new(
-        ResultsTable::eval_summary_fields(),
-        vec![
-            Arc::new(Int32Array::from(vec![
-                summary.map(|summary| summary.total_tasks),
-            ])),
-            Arc::new(Int32Array::from(vec![
-                summary.map(|summary| summary.passed_tasks),
-            ])),
-            Arc::new(Int32Array::from(vec![
-                summary.map(|summary| summary.failed_tasks),
-            ])),
-            Arc::new(Float64Array::from(vec![
-                summary.map(|summary| summary.pass_rate),
-            ])),
-            Arc::new(Int64Array::from(vec![
-                summary.map(|summary| summary.duration_ms),
-            ])),
-        ],
-        summary.is_none().then(|| NullBuffer::new_null(1)),
-    ))
-}
-
 /// The serialized name of a unit enum value, such as `Psi` or `NoDrift`.
 ///
 /// # Errors
 /// Returns a JSON error when the value cannot be serialized.
 fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError> {
     Ok(serde_json::to_value(value)?.as_str().map(str::to_owned))
-}
-
-/// The stored value of a Drift feature verdict.
-const fn drift_verdict(verdict: DriftVerdict) -> &'static str {
-    match verdict {
-        DriftVerdict::NoDrift => "no_drift",
-        DriftVerdict::Drift => "drift",
-        DriftVerdict::Inconclusive => "inconclusive",
-    }
-}
-
-/// A finite engine score, or null for the engine's `NaN`/infinite marker.
-fn finite(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
 }
 
 /// Build a nullable UTF-8 column.
@@ -824,22 +585,27 @@ fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayR
 
 #[cfg(test)]
 mod tests {
+    //! Outcome-to-row mapping of the result tables.
+
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
+    use arrow::datatypes::Float64Type;
     use chrono::TimeZone;
-    use vala_drift::FeatureDriftReport;
+    use serde_json::Value;
     use wyrd_spec::card::drift::DriftMethod;
+    use wyrd_spec::card::verifier::Check;
     use wyrd_spec::ids::FeatureName;
-    use wyrd_spec::vala::eval::ids::TaskId;
-    use wyrd_spec::vala::eval::operator::ComparisonOperator;
-    use wyrd_spec::vala::eval::result::AssertionResult;
+    use wyrd_spec::vala::eval::TaskId;
+    use wyrd_spec::verification::DriftVerdict;
+    use wyrd_spec::verification::execution::RequirementOutcome;
 
     use super::*;
 
-    /// Owned identities of one binding run, borrowed as a [`ResultRun`].
+    /// Owned identities of one binding execution, borrowed as a [`ResultRun`].
     struct TestRun {
+        /// The execution.
+        execution_id: ExecutionId,
         /// The application Run judged.
         run_id: RunId,
         /// Subject Card.
@@ -852,22 +618,45 @@ mod tests {
         binding: BindingId,
         /// Frozen inline Trigger.
         trigger: FrozenTarget,
-        /// Frozen input.
-        input: RunInput,
+        /// Scheduled window.
+        window: DriftWindow,
     }
 
     impl TestRun {
-        /// Borrow this run as the builder's view.
-        fn view(&self) -> ResultRun<'_> {
-            ResultRun {
-                run_id: Some(&self.run_id),
-                verifier_version: "1.2.0",
-                card_uid: &self.subject,
-                owner_card_uid: Some(&self.owner),
-                binding_id: Some(self.binding),
-                trigger: Some(&self.trigger),
-                input: &self.input,
+        /// A binding execution over one fixed day.
+        fn new() -> Self {
+            Self {
+                execution_id: ExecutionId::new_v7(),
+                run_id: RunId::new(),
+                subject: uid(),
+                owner: uid(),
+                verifier: uid(),
+                binding: BindingId::new_v7(),
+                trigger: FrozenTarget::Digest("sha256:t".to_owned()),
+                window: DriftWindow {
+                    start: at(-86_400),
+                    end: at(0),
+                },
             }
+        }
+
+        /// A builder for this execution with fixed times.
+        fn builder(&self) -> ResultPayloadBuilder<'_> {
+            ResultPayloadBuilder::new(
+                ResultRun {
+                    execution_id: self.execution_id,
+                    run_id: Some(&self.run_id),
+                    verifier_version: "1.2.0",
+                    card_uid: &self.subject,
+                    owner_card_uid: Some(&self.owner),
+                    binding_id: Some(self.binding),
+                    trigger: Some(&self.trigger),
+                    window: Some(&self.window),
+                },
+                &self.verifier,
+                at(10),
+                at(20),
+            )
         }
     }
 
@@ -884,81 +673,56 @@ mod tests {
         CardUid::from_uuid(uuid::Uuid::now_v7()).expect("UUIDv7 is a valid Card UID")
     }
 
-    /// A binding run over `input`.
-    fn run(input: RunInput) -> TestRun {
-        TestRun {
-            run_id: RunId::new(),
-            subject: uid(),
-            owner: uid(),
-            verifier: uid(),
-            binding: BindingId::new_v7(),
-            trigger: FrozenTarget::Digest("sha256:t".to_owned()),
-            input,
-        }
-    }
-
-    /// A Drift run over one fixed day.
-    fn drift_run() -> TestRun {
-        run(RunInput::DriftWindow(DriftWindow {
-            start: at(-86_400),
-            end: at(0),
-        }))
-    }
-
-    /// An Eval run over one committed record.
-    fn eval_run() -> TestRun {
-        run(RunInput::EvalRecord {
-            record_id: "record-1".to_owned(),
-            event_time: at(-5),
-        })
-    }
-
-    /// A builder for `run` with fixed identities and times.
-    fn builder(run: &TestRun) -> ResultPayloadBuilder<'_> {
-        ResultPayloadBuilder::new(
-            run.view(),
-            &run.verifier,
-            VerificationResultId::new_v7(),
-            at(10),
-            at(20),
-        )
-    }
-
-    /// Map `report` for `run` with fixed identities and times.
-    ///
-    /// # Panics
-    /// Panics when the report does not map.
-    fn build(run: &TestRun, report: &VerifierReport) -> ResultPayload {
-        builder(run).build(report).expect("report maps to batches")
-    }
-
-    /// The named summary columns of an unscored Drift result over `run`.
-    ///
-    /// # Panics
-    /// Panics when the run is not a Drift run or the Trigger cannot encode.
-    fn drift_summary_columns(builder: &ResultPayloadBuilder<'_>) -> Vec<NamedColumn> {
-        let RunInput::DriftWindow(window) = builder.run.input else {
-            panic!("summary columns need a Drift run");
-        };
-        builder
-            .summary(
-                "drift",
-                VerificationVerdict::Inconclusive,
-                Some(window),
-                None,
-                [
-                    (
-                        DRIFT_REPORT,
-                        drift_report(None).expect("null report builds"),
-                    ),
-                    (EVAL_SUMMARY, eval_summary(None)),
-                    (
-                        ASSERTION_RESULT,
-                        assertion_result(None).expect("null assertion result builds"),
-                    ),
-                ],
+    /// A failed outcome with one two-feature drift requirement, one with a
+    /// non-finite score, and one assertion requirement with no detail.
+    fn outcome() -> VerificationOutcome {
+        let feature = |name: &str, score: f64, verdict| {
+            let name = FeatureName::new(name).expect("valid feature name");
+            (
+                name.clone(),
+                FeatureDriftReport {
+                    feature: name,
+                    score: Some(score),
+                    threshold: Some(0.2),
+                    verdict,
+                    evidence: None,
+                },
             )
-            .expect("summary columns author")
+        };
+        let requirement = |id: &str, detail| RequirementResult {
+            id: TaskId::new(id).expect("valid task id"),
+            step: None,
+            statement: id.to_owned(),
+            outcome: RequirementOutcome::Failed,
+            reason: "drifted".to_owned(),
+            actual: None,
+            citations: Vec::new(),
+            detail,
+            check: serde_json::from_value::<Check>(serde_json::json!({
+                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+            }))
+            .expect("assert check decodes"),
+            provenance: None,
+        };
+        VerificationOutcome {
+            verdict: VerificationVerdict::Failed,
+            requirements: vec![
+                requirement(
+                    "income_stable",
+                    Some(RequirementDetail::Drift(DriftReport {
+                        method: DriftMethod::Psi,
+                        features: BTreeMap::from([
+                            feature("dti", f64::NAN, DriftVerdict::Inconclusive),
+                            feature("income", 0.4, DriftVerdict::Drift),
+                        ]),
+                        verdict: DriftVerdict::Drift,
+                    })),
+                ),
+                requirement("asserted", None),
+            ],
+            steps: Vec::new(),
+            evidence: BTreeMap::new(),
+        }
     }
 
     /// Read one UTF-8 cell.
@@ -970,420 +734,73 @@ mod tests {
         array.is_valid(row).then(|| array.value(row).to_owned())
     }
 
-    /// Decode one Variant cell of a top-level column to JSON.
+    /// Drift feature rows carry their requirement and precede the summary,
+    /// a non-finite score is null, and the summary stores the whole outcome
+    /// under the execution's identity.
     ///
     /// # Panics
-    /// Panics when the column is absent or the cell is not a valid Variant.
-    fn variant_cell(batch: &RecordBatch, column: &str, row: usize) -> Value {
-        let array = batch
-            .column_by_name(column)
-            .unwrap_or_else(|| panic!("{column} column exists"));
-        wyrd_queue::variant::variant_cell_to_json(array.as_ref(), row).expect("Variant decodes")
-    }
-
-    /// Borrow one Struct column of a batch.
-    ///
-    /// # Panics
-    /// Panics when the column is absent or not a Struct.
-    fn struct_column<'b>(batch: &'b RecordBatch, column: &str) -> &'b StructArray {
-        batch
-            .column_by_name(column)
-            .unwrap_or_else(|| panic!("{column} column exists"))
-            .as_struct()
-    }
-
-    /// A two-feature Drift report writes its features before the summary, all
-    /// rows share one identity, and NaN scores become null.
+    /// Panics when the outcome maps to other rows.
     #[test]
-    fn drift_result_writes_features_then_summary_with_nan_as_null() {
-        let run = drift_run();
-        let mut features = BTreeMap::new();
-        for (name, score, verdict) in [
-            ("latency", 0.4, DriftVerdict::Drift),
-            ("tokens", f64::NAN, DriftVerdict::Inconclusive),
-        ] {
-            let feature = FeatureName::new(name).expect("feature name");
-            features.insert(
-                feature.clone(),
-                FeatureDriftReport {
-                    feature,
-                    score,
-                    threshold: 0.2,
-                    verdict,
-                    evidence: None,
-                },
+    fn outcome_writes_requirement_features_then_summary() {
+        let run = TestRun::new();
+        let outcome = outcome();
+        let payload = run.builder().build(&outcome).expect("outcome maps");
+        let [features, summary] = payload.batches() else {
+            panic!("features then summary");
+        };
+        assert_eq!(features.table, "vala.drift.result_features");
+        assert_eq!(summary.table, "vala.verification.results");
+        let rows = &features.batch;
+        assert_eq!(rows.num_rows(), 2);
+        for row in 0..2 {
+            assert_eq!(
+                cell(rows, "requirement_id", row).as_deref(),
+                Some("income_stable")
             );
+            assert_eq!(cell(rows, "method", row).as_deref(), Some("Psi"));
         }
-        let report = VerifierReport::Drift(Some(DriftReport {
-            method: DriftMethod::Psi,
-            features,
-            verdict: DriftVerdict::Drift,
-        }));
-        let payload = build(&run, &report);
-        assert_eq!(payload.verdict(), VerificationVerdict::Failed);
-        let tables: Vec<_> = payload.batches().iter().map(|b| b.table.as_str()).collect();
-        assert_eq!(
-            tables,
-            ["vala.drift.result_features", "vala.verification.results"]
-        );
-        let features = &payload.batches()[0].batch;
-        let summary = &payload.batches()[1].batch;
-        assert_eq!(features.num_rows(), 2);
-        assert_eq!(summary.num_rows(), 1);
-        let result_id = payload.result_id().to_string();
-        for batch in [features, summary] {
-            for row in 0..batch.num_rows() {
-                assert_eq!(
-                    cell(batch, "result_id", row).as_deref(),
-                    Some(result_id.as_str())
-                );
-                assert_eq!(
-                    cell(batch, RUN_ID, row).as_deref(),
-                    Some(run.run_id.as_str())
-                );
-                assert_eq!(
-                    cell(batch, CARD_UID, row).as_deref(),
-                    Some(run.subject.as_str())
-                );
-                assert_eq!(
-                    cell(batch, "verifier_card_uid", row).as_deref(),
-                    Some(run.verifier.as_str())
-                );
-            }
-        }
-        assert_eq!(cell(features, "method", 0).as_deref(), Some("Psi"));
-        assert_eq!(
-            cell(features, "verdict", 1).as_deref(),
-            Some("inconclusive")
-        );
-        let scores = features
+        assert_eq!(cell(rows, "feature", 0).as_deref(), Some("dti"));
+        assert_eq!(cell(rows, "verdict", 1).as_deref(), Some("Drift"));
+        let scores = rows
             .column_by_name("score")
             .expect("score column")
             .as_primitive::<Float64Type>();
-        assert!(scores.is_valid(0) && scores.is_null(1), "NaN score is null");
-        assert_eq!(cell(summary, "implementation", 0).as_deref(), Some("drift"));
-        assert_eq!(
-            cell(summary, "execution_status", 0).as_deref(),
-            Some("completed")
-        );
+        assert!(scores.is_null(0));
+        assert!((scores.value(1) - 0.4).abs() < f64::EPSILON);
+        let summary = &summary.batch;
+        let execution = run.execution_id.to_string();
+        assert_eq!(cell(summary, "result_id", 0), Some(execution.clone()));
+        assert_eq!(cell(summary, "execution_id", 0), Some(execution));
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("failed"));
-        assert_eq!(cell(summary, "source_record_id", 0), None);
         assert_eq!(
-            cell(summary, "trigger_identity", 0).as_deref(),
-            Some(r#"{"digest":"sha256:t"}"#)
+            cell(summary, RUN_ID, 0).as_deref(),
+            Some(run.run_id.as_str())
         );
-        let report = struct_column(summary, DRIFT_REPORT);
-        assert!(report.is_valid(0), "a scored Drift sets drift_report");
-        assert!(
-            struct_column(summary, EVAL_SUMMARY).is_null(0),
-            "a scored Drift leaves eval_summary null"
-        );
-        let report = RecordBatch::from(report.clone());
-        assert_eq!(cell(&report, "method", 0).as_deref(), Some("Psi"));
-        assert_eq!(cell(&report, "verdict", 0).as_deref(), Some("Drift"));
-        let features = variant_cell(&report, "features", 0);
-        assert_eq!(features["tokens"]["score"], Value::Null);
-        assert_eq!(features["latency"]["verdict"], "Drift");
-    }
-
-    /// An unscored Drift execution writes only an inconclusive summary with
-    /// neither summary Struct set, and never an empty detail batch.
-    #[test]
-    fn unscored_drift_writes_only_the_summary() {
-        let run = drift_run();
-        let payload = build(&run, &VerifierReport::Drift(None));
-        assert_eq!(payload.batches().len(), 1);
-        let summary = &payload.batches()[0].batch;
-        assert_eq!(payload.batches()[0].table, "vala.verification.results");
-        assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("inconclusive"));
-        for column in [DRIFT_REPORT, EVAL_SUMMARY] {
-            let report = struct_column(summary, column);
-            assert!(report.is_null(0), "{column} is null");
-            assert!(
-                report.columns().iter().all(|child| child.is_null(0)),
-                "{column}'s children are null under the null parent, so a \
-                 child projection reads SQL null"
-            );
-        }
-    }
-
-    /// Eval writes one item per ran and skipped outcome before the summary,
-    /// whose `eval_summary` is the executed-only workflow summary.
-    #[test]
-    fn eval_result_writes_ran_and_skipped_items_then_summary() {
-        let run = eval_run();
-        let task = |id: &str| TaskId::new(id).expect("task id");
-        let report = EvalReport {
-            outcomes: vec![
-                TaskRunOutcome::Ran(Box::new(AssertionResult {
-                    task_id: task("exact"),
-                    passed: true,
-                    actual: Some(Value::Null),
-                    expected: serde_json::json!({"b": 2, "a": 1}),
-                    operator: ComparisonOperator::Equals,
-                    message: None,
-                    stage: 0,
-                    started_at: at(11),
-                    duration_ms: 7,
-                })),
-                TaskRunOutcome::Skipped {
-                    task_id: task("gated"),
-                    reason: SkipReason::DependencySkipped {
-                        upstream: task("exact"),
-                    },
-                },
-            ],
-        };
-        let payload = build(
-            &run,
-            &VerifierReport::Eval {
-                report,
-                verdict: VerificationVerdict::Passed,
-                run_id: None,
-            },
-        );
-        let tables: Vec<_> = payload.batches().iter().map(|b| b.table.as_str()).collect();
-        assert_eq!(
-            tables,
-            ["vala.eval.result_items", "vala.verification.results"]
-        );
-        let items = &payload.batches()[0].batch;
-        assert_eq!(cell(items, "outcome_kind", 0).as_deref(), Some("ran"));
-        assert!(items.column_by_name("actual").expect("actual").is_valid(0));
-        assert_eq!(variant_cell(items, "actual", 0), Value::Null);
-        assert_eq!(
-            variant_cell(items, "expected", 0),
-            serde_json::json!({"a": 1, "b": 2})
-        );
-        assert_eq!(
-            cell(items, "source_record_id", 1).as_deref(),
-            Some("record-1")
-        );
-        assert_eq!(cell(items, "outcome_kind", 1).as_deref(), Some("skipped"));
-        assert_eq!(
-            cell(items, "skip_reason", 1).as_deref(),
-            Some("dependency_skipped")
-        );
-        assert_eq!(cell(items, "upstream_task_id", 1).as_deref(), Some("exact"));
-        assert!(
-            items
-                .column_by_name("expected")
-                .expect("expected")
-                .is_null(1)
-        );
-        let summary = &payload.batches()[1].batch;
-        assert_eq!(
-            cell(summary, "source_record_id", 0).as_deref(),
-            Some("record-1")
-        );
-        assert!(struct_column(summary, DRIFT_REPORT).is_null(0));
-        let eval = RecordBatch::from(struct_column(summary, EVAL_SUMMARY).clone());
-        let count = |name: &str| {
-            eval.column_by_name(name)
-                .expect("count column")
-                .as_primitive::<Int32Type>()
-                .value(0)
-        };
-        assert_eq!((count("total_tasks"), count("passed_tasks")), (1, 1));
-    }
-
-    /// A sampled-out Eval writes only the summary with a zero-count `eval_summary`.
-    #[test]
-    fn sampled_out_eval_writes_zero_count_summary_only() {
-        let run = eval_run();
-        let payload = build(
-            &run,
-            &VerifierReport::Eval {
-                report: EvalReport::default(),
-                verdict: VerificationVerdict::Inconclusive,
-                run_id: None,
-            },
-        );
-        assert_eq!(payload.batches().len(), 1);
-        let summary = struct_column(&payload.batches()[0].batch, EVAL_SUMMARY);
-        assert!(
-            summary.is_valid(0),
-            "a sampled-out Eval still sets eval_summary"
-        );
-        let summary = RecordBatch::from(summary.clone());
-        let pass_rate = summary
-            .column_by_name("pass_rate")
-            .expect("pass rate")
-            .as_primitive::<Float64Type>()
-            .value(0);
-        assert!(pass_rate.abs() < f64::EPSILON, "pass rate {pass_rate}");
-        assert_eq!(
+        let stored = wyrd_queue::variant::variant_cell_to_json(
             summary
-                .column_by_name("duration_ms")
-                .expect("duration")
-                .as_primitive::<Int64Type>()
-                .value(0),
-            0
-        );
+                .column_by_name(OUTCOME)
+                .expect("outcome column")
+                .as_ref(),
+            0,
+        )
+        .expect("outcome Variant decodes");
+        let mut expected = serde_json::to_value(&outcome).expect("outcome encodes");
+        expected["requirements"][0]["detail"]["drift"]["features"]["dti"]["score"] = Value::Null;
+        assert_eq!(stored, expected);
     }
 
-    /// A direct task judgment writes exactly one `vala.verification.results`
-    /// row and no detail row: the task verdict, exact Verifier version,
-    /// subject, and requesting principal, null binding facts and window, the
-    /// application Run's record as
-    /// source, the execution interval, and its one `AssertionResult` as details.
+    /// An outcome with no drift detail writes only the summary.
+    ///
+    /// # Panics
+    /// Panics when a feature batch is written.
     #[test]
-    fn direct_task_writes_one_summary_row() {
-        let subject = uid();
-        let verifier = uid();
-        let application = RunId::new();
-        let input = RunInput::EvalRecord {
-            record_id: application.as_str().to_owned(),
-            event_time: at(10),
-        };
-        let result = AssertionResult {
-            task_id: TaskId::new("no-refund-promise").expect("task id"),
-            passed: false,
-            actual: Some(serde_json::json!("we will refund you")),
-            expected: serde_json::json!("refund"),
-            operator: ComparisonOperator::NotContains,
-            message: None,
-            stage: 0,
-            started_at: at(11),
-            duration_ms: 3,
-        };
-        let payload = ResultPayloadBuilder::new(
-            ResultRun {
-                run_id: Some(&application),
-                verifier_version: "1.0.0",
-                card_uid: &subject,
-                owner_card_uid: None,
-                binding_id: None,
-                trigger: None,
-                input: &input,
-            },
-            &verifier,
-            VerificationResultId::new_v7(),
-            at(10),
-            at(20),
-        )
-        .build(&VerifierReport::Task(Box::new(result.clone())))
-        .expect("a task report maps");
+    fn outcome_without_drift_writes_only_the_summary() {
+        let run = TestRun::new();
+        let mut outcome = outcome();
+        outcome.requirements.remove(0);
+        let payload = run.builder().build(&outcome).expect("outcome maps");
+        assert_eq!(payload.batches().len(), 1);
         assert_eq!(payload.verdict(), VerificationVerdict::Failed);
-        let [only] = payload.batches() else {
-            panic!("a task writes exactly one batch");
-        };
-        assert_eq!(only.table, "vala.verification.results");
-        let row = &only.batch;
-        assert_eq!(row.num_rows(), 1);
-        for (column, expected) in [
-            ("result_id", Some(payload.result_id().to_string())),
-            ("implementation", Some("task".to_owned())),
-            ("execution_status", Some("completed".to_owned())),
-            ("verdict", Some("failed".to_owned())),
-            ("verifier_version", Some("1.0.0".to_owned())),
-            ("verifier_card_uid", Some(verifier.to_string())),
-            ("owner_card_uid", None),
-            ("binding_id", None),
-            ("trigger_identity", None),
-            ("source_record_id", Some(application.as_str().to_owned())),
-            (RUN_ID, Some(application.as_str().to_owned())),
-            (CARD_UID, Some(subject.to_string())),
-        ] {
-            assert_eq!(cell(row, column, 0), expected, "{column}");
-        }
-        let times = |column: &str| {
-            let array = row
-                .column_by_name(column)
-                .unwrap_or_else(|| panic!("{column} column exists"))
-                .as_primitive::<TimestampMicrosecondType>();
-            array.is_valid(0).then(|| array.value(0))
-        };
-        assert_eq!(times("window_start"), None);
-        assert_eq!(times("window_end"), None);
-        assert_eq!(times("started_at"), Some(at(10).timestamp_micros()));
-        assert_eq!(times("ended_at"), Some(at(20).timestamp_micros()));
-        assert_eq!(
-            variant_cell(row, ASSERTION_RESULT, 0),
-            serde_json::to_value(&result).expect("result encodes")
-        );
-        for column in [DRIFT_REPORT, EVAL_SUMMARY] {
-            assert!(
-                row.column_by_name(column)
-                    .expect("summary column")
-                    .is_null(0)
-            );
-        }
-    }
-
-    /// A report whose implementation cannot consume the run's input is refused.
-    #[test]
-    fn mismatched_report_and_input_is_refused() {
-        let run = eval_run();
-        let error = ResultPayloadBuilder::new(
-            run.view(),
-            &run.verifier,
-            VerificationResultId::new_v7(),
-            at(10),
-            at(20),
-        )
-        .build(&VerifierReport::Drift(None))
-        .expect_err("a Drift report cannot complete an Eval record run");
-        assert!(matches!(
-            error,
-            ResultPayloadError::InputMismatch {
-                implementation: "drift"
-            }
-        ));
-    }
-
-    /// A reordered table declaration keeps every authored value under its own
-    /// field name: adjacent same-typed columns such as `implementation`,
-    /// `execution_status`, `verdict`, and `verifier_version` are not relabeled.
-    #[test]
-    fn reordered_table_fields_keep_values_bound_to_names() {
-        let run = drift_run();
-        let builder = builder(&run);
-        let declared = builder
-            .finish::<ResultsTable>(drift_summary_columns(&builder))
-            .expect("declared order assembles")
-            .batch;
-        let mut reversed = ResultsTable::arrow_fields();
-        reversed.reverse();
-        let reordered = builder
-            .assemble(reversed.clone(), drift_summary_columns(&builder))
-            .expect("reversed order assembles");
-        let order: Vec<_> = reordered
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        let expected: Vec<_> = reversed
-            .iter()
-            .map(|field| field.name().clone())
-            .chain([CARD_UID, RUN_ID].map(str::to_owned))
-            .collect();
-        assert_eq!(order, expected);
-        for field in ResultsTable::arrow_fields() {
-            assert_eq!(
-                reordered.column_by_name(field.name()),
-                declared.column_by_name(field.name()),
-                "{} keeps its values",
-                field.name()
-            );
-        }
-        assert_eq!(
-            cell(&reordered, "implementation", 0).as_deref(),
-            Some("drift")
-        );
-        assert_eq!(
-            cell(&reordered, "execution_status", 0).as_deref(),
-            Some("completed")
-        );
-        assert_eq!(
-            cell(&reordered, "verdict", 0).as_deref(),
-            Some("inconclusive")
-        );
-        assert_eq!(
-            cell(&reordered, "verifier_version", 0).as_deref(),
-            Some("1.2.0")
-        );
     }
 
     /// One refusal case: the expected problem, the mutation applied to valid
@@ -1392,10 +809,13 @@ mod tests {
 
     /// Authored columns that omit, repeat, or invent a table field name are
     /// refused with the named problem before any batch is assembled.
+    ///
+    /// # Panics
+    /// Panics when a mismatch is not refused as named.
     #[test]
     fn missing_duplicate_and_unexpected_columns_are_refused() {
-        let run = drift_run();
-        let builder = builder(&run);
+        let run = TestRun::new();
+        let builder = run.builder();
         let cases: [ColumnCase; 3] = [
             (
                 "missing",
@@ -1414,7 +834,7 @@ mod tests {
             ),
         ];
         for (expected_problem, mutate, expected_column) in cases {
-            let mut columns = drift_summary_columns(&builder);
+            let mut columns = builder.summary(&outcome()).expect("summary authors");
             mutate(&mut columns);
             let error = builder
                 .finish::<ResultsTable>(columns)

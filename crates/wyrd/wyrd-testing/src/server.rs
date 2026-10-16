@@ -4996,7 +4996,6 @@ impl WyrdTestServerBuilder {
             resources: bifrost_resources,
             cluster: cluster_registry,
             token_verifier: Arc::clone(&verifier),
-            issuing_key: Some(Arc::clone(&issuing_key)),
             peer_tls,
             config: bifrost_config,
             forge_config: forge_runtime,

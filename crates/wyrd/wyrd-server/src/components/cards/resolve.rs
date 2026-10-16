@@ -4,10 +4,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::json;
 use wyrd_spec::card::data::{ArrowFormat, DataInterface};
-use wyrd_spec::card::drift::DriftSignal;
+use wyrd_spec::card::drift::{DriftSignal, DriftSpec};
 use wyrd_spec::card::operator::OperatorSpec;
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+use wyrd_spec::card::verifier::{InputSlot, VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -25,46 +25,40 @@ use wyrd_sql::queries::verification::BindingSchedule;
 /// Identity key used to look up a resolved external reference.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 
-/// Reject a Trigger activation that cannot run the Verifier's implementation.
+/// Reject a schedule binding whose Verifier judges no recorded samples, then
+/// check the binding's sample-slot mapping against the Verifier.
+///
+/// A schedule occurrence supplies only recorded measurements for a window, so
+/// it can activate only a Verifier with a `samples` slot, and every required
+/// slot must be a mapped samples slot.
 ///
 /// # Errors
-/// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` unless a drift
-/// Verifier runs on `schedule` or an eval Verifier runs on `observations_ready`.
+/// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the Verifier has
+/// no samples slot, and the [`VerifierSpec::validate_schedule`] refusal for an
+/// incomplete or inexact `inputs` mapping.
 fn check_activation(
     verifier: &VerifierSpec,
-    trigger: &TriggerSpec,
+    binding: &VerificationBinding,
     field: &str,
 ) -> Result<(), WyrdError> {
-    let compatible = matches!(
-        (&verifier.implementation, &trigger.activation),
-        (
-            VerifierImplementation::Drift(_),
-            TriggerActivation::Schedule { .. }
-        ) | (
-            VerifierImplementation::Eval(_),
-            TriggerActivation::ObservationsReady {}
-        )
-    );
-    if compatible {
-        return Ok(());
+    let samples = verifier
+        .inputs
+        .values()
+        .any(|slot| matches!(slot, InputSlot::Samples { .. }));
+    if !samples {
+        return Err(WyrdError::SpecTriggerActivationMismatch {
+            message: format!("{field}.runs_on cannot activate a Verifier without a samples slot"),
+            details: serde_json::json!({ "field": format!("{field}.runs_on") }),
+        });
     }
-    Err(WyrdError::SpecTriggerActivationMismatch {
-        message: format!(
-            "{field}.runs_on cannot activate a {} Verifier",
-            verifier.implementation.kind_name()
-        ),
-        details: serde_json::json!({
-            "field": format!("{field}.runs_on"),
-            "implementation": verifier.implementation.kind_name(),
-        }),
-    })
+    verifier.validate_schedule(&binding.inputs)
 }
 
 /// Validate an Operator's shape and the exact connection authority it names.
 ///
-/// `implementation` is the bound Verifier's implementation when the Operator
-/// is attached to a binding, so a kind-specific template field of another
-/// implementation is refused; a standalone Operator Card passes `None`.
+/// `verifier` is the bound Verifier when the Operator is attached to a
+/// binding, so a template field that Verifier cannot fill is refused; a
+/// standalone Operator Card passes `None`.
 ///
 /// Reads only the tenant's redacted connection row (never the secret) under
 /// the caller's RLS. Missing, disabled, wrong-provider, and mismatched
@@ -73,16 +67,16 @@ fn check_activation(
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_INVALID_OPERATOR` for a shape or template violation
-/// (including a template field of another Verifier implementation),
+/// (including a template field the bound Verifier cannot fill),
 /// `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` when no active matching
 /// connection exists, and a registry error when the read fails.
 async fn check_operator(
     conn: &mut TenantConn<'_>,
     operator: &OperatorSpec,
     field: &str,
-    implementation: Option<&VerifierImplementation>,
+    verifier: Option<&VerifierSpec>,
 ) -> Result<(), WyrdError> {
-    operator.validate(field, implementation)?;
+    operator.validate(field, verifier)?;
     let Some((provider, name)) = operator.connection() else {
         return Ok(());
     };
@@ -229,7 +223,8 @@ impl EffectiveSpecs {
     ///
     /// # Errors
     /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the effective
-    /// Trigger cannot run the effective Verifier implementation,
+    /// Trigger cannot activate the effective Verifier, the schedule mapping
+    /// refusal of [`VerifierSpec::validate_schedule`],
     /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a `schedule` Trigger cannot
     /// be armed,
     /// the Operator shape and connection refusals of `check_operator`, and
@@ -282,7 +277,9 @@ impl EffectiveSpecs {
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)
         {
-            check_activation(verifier, trigger, field)?;
+            if matches!(trigger.activation, TriggerActivation::Schedule { .. }) {
+                check_activation(verifier, binding, field)?;
+            }
         }
         if let Some(Spec::Trigger(TriggerSpec {
             activation: TriggerActivation::Schedule { cron, tz },
@@ -302,17 +299,18 @@ impl EffectiveSpecs {
             };
             let field = format!("{field}.on_failure[{index}]");
             if let Some(Spec::Operator(operator)) = operator {
-                let implementation = match &verifier {
-                    Some(Spec::Verifier(verifier)) => Some(&verifier.implementation),
+                let verifier = match &verifier {
+                    Some(Spec::Verifier(verifier)) => Some(verifier),
                     _ => None,
                 };
-                check_operator(conn, &operator, &field, implementation).await?;
+                check_operator(conn, &operator, &field, verifier).await?;
             }
         }
         Ok(())
     }
 
-    /// Check every submitted PSI or SPC Verifier against its effective baseline Data.
+    /// Check every submitted PSI or SPC drift check against its effective
+    /// baseline Data.
     ///
     /// The fitter reads the Data Card's registered Parquet artifact, so the
     /// baseline must use an interface whose artifact is Parquet — Pandas,
@@ -332,55 +330,67 @@ impl EffectiveSpecs {
         submissions: &[CardSubmission],
     ) -> Result<(), WyrdError> {
         for submission in submissions {
-            let Spec::Verifier(VerifierSpec {
-                implementation: VerifierImplementation::Drift(drift),
-                ..
-            }) = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
+            let Spec::Verifier(verifier) =
+                Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                    .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
             else {
                 continue;
             };
-            let DriftSignal::Distribution {
-                baseline_ref,
-                features,
-            } = &drift.signal
-            else {
-                continue;
-            };
-            let Some(Spec::Data(data)) = self.load(conn, Some(baseline_ref)).await? else {
-                return Err(baseline_error(
-                    "signal.baseline_ref must name a registered Data Card",
-                    json!({ "field": "signal.baseline_ref" }),
-                ));
-            };
-            let parquet = match &data.interface {
-                DataInterface::Pandas(_) | DataInterface::Polars(_) | DataInterface::Parquet(_) => {
-                    true
-                }
-                DataInterface::Arrow(meta) => meta.format == ArrowFormat::Parquet,
-                _ => false,
-            };
-            if !parquet {
-                return Err(baseline_error(
-                    format!(
-                        "baseline Data Card interface {} is not stored as Parquet",
-                        data.interface.kind()
-                    ),
-                    json!({ "field": "signal.baseline_ref", "interface": data.interface.kind(), "expected": "Parquet artifact" }),
-                ));
+            for (_, check) in verifier.drift_checks() {
+                self.validate_baseline(conn, &check.spec).await?;
             }
-            if let Some(missing) = features.iter().find(|feature| {
-                !data
-                    .schema
-                    .columns
-                    .iter()
-                    .any(|column| column.name.as_str() == feature.as_str())
-            }) {
-                return Err(baseline_error(
-                    format!("baseline Data Card has no column for feature {missing}"),
-                    json!({ "field": "signal.features", "feature": missing.as_str() }),
-                ));
-            }
+        }
+        Ok(())
+    }
+
+    /// Check one PSI or SPC drift check against its effective baseline Data.
+    ///
+    /// # Errors
+    /// Returns the refusals documented on
+    /// [`validate_baselines`](Self::validate_baselines).
+    async fn validate_baseline(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        drift: &DriftSpec,
+    ) -> Result<(), WyrdError> {
+        let DriftSignal::Distribution {
+            baseline_ref,
+            features,
+        } = &drift.signal
+        else {
+            return Ok(());
+        };
+        let Some(Spec::Data(data)) = self.load(conn, Some(baseline_ref)).await? else {
+            return Err(baseline_error(
+                "signal.baseline_ref must name a registered Data Card",
+                json!({ "field": "signal.baseline_ref" }),
+            ));
+        };
+        let parquet = match &data.interface {
+            DataInterface::Pandas(_) | DataInterface::Polars(_) | DataInterface::Parquet(_) => true,
+            DataInterface::Arrow(meta) => meta.format == ArrowFormat::Parquet,
+            _ => false,
+        };
+        if !parquet {
+            return Err(baseline_error(
+                format!(
+                    "baseline Data Card interface {} is not stored as Parquet",
+                    data.interface.kind()
+                ),
+                json!({ "field": "signal.baseline_ref", "interface": data.interface.kind(), "expected": "Parquet artifact" }),
+            ));
+        }
+        if let Some(missing) = features.iter().find(|feature| {
+            !data
+                .schema
+                .columns
+                .iter()
+                .any(|column| column.name.as_str() == feature.as_str())
+        }) {
+            return Err(baseline_error(
+                format!("baseline Data Card has no column for feature {missing}"),
+                json!({ "field": "signal.features", "feature": missing.as_str() }),
+            ));
         }
         Ok(())
     }

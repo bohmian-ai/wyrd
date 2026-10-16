@@ -17,10 +17,7 @@ use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::trigger::TriggerActivation;
-use wyrd_spec::card::verifier::{
-    OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus, VerifierImplementation,
-    VerifierSpec,
-};
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus};
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
@@ -64,7 +61,7 @@ use wyrd_sql::queries::cards::{
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
 use wyrd_sql::queries::verification::{
-    BindingActivation, FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
+    FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
 };
 use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
 use wyrd_storage::StorageError;
@@ -1234,17 +1231,16 @@ async fn persist_node(
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
     }
-    if let Spec::Verifier(VerifierSpec {
-        implementation: VerifierImplementation::Drift(drift),
-        ..
-    }) = &card.spec
-        && let DriftSignal::Distribution { baseline_ref, .. } = &drift.signal
-    {
-        let data_card_uid = pinned_uid(baseline_ref.as_card_ref())?;
-        DriftBaselineQueue::default()
-            .insert_pending(conn, &row.card_uid, &data_card_uid)
-            .await
-            .map_err(registry_db_error)?;
+    if let Spec::Verifier(verifier) = &card.spec {
+        for (requirement, check) in verifier.drift_checks() {
+            if let DriftSignal::Distribution { baseline_ref, .. } = &check.spec.signal {
+                let data_card_uid = pinned_uid(baseline_ref.as_card_ref())?;
+                DriftBaselineQueue::default()
+                    .insert_pending(conn, &row.card_uid, requirement, &data_card_uid)
+                    .await
+                    .map_err(registry_db_error)?;
+            }
+        }
     }
     Ok(outcome_row_to_response(
         &row,
@@ -1332,7 +1328,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 let Some(runs_on) = &binding.runs_on else {
                     continue;
                 };
-                let (trigger, activation) = match runs_on {
+                let (trigger, TriggerActivation::Schedule { cron, tz }) = match runs_on {
                     InlineableRef::Inline(trigger) => {
                         let body = Spec::Trigger((**trigger).clone());
                         (inline_digest(&body)?, trigger.activation.clone())
@@ -1363,14 +1359,9 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     verifier_card_uid: pinned_uid(binding.verifier.as_card_ref())?,
                     trigger,
                     operators,
-                    activation: match activation {
-                        TriggerActivation::Schedule { cron, tz } => {
-                            BindingActivation::Schedule { cron, tz }
-                        }
-                        TriggerActivation::ObservationsReady {} => {
-                            BindingActivation::ObservationsReady
-                        }
-                    },
+                    cron,
+                    tz,
+                    inputs: binding.inputs.clone(),
                 });
             }
         }
@@ -2661,13 +2652,20 @@ mod tests {
         })
     }
 
-    /// Build one Verifier submission fixture with an empty Eval implementation.
+    /// Build one Verifier submission fixture with one assertion.
     fn verifier(name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Verifier",
             "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-            "spec": { "implementation": { "kind": "eval", "spec": { "tasks": {} } } },
+            "spec": {
+                "inputs": { "x": { "type": "json" } },
+                "requirements": [{
+                    "id": "valid",
+                    "statement": "The input is true.",
+                    "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true }
+                }]
+            },
             "artifacts": []
         })
     }

@@ -1828,15 +1828,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// No Verifier run with this identity is visible to the caller's tenant.
-    #[error("[WYRD_VERIFICATION_404_RUN_NOT_FOUND] {message}")]
+    /// No Verifier execution with this identity is visible to the caller's
+    /// tenant.
+    #[error("[WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND] {message}")]
     #[wyrd_error(
-        code = "WYRD_VERIFICATION_404_RUN_NOT_FOUND",
+        code = "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
         status = 404,
-        title = "Verification run not found",
-        remediation = "Use the run_id returned by POST /v1/verification/runs in the same tenant."
+        title = "Verification execution not found",
+        remediation = "Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible."
     )]
-    VerificationRunNotFound {
+    VerificationExecutionNotFound {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3791,7 +3792,7 @@ impl WyrdError {
             | Self::SpecInvalidBindingRefKind { message, details }
             | Self::SpecDuplicateBindingOperator { message, details }
             | Self::VerificationBindingNotFound { message, details }
-            | Self::VerificationRunNotFound { message, details }
+            | Self::VerificationExecutionNotFound { message, details }
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }

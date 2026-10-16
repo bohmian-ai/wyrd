@@ -10,11 +10,13 @@
 use monty_types::memory_limit_with_headroom;
 use std::time::Duration;
 
+pub mod blocks;
 pub mod evidence;
 pub mod extract;
 pub mod registry;
 pub mod sandbox;
 pub mod tools;
+pub mod traces;
 pub mod workspace;
 
 /// The Deployment limits the hosted capabilities enforce.

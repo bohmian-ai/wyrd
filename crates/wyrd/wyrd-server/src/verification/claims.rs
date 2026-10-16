@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::queries::verifier_runs::Settlement;
+use wyrd_sql::queries::verifier_executions::Settlement;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]

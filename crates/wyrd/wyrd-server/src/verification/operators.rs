@@ -44,7 +44,7 @@ use wyrd_spec::verification::{FrozenTarget, VerificationError};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::operator_connections::find_connection;
 use wyrd_sql::queries::operator_dispatches::{ClaimedDispatch, OperatorDispatchQueue};
-use wyrd_sql::queries::verifier_runs::RetryOutcome;
+use wyrd_sql::queries::verifier_executions::RetryOutcome;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
@@ -464,13 +464,13 @@ impl LeasedWork for OperatorWorker {
     /// releases the lease; a retryable failure observed after `stop` is also
     /// released, since the process, not the dispatch, failed. The attempt
     /// runs in one `operator.dispatch` span naming the scrubbed dispatch and
-    /// failed run identities, which relates it to that run's attempt trace.
+    /// failed execution identities, which relates it to that execution's attempt trace.
     /// Delivery is bounded by its own permits, so it never reports a
     /// shared-resource refusal and always resolves to `false`.
     #[tracing::instrument(
         name = "operator.dispatch",
         skip_all,
-        fields(dispatch_id = %dispatch.lease.dispatch_id, run_id = %dispatch.run_id, attempt = dispatch.attempt)
+        fields(dispatch_id = %dispatch.lease.dispatch_id, execution_id = %dispatch.execution_id, attempt = dispatch.attempt)
     )]
     async fn process(
         self: Arc<Self>,
@@ -1056,9 +1056,9 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::AddressPolicy;
-    use wyrd_spec::card::operator::VerifierCounts;
+    use wyrd_spec::card::operator::DriftCounts;
     use wyrd_spec::ids::{
-        BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
+        BindingId, CardUid, ExecutionId, OperatorDispatchId, VerificationResultId,
     };
     use wyrd_spec::verification::VerificationVerdict;
 
@@ -1078,7 +1078,7 @@ mod tests {
     fn context() -> OperatorFailureContext {
         OperatorFailureContext {
             dispatch_id: OperatorDispatchId::new_v7(),
-            run_id: VerificationRunId::new_v7(),
+            execution_id: ExecutionId::new_v7(),
             result_id: VerificationResultId::new_v7(),
             binding_id: BindingId::new_v7(),
             verifier_card_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
@@ -1088,25 +1088,32 @@ mod tests {
             verdict: VerificationVerdict::Failed,
             completed_at: Utc::now(),
             summary: "failed".to_owned(),
-            verifier: VerifierCounts::eval(7, 10),
+            drift: Some(DriftCounts {
+                drifted_features: 3,
+                total_features: 10,
+            }),
         }
     }
 
-    /// An HTTP JSON body renders every `eval.*` count as a string value from
-    /// the frozen context, with the partial pass rate rounded down.
+    /// An HTTP JSON body renders every `drift.*` count as a string value from
+    /// the frozen context, and a context without drift counts refuses them.
+    ///
+    /// # Panics
+    /// Panics when a rendered body differs.
     #[test]
-    fn eval_counts_render_into_a_json_body() {
+    fn drift_counts_render_into_a_json_body() {
         let body = serde_json::json!({
-            "passed": "{{eval.passed_tasks}}",
-            "counts": ["{{eval.failed_tasks}}", "{{eval.total_tasks}}"],
-            "rate": "{{ eval.pass_rate_percent }}%",
+            "counts": ["{{drift.drifted_features}}", "{{ drift.total_features }}"],
         });
         assert_eq!(
-            render_json(&body, &context()).expect("eval fields render"),
-            serde_json::json!({ "passed": "7", "counts": ["3", "10"], "rate": "70%" })
+            render_json(&body, &context()).expect("drift fields render"),
+            serde_json::json!({ "counts": ["3", "10"] })
         );
-        let drift = serde_json::json!({ "n": "{{drift.total_features}}" });
-        assert!(render_json(&drift, &context()).is_err());
+        let without = OperatorFailureContext {
+            drift: None,
+            ..context()
+        };
+        assert!(render_json(&body, &without).is_err());
     }
 
     /// A path-only URL renders onto the connection origin it is given and is

@@ -141,89 +141,112 @@ Every output has a `format` field naming the extractor that produced it, and eve
 | `json` | The parsed document | `value` |
 | `text`, `markdown`, `html` | The source text, unchanged | `text` |
 
-**PDF**
+###### PDF
 
-```typescript
-{ format: "pdf"; pages: { number: number; text: string }[] }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"pdf"` | Always `pdf` |
+| `pages` | list | One entry per page, in document order |
+| `pages[].number` | integer | Page number, starting at 1 |
+| `pages[].text` | string | All text on the page. `""` when the page has no text layer, such as a scan |
 
 ```json
 {"format": "pdf", "pages": [{"number": 1, "text": "Refund policy\nRefunds are issued within 30 days."}, {"number": 2, "text": ""}]}
 ```
 
-`number` is one-based. A page with no text layer, such as a scan, has `text: ""`. An encrypted PDF fails the step.
+An encrypted PDF fails the step.
 
-**DOCX**
+###### DOCX
 
-```typescript
-{ format: "docx"; blocks: ({ kind: "paragraph"; text: string; style: string | null } | { kind: "table"; rows: string[][] })[] }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"docx"` | Always `docx` |
+| `blocks` | list | The document body, one entry per paragraph or table, in document order |
+| `blocks[].kind` | `"paragraph"` or `"table"` | Which of the two shapes below this block has |
+| `blocks[].text` | string | Paragraph only: the paragraph's text |
+| `blocks[].style` | string or `null` | Paragraph only: Word's style ID, such as `Heading1` or `ListParagraph`. `null` for an unstyled paragraph |
+| `blocks[].rows` | list of lists of strings | Table only: each row's cell text, left to right |
 
 ```json
 {"format": "docx", "blocks": [{"kind": "paragraph", "text": "Refund policy", "style": "Heading1"}, {"kind": "table", "rows": [["Window", "Days"], ["Standard", "30"]]}]}
 ```
 
-`style` is Word's stored style ID, such as `Heading1`, or `null` for an unstyled paragraph. Text inside content controls is included.
+Only the document body is read: text inside content controls is included; headers, footers, footnotes, and comments are not.
 
-**PPTX**
+###### PPTX
 
-```typescript
-{ format: "pptx"; slides: { number: number; title: string | null; paragraphs: string[]; tables: { rows: string[][] }[]; notes: string }[] }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"pptx"` | Always `pptx` |
+| `slides` | list | One entry per slide, in presentation order |
+| `slides[].number` | integer | Slide number, starting at 1 |
+| `slides[].title` | string or `null` | Text of the slide's title placeholder, with its lines joined by `\n`. `null` when the slide has none |
+| `slides[].paragraphs` | list of strings | Every non-empty paragraph in the slide's other text boxes and placeholders, in slide order. Table text is not repeated here |
+| `slides[].tables` | list | Tables on the slide |
+| `slides[].tables[].rows` | list of lists of strings | Each row's cell text, left to right |
+| `slides[].notes` | string | Speaker notes, with paragraphs joined by `\n`. `""` when there are none |
 
 ```json
 {"format": "pptx", "slides": [{"number": 1, "title": "Q3 refunds", "paragraphs": ["Refund rate fell to 2%"], "tables": [{"rows": [["Region", "Rate"], ["US", "2%"]]}], "notes": ""}]}
 ```
 
-Slides are in presentation order and `number` is one-based. `title` is `null` when the slide has no title placeholder; `notes` is `""` when it has no speaker notes.
+###### XLSX
 
-**XLSX**
-
-```typescript
-{ format: "xlsx"; sheets: { name: string; cells: { address: string; value: string | number | boolean | null; formula: string | null; error: string | null }[] }[] }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"xlsx"` | Always `xlsx` |
+| `sheets` | list | One entry per worksheet, in workbook order |
+| `sheets[].name` | string | The sheet's tab name |
+| `sheets[].cells` | list | Every non-empty cell, row by row, left to right. Empty cells are left out |
+| `sheets[].cells[].address` | string | The cell's address, such as `B2` |
+| `sheets[].cells[].value` | string, number, boolean, or `null` | The cell's value. For a formula, the result Excel last saved; Wyrd never recalculates. Dates are Excel serial numbers. `null` for an error cell |
+| `sheets[].cells[].formula` | string or `null` | The formula, such as `=SUM(B2:B9)`. `null` for a typed value |
+| `sheets[].cells[].error` | string or `null` | The error the cell shows, such as `#DIV/0!`. `null` when there is none |
 
 ```json
 {"format": "xlsx", "sheets": [{"name": "Refunds", "cells": [{"address": "A1", "value": "Days", "formula": null, "error": null}, {"address": "B2", "value": 30, "formula": "=15*2", "error": null}]}]}
 ```
 
-Cells are in row, then column, order, and empty cells are left out, so look a cell up by `address`, not by its position in `cells`. `value` is the stored value or the result Excel last saved for a formula; Wyrd never recalculates. Dates stay Excel serial numbers. An error cell has `value: null` and the error, such as `#DIV/0!`, in `error`.
+Because empty cells are left out, `cells[1]` above is `B2`, not `A2`. Look a cell up by `address`.
 
-**CSV**
+###### CSV
 
-```typescript
-{ format: "csv"; rows: string[][] }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"csv"` | Always `csv` |
+| `rows` | list of lists of strings | Every row in file order, including the header row. Every cell is a string, so `0.02` is `"0.02"`. Rows may have different lengths |
 
 ```json
 {"format": "csv", "rows": [["region", "rate"], ["US", "0.02"]]}
 ```
 
-The first row is kept as data and no types are inferred, so `"0.02"` is a string. Rows may have different lengths.
+###### JSON
 
-**JSON**
-
-```typescript
-{ format: "json"; value: any }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"json"` | Always `json` |
+| `value` | any JSON | The parsed document, unchanged |
 
 ```json
 {"format": "json", "value": {"refund_days": 30, "regions": ["US", "EU"]}}
 ```
 
-**Text, Markdown, HTML**
+###### Text, Markdown, HTML
 
-```typescript
-{ format: "text" | "markdown" | "html"; text: string }
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | `"text"`, `"markdown"`, or `"html"` | The slot format the file was sent as |
+| `text` | string | The whole file, unchanged. Markdown and HTML are not parsed, so headings and tags are still in the text |
 
 ```json
 {"format": "markdown", "text": "# Refund policy\n\nRefunds are issued within 30 days.\n"}
 ```
 
-The file must be UTF-8. Markdown and HTML are not parsed; you get the source.
+The file must be UTF-8.
 
-In every table, from DOCX or PPTX, a merged cell's text is in its top-left position and the positions it covers are `""`, so every row of a table has the same length.
+###### Tables and merged cells
+
+In DOCX and PPTX tables, a merged cell's text is in its top-left position and every position it covers is `""`, so every row of one table has the same length.
 
 ##### Use the output
 

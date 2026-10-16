@@ -184,8 +184,8 @@ async fn latest_version_resolves_to_the_registered_card() {
     deployment.shutdown().await;
 }
 
-/// Registering the unchanged graph again keeps its root and its binding
-/// identities.
+/// Registering the unchanged graph again keeps its root. The desk's only
+/// binding has no schedule Trigger, so no binding is projected either time.
 ///
 /// # Panics
 /// Panics when the second registration or a read differs.
@@ -195,29 +195,17 @@ async fn registering_the_graph_again_is_idempotent() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
-    let bindings = |card: Card| {
-        card.status
-            .and_then(|status| status.verification)
-            .expect("the desk serves verification status")
-            .binding_ids
-    };
-    let before = bindings(
-        cards
-            .get(CardSelector::exact(desk.root.clone()))
-            .await
-            .expect("desk reads"),
-    );
 
     let again = register(&cards, DESK).await;
 
     assert_eq!(again.root, desk.root);
-    let after = bindings(
-        cards
-            .get(CardSelector::exact(again.root))
-            .await
-            .expect("desk reads"),
-    );
-    assert_eq!(after, before);
+    let status = cards
+        .get(CardSelector::exact(again.root))
+        .await
+        .expect("desk reads")
+        .status
+        .expect("the desk serves status");
+    assert_eq!(status.verification, None);
     deployment.shutdown().await;
 }
 

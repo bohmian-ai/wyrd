@@ -13,7 +13,7 @@ from wyrd.prompt import PromptCard
 from wyrd.state import CardEnvelope, WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import FIXTURES, binding_ids, download, hydrated, register
+from .support import FIXTURES, download, hydrated, register
 
 pytestmark = pytest.mark.integration
 
@@ -54,12 +54,12 @@ def test_latest_version_resolves_to_the_registered_card(
 def test_registering_the_graph_again_is_idempotent(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
-    bindings = binding_ids(cards, support_desk["support-desk"])
-
     again = cards.register_from_path(FIXTURES / SUPPORT_DESK)
 
     assert again.root == support_desk["support-desk"]
-    assert binding_ids(cards, again.root) == bindings
+    status = cards.get(again.root).status
+    # The desk's only binding has no schedule Trigger, so none is projected.
+    assert status is not None and status.get("verification") is None
 
 
 def test_cards_get_returns_every_kind_as_envelope(

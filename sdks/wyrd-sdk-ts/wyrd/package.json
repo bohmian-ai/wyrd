@@ -1,6 +1,18 @@
 {
   "name": "wyrd-ai",
   "version": "0.2.0",
+  "description": "TypeScript SDK for Wyrd: verification and assurance for AI systems.",
+  "keywords": [
+    "wyrd",
+    "ai",
+    "verification",
+    "evaluation",
+    "llm",
+    "agents",
+    "observability",
+    "assurance"
+  ],
+  "homepage": "https://github.com/bohmian-ai/wyrd#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bohmian-ai/wyrd.git",

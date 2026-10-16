@@ -53,6 +53,10 @@ Dependency rules below are enforced by `check:deps`:
 - Bifrost is exposed through `wyrd_client::Bifrost` over the shared client HTTP
   and gRPC transport. Gate, Scribe, Oracle, and Forge remain server-owned and are never
   client types.
+- No current surface uses the retired abbreviated evaluation names;
+  verification vocabulary is the only vocabulary. History (`changes/`, applied
+  migrations), refusal tests proving a retired name stays unknown, and external
+  syntax are exempt.
 
 ## Service Ownership
 

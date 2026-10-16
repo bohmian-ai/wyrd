@@ -18,6 +18,10 @@ publish_no_verify = true
 # wyrd-auth) stay unpublished.
 
 [[package]]
+name = "vala-drift"
+publish = true
+
+[[package]]
 name = "vala-eval"
 publish = true
 
@@ -119,4 +123,8 @@ publish = true
 
 [[package]]
 name = "wyrd-utils"
+publish = true
+
+[[package]]
+name = "wyrd-version"
 publish = true

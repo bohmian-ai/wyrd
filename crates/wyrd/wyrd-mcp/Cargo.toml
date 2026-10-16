@@ -43,12 +43,12 @@ wyrd-testing = { workspace = true }
 # is about two real tables, not one.
 vala-bifrost-redux = { workspace = true, features = ["test-support"] }
 # Reuse native result mapping and reports when seeding retained evidence.
-vala-eval = { workspace = true }
+vala-eval = { path = "../../vala/vala-eval" }
 wyrd-sql = { workspace = true }
 arrow = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
-wyrd-spec = { workspace = true }
-wyrd-runtime = { workspace = true }
+wyrd-spec = { path = "../../wyrd-spec" }
+wyrd-runtime = { path = "../../shared/wyrd-runtime" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
@@ -58,7 +58,7 @@ jsonschema = { workspace = true }
 sqlx = { workspace = true }
 # The local judge provider the trace-continuity journey's Eval calls.
 wiremock = { workspace = true }
-wyrd-telemetry = { workspace = true, features = ["test-support"] }
+wyrd-telemetry = { path = "../../shared/wyrd-telemetry", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -6,7 +6,6 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "In-memory drift baseline fit and target scoring for PSI, SPC, and Custom methods."
 
 [lib]
@@ -28,7 +27,7 @@ wyrd-version = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 serde_json = { workspace = true }
-wyrd-semver = { workspace = true }
+wyrd-semver = { path = "../../shared/wyrd-semver" }
 arrow = { workspace = true }
 
 [lints]

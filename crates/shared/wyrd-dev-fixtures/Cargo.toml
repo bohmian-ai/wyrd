@@ -30,8 +30,8 @@ thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
 url = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true, features = ["v7"] }
-vala-sql = { path = "../../vala/vala-sql", version = "0.2.0", optional = true }
-wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.2.0", optional = true }
+vala-sql = { workspace = true, optional = true }
+wyrd-sql = { workspace = true, optional = true }
 wyrd-spec = { workspace = true, optional = true }
 
 [dev-dependencies]

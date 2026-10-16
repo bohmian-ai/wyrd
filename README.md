@@ -88,7 +88,9 @@ wyrd apply refund-letters/service.yaml
 wyrd get --kind Service --space default --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
-## Observe - Wyrd ships python, typescript and rust SDKs
+## Observe
+
+**Wyrd ships python, typescript and rust SDKs**
 
 ```python
 from wyrd import WyrdState, verify

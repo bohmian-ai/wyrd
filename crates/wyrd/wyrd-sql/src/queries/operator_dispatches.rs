@@ -1,7 +1,7 @@
 //! Operator dispatch queue: leased claims, delivery settlement, and deadlines.
 //!
-//! Settlement of a failed binding-created run inserts `wyrd.operator_dispatches`
-//! rows (see [`crate::queries::verifier_runs`]); this module is the Operator
+//! Settlement of a failed binding-created execution inserts `wyrd.operator_dispatches`
+//! rows (see [`crate::queries::verifier_executions`]); this module is the Operator
 //! worker's side. [`OperatorDispatchQueue`] owns the server delivery ceilings —
 //! attempt budget, dispatch deadline, and lease length — and every statement
 //! evaluates availability, expiry, retry eligibility, and the deadline against
@@ -20,10 +20,10 @@ use serde_json::Value;
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::ids::{CardUid, IdError, OperatorDispatchId, VerificationRunId};
+use wyrd_spec::ids::{CardUid, ExecutionId, IdError, OperatorDispatchId};
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
 
-use crate::queries::verifier_runs::{LeaseToken, RetryOutcome, Settlement, settlement};
+use crate::queries::verifier_executions::{LeaseToken, RetryOutcome, Settlement, settlement};
 use crate::{OperatorPool, TenantConn};
 
 /// Fail every dispatch that can no longer be attempted.
@@ -70,10 +70,10 @@ const CLAIM_SQL: &str = r"
        SET status = 'running', attempts = d.attempts + 1, lease_token = $1,
            lease_expires_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
            next_attempt_at = NULL, updated_at = statement_timestamp()
-      FROM candidate, wyrd.verifier_runs r
+      FROM candidate, wyrd.verifier_executions e
      WHERE d.dispatch_id = candidate.dispatch_id
-       AND r.run_id = d.run_id
-    RETURNING d.dispatch_id, d.run_id, r.owner_card_uid, d.operator_uid,
+       AND e.execution_id = d.execution_id
+    RETURNING d.dispatch_id, d.execution_id, e.owner_card_uid, d.operator_uid,
               d.operator_digest, d.failure_context, d.attempts,
               GREATEST(0, floor(extract(epoch FROM
                   d.created_at + ($4::bigint * INTERVAL '1 millisecond') - statement_timestamp()
@@ -175,8 +175,8 @@ pub struct DispatchLease {
 pub struct ClaimedDispatch {
     /// Settlement identity.
     pub lease: DispatchLease,
-    /// The failed run.
-    pub run_id: VerificationRunId,
+    /// The failed execution.
+    pub execution_id: ExecutionId,
     /// Owner Card whose binding configured the Operator.
     pub owner_card_uid: Option<CardUid>,
     /// The frozen Operator identity.
@@ -349,8 +349,8 @@ fn millis(duration: Duration) -> i64 {
 struct ClaimRow {
     /// Dispatch identity.
     dispatch_id: Uuid,
-    /// Run identity.
-    run_id: Uuid,
+    /// Execution identity.
+    execution_id: Uuid,
     /// Owner Card.
     owner_card_uid: Option<Uuid>,
     /// Operator Card UID.
@@ -386,7 +386,7 @@ impl ClaimRow {
                 dispatch_id: OperatorDispatchId::new(self.dispatch_id).map_err(decode)?,
                 token,
             },
-            run_id: VerificationRunId::new(self.run_id).map_err(decode)?,
+            execution_id: ExecutionId::new(self.execution_id).map_err(decode)?,
             owner_card_uid: self
                 .owner_card_uid
                 .map(CardUid::from_uuid)

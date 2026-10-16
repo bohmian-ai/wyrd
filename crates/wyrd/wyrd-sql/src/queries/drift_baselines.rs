@@ -1,7 +1,7 @@
 //! Fitted Drift baseline work and status: registration, claims, settlement.
 //!
-//! `wyrd.drift_baselines` holds one row per PSI or SPC Drift Verifier Card
-//! version. It is both the fitter's durable work record and the status the
+//! `wyrd.drift_baselines` holds one row per PSI or SPC drift check of a
+//! Verifier Card version, keyed by the check's requirement ID. It is both the fitter's durable work record and the status the
 //! Verifier Card read serves. [`DriftBaselineQueue`] owns the retry policy
 //! every transition applies; each tenant operation runs on the caller's
 //! [`TenantConn`] under forced RLS without committing, so registration inserts
@@ -24,19 +24,20 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::eval::ids::TaskId;
 use wyrd_spec::verification::VerificationError;
 
-use crate::queries::verifier_runs::{
-    LeaseToken, RetryOutcome, RunRetryPolicy, Settlement, settlement, stored,
+use crate::queries::verifier_executions::{
+    LeaseToken, RetryOutcome, RetryPolicy, Settlement, settlement, stored,
 };
 use crate::{OperatorPool, TenantConn};
 
 /// Insert a registration's pending baseline, due at PostgreSQL's statement time.
 const INSERT_PENDING_SQL: &str = r"
     INSERT INTO wyrd.drift_baselines (
-        data_tenant_id, verifier_uid, data_card_uid, max_attempts,
+        data_tenant_id, verifier_uid, requirement_id, data_card_uid, max_attempts,
         next_attempt_at, created_at, updated_at
-    ) VALUES (wyrd.current_tenant(), $1, $2, $3,
+    ) VALUES (wyrd.current_tenant(), $1, $4, $2, $3,
               statement_timestamp(), statement_timestamp(), statement_timestamp())
     ON CONFLICT DO NOTHING
 ";
@@ -57,11 +58,11 @@ const EXHAUST_EXPIRED_SQL: &str = r"
 /// the new deadline are PostgreSQL's statement time.
 const CLAIM_SQL: &str = r"
     WITH candidate AS (
-        SELECT verifier_uid
+        SELECT verifier_uid, requirement_id
           FROM wyrd.drift_baselines
          WHERE (state IN ('pending', 'failed') AND next_attempt_at <= statement_timestamp())
             OR (state = 'building' AND lease_expires_at <= statement_timestamp())
-         ORDER BY COALESCE(next_attempt_at, lease_expires_at), verifier_uid
+         ORDER BY COALESCE(next_attempt_at, lease_expires_at), verifier_uid, requirement_id
          LIMIT 1
            FOR UPDATE SKIP LOCKED
     )
@@ -71,7 +72,8 @@ const CLAIM_SQL: &str = r"
            next_attempt_at = NULL, error = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE b.verifier_uid = candidate.verifier_uid
-    RETURNING b.verifier_uid, b.data_card_uid, b.attempts, b.max_attempts
+       AND b.requirement_id = candidate.requirement_id
+    RETURNING b.verifier_uid, b.requirement_id, b.data_card_uid, b.attempts, b.max_attempts
 ";
 
 /// Settle a leased fit `ready` with its fitted profile.
@@ -79,7 +81,8 @@ const COMPLETE_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'ready', fitted = $3, error = NULL, lease_expires_at = NULL,
            updated_at = statement_timestamp()
-     WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
+     WHERE verifier_uid = $1 AND requirement_id = $4 AND lease_token = $2
+       AND state = 'building'
 ";
 
 /// Settle a leased fit `failed`; `$4` is the retry delay in milliseconds, or
@@ -89,7 +92,8 @@ const FAIL_SQL: &str = r"
        SET state = 'failed', error = $3, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp() + ($4::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
-     WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
+     WHERE verifier_uid = $1 AND requirement_id = $5 AND lease_token = $2
+       AND state = 'building'
     RETURNING next_attempt_at
 ";
 
@@ -97,7 +101,8 @@ const FAIL_SQL: &str = r"
 const LEASED_ATTEMPTS_SQL: &str = r"
     SELECT attempts, max_attempts
       FROM wyrd.drift_baselines
-     WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
+     WHERE verifier_uid = $1 AND requirement_id = $3 AND lease_token = $2
+       AND state = 'building'
        FOR UPDATE
 ";
 
@@ -106,23 +111,28 @@ const RELEASE_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'pending', attempts = attempts - 1, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp(), updated_at = statement_timestamp()
-     WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
+     WHERE verifier_uid = $1 AND requirement_id = $3 AND lease_token = $2
+       AND state = 'building'
 ";
 
-/// Read one Verifier's baseline status with its exact Data Card identity.
+/// Read the least-ready of one Verifier's baselines with its exact Data Card
+/// identity: a failed fit first, then one still being fitted, then a ready one.
 const STATUS_SQL: &str = r"
     SELECT b.state, b.error,
            jsonb_build_object('kind', d.kind, 'space', d.space, 'name', d.name,
                               'version', d.version, 'uid', d.card_uid) AS data
       FROM wyrd.drift_baselines b
       JOIN wyrd.cards d ON d.card_uid = b.data_card_uid
-     WHERE b.verifier_uid = $1
+     WHERE b.verifier_uid = $1 AND b.requirement_id IS NOT NULL
+     ORDER BY CASE b.state WHEN 'failed' THEN 0 WHEN 'ready' THEN 2 ELSE 1 END,
+              b.requirement_id
+     LIMIT 1
 ";
 
-/// Read one Verifier's fitted profile when it is ready.
+/// Read one drift check's fitted profile when it is ready.
 const FITTED_SQL: &str = r"
     SELECT fitted FROM wyrd.drift_baselines
-     WHERE verifier_uid = $1 AND state = 'ready'
+     WHERE verifier_uid = $1 AND requirement_id = $2 AND state = 'ready'
 ";
 
 /// List tenants with claimable fits, longest-waiting tenant first.
@@ -141,6 +151,8 @@ const DUE_TENANTS_SQL: &str = r"
 pub struct BaselineLease {
     /// The Verifier Card version whose baseline is being fitted.
     pub verifier_uid: CardUid,
+    /// The drift check's requirement the baseline is fitted for.
+    pub requirement_id: TaskId,
     /// This claim's fencing token.
     pub token: LeaseToken,
 }
@@ -165,17 +177,19 @@ pub struct ClaimedBaseline {
 /// never commits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DriftBaselineQueue {
-    /// Fit-failure retry policy; the same bounded doubling the run queue uses.
-    retry: RunRetryPolicy,
+    /// Fit-failure retry policy; the same bounded doubling the execution queue uses.
+    retry: RetryPolicy,
 }
 
 impl DriftBaselineQueue {
-    /// Insert the pending baseline of a newly registered PSI or SPC Verifier.
+    /// Insert the pending baseline of one PSI or SPC drift check of a newly
+    /// registered Verifier.
     ///
-    /// Pins the exact Verifier and baseline Data Card versions and makes the
-    /// row due at PostgreSQL's statement time. Runs in the registration
-    /// transaction; an existing row for the same Verifier is kept, since the
-    /// Verifier Card version and its baseline reference are immutable.
+    /// Pins the exact Verifier version, the check's `requirement_id`, and the
+    /// baseline Data Card version, and makes the row due at PostgreSQL's
+    /// statement time. Runs in the registration transaction; an existing row
+    /// for the same Verifier and requirement is kept, since the Verifier Card
+    /// version and its baseline reference are immutable.
     ///
     /// # Errors
     /// Returns the database error when the insert fails, including a foreign
@@ -185,12 +199,14 @@ impl DriftBaselineQueue {
         &self,
         conn: &mut TenantConn<'_>,
         verifier_uid: &CardUid,
+        requirement_id: &TaskId,
         data_card_uid: &CardUid,
     ) -> Result<(), SqlxError> {
         sqlx::query(INSERT_PENDING_SQL)
             .bind(verifier_uid.as_uuid())
             .bind(data_card_uid.as_uuid())
             .bind(self.retry.max_attempts)
+            .bind(requirement_id.as_str())
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -223,15 +239,16 @@ impl DriftBaselineQueue {
             .execute(&mut **conn.transaction())
             .await?;
         let token = Uuid::now_v7();
-        let row: Option<(Uuid, Uuid, i32, i32)> = sqlx::query_as(CLAIM_SQL)
+        let row: Option<(Uuid, String, Uuid, i32, i32)> = sqlx::query_as(CLAIM_SQL)
             .bind(token)
             .bind(lease_for.num_milliseconds())
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        row.map(|(verifier, data, attempt, max_attempts)| {
+        row.map(|(verifier, requirement, data, attempt, max_attempts)| {
             Ok(ClaimedBaseline {
                 lease: BaselineLease {
                     verifier_uid: stored(CardUid::from_uuid(verifier))?,
+                    requirement_id: stored(TaskId::new(requirement))?,
                     token: LeaseToken(token),
                 },
                 data_card_uid: stored(CardUid::from_uuid(data))?,
@@ -260,6 +277,7 @@ impl DriftBaselineQueue {
             .bind(lease.verifier_uid.as_uuid())
             .bind(lease.token.0)
             .bind(Json(fitted))
+            .bind(lease.requirement_id.as_str())
             .execute(&mut **conn.transaction())
             .await?;
         Ok(settlement(result.rows_affected()))
@@ -284,6 +302,7 @@ impl DriftBaselineQueue {
         let budget: Option<(i32, i32)> = sqlx::query_as(LEASED_ATTEMPTS_SQL)
             .bind(lease.verifier_uid.as_uuid())
             .bind(lease.token.0)
+            .bind(lease.requirement_id.as_str())
             .fetch_optional(&mut **conn.transaction())
             .await?;
         let Some((attempts, max_attempts)) = budget else {
@@ -296,6 +315,7 @@ impl DriftBaselineQueue {
             .bind(lease.token.0)
             .bind(Json(error))
             .bind(delay)
+            .bind(lease.requirement_id.as_str())
             .fetch_one(&mut **conn.transaction())
             .await?;
         Ok(next_attempt_at.map_or(RetryOutcome::Exhausted, RetryOutcome::Scheduled))
@@ -317,6 +337,7 @@ impl DriftBaselineQueue {
         let result = sqlx::query(RELEASE_SQL)
             .bind(lease.verifier_uid.as_uuid())
             .bind(lease.token.0)
+            .bind(lease.requirement_id.as_str())
             .execute(&mut **conn.transaction())
             .await?;
         Ok(settlement(result.rows_affected()))
@@ -325,8 +346,10 @@ impl DriftBaselineQueue {
     /// Read one Verifier's baseline status for the Card read.
     ///
     /// Returns the state, the exact UID-pinned baseline Data Card, and the
-    /// last failure's structured error. A Verifier without a baseline row
-    /// (Custom Drift, Eval, or any other Card) is `Ok(None)`.
+    /// last failure's structured error of its least-ready drift check: a
+    /// failed fit before one still pending or building, and either before a
+    /// ready one, so `ready` means every fitted check is ready. A Verifier
+    /// without a baseline row (no PSI or SPC drift check) is `Ok(None)`.
     ///
     /// # Errors
     /// Returns the database error when the read fails, or a decode error when
@@ -354,7 +377,7 @@ impl DriftBaselineQueue {
         .transpose()
     }
 
-    /// Read one Verifier's fitted profile, or `None` until it is ready.
+    /// Read one drift check's fitted profile, or `None` until it is ready.
     ///
     /// # Errors
     /// Returns the database error when the read fails.
@@ -362,9 +385,11 @@ impl DriftBaselineQueue {
         &self,
         conn: &mut TenantConn<'_>,
         verifier_uid: &CardUid,
+        requirement_id: &TaskId,
     ) -> Result<Option<Value>, SqlxError> {
         let fitted: Option<Json<Value>> = sqlx::query_scalar(FITTED_SQL)
             .bind(verifier_uid.as_uuid())
+            .bind(requirement_id.as_str())
             .fetch_optional(&mut **conn.transaction())
             .await?;
         Ok(fitted.map(|Json(fitted)| fitted))

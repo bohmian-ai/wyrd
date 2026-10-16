@@ -11,6 +11,7 @@
 //! transaction under forced RLS and never commits.
 // raw-query grep allowlist: verification tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -19,8 +20,9 @@ use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_spec::card::verifier::ScheduledInput;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{BindingId, CardUid};
+use wyrd_spec::ids::{BindingId, CardUid, SlotName};
 use wyrd_spec::verification::DriftWindow;
 /// The frozen Trigger/Operator identity is the wire contract's own type, so
 /// stored JSON, dispatch rows, and Run GET share one shape.
@@ -41,8 +43,8 @@ const PROJECT_BINDING_SQL: &str = r"
         binding_id, data_tenant_id, owner_card_uid, owner_card_kind,
         subject_occurrence_key, card_uid, verifier_card_uid,
         trigger_uid, trigger_digest, operators, activation,
-        schedule_cron, schedule_tz
-    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        schedule_cron, schedule_tz, inputs
+    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, 'schedule', $10, $11, $12)
     ON CONFLICT ON CONSTRAINT verification_bindings_natural_key
     DO UPDATE SET binding_id = wyrd.verification_bindings.binding_id
     RETURNING binding_id
@@ -277,20 +279,6 @@ pub struct ScheduledOccurrence {
     pub next_run_at: DateTime<Utc>,
 }
 
-/// The effective activation frozen on a binding row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindingActivation {
-    /// A cron schedule; its cursor stays null until the owner activates.
-    Schedule {
-        /// Authored cron expression, already validated by [`BindingSchedule`].
-        cron: String,
-        /// Authored IANA timezone; absent means UTC.
-        tz: Option<String>,
-    },
-    /// Each committed observation for the subject; no cursor.
-    ObservationsReady,
-}
-
 /// One effective binding of an owner Card version, ready to project.
 #[derive(Debug, Clone)]
 pub struct NewBinding {
@@ -307,8 +295,14 @@ pub struct NewBinding {
     pub trigger: FrozenTarget,
     /// Effective `on_failure` Operators in authored order.
     pub operators: Vec<FrozenTarget>,
-    /// Effective activation.
-    pub activation: BindingActivation,
+    /// Authored cron expression of the effective schedule, already validated
+    /// by [`BindingSchedule`]; its cursor stays null until the owner activates.
+    pub cron: String,
+    /// Authored IANA timezone of the schedule; absent means UTC.
+    pub tz: Option<String>,
+    /// Recorded measurements filling each samples slot of the Verifier for
+    /// every scheduled window.
+    pub inputs: BTreeMap<SlotName, ScheduledInput>,
 }
 
 /// Project an owner Card version's effective bindings.
@@ -337,12 +331,6 @@ pub async fn project_bindings(
             FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
             FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
         };
-        let (activation, cron, tz) = match &binding.activation {
-            BindingActivation::Schedule { cron, tz } => {
-                ("schedule", Some(cron.as_str()), tz.as_deref())
-            }
-            BindingActivation::ObservationsReady => ("observations_ready", None, None),
-        };
         let id: Uuid = sqlx::query_scalar(PROJECT_BINDING_SQL)
             .bind(BindingId::new_v7().as_uuid())
             .bind(owner_card_uid.as_uuid())
@@ -353,9 +341,9 @@ pub async fn project_bindings(
             .bind(trigger_uid)
             .bind(trigger_digest)
             .bind(Json(&binding.operators))
-            .bind(activation)
-            .bind(cron)
-            .bind(tz)
+            .bind(binding.cron.as_str())
+            .bind(binding.tz.as_deref())
+            .bind(Json(&binding.inputs))
             .fetch_one(&mut **conn.transaction())
             .await?;
         ids.push(stored_binding_id(id)?);
@@ -475,7 +463,7 @@ pub struct BindingActivity {
     pub principal_id: Option<PrincipalId>,
     /// Last qualifying machine exchange, absent before the first.
     pub last_authenticated_at: Option<DateTime<Utc>>,
-    /// Schedule cursor; absent before arming and for `observations_ready`.
+    /// Schedule cursor; absent before arming.
     pub next_run_at: Option<DateTime<Utc>>,
     /// Whether new binding-created work may be admitted at database time.
     pub active: bool,

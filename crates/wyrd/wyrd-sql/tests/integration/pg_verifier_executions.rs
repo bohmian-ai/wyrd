@@ -1,4 +1,5 @@
-//! PgFixture coverage for the durable Verifier run queue: shared enqueue,
+//! PgFixture coverage for the durable Verifier execution queue: batched
+//! submission acceptance with keyed replay and conflict, scheduled enqueue,
 //! scheduler claims, leased execution, token-fenced settlement, Operator
 //! dispatch creation, status reads, and tenant isolation.
 //!
@@ -6,23 +7,29 @@
 //! connections, so forced RLS applies. Each fixture owns its own database, so
 //! cross-tenant counts are exact.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
 use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, OperatorFailureContext, VerifierCounts};
-use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
+use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::ids::{
+    BindingId, CardUid, ExecutionId, FeatureName, SlotName, VerificationResultId,
+};
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
     DriftWindow, OperatorDispatchStatus, VerificationError, VerificationExecutionStatus,
-    VerificationRunTarget, VerificationVerdict, VerifierReadiness,
+    VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::provision_system_principal;
@@ -32,18 +39,18 @@ use wyrd_sql::queries::cards::{
 };
 use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
-    BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
+    FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
-use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
-    QueueCounts, RequestKey, RetryOutcome, RunAuthority, RunInput, RunOrigin, RunRequest,
-    ScheduleOutcome, ScheduleSkip, ScheduleTick, Settlement, TargetCards, TerminalStatus,
-    TraceWaitOutcome, VerifierRunQueue,
+use wyrd_sql::queries::verifier_executions::{
+    ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
+    ExecutionOrigin, ExecutionStatus, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
+    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus, TraceWaitOutcome,
+    VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// Counts every test completion freezes, matching a one-of-three drift report.
-const DRIFT_COUNTS: VerifierCounts = VerifierCounts::Drift {
+const DRIFT_COUNTS: DriftCounts = DriftCounts {
     drifted_features: 1,
     total_features: 3,
 };
@@ -66,7 +73,7 @@ fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
         .expect("valid instant")
 }
 
-/// The fixed manual Drift window every manual test run analyzes.
+/// The fixed window of a binding's first scheduled execution in these tests.
 fn window() -> DriftWindow {
     DriftWindow {
         start: at(1, 0, 0),
@@ -74,8 +81,8 @@ fn window() -> DriftWindow {
     }
 }
 
-/// A registering user principal in `tenant`, which also serves as a manual
-/// run requester.
+/// A registering user principal in `tenant`, which also serves as a
+/// submitting caller.
 ///
 /// The principal carries no permissions; persistence-level queries do not
 /// authorize.
@@ -89,19 +96,30 @@ fn actor(tenant: DataTenantId) -> Principal {
     )
 }
 
-/// A ready Custom Drift Verifier implementation.
+/// A stored building-block Verifier spec with one drift check by `method`.
+fn drift(method: &str) -> Value {
+    json!({
+        "requirements": [{
+            "id": "latency_drift",
+            "statement": "latency keeps its baseline distribution",
+            "check": { "kind": "drift", "method": method, "on": { "input": "current" } }
+        }]
+    })
+}
+
+/// A ready Verifier whose one drift check needs no fitted baseline.
 fn custom_drift() -> Value {
-    serde_json::json!({ "implementation": { "kind": "drift", "spec": { "method": "Custom" } } })
+    drift("Custom")
 }
 
-/// A PSI Drift Verifier implementation, never ready until a baseline exists.
+/// A PSI Verifier, never ready until its baseline is fitted.
 fn psi_drift() -> Value {
-    serde_json::json!({ "implementation": { "kind": "drift", "spec": { "method": "Psi" } } })
+    drift("Psi")
 }
 
-/// A ready Eval Verifier implementation.
-fn eval() -> Value {
-    serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } })
+/// A Verifier stored under the retired implementation contract.
+fn retired() -> Value {
+    json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } })
 }
 
 /// Insert one Card row named `name` and return its UID.
@@ -147,7 +165,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
 /// # Panics
 /// Panics when the fixture JSON no longer deserializes as a [`Card`].
 fn service_card(name: &str) -> Card {
-    serde_json::from_value(serde_json::json!({
+    serde_json::from_value(json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
         "metadata": { "name": name, "version": "1.0.0", "space": "default" },
@@ -209,7 +227,19 @@ async fn register_verifier(
     card_uid
 }
 
-/// Project one owner-level binding of `verifier` on `owner` with `operators`.
+/// The scheduled samples selector every test binding stores.
+///
+/// # Panics
+/// Never in practice: the literals match the slot and feature grammars.
+fn scheduled_inputs() -> BTreeMap<SlotName, ScheduledInput> {
+    BTreeMap::from([(
+        SlotName::new("current").expect("valid slot name"),
+        ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),
+    )])
+}
+
+/// Project one owner-level daily-at-02:00-UTC binding of `verifier` on
+/// `owner` with `operators`.
 ///
 /// # Panics
 /// Panics when the projection fails.
@@ -217,7 +247,6 @@ async fn bind(
     conn: &mut TenantConn<'_>,
     owner: &CardUid,
     verifier: &CardUid,
-    activation: BindingActivation,
     operators: Vec<FrozenTarget>,
 ) -> BindingId {
     project_bindings(
@@ -230,19 +259,13 @@ async fn bind(
             verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators,
-            activation,
+            cron: "0 2 * * *".to_owned(),
+            tz: None,
+            inputs: scheduled_inputs(),
         }],
     )
     .await
     .expect("binding projects")[0]
-}
-
-/// Daily-at-02:00-UTC activation.
-fn daily() -> BindingActivation {
-    BindingActivation::Schedule {
-        cron: "0 2 * * *".to_owned(),
-        tz: None,
-    }
 }
 
 /// Overwrite one binding's schedule cursor.
@@ -286,8 +309,8 @@ async fn database_now(conn: &mut TenantConn<'_>) -> DateTime<Utc> {
         .expect("database clock reads")
 }
 
-/// Bring `run`'s lease and retry deadlines due by moving whichever of them is
-/// set to the database's current instant.
+/// Bring `execution`'s lease and retry deadlines due by moving whichever of
+/// them is set to the database's current instant.
 ///
 /// This is how a test reaches an expired lease or an elapsed backoff without a
 /// process clock to advance: the row under test is placed in the past and
@@ -295,34 +318,34 @@ async fn database_now(conn: &mut TenantConn<'_>) -> DateTime<Utc> {
 ///
 /// # Panics
 /// Panics when the update fails.
-async fn expire_deadlines(conn: &mut TenantConn<'_>, run: VerificationRunId) {
+async fn expire_deadlines(conn: &mut TenantConn<'_>, execution: ExecutionId) {
     sqlx::query(
-        "UPDATE wyrd.verifier_runs
+        "UPDATE wyrd.verifier_executions
             SET lease_expires_at = CASE WHEN lease_expires_at IS NULL
                                         THEN NULL ELSE statement_timestamp() END,
                 next_attempt_at = CASE WHEN next_attempt_at IS NULL
                                        THEN NULL ELSE statement_timestamp() END
-          WHERE run_id = $1",
+          WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .expect("deadlines expire");
 }
 
-/// Read the backoff the queue stored for `run`: the gap between the retry's
-/// own write instant and the attempt deadline it scheduled.
+/// Read the backoff the queue stored for `execution`: the gap between the
+/// retry's own write instant and the attempt deadline it scheduled.
 ///
 /// Both timestamps come from the same `statement_timestamp()`, so the gap is
 /// exactly the configured backoff regardless of when the test reads it.
 ///
 /// # Panics
-/// Panics when the run row cannot be read or is not awaiting a retry.
-async fn stored_backoff(conn: &mut TenantConn<'_>, run: VerificationRunId) -> Duration {
+/// Panics when the row cannot be read or is not awaiting a retry.
+async fn stored_backoff(conn: &mut TenantConn<'_>, execution: ExecutionId) -> Duration {
     let (attempt_at, updated_at): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
-        "SELECT next_attempt_at, updated_at FROM wyrd.verifier_runs WHERE run_id = $1",
+        "SELECT next_attempt_at, updated_at FROM wyrd.verifier_executions WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("retry deadline reads");
@@ -372,26 +395,15 @@ fn assert_next_daily_boundary(cursor: Option<DateTime<Utc>>, after: DateTime<Utc
     );
 }
 
-/// Count the tenant's runs.
+/// Count the tenant's executions.
 ///
 /// # Panics
 /// Panics when the count cannot be read.
-async fn run_count(conn: &mut TenantConn<'_>) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_runs")
+async fn execution_count(conn: &mut TenantConn<'_>) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_executions")
         .fetch_one(&mut **conn.transaction())
         .await
-        .expect("runs count")
-}
-
-/// Unwrap a newly created run.
-///
-/// # Panics
-/// Panics when `outcome` is not [`EnqueueOutcome::Enqueued`].
-fn enqueued(outcome: EnqueueOutcome) -> VerificationRunId {
-    match outcome {
-        EnqueueOutcome::Enqueued(run_id) => run_id,
-        other => panic!("expected a new run, got {other:?}"),
-    }
+        .expect("executions count")
 }
 
 /// The direct accepted authority of `principal`, with no delegation chain.
@@ -421,14 +433,48 @@ fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuth
 ///
 /// # Panics
 /// Panics when SYSTEM cannot be provisioned.
-async fn background(conn: &mut TenantConn<'_>, owner: PrincipalId) -> RunAuthority {
+async fn background(conn: &mut TenantConn<'_>, owner: PrincipalId) -> ExecutionAuthority {
     let system = provision_system_principal(conn, Attribution::unresolved())
         .await
         .expect("system principal provisions");
-    RunAuthority::background(
+    ExecutionAuthority::background(
         owner_authority(conn.data_tenant_id(), owner),
         PrincipalId::new(system),
     )
+}
+
+/// Enqueue the next scheduled occurrence of `binding` and return its execution.
+///
+/// The n-th execution of a binding analyzes the n-th consecutive day starting
+/// at [`window`], so repeated calls create distinct occurrences.
+///
+/// # Panics
+/// Panics when the enqueue fails or does not create a new execution.
+async fn scheduled(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    binding: BindingId,
+) -> ExecutionId {
+    let earlier: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_executions WHERE binding_id = $1")
+            .bind(binding.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("earlier executions count");
+    let offset = Duration::days(earlier);
+    let occurrence = DriftWindow {
+        start: window().start + offset,
+        end: window().end + offset,
+    };
+    let authority = background(conn, PrincipalId::new(Uuid::now_v7())).await;
+    match queue
+        .enqueue_scheduled(conn, binding, occurrence, &authority)
+        .await
+        .expect("scheduled execution enqueues")
+    {
+        EnqueueOutcome::Enqueued(execution_id) => execution_id,
+        other => panic!("expected a new execution, got {other:?}"),
+    }
 }
 
 /// Claim and settle the next due binding the way the server scheduler does:
@@ -437,7 +483,7 @@ async fn background(conn: &mut TenantConn<'_>, owner: PrincipalId) -> RunAuthori
 /// # Panics
 /// Panics when the claim, SYSTEM provisioning, or settlement fails.
 async fn schedule_next_due(
-    queue: &VerifierRunQueue,
+    queue: &VerifierExecutionQueue,
     conn: &mut TenantConn<'_>,
 ) -> Option<ScheduleTick> {
     let due = queue.claim_due(conn).await.expect("due binding claims")?;
@@ -453,42 +499,83 @@ async fn schedule_next_due(
     )
 }
 
-/// Enqueue observation runs the way the server observation path does: lock
-/// the matching bindings, resolve each owner's authority with the tenant
-/// SYSTEM actor, then insert. Returns the number of runs inserted.
-///
-/// # Panics
-/// Panics when the lock, SYSTEM provisioning, or insert fails.
-async fn enqueue_observation_batch(
-    queue: &VerifierRunQueue,
-    conn: &mut TenantConn<'_>,
-    records: &[ObservationRecord],
-) -> u64 {
-    let locked = queue
-        .lock_observation_bindings(conn, records)
-        .await
-        .expect("observation bindings lock");
-    let mut bindings = Vec::with_capacity(locked.len());
-    for binding in locked {
-        if let Some(owner) = binding.owner {
-            let authority = background(conn, owner).await;
-            bindings.push((binding, authority));
-        }
+/// A request to run `verifier` on `subject` with one inline JSON input.
+fn request(verifier: &CardUid, subject: &CardUid) -> VerificationRequest {
+    VerificationRequest {
+        verifier_card_uid: verifier.clone(),
+        card_uid: subject.clone(),
+        run_id: None,
+        inputs: BTreeMap::from([(
+            SlotName::new("answer").expect("valid slot name"),
+            InputDeclaration::Json {
+                value: json!({ "text": "42" }),
+            },
+        )]),
+        execution_route_overrides: BTreeMap::new(),
     }
-    queue
-        .enqueue_observation_runs(conn, records, &bindings)
-        .await
-        .expect("observation runs enqueue")
 }
 
-/// Manual request for a binding by `requester`.
-fn manual_binding(requester: &Principal, binding_id: BindingId) -> RunRequest {
-    RunRequest::Manual {
-        authority: RunAuthority::manual(authority(requester)),
-        target: VerificationRunTarget::Binding { binding_id },
-        window: window(),
-        cause: None,
-    }
+/// Stage `request` by `authority` as the submit path does, under `key`.
+///
+/// # Panics
+/// Panics when the request cannot be canonicalized.
+fn submission(
+    tenant: DataTenantId,
+    authority: AcceptedAuthority,
+    request: VerificationRequest,
+    key: Option<&str>,
+) -> Submission {
+    Submission::new(tenant, authority, request, None, key.map(str::to_owned))
+        .expect("request canonicalizes")
+}
+
+/// Accept one submission as its own batch and return the writer's decision.
+///
+/// # Panics
+/// Panics when the batch fails or returns other than one outcome.
+async fn accept(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    submission: &Submission,
+) -> SubmissionOutcome {
+    let outcomes = queue
+        .accept_submissions(conn, std::slice::from_ref(submission))
+        .await
+        .expect("submission batch accepts");
+    assert_eq!(outcomes.len(), 1, "one outcome per submission");
+    outcomes[0]
+}
+
+/// Accept one valid submission and return its execution.
+///
+/// # Panics
+/// Panics when the submission is not accepted.
+async fn submitted(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    submission: &Submission,
+) -> ExecutionId {
+    assert_eq!(
+        accept(queue, conn, submission).await,
+        SubmissionOutcome::Accepted
+    );
+    submission.execution_id
+}
+
+/// Read one execution's status, which must exist.
+///
+/// # Panics
+/// Panics when the read fails or the execution is not visible.
+async fn status(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+) -> ExecutionStatus {
+    queue
+        .execution_status(conn, execution)
+        .await
+        .expect("status reads")
+        .expect("execution exists")
 }
 
 /// A retryable engine error.
@@ -499,29 +586,31 @@ fn engine_error() -> VerificationError {
     }
 }
 
-/// Claim the next runnable run, which must exist.
+/// Claim the next runnable execution, which must exist.
 ///
 /// # Panics
 /// Panics when the claim fails or nothing is runnable.
-async fn claim(queue: &VerifierRunQueue, conn: &mut TenantConn<'_>) -> ClaimedRun {
+async fn claim(queue: &VerifierExecutionQueue, conn: &mut TenantConn<'_>) -> ClaimedExecution {
     queue
         .claim(conn, Duration::minutes(5))
         .await
         .expect("claim runs")
-        .expect("a run is runnable")
+        .expect("an execution is runnable")
 }
 
-/// A binding run freezes the owner, binding, Trigger, Operators, window, and
-/// requester; a direct run freezes only the Verifier, subject, window, and
-/// requester. Both claims expose exactly those identities.
+/// A scheduled execution freezes the owner, binding, Trigger, Operators,
+/// window, and the binding's samples selectors; a submission freezes only the
+/// Verifier, subject, optional Run, inputs, route overrides, and the caller's
+/// authority. Both claims expose exactly those identities.
 ///
 /// # Panics
-/// Panics when a run is refused or any frozen identity differs.
+/// Panics when an execution is refused or any frozen identity differs.
 #[tokio::test]
-async fn manual_enqueue_freezes_binding_and_direct_identities() {
+async fn scheduled_and_submitted_executions_freeze_their_inputs() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -529,46 +618,23 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let operator = FrozenTarget::Uid(uid());
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        daily(),
-        vec![operator.clone()],
-    )
-    .await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![operator.clone()]).await;
 
-    let bound = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("binding run enqueues"),
-    );
-    let direct_request = RunRequest::Manual {
-        authority: RunAuthority::manual(authority(&actor)),
-        target: VerificationRunTarget::Verifier {
-            verifier_card_uid: verifier.clone(),
-            card_uid: owner.clone(),
-        },
-        window: window(),
-        cause: None,
-    };
-    let direct = enqueued(
-        queue
-            .enqueue(&mut conn, &direct_request)
-            .await
-            .expect("direct run enqueues"),
-    );
+    let bound = scheduled(&queue, &mut conn, binding).await;
+    let mut direct_request = request(&verifier, &owner);
+    direct_request.run_id = Some(RunId::from_string("app-run-1".to_owned()));
+    let direct_submission = submission(tenant, authority(&actor), direct_request.clone(), None);
+    let direct = submitted(&queue, &mut conn, &direct_submission).await;
     assert_ne!(bound, direct);
 
     let first = claim(&queue, &mut conn).await;
     let second = claim(&queue, &mut conn).await;
-    let (bound_claim, direct_claim) = if first.lease.run_id == bound {
+    let (bound_claim, direct_claim) = if first.lease.execution_id == bound {
         (first, second)
     } else {
         (second, first)
     };
-    assert_eq!(bound_claim.origin, RunOrigin::Manual);
+    assert_eq!(bound_claim.origin, ExecutionOrigin::Schedule);
     assert_eq!(bound_claim.binding_id, Some(binding));
     assert_eq!(bound_claim.owner_card_uid, Some(owner.clone()));
     assert_eq!(
@@ -578,291 +644,171 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
     assert_eq!(bound_claim.verifier_card_uid, verifier);
     assert_eq!(bound_claim.verifier_version, "1.0.0");
     assert_eq!(bound_claim.card_uid, owner);
-    assert_eq!(bound_claim.input, RunInput::DriftWindow(window()));
-    assert_eq!(bound_claim.attribution, Attribution::direct(actor.id));
-    assert_eq!(bound_claim.authority, authority(&actor));
+    assert_eq!(
+        bound_claim.input,
+        ExecutionInput::Scheduled {
+            window: window(),
+            slots: scheduled_inputs(),
+        }
+    );
     assert_eq!((bound_claim.attempt, bound_claim.max_attempts), (1, 3));
 
-    assert_eq!(direct_claim.lease.run_id, direct);
+    assert_eq!(direct_claim.lease.execution_id, direct);
+    assert_eq!(direct_claim.origin, ExecutionOrigin::Manual);
     assert_eq!(direct_claim.binding_id, None);
     assert_eq!(direct_claim.owner_card_uid, None);
     assert_eq!(direct_claim.trigger, None);
-    assert_eq!(direct_claim.attribution, Attribution::direct(actor.id));
-    let operators: Value =
-        sqlx::query_scalar("SELECT operators FROM wyrd.verifier_runs WHERE run_id = $1")
-            .bind(direct.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("operators read");
     assert_eq!(
-        operators,
-        serde_json::json!([]),
-        "a direct run has no Operators"
+        direct_claim.input,
+        ExecutionInput::Submitted {
+            run_id: direct_request.run_id,
+            inputs: direct_request.inputs,
+            route_overrides: BTreeMap::new(),
+        }
     );
+    assert_eq!(direct_claim.attribution, Attribution::direct(actor.id));
+    assert_eq!(direct_claim.authority, authority(&actor));
+    let operators: Value = sqlx::query_scalar(
+        "SELECT operators FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(direct.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("operators read");
+    assert_eq!(operators, json!([]), "a submission has no Operators");
 }
 
-/// Unknown bindings, missing or inactive Verifiers, unready PSI baselines,
-/// missing subjects, and implementation/input mismatches are refused with a
-/// typed reason and create nothing.
+/// Unknown bindings and unready PSI baselines refuse a scheduled occurrence
+/// without writing. A submission whose Verifier is missing, not a Verifier,
+/// deleted, or stored under the retired contract, whose PSI baseline is not
+/// ready, or whose subject is unavailable settles `errored` with the public
+/// catalog code and never runs; a Card the tenant does not hold at all
+/// leaves no row.
 ///
 /// # Panics
 /// Panics when any request is accepted or refused for the wrong reason.
 #[tokio::test]
-async fn enqueue_refuses_unrunnable_targets_without_writing() {
+async fn unrunnable_targets_are_refused() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
     let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
-    let eval_verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
-    let psi_binding = bind(&mut conn, &owner, &psi, daily(), Vec::new()).await;
-    let direct = |verifier: &CardUid, subject: &CardUid| RunRequest::Manual {
-        authority: RunAuthority::manual(authority(&actor)),
-        target: VerificationRunTarget::Verifier {
-            verifier_card_uid: verifier.clone(),
-            card_uid: subject.clone(),
-        },
-        window: window(),
-        cause: None,
-    };
-
-    let cases = [
+    let old = register_verifier(&mut conn, &actor, "old", retired()).await;
+    let psi_binding = bind(&mut conn, &owner, &psi, Vec::new()).await;
+    let owner_authority = background(&mut conn, owner_principal).await;
+    for (binding, refusal) in [
+        (BindingId::new_v7(), EnqueueRefusal::BindingNotFound),
         (
-            manual_binding(&actor, BindingId::new_v7()),
-            EnqueueRefusal::BindingNotFound,
-        ),
-        (
-            manual_binding(&actor, psi_binding),
+            psi_binding,
             EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady),
         ),
-        (
-            direct(&uid(), &owner),
-            EnqueueRefusal::NotReady(VerifierReadiness::VerifierUnavailable),
-        ),
-        (
-            direct(&owner, &owner),
-            EnqueueRefusal::NotReady(VerifierReadiness::VerifierUnavailable),
-        ),
-        (direct(&custom, &uid()), EnqueueRefusal::SubjectUnavailable),
-        (
-            direct(&eval_verifier, &owner),
-            EnqueueRefusal::InputMismatch,
-        ),
-    ];
-    for (request, refusal) in cases {
+    ] {
         assert_eq!(
             queue
-                .enqueue(&mut conn, &request)
+                .enqueue_scheduled(&mut conn, binding, window(), &owner_authority)
                 .await
                 .expect("enqueue answers"),
             EnqueueOutcome::Refused(refusal)
         );
     }
+    assert_eq!(execution_count(&mut conn).await, 0);
 
+    let (dormant, _) = register_service(&mut conn, &actor, "dormant").await;
     sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
-        .bind(custom.as_uuid())
+        .bind(dormant.as_uuid())
         .execute(&mut **conn.transaction())
         .await
-        .expect("verifier deletes");
-    assert_eq!(
+        .expect("subject deletes");
+    let cases = [
+        (
+            &psi,
+            &owner,
+            EnqueueRefusal::NotReady(VerifierReadiness::BaselineNotReady),
+            "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
+        ),
+        (
+            &owner,
+            &owner,
+            EnqueueRefusal::NotReady(VerifierReadiness::VerifierUnavailable),
+            "WYRD_VERIFICATION_400_INVALID_TARGET",
+        ),
+        (
+            &old,
+            &owner,
+            EnqueueRefusal::NotReady(VerifierReadiness::VerifierUnavailable),
+            "WYRD_VERIFICATION_400_INVALID_TARGET",
+        ),
+        (
+            &custom,
+            &dormant,
+            EnqueueRefusal::SubjectUnavailable,
+            "WYRD_VERIFICATION_400_INVALID_TARGET",
+        ),
+    ];
+    for (verifier, subject, refusal, code) in cases {
+        let refused = submission(tenant, authority(&actor), request(verifier, subject), None);
+        assert_eq!(
+            accept(&queue, &mut conn, &refused).await,
+            SubmissionOutcome::Refused(refusal)
+        );
+        let state = status(&queue, &mut conn, refused.execution_id).await.state;
+        assert_eq!(state.status, VerificationExecutionStatus::Errored);
+        assert_eq!(state.error.map(|error| error.code), Some(code.to_owned()));
+    }
+    assert!(
         queue
-            .enqueue(&mut conn, &direct(&custom, &owner))
+            .claim(&mut conn, Duration::minutes(5))
             .await
-            .expect("enqueue answers"),
-        EnqueueOutcome::Refused(EnqueueRefusal::NotReady(
+            .expect("claim runs")
+            .is_none(),
+        "a refused submission never runs"
+    );
+
+    let unknown = submission(tenant, authority(&actor), request(&uid(), &owner), None);
+    assert_eq!(
+        accept(&queue, &mut conn, &unknown).await,
+        SubmissionOutcome::Refused(EnqueueRefusal::NotReady(
             VerifierReadiness::VerifierUnavailable
         ))
     );
-    assert_eq!(run_count(&mut conn).await, 0);
-}
-
-/// A keyed manual request replays its run for the same digest, refuses a
-/// different digest under the same key, and scopes keys to the requester; a
-/// refused keyed request leaves the key unused. `target_cards` resolves a
-/// binding's Verifier and subject, echoes a direct target's, and answers
-/// `None` for an unknown binding.
-///
-/// # Panics
-/// Panics when any keyed outcome, stored key, run count, or subject differs.
-#[tokio::test]
-async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let other = self::actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
-    let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
-    let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
-    let binding = bind(&mut conn, &owner, &custom, daily(), Vec::new()).await;
-    let psi_binding = bind(&mut conn, &owner, &psi, daily(), Vec::new()).await;
-    let target = VerificationRunTarget::Binding {
-        binding_id: binding,
-    };
-    let key = |digest: &'static [u8]| RequestKey {
-        key: "retry-1",
-        request_sha256: digest,
-    };
-
-    let first = queue
-        .enqueue_manual(
-            &mut conn,
-            authority(&actor),
-            &target,
-            window(),
-            None,
-            Some(key(b"a")),
-        )
-        .await
-        .expect("keyed run enqueues");
-    let ManualEnqueueOutcome::Enqueued(run_id) = first else {
-        panic!("expected a new run, got {first:?}");
-    };
-    assert_eq!(
+    assert!(
         queue
-            .enqueue_manual(
-                &mut conn,
-                authority(&actor),
-                &target,
-                window(),
-                None,
-                Some(key(b"a"))
-            )
+            .execution_status(&mut conn, unknown.execution_id)
             .await
-            .expect("replay answers"),
-        ManualEnqueueOutcome::Replayed(run_id)
-    );
-    assert_eq!(
-        queue
-            .enqueue_manual(
-                &mut conn,
-                authority(&actor),
-                &target,
-                window(),
-                None,
-                Some(key(b"b"))
-            )
-            .await
-            .expect("conflict answers"),
-        ManualEnqueueOutcome::KeyReused(run_id)
-    );
-    let stored: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT idempotency_key, request_sha256 FROM wyrd.verifier_runs WHERE run_id = $1",
-    )
-    .bind(run_id.as_uuid())
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("stored key reads");
-    assert_eq!(stored, (Some("retry-1".to_owned()), Some(b"a".to_vec())));
-
-    let other_run = queue
-        .enqueue_manual(
-            &mut conn,
-            authority(&other),
-            &target,
-            window(),
-            None,
-            Some(key(b"a")),
-        )
-        .await
-        .expect("other requester enqueues");
-    assert!(matches!(other_run, ManualEnqueueOutcome::Enqueued(id) if id != run_id));
-    let unready = VerificationRunTarget::Binding {
-        binding_id: psi_binding,
-    };
-    let refused_key = RequestKey {
-        key: "refused",
-        request_sha256: b"c",
-    };
-    for _ in 0..2 {
-        assert_eq!(
-            queue
-                .enqueue_manual(
-                    &mut conn,
-                    authority(&actor),
-                    &unready,
-                    window(),
-                    None,
-                    Some(refused_key)
-                )
-                .await
-                .expect("refusal answers"),
-            ManualEnqueueOutcome::Refused(EnqueueRefusal::NotReady(
-                VerifierReadiness::BaselineNotReady
-            ))
-        );
-    }
-    assert_eq!(run_count(&mut conn).await, 2);
-
-    assert_eq!(
-        queue
-            .target_cards(&mut conn, &target)
-            .await
-            .expect("binding target reads"),
-        Some(TargetCards {
-            verifier: custom.clone(),
-            subject: owner.clone(),
-        })
-    );
-    let direct = VerificationRunTarget::Verifier {
-        verifier_card_uid: custom.clone(),
-        card_uid: owner.clone(),
-    };
-    assert_eq!(
-        queue
-            .target_cards(&mut conn, &direct)
-            .await
-            .expect("direct target answers"),
-        Some(TargetCards {
-            verifier: custom,
-            subject: owner,
-        })
-    );
-    let unknown = VerificationRunTarget::Binding {
-        binding_id: BindingId::new_v7(),
-    };
-    assert_eq!(
-        queue
-            .target_cards(&mut conn, &unknown)
-            .await
-            .expect("unknown binding answers"),
-        None
+            .expect("status reads")
+            .is_none(),
+        "a Verifier the tenant does not hold leaves no row"
     );
 }
 
-/// Manual idempotency is scoped by subject and actor together: the same
-/// actor for a different subject and the same subject through a different
-/// actor each create their own run under one key, while an exact replay of a
-/// pair returns its run and changed input under that pair conflicts. Each run
-/// stores the accepting pair.
+/// A keyed submission replays its execution for the same request, settles a
+/// different request under the same key `errored` with the idempotency
+/// conflict under its own ID while the original stays pending, and scopes
+/// keys to the subject and actor together. A retried batch changes nothing,
+/// and a refused keyed request replays its refusal.
 ///
 /// # Panics
-/// Panics when two pairs share a run, a replay creates one, or a stored pair
-/// differs from the accepting request.
+/// Panics when any keyed outcome, stored key, row count, or state differs.
 #[tokio::test]
-async fn subject_actor_manual_replay() {
+async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let (alice, bob, carol) = (actor(tenant), actor(tenant), actor(tenant));
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &alice, "svc").await;
     let custom = register_verifier(&mut conn, &alice, "custom", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &custom, daily(), Vec::new()).await;
-    let target = VerificationRunTarget::Binding {
-        binding_id: binding,
-    };
+    let psi = register_verifier(&mut conn, &alice, "psi", psi_drift()).await;
     let through = |subject: &Principal, actor: &Principal| {
         AcceptedAuthority::new(
             subject,
@@ -871,31 +817,95 @@ async fn subject_actor_manual_replay() {
             }],
         )
     };
-    let key = |digest: &'static [u8]| {
-        Some(RequestKey {
-            key: "shared-key",
-            request_sha256: digest,
-        })
-    };
+    let original_request = request(&custom, &owner);
+    let mut changed_request = original_request.clone();
+    changed_request.run_id = Some(RunId::from_string("app-run-2".to_owned()));
 
-    let mut runs = Vec::new();
-    for accepted in [
+    let original = submission(
+        tenant,
         authority(&alice),
-        through(&alice, &bob),
-        through(&carol, &bob),
-    ] {
-        let pair = accepted.attribution();
-        let outcome = queue
-            .enqueue_manual(&mut conn, accepted, &target, window(), None, key(b"a"))
+        original_request.clone(),
+        Some("retry-1"),
+    );
+    let execution = submitted(&queue, &mut conn, &original).await;
+    let retry = submission(
+        tenant,
+        authority(&alice),
+        original_request.clone(),
+        Some("retry-1"),
+    );
+    assert_eq!(
+        retry.execution_id, execution,
+        "an identical keyed retry is assigned the same execution before acceptance"
+    );
+    assert_eq!(
+        queue
+            .accept_submissions(&mut conn, &[original.clone(), retry])
             .await
-            .expect("keyed run enqueues");
-        let ManualEnqueueOutcome::Enqueued(run_id) = outcome else {
-            panic!("each subject/actor pair owns its key, got {outcome:?}");
-        };
-        let stored: (Uuid, Uuid) = sqlx::query_as(
-            "SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_runs WHERE run_id = $1",
+            .expect("replayed batch accepts"),
+        vec![
+            SubmissionOutcome::Replayed(execution),
+            SubmissionOutcome::Replayed(execution)
+        ]
+    );
+
+    let conflicting = submission(
+        tenant,
+        authority(&alice),
+        changed_request.clone(),
+        Some("retry-1"),
+    );
+    assert_ne!(conflicting.execution_id, execution);
+    assert_eq!(
+        accept(&queue, &mut conn, &conflicting).await,
+        SubmissionOutcome::Conflict {
+            original: execution
+        }
+    );
+    let conflict = status(&queue, &mut conn, conflicting.execution_id)
+        .await
+        .state;
+    assert_eq!(conflict.status, VerificationExecutionStatus::Errored);
+    assert_eq!(
+        conflict.error.map(|error| error.code),
+        Some("WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT".to_owned())
+    );
+    assert_eq!(
+        status(&queue, &mut conn, execution).await.state.status,
+        VerificationExecutionStatus::Pending,
+        "a conflict never changes the original execution"
+    );
+    assert_eq!(
+        accept(&queue, &mut conn, &conflicting).await,
+        SubmissionOutcome::Replayed(conflicting.execution_id),
+        "a retried conflict replays its own errored row"
+    );
+    let stored: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT idempotency_key, request_sha256 FROM wyrd.verifier_executions \
+          WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("stored key reads");
+    assert_eq!(
+        stored,
+        (
+            Some("retry-1".to_owned()),
+            original.key.as_ref().map(|key| key.request_sha256.to_vec())
         )
-        .bind(run_id.as_uuid())
+    );
+
+    let mut pairs = Vec::new();
+    for accepted in [through(&alice, &bob), through(&carol, &bob)] {
+        let pair = accepted.attribution();
+        let keyed = submission(tenant, accepted, original_request.clone(), Some("retry-1"));
+        let execution_id = submitted(&queue, &mut conn, &keyed).await;
+        let stored: (Uuid, Uuid) = sqlx::query_as(
+            "SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_executions \
+              WHERE execution_id = $1",
+        )
+        .bind(execution_id.as_uuid())
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("stored pair reads");
@@ -906,115 +916,143 @@ async fn subject_actor_manual_replay() {
                 pair.act_principal_id.as_uuid()
             )
         );
-        runs.push(run_id);
+        pairs.push(execution_id);
     }
-    assert_eq!(run_count(&mut conn).await, 3);
+    assert_ne!(pairs[0], pairs[1]);
+    assert!(!pairs.contains(&execution));
 
-    assert_eq!(
-        queue
-            .enqueue_manual(
-                &mut conn,
-                through(&alice, &bob),
-                &target,
-                window(),
-                None,
-                key(b"a")
-            )
-            .await
-            .expect("replay answers"),
-        ManualEnqueueOutcome::Replayed(runs[1])
+    let unready = submission(
+        tenant,
+        authority(&alice),
+        request(&psi, &owner),
+        Some("refused"),
     );
     assert_eq!(
-        queue
-            .enqueue_manual(
-                &mut conn,
-                through(&alice, &bob),
-                &target,
-                window(),
-                None,
-                key(b"b")
-            )
-            .await
-            .expect("conflict answers"),
-        ManualEnqueueOutcome::KeyReused(runs[1])
+        accept(&queue, &mut conn, &unready).await,
+        SubmissionOutcome::Refused(EnqueueRefusal::NotReady(
+            VerifierReadiness::BaselineNotReady
+        ))
     );
-    assert_eq!(run_count(&mut conn).await, 3);
+    assert_eq!(
+        accept(&queue, &mut conn, &unready).await,
+        SubmissionOutcome::Replayed(unready.execution_id),
+        "a retried refusal replays the refused execution"
+    );
+    assert_eq!(execution_count(&mut conn).await, 5);
 }
 
-/// An observation creates one run per (binding, input record); a repeated
-/// delivery of the same record returns the existing run, and the claim carries
-/// the record and its exact event time.
+/// Another tenant's keyed submission, or one that names another tenant's
+/// Cards, never replays or conflicts with this tenant's executions.
 ///
 /// # Panics
-/// Panics when a duplicate creates a second run or the claimed input differs.
+/// Panics when a foreign submission observes or reuses a local execution.
 #[tokio::test]
-async fn observation_runs_are_unique_per_input_record() {
+async fn keyed_submissions_are_tenant_scoped() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let other = fixture
+        .seed_additional_tenant("verifier-executions-keys")
+        .await
+        .expect("second tenant seeds");
+    let tenant = fixture.data_tenant_id();
+    let alice = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    let authority = background(&mut conn, owner_principal).await;
-    let event_time = at(22, 11, 59);
-    let observation = |record: &str| RunRequest::Observation {
-        binding_id: binding,
-        record_id: record.to_owned(),
-        event_time,
-        authority: authority.clone(),
+    let (owner, _) = register_service(&mut conn, &alice, "svc").await;
+    let custom = register_verifier(&mut conn, &alice, "custom", custom_drift()).await;
+    let local = submission(
+        tenant,
+        authority(&alice),
+        request(&custom, &owner),
+        Some("shared-key"),
+    );
+    submitted(&queue, &mut conn, &local).await;
+    conn.commit().await.expect("tenant A commits");
+
+    let mut foreign = fixture
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant B opens");
+    let replayed_elsewhere = Submission {
+        execution_id: local.execution_id,
+        ..local.clone()
     };
+    assert_eq!(
+        accept(&queue, &mut foreign, &replayed_elsewhere).await,
+        SubmissionOutcome::Refused(EnqueueRefusal::NotReady(
+            VerifierReadiness::VerifierUnavailable
+        )),
+        "another tenant's execution ID is invisible, and so are its Cards"
+    );
+    assert_eq!(execution_count(&mut foreign).await, 0);
+}
 
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &observation("record-1"))
-            .await
-            .expect("observation enqueues"),
+/// Concurrent writers accepting the same subject, actor, and key serialize:
+/// the later writer waits for the uncommitted earlier one, then replays an
+/// identical request or records a conflict for a different one.
+///
+/// # Panics
+/// Panics when the later writer does not wait or decides without seeing the
+/// committed original.
+#[tokio::test]
+async fn concurrent_keyed_writers_serialize_on_the_key() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let alice = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut setup, &alice, "svc").await;
+    let custom = register_verifier(&mut setup, &alice, "custom", custom_drift()).await;
+    setup.commit().await.expect("setup commits");
+    let original = submission(
+        tenant,
+        authority(&alice),
+        request(&custom, &owner),
+        Some("race"),
     );
-    assert_eq!(
-        queue
-            .enqueue(&mut conn, &observation("record-1"))
-            .await
-            .expect("duplicate answers"),
-        EnqueueOutcome::AlreadyEnqueued(run)
-    );
-    enqueued(
-        queue
-            .enqueue(&mut conn, &observation("record-2"))
-            .await
-            .expect("second record enqueues"),
-    );
-    assert_eq!(run_count(&mut conn).await, 2);
+    let mut changed = request(&custom, &owner);
+    changed.run_id = Some(RunId::from_string("app-run-3".to_owned()));
+    let conflicting = submission(tenant, authority(&alice), changed, Some("race"));
 
-    let claimed = claim(&queue, &mut conn).await;
-    assert_eq!(claimed.lease.run_id, run);
-    assert_eq!(claimed.origin, RunOrigin::Observation);
+    let mut earlier = fixture.tenant_conn().await.expect("earlier opens");
+    submitted(&queue, &mut earlier, &original).await;
+    let mut later = fixture.tenant_conn().await.expect("later opens");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+    let later_accept = async {
+        let outcome = queue
+            .accept_submissions(&mut later, &[original.clone(), conflicting.clone()])
+            .await
+            .expect("later batch accepts");
+        later.commit().await.expect("later commits");
+        outcome
+    };
+    tokio::pin!(later_accept);
+    let raced = tokio::select! {
+        outcome = &mut later_accept => Some(outcome),
+        () = await_blocked_backend(&mut probe) => None,
+    };
     assert_eq!(
-        claimed.attribution,
-        authority.attribution(),
-        "an observation-triggered run serves the owner with the SYSTEM actor"
+        raced, None,
+        "a later writer under the same key waits for the uncommitted earlier one"
     );
-    assert_eq!(claimed.authority, *authority.authority());
+    earlier.commit().await.expect("earlier commits");
     assert_eq!(
-        claimed.input,
-        RunInput::EvalRecord {
-            record_id: "record-1".to_owned(),
-            event_time,
-        }
+        later_accept.await,
+        vec![
+            SubmissionOutcome::Replayed(original.execution_id),
+            SubmissionOutcome::Conflict {
+                original: original.execution_id
+            }
+        ]
     );
 }
 
-/// Wait until some backend of this fixture's own database is blocked behind
+/// Wait until some backend of this fixture's database is blocked behind
 /// another transaction's lock.
 ///
 /// Clears the activity snapshot on every poll, because Postgres otherwise
@@ -1047,150 +1085,21 @@ async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
     }
 }
 
-/// Observation runs of one binding get their `every_nth` ordinal once, at
-/// enqueue: a later enqueue waits for an uncommitted earlier one, so the
-/// earlier record is always ordinal 1 and the later ordinal 2. That stored
-/// ordinal is what every attempt reads, before and after a restart, so the
-/// sampling decision cannot flip. Duplicate enqueues consume no ordinal.
-///
-/// # Panics
-/// Panics when the later enqueue does not wait, an ordinal is not the
-/// serialized position, a reclaim reads a different ordinal, or a duplicate
-/// consumes one.
-#[tokio::test]
-async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut setup = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, owner_principal) = register_service(&mut setup, &actor, "svc").await;
-    let verifier = register_verifier(&mut setup, &actor, "eval", eval()).await;
-    let binding = bind(
-        &mut setup,
-        &owner,
-        &verifier,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    let authority = background(&mut setup, owner_principal).await;
-    setup.commit().await.expect("setup commits");
-    let event_time = at(22, 11, 59);
-    let observation = |record: &str| RunRequest::Observation {
-        binding_id: binding,
-        record_id: record.to_owned(),
-        event_time,
-        authority: authority.clone(),
-    };
-
-    let mut earlier = fixture.tenant_conn().await.expect("earlier opens");
-    let first = enqueued(
-        queue
-            .enqueue(&mut earlier, &observation("record-1"))
-            .await
-            .expect("earlier enqueues"),
-    );
-    let mut later = fixture.tenant_conn().await.expect("later opens");
-    let mut probe = fixture.tenant_conn().await.expect("probe opens");
-    let later_enqueue = async {
-        let run = enqueued(
-            queue
-                .enqueue(&mut later, &observation("record-2"))
-                .await
-                .expect("later enqueues"),
-        );
-        later.commit().await.expect("later commits");
-        run
-    };
-    tokio::pin!(later_enqueue);
-    let raced = tokio::select! {
-        run = &mut later_enqueue => Some(run),
-        () = await_blocked_backend(&mut probe) => None,
-    };
-    assert_eq!(
-        raced, None,
-        "a later enqueue for the binding waits for the uncommitted earlier one"
-    );
-    earlier.commit().await.expect("earlier commits");
-    let second = later_enqueue.await;
-    drop(probe);
-
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    for (record, run) in [("record-1", first), ("record-2", second)] {
-        assert_eq!(
-            queue
-                .enqueue(&mut conn, &observation(record))
-                .await
-                .expect("duplicate answers"),
-            EnqueueOutcome::AlreadyEnqueued(run)
-        );
-    }
-    let third = enqueued(
-        queue
-            .enqueue(&mut conn, &observation("record-3"))
-            .await
-            .expect("third record enqueues"),
-    );
-    let mut attempts = Vec::new();
-    for _ in 0..3 {
-        attempts.push(claim(&queue, &mut conn).await);
-    }
-    let ordinals: Vec<_> = attempts
-        .iter()
-        .map(|run| (run.lease.run_id, run.observation_ordinal))
-        .collect();
-    assert_eq!(
-        ordinals,
-        vec![(first, Some(1)), (second, Some(2)), (third, Some(3))],
-        "ordinals follow serialized enqueue and duplicates consume none"
-    );
-    assert_eq!(
-        queue
-            .release(&mut conn, attempts[1].lease, Duration::zero())
-            .await
-            .expect("release answers"),
-        Settlement::Applied
-    );
-    conn.commit().await.expect("first attempts commit");
-
-    let (restarted, _) = fixture
-        .fresh_runtime_handles()
-        .await
-        .expect("fresh handles open");
-    let mut conn = restarted
-        .tenant_conn(fixture.data_tenant_id())
-        .await
-        .expect("restarted runner opens");
-    let retried = claim(&queue, &mut conn).await;
-    assert_eq!(retried.lease.run_id, second);
-    assert_eq!(
-        retried.observation_ordinal,
-        Some(2),
-        "a restarted attempt reads the ordinal stored at enqueue, so `every_nth` cannot flip"
-    );
-}
-
 /// Two schedulers ticking the same due binding concurrently create exactly one
-/// run: the second skips the locked row. The committed cursor moves to the
+/// execution: the second skips the locked row. The committed cursor moves to the
 /// next future boundary, a restarted scheduler on fresh handles finds nothing
-/// due, and re-enqueueing the same occurrence returns the existing run. The
+/// due, and re-enqueueing the same occurrence returns the existing execution. The
 /// cursor sits one claim delay behind the database clock, and the claimed
 /// window still ends at the cursor.
 ///
 /// # Panics
-/// Panics when an occurrence produces zero or two runs, the window or cursor
-/// is wrong, or a restarted scheduler re-runs the occurrence.
+/// Panics when an occurrence produces zero or two executions, the window or cursor
+/// is wrong, or a restarted scheduler executes the occurrence again.
 #[tokio::test]
 async fn concurrent_schedulers_create_one_run_per_occurrence() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut setup = fixture
         .tenant_conn()
         .await
@@ -1200,7 +1109,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .expect("the tenant SYSTEM principal provisions");
     let (owner, principal) = register_service(&mut setup, &actor, "svc").await;
     let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut setup, &owner, &verifier, daily(), Vec::new()).await;
+    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
     let armed_after = database_now(&mut setup).await;
     record_machine_authentication(&mut setup, principal)
         .await
@@ -1223,8 +1132,8 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     assert_eq!(tick.binding_id, binding);
     assert_eq!(tick.due_at, due);
     assert_next_daily_boundary(tick.next_run_at, due);
-    let ScheduleOutcome::Enqueued(run) = tick.outcome else {
-        panic!("expected a scheduled run, got {:?}", tick.outcome);
+    let ScheduleOutcome::Enqueued(execution) = tick.outcome else {
+        panic!("expected a scheduled execution, got {:?}", tick.outcome);
     };
     first.commit().await.expect("first scheduler commits");
     assert!(
@@ -1244,23 +1153,32 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     assert!(schedule_next_due(&queue, &mut conn).await.is_none());
     assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     let claimed = claim(&queue, &mut conn).await;
-    assert_eq!(claimed.lease.run_id, run);
-    assert_eq!(claimed.origin, RunOrigin::Schedule);
+    assert_eq!(claimed.lease.execution_id, execution);
+    assert_eq!(claimed.origin, ExecutionOrigin::Schedule);
     assert_eq!(
         claimed.attribution,
         Attribution::new(principal, PrincipalId::new(system)),
-        "a scheduled run serves the owner with the SYSTEM actor"
+        "a scheduled execution serves the owner with the SYSTEM actor"
     );
     assert_eq!(
         claimed.authority,
         owner_authority(fixture.data_tenant_id(), principal)
     );
-    let RunInput::DriftWindow(occurrence) = claimed.input else {
+    let ExecutionInput::Scheduled {
+        window: occurrence,
+        slots,
+    } = claimed.input
+    else {
         panic!(
-            "a scheduled Drift run analyzes a window, got {:?}",
+            "a scheduled execution analyzes a window, got {:?}",
             claimed.input
         );
     };
+    assert_eq!(
+        slots,
+        scheduled_inputs(),
+        "the binding's selectors are frozen"
+    );
     assert_eq!(
         occurrence.end, due,
         "the occurrence closes at its due instant"
@@ -1268,33 +1186,26 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     let replay = background(&mut conn, principal).await;
     assert_eq!(
         queue
-            .enqueue(
-                &mut conn,
-                &RunRequest::Scheduled {
-                    binding_id: binding,
-                    window: occurrence,
-                    authority: replay,
-                },
-            )
+            .enqueue_scheduled(&mut conn, binding, occurrence, &replay)
             .await
             .expect("duplicate occurrence answers"),
-        EnqueueOutcome::AlreadyEnqueued(run)
+        EnqueueOutcome::AlreadyEnqueued(execution)
     );
-    assert_eq!(run_count(&mut conn).await, 1);
+    assert_eq!(execution_count(&mut conn).await, 1);
 }
 
 /// Inactive owners, unready PSI Verifiers, and missed occurrences create no
-/// run, and every cursor still advances to the first boundary after the
+/// execution, and every cursor still advances to the first boundary after the
 /// schedule clock (database time minus the claim delay) without backfill.
 ///
 /// # Panics
-/// Panics when a skipped occurrence creates a run, reports the wrong reason,
+/// Panics when a skipped occurrence creates a execution, reports the wrong reason,
 /// or leaves its cursor anywhere but the next future boundary.
 #[tokio::test]
 async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -1305,7 +1216,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     let due = now - SCHEDULE_CLAIM_DELAY;
 
     let (stale_owner, stale) = register_service(&mut conn, &actor, "stale").await;
-    let inactive = bind(&mut conn, &stale_owner, &custom, daily(), Vec::new()).await;
+    let inactive = bind(&mut conn, &stale_owner, &custom, Vec::new()).await;
     record_machine_authentication(&mut conn, stale)
         .await
         .expect("stale activation records");
@@ -1313,8 +1224,8 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     set_cursor(&mut conn, inactive, Some(due)).await;
 
     let (live_owner, live) = register_service(&mut conn, &actor, "live").await;
-    let unready = bind(&mut conn, &live_owner, &psi, daily(), Vec::new()).await;
-    let missed = bind(&mut conn, &live_owner, &custom, daily(), Vec::new()).await;
+    let unready = bind(&mut conn, &live_owner, &psi, Vec::new()).await;
+    let missed = bind(&mut conn, &live_owner, &custom, Vec::new()).await;
     record_machine_authentication(&mut conn, live)
         .await
         .expect("live activation records");
@@ -1342,22 +1253,22 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     for binding in [inactive, unready, missed] {
         assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     }
-    assert_eq!(run_count(&mut conn).await, 0);
+    assert_eq!(execution_count(&mut conn).await, 0);
 }
 
-/// The stored lease expiry of `run`.
+/// The stored lease expiry of `execution`.
 ///
 /// # Panics
-/// Panics when the run cannot be read or holds no lease.
-async fn lease_expiry(conn: &mut TenantConn<'_>, run: VerificationRunId) -> DateTime<Utc> {
+/// Panics when the execution cannot be read or holds no lease.
+async fn lease_expiry(conn: &mut TenantConn<'_>, execution: ExecutionId) -> DateTime<Utc> {
     sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT lease_expires_at FROM wyrd.verifier_runs WHERE run_id = $1",
+        "SELECT lease_expires_at FROM wyrd.verifier_executions WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("lease reads")
-    .expect("the run holds a lease")
+    .expect("the execution holds a lease")
 }
 
 /// One renewal statement leaves a lease younger than a third of its length
@@ -1372,41 +1283,36 @@ async fn lease_expiry(conn: &mut TenantConn<'_>, run: VerificationRunId) -> Date
 async fn leases_renew_once_a_third_has_passed_and_never_revive() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
     let lease = Duration::minutes(5);
     let stale = claim(&queue, &mut conn).await;
-    expire_deadlines(&mut conn, run).await;
+    expire_deadlines(&mut conn, execution).await;
     let held = claim(&queue, &mut conn).await;
-    let young = lease_expiry(&mut conn, run).await;
+    let young = lease_expiry(&mut conn, execution).await;
     let renewed = queue
         .renew(&mut conn, &[stale.lease.token, held.lease.token], lease)
         .await
         .expect("renewal runs");
     assert_eq!(renewed, vec![held.lease.token], "a reclaimed token is gone");
     assert_eq!(
-        lease_expiry(&mut conn, run).await,
+        lease_expiry(&mut conn, execution).await,
         young,
         "a young lease stays"
     );
 
     sqlx::query(
-        "UPDATE wyrd.verifier_runs \
-         SET lease_expires_at = statement_timestamp() + INTERVAL '1 minute' WHERE run_id = $1",
+        "UPDATE wyrd.verifier_executions \
+         SET lease_expires_at = statement_timestamp() + INTERVAL '1 minute' WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .expect("lease ages");
@@ -1417,11 +1323,11 @@ async fn leases_renew_once_a_third_has_passed_and_never_revive() {
         .expect("renewal runs");
     assert_eq!(renewed, vec![held.lease.token]);
     assert!(
-        lease_expiry(&mut conn, run).await >= now + lease,
+        lease_expiry(&mut conn, execution).await >= now + lease,
         "a lease past a third of its length is extended from the database clock"
     );
 
-    expire_deadlines(&mut conn, run).await;
+    expire_deadlines(&mut conn, execution).await;
     assert!(
         queue
             .renew(&mut conn, &[held.lease.token], lease)
@@ -1443,20 +1349,15 @@ async fn leases_renew_once_a_third_has_passed_and_never_revive() {
 async fn reclaimed_lease_fences_the_stale_token() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
 
     let claimed_at = database_now(&mut conn).await;
     let stale = claim(&queue, &mut conn).await;
@@ -1472,9 +1373,9 @@ async fn reclaimed_lease_fences_the_stale_token() {
             .is_none(),
         "a live lease is not reclaimable"
     );
-    expire_deadlines(&mut conn, run).await;
+    expire_deadlines(&mut conn, execution).await;
     let current = claim(&queue, &mut conn).await;
-    assert_eq!(current.lease.run_id, run);
+    assert_eq!(current.lease.execution_id, execution);
     assert_eq!(current.attempt, 2);
     assert_ne!(current.lease.token, stale.lease.token);
 
@@ -1487,7 +1388,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
                 result,
                 VerificationVerdict::Passed,
                 "drift detected",
-                DRIFT_COUNTS
+                Some(DRIFT_COUNTS)
             )
             .await
             .expect("stale completion answers"),
@@ -1509,7 +1410,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
                     result,
                     VerificationVerdict::Passed,
                     "drift detected",
-                    DRIFT_COUNTS
+                    Some(DRIFT_COUNTS)
                 )
                 .await
                 .expect("completion answers"),
@@ -1524,60 +1425,54 @@ async fn reclaimed_lease_fences_the_stale_token() {
                 VerificationResultId::new_v7(),
                 VerificationVerdict::Passed,
                 "drift detected",
-                DRIFT_COUNTS,
+                Some(DRIFT_COUNTS),
             )
             .await
             .expect("conflicting completion answers"),
         Settlement::StaleLease,
-        "a settled run cannot point at a different result"
+        "a settled execution cannot point at a different result"
     );
     let status = queue
-        .run_status(&mut conn, run)
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert_eq!(status.status, VerificationExecutionStatus::Completed);
+        .expect("execution exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
     assert_eq!(status.result_id, Some(result));
-    assert_eq!(status.error, None);
+    assert_eq!(status.state.error, None);
 }
 
-/// A retryable failure backs off 30 then 60 seconds on the same run and input;
+/// A retryable failure backs off 30 then 60 seconds on the same execution and input;
 /// the third failure exhausts the budget and settles `errored` with the
 /// structured error, no result, and no dispatch.
 ///
 /// # Panics
 /// Panics when a retry is claimable early, the backoff differs, or exhaustion
-/// does not settle the run as a verdict-free error.
+/// does not settle the execution as a verdict-free error.
 #[tokio::test]
 async fn retries_back_off_then_exhaust_to_errored() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        daily(),
-        vec![FrozenTarget::Uid(uid())],
-    )
-    .await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
 
     for (attempt, delay) in [(1, 30), (2, 60)] {
         let claimed = claim(&queue, &mut conn).await;
-        assert_eq!((claimed.lease.run_id, claimed.attempt), (run, attempt));
-        assert_eq!(claimed.input, RunInput::DriftWindow(window()));
+        assert_eq!(
+            (claimed.lease.execution_id, claimed.attempt),
+            (execution, attempt)
+        );
+        assert!(
+            matches!(claimed.input, ExecutionInput::Scheduled { window: w, .. } if w == window()),
+            "every attempt judges the same frozen window"
+        );
         let retried_at = database_now(&mut conn).await;
         let RetryOutcome::Scheduled(due) = queue
             .retry(&mut conn, claimed.lease, &engine_error())
@@ -1591,17 +1486,17 @@ async fn retries_back_off_then_exhaust_to_errored() {
             "the database dates the next attempt from its own clock"
         );
         assert_eq!(
-            stored_backoff(&mut conn, run).await,
+            stored_backoff(&mut conn, execution).await,
             Duration::seconds(delay),
             "attempt {attempt} backs off {delay} seconds"
         );
         let status = queue
-            .run_status(&mut conn, run)
+            .execution_status(&mut conn, execution)
             .await
             .expect("status reads")
-            .expect("run exists");
-        assert_eq!(status.status, VerificationExecutionStatus::Retrying);
-        assert_eq!(status.error, Some(engine_error()));
+            .expect("execution exists");
+        assert_eq!(status.state.status, VerificationExecutionStatus::Retrying);
+        assert_eq!(status.state.error, Some(engine_error()));
         assert!(
             queue
                 .claim(&mut conn, Duration::minutes(5))
@@ -1610,7 +1505,7 @@ async fn retries_back_off_then_exhaust_to_errored() {
                 .is_none(),
             "a retry is not claimable before its backoff"
         );
-        expire_deadlines(&mut conn, run).await;
+        expire_deadlines(&mut conn, execution).await;
     }
     let last = claim(&queue, &mut conn).await;
     assert_eq!(last.attempt, 3);
@@ -1629,17 +1524,17 @@ async fn retries_back_off_then_exhaust_to_errored() {
         RetryOutcome::StaleLease
     );
     let status = queue
-        .run_status(&mut conn, run)
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert_eq!(status.status, VerificationExecutionStatus::Errored);
-    assert_eq!(status.error, Some(engine_error()));
+        .expect("execution exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Errored);
+    assert_eq!(status.state.error, Some(engine_error()));
     assert_eq!(status.result_id, None);
-    assert!(status.dispatches.is_empty());
+    assert!(status.state.dispatches.is_empty());
 }
 
-/// Cancelled and timed-out runs settle with their error and no result, and a
+/// Cancelled and timed-out executions settle with their error and no result, and a
 /// crash on the final attempt is settled `errored` by the next claim instead of
 /// being reclaimed past the budget.
 ///
@@ -1650,21 +1545,14 @@ async fn retries_back_off_then_exhaust_to_errored() {
 async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        daily(),
-        vec![FrozenTarget::Uid(uid())],
-    )
-    .await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
     let error = engine_error();
 
     for (terminal, expected) in [
@@ -1677,12 +1565,7 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
             VerificationExecutionStatus::TimedOut,
         ),
     ] {
-        let run = enqueued(
-            queue
-                .enqueue(&mut conn, &manual_binding(&actor, binding))
-                .await
-                .expect("run enqueues"),
-        );
+        let execution = scheduled(&queue, &mut conn, binding).await;
         let claimed = claim(&queue, &mut conn).await;
         assert_eq!(
             queue
@@ -1692,25 +1575,20 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
             Settlement::Applied
         );
         let status = queue
-            .run_status(&mut conn, run)
+            .execution_status(&mut conn, execution)
             .await
             .expect("status reads")
-            .expect("run exists");
-        assert_eq!(status.status, expected);
+            .expect("execution exists");
+        assert_eq!(status.state.status, expected);
         assert_eq!(status.result_id, None);
-        assert_eq!(status.error, Some(error.clone()));
-        assert!(status.dispatches.is_empty());
+        assert_eq!(status.state.error, Some(error.clone()));
+        assert!(status.state.dispatches.is_empty());
     }
 
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let execution = scheduled(&queue, &mut conn, binding).await;
     for _ in 0..3 {
         claim(&queue, &mut conn).await;
-        expire_deadlines(&mut conn, run).await;
+        expire_deadlines(&mut conn, execution).await;
     }
     assert!(
         queue
@@ -1721,20 +1599,20 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
         "an exhausted expired lease is not reclaimed"
     );
     let status = queue
-        .run_status(&mut conn, run)
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert_eq!(status.status, VerificationExecutionStatus::Errored);
+        .expect("execution exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Errored);
     assert_eq!(
-        status.error.map(|error| error.code),
+        status.state.error.map(|error| error.code),
         Some("lease_expired".to_owned())
     );
 }
 
-/// A failed binding run creates one pending dispatch per distinct frozen
-/// Operator, exactly once across settlement retries; passed binding runs and
-/// failed direct runs create none. The Run GET projection lists dispatch
+/// A failed binding execution creates one pending dispatch per distinct frozen
+/// Operator, exactly once across settlement retries; passed binding executions and
+/// failed direct executions create none. The status projection lists dispatch
 /// delivery state and never exposes a verdict.
 ///
 /// # Panics
@@ -1744,7 +1622,7 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
 async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -1757,38 +1635,30 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
         &mut conn,
         &owner,
         &verifier,
-        daily(),
         vec![pager.clone(), inline.clone(), pager.clone()],
     )
     .await;
-    let direct_request = RunRequest::Manual {
-        authority: RunAuthority::manual(authority(&actor)),
-        target: VerificationRunTarget::Verifier {
-            verifier_card_uid: verifier.clone(),
-            card_uid: owner.clone(),
-        },
-        window: window(),
-        cause: None,
-    };
+    let direct = submission(
+        fixture.data_tenant_id(),
+        authority(&actor),
+        request(&verifier, &owner),
+        None,
+    );
 
     let mut settled = Vec::new();
-    for (request, verdict) in [
-        (manual_binding(&actor, binding), VerificationVerdict::Failed),
-        (manual_binding(&actor, binding), VerificationVerdict::Passed),
-        (
-            manual_binding(&actor, binding),
-            VerificationVerdict::Inconclusive,
-        ),
-        (direct_request, VerificationVerdict::Failed),
+    for (bound, verdict) in [
+        (true, VerificationVerdict::Failed),
+        (true, VerificationVerdict::Passed),
+        (true, VerificationVerdict::Inconclusive),
+        (false, VerificationVerdict::Failed),
     ] {
-        let run = enqueued(
-            queue
-                .enqueue(&mut conn, &request)
-                .await
-                .expect("run enqueues"),
-        );
+        let execution = if bound {
+            scheduled(&queue, &mut conn, binding).await
+        } else {
+            submitted(&queue, &mut conn, &direct).await
+        };
         let claimed = claim(&queue, &mut conn).await;
-        assert_eq!(claimed.lease.run_id, run);
+        assert_eq!(claimed.lease.execution_id, execution);
         let result = VerificationResultId::new_v7();
         for _ in 0..2 {
             assert_eq!(
@@ -1799,22 +1669,23 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
                         result,
                         verdict,
                         "drift detected",
-                        DRIFT_COUNTS
+                        Some(DRIFT_COUNTS)
                     )
                     .await
                     .expect("completion answers"),
                 Settlement::Applied
             );
         }
-        settled.push(run);
+        settled.push(execution);
     }
 
     let failed = queue
-        .run_status(&mut conn, settled[0])
+        .execution_status(&mut conn, settled[0])
         .await
         .expect("status reads")
-        .expect("run exists");
+        .expect("execution exists");
     let mut operators: Vec<_> = failed
+        .state
         .dispatches
         .iter()
         .map(|dispatch| dispatch.operator.clone())
@@ -1823,22 +1694,22 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
     let mut expected = vec![pager, inline];
     expected.sort_by_key(|operator| format!("{operator:?}"));
     assert_eq!(operators, expected);
-    assert!(failed.dispatches.iter().all(|dispatch| {
+    assert!(failed.state.dispatches.iter().all(|dispatch| {
         dispatch.status == OperatorDispatchStatus::Pending && dispatch.error.is_none()
     }));
-    let wire = serde_json::to_value(&failed).expect("status serializes");
+    let wire = serde_json::to_value(&failed.state).expect("status serializes");
     assert!(
         wire.get("verdict").is_none(),
-        "Run GET never carries a verdict"
+        "execution status never carries a verdict"
     );
-    for run in &settled[1..] {
+    for execution in &settled[1..] {
         let status = queue
-            .run_status(&mut conn, *run)
+            .execution_status(&mut conn, *execution)
             .await
             .expect("status reads")
-            .expect("run exists");
-        assert_eq!(status.status, VerificationExecutionStatus::Completed);
-        assert!(status.dispatches.is_empty());
+            .expect("execution exists");
+        assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
+        assert!(status.state.dispatches.is_empty());
     }
     let dispatches: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.operator_dispatches")
         .fetch_one(&mut **conn.transaction())
@@ -1847,30 +1718,25 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
     assert_eq!(dispatches, 2);
 }
 
-/// Releasing a leased run for shutdown makes it immediately claimable again
+/// Releasing a leased execution for shutdown makes it immediately claimable again
 /// with the same input and without consuming an attempt.
 ///
 /// # Panics
-/// Panics when the released run is not claimable at once or its attempt
+/// Panics when the released execution is not claimable at once or its attempt
 /// counter advanced.
 #[tokio::test]
 async fn release_requeues_without_consuming_an_attempt() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
 
     let first = claim(&queue, &mut conn).await;
     assert_eq!(
@@ -1881,18 +1747,18 @@ async fn release_requeues_without_consuming_an_attempt() {
         Settlement::Applied
     );
     let status = queue
-        .run_status(&mut conn, run)
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert_eq!(status.status, VerificationExecutionStatus::Pending);
+        .expect("execution exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Pending);
     let again = claim(&queue, &mut conn).await;
-    assert_eq!(again.lease.run_id, run);
+    assert_eq!(again.lease.execution_id, execution);
     assert_eq!(again.attempt, 1);
     assert_eq!(again.input, first.input);
 }
 
-/// A claim reports how long its run waited past its due time and how long
+/// A claim reports how long its execution waited past its due time and how long
 /// ago its trigger created it, both measured by the claim statement's
 /// PostgreSQL instant, and a reclaim measures its wait from the lease expiry.
 ///
@@ -1903,30 +1769,25 @@ async fn release_requeues_without_consuming_an_attempt() {
 async fn claim_reports_postgres_measured_queue_wait_and_age() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
     sqlx::query(
-        "UPDATE wyrd.verifier_runs
+        "UPDATE wyrd.verifier_executions
             SET created_at = statement_timestamp() - INTERVAL '30 seconds',
                 next_attempt_at = statement_timestamp() - INTERVAL '10 seconds'
-          WHERE run_id = $1",
+          WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .execute(&mut **conn.transaction())
     .await
-    .expect("run is backdated");
+    .expect("execution is backdated");
     let slack = std::time::Duration::from_secs(5);
 
     let first = claim(&queue, &mut conn).await;
@@ -1944,11 +1805,11 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
     );
 
     sqlx::query(
-        "UPDATE wyrd.verifier_runs
+        "UPDATE wyrd.verifier_executions
             SET lease_expires_at = statement_timestamp() - INTERVAL '20 seconds'
-          WHERE run_id = $1",
+          WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .expect("lease expires");
@@ -1962,378 +1823,35 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
     );
 }
 
-/// One committed record of `subject` written by a principal bound to
-/// `writer`.
-fn record(subject: &CardUid, writer: &CardUid, record_id: &str) -> ObservationRecord {
-    ObservationRecord {
-        subject: subject.clone(),
-        writer: Some(writer.clone()),
-        record_id: record_id.to_owned(),
-        event_time: at(22, 11, 59),
-    }
-}
-
-/// A binding's observation runs as `(record_id, ordinal)` in ordinal order.
-///
-/// # Panics
-/// Panics when the runs cannot be read.
-async fn ordinals(conn: &mut TenantConn<'_>, binding: BindingId) -> Vec<(String, i64)> {
-    sqlx::query_as(
-        "SELECT input_record_id, observation_ordinal FROM wyrd.verifier_runs \
-          WHERE binding_id = $1 AND origin = 'observation' ORDER BY observation_ordinal",
-    )
-    .bind(binding.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("ordinals read")
-}
-
-/// A batch of records for several subjects inserts one run per
-/// (`observations_ready` binding the writer owns, record): two bindings of one
-/// subject each take every record of it, a scheduled binding takes none, a
-/// record whose writer does not own its subject's binding takes none, and a
-/// record repeated in the batch runs once.
-/// Resubmitting the batch inserts nothing and consumes no ordinal, so a later
-/// record numbers straight after the first batch.
-///
-/// # Panics
-/// Panics when a run count or ordinal differs.
-#[tokio::test]
-async fn observation_batches_insert_once_per_binding_and_record() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let system = provision_system_principal(&mut conn, Attribution::unresolved())
-        .await
-        .expect("the tenant SYSTEM principal provisions");
-    let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;
-    let judge = register_verifier(&mut conn, &actor, "judge", eval()).await;
-    let drift = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let (live, live_principal) = register_service(&mut conn, &actor, "live").await;
-    let first = bind(
-        &mut conn,
-        &live,
-        &assertion,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    let second = bind(
-        &mut conn,
-        &live,
-        &judge,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    bind(&mut conn, &live, &drift, daily(), Vec::new()).await;
-    let (other, other_principal) = register_service(&mut conn, &actor, "other").await;
-    let other_binding = bind(
-        &mut conn,
-        &other,
-        &assertion,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    let (foreign, foreign_principal) = register_service(&mut conn, &actor, "foreign").await;
-    bind(
-        &mut conn,
-        &foreign,
-        &assertion,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    for principal in [live_principal, other_principal, foreign_principal] {
-        record_machine_authentication(&mut conn, principal)
-            .await
-            .expect("activation records");
-    }
-    let batch = [
-        record(&live, &live, "r-1"),
-        record(&other, &other, "o-1"),
-        record(&foreign, &live, "s-1"),
-        record(&live, &live, "r-2"),
-        record(&live, &live, "r-1"),
-    ];
-
-    let inserted = enqueue_observation_batch(&queue, &mut conn, &batch).await;
-    assert_eq!(inserted, 5, "two live bindings x two records, one other");
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &batch).await,
-        0,
-        "a repeated batch inserts nothing"
-    );
-    assert_eq!(run_count(&mut conn).await, 5);
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &[record(&live, &live, "r-3")]).await,
-        2
-    );
-    let numbered = |records: &[(&str, i64)]| -> Vec<(String, i64)> {
-        records
-            .iter()
-            .map(|(record, ordinal)| ((*record).to_owned(), *ordinal))
-            .collect()
-    };
-    for binding in [first, second] {
-        assert_eq!(
-            ordinals(&mut conn, binding).await,
-            numbered(&[("r-1", 1), ("r-2", 2), ("r-3", 3)]),
-            "no repeat consumed an ordinal"
-        );
-    }
-    assert_eq!(
-        ordinals(&mut conn, other_binding).await,
-        numbered(&[("o-1", 1)])
-    );
-    let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT DISTINCT sub_principal_id, act_principal_id \
-           FROM wyrd.verifier_runs WHERE binding_id = $1",
-    )
-    .bind(first.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("pairs read");
-    assert_eq!(
-        pairs,
-        [(live_principal.as_uuid(), system)],
-        "every observation-triggered run serves the owner with the SYSTEM actor, never the writer"
-    );
-}
-
-/// Two frames that name the same two subjects in opposite orders serialize
-/// instead of deadlocking.
-///
-/// One outbox batch mixes records for every subject its producers emitted,
-/// in arrival order, and enqueues them in one transaction. Locking each
-/// binding as its record arrived let two such batches hold one binding each
-/// and wait on the other until Postgres aborted one. The batch enqueue locks
-/// every binding it will touch up front, in binding order, so the second
-/// batch waits at its first statement and then completes.
-///
-/// # Panics
-/// Panics when the second frame does not wait for the first, either frame
-/// fails, or the frames do not make one run per row.
-#[tokio::test]
-async fn frames_naming_subjects_in_opposite_orders_serialize() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut setup = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let verifier = register_verifier(&mut setup, &actor, "eval", eval()).await;
-    let mut subjects = Vec::new();
-    for name in ["assertion", "judge"] {
-        let (owner, principal) = register_service(&mut setup, &actor, name).await;
-        bind(
-            &mut setup,
-            &owner,
-            &verifier,
-            BindingActivation::ObservationsReady,
-            Vec::new(),
-        )
-        .await;
-        record_machine_authentication(&mut setup, principal)
-            .await
-            .expect("activation records");
-        subjects.push(owner);
-    }
-    setup.commit().await.expect("setup commits");
-    let [x, y] = [&subjects[0], &subjects[1]];
-
-    let mut first = fixture.tenant_conn().await.expect("first opens");
-    let made = enqueue_observation_batch(
-        &queue,
-        &mut first,
-        &[record(x, x, "a-1"), record(y, y, "a-2")],
-    )
-    .await;
-    assert_eq!(made, 2);
-    let mut second = fixture.tenant_conn().await.expect("second opens");
-    let mut probe = fixture.tenant_conn().await.expect("probe opens");
-    let second_frame = async {
-        let made = enqueue_observation_batch(
-            &queue,
-            &mut second,
-            &[record(y, y, "b-1"), record(x, x, "b-2")],
-        )
-        .await;
-        second.commit().await.expect("second commits");
-        made
-    };
-    tokio::pin!(second_frame);
-    let raced = tokio::select! {
-        made = &mut second_frame => Some(made),
-        () = await_blocked_backend(&mut probe) => None,
-    };
-    assert_eq!(
-        raced, None,
-        "the second frame waits for every binding the first frame holds"
-    );
-    first.commit().await.expect("first commits");
-    assert_eq!(second_frame.await, 2);
-    drop(probe);
-
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    assert_eq!(run_count(&mut conn).await, 4);
-}
-
-/// An Eval record of a Card-bound writer runs only the bindings its writer
-/// owns, while an unbound writer's record runs every binding of its subject.
-///
-/// Services A and B each own an `observations_ready` binding on A's Card. A
-/// record A writes runs A's binding and never B's: not while B is active, and
-/// not when the record is retried after B authenticates again. A record B
-/// writes on the same subject runs B's binding and not A's. A record written
-/// by a principal bound to no Card runs both.
-///
-/// # Panics
-/// Panics when a binding takes a run of a record its owner did not write, or
-/// misses a run of one it did.
-#[tokio::test]
-async fn observation_runs_follow_the_writer() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
-    let (a, _) = register_service(&mut conn, &actor, "writer-a").await;
-    let (b, b_principal) = register_service(&mut conn, &actor, "writer-b").await;
-    let a_binding = bind(
-        &mut conn,
-        &a,
-        &verifier,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
-    )
-    .await;
-    let b_binding = project_bindings(
-        &mut conn,
-        &b,
-        &CardKind::Service,
-        &[NewBinding {
-            subject_occurrence_key: "a".to_owned(),
-            card_uid: a.clone(),
-            verifier_card_uid: verifier.clone(),
-            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
-            operators: Vec::new(),
-            activation: BindingActivation::ObservationsReady,
-        }],
-    )
-    .await
-    .expect("B's binding on A projects")[0];
-    record_machine_authentication(&mut conn, b_principal)
-        .await
-        .expect("B authenticates");
-
-    let first = [record(&a, &a, "a-1")];
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &first).await,
-        1
-    );
-    record_machine_authentication(&mut conn, b_principal)
-        .await
-        .expect("B authenticates again");
-    let retried = [record(&a, &a, "a-1"), record(&a, &a, "a-2")];
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &retried).await,
-        1,
-        "only A's new record runs, and only on A's binding"
-    );
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &[record(&a, &b, "b-1")]).await,
-        1
-    );
-
-    let numbered = |records: &[(&str, i64)]| -> Vec<(String, i64)> {
-        records
-            .iter()
-            .map(|(record, ordinal)| ((*record).to_owned(), *ordinal))
-            .collect()
-    };
-    assert_eq!(
-        ordinals(&mut conn, a_binding).await,
-        numbered(&[("a-1", 1), ("a-2", 2)])
-    );
-    assert_eq!(
-        ordinals(&mut conn, b_binding).await,
-        numbered(&[("b-1", 1)]),
-        "B never takes a run of A's record"
-    );
-
-    let unbound = ObservationRecord {
-        writer: None,
-        ..record(&a, &a, "u-1")
-    };
-    assert_eq!(
-        enqueue_observation_batch(&queue, &mut conn, &[unbound]).await,
-        2,
-        "a writer bound to no Card activates every binding of the subject"
-    );
-    assert_eq!(
-        ordinals(&mut conn, a_binding).await,
-        numbered(&[("a-1", 1), ("a-2", 2), ("u-1", 3)])
-    );
-    assert_eq!(
-        ordinals(&mut conn, b_binding).await,
-        numbered(&[("b-1", 1), ("u-1", 2)])
-    );
-}
-
 /// Waiting for a trace refunds the attempt and requeues after the poll delay;
-/// once the fixed deadline measured from the run's creation passes, the run
+/// once the fixed deadline measured from the execution's creation passes, the execution
 /// settles `timed_out` with no result, and a stale token changes nothing.
 ///
 /// # Panics
-/// Panics when a wait consumes an attempt, the deadline does not time the run
+/// Panics when a wait consumes an attempt, the deadline does not time the execution
 /// out, or a stale token settles.
 #[tokio::test]
 async fn trace_wait_requeues_until_deadline_then_times_out() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
-    let binding = bind(
+    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "judge", custom_drift()).await;
+    let execution = submitted(
+        &queue,
         &mut conn,
-        &owner,
-        &verifier,
-        BindingActivation::ObservationsReady,
-        Vec::new(),
+        &submission(
+            fixture.data_tenant_id(),
+            authority(&actor),
+            request(&verifier, &owner),
+            None,
+        ),
     )
     .await;
-    let authority = background(&mut conn, owner_principal).await;
-    let run = enqueued(
-        queue
-            .enqueue(
-                &mut conn,
-                &RunRequest::Observation {
-                    binding_id: binding,
-                    record_id: "record-1".to_owned(),
-                    event_time: at(22, 11, 59),
-                    authority,
-                },
-            )
-            .await
-            .expect("observation enqueues"),
-    );
     let waiting = VerificationError {
         code: "trace_not_landed".to_owned(),
         message: "the required trace has not landed".to_owned(),
@@ -2351,10 +1869,10 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
         .await
         .expect("wait answers")
     else {
-        panic!("a run inside its deadline must requeue");
+        panic!("a execution inside its deadline must requeue");
     };
     assert!(due > database_now(&mut conn).await);
-    expire_deadlines(&mut conn, run).await;
+    expire_deadlines(&mut conn, execution).await;
     let second = claim(&queue, &mut conn).await;
     assert_eq!(second.attempt, 1, "waiting must not consume an attempt");
     assert_eq!(second.input, first.input);
@@ -2372,11 +1890,11 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
         TraceWaitOutcome::StaleLease
     );
 
-    sqlx::query("UPDATE wyrd.verifier_runs SET created_at = created_at - INTERVAL '2 hours' WHERE run_id = $1")
-        .bind(run.as_uuid())
+    sqlx::query("UPDATE wyrd.verifier_executions SET created_at = created_at - INTERVAL '2 hours' WHERE execution_id = $1")
+        .bind(execution.as_uuid())
         .execute(&mut **conn.transaction())
         .await
-        .expect("run ages");
+        .expect("execution ages");
     assert_eq!(
         queue
             .await_trace(
@@ -2391,13 +1909,13 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
         TraceWaitOutcome::TimedOut
     );
     let status = queue
-        .run_status(&mut conn, run)
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert_eq!(status.status, VerificationExecutionStatus::TimedOut);
+        .expect("execution exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::TimedOut);
     assert_eq!(status.result_id, None);
-    assert_eq!(status.error, Some(waiting));
+    assert_eq!(status.state.error, Some(waiting));
 }
 
 /// Runs, dispatches, and status reads are invisible to another tenant, which
@@ -2405,41 +1923,29 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
 /// owning tenant, and queue depth counts every tenant's non-terminal work.
 ///
 /// # Panics
-/// Panics when tenant B can read, claim, or settle tenant A's run, or
+/// Panics when tenant B can read, claim, or settle tenant A's execution, or
 /// discovery and depth differ from the committed queue.
 #[tokio::test]
 async fn queue_state_is_tenant_isolated() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let other = fixture
-        .seed_additional_tenant("verifier-runs-other")
+        .seed_additional_tenant("verifier-executions-other")
         .await
         .expect("second tenant seeds");
     let tenant = fixture.data_tenant_id();
     let actor = actor(tenant);
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        daily(),
-        vec![FrozenTarget::Uid(uid())],
-    )
-    .await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
     record_machine_authentication(&mut conn, principal)
         .await
         .expect("owner activates");
-    let failed = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let failed = scheduled(&queue, &mut conn, binding).await;
     let claimed = claim(&queue, &mut conn).await;
     queue
         .complete(
@@ -2448,26 +1954,21 @@ async fn queue_state_is_tenant_isolated() {
             VerificationResultId::new_v7(),
             VerificationVerdict::Failed,
             "drift detected",
-            DRIFT_COUNTS,
+            Some(DRIFT_COUNTS),
         )
         .await
-        .expect("run completes");
-    let pending = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("second run enqueues"),
-    );
+        .expect("execution completes");
+    let pending = scheduled(&queue, &mut conn, binding).await;
     conn.commit().await.expect("tenant A commits");
 
     let mut foreign = fixture
         .tenant_conn_for(other)
         .await
         .expect("tenant B opens");
-    for run in [failed, pending] {
+    for execution in [failed, pending] {
         assert!(
             queue
-                .run_status(&mut foreign, run)
+                .execution_status(&mut foreign, execution)
                 .await
                 .expect("foreign status reads")
                 .is_none()
@@ -2482,7 +1983,12 @@ async fn queue_state_is_tenant_isolated() {
     );
     assert_eq!(
         queue
-            .enqueue(&mut foreign, &manual_binding(&actor, binding))
+            .enqueue_scheduled(
+                &mut foreign,
+                binding,
+                window(),
+                &ExecutionAuthority::background(authority(&actor), actor.id),
+            )
             .await
             .expect("foreign enqueue answers"),
         EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
@@ -2505,7 +2011,7 @@ async fn queue_state_is_tenant_isolated() {
     let operator = fixture.operator_pool();
     assert_eq!(
         queue
-            .tenants_with_runnable_runs(operator)
+            .tenants_with_runnable_executions(operator)
             .await
             .expect("runnable tenants read"),
         vec![tenant]
@@ -2534,7 +2040,7 @@ async fn queue_state_is_tenant_isolated() {
     );
     let depth = queue.queue_depth(operator).await.expect("depth reads");
     assert_eq!(
-        depth.runs,
+        depth.executions,
         QueueCounts {
             pending: 1,
             retrying: 0,
@@ -2552,7 +2058,7 @@ async fn queue_state_is_tenant_isolated() {
 }
 
 /// Binding GET reports the owner gate, generic readiness, cursor, last
-/// qualifying exchange, and latest run; activity lapses after the inactivity
+/// qualifying exchange, and latest execution; activity lapses after the inactivity
 /// window and PSI readiness stays fail-closed.
 ///
 /// # Panics
@@ -2561,7 +2067,7 @@ async fn queue_state_is_tenant_isolated() {
 async fn binding_status_reports_activity_readiness_and_latest_run() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -2569,8 +2075,8 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
     let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
     let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
-    let ready = bind(&mut conn, &owner, &custom, daily(), Vec::new()).await;
-    let unready = bind(&mut conn, &owner, &psi, daily(), Vec::new()).await;
+    let ready = bind(&mut conn, &owner, &custom, Vec::new()).await;
+    let unready = bind(&mut conn, &owner, &psi, Vec::new()).await;
 
     let dormant = queue
         .binding_status(&mut conn, ready)
@@ -2580,7 +2086,7 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
     assert!(!dormant.active);
     assert_eq!(dormant.next_run_at, None);
     assert_eq!(dormant.last_activated_at, None);
-    assert_eq!(dormant.last_run_id, None);
+    assert_eq!(dormant.last_execution_id, None);
 
     let activated_after = database_now(&mut conn).await;
     record_machine_authentication(&mut conn, principal)
@@ -2588,12 +2094,7 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
         .expect("owner activates");
     let mut latest = None;
     for _ in 0..2 {
-        latest = Some(enqueued(
-            queue
-                .enqueue(&mut conn, &manual_binding(&actor, ready))
-                .await
-                .expect("run enqueues"),
-        ));
+        latest = Some(scheduled(&queue, &mut conn, ready).await);
     }
     let status = queue
         .binding_status(&mut conn, ready)
@@ -2613,7 +2114,7 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
             .is_some_and(|at| at >= activated_after),
         "the exchange is stamped by the database clock"
     );
-    assert_eq!(status.last_run_id, latest);
+    assert_eq!(status.last_execution_id, latest);
 
     let psi_status = queue
         .binding_status(&mut conn, unready)
@@ -2651,39 +2152,27 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
 async fn database_clock_owns_verifier_queue_deadlines() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(
-        &mut conn,
-        &owner,
-        &verifier,
-        daily(),
-        vec![FrozenTarget::Uid(uid())],
-    )
-    .await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
 
     let before_enqueue = database_now(&mut conn).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let execution = scheduled(&queue, &mut conn, binding).await;
     let after_enqueue = database_now(&mut conn).await;
     let (created_at, next_attempt_at, updated_at): (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) =
         sqlx::query_as(
             "SELECT created_at, next_attempt_at, updated_at \
-             FROM wyrd.verifier_runs WHERE run_id = $1",
+             FROM wyrd.verifier_executions WHERE execution_id = $1",
         )
-        .bind(run.as_uuid())
+        .bind(execution.as_uuid())
         .fetch_one(&mut **conn.transaction())
         .await
-        .expect("run timestamps read");
+        .expect("execution timestamps read");
     for (field, stamp) in [
         ("created_at", created_at),
         ("next_attempt_at", next_attempt_at),
@@ -2720,7 +2209,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
         "the retry deadline is the database instant plus the configured backoff"
     );
     assert_eq!(
-        stored_backoff(&mut conn, run).await,
+        stored_backoff(&mut conn, execution).await,
         Duration::seconds(30),
         "the stored backoff is derived entirely inside the database"
     );
@@ -2730,10 +2219,10 @@ async fn database_clock_owns_verifier_queue_deadlines() {
             .await
             .expect("early claim runs")
             .is_none(),
-        "the database refuses a run whose own backoff has not elapsed"
+        "the database refuses a execution whose own backoff has not elapsed"
     );
 
-    expire_deadlines(&mut conn, run).await;
+    expire_deadlines(&mut conn, execution).await;
     let settled = claim(&queue, &mut conn).await;
     let before_complete = database_now(&mut conn).await;
     assert_eq!(
@@ -2744,29 +2233,31 @@ async fn database_clock_owns_verifier_queue_deadlines() {
                 VerificationResultId::new_v7(),
                 VerificationVerdict::Failed,
                 "drift detected",
-                DRIFT_COUNTS,
+                Some(DRIFT_COUNTS),
             )
             .await
             .expect("completion answers"),
         Settlement::Applied
     );
     let after_complete = database_now(&mut conn).await;
-    let settled_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT settled_at FROM wyrd.verifier_runs WHERE run_id = $1")
-            .bind(run.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("settled instant reads");
+    let settled_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT settled_at FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("settled instant reads");
     assert!(
         (before_complete..=after_complete).contains(&settled_at),
         "settlement is stamped by the database clock"
     );
-    let dispatched_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT created_at FROM wyrd.operator_dispatches WHERE run_id = $1")
-            .bind(run.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("dispatch instant reads");
+    let dispatched_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM wyrd.operator_dispatches WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("dispatch instant reads");
     assert!(
         (before_complete..=after_complete).contains(&dispatched_at),
         "a dispatch created by settlement is stamped by the database clock"
@@ -2805,35 +2296,29 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     assert_eq!(tick.due_at, due);
 }
 
-/// Settle one failed binding run of `verifier` on `owner` with two Operators
-/// and return the run.
+/// Settle one failed binding execution of `verifier` on `owner` with two Operators
+/// and return the execution.
 ///
 /// # Panics
-/// Panics when the run cannot be enqueued, claimed, or completed.
-async fn failed_run_with_two_dispatches(
-    queue: &VerifierRunQueue,
+/// Panics when the execution cannot be enqueued, claimed, or completed.
+async fn failed_execution_with_two_dispatches(
+    queue: &VerifierExecutionQueue,
     conn: &mut TenantConn<'_>,
     actor: &Principal,
-) -> VerificationRunId {
+) -> ExecutionId {
     let (owner, _) = register_service(conn, actor, "svc").await;
     let verifier = register_verifier(conn, actor, "drift", custom_drift()).await;
     let binding = bind(
         conn,
         &owner,
         &verifier,
-        daily(),
         vec![
             FrozenTarget::Uid(uid()),
             FrozenTarget::Digest("sha256:operator".to_owned()),
         ],
     )
     .await;
-    let run = enqueued(
-        queue
-            .enqueue(conn, &manual_binding(actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
+    let execution = scheduled(queue, conn, binding).await;
     let claimed = claim(queue, conn).await;
     let summary = "x".repeat(2 * MAX_SUMMARY_CHARS);
     queue
@@ -2843,15 +2328,15 @@ async fn failed_run_with_two_dispatches(
             VerificationResultId::new_v7(),
             VerificationVerdict::Failed,
             &summary,
-            DRIFT_COUNTS,
+            Some(DRIFT_COUNTS),
         )
         .await
         .expect("failed completion settles");
-    run
+    execution
 }
 
 /// A failed settlement freezes the bounded failure context on each dispatch,
-/// built from the settled run and its exact Cards.
+/// built from the settled execution and its exact Cards.
 ///
 /// # Panics
 /// Panics when the stored context is missing a field, carries another
@@ -2860,14 +2345,14 @@ async fn failed_run_with_two_dispatches(
 async fn failed_settlement_freezes_the_bounded_failure_context() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    let run = failed_run_with_two_dispatches(&queue, &mut conn, &actor).await;
+    let execution = failed_execution_with_two_dispatches(&queue, &mut conn, &actor).await;
 
     let contexts: Vec<(Uuid, Value)> = sqlx::query_as(
-        "SELECT dispatch_id, failure_context FROM wyrd.operator_dispatches WHERE run_id = $1",
+        "SELECT dispatch_id, failure_context FROM wyrd.operator_dispatches WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .fetch_all(&mut **conn.transaction())
     .await
     .expect("contexts read");
@@ -2876,12 +2361,12 @@ async fn failed_settlement_freezes_the_bounded_failure_context() {
         let context: OperatorFailureContext =
             serde_json::from_value(context).expect("context is the closed shape");
         assert_eq!(context.dispatch_id.as_uuid(), dispatch_id);
-        assert_eq!(context.run_id, run);
+        assert_eq!(context.execution_id, execution);
         assert_eq!(context.verdict, VerificationVerdict::Failed);
         assert_eq!(context.verifier_ref, "default/drift@1.0.0");
         assert_eq!(context.subject_ref, "default/svc@1.0.0");
         assert_eq!(context.summary.chars().count(), MAX_SUMMARY_CHARS);
-        assert_eq!(context.verifier, DRIFT_COUNTS);
+        assert_eq!(context.drift, Some(DRIFT_COUNTS));
     }
 }
 
@@ -2896,10 +2381,10 @@ async fn failed_settlement_freezes_the_bounded_failure_context() {
 async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let runs = VerifierRunQueue::default();
+    let executions = VerifierExecutionQueue::default();
     let dispatches = OperatorDispatchQueue::default();
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    let run = failed_run_with_two_dispatches(&runs, &mut conn, &actor).await;
+    let execution = failed_execution_with_two_dispatches(&executions, &mut conn, &actor).await;
     conn.commit().await.expect("settlement commits");
     assert_eq!(
         dispatches
@@ -2927,7 +2412,7 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
             .expect("claim runs")
             .is_none()
     );
-    assert_eq!(first.run_id, run);
+    assert_eq!(first.execution_id, execution);
     assert_eq!(first.attempt, 1);
     assert!(first.remaining <= std::time::Duration::from_mins(5));
     assert!(first.remaining > std::time::Duration::from_secs(290));
@@ -3013,12 +2498,12 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
             );
         }
     }
-    let status = runs
-        .run_status(&mut conn, run)
+    let status = executions
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    let mut statuses: Vec<_> = status.dispatches.iter().map(|d| d.status).collect();
+        .expect("execution exists");
+    let mut statuses: Vec<_> = status.state.dispatches.iter().map(|d| d.status).collect();
     statuses.sort_by_key(|status| <&'static str>::from(*status));
     assert_eq!(
         statuses,
@@ -3027,7 +2512,7 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
             OperatorDispatchStatus::Failed
         ]
     );
-    assert_eq!(status.status, VerificationExecutionStatus::Completed);
+    assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
 }
 
 /// The largest decimal `Retry-After` a provider can send (`u64::MAX`
@@ -3043,10 +2528,10 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
 async fn maximum_retry_after_settles_at_the_deadline() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let runs = VerifierRunQueue::default();
+    let executions = VerifierExecutionQueue::default();
     let dispatches = OperatorDispatchQueue::default();
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    failed_run_with_two_dispatches(&runs, &mut conn, &actor).await;
+    failed_execution_with_two_dispatches(&executions, &mut conn, &actor).await;
     let claimed = dispatches
         .claim(&mut conn)
         .await
@@ -3092,14 +2577,14 @@ async fn maximum_retry_after_settles_at_the_deadline() {
 async fn expired_dispatch_deadline_fails_without_a_claim() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
-    let runs = VerifierRunQueue::default();
+    let executions = VerifierExecutionQueue::default();
     let expired = OperatorDispatchQueue::new(
         3,
         std::time::Duration::ZERO,
         std::time::Duration::from_secs(45),
     );
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    let run = failed_run_with_two_dispatches(&runs, &mut conn, &actor).await;
+    let execution = failed_execution_with_two_dispatches(&executions, &mut conn, &actor).await;
     assert!(
         expired
             .claim(&mut conn)
@@ -3107,12 +2592,12 @@ async fn expired_dispatch_deadline_fails_without_a_claim() {
             .expect("claim runs")
             .is_none()
     );
-    let status = runs
-        .run_status(&mut conn, run)
+    let status = executions
+        .execution_status(&mut conn, execution)
         .await
         .expect("status reads")
-        .expect("run exists");
-    assert!(status.dispatches.iter().all(|dispatch| {
+        .expect("execution exists");
+    assert!(status.state.dispatches.iter().all(|dispatch| {
         dispatch.status == OperatorDispatchStatus::Failed
             && dispatch.error.as_ref().map(|e| e.code.as_str()) == Some("deadline_exceeded")
     }));

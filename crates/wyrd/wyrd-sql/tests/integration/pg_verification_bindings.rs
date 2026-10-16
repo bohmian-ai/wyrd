@@ -4,15 +4,17 @@
 //! Every test runs against the repository managed Postgres through tenant
 //! connections, so forced RLS applies.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
 use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{BindingId, CardUid};
+use wyrd_spec::ids::{BindingId, CardUid, FeatureName, SlotName};
 use wyrd_spec::registry::RegistrationOperationId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -23,8 +25,8 @@ use wyrd_sql::queries::cards::{
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::verification::{
-    BindingActivation, BindingActivity, FrozenTarget, InactivityTimeout, NewBinding,
-    binding_activity, owner_binding_ids, project_bindings, record_machine_authentication,
+    BindingActivity, FrozenTarget, InactivityTimeout, NewBinding, binding_activity,
+    owner_binding_ids, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -76,10 +78,12 @@ fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
         verifier_card_uid: verifier.clone(),
         trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
         operators: vec![FrozenTarget::Uid(uid())],
-        activation: BindingActivation::Schedule {
-            cron: "0 2 * * *".to_owned(),
-            tz: None,
-        },
+        cron: "0 2 * * *".to_owned(),
+        tz: None,
+        inputs: BTreeMap::from([(
+            SlotName::new("current").expect("valid slot name"),
+            ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),
+        )]),
     }
 }
 
@@ -436,9 +440,9 @@ async fn projection_is_transactional_and_tenant_isolated() {
 }
 
 /// The first qualifying exchange arms a null cursor to the next boundary and
-/// activates the owner; a renewal moves only activity, never the cursor; an
-/// `observations_ready` binding never gets a cursor; component bindings
-/// inherit the Service principal's activity.
+/// activates the owner; a renewal moves only activity, never the cursor; every
+/// binding of the owner is armed; component bindings inherit the Service
+/// principal's activity.
 ///
 /// # Panics
 /// Panics when arming, renewal, window, or inheritance expectations fail.
@@ -452,17 +456,18 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
         .expect("tenant connection opens");
     let (owner, principal) =
         register_service(&mut conn, &actor, &service_card("armed", "1.0.0")).await;
-    let mut ready = schedule_binding(OWNER_OCCURRENCE_KEY, &uid());
-    ready.activation = BindingActivation::ObservationsReady;
     let ids = project_bindings(
         &mut conn,
         &owner,
         &CardKind::Service,
-        &[schedule_binding("retriever", &uid()), ready],
+        &[
+            schedule_binding("retriever", &uid()),
+            schedule_binding(OWNER_OCCURRENCE_KEY, &uid()),
+        ],
     )
     .await
     .expect("bindings project");
-    let (component, eval) = (ids[0], ids[1]);
+    let (component, service) = (ids[0], ids[1]);
 
     let before = gate(&mut conn, component).await;
     assert!(!before.active, "never-authenticated owner is inactive");
@@ -479,7 +484,10 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
         armed > anchor,
         "the cursor is the first boundary after the database anchor"
     );
-    assert_eq!(cursor(&mut conn, eval.as_uuid()).await, None);
+    assert!(
+        cursor(&mut conn, service.as_uuid()).await.is_some(),
+        "the exchange arms every binding of the owner"
+    );
 
     record_machine_authentication(&mut conn, principal)
         .await
@@ -491,12 +499,12 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
     move_stamp(&mut conn, principal, "25 hours").await;
     assert!(!gate(&mut conn, component).await.active);
     move_stamp(&mut conn, principal, "1 hour").await;
-    let eval_gate = gate(&mut conn, eval).await;
+    let service_gate = gate(&mut conn, service).await;
     assert!(
-        eval_gate.active,
-        "component and eval bindings share the Service principal"
+        service_gate.active,
+        "component and Service-level bindings share the Service principal"
     );
-    assert_eq!(eval_gate.principal_id, Some(principal));
+    assert_eq!(service_gate.principal_id, Some(principal));
 }
 
 /// Read one binding's gate under the default window, as the database's
@@ -749,7 +757,7 @@ async fn non_v7_stored_identities_are_refused() {
     ));
 }
 
-/// Insert an `observations_ready` owner binding with raw identities,
+/// Insert a scheduled owner binding with raw identities,
 /// bypassing [`project_bindings`] so a test can store an invalid UUID version.
 ///
 /// # Panics
@@ -758,9 +766,10 @@ async fn insert_raw_binding(conn: &mut TenantConn<'_>, binding: Uuid, owner: Uui
     sqlx::query(
         "INSERT INTO wyrd.verification_bindings \
             (binding_id, data_tenant_id, owner_card_uid, owner_card_kind, \
-             subject_occurrence_key, card_uid, verifier_card_uid, trigger_digest, activation) \
+             subject_occurrence_key, card_uid, verifier_card_uid, trigger_digest, activation, \
+             schedule_cron) \
          VALUES ($1, wyrd.current_tenant(), $2, 'Service', $3, $2, $4, 'sha256:t', \
-                 'observations_ready')",
+                 'schedule', '0 2 * * *')",
     )
     .bind(binding)
     .bind(owner)

@@ -14,4 +14,4 @@ mod pg_platform_identity;
 mod pg_query_compile;
 mod pg_tenant_slug;
 mod pg_verification_bindings;
-mod pg_verifier_runs;
+mod pg_verifier_executions;

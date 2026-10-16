@@ -67,7 +67,7 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     if let Spec::Verifier(spec) = &card.spec
         && let Err(error) = spec.validate()
     {
-        diagnostics.push(catalog_error(card, &error.into()));
+        diagnostics.push(catalog_error(card, &error));
     }
 }
 
@@ -331,6 +331,7 @@ mod tests {
                 },
             }))),
             on_failure: Vec::new(),
+            inputs: BTreeMap::new(),
         }
     }
 }

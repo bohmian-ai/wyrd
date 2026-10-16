@@ -1,32 +1,35 @@
-//! Stage-walking driver for `ExecutionPlan`.
+//! Stage-walking driver for `ExecutionPlan`s.
 //!
-//! The driver:
+//! [`walk`] is the one stage lifecycle every `vala-eval` execution shares:
 //!
-//! 1. Walks `ExecutionPlan::stages` in topological order, threading an
-//!    [`Arc<ContextSnapshot>`] through each stage.
-//! 2. Per stage: resolves dependency-skip and condition-gate skips
-//!    sequentially (no IO), then buckets the runnable tasks by
-//!    [`crate::store::EvalTaskKind`] and fans the four buckets out
-//!    concurrently via `tokio::JoinSet` coordinated by `tokio::try_join!`.
-//! 3. At each stage barrier: rebuilds the next snapshot by extending the
-//!    prior one with the new [`crate::context::TaskOutput`]s. The rebuild is
-//!    a sequence of `Arc::clone` bumps; no JSON deep-clones happen here.
-//! 4. Maintains a single-threaded [`RunLedger`] for per-run state (skip set
-//!    plus outcome stream). [`crate::store::TaskRegistry`] stays immutable.
+//! 1. Walks the stages in topological order, settling every task into one
+//!    [`RunLedger`].
+//! 2. Per stage: the caller's `prepare` classifies each task synchronously
+//!    (no IO) against the ledger of earlier stages, settling skips without
+//!    running and handing back runnable futures.
+//! 3. Fans the runnable tasks out concurrently on one `tokio::JoinSet`.
+//! 4. At the stage barrier: appends the stage's settlements to the ledger in
+//!    declaration order.
+//!
+//! [`execute_plan`] drives Eval task plans through it: each stage's
+//! [`ContextSnapshot`] extends the record context with every earlier output
+//! (a sequence of `Arc::clone` bumps, no JSON deep-clones), and each task runs
+//! on its kind's executor. Verifier executions drive the same walk through
+//! `crate::blocks::VerificationEngine`.
 //!
 //! An executor error aborts the run and propagates to the caller: an error is
 //! an execution failure, never a subject failure, so it is never recorded as a
 //! Failed `AssertionResult`. Only a completed comparison produces a result.
-//!
-//! The four-bucket fan-out shape keeps task kinds concurrent within a stage.
 //! Executors return outputs rather than writing into shared state, so no locks
 //! are needed across the stage barrier.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tracing::Instrument as _;
 
 use wyrd_spec::vala::eval::{
@@ -143,21 +146,131 @@ impl EvalReport {
     }
 }
 
-/// Output of the task-classification pass: runnable buckets by kind and skip outcomes in declaration order.
-type ClassifiedStage = (BTreeMap<EvalTaskKind, Vec<EvalTask>>, Vec<TaskRunOutcome>);
-
-/// Per-run state owned by the driver. Single-threaded — no locks.
+/// Per-run state shared by every stage-walking execution: each settled task
+/// by id, in the order the stage walk settled it.
 ///
-/// `skipped` is the cumulative skip set used for `DependencySkipped`
-/// propagation across stages. `outcomes` is the stream consumed by the
-/// final [`EvalReport`].
-#[derive(Debug, Default, Clone)]
-pub struct RunLedger {
-    /// Task ids that were skipped during this run, in any order.
-    pub skipped: BTreeSet<TaskId>,
-    /// Outcomes in the order the stage loop produced them.
-    pub outcomes: Vec<TaskRunOutcome>,
+/// [`walk`] owns it and appends one stage at a time in declaration order, so
+/// iteration order is stage order and, within a stage, declaration order.
+/// Preparation of a later stage reads earlier settlements through
+/// [`RunLedger::get`]; nothing mutates a settled entry.
+#[derive(Debug, Clone)]
+pub struct RunLedger<O> {
+    /// Settled tasks in settlement order.
+    entries: Vec<(TaskId, O)>,
+    /// Position of each settled task in `entries`.
+    index: HashMap<TaskId, usize>,
 }
+
+impl<O> Default for RunLedger<O> {
+    /// An empty ledger: nothing has settled.
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+}
+
+impl<O> RunLedger<O> {
+    /// The settlement of `task`, when an earlier stage settled it.
+    #[must_use]
+    pub fn get(&self, task: &TaskId) -> Option<&O> {
+        self.index.get(task).map(|&at| &self.entries[at].1)
+    }
+
+    /// Every settlement, in settlement order.
+    pub fn iter(&self) -> impl Iterator<Item = (&TaskId, &O)> + '_ {
+        self.entries.iter().map(|(id, settled)| (id, settled))
+    }
+
+    /// Record `task`'s settlement after every earlier one.
+    fn push(&mut self, task: TaskId, settled: O) {
+        self.index.insert(task.clone(), self.entries.len());
+        self.entries.push((task, settled));
+    }
+}
+
+impl<O> IntoIterator for RunLedger<O> {
+    /// One owned settlement: the task id and what it settled as.
+    type Item = (TaskId, O);
+    /// Consumes the ledger, yielding settlements in settlement order.
+    type IntoIter = std::vec::IntoIter<(TaskId, O)>;
+
+    /// Every settlement, in settlement order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+/// A pending task future spawned by [`walk`].
+pub(crate) type Running<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send>>;
+
+/// How one planned task proceeds, decided before its stage fans out.
+pub(crate) enum Prepared<O, E> {
+    /// Settled without running, such as a skip.
+    Settled(O),
+    /// Runs concurrently with the rest of its stage.
+    Run(Running<O, E>),
+}
+
+/// Walk `stages` in order, settling every task into one [`RunLedger`].
+///
+/// This is the single stage lifecycle of `vala-eval`: per stage, `prepare`
+/// sees the ledger of every earlier stage and returns one [`Prepared`] per
+/// stage task, in declaration order; settled tasks are recorded as is, and
+/// runnable ones are spawned on one `JoinSet` inside the caller's current
+/// span, so a task's work stays in the caller's trace. At the stage barrier
+/// the settlements are appended in declaration order. Contract-specific
+/// classification, budgets and results stay in `prepare`.
+///
+/// # Errors
+/// Returns the first `prepare` error, the first task error in completion
+/// order, or `joined` applied to a task that panicked or was aborted.
+///
+/// # Cancellation
+/// Returning early or dropping the future drops the `JoinSet`, which aborts
+/// every task of the stage still running; the stage yields no partial
+/// settlements. Work an aborted task already performed is not rolled back.
+pub(crate) async fn walk<'s, O, E>(
+    stages: impl IntoIterator<Item = &'s Stage>,
+    mut prepare: impl FnMut(&RunLedger<O>, &Stage) -> Result<Vec<Prepared<O, E>>, E>,
+    joined: fn(JoinError) -> E,
+) -> Result<RunLedger<O>, E>
+where
+    O: Send + 'static,
+    E: Send + 'static,
+{
+    let mut ledger = RunLedger::default();
+    for stage in stages {
+        let mut settled = HashMap::new();
+        let mut running = JoinSet::new();
+        for (at, prepared) in prepare(&ledger, stage)?.into_iter().enumerate() {
+            match prepared {
+                Prepared::Settled(done) => {
+                    settled.insert(at, done);
+                }
+                Prepared::Run(task) => {
+                    running.spawn(
+                        async move { (at, task.await) }.instrument(tracing::Span::current()),
+                    );
+                }
+            }
+        }
+        while let Some(done) = running.join_next().await {
+            let (at, done) = done.map_err(joined)?;
+            settled.insert(at, done?);
+        }
+        for (at, task) in stage.tasks.iter().enumerate() {
+            if let Some(done) = settled.remove(&at) {
+                ledger.push(task.clone(), done);
+            }
+        }
+    }
+    Ok(ledger)
+}
+
+/// One Eval task's settlement: the executor output, or why it was skipped.
+type EvalSettled = Result<Arc<TaskOutput>, SkipReason>;
 
 /// Per-variant task execution.
 #[async_trait]
@@ -191,267 +304,118 @@ pub struct Executors {
     pub agent: Arc<dyn TaskExecutor>,
 }
 
+impl Executors {
+    /// The executor that runs tasks of `kind`.
+    fn of(&self, kind: EvalTaskKind) -> &Arc<dyn TaskExecutor> {
+        match kind {
+            EvalTaskKind::Assertion => &self.assertion,
+            EvalTaskKind::LlmJudge => &self.judge,
+            EvalTaskKind::TraceAssertion => &self.trace,
+            EvalTaskKind::AgentAssertion => &self.agent,
+        }
+    }
+}
+
 /// Walk `plan.stages` in order, returning the per-run report.
 /// This is the main entry point for the driver.
 ///
+/// Each stage runs through [`walk`]: its snapshot extends the record context
+/// with every earlier output, dependency and condition skips settle without
+/// running, and every other task runs concurrently on its kind's executor.
+///
 /// # Errors
 /// Returns [`EvalExecError::DagInvalid`] when a plan references a task absent
-/// from the registry, and any condition-evaluation or task-executor error
-/// unchanged; no error is converted into a Failed result.
+/// from the registry or a task panics, and any condition-evaluation or
+/// task-executor error unchanged; no error is converted into a Failed result.
 pub async fn execute_plan(
     plan: &ExecutionPlan,
     cx: &ExecutionContext,
     registry: &TaskRegistry,
     executors: &Executors,
 ) -> Result<EvalReport, EvalExecError> {
-    let mut snapshot = Arc::clone(cx.snapshot());
-    let mut ledger = RunLedger::default();
-    for stage in &plan.stages {
-        snapshot = execute_stage(stage, snapshot, registry, executors, &mut ledger).await?;
-    }
+    let base = cx.snapshot();
+    let ledger = walk(
+        &plan.stages,
+        |ledger: &RunLedger<EvalSettled>, stage| {
+            let outputs = ledger.iter().filter_map(|(id, settled)| {
+                settled
+                    .as_ref()
+                    .ok()
+                    .map(|output| (id.clone(), Arc::clone(output)))
+            });
+            let snapshot = Arc::new(base.extend(outputs));
+            stage
+                .tasks
+                .iter()
+                .map(|id| prepare_task(id, stage, &snapshot, registry, executors, ledger))
+                .collect()
+        },
+        |error| EvalExecError::DagInvalid {
+            reason: format!("task join failure: {error}"),
+        },
+    )
+    .await?;
     Ok(EvalReport {
-        outcomes: ledger.outcomes,
+        outcomes: ledger
+            .into_iter()
+            .map(|(task_id, settled)| match settled {
+                Ok(output) => TaskRunOutcome::Ran(Box::new(output.result().clone())),
+                Err(reason) => TaskRunOutcome::Skipped { task_id, reason },
+            })
+            .collect(),
     })
 }
 
-/// Execute one stage: classify tasks, fan out concurrently, and extend the snapshot.
-///
-/// Returns the new snapshot to thread into the next stage.
-async fn execute_stage(
-    stage: &Stage,
-    snapshot: Arc<ContextSnapshot>,
-    registry: &TaskRegistry,
-    executors: &Executors,
-    ledger: &mut RunLedger,
-) -> Result<Arc<ContextSnapshot>, EvalExecError> {
-    // prepare the tasks: resolve skips and bucket the runnable tasks by kind
-    let (buckets, skips) = classify_stage_tasks(stage, &snapshot, registry, ledger)?;
-
-    // run the buckets concurrently and collect their outputs flat; no ordering guarantees within the stage yet
-    let outputs =
-        fan_out_all_buckets(buckets, Arc::clone(&snapshot), executors, stage.index).await?;
-    let by_id: HashMap<TaskId, TaskOutput> = outputs.into_iter().collect();
-
-    // merge the skips and outputs back into declaration order, extending the ledger and preparing the snapshot extension
-    let (ordered, new_outputs) = order_stage_outcomes(stage, skips, by_id);
-    ledger.outcomes.extend(ordered);
-    Ok(Arc::new(snapshot.extend(new_outputs)))
-}
-
-/// First pass: resolve skips synchronously and bucket the runnable tasks by kind.
-///
-/// Dependency-skip propagation and condition-gate evaluation are both pure
-/// (no IO). `ledger.skipped` is extended in place so later stages — and later
-/// tasks in this same stage — can propagate skips transitively.
-///
-/// Returns the runnable-task buckets and the skip outcomes in declaration order.
-fn classify_stage_tasks(
-    stage: &Stage,
-    snapshot: &ContextSnapshot,
-    registry: &TaskRegistry,
-    ledger: &mut RunLedger,
-) -> Result<ClassifiedStage, EvalExecError> {
-    let mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>> = BTreeMap::new();
-    let mut skips: Vec<TaskRunOutcome> = Vec::new();
-
-    for task_id in &stage.tasks {
-        let task = registry
-            .get(task_id)
-            .ok_or_else(|| EvalExecError::DagInvalid {
-                reason: format!(
-                    "plan stage {} references unknown task {:?}",
-                    stage.index,
-                    task_id.as_str()
-                ),
-            })?;
-
-        if let Some(upstream) = first_skipped_dependency(task, ledger) {
-            ledger.skipped.insert(task_id.clone());
-            skips.push(TaskRunOutcome::Skipped {
-                task_id: task_id.clone(),
-                reason: SkipReason::DependencySkipped { upstream },
-            });
-            continue;
-        }
-
-        if let Some(condition) = task.condition()
-            && !evaluate_condition(task_id, task.depends_on(), condition, snapshot)?
-        {
-            ledger.skipped.insert(task_id.clone());
-            skips.push(TaskRunOutcome::Skipped {
-                task_id: task_id.clone(),
-                reason: SkipReason::ConditionFalse,
-            });
-            continue;
-        }
-
-        buckets
-            .entry(EvalTaskKind::from_task(task))
-            .or_default()
-            .push(task.clone());
-    }
-
-    Ok((buckets, skips))
-}
-
-/// Second pass: run all four task-kind buckets concurrently and return their outputs flat.
-///
-/// `tokio::try_join!` keeps the four kinds parallel. Within each kind,
-/// [`fan_out_bucket`] spawns one Tokio task per eval task via `JoinSet`.
-/// The flat output vec arrives in assertion → judge → trace → agent order;
-/// declaration order is restored by [`order_stage_outcomes`].
-async fn fan_out_all_buckets(
-    mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>>,
-    snapshot: Arc<ContextSnapshot>,
-    executors: &Executors,
-    stage_index: u32,
-) -> Result<Vec<(TaskId, TaskOutput)>, EvalExecError> {
-    let assertion_tasks = buckets.remove(&EvalTaskKind::Assertion).unwrap_or_default();
-    let judge_tasks = buckets.remove(&EvalTaskKind::LlmJudge).unwrap_or_default();
-    let trace_tasks = buckets
-        .remove(&EvalTaskKind::TraceAssertion)
-        .unwrap_or_default();
-    let agent_tasks = buckets
-        .remove(&EvalTaskKind::AgentAssertion)
-        .unwrap_or_default();
-
-    let (assertion_out, judge_out, trace_out, agent_out) = tokio::try_join!(
-        fan_out_bucket(
-            assertion_tasks,
-            Arc::clone(&snapshot),
-            Arc::clone(&executors.assertion),
-            stage_index
-        ),
-        fan_out_bucket(
-            judge_tasks,
-            Arc::clone(&snapshot),
-            Arc::clone(&executors.judge),
-            stage_index
-        ),
-        fan_out_bucket(
-            trace_tasks,
-            Arc::clone(&snapshot),
-            Arc::clone(&executors.trace),
-            stage_index
-        ),
-        fan_out_bucket(
-            agent_tasks,
-            Arc::clone(&snapshot),
-            Arc::clone(&executors.agent),
-            stage_index
-        ),
-    )?;
-
-    Ok(assertion_out
-        .into_iter()
-        .chain(judge_out)
-        .chain(trace_out)
-        .chain(agent_out)
-        .collect())
-}
-
-/// Merge skip outcomes and task outputs into stage-declaration order.
-///
-/// Skips arrived in declaration order from [`classify_stage_tasks`]; they are
-/// re-indexed by task id so the single pass over `stage.tasks` can interleave
-/// them with ran outputs without a second linear scan.
-///
-/// Returns the ordered outcomes (for the ledger) and the new outputs (for
-/// snapshot extension).
-fn order_stage_outcomes(
-    stage: &Stage,
-    skips: Vec<TaskRunOutcome>,
-    mut by_id: HashMap<TaskId, TaskOutput>,
-) -> (Vec<TaskRunOutcome>, Vec<(TaskId, Arc<TaskOutput>)>) {
-    let mut skips_by_id: HashMap<TaskId, TaskRunOutcome> = skips
-        .into_iter()
-        .map(|outcome| (outcome_task_id(&outcome).clone(), outcome))
-        .collect();
-
-    let mut ordered: Vec<TaskRunOutcome> = Vec::with_capacity(stage.tasks.len());
-    let mut new_outputs: Vec<(TaskId, Arc<TaskOutput>)> = Vec::new();
-
-    for task_id in &stage.tasks {
-        if let Some(skip) = skips_by_id.remove(task_id) {
-            ordered.push(skip);
-        } else if let Some(output) = by_id.remove(task_id) {
-            ordered.push(TaskRunOutcome::Ran(Box::new(output.result().clone())));
-            new_outputs.push((task_id.clone(), Arc::new(output)));
-        }
-    }
-
-    (ordered, new_outputs)
-}
-
-/// Run every task of one task-kind bucket concurrently on its shared executor.
-///
-/// [`fan_out_all_buckets`] calls this once per kind (assertion, judge, trace,
-/// agent) for one stage. Each task gets its own Tokio task on a `JoinSet`
-/// sharing `snapshot` and `executor`, running inside the caller's current
-/// span so a task's work (a judge's gateway call) stays in the caller's
-/// trace; outputs are collected in completion
-/// order, and [`order_stage_outcomes`] later restores declaration order. An
-/// empty bucket returns immediately without spawning.
+/// Classify one Eval task of `stage`: a skipped dependency or a false
+/// condition settles it as skipped, otherwise it runs on its kind's executor
+/// against the stage `snapshot`.
 ///
 /// # Errors
-/// Returns the first error observed in completion order: the executor's own
-/// [`EvalExecError`] unchanged, so an executor failure aborts the run rather
-/// than becoming a failed result, or [`EvalExecError::DagInvalid`] when a
-/// spawned task panicked or was cancelled.
-///
-/// # Cancellation
-/// Returning early drops the `JoinSet`, which aborts every sibling task of
-/// this bucket still running; their outputs, and any already collected, are
-/// discarded, so the stage yields no partial results. Dropping this future
-/// (including when `tokio::try_join!` in [`fan_out_all_buckets`] short-circuits
-/// on another bucket's error) aborts the bucket's tasks the same way. Work an
-/// aborted executor already performed, such as a provider call, is not
-/// rolled back.
-async fn fan_out_bucket(
-    tasks: Vec<EvalTask>,
-    snapshot: Arc<ContextSnapshot>,
-    executor: Arc<dyn TaskExecutor>,
-    stage: u32,
-) -> Result<Vec<(TaskId, TaskOutput)>, EvalExecError> {
-    if tasks.is_empty() {
-        return Ok(Vec::new());
+/// Returns [`EvalExecError::DagInvalid`] when the registry lacks the task and
+/// the condition-evaluation error of an unevaluable condition.
+fn prepare_task(
+    task_id: &TaskId,
+    stage: &Stage,
+    snapshot: &Arc<ContextSnapshot>,
+    registry: &TaskRegistry,
+    executors: &Executors,
+    ledger: &RunLedger<EvalSettled>,
+) -> Result<Prepared<EvalSettled, EvalExecError>, EvalExecError> {
+    let task = registry
+        .get(task_id)
+        .ok_or_else(|| EvalExecError::DagInvalid {
+            reason: format!(
+                "plan stage {} references unknown task {:?}",
+                stage.index,
+                task_id.as_str()
+            ),
+        })?;
+    if let Some(upstream) = first_skipped_dependency(task, ledger) {
+        return Ok(Prepared::Settled(Err(SkipReason::DependencySkipped {
+            upstream,
+        })));
     }
-
-    let mut set: JoinSet<Result<(TaskId, TaskOutput), EvalExecError>> = JoinSet::new();
-    for task in tasks {
-        let snapshot = Arc::clone(&snapshot);
-        let executor = Arc::clone(&executor);
-        set.spawn(
-            async move {
-                let output = executor.execute(&task, &snapshot, stage).await?;
-                Ok((task.id().clone(), output))
-            }
-            .instrument(tracing::Span::current()),
-        );
+    if let Some(condition) = task.condition()
+        && !evaluate_condition(task_id, task.depends_on(), condition, snapshot)?
+    {
+        return Ok(Prepared::Settled(Err(SkipReason::ConditionFalse)));
     }
-
-    let mut collected = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(pair)) => collected.push(pair),
-            Ok(Err(error)) => return Err(error),
-            Err(join_err) => {
-                return Err(EvalExecError::DagInvalid {
-                    reason: format!("task join failure: {join_err}"),
-                });
-            }
-        }
-    }
-    Ok(collected)
+    let task = task.clone();
+    let snapshot = Arc::clone(snapshot);
+    let executor = Arc::clone(executors.of(EvalTaskKind::from_task(&task)));
+    let stage = stage.index;
+    Ok(Prepared::Run(Box::pin(async move {
+        let output = executor.execute(&task, &snapshot, stage).await?;
+        Ok(Ok(Arc::new(output)))
+    })))
 }
 
-fn first_skipped_dependency(task: &EvalTask, ledger: &RunLedger) -> Option<TaskId> {
-    for dep in task.depends_on() {
-        if ledger.skipped.contains(dep) {
-            return Some(dep.clone());
-        }
-    }
-    None
+/// The first declared dependency of `task` that settled as skipped.
+fn first_skipped_dependency(task: &EvalTask, ledger: &RunLedger<EvalSettled>) -> Option<TaskId> {
+    task.depends_on()
+        .iter()
+        .find(|dep| matches!(ledger.get(dep), Some(Err(_))))
+        .cloned()
 }
 
 fn evaluate_condition(
@@ -501,13 +465,6 @@ fn evaluate_condition(
         current = node.subsequent.as_deref();
     }
     Ok(acc.unwrap_or(true))
-}
-
-fn outcome_task_id(outcome: &TaskRunOutcome) -> &TaskId {
-    match outcome {
-        TaskRunOutcome::Ran(result) => &result.task_id,
-        TaskRunOutcome::Skipped { task_id, .. } => task_id,
-    }
 }
 
 #[cfg(test)]
@@ -588,6 +545,17 @@ mod tests {
         Ok(())
     }
 
+    /// Skip propagation names the first skipped dependency in the task's
+    /// declared order, not in ledger settlement order: `b` settles before `a`,
+    /// yet `c` (declaring `a` then `b`) reports `a`.
+    ///
+    /// # Errors
+    /// Returns the task-id, DAG-validation, or registry-construction error of
+    /// the static fixture.
+    ///
+    /// # Panics
+    /// Panics when task `c` is not registered or the reported upstream is not
+    /// `a`.
     #[test]
     fn first_skipped_dependency_returns_declaration_order() -> Result<(), Box<dyn Error>> {
         let tasks = vec![
@@ -602,8 +570,8 @@ mod tests {
         let plan = wyrd_spec::vala::eval::validate_dag(&map)?;
         let registry = TaskRegistry::from_plan(&plan, map.clone())?;
         let mut ledger = RunLedger::default();
-        ledger.skipped.insert(tid("b")?);
-        ledger.skipped.insert(tid("a")?);
+        ledger.push(tid("b")?, Err(SkipReason::ConditionFalse));
+        ledger.push(tid("a")?, Err(SkipReason::ConditionFalse));
 
         let task_c = tid("c")?;
         let task = registry.get(&task_c).expect("task c registered");

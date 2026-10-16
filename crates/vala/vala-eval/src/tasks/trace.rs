@@ -121,7 +121,10 @@ async fn execute_trace(
     })
 }
 
-fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
+/// Project a trace's spans into the JSON document span selectors read.
+///
+/// Shared by Eval trace assertions and Verifier `trace` checks.
+pub(crate) fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
     let projected: Vec<Value> = spans.iter().map(project_one).collect();
     serde_json::json!({
         "trace_id": trace_id.to_hex(),
@@ -152,7 +155,12 @@ fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
 }
 
 #[cfg(test)]
-mod trace_executor {
+pub(crate) mod trace_executor {
+    //! Trace assertion executor tests and the shared span fixture.
+    //!
+    //! The [`span`] fixture is crate-visible so other engines' tests, such as
+    //! the Verifier engine's trace checks, project the same span shape the
+    //! trace executor reads instead of building their own.
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -223,7 +231,9 @@ mod trace_executor {
         }
     }
 
-    fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
+    /// One finished span named `name`, tagged with an eval scenario. Shared
+    /// with the Verifier engine's trace-check tests.
+    pub(crate) fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
         let start_time = Utc
             .with_ymd_and_hms(2026, 6, 10, 12, 0, 0)
             .single()

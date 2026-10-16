@@ -8535,6 +8535,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "vala-drift",
  "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",

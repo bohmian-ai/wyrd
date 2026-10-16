@@ -1,5 +1,6 @@
 """An Agent authored in Python, saved as a Card, and run offline."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,12 @@ def test_saved_agent_loads_and_runs_on_the_mock_provider(tmp_path: Path) -> None
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:
+    """A saved Agent reloads to the same Card, and a loaded Agent exports its authored spec unchanged.
+
+    Omitted, partial, explicit-default and nondefault run configs plus a verification
+    binding survive `to_card`, `model_dump_json` and a YAML save and reload; a
+    `with_run_config` edit persists and keeps the bindings.
+    """
     path = tmp_path / "agent.yaml"
     agent = Agent(
         prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
@@ -48,6 +55,44 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
     loaded_card = loaded.to_card()
 
     assert loaded_card.model_dump() == card.model_dump()
+
+    envelope = json.loads(agent.model_dump_json())
+    binding = {
+        "verifier": {
+            "kind": "Verifier",
+            "name": "answers-grounded",
+            "version": "1.0.0",
+            "space": "default",
+        }
+    }
+    for run_config in (
+        {},
+        {"timeout_ms": 5000},
+        {"max_iterations": 10, "tool_concurrency_cap": 8},
+        {
+            "max_iterations": 3,
+            "tool_concurrency_cap": 2,
+            "session_recent_limit": 20,
+            "timeout_ms": 9000,
+        },
+    ):
+        authored = {**envelope["spec"], "verified_by": [binding]}
+        authored.pop("run_config", None)
+        if run_config:
+            authored["run_config"] = run_config
+        source = Agent.model_validate_json(json.dumps({**envelope, "spec": authored}))
+
+        assert source.to_card().model_dump()["spec"] == authored
+        assert json.loads(source.model_dump_json())["spec"] == authored
+        source.save(path)
+        assert json.loads(Agent.from_yaml(path).model_dump_json())["spec"] == authored
+
+        source.with_run_config(RunConfig(max_iterations=4))
+        spec = json.loads(source.model_dump_json())["spec"]
+        assert spec["run_config"]["max_iterations"] == 4
+        assert spec["verified_by"] == [binding]
+        source.save(path)
+        assert json.loads(Agent.from_yaml(path).model_dump_json())["spec"] == spec
 
 
 def test_agent_card_json_round_trip() -> None:

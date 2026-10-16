@@ -333,21 +333,29 @@ pub fn apply_context_capture(
     mut result: AssertionResult,
     capture: EvalContextCapture,
 ) -> Result<AssertionResult, EvalExecError> {
+    result.actual = capture_actual(result.actual, capture)?;
+    Ok(result)
+}
+
+/// Apply `capture` to one stored `actual` value: kept verbatim for `full`,
+/// replaced by its SHA-256 hex digest for `hash`, and dropped for `redact`.
+///
+/// The one capture rule shared by Eval results and Verifier requirement
+/// results.
+///
+/// # Errors
+/// Returns `ContextHashFailed` if hashing cannot serialize the value.
+pub fn capture_actual(
+    actual: Option<serde_json::Value>,
+    capture: EvalContextCapture,
+) -> Result<Option<serde_json::Value>, EvalExecError> {
     match capture {
-        EvalContextCapture::Full => Ok(result),
-        EvalContextCapture::Hash => {
-            result.actual = result
-                .actual
-                .as_ref()
-                .map(hash_context_value)
-                .transpose()?
-                .map(serde_json::Value::String);
-            Ok(result)
-        }
-        EvalContextCapture::Redact => {
-            result.actual = None;
-            Ok(result)
-        }
+        EvalContextCapture::Full => Ok(actual),
+        EvalContextCapture::Hash => actual
+            .as_ref()
+            .map(|value| hash_context_value(value).map(serde_json::Value::String))
+            .transpose(),
+        EvalContextCapture::Redact => Ok(None),
     }
 }
 

@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 
-use wyrd_spec::vala::eval::{AssertionResult, AssertionTask, EvalTask, JsonPath, TaskId};
+use wyrd_spec::vala::eval::{
+    AssertionResult, AssertionTask, ComparisonOperator, EvalTask, JsonPath, TaskId,
+};
 
 use crate::context::{ContextSnapshot, TaskOutput, extract_required_jsonpath_from};
 use crate::error::EvalExecError;
@@ -69,6 +71,21 @@ impl TaskExecutor for AssertionTaskExecutor {
     }
 }
 
+/// Judge one assertion task against `snapshot`.
+///
+/// Selects the observed value from the task's scoped view (the record
+/// context plus the declared dependencies' outputs under `$.task`), using
+/// the item path in item mode or the context path otherwise; without a path
+/// it compares the whole view, or the bare record when there are no
+/// dependencies. Item mode
+/// compares every selected item, single mode the one selected value. The
+/// result is attributed to the task at `stage` with its start time and
+/// duration; a false comparison is a Failed result, not an error.
+///
+/// # Errors
+/// Returns the [`EvalExecError`] of a selection that cannot be extracted
+/// (an invalid or missing required path) and of an operator that cannot
+/// compare the selected value's type, unchanged.
 fn execute_assertion(
     task: &AssertionTask,
     snapshot: &ContextSnapshot,
@@ -78,8 +95,8 @@ fn execute_assertion(
     let view = snapshot.build_scoped_view(&task.depends_on);
     let observed = resolve_observed(task, &view, snapshot)?;
     let (passed, actual, expected, message) = match &task.item_context_path {
-        Some(_) => evaluate_item_mode(task, &observed)?,
-        None => evaluate_single(task, &observed)?,
+        Some(_) => evaluate_item_mode(&task.id, &task.operator, &task.expected, &observed)?,
+        None => evaluate_single(&task.id, &task.operator, &task.expected, &observed)?,
     };
 
     Ok(AssertionResult {
@@ -119,51 +136,73 @@ fn extract(value: &Value, path: &JsonPath, task_id: &TaskId) -> Result<Value, Ev
     extract_required_jsonpath_from(value, path, task_id)
 }
 
-fn evaluate_single(
-    task: &AssertionTask,
+/// The compared outcome of one assertion: passed, observed actual, the
+/// expected value compared, and a failure message.
+pub(crate) type Compared = (bool, Option<Value>, Value, Option<String>);
+
+/// Compare one `observed` value with `expected` under `operator`.
+///
+/// Shared by Eval assertion tasks and Verifier `assert` checks over a `path`.
+///
+/// # Errors
+/// Returns [`EvalExecError::OperatorTypeMismatch`] for `task_id` when the
+/// operator cannot compare the values.
+pub(crate) fn evaluate_single(
+    task_id: &TaskId,
+    operator: &ComparisonOperator,
+    expected: &Value,
     observed: &Value,
-) -> Result<(bool, Option<Value>, Value, Option<String>), EvalExecError> {
-    let verdict = operators::evaluate_operator(observed, &task.operator, &task.expected).map_err(
-        |error| EvalExecError::OperatorTypeMismatch {
-            task_id: task.id.clone(),
-            operator: format!("{:?}", task.operator),
+) -> Result<Compared, EvalExecError> {
+    let verdict = operators::evaluate_operator(observed, operator, expected).map_err(|error| {
+        EvalExecError::OperatorTypeMismatch {
+            task_id: task_id.clone(),
+            operator: format!("{operator:?}"),
             reason: error.to_string(),
-        },
-    )?;
+        }
+    })?;
     let message = if verdict.passed {
         None
     } else {
-        Some(format!("operator {:?} returned false", task.operator))
+        Some(format!("operator {operator:?} returned false"))
     };
     Ok((
         verdict.passed,
         verdict.observed,
-        verdict.expected.unwrap_or_else(|| task.expected.clone()),
+        verdict.expected.unwrap_or_else(|| expected.clone()),
         message,
     ))
 }
 
-fn evaluate_item_mode(
-    task: &AssertionTask,
+/// Compare every element of the `observed` array with `expected`; the
+/// assertion passes only when every element passes, so an empty array passes.
+///
+/// Shared by Eval item-mode assertions and Verifier `assert` checks over an
+/// `each` selector.
+///
+/// # Errors
+/// Returns [`EvalExecError::OperatorTypeMismatch`] for `task_id` when
+/// `observed` is not an array or the operator cannot compare an element.
+pub(crate) fn evaluate_item_mode(
+    task_id: &TaskId,
+    operator: &ComparisonOperator,
+    expected: &Value,
     observed: &Value,
-) -> Result<(bool, Option<Value>, Value, Option<String>), EvalExecError> {
+) -> Result<Compared, EvalExecError> {
+    let mismatch = |reason: String| EvalExecError::OperatorTypeMismatch {
+        task_id: task_id.clone(),
+        operator: format!("{operator:?}"),
+        reason,
+    };
     let Value::Array(items) = observed else {
-        return Err(EvalExecError::OperatorTypeMismatch {
-            task_id: task.id.clone(),
-            operator: format!("{:?}", task.operator),
-            reason: "item_context_path resolved to a non-array value".to_string(),
-        });
+        return Err(mismatch(
+            "item_context_path resolved to a non-array value".to_string(),
+        ));
     };
 
     let mut failures = 0_usize;
     for item in items {
-        let verdict = operators::evaluate_operator(item, &task.operator, &task.expected).map_err(
-            |error| EvalExecError::OperatorTypeMismatch {
-                task_id: task.id.clone(),
-                operator: format!("{:?}", task.operator),
-                reason: error.to_string(),
-            },
-        )?;
+        let verdict = operators::evaluate_operator(item, operator, expected)
+            .map_err(|error| mismatch(error.to_string()))?;
         if !verdict.passed {
             failures += 1;
         }
@@ -173,15 +212,14 @@ fn evaluate_item_mode(
         None
     } else {
         Some(format!(
-            "{failures}/{} items failed operator {:?}",
+            "{failures}/{} items failed operator {operator:?}",
             items.len(),
-            task.operator
         ))
     };
     Ok((
         failures == 0,
         Some(observed.clone()),
-        task.expected.clone(),
+        expected.clone(),
         message,
     ))
 }

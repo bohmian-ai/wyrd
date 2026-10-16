@@ -1,8 +1,11 @@
 //! Verifier-shared Bifrost tables.
 //!
-//! `vala.verification.results` is the one verdict surface every Verifier
-//! implementation writes, whatever its per-implementation detail table.
+//! `vala.verification.results` is the one result surface every Verifier
+//! execution writes; `vala.verification.execution_inputs` pins each
+//! execution's named inputs and a queued execution's accepted request context.
 
+mod execution_inputs;
 mod results;
 
-pub use results::{ASSERTION_RESULT, DRIFT_REPORT, EVAL_SUMMARY, ResultsTable};
+pub use execution_inputs::{ACTIVATION, ExecutionInputsTable, INPUTS};
+pub use results::{OUTCOME, ResultsTable};

@@ -42,7 +42,8 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
-    CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultItemsTable,
+    ResultsTable, TableError,
 };
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
@@ -309,25 +310,6 @@ impl<T: AuditStage> GateAudit for T {
     }
 }
 
-/// Receives Eval observation frames after Scribe has durably acknowledged them.
-///
-/// Gate calls it only for the acknowledgement whose attempt first committed the
-/// batch; a replay Scribe suppressed as already committed is never handed over,
-/// so the receipt instant a frame arrives with is the one stamped on its rows.
-///
-/// The server composes one implementation that enqueues Verifier runs; the
-/// trait exists because that queue lives in a crate Gate must not depend on.
-/// The call is synchronous and must return without IO: implementations hand
-/// the frame to their own tracked task, so the hook can neither delay nor roll
-/// back the acknowledgement Gate has already earned.
-pub trait ObservationAck: Send + Sync {
-    /// Accepts one acknowledged `vala.eval.observations` frame.
-    ///
-    /// `frame` is the exact Arrow IPC payload Scribe admitted, whose
-    /// `card_uid` values Scribe authorized and stored unchanged.
-    fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes);
-}
-
 /// The concrete Bifrost write boundary.
 ///
 /// Gate owns authentication, request bounds, and transport response ordering.
@@ -341,8 +323,6 @@ pub struct Gate<A: GateAudit + 'static> {
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional SQL dispatch seam reaching an Oracle this Gate does not own.
     query: Option<Arc<dyn OracleQueryDispatch>>,
-    /// Post-acknowledgement hook for Eval observation frames, when composed.
-    observations: Option<Arc<dyn ObservationAck>>,
     /// Tenant registry resolving unbound writers' Card attribution, when
     /// composed; without it an unbound writer's `card_uid` is refused.
     cards: Option<attribution::CardRegistry>,
@@ -371,7 +351,6 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
         Self {
             scribe: self.scribe.clone(),
             query: self.query.clone(),
-            observations: self.observations.clone(),
             cards: self.cards.clone(),
             audit: self.audit.clone(),
             limits: self.limits,
@@ -427,7 +406,6 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: Some(scribe),
             query: None,
-            observations: None,
             cards: None,
             audit: None,
             limits,
@@ -447,7 +425,6 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: Some(scribe),
             query: None,
-            observations: None,
             cards: None,
             audit: None,
             limits,
@@ -467,7 +444,6 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: None,
             query: None,
-            observations: None,
             cards: None,
             audit: None,
             limits,
@@ -484,13 +460,6 @@ impl<A: GateAudit + 'static> Gate<A> {
     #[must_use]
     pub fn with_query_dispatch(mut self, query: Arc<dyn OracleQueryDispatch>) -> Self {
         self.query = Some(query);
-        self
-    }
-
-    /// Attaches the hook every acknowledged Eval observation frame is handed to.
-    #[must_use]
-    pub fn with_observation_ack(mut self, observations: Arc<dyn ObservationAck>) -> Self {
-        self.observations = Some(observations);
         self
     }
 
@@ -569,7 +538,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// The checks run cheapest first. A principal holding `BifrostRecord`
     /// `Write` under no scope at all is refused before any catalog work. The
-    /// three verification result tables and the exact `vala.gateway.calls`
+    /// four server-owned verification tables and the exact `vala.gateway.calls`
     /// table are written only by the server's internal capture writer, which
     /// never passes Gate, so every public principal, a wildcard holder
     /// included, is refused next; the rest of `vala.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
@@ -1063,14 +1032,6 @@ impl<A: GateAudit + 'static> Gate<A> {
             .attributed_cards(auth, || attribution::native_card_uids(&frame.arrow_ipc))
             .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
-        let observed = self
-            .observations
-            .as_ref()
-            .filter(|_| {
-                table.namespace == BifrostNamespace::Eval
-                    && table.name == crate::tables::EvalObservationsTable::NAME
-            })
-            .map(|hook| (Arc::clone(hook), frame.arrow_ipc.clone()));
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             attribution: auth.attribution(),
@@ -1095,23 +1056,19 @@ impl<A: GateAudit + 'static> Gate<A> {
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
         metrics::histogram!("bifrost_gate_resolution_seconds")
             .record(resolution_started.elapsed().as_secs_f64());
-        // Only the attempt that inserted the batch activates runs, so a
-        // suppressed replay never enqueues a run twice.
-        if let Some((hook, frame)) = observed.filter(|_| admission.first_commit) {
-            hook.acknowledged(auth, frame);
-        }
         Ok(admission.rows_accepted)
     }
 }
 
-/// Whether `table` is one of the verification result tables only the internal
-/// result writer writes.
+/// Whether `table` is one of the verification result or input tables only the
+/// server's internal writer writes.
 ///
 /// The set is closed and owned by the table definitions themselves, so a
 /// renamed result table cannot silently fall out of the reservation.
 fn is_verification_result_table(table: &TableRef) -> bool {
     [
         (ResultsTable::NAMESPACE, ResultsTable::NAME),
+        (ExecutionInputsTable::NAMESPACE, ExecutionInputsTable::NAME),
         (ResultFeaturesTable::NAMESPACE, ResultFeaturesTable::NAME),
         (ResultItemsTable::NAMESPACE, ResultItemsTable::NAME),
     ]
@@ -2645,7 +2602,7 @@ mod tests {
         }
     }
 
-    /// Every public write to the three verification result tables is refused
+    /// Every public write to the four server-owned verification tables is refused
     /// as reserved, for every principal kind — a SYSTEM principal and a
     /// wildcard administrator included — before Scribe, with exactly one
     /// denied decision, because only the server's internal writer writes them.
@@ -2685,6 +2642,7 @@ mod tests {
         ];
         for table in [
             "vala.verification.results",
+            "vala.verification.execution_inputs",
             "vala.drift.result_features",
             "vala.eval.result_items",
         ] {

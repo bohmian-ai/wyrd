@@ -403,7 +403,7 @@ Commits `f2a726c90..HEAD` on `change/verifier-building-blocks-task-005`.
 | Generic input/results replace old live contracts without history deletion | `f210fef96` (additive migration), `ac9539734` | `test:sql`; `pg_migration::migrations_apply_and_are_idempotent` | PASS |
 | README scheduled drift lifecycle in all three SDKs, unseeded, through the scheduler | `a36c01870`, `b3316b1d5`, `50e4ed235` | Rust `scheduled_drift_alerts_operator::*` and `verify_in_real_time::unfitted_baseline_is_skipped_on_schedule`; Python/TS mirrors in the gate (Proof) | PASS |
 | Eight README action/check rows in Rust, Python and TypeScript | `5690c6452`, `a36c01870` | Rust `verifier_building_blocks::*` 20/20; Python/TS mirrors in the gate (Proof) | PASS |
-| External examples own Cards, follow REQ-016, pass against the candidate | `wyrd-example-rs` `f7647cf`; `wyrd-example-py` `5b2e1e9`, `a9a6327`; `wyrd-example-ts` branch `verifier-building-blocks` `79ea206`, `0e45152` | `cargo test` 1/1; `pytest` 5/5; `npm run typecheck && npm run test` 5/5 | PASS (README quickstarts not run live) |
+| External examples own Cards, follow REQ-016, pass against the candidate | `wyrd-example-rs` `f7647cf`, `669d130`; `wyrd-example-py` `5b2e1e9`, `a9a6327`, `1e27f68`; `wyrd-example-ts` branch `verifier-building-blocks` `79ea206`, `0e45152`, `5c79080`. Each checks answers with three Verifiers: Service-bound `no-refund-promise` (assert), agent-bound `ticket-complete` (code) and `follows-policy` (agent step + judge, `gpt-6-luna`, submitted) | `cargo test -- --ignored` 1/1; `pytest` 6/6; `npm run typecheck && npm test` 6/6 | PASS (README quickstarts not run live) |
 | Merged candidate closes AC-001–010 | — | `mise run gate` exit 0 (Proof) | PASS |
 
 ### Diagnoses

@@ -1062,10 +1062,11 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     assert_eq!(spun.status, "completed", "{spun:?}");
 }
 
-/// Hosted limits whose combined input-file bound admits the 11-byte notes
-/// file once but not twice.
+/// Hosted limits whose individual input-file bound admits the 11-byte notes
+/// file and whose combined bound admits it once but not twice.
 fn tight_files() -> HostedLimits {
     HostedLimits {
+        file_max_bytes: 12,
         files_max_bytes: 20,
         ..HostedLimits::default()
     }
@@ -1098,8 +1099,10 @@ fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
 /// per-execution engine direct and queued executions share: a format the
 /// slot refuses, a file above the slot's `max_bytes`, the same file pinned
 /// in two slots, and an Artifact plus an unread uploaded file whose
-/// declared lengths together pass the bound are all refused. One pinned
-/// Artifact read by two extract steps is charged once and passes.
+/// declared lengths together pass the bound are all refused, as is the
+/// file in an uncapped slot on engines whose individual input-file bound
+/// it passes within the combined one. One pinned Artifact read by two
+/// extract steps is charged once and passes.
 ///
 /// # Panics
 /// Panics when the server, pool, or engine fails to start, a refusal is
@@ -1116,8 +1119,20 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         [Permission::card_read()],
     );
     let slot = |name: &str| SlotName::new(name).expect("slot");
-    let run = |spec: Arc<VerifierSpec>, evidence: BTreeMap<SlotName, InputDeclaration>| {
-        let (blocks, caller, state) = (&blocks, &caller, registered.server.state());
+    let cramped = HostedBlocks::start(
+        worker(),
+        HostedLimits {
+            file_max_bytes: 4,
+            ..tight_files()
+        },
+    )
+    .await
+    .expect("cramped pool starts");
+    let run_on = |cramped_pool: bool,
+                  spec: Arc<VerifierSpec>,
+                  evidence: BTreeMap<SlotName, InputDeclaration>| {
+        let blocks = if cramped_pool { &cramped } else { &blocks };
+        let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
             blocks
@@ -1140,6 +1155,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                 .await
         }
     };
+    let run = |spec, evidence| run_on(false, spec, evidence);
     let unread = InputDeclaration::File {
         sha256: Sha256Hex::digest(b"never uploaded"),
         size_bytes: 10,
@@ -1188,6 +1204,16 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         };
         assert!(reason.contains(expected), "{reason}");
     }
+    let refused = run_on(
+        true,
+        two_extracts(&["text"], None),
+        BTreeMap::from([(slot("a"), registered.file("notes.txt"))]),
+    )
+    .await;
+    let Err(EngineError::InputTooLarge(reason)) = &refused else {
+        panic!("expected the individual input-file limit: {refused:?}")
+    };
+    assert!(reason.contains("4-byte input file limit"), "{reason}");
 
     let outcome = run(
         two_extracts(&["text"], Some(11)),
@@ -1198,8 +1224,10 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
     assert_eq!(outcome.verdict, VerificationVerdict::Passed, "{outcome:?}");
 }
 
-/// A queued execution whose evidence does not conform to its Verifier, or
-/// whose declared files together pass the combined input-file bound, settles
+/// A queued execution whose evidence does not conform to its Verifier, whose
+/// one unused file passes the individual input-file bound within the
+/// combined one, or whose declared files together pass the combined bound
+/// settles
 /// `errored` with `input_invalid` on its first attempt and no result, so no
 /// verdict or Operator follows and no retry is spent; conforming evidence in
 /// the same runtime completes.
@@ -1250,12 +1278,12 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
         .expect("Verifier registers");
     let slot = |name: &str| SlotName::new(name).expect("slot");
     let x = |value: Value| (slot("x"), InputDeclaration::Json { value });
-    let file = |name: &str, body: &[u8]| {
+    let file = |name: &str, body: &[u8], size_bytes| {
         (
             slot(name),
             InputDeclaration::File {
                 sha256: Sha256Hex::digest(body),
-                size_bytes: 15,
+                size_bytes,
                 format: "text".parse().expect("format"),
                 filename: None,
             },
@@ -1265,11 +1293,23 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
         .submit(&verifier, &subject, BTreeMap::from([x(json!("one"))]))
         .await
         .expect("schema-invalid execution queues");
+    let large = seed
+        .submit(
+            &verifier,
+            &subject,
+            BTreeMap::from([x(json!(1)), file("a", b"large", 15)]),
+        )
+        .await
+        .expect("individually oversized execution queues");
     let oversized = seed
         .submit(
             &verifier,
             &subject,
-            BTreeMap::from([x(json!(1)), file("a", b"first"), file("b", b"second")]),
+            BTreeMap::from([
+                x(json!(1)),
+                file("a", b"first", 11),
+                file("b", b"second", 11),
+            ]),
         )
         .await
         .expect("oversized execution queues");
@@ -1291,7 +1331,7 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = Instant::now() + Duration::from_mins(1);
     let mut settled = Vec::new();
-    for execution in [invalid, oversized, valid] {
+    for execution in [invalid, large, oversized, valid] {
         settled.push(loop {
             let row = seed.execution(execution).await.expect("execution reads");
             if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
@@ -1304,7 +1344,7 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     stop.cancel();
     task.await.expect("the runtime stops");
 
-    for refused in &settled[..2] {
+    for refused in &settled[..3] {
         assert_eq!(
             (
                 refused.status.as_str(),
@@ -1316,6 +1356,6 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
         );
         assert!(refused.result_id.is_none(), "{refused:?}");
     }
-    assert_eq!(settled[2].status, "completed", "{:?}", settled[2]);
-    assert!(settled[2].result_id.is_some(), "{:?}", settled[2]);
+    assert_eq!(settled[3].status, "completed", "{:?}", settled[3]);
+    assert!(settled[3].result_id.is_some(), "{:?}", settled[3]);
 }

@@ -1077,8 +1077,9 @@ async fn direct_execution_refusals_are_stable() {
 /// is refused by the server before any block runs: an undeclared slot, a
 /// declaration of another kind, a JSON value violating its slot schema, a
 /// file in a format its media slot refuses, a file above the slot's
-/// `max_bytes`, and files whose declared lengths together exceed the
-/// combined input-file limit. Conforming evidence still passes, an omitted
+/// `max_bytes`, an unused file in an uncapped slot above the individual
+/// input-file limit but within the combined one, and files whose declared
+/// lengths together exceed the combined input-file limit. Conforming evidence still passes, an omitted
 /// optional slot reads as null, and a missing required slot stays
 /// inconclusive rather than refused. Nothing is enqueued.
 ///
@@ -1143,6 +1144,11 @@ async fn direct_execution_refuses_nonconforming_evidence() {
         ),
         (
             json!({ "x": x, "policy": file("pdf", 11) }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            json!({ "x": x, "pages": file("pdf", 21 * mib) }),
             StatusCode::PAYLOAD_TOO_LARGE,
             "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         ),

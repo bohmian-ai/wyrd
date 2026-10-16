@@ -320,13 +320,15 @@ impl EvidenceReader for TenantEvidence {
     /// [`Self::artifact_file`], under the caller's audited `card:read`, and
     /// must be a format its media slot accepts and within the slot's
     /// `max_bytes`; uploaded files were checked by the engine from their
-    /// declarations. The declared lengths of every file and selected
-    /// Artifact file then must fit the Deployment's combined input-file
-    /// limit together. Each original input counts once, whatever later
+    /// declarations. Every file and selected Artifact file, used or not,
+    /// must then fit the Deployment's individual input-file limit, and
+    /// their declared lengths must fit its combined input-file limit
+    /// together. Each original input counts once, whatever later
     /// reads, workspaces, or retries do with it; no bytes are read here.
     ///
     /// # Errors
-    /// Returns [`EngineError::InputTooLarge`] past a slot or combined limit,
+    /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
+    /// combined limit,
     /// [`EngineError::InputInvalid`] for an Artifact file that cannot be
     /// resolved or that its slot does not accept, and
     /// [`EngineError::EvidenceUnavailable`] when the registry is unavailable.
@@ -368,6 +370,12 @@ impl EvidenceReader for TenantEvidence {
                 }
                 InputDeclaration::Json { .. } | InputDeclaration::Trace { .. } => continue,
             };
+            if size > self.limits.file_max_bytes {
+                return Err(EngineError::InputTooLarge(format!(
+                    "input {name}: the file exceeds the {}-byte input file limit",
+                    self.limits.file_max_bytes
+                )));
+            }
             total = total
                 .checked_add(size)
                 .filter(|total| *total <= self.limits.files_max_bytes)

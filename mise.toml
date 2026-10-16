@@ -256,8 +256,8 @@ run = "uv run python -m pytest -q -m integration tests/integration/gateway tests
 
 [tasks."test:gateway:smoke:live"]
 description = """Opt-in live provider sweep against real OpenAI, Anthropic, Gemini, and Jev with the operator's own keys.
-Part 1 sends each provider's own client through a live gateway; part 2 runs portable and native Wyrd Prompts
-through a native-route Agent straight to the provider, isolating Prompt lowering from the gateway. Credentials
+Part 1 sends each provider's own client through a live gateway; part 2 renders portable and native Wyrd Prompts
+and posts each native request straight to the provider, isolating Prompt lowering from the gateway. Credentials
 come from the environment, normally an untracked mise.local.toml: OPENAI_API_KEY, ANTHROPIC_API_KEY,
 GOOGLE_API_KEY or GEMINI_API_KEY, and TYPESAFE_API_KEY. A provider without a key is skipped explicitly.
 WYRD_SMOKE_<PROVIDER>_MODEL overrides a provider's model. Vertex is excluded: its credential is a short-lived

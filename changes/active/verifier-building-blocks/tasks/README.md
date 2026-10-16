@@ -10,20 +10,21 @@ owned.
 
 The owner approved Task 001 and its final remediation at
 `a02055b5561b889fa9d934038109f3028b0ecb1d` and Task 004 at
-`b4226148e9f962d0508ba46edb9c07676cad48ba`. Tasks 002, 003, and 004 are
+`b4226148e9f962d0508ba46edb9c07676cad48ba`. The owner approved and accepted
+Tasks 002 and 003, including remediations TASK-002-R2 and TASK-003-R1, as
+merged at `24a654faf` and `cf6a33b72`. Tasks 002, 003, and 004 are
 merged into `change/verifier-building-blocks`; Task 005 builds on that
 integrated result.
 
 | Task | Status | Next step |
 | --- | --- | --- |
 | [001 — contracts](TASK-001-verifier-contract.md) | Complete; owner-approved | None |
-| [002 — engine](TASK-002-verification-engine.md) | Merged; review `task-002-r1` FIX_REQUIRED, remediation TASK-002-R2 (rustdoc only) implemented | Fresh `$wyrd-task-review` of TASK-002 |
-| [003 — hosted runtime](TASK-003-hosted-check-runtime.md) | Merged with remediation TASK-003-R1; review `task-003` FIX_REQUIRED | Fresh `$wyrd-task-review` of TASK-003 |
+| [002 — engine](TASK-002-verification-engine.md) | Complete; owner-approved; merged | None |
+| [003 — hosted runtime](TASK-003-hosted-check-runtime.md) | Complete; owner-approved; merged | None |
 | [004 — SDKs, examples, docs](TASK-004-sdks-examples-and-docs.md) | Complete; owner-approved; merged | Journeys run at merged-change review |
 | [005 — integration](TASK-005-server-integration.md) | In progress; review `task-005` FIX_REQUIRED, remediation TASK-005-R1 implemented at `b4f0db306`; TASK-005-S1 smoke tests committed, live sweep not yet run | Fresh `$wyrd-task-review` of TASK-005; run and record the S1 live sweep |
 
-Owner approval is direct acceptance, not an independent review PASS. No
-remediation above has yet passed a fresh independent review, and prior
+Owner approval is direct acceptance, not an independent review PASS; prior
 immutable verdicts are preserved. Full integration and journey tests remain
 due once at merged-change review.
 

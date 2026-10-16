@@ -8,25 +8,33 @@
 //!
 //! The local upstream stands in for the model provider: the refund reader
 //! first calls `fs.read` on its workspace copy of the policy and then answers
-//! a 100-dollar limit, and the judge passes every answer with a citation
-//! unless the answer names a scripted case.
+//! a 100-dollar limit, the judge passes every answer with a citation unless
+//! the answer names a scripted case, and the `tool-review` investigator
+//! calls the Card, Bifrost, and code tools at once and then finishes. Scripted
+//! answer texts also fail the reader's provider, schema, and deadline and the
+//! code step and check; scoped and delegated principals exercise every tool
+//! grant.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opentelemetry::trace::TraceContextExt as _;
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::CardRef;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
-    CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
+    Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
     StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
 };
+use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::action_timeline::service_telemetry;
@@ -48,6 +56,21 @@ const BREAKS: &str = r#"{"outcome":"failed","reason":"contradicts the policy","c
 /// citation, which must not count as one.
 const UNCITED: &str = r#"{"outcome":"passed","reason":"trust me","citations":[]}"#;
 
+/// The judge's Verdict for an answer containing `JUDGE-FOREIGN-CITE`: a pass
+/// citing a JSON pointer the original answer does not have.
+const FOREIGN_CITE: &str = r#"{"outcome":"passed","reason":"see the note","citations":[{"slot":"answer","locator":{"json_pointer":"/note"}}]}"#;
+
+/// The three built-ins the investigator calls, in call order.
+const TOOLS: [&str; 3] = ["cards.get_by_ref", "bifrost.query", "code.run"];
+
+/// The stable code of a permission denial, carried by every denied tool
+/// call's error.
+const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
+
+/// The permissions every `tool-review` principal holds: run any Verifier and
+/// invoke the gateway its investigator calls the model through.
+const VERIFIES: [&str; 2] = ["verifier:run", "gateway:invoke"];
+
 /// The policy every review reads: the support desk's checked-in refund
 /// policy.
 fn policy() -> PathBuf {
@@ -65,6 +88,70 @@ fn completion(message: Value) -> ResponseTemplate {
         "choices": [{ "index": 0, "finish_reason": "stop", "message": message }],
         "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
     }))
+}
+
+/// Mount `response` for the refund reader's Chat Completions requests whose
+/// answer under review contains `marker`, ahead of the reader's scripted
+/// tool turn, which is mounted after it at the same priority.
+async fn fail_reader(upstream: &MockServer, marker: &str, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("REFUND RULES"))
+        .and(body_string_contains(marker))
+        .respond_with(response)
+        .with_priority(1)
+        .mount(upstream)
+        .await;
+}
+
+/// One assistant tool call of `tool` with JSON `arguments`, as the model
+/// returns it.
+fn tool_call(id: &str, tool: &str, arguments: &Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": { "name": tool, "arguments": arguments.to_string() },
+    })
+}
+
+/// Script the investigator: a request that already carries tool results
+/// finishes with `{"done": true}`; any other asks for one call of each of
+/// [`TOOLS`] in a single turn.
+async fn script_investigator(upstream: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("INVESTIGATE"))
+        .and(body_string_contains(r#""role":"tool""#))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": r#"{"done":true}"# }),
+        ))
+        .with_priority(1)
+        .mount(upstream)
+        .await;
+    let calls = [
+        tool_call(
+            "call-card",
+            TOOLS[0],
+            &json!({ "card_ref": {
+                "kind": "Service", "name": "policy-desk", "version": "1.0.0", "space": "default"
+            } }),
+        ),
+        tool_call(
+            "call-query",
+            TOOLS[1],
+            &json!({ "sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1 }),
+        ),
+        tool_call("call-code", TOOLS[2], &json!({ "code": "print(6 * 7)" })),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("INVESTIGATE"))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": null, "tool_calls": calls }),
+        ))
+        .with_priority(2)
+        .mount(upstream)
+        .await;
 }
 
 /// Mount the answer `content` for Chat Completions requests whose body
@@ -98,6 +185,18 @@ fn review(text: &str, refund: u32, trace: Option<&str>) -> Inputs {
     Inputs::named(inputs)
 }
 
+/// The citation of the answer's text, which every cited Verdict of the
+/// story names.
+///
+/// # Panics
+/// Panics when `answer` is not a slot name.
+fn answer_text() -> [Citation; 1] {
+    [Citation {
+        slot: "answer".parse().expect("slot name"),
+        locator: Locator::JsonPointer("/text".to_owned()),
+    }]
+}
+
 /// The requirement `id` of `result`.
 ///
 /// # Panics
@@ -124,6 +223,15 @@ fn step<'a>(result: &'a VerificationResult, id: &str) -> &'a StepResult {
         .unwrap_or_else(|| panic!("step {id}: {result:#?}"))
 }
 
+/// One retained result's subject and actor.
+#[derive(Debug, PartialEq, Deserialize)]
+struct Attribution {
+    /// The principal the result was for.
+    sub_principal_id: String,
+    /// The principal that requested it.
+    act_principal_id: String,
+}
+
 /// The policy desk deployment: a verification-capable server whose gateway
 /// deploys `gpt-4o` on the local upstream, with `policy-desk` registered and
 /// hydrated and acting as its own Card-scoped key.
@@ -132,8 +240,8 @@ struct PolicyDesk {
     deployment: Deployment,
     /// The local model upstream.
     upstream: MockServer,
-    /// The hydrated bundle; kept so the state's files stay on disk.
-    _bundle: TempDir,
+    /// The hydrated bundle, which every state loads from.
+    bundle: TempDir,
     /// The registered `policy-desk` Service.
     root: CardRef,
     /// The Service's own client.
@@ -150,6 +258,20 @@ impl PolicyDesk {
     /// Panics when a setup step fails.
     async fn start() -> Self {
         let upstream = MockServer::start().await;
+        fail_reader(&upstream, "PROVIDER-DOWN", ResponseTemplate::new(500)).await;
+        fail_reader(
+            &upstream,
+            "OFF-SCHEMA",
+            completion(json!({ "role": "assistant", "content": r#"{"wrong":1}"# })),
+        )
+        .await;
+        fail_reader(
+            &upstream,
+            "SLOW-READER",
+            completion(json!({ "role": "assistant", "content": r#"{"max_refund":100}"# }))
+                .set_delay(Duration::from_secs(15)),
+        )
+        .await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(body_string_contains("REFUND RULES"))
@@ -172,6 +294,9 @@ impl PolicyDesk {
         answer(&upstream, "REFUND RULES", r#"{"max_refund":100}"#, 2).await;
         answer(&upstream, "REFUSE-POLICY", BREAKS, 3).await;
         answer(&upstream, "UNCITED", UNCITED, 3).await;
+        answer(&upstream, "JUDGE-MALFORMED", "not a verdict", 3).await;
+        answer(&upstream, "JUDGE-FOREIGN-CITE", FOREIGN_CITE, 3).await;
+        script_investigator(&upstream).await;
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
         let deployment = Deployment::start_with(
             WyrdTestServer::builder()
@@ -193,7 +318,7 @@ impl PolicyDesk {
         Self {
             deployment,
             upstream,
-            _bundle: bundle,
+            bundle,
             root: desk.root,
             client,
             state,
@@ -213,24 +338,104 @@ impl PolicyDesk {
             .expect("the review runs")
     }
 
-    /// Export one span named `name` as the Service, wait until its trace is
-    /// stored, and return the trace ID as 32 hex characters.
+    /// Export a span named `outer`, carrying `policy_id`, with one child
+    /// named `inner` started inside it, as the Service; wait until both are
+    /// stored and return the trace ID as 32 hex characters.
+    ///
+    /// Stored spans order by start time, so `outer` is the trace document's
+    /// `spans[0]` and `inner` its `spans[1]`.
     ///
     /// # Panics
-    /// Panics when the span does not export or its trace is not stored.
-    async fn record_trace(&self, name: &str) -> String {
+    /// Panics when the spans do not export or are not both stored.
+    async fn record_trace(&self, [outer, inner]: [&str; 2], policy_id: &str) -> String {
         let (dispatch, provider) = service_telemetry(&self.client);
         let trace = tracing::dispatcher::with_default(&dispatch, || {
-            let span = tracing::info_span!("lookup", otel.name = %name);
-            span.in_scope(|| ());
+            let span = tracing::info_span!("lookup", otel.name = %outer, policy_id = %policy_id);
+            span.in_scope(|| tracing::info_span!("draft", otel.name = %inner).in_scope(|| ()));
             span.context().span().span_context().trace_id().to_string()
         });
-        tokio::task::block_in_place(|| provider.force_flush()).expect("the span exports");
-        assert!(
-            !self.deployment.timeline(&trace).await.is_empty(),
-            "the trace is stored"
+        tokio::task::block_in_place(|| provider.force_flush()).expect("the spans export");
+        assert_eq!(
+            self.deployment.timeline(&trace).await.len(),
+            2,
+            "both spans are stored"
         );
         trace
+    }
+
+    /// The hydrated Service, loaded with its server calls fixed to `client`
+    /// and Bifrost not started.
+    ///
+    /// # Panics
+    /// Panics when the bundle does not load.
+    fn state_as(&self, client: WyrdClient) -> WyrdState {
+        WyrdState::from_path_with(self.bundle.path().join("bundle"), client)
+            .expect("bundle loads offline")
+    }
+
+    /// Ask the investigator `question` with `tool-review` now, as `client`.
+    ///
+    /// # Panics
+    /// Panics when the verify is refused.
+    async fn investigate(&self, client: WyrdClient, question: &str) -> VerificationResult {
+        self.state_as(client)
+            .run()
+            .observe()
+            .verify("tool-review", json!(question))
+            .await
+            .expect("the investigation runs")
+    }
+
+    /// Assert the investigation of `question` finished after calling each of
+    /// [`TOOLS`] once, in order, where exactly the `allowed` calls returned
+    /// output and every other call was denied with [`DENIED`] and returned
+    /// nothing. The model's tool turn shows the policy desk's Card only when
+    /// the Card read was allowed.
+    ///
+    /// # Panics
+    /// Panics when the step, a call, or the model's tool turn differs.
+    async fn assert_tools(&self, result: &VerificationResult, question: &str, allowed: &[&str]) {
+        let investigate = step(result, "investigate");
+        assert_eq!(investigate.status, StepStatus::Succeeded, "{question}");
+        let called: Vec<Value> = investigate
+            .tool_calls
+            .iter()
+            .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
+            .collect();
+        assert_eq!(called, TOOLS.map(|tool| json!(tool)), "{question}");
+        for (call, tool) in investigate.tool_calls.iter().zip(TOOLS) {
+            if allowed.contains(&tool) {
+                assert!(call.error.is_none(), "{question} {tool}: {call:?}");
+                assert!(call.output_sha256.is_some(), "{question} {tool}");
+                assert!(call.returned_bytes > 0, "{question} {tool}");
+            } else {
+                assert!(
+                    call.error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(DENIED)),
+                    "{question} {tool}: {call:?}"
+                );
+                assert_eq!(
+                    (call.output_sha256.as_ref(), call.returned_bytes),
+                    (None, 0),
+                    "{question} {tool}"
+                );
+            }
+        }
+        let turn = self
+            .upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .find(|body| body.contains(question) && body.contains(r#""role":"tool""#))
+            .expect("the model received the tool results");
+        assert_eq!(
+            turn.contains("document-formats"),
+            allowed.contains(&TOOLS[0]),
+            "{question}: the Card reaches the model only when its read is allowed"
+        );
     }
 }
 
@@ -244,7 +449,9 @@ impl PolicyDesk {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn policy_review_runs_every_action_and_check_kind() {
     let desk = PolicyDesk::start().await;
-    let trace = desk.record_trace("lookup-policy").await;
+    let trace = desk
+        .record_trace(["lookup-policy", "draft-answer"], "refunds")
+        .await;
 
     let result = desk
         .review(review("Refunds follow our policy.", 50, Some(&trace)))
@@ -294,6 +501,8 @@ async fn policy_review_runs_every_action_and_check_kind() {
         "limit-found",
         "refund-within-limit",
         "policy-looked-up",
+        "answer-drafted-after-lookup",
+        "lookup-read-refunds",
         "follows-policy",
         "names-the-policy",
     ] {
@@ -303,10 +512,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
             "{id}"
         );
     }
-    let cited = [Citation {
-        slot: "answer".parse().expect("slot name"),
-        locator: Locator::JsonPointer("/text".to_owned()),
-    }];
+    let cited = answer_text();
     assert_eq!(requirement(&result, "follows-policy").citations, cited);
     assert_eq!(requirement(&result, "names-the-policy").citations, cited);
     let judged = desk
@@ -445,7 +651,9 @@ async fn forbidden_code_access_cannot_pass_dependent_work() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn trace_check_fails_a_guess_and_needs_its_trace() {
     let desk = PolicyDesk::start().await;
-    let guessed = desk.record_trace("guess-policy").await;
+    let guessed = desk
+        .record_trace(["guess-policy", "draft-answer"], "refunds")
+        .await;
 
     let failed = desk
         .review(review("Refunds follow our policy.", 50, Some(&guessed)))
@@ -680,4 +888,338 @@ async fn every_format_extracts_its_locked_output() {
         );
     }
     desk.deployment.shutdown().await;
+}
+
+/// A reader whose provider fails, whose answer breaks its declared output
+/// schema, or that outlives its step's five-second deadline fails its step:
+/// the code step needing its rules is skipped, every requirement depending
+/// on them is inconclusive, and with no other failure the review is
+/// inconclusive, never failed or passed.
+///
+/// # Panics
+/// Panics when a review is refused or a step, requirement, or verdict
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn failed_reader_leaves_its_dependents_inconclusive() {
+    let desk = PolicyDesk::start().await;
+
+    for marker in ["PROVIDER-DOWN", "OFF-SCHEMA", "SLOW-READER"] {
+        let result = desk
+            .review(review(
+                &format!("{marker}: refunds follow our policy."),
+                50,
+                None,
+            ))
+            .await;
+
+        let rules = step(&result, "refund-rules");
+        assert_eq!(rules.status, StepStatus::Failed, "{marker}: {rules:?}");
+        assert!(rules.reason.is_some(), "{marker}: the failure says why");
+        assert_eq!(
+            step(&result, "answer-facts").status,
+            StepStatus::Skipped,
+            "{marker}"
+        );
+        for id in ["limit-found", "refund-within-limit", "follows-policy"] {
+            assert_eq!(
+                requirement(&result, id).outcome,
+                RequirementOutcome::Inconclusive,
+                "{marker} {id}"
+            );
+        }
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Inconclusive,
+            "{marker}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// A code step that raises or outlives its five-second deadline fails with
+/// its reason, and the assertion on its output is inconclusive, never
+/// passed.
+///
+/// # Panics
+/// Panics when a review is refused or the step or requirement differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn failed_code_step_leaves_its_assertion_inconclusive() {
+    let desk = PolicyDesk::start().await;
+
+    for text in ["fail the facts", "spin the facts"] {
+        let result = desk.review(review(text, 50, None)).await;
+
+        let facts = step(&result, "answer-facts");
+        assert_eq!(facts.status, StepStatus::Failed, "{text}: {facts:?}");
+        assert!(facts.reason.is_some(), "{text}: the failure says why");
+        assert_eq!(
+            requirement(&result, "refund-within-limit").outcome,
+            RequirementOutcome::Inconclusive,
+            "{text}"
+        );
+        assert_ne!(
+            result.outcome.verdict,
+            VerificationVerdict::Passed,
+            "{text}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// Span order and attributes are judged on the stored trace: a draft
+/// recorded before its lookup fails both order requirements while its
+/// `policy_id` still passes, and a lookup of another policy fails only the
+/// attribute requirement.
+///
+/// # Panics
+/// Panics when a review is refused or a trace outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn trace_check_judges_span_order_and_attributes() {
+    let desk = PolicyDesk::start().await;
+    let reversed = desk
+        .record_trace(["draft-answer", "lookup-policy"], "refunds")
+        .await;
+    let shipping = desk
+        .record_trace(["lookup-policy", "draft-answer"], "shipping")
+        .await;
+
+    let cases = [
+        (
+            reversed,
+            [
+                RequirementOutcome::Failed,
+                RequirementOutcome::Failed,
+                RequirementOutcome::Passed,
+            ],
+        ),
+        (
+            shipping,
+            [
+                RequirementOutcome::Passed,
+                RequirementOutcome::Passed,
+                RequirementOutcome::Failed,
+            ],
+        ),
+    ];
+    for (trace, expected) in cases {
+        let result = desk
+            .review(review("Refunds follow our policy.", 50, Some(&trace)))
+            .await;
+
+        let judged = [
+            "policy-looked-up",
+            "answer-drafted-after-lookup",
+            "lookup-read-refunds",
+        ]
+        .map(|id| requirement(&result, id).outcome);
+        assert_eq!(judged, expected, "{trace}");
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// A judge whose output is not a closed Verdict, or whose pass cites a
+/// location the original answer does not have, leaves `follows-policy`
+/// inconclusive with its reason; neither counts as a pass.
+///
+/// # Panics
+/// Panics when a review is refused or the judged outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn invalid_judge_verdicts_are_inconclusive() {
+    let desk = PolicyDesk::start().await;
+
+    for marker in ["JUDGE-MALFORMED", "JUDGE-FOREIGN-CITE"] {
+        let result = desk
+            .review(review(
+                &format!("{marker}: refunds follow our policy."),
+                50,
+                None,
+            ))
+            .await;
+
+        let judged = requirement(&result, "follows-policy");
+        assert_eq!(
+            judged.outcome,
+            RequirementOutcome::Inconclusive,
+            "{marker}: {judged:?}"
+        );
+        assert!(!judged.reason.is_empty(), "{marker}: it says why");
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Inconclusive,
+            "{marker}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// The code check's valid failed Verdict fails `names-the-policy` citing the
+/// answer; a malformed Verdict, a citation of a slot the Verifier declares
+/// no input for, forbidden host access, and a check outliving the code
+/// deadline are each inconclusive with their reason.
+///
+/// # Panics
+/// Panics when a review is refused or a code-check outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn code_check_fails_with_citations_and_is_inconclusive_otherwise() {
+    let desk = PolicyDesk::start().await;
+
+    let failed = desk.review(review("Refunds are fine.", 50, None)).await;
+    let named = requirement(&failed, "names-the-policy");
+    assert_eq!(
+        (named.outcome, &named.citations[..]),
+        (RequirementOutcome::Failed, &answer_text()[..])
+    );
+    assert_eq!(failed.outcome.verdict, VerificationVerdict::Failed);
+
+    for text in [
+        "CODE-MALFORMED",
+        "CODE-FOREIGN-CITE",
+        "CODE-FORBIDDEN",
+        "CODE-SPIN",
+    ] {
+        let result = desk.review(review(text, 50, None)).await;
+
+        let named = requirement(&result, "names-the-policy");
+        assert_eq!(
+            named.outcome,
+            RequirementOutcome::Inconclusive,
+            "{text}: {named:?}"
+        );
+        assert!(!named.reason.is_empty(), "{text}: it says why");
+        assert_ne!(
+            result.outcome.verdict,
+            VerificationVerdict::Passed,
+            "{text}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// The hosted investigator's Card, Bifrost, and code tools each need both a
+/// covering tool grant and the capability's own grant: a principal holding
+/// both reads all three; one without the tool grant is denied every call
+/// even with its Card and query reads; one without the Card and query reads
+/// may only run code; and an exact `cards.get_by_ref` tool grant covers no
+/// other tool. A denied call returns nothing to the model.
+///
+/// # Panics
+/// Panics when a principal does not seed, an investigation is refused, or a
+/// tool call differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn hosted_tools_need_the_tool_and_domain_grants() {
+    let desk = PolicyDesk::start().await;
+    let cases: [(&str, &[&str], &[&str]); 3] = [
+        (
+            "all_tools",
+            &["tool:invoke", "cards:read", "bifrost_query:read"],
+            &TOOLS,
+        ),
+        ("no_tool_grant", &["cards:read", "bifrost_query:read"], &[]),
+        ("no_domain_grant", &["tool:invoke"], &[TOOLS[2]]),
+    ];
+
+    for (name, extra, allowed) in cases {
+        let permissions = [&VERIFIES[..], extra].concat();
+        let key = desk.deployment.scoped_key(name, &permissions).await;
+        let result = desk.investigate(desk.deployment.client(&key), name).await;
+        desk.assert_tools(&result, name, allowed).await;
+    }
+    let key = desk
+        .deployment
+        .granted_key("card_tool_only", &grants(json!({ "tool": TOOLS[0] })))
+        .await;
+    let result = desk
+        .investigate(desk.deployment.client(&key), "card_tool_only")
+        .await;
+    desk.assert_tools(&result, "card_tool_only", &[TOOLS[0]])
+        .await;
+    desk.deployment.shutdown().await;
+}
+
+/// A principal that may call every tool, acting through a delegate granted
+/// only the exact `cards.get_by_ref` tool, keeps only the narrower
+/// authority: the Card read succeeds, the query and code calls are denied
+/// with nothing returned, and the retained result names the original
+/// subject and the delegate as actor.
+///
+/// # Panics
+/// Panics when a principal does not seed, the delegation or investigation
+/// is refused, a tool call differs, or the attribution differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn delegated_tools_keep_the_narrower_authority() {
+    let desk = PolicyDesk::start().await;
+    let subject = desk
+        .deployment
+        .granted("tool_subject", &grants(json!("all")))
+        .await;
+    let actor = desk
+        .deployment
+        .granted("tool_delegate", &grants(json!({ "tool": TOOLS[0] })))
+        .await;
+    let token = desk
+        .deployment
+        .server()
+        .exchange_api_key(subject.api_key().expect("the subject has a key"))
+        .await
+        .expect("the subject's token exchanges");
+    let delegated = desk
+        .deployment
+        .client(
+            actor
+                .api_key()
+                .expect("the delegate has a key")
+                .expose_secret(),
+        )
+        .on_behalf_of(SecretString::from(token), TokenAudience::Wyrd)
+        .await
+        .expect("the delegate acts for the subject");
+
+    let result = desk.investigate(delegated, "delegated").await;
+
+    desk.assert_tools(&result, "delegated", &[TOOLS[0]]).await;
+    desk.deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let attributed: Vec<Attribution> =
+        Bifrost::connect_with(&desk.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT sub_principal_id, act_principal_id \
+                   FROM vala.verification.results WHERE execution_id = $1",
+                &[QueryParam::String(result.execution_id.to_string())],
+            )
+            .await
+            .expect("the result reads back");
+    assert_eq!(
+        attributed,
+        [Attribution {
+            sub_principal_id: subject.id().to_string(),
+            act_principal_id: actor.id().to_string(),
+        }]
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// The grants of a principal that verifies, invokes the gateway, reads Cards
+/// and Bifrost, and may call the tools `tool_scope` covers: `"all"` or one
+/// exact `{"tool": name}`.
+fn grants(tool_scope: Value) -> [Value; 5] {
+    [
+        json!({ "resource": "verifier", "action": "run", "scope": "all" }),
+        json!({ "resource": "gateway", "action": "invoke", "scope": "all" }),
+        json!({ "resource": "tool", "action": "invoke", "scope": tool_scope }),
+        json!({ "resource": "cards", "action": "read", "scope": "all" }),
+        json!({ "resource": "bifrost_query", "action": "read", "scope": "all" }),
+    ]
 }

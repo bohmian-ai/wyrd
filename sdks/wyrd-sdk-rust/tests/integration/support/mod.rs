@@ -183,6 +183,17 @@ impl Deployment {
     /// Panics when a grant does not parse or the role or principal cannot be
     /// seeded.
     pub async fn granted_key(&self, name: &str, grants: &[serde_json::Value]) -> String {
+        api_key(self.granted(name, grants).await)
+    }
+
+    /// Seed role `name` with exactly `grants` as [`Self::granted_key`] does
+    /// and return the bootstrapped principal, whose id a story compares with
+    /// retained subject and actor attribution.
+    ///
+    /// # Panics
+    /// Panics when a grant does not parse or the role or principal cannot be
+    /// seeded.
+    pub async fn granted(&self, name: &str, grants: &[serde_json::Value]) -> Bootstrap {
         let grants = grants
             .iter()
             .map(|grant| {
@@ -193,7 +204,10 @@ impl Deployment {
             .seed_role(name, &grants)
             .await
             .expect("role seeds");
-        self.key(name, &[name]).await
+        self.server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("principal bootstraps")
     }
 
     /// Issue a key for the principal registration projected for the Service

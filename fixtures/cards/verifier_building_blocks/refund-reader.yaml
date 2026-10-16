@@ -14,7 +14,7 @@ spec:
     model: gpt-4o
     messages:
       - role: user
-        content: "REFUND RULES: read /inputs/policy.pdf. Outline: {{outline}}. Return the largest refund approved without a manager."
+        content: "REFUND RULES: read /inputs/policy.pdf. Outline: {{outline}}. Answer under review: {{answer}}. Return the largest refund approved without a manager."
     response_format:
       type: object
       properties: {max_refund: {type: number}}

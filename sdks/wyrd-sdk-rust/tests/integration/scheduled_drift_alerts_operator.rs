@@ -1,6 +1,7 @@
 //! A scheduled drift check over submitted samples fails and its Operator
 //! alerts the on-call hook on the origin its connection supplies; a passing
-//! window alerts no one.
+//! window alerts no one. A second Service control-charts the same latency
+//! against its fitted SPC baseline.
 //!
 //! The story follows the full scheduled lifecycle: register the baseline and
 //! the Service, let the real fitter fit the baseline, `observe.submit` the
@@ -61,16 +62,26 @@ struct Watch {
     alerts: UnboundedReceiver<Request>,
     /// The Service registration.
     service: RegistrationReceipt,
+    /// The scheduled Verifier every sample is submitted to.
+    verifier: &'static str,
 }
 
 impl Watch {
-    /// Start the hook and the server, create the connection, register the
-    /// baseline and the Service, and wait for the real fitter to fit the
-    /// `latency-shift` baseline.
+    /// Start the `latency-watch` story with its PSI `latency-shift` Verifier.
     ///
     /// # Panics
     /// Panics when a setup step fails or the baseline does not fit in time.
     async fn start() -> Self {
+        Self::start_with("latency-watch.yaml", "latency-shift").await
+    }
+
+    /// Start the hook and the server, create the connection, register the
+    /// baseline and the story's `service` Card, and wait for the real fitter
+    /// to fit its scheduled `verifier`'s baseline.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails or the baseline does not fit in time.
+    async fn start_with(service: &str, verifier: &'static str) -> Self {
         let hook = MockServer::start().await;
         let (sender, alerts) = unbounded_channel();
         Mock::given(wiremock::matchers::any())
@@ -96,13 +107,13 @@ impl Watch {
         register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
         let watch = register(
             &cards,
-            "cards/scheduled_drift_alerts_operator/latency-watch.yaml",
+            &format!("cards/scheduled_drift_alerts_operator/{service}"),
         )
         .await;
         deployment
             .server()
             .wait_for_baseline(
-                registered(&watch, "latency-shift")
+                registered(&watch, verifier)
                     .uid
                     .as_ref()
                     .expect("registered Verifier has a UID"),
@@ -115,6 +126,7 @@ impl Watch {
             _hook: hook,
             alerts,
             service: watch,
+            verifier,
         }
     }
 
@@ -137,7 +149,7 @@ impl Watch {
         for latency in latencies {
             let submitted = run
                 .observe()
-                .submit("latency-shift", json!({ "latency": latency }))
+                .submit(self.verifier, json!({ "latency": latency }))
                 .await
                 .expect("the sample is submitted");
             assert!(matches!(submitted, Submission::Recorded), "{submitted:?}");
@@ -291,6 +303,65 @@ async fn empty_window_is_inconclusive_and_alerts_no_one() {
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
     watch.assert_quiet().await;
+    watch.deployment.shutdown().await;
+}
+
+/// Twenty latencies of 99 ms, four complete subgroups of five, are charted
+/// on schedule against the X-bar/S limits fitted from the healthy 0 to 99 ms
+/// baseline: every subgroup mean lies above the X-bar limit around its 49.5
+/// center while no subgroup spreads, so `latency-in-control` fails with four
+/// X-bar signals, no S signal, and its chart evidence.
+///
+/// # Panics
+/// Panics when a step fails or the result or its SPC detail differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn ready_spc_baseline_charts_a_scheduled_window() {
+    let watch = Watch::start_with("latency-steady.yaml", "latency-control").await;
+    watch.submit(std::iter::repeat_n(99, 20)).await;
+
+    let result = watch.judge().await;
+
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    assert_eq!(result.verifier.name.as_str(), "latency-control");
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
+    assert_eq!(
+        (requirement.id.as_str(), requirement.outcome),
+        ("latency-in-control", RequirementOutcome::Failed)
+    );
+    let check = serde_json::to_value(&requirement.check).expect("the check serializes");
+    assert_eq!(check["method"], "Spc", "{check}");
+    let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
+        panic!("a drift requirement carries its report: {requirement:?}");
+    };
+    let latency = report
+        .features
+        .iter()
+        .find(|(name, _)| name.as_str() == "latency")
+        .map(|(_, feature)| feature)
+        .expect("the latency feature is scored");
+    assert_eq!(
+        (latency.score, latency.threshold),
+        (Some(4.0), Some(0.0)),
+        "{latency:?}"
+    );
+    let chart = &latency
+        .evidence
+        .as_ref()
+        .expect("a scored SPC feature carries its chart")["Spc"];
+    assert_eq!(
+        (
+            &chart["subgroup_size"],
+            &chart["subgroups"],
+            &chart["x_bar"]["center"],
+            &chart["x_bar"]["signals"],
+            &chart["s"]["signals"],
+        ),
+        (&json!(5), &json!(4), &json!(49.5), &json!(4), &json!(0)),
+        "{chart}"
+    );
     watch.deployment.shutdown().await;
 }
 

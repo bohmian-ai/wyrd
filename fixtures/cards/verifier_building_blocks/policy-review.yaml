@@ -1,5 +1,8 @@
 # Every action kind (extract, agent, code) and every Run check kind (assert,
 # trace, agent, code) over one answer, its refund policy PDF, and its trace.
+# Scripted answer texts drive the failure paths: the reader's provider
+# markers, the code step's `fail the facts` and `spin the facts`, and the
+# code check's `raise` and `CODE-*` cases.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -30,8 +33,9 @@ spec:
       action:
         kind: agent
         agent: ./refund-reader.yaml
-        inputs: {outline: steps.policy-text.output}
+        inputs: {outline: steps.policy-text.output, answer: inputs.answer.text}
         workspace: {/inputs/policy.pdf: inputs.policy}
+      timeout_seconds: 5
       requirements:
         - id: limit-found
           statement: The reader found a positive refund limit
@@ -46,7 +50,13 @@ spec:
             def facts(answer, rules):
                 if answer["text"] == "read the host":
                     open("/etc/passwd").read()
+                if answer["text"] == "fail the facts":
+                    raise ValueError("cannot read the facts")
+                if answer["text"] == "spin the facts":
+                    while True:
+                        pass
                 return {"within_limit": answer["refund"] <= rules["max_refund"]}
+      timeout_seconds: 5
   requirements:
     - id: refund-within-limit
       statement: The refund offered is within the policy limit
@@ -54,6 +64,12 @@ spec:
     - id: policy-looked-up
       statement: The answer was produced after a lookup-policy span
       check: {kind: trace, on: inputs.trace, span_selector: "$.spans[0].name", operator: equals, expected: lookup-policy}
+    - id: answer-drafted-after-lookup
+      statement: The answer was drafted after the policy lookup
+      check: {kind: trace, on: inputs.trace, span_selector: "$.spans[1].name", operator: equals, expected: draft-answer}
+    - id: lookup-read-refunds
+      statement: The policy lookup read the refunds policy
+      check: {kind: trace, on: inputs.trace, span_selector: "$.spans[0].attributes.policy_id", operator: equals, expected: refunds}
     - id: follows-policy
       statement: The answer follows the refund policy
       check:
@@ -72,9 +88,23 @@ spec:
         source:
           inline: |
             def check(answer):
-                if answer["text"] == "raise":
+                text = answer["text"]
+                if text == "raise":
                     raise ValueError("refused to judge")
-                named = "policy" in answer["text"].lower()
+                if text == "CODE-MALFORMED":
+                    return {"outcome": "maybe"}
+                if text == "CODE-FOREIGN-CITE":
+                    return {
+                        "outcome": "passed",
+                        "reason": "cites a receipt",
+                        "citations": [{"slot": "receipt", "locator": {"json_pointer": "/text"}}],
+                    }
+                if text == "CODE-FORBIDDEN":
+                    open("/etc/passwd").read()
+                if text == "CODE-SPIN":
+                    while True:
+                        pass
+                named = "policy" in text.lower()
                 return {
                     "outcome": "passed" if named else "failed",
                     "reason": "names the policy" if named else "does not name the policy",

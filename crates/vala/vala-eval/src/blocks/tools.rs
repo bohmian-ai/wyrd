@@ -154,7 +154,8 @@ impl AgentTool for RecordedTool {
 
     /// Invoke the bound tool and record arguments, output digest, and size.
     ///
-    /// A result larger than the session limit is replaced by an error, so
+    /// A failed call records its error prefixed with its stable Wyrd code, so
+    /// a denied call names `WYRD_PERMISSION_403_DENIED_RBAC`. A result larger than the session limit is replaced by an error, so
     /// the model never receives it and the record shows no returned bytes.
     ///
     /// # Errors
@@ -199,7 +200,8 @@ impl AgentTool for RecordedTool {
             Ok(output)
         });
         if let Err(error) = &result {
-            record.error = Some(error.to_string());
+            let code = wyrd_spec::error::WyrdError::from(error).code();
+            record.error = Some(format!("{code}: {error}"));
         }
         self.records.lock().unwrap_or_else(PoisonError::into_inner)[slot] = Some(record);
         result

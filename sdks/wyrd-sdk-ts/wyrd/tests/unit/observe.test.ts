@@ -82,6 +82,35 @@ describe("internal native run wrapper", () => {
     });
   });
 
+  test("a lone non-record value, or an object marked positional, crosses without a slot", async () => {
+    const { observe, calls } = fakeRun();
+    const artifact = { kind: "Artifact", name: "decks", version: "1.0.0" } as const;
+
+    await observe.verify("answer-check", "yes");
+    await observe.verify("answer-check", 7);
+    await observe.verify("answer-check", null);
+    await observe.verify("answer-check", ["a", 1]);
+    await observe.verify("answer-check", verify.File.path("/does/not/exist/policy.pdf"));
+    await observe.verify("answer-check", new verify.ArtifactRef(artifact));
+    await observe.verify("answer-check", { answer: "yes" }, { positional: true });
+    await observe.submit("answer-check", { answer: "yes" }, { positional: true });
+    await observe.verify("answer-check", { answer: "yes" });
+
+    const sent = calls.map((call) => (call[1] as Record<string, unknown>[])[0]);
+    expect(sent.slice(0, 4)).toEqual([
+      { slot: undefined, valueJson: '"yes"' },
+      { slot: undefined, valueJson: "7" },
+      { slot: undefined, valueJson: "null" },
+      { slot: undefined, valueJson: '["a",1]' },
+    ]);
+    expect(sent[4]).toMatchObject({ slot: undefined, file: { path: "/does/not/exist/policy.pdf" } });
+    expect(sent[5]).toMatchObject({ slot: undefined, artifact: JSON.stringify(artifact) });
+    expect(sent[6]).toEqual({ slot: undefined, valueJson: '{"answer":"yes"}' });
+    expect(sent[7]).toEqual({ slot: undefined, valueJson: '{"answer":"yes"}' });
+    expect(sent[8]).toEqual({ slot: "answer", valueJson: '"yes"' });
+    expect(calls.every((call) => (call[1] as unknown[]).length === 1)).toBe(true);
+  });
+
   test("constructing a File reads nothing", () => {
     expect(verify.File.path("/does/not/exist.pdf").path).toBe("/does/not/exist.pdf");
   });

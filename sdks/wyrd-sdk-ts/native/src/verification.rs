@@ -32,11 +32,12 @@ pub struct NativeFileInput {
     pub filename: Option<String>,
 }
 
-/// One named slot value: exactly one of `value_json`, `file`, or `artifact`.
+/// One slot value: exactly one of `value_json`, `file`, or `artifact`.
 #[napi(object)]
 pub struct NativeVerifierInput {
-    /// The Verifier input slot this value fills.
-    pub slot: String,
+    /// The Verifier input slot this value fills; absent for the one
+    /// positional value of a single-slot Verifier.
+    pub slot: Option<String>,
     /// A JSON value for a `json`, `trace`, or `samples` slot.
     pub value_json: Option<String>,
     /// A local file for a `media` slot.
@@ -47,43 +48,62 @@ pub struct NativeVerifierInput {
     pub artifact_path: Option<String>,
 }
 
-/// Convert Node slot values into the shared client's named [`Inputs`].
+/// Convert Node slot values into the shared client's [`Inputs`]: one value
+/// without a slot is [`Inputs::One`], which the shared client projects onto
+/// the Verifier's only slot; otherwise every value names its slot.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for a slot value that is not exactly
-/// one kind, malformed JSON, or a malformed Artifact reference, and
-/// `WYRD_VERIFICATION_400_INPUT_INVALID` for an unknown file format or a file
-/// that is not exactly one of path and bytes.
-pub(crate) fn inputs(values: Vec<NativeVerifierInput>) -> Result<Inputs, WyrdError> {
+/// one kind, malformed JSON, a malformed Artifact reference, or a value
+/// without a slot beside others, and `WYRD_VERIFICATION_400_INPUT_INVALID`
+/// for an unknown file format or a file that is not exactly one of path and
+/// bytes.
+pub(crate) fn inputs(mut values: Vec<NativeVerifierInput>) -> Result<Inputs, WyrdError> {
+    if let [NativeVerifierInput { slot: None, .. }] = values.as_slice() {
+        let value = values.remove(0);
+        return Ok(Inputs::One(input("input", value)?));
+    }
     let mut named = Vec::with_capacity(values.len());
-    for value in values {
-        let input = match (value.value_json, value.file, value.artifact) {
-            (Some(json), None, None) => {
-                Input::Value(serde_json::from_str::<Value>(&json).map_err(|error| {
-                    WyrdError::Validation {
-                        message: format!("input {} is not JSON: {error}", value.slot),
-                        details: json!({ "field": "inputs", "slot": value.slot }),
-                    }
-                })?)
-            }
-            (None, Some(file), None) => Input::File(file_input(&value.slot, file)?),
-            (None, None, Some(artifact)) => Input::Artifact(ArtifactRef::new(
-                parse_card_ref(&artifact)?,
-                value.artifact_path,
-            )),
-            _ => {
-                return Err(WyrdError::Validation {
-                    message: format!(
-                        "input {} must be exactly one value, File, or ArtifactRef",
-                        value.slot
-                    ),
-                    details: json!({ "field": "inputs", "slot": value.slot }),
-                });
-            }
+    for mut value in values {
+        let Some(slot) = value.slot.take() else {
+            return Err(WyrdError::Validation {
+                message: "a positional input is passed alone".to_owned(),
+                details: json!({ "field": "inputs" }),
+            });
         };
-        named.push((value.slot, input));
+        let input = input(&slot, value)?;
+        named.push((slot, input));
     }
     Ok(Inputs::named(named))
+}
+
+/// Convert one Node value, labelled `slot` in refusals, into a shared
+/// [`Input`].
+///
+/// # Errors
+/// As [`inputs`], for this one value.
+fn input(slot: &str, value: NativeVerifierInput) -> Result<Input, WyrdError> {
+    Ok(match (value.value_json, value.file, value.artifact) {
+        (Some(json), None, None) => {
+            Input::Value(serde_json::from_str::<Value>(&json).map_err(|error| {
+                WyrdError::Validation {
+                    message: format!("input {slot} is not JSON: {error}"),
+                    details: json!({ "field": "inputs", "slot": slot }),
+                }
+            })?)
+        }
+        (None, Some(file), None) => Input::File(file_input(slot, file)?),
+        (None, None, Some(artifact)) => Input::Artifact(ArtifactRef::new(
+            parse_card_ref(&artifact)?,
+            value.artifact_path,
+        )),
+        _ => {
+            return Err(WyrdError::Validation {
+                message: format!("input {slot} must be exactly one value, File, or ArtifactRef"),
+                details: json!({ "field": "inputs", "slot": slot }),
+            });
+        }
+    })
 }
 
 /// Build one lazy shared [`File`] from its Node description.

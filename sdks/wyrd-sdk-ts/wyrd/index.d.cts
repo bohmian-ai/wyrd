@@ -655,7 +655,7 @@ export declare class NativeRun {
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**
-   * Executes a bound Verifier now on named slot values and returns its
+   * Executes a bound Verifier now on slot values and returns its
    * result.
    *
    * # Errors
@@ -666,7 +666,7 @@ export declare class NativeRun {
    */
   verify(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeLifecycleResult>
   /**
-   * Submits named slot values: Window samples are recorded, Run evidence
+   * Submits slot values: Window samples are recorded, Run evidence
    * is queued for one execution.
    *
    * # Errors
@@ -1224,10 +1224,13 @@ export interface NativeTableConfigResult {
   error?: NativeWyrdError
 }
 
-/** One named slot value: exactly one of `value_json`, `file`, or `artifact`. */
+/** One slot value: exactly one of `value_json`, `file`, or `artifact`. */
 export interface NativeVerifierInput {
-  /** The Verifier input slot this value fills. */
-  slot: string
+  /**
+   * The Verifier input slot this value fills; absent for the one
+   * positional value of a single-slot Verifier.
+   */
+  slot?: string
   /** A JSON value for a `json`, `trace`, or `samples` slot. */
   valueJson?: string
   /** A local file for a `media` slot. */

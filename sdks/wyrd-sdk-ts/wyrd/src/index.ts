@@ -2091,23 +2091,49 @@ export type VerifierInput = JsonValue | verify.File | verify.ArtifactRef;
 /** Slot values keyed by the Verifier's input slot names. */
 export type VerifierInputs = Readonly<Record<string, VerifierInput>>;
 
+/** How `verify` and `submit` read their `inputs`. */
+export interface VerifierInputOptions {
+  /**
+   * Pass `inputs` whole as the one value of a single-slot Verifier, even when
+   * it is a JSON object that would otherwise read as slot names.
+   */
+  readonly positional?: boolean;
+}
+
 /** What `submit` did: Window samples were recorded, or Run evidence was queued. */
 export type Submission =
   | { readonly kind: "recorded" }
   | { readonly kind: "queued"; readonly execution: verify.Execution };
 
-/** Project named slot values onto the native boundary, refusing values JSON cannot carry exactly. */
-function nativeInputs(inputs: VerifierInputs): NativeVerifierInput[] {
-  return Object.entries(inputs).map(([slot, value]): NativeVerifierInput => {
-    if (value instanceof verify.File) {
-      const bytes = value.bytes && Buffer.from(value.bytes.buffer, value.bytes.byteOffset, value.bytes.byteLength);
-      return { slot, file: { path: value.path, bytes, ...value.options } };
-    }
-    if (value instanceof verify.ArtifactRef) {
-      return { slot, artifact: cardRefText(value.artifact), artifactPath: value.path };
-    }
-    return { slot, valueJson: strictJson(`inputs.${slot}`, value) };
-  });
+/**
+ * Project slot values onto the native boundary, refusing values JSON cannot
+ * carry exactly. A plain object is named slot values unless `positional` is
+ * set; any other value is the one positional value, sent without a slot.
+ */
+function nativeInputs(inputs: VerifierInput | VerifierInputs, options?: VerifierInputOptions): NativeVerifierInput[] {
+  const named =
+    !options?.positional &&
+    typeof inputs === "object" &&
+    inputs !== null &&
+    !Array.isArray(inputs) &&
+    !(inputs instanceof verify.File) &&
+    !(inputs instanceof verify.ArtifactRef);
+  if (!named) {
+    return [nativeInput(undefined, inputs as VerifierInput)];
+  }
+  return Object.entries(inputs as VerifierInputs).map(([slot, value]) => nativeInput(slot, value));
+}
+
+/** Project one value, filling `slot` or, without one, the only slot. */
+function nativeInput(slot: string | undefined, value: VerifierInput): NativeVerifierInput {
+  if (value instanceof verify.File) {
+    const bytes = value.bytes && Buffer.from(value.bytes.buffer, value.bytes.byteOffset, value.bytes.byteLength);
+    return { slot, file: { path: value.path, bytes, ...value.options } };
+  }
+  if (value instanceof verify.ArtifactRef) {
+    return { slot, artifact: cardRefText(value.artifact), artifactPath: value.path };
+  }
+  return { slot, valueJson: strictJson(slot === undefined ? "inputs" : `inputs.${slot}`, value) };
 }
 
 /**
@@ -2257,28 +2283,39 @@ export class Observe {
    * request is never replayed.
    *
    * @param verifier - The bound Verifier's name.
-   * @param inputs - Values keyed by input slot name.
+   * @param inputs - Values keyed by input slot name, or the one value of a
+   * single-slot Verifier: a scalar, array, `verify.File`, or `verify.ArtifactRef`.
+   * @param options - `{ positional: true }` passes a JSON object whole as that one value.
    * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER`,
    * `WYRD_VERIFICATION_400_INPUT_INVALID`, `WYRD_VERIFICATION_413_INPUT_TOO_LARGE`,
    * `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` for a scheduled-window Verifier,
    * or the server's refusal.
    */
-  async verify(verifier: string, inputs: VerifierInputs): Promise<VerificationResult> {
-    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs)));
+  async verify(
+    verifier: string,
+    inputs: VerifierInput | VerifierInputs,
+    options?: VerifierInputOptions,
+  ): Promise<VerificationResult> {
+    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs, options)));
   }
 
   /**
-   * Submit named slot values: Window samples are recorded for the Verifier's
+   * Submit slot values: Window samples are recorded for the Verifier's
    * schedule, and Run evidence is queued for one execution. Acceptance confirms
    * staging only; read the outcome through the execution's `wait`.
    *
    * @param verifier - The bound Verifier's name.
-   * @param inputs - Values keyed by input slot name.
+   * @param inputs - As {@link Observe.verify}.
+   * @param options - As {@link Observe.verify}.
    * @throws a {@link WyrdError} for the input refusals of {@link Observe.verify},
    * the Bifrost lifecycle refusals for samples, or the server's refusal.
    */
-  async submit(verifier: string, inputs: VerifierInputs): Promise<Submission> {
-    const submission = await this.#native.submit(verifier, nativeInputs(inputs));
+  async submit(
+    verifier: string,
+    inputs: VerifierInput | VerifierInputs,
+    options?: VerifierInputOptions,
+  ): Promise<Submission> {
+    const submission = await this.#native.submit(verifier, nativeInputs(inputs, options));
     if (submission.execution == null && submission.error == null) {
       return { kind: "recorded" };
     }

@@ -747,7 +747,7 @@ impl NativeRun {
         NativeRunOpen::outcome(self.run.for_card(&alias))
     }
 
-    /// Executes a bound Verifier now on named slot values and returns its
+    /// Executes a bound Verifier now on slot values and returns its
     /// result.
     ///
     /// # Errors
@@ -772,7 +772,7 @@ impl NativeRun {
         })
     }
 
-    /// Submits named slot values: Window samples are recorded, Run evidence
+    /// Submits slot values: Window samples are recorded, Run evidence
     /// is queued for one execution.
     ///
     /// # Errors

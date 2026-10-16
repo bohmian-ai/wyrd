@@ -298,7 +298,7 @@ impl PyGoogleFunctionCall {
             &req.contents[self.content_index]
         };
         match &c.parts[self.part_index] {
-            GooglePart::FunctionCall { function_call } => function_call,
+            GooglePart::FunctionCall { function_call, .. } => function_call,
             _ => unreachable!(),
         }
     }

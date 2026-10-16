@@ -81,6 +81,7 @@ impl ProviderMessageConversion<GoogleContent> for OpenAiChatMessage {
                     name: call.function.name.clone(),
                     args: serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null),
                 },
+                thought_signature: None,
             }));
         }
 
@@ -154,6 +155,7 @@ impl ProviderMessageConversion<GoogleContent> for AnthropicMessage {
                             name: name.clone(),
                             args: input.clone(),
                         },
+                        thought_signature: None,
                     })
                 }
                 AnthropicContentBlock::ToolResult { content, .. } => {
@@ -183,7 +185,7 @@ impl ProviderMessageConversion<OpenAiChatMessage> for GoogleContent {
             .parts
             .iter()
             .filter_map(|part| match part {
-                GooglePart::FunctionCall { function_call } => Some(OpenAiToolCall {
+                GooglePart::FunctionCall { function_call, .. } => Some(OpenAiToolCall {
                     id: function_call.name.clone(),
                     kind: "function".to_string(),
                     function: OpenAiToolFunctionCall {
@@ -236,7 +238,7 @@ impl ProviderMessageConversion<AnthropicMessage> for GoogleContent {
                         citations: None,
                     })
                 }
-                GooglePart::FunctionCall { function_call } => {
+                GooglePart::FunctionCall { function_call, .. } => {
                     Some(AnthropicContentBlock::ToolUse {
                         id: function_call.name.clone(),
                         name: function_call.name.clone(),
@@ -566,7 +568,7 @@ mod conversion {
         assert!(converted
             .parts
             .iter()
-            .any(|part| matches!(part, GooglePart::FunctionCall { function_call } if function_call.name == "lookup")));
+            .any(|part| matches!(part, GooglePart::FunctionCall { function_call, .. } if function_call.name == "lookup")));
     }
 
     #[test]
@@ -604,7 +606,7 @@ mod conversion {
         assert!(converted
             .parts
             .iter()
-            .any(|part| matches!(part, GooglePart::FunctionCall { function_call } if function_call.name == "lookup")));
+            .any(|part| matches!(part, GooglePart::FunctionCall { function_call, .. } if function_call.name == "lookup")));
     }
 
     #[test]

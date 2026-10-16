@@ -268,6 +268,7 @@ pub(crate) mod common {
                                 name: "lookup".to_string(),
                                 args: json!({"q": "hello"}),
                             },
+                            thought_signature: None,
                         },
                     ],
                 },

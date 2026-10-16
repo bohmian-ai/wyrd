@@ -663,7 +663,7 @@ async fn every_format_extracts_its_locked_output() {
             .verify(
                 "document-formats",
                 File::path(fixture(&format!(
-                    "cards/verifier_building_blocks/evidence/{name}"
+                    "cards/verifier_building_blocks/samples/{name}"
                 ))),
             )
             .await

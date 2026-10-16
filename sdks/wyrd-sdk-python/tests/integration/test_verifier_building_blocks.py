@@ -292,7 +292,7 @@ def test_submitted_review_is_judged_in_the_background(
 
 
 def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
-    evidence = FIXTURES / "cards/verifier_building_blocks/evidence"
+    evidence = FIXTURES / "cards/verifier_building_blocks/samples"
     for name, expected in DOCUMENTS.items():
         result = desk.run().observe.verify("document-formats", verify.File(evidence / name))
 

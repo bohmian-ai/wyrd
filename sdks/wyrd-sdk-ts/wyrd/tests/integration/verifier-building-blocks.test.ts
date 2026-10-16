@@ -347,7 +347,7 @@ test("every format extracts its locked output", async ({ desk }) => {
 
   for (const [name, expected] of documents) {
     const result = await desk.state.run().observe.verify("document-formats", {
-      document: verify.File.path(fixture(`cards/verifier_building_blocks/evidence/${name}`)),
+      document: verify.File.path(fixture(`cards/verifier_building_blocks/samples/${name}`)),
     });
 
     expect(step(result, "read").output, name).toEqual(expected);

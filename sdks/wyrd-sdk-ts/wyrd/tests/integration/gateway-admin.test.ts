@@ -19,6 +19,7 @@ function deployment(name: string, credential: string): ProviderDeployment {
     adapter: "openai",
     auth: { bearer: { credential } },
     capabilities: ["chat_completions"],
+    access: "open",
   };
 }
 

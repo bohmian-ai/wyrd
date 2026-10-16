@@ -105,12 +105,13 @@ async fn fail_reader(upstream: &MockServer, marker: &str, response: ResponseTemp
 }
 
 /// One assistant tool call of `tool` with JSON `arguments`, as the model
-/// returns it.
+/// returns it: under the provider-facing name, which spells the dotted wire
+/// name with underscores.
 fn tool_call(id: &str, tool: &str, arguments: &Value) -> Value {
     json!({
         "id": id,
         "type": "function",
-        "function": { "name": tool, "arguments": arguments.to_string() },
+        "function": { "name": tool.replace('.', "_"), "arguments": arguments.to_string() },
     })
 }
 
@@ -141,7 +142,7 @@ async fn script_investigator(upstream: &MockServer) {
             TOOLS[1],
             &json!({ "sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1 }),
         ),
-        tool_call("call-code", TOOLS[2], &json!({ "code": "print(6 * 7)" })),
+        tool_call("call-code", TOOLS[2], &json!({ "source": "6 * 7" })),
     ];
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))

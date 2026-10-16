@@ -19,7 +19,7 @@
 //! [`GEN_AI_EVALUATION_SCORE_VALUE`](crate::vala::trace::attributes::GEN_AI_EVALUATION_SCORE_VALUE),
 //! [`GEN_AI_EVALUATION_EXPLANATION`](crate::vala::trace::attributes::GEN_AI_EVALUATION_EXPLANATION).
 //!
-//! Extraction from `SpanEvent` to `GenAiEvalResult` happens in the GenAI
+//! Extraction from `SpanEvent` to `GenAiEvaluationResult` happens in the GenAI
 //! projector. Wyrd-side, that is `vala-bifrost-redux` or the OTLP receiver
 //! (`vala-ingest`). This crate just publishes the shape.
 
@@ -31,7 +31,7 @@ use crate::error::WyrdError;
 /// the parent GenAI span.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct GenAiEvalResult {
+pub struct GenAiEvaluationResult {
     /// `gen_ai.evaluation.name` - required free-form identifier of the
     /// evaluation, such as `"factuality"`, `"safety"`, or `"toxicity"`.
     pub name: String,
@@ -41,7 +41,7 @@ pub struct GenAiEvalResult {
     pub score_label: Option<String>,
     /// `gen_ai.evaluation.score.value` - optional finite numeric score.
     ///
-    /// NaN and infinite values are rejected by [`GenAiEvalResult::validate`].
+    /// NaN and infinite values are rejected by [`GenAiEvaluationResult::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_value: Option<f64>,
     /// `gen_ai.evaluation.explanation` - optional human-readable explanation.
@@ -55,7 +55,7 @@ pub struct GenAiEvalResult {
     pub response_id: Option<String>,
 }
 
-impl GenAiEvalResult {
+impl GenAiEvaluationResult {
     /// Validate the evaluation-result invariants.
     ///
     /// Enforces:
@@ -71,14 +71,14 @@ impl GenAiEvalResult {
     pub fn validate(&self) -> Result<(), WyrdError> {
         if self.name.is_empty() {
             return Err(WyrdError::Validation {
-                message: "gen_ai_eval_result.name must be non-empty".to_string(),
+                message: "gen_ai_evaluation_result.name must be non-empty".to_string(),
                 details: serde_json::Value::Null,
             });
         }
         if self.name.len() > 256 {
             return Err(WyrdError::Validation {
                 message: format!(
-                    "gen_ai_eval_result.name length must be <= 256, got {}",
+                    "gen_ai_evaluation_result.name length must be <= 256, got {}",
                     self.name.len()
                 ),
                 details: serde_json::Value::Null,
@@ -88,7 +88,7 @@ impl GenAiEvalResult {
             && !value.is_finite()
         {
             return Err(WyrdError::Validation {
-                message: format!("gen_ai_eval_result.score_value must be finite, got {value}"),
+                message: format!("gen_ai_evaluation_result.score_value must be finite, got {value}"),
                 details: serde_json::Value::Null,
             });
         }
@@ -97,7 +97,7 @@ impl GenAiEvalResult {
         {
             return Err(WyrdError::Validation {
                 message: format!(
-                    "gen_ai_eval_result.score_label length must be <= 64, got {}",
+                    "gen_ai_evaluation_result.score_label length must be <= 64, got {}",
                     label.len()
                 ),
                 details: serde_json::Value::Null,
@@ -108,7 +108,7 @@ impl GenAiEvalResult {
         {
             return Err(WyrdError::Validation {
                 message: format!(
-                    "gen_ai_eval_result.explanation length must be <= 4096, got {}",
+                    "gen_ai_evaluation_result.explanation length must be <= 4096, got {}",
                     explanation.len()
                 ),
                 details: serde_json::Value::Null,
@@ -119,7 +119,7 @@ impl GenAiEvalResult {
         {
             return Err(WyrdError::Validation {
                 message: format!(
-                    "gen_ai_eval_result.response_id length must be <= 128, got {}",
+                    "gen_ai_evaluation_result.response_id length must be <= 128, got {}",
                     response_id.len()
                 ),
                 details: serde_json::Value::Null,

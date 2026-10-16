@@ -20,7 +20,7 @@
 //! - `resource`, `instrumentation_scope` — OTel-canonical producer typing.
 //! - `span` — `SpanRecord` + `SpanKind` + `SpanStatus`.
 //! - `trace_summary` — `TraceSummaryRecord`.
-//! - `gen_ai_eval_result` — one evaluation result attached to a GenAI span.
+//! - `gen_ai_evaluation_result` — one evaluation result attached to a GenAI span.
 //! - `gen_ai_span` — `GenAiSpanRecord` (full OTel GenAI semconv surface).
 //!
 //! Trace and span ids live in [`crate::vala::ids`].
@@ -37,7 +37,7 @@ pub(crate) fn duration_ms_from_timestamps(start: DateTime<Utc>, end: DateTime<Ut
 
 pub mod attribute_value;
 pub mod attributes;
-pub mod gen_ai_eval_result;
+pub mod gen_ai_evaluation_result;
 pub mod gen_ai_span;
 pub mod instrumentation_scope;
 pub mod resource;
@@ -47,7 +47,7 @@ pub mod span_link;
 pub mod trace_summary;
 
 pub use attribute_value::AttributeValue;
-pub use gen_ai_eval_result::GenAiEvalResult;
+pub use gen_ai_evaluation_result::GenAiEvaluationResult;
 pub use gen_ai_span::GenAiSpanRecord;
 pub use instrumentation_scope::InstrumentationScope;
 pub use resource::Resource;
@@ -383,7 +383,7 @@ mod attributes_tests {
 
     #[test]
     fn wyrd_keys_count_locked() {
-        assert_eq!(WYRD_KEYS.len(), 8);
+        assert_eq!(WYRD_KEYS.len(), 7);
     }
 
     #[test]
@@ -1746,11 +1746,11 @@ mod trace_summary_record_tests {
 }
 
 #[cfg(test)]
-mod gen_ai_eval_result_tests {
-    use crate::vala::trace::GenAiEvalResult;
+mod gen_ai_evaluation_result_tests {
+    use crate::vala::trace::GenAiEvaluationResult;
 
-    fn eval() -> GenAiEvalResult {
-        GenAiEvalResult {
+    fn evaluation() -> GenAiEvaluationResult {
+        GenAiEvaluationResult {
             name: "factuality".into(),
             score_label: Some("pass".into()),
             score_value: Some(0.92),
@@ -1760,16 +1760,16 @@ mod gen_ai_eval_result_tests {
     }
 
     #[test]
-    fn gen_ai_eval_result_round_trip_full() {
-        let result = eval();
+    fn gen_ai_evaluation_result_round_trip_full() {
+        let result = evaluation();
         let json = serde_json::to_string(&result).unwrap();
-        let back: GenAiEvalResult = serde_json::from_str(&json).unwrap();
+        let back: GenAiEvaluationResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back, result);
     }
 
     #[test]
-    fn gen_ai_eval_result_round_trip_minimal() {
-        let result = GenAiEvalResult {
+    fn gen_ai_evaluation_result_round_trip_minimal() {
+        let result = GenAiEvaluationResult {
             name: "safety".into(),
             score_label: None,
             score_value: None,
@@ -1778,25 +1778,25 @@ mod gen_ai_eval_result_tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         assert_eq!(json, r#"{"name":"safety"}"#);
-        let back: GenAiEvalResult = serde_json::from_str(&json).unwrap();
+        let back: GenAiEvaluationResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back, result);
     }
 
     #[test]
-    fn gen_ai_eval_result_deny_unknown_fields() {
+    fn gen_ai_evaluation_result_deny_unknown_fields() {
         let serialized = r#"{"name":"x","rogue":true}"#;
-        let result: Result<GenAiEvalResult, _> = serde_json::from_str(serialized);
+        let result: Result<GenAiEvaluationResult, _> = serde_json::from_str(serialized);
         assert!(result.is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_happy_path() {
-        eval().validate().unwrap();
+    fn gen_ai_evaluation_result_validate_happy_path() {
+        evaluation().validate().unwrap();
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_empty_name() {
-        let result = GenAiEvalResult {
+    fn gen_ai_evaluation_result_validate_rejects_empty_name() {
+        let result = GenAiEvaluationResult {
             name: String::new(),
             score_label: None,
             score_value: None,
@@ -1807,64 +1807,64 @@ mod gen_ai_eval_result_tests {
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_overlong_name() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_overlong_name() {
+        let mut result = evaluation();
         result.name = "a".repeat(257);
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_nan_score() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_nan_score() {
+        let mut result = evaluation();
         result.score_value = Some(f64::NAN);
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_pos_inf_score() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_pos_inf_score() {
+        let mut result = evaluation();
         result.score_value = Some(f64::INFINITY);
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_neg_inf_score() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_neg_inf_score() {
+        let mut result = evaluation();
         result.score_value = Some(f64::NEG_INFINITY);
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_accepts_negative_score() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_accepts_negative_score() {
+        let mut result = evaluation();
         result.score_value = Some(-3.5);
         result.validate().unwrap();
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_overlong_score_label() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_overlong_score_label() {
+        let mut result = evaluation();
         result.score_label = Some("a".repeat(65));
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_overlong_explanation() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_overlong_explanation() {
+        let mut result = evaluation();
         result.explanation = Some("a".repeat(4097));
         assert!(result.validate().is_err());
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_accepts_4096_char_explanation() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_accepts_4096_char_explanation() {
+        let mut result = evaluation();
         result.explanation = Some("a".repeat(4096));
         result.validate().unwrap();
     }
 
     #[test]
-    fn gen_ai_eval_result_validate_rejects_overlong_response_id() {
-        let mut result = eval();
+    fn gen_ai_evaluation_result_validate_rejects_overlong_response_id() {
+        let mut result = evaluation();
         result.response_id = Some("a".repeat(129));
         assert!(result.validate().is_err());
     }
@@ -1876,7 +1876,7 @@ mod gen_ai_span_record_tests {
     use serde_json::json;
 
     use crate::vala::ids::{SpanId, TraceId};
-    use crate::vala::trace::{GenAiEvalResult, GenAiSpanRecord, Resource, SpanStatus};
+    use crate::vala::trace::{GenAiEvaluationResult, GenAiSpanRecord, Resource, SpanStatus};
 
     fn gen_ai() -> GenAiSpanRecord {
         let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -1961,7 +1961,7 @@ mod gen_ai_span_record_tests {
             mcp_method_name: None,
             mcp_protocol_version: None,
             mcp_resource_uri: None,
-            eval_results: vec![],
+            evaluation_results: vec![],
             extra: serde_json::Map::new(),
         }
     }
@@ -2058,7 +2058,7 @@ mod gen_ai_span_record_tests {
             mcp_method_name: None,
             mcp_protocol_version: None,
             mcp_resource_uri: None,
-            eval_results: vec![],
+            evaluation_results: vec![],
             extra: serde_json::Map::new(),
         };
         let serialized = serde_json::to_string(&record).unwrap();
@@ -2068,17 +2068,17 @@ mod gen_ai_span_record_tests {
     }
 
     #[test]
-    fn gen_ai_span_record_eval_results_round_trip_with_two_entries() {
+    fn gen_ai_span_record_evaluation_results_round_trip_with_two_entries() {
         let mut record = gen_ai();
-        record.eval_results = vec![
-            GenAiEvalResult {
+        record.evaluation_results = vec![
+            GenAiEvaluationResult {
                 name: "factuality".into(),
                 score_label: Some("pass".into()),
                 score_value: Some(0.92),
                 explanation: None,
                 response_id: Some("msg_abc123".into()),
             },
-            GenAiEvalResult {
+            GenAiEvaluationResult {
                 name: "safety".into(),
                 score_label: Some("pass".into()),
                 score_value: Some(1.0),
@@ -2087,6 +2087,9 @@ mod gen_ai_span_record_tests {
             },
         ];
         let serialized = serde_json::to_string(&record).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(wire["evaluation_results"].as_array().map(Vec::len), Some(2));
+        assert!(wire.get("eval_results").is_none(), "no abbreviated alias");
         let back: GenAiSpanRecord = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back, record);
     }
@@ -2228,9 +2231,9 @@ mod gen_ai_span_record_tests {
     }
 
     #[test]
-    fn gen_ai_span_record_validate_propagates_eval_result_failure() {
+    fn gen_ai_span_record_validate_propagates_evaluation_result_failure() {
         let mut record = gen_ai();
-        record.eval_results.push(GenAiEvalResult {
+        record.evaluation_results.push(GenAiEvaluationResult {
             name: String::new(),
             score_label: None,
             score_value: None,
@@ -2307,7 +2310,6 @@ mod key_array_sync_tests {
             TRACING_INPUT,
             TRACING_OUTPUT,
             TRACING_LABEL,
-            EVAL_RECORD_UID,
             SERVICE_CARD_UID,
             DATA_TENANT_ID,
         ];
@@ -2805,7 +2807,7 @@ mod otel_proto_parity_tests {
             mcp_method_name: None,
             mcp_protocol_version: None,
             mcp_resource_uri: None,
-            eval_results: vec![],
+            evaluation_results: vec![],
             extra: serde_json::Map::new(),
         };
 
@@ -2821,7 +2823,7 @@ mod otel_proto_parity_tests {
         assert!(obj.contains_key("provider_name"), "missing provider_name");
         assert!(obj.contains_key("operation_name"), "missing operation_name");
         assert!(obj.contains_key("request_model"), "missing request_model");
-        assert!(obj.contains_key("eval_results"), "missing eval_results");
+        assert!(obj.contains_key("evaluation_results"), "missing evaluation_results");
         assert!(obj.contains_key("extra"), "missing extra");
         assert!(obj.contains_key("resource"), "missing resource");
         assert!(obj.contains_key("status"), "missing status");

@@ -1,0 +1,75 @@
+{
+  "wyrd-example-ts": {
+    "head": "0e45152b5ad0bf33f6d6518c305f5d8868eb7e71",
+    "status": "",
+    "source_sha256": {
+      ".gitignore": "3fbf0f66bf53b0685aebd3958a9376342069db6c904fa37105fc40f632fb32df",
+      "README.md": "2e4ac77b4fbf879629bf7db879c4cc8155f9a5670e2d50aeaf046389831e3cba",
+      "package-lock.json": "074d094aa217b02fcf4475ba00bc8184ad20db65bdd18d54b6ce9292e40746cb",
+      "package.json": "c76f69b15bebb0e9b6fa014b5054c53c5252e31d3acf85d96fc897bf2dc8fe0d",
+      "scripts/ask.ts": "7631908ea284d3485a6af5e3a98c279f9784aab860f5774cf9ce22cb0af5ed38",
+      "scripts/deploy.ts": "39b3c191f6843e983cdecbb7390f5236f7c4f1bd62881eedfa5090e72b70114d",
+      "scripts/evidence.ts": "56c95202accce9051ce2b80c01c55904983047ac730f969c8cf8e90a89636263",
+      "scripts/test.sh": "796de96c40a6e7736f519fcb9d83015048416a4d39832dff15427b16d8e94a01",
+      "scripts/vendor.sh": "27c342afb7f871e3f8e6c83c41f3ffc7c9db81ac9ae26d8b7a292ba1f61c5c6e",
+      "service/policy-check.yaml": "20f230fd5da24efbf71c0724ab4a84be88f5266dc540061b4d0ab5cc627b78f3",
+      "service/policy-judge.yaml": "e9facb680c1db4fe22d3425e2f6d999a06e9a6af0950ccae17e5efafa9c5f3b7",
+      "service/policy-reader.yaml": "c2670c7d89b4e3249c9abf631d3068e677e4e796805a30e9ddad93a8ab5a0c77",
+      "service/refund-policy.pdf": "cae408d87fbde97c2b398fc041c2e36d3f27af4b1a3992596da60a40ef311b02",
+      "service/support-agent.yaml": "5cacaac5234a34f1078b3545d73b529a78b8968fab889c3c51b1e8aef5154628",
+      "service/support-api.yaml": "faeeaf72c34349dad06098832b2601b142cc04a984b038eb4e340bfe4447d87b",
+      "service/support-prompt.yaml": "6876b120daa3cb603d9f71a55a68e2dda61f6b1fbac7df07a8e30cc13362f6d9",
+      "src/agent.ts": "60d9b54c1ca56071100673d09bf971245b650c499b163b5102c72a05f6cb3533",
+      "src/server.ts": "4f2fb2e830281bd64f19568f43d9488562353efbdbd2e56696baba4c3dfbdb97",
+      "src/wyrd.ts": "30d14c6b2ca46df10a7bbb1c75542f251d5b19cb27a5d198db143548fd73caf0",
+      "test/support-api.test.ts": "00c3ef6814f31f69f9fa3a3b9f5fd3cfeff4e096f1733b8c6f1c8e67c9cd4c30",
+      "tsconfig.json": "65e4851c978f3b45f8447cf1bf110ce22247d751a9a2a890c89880f3f3c63c2c"
+    }
+  },
+  "wyrd-example-py": {
+    "head": "a9a6327b9027223a128d53f64360d1d9bc7c0555",
+    "status": "",
+    "source_sha256": {
+      ".gitignore": "e03bd5fb6fe50d68152da6e2f80b98c7f4a44f67907a31841a7cd1ba75a02216",
+      "README.md": "4fd6df8b09fe9ea3acf6ba88eccea0dc6053ac0ef142081541ad3d6a682ac5cb",
+      "pyproject.toml": "ebb522b5db0ebf29a40436f62c379c4a54b467869fa0a3598eb90466a6518d18",
+      "scripts/deploy.py": "b11da87f4012916e69c75329b3dd8cb56fa3f4145a298433222d30bde8dac59c",
+      "scripts/evidence.py": "10fd7b0b3cad34814409b7f083c24d8cf4dce5667fb578070b5bbb3c82a619c6",
+      "scripts/review.py": "ce6fa5720e06d7aeed1a62f4c2d72e95bc2201f05dbdc4812c046d4afd4f3a62",
+      "service/policy-check.yaml": "979d28b574f1b585127d59e0be397323f5b9f1d7e69cf7166ae675199e2d4fcc",
+      "service/policy-judge.yaml": "e9facb680c1db4fe22d3425e2f6d999a06e9a6af0950ccae17e5efafa9c5f3b7",
+      "service/policy-reader.yaml": "c2670c7d89b4e3249c9abf631d3068e677e4e796805a30e9ddad93a8ab5a0c77",
+      "service/refund-policy.pdf": "cae408d87fbde97c2b398fc041c2e36d3f27af4b1a3992596da60a40ef311b02",
+      "service/support-agent.yaml": "e3593094a8f2aa6dd4ec89b81e276f57cee8c381a9ac7ad646a1aee163a99f35",
+      "service/support-desk.yaml": "ae982234d80bb5bb2508a740153095c3fe9745adecdc03c952d3d1adea826381",
+      "service/support-prompt.yaml": "61ad4762f9967babab61cfbee3f4aaa536d008964e5b2659589d830d4def82d9",
+      "src/app.py": "db2ab216c5da430c55c8ca709e4196acf4d4e86bdb6c6ff76095d32c2f7b7bb8",
+      "src/desk.py": "ec9bc92f3e3184b67e52527e216483c6aa051b7f47f9dcdac2177be6cdc05fba",
+      "test/conftest.py": "005f5064d71a9b7c521c5a2735d8dab4bc68ccf5233752e32a230f6f15ba03e8",
+      "test/test_api.py": "89eb52e48020efa8efe9a9da32628a1f2c1c87933422e3ed355916563926ae0e",
+      "uv.lock": "972888f3f0d5304c8179293709a5f748bb24a8365270766b728eb3261c1b3683"
+    }
+  },
+  "wyrd-example-rs": {
+    "head": "f7647cf3fc6f63b102695a08d22ee73aef9c0b04",
+    "status": "",
+    "source_sha256": {
+      ".gitignore": "ba670316dde5c67c0698278b92c11e4359b078b09ccc5566bc9467967902ea1e",
+      "Cargo.lock": "f041f93eb95dcf321254a78bad4d4f2bc56f75858672cb6a4a47f99624a0cc65",
+      "Cargo.toml": "251877a7f8bf5d23cb41c5b3072ab7ba3f43b4ce32ef695152d0ba83a0c14651",
+      "README.md": "affc98ec9a50f33cfb28402671e6abaa6923ce5ed45f9bab325cec87a3a02d5c",
+      "rust-toolchain.toml": "72f7dd8c9fdf9c1fcd8eb8bf9326d4bc66833e4ebf4bc2932636e2b85efcb7af",
+      "scripts/evidence.rs": "1250a8cd4e8959bea2a24d6e74b440579974b3d1d7ee9a41a44086956f794d05",
+      "service/policy-check.yaml": "979d28b574f1b585127d59e0be397323f5b9f1d7e69cf7166ae675199e2d4fcc",
+      "service/policy-judge.yaml": "e9facb680c1db4fe22d3425e2f6d999a06e9a6af0950ccae17e5efafa9c5f3b7",
+      "service/policy-reader.yaml": "c2670c7d89b4e3249c9abf631d3068e677e4e796805a30e9ddad93a8ab5a0c77",
+      "service/refund-policy.pdf": "cae408d87fbde97c2b398fc041c2e36d3f27af4b1a3992596da60a40ef311b02",
+      "service/support-agent.yaml": "e3593094a8f2aa6dd4ec89b81e276f57cee8c381a9ac7ad646a1aee163a99f35",
+      "service/support-desk.yaml": "8e5452b72fa80fbce621d41c952803992378ec64b015f18c5b28b639ee501550",
+      "service/support-prompt.yaml": "61ad4762f9967babab61cfbee3f4aaa536d008964e5b2659589d830d4def82d9",
+      "src/lib.rs": "f7de67b5cee447333a736a74b80427936bd7c2714eb7441a4d0705c8f1146ede",
+      "src/main.rs": "501589a2b15c65c024077dfd1776dbad29975a662e6bd388a361005fd4add7c6",
+      "test/support_desk.rs": "23439c28a1321b757366ac5b3238ff0c68368d587368f9e7a57b58ed4da29fc6"
+    }
+  }
+}

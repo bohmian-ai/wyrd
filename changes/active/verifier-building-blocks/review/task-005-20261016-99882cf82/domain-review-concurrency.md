@@ -1,0 +1,48 @@
+# TASK-005 concurrency and lifecycle review
+
+Result: **FAIL**
+
+Subject: `f2a726c90edbf8956c7b91c843379175ee20eac0..99882cf824e70a601033aba4cfa5c5b27a8dfc7c`. HEAD remained the candidate at the final source inspection. This is an independent static sensitive-domain discovery review; source was not edited.
+
+## Boundary and authority coverage
+
+The reviewed boundary is submission identity and ACK handoff, transactional acceptance, leased execution, capacity refusal, scheduling admission order, reaction deduplication, and SDK staging/wait lifetime. Authorities are the approved revision-8 spec (especially REQ-012–015, INV-001/004/007 and Deployment limits), original TASK-005 scenarios 2–4 and 6, AGENTS.md, agent-rules.md, Wyrd design's Verifier/coordination-clock sections, Bifrost design's verification capture/resource invariants, and the spec-driven-development, maintainer-style, Rust-core, evaluation, drift-monitoring and analytical-operations-reliability references.
+
+| Boundary | Sources inspected | Assessment |
+|---|---|---|
+| Stable key, replay and conflict | `wyrd-sql/src/queries/verifier_executions.rs` RequestKey/Submission, accept_submissions/accept/insert_submission and SQL; cumulative changes | Tenant/subject/actor/hash-derived identity and transaction-scoped key lock preserve original identity; conflict gets its distinct terminal identity. Cross-process ordering is acceptance transaction ordering. |
+| ACK handoff and loss | `wyrd-server/src/scribe_outbox.rs` ScribeSink::write; `verification/submissions.rs` SubmissionSink | Only acknowledged input items stage queue work; retry reuses frames and submissions; SQL absorbs replay; no new request-path PG write or second durable queue. |
+| Claims, leases, cancellation and settlement | `verification/claims.rs`, `leases.rs`, `runner.rs`; queue claim/renew/complete/retry/release SQL and methods | Existing shared loop and fencing remain the owners. Lost leases cancel execution; shutdown releases work; completed staging is separated from analytical visibility. Capacity integration fails as described below. |
+| Scheduling and baseline admission | `verification/scheduler.rs`, `drift.rs`, queue due-binding/schedule and binding latest queries | Existing binding lock, occurrence uniqueness, transactional cursor advance and database clock remain. Binding latest follows row admission rather than completion or retry. |
+| Reactions | queue complete and INSERT_DISPATCH_SQL; runner result/settle | Failed scheduled results alone produce deduplicated dispatches. Delivery identity stays execution-scoped. |
+| Runtime capacity and sibling consumers | `verification/hosted/blocks.rs`, `sandbox.rs`, `workspace.rs`, `tools.rs`; Vala blocks engine attempt/judge/run | A real sandbox admission refusal is converted into verdict evidence rather than requeued; sandbox use through Agent code tools additionally erases the error category. |
+| SDK lifetime | shared client Observe::stage/record_or_stage/enqueue_staged/enqueue_run, verify::Target::enqueue, Execution::wait_until; TS native stage/enqueue call | Synchronous sample staging uses existing Bifrost lifecycle checks; queued run evidence is owned across async upload/enqueue. Wait bounds each read and polling with the caller deadline and does not invent a result from completed status. |
+| Trace ordering | hosted/traces.rs statement/fetch and Vala engine trace projection | Deterministic `(start_time, span_id)` order does not establish parent-before-child for equal timestamps. No new causal-order requirement is prescribed by this domain review. |
+
+## Material proposed finding
+
+### CONC-001 — INCORRECT: sandbox admission pressure settles queued work instead of deferring it
+
+**Obligation.** TASK-005 scenario 6 requires queued background work to remain queued under configured pool saturation. The spec Deployment limits says “Background executions remain in the existing queue until runtime capacity is available” and REQ-013 preserves that lifecycle. Wyrd design lines 1321–1326 explicitly require work refused by verification-runtime capacity to return to the queue without consuming an attempt.
+
+**Exact source and reachable producer-to-consumer path.**
+
+1. `crates/wyrd/wyrd-server/src/verification/runner.rs:202` constructs the existing ClaimLoop without execution permits. `claims.rs:155–177` keeps claiming when prior rounds claimed work. Thus multiple admitted queued executions can concurrently reach Python operations; this is intentional resource-owner admission, not itself a demand for a new execution permit.
+2. `crates/wyrd/wyrd-server/src/verification/hosted/sandbox.rs:160–163` calls `admission.try_acquire()` and produces `BlockError::Retryable("the Python sandbox is at capacity")` once the configured workers plus waiters are occupied. This refusal is reachable with ordinary queued Verifiers containing one code check, while other executions hold all admitted sandbox operations.
+3. `crates/vala/vala-eval/src/blocks/engine.rs:418–420` maps **every** check executor error to `Judged::inconclusive`. The equivalent action path at `engine.rs:355–371` retries according to authored step retries and then converts the error to a failed step reason. Neither path can return a runtime-capacity deferral to the caller. The engine's error enum contains no admission failure.
+4. `crates/wyrd/wyrd-server/src/verification/runner.rs:410–415` treats the resulting engine outcome as `EngineOutcome::Completed`. `runner.rs:329` builds its result, and `runner.rs:449–465` completes and stages it. The originally queued execution is now terminal with an inconclusive requirement (or a failed preparation step), even if capacity becomes available immediately afterward. `pass_rate` can even produce a passing aggregate when another requirement passed, but this finding does not depend on that case.
+5. The existing correct owner/mechanism is already present: `EngineOutcome::Deferred`, `Transition::Defer`, and `VerifierExecutionQueue::release` refund the attempt and retain identity; `ClaimLoop` pauses new claiming after a deferral. Real Python admission failures do not reach it. Current `Deferred` production use covers drift/query input admission, not hosted Python admission.
+
+**Sibling consumers/writers.** Code actions and code checks share `CodeExecutor`/`Sandbox`; Agent-action `code.run` shares the same sandbox in `hosted/tools.rs:280–302` but stringifies its error into `ToolError::Invocation`. Direct execute and the background runner share `HostedBlocks::engine`; direct check-local infrastructure failure semantics must remain unchanged. Workspace materialization uses an existing semaphore but waits rather than producing this sandbox refusal; it is not a separate instance of CONC-001. The one queue writer and scheduler both feed the existing Verifier runner; neither should acquire a new independent queue.
+
+**Observable consequence.** A client that submits valid code verification during transient pool saturation gets a completed inconclusive result instead of its deferred execution eventually being evaluated. The configured in-process admission count is bounded, but it is not integrated with the promised durable queued-work behavior. Green queue-deferral tests do not prove this seam.
+
+**Smallest required outcome/correction boundary.** Preserve a distinguishable runtime-admission refusal from the hosted sandbox through the common engine/hosted execution boundary and route queued executions through the existing `Deferred`/fenced release mechanism. Cover all Python entry consumers, including code actions/checks and enabled Agent `code.run`; do not infer capacity from strings or indiscriminately turn every provider/runtime check failure into execution retry. Preserve direct execution's bounded deadline and check-local inconclusive semantics, existing step retries, accepted authority, cancellation, and sibling service availability. Reuse the existing queue and claim loop; no new scheduler, job service, per-request PG write, or blanket execution permit is warranted.
+
+**Focused closure proof.** Use the existing real server/runtime and sandbox fixture with minimal configured workers/waiters. Hold the pool admission slots, enqueue an ordinary code-check Verifier, and prove its real hosted engine path does not complete or charge an attempt on admission refusal. Free capacity, prove the same execution ID evaluates its code and completes with the expected verdict, and assert identity/reaction deduplication. Exercise the sibling action/tool propagation at the narrowest existing boundary, and retain direct check-error behavior. A scripted `EngineOutcome::Deferred` alone is insufficient.
+
+## Verification assessment and limits
+
+Supplied evidence records a full gate pass at `03712af5e` and local external example builds; no broad verification was rerun in this read-only audit. The candidate adds evidence commits afterward. Existing tests inspected include real replay/conflict routes and runtime lease/shutdown/scheduler cases. The runtime capacity tests `deferred_engine_admission_requeues_without_spending_attempts` and `a_refused_run_pauses_claiming_until_a_running_run_finishes` inject `EngineOutcome::Deferred` through `EngineScript`, bypassing the broken hosted mapping. `sandbox_bounds_workers_and_waiters` exercises the real sandbox refusal but stops at `BlockError::Retryable`; it does not compose that refusal through the queue runner. Together these tests leave the material seam unproven.
+
+No live model provider, new stress workload, full gate, or external repo builds were run. No implementation, push or merge occurred. The material risk is the terminal result caused by transient capacity pressure documented in CONC-001.

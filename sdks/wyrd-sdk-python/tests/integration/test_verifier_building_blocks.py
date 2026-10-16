@@ -142,6 +142,25 @@ def desk(policy_desk_bundle: Path, policy_desk_key: str) -> Iterator[WyrdState]:
     state.shutdown()
 
 
+@pytest.fixture
+def isolated_desk(receiver: Receiver, tmp_path: Path) -> Iterator[WyrdState]:
+    """A ``desk`` on its own server.
+
+    A failed provider call takes the tenant's deployment out of selection for
+    the gateway cooldown, so a test that fails the provider must not share the
+    session tenant with the tests after it.
+    """
+    with WyrdTestServer(verification_runtime=True, provider_base_url=receiver.url):
+        cards = Cards()
+        configure_gateway(WyrdClient())
+        register(cards, "cards/verifier_building_blocks/policy-desk.yaml")
+        bundle = download(cards, "policy-desk", tmp_path)
+        state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("policy-desk")))
+        state.start_bifrost()
+        yield state
+        state.shutdown()
+
+
 def review(
     desk: WyrdState, text: str, refund: int, trace_id: str | None = None
 ) -> verify.VerificationResult:
@@ -404,9 +423,10 @@ def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
         assert requirement(result, "extracted")["outcome"] == "passed", name
 
 
-def test_failed_reader_leaves_its_dependents_inconclusive(desk: WyrdState) -> None:
-    for marker in ("PROVIDER-DOWN", "OFF-SCHEMA", "SLOW-READER"):
-        result = review(desk, f"{marker}: refunds follow our policy.", 50)
+def test_failed_reader_leaves_its_dependents_inconclusive(isolated_desk: WyrdState) -> None:
+    # PROVIDER-DOWN runs last: its failure starts the deployment's cooldown.
+    for marker in ("OFF-SCHEMA", "SLOW-READER", "PROVIDER-DOWN"):
+        result = review(isolated_desk, f"{marker}: refunds follow our policy.", 50)
 
         rules = step(result, "refund-rules")
         assert rules["status"] == "failed", (marker, rules)
@@ -496,7 +516,7 @@ def test_delegated_tools_keep_the_narrower_authority(
     actor = WyrdClient(
         credential=wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]}))
     )
-    delegated = actor.on_behalf_of(subject.access_token())
+    delegated = actor.on_behalf_of(subject.access_token(), audience="wyrd")
 
     result = investigate(policy_desk_bundle, delegated, "delegated")
 

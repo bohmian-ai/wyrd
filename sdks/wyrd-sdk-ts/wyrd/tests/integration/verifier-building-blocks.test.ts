@@ -208,7 +208,8 @@ function reviewNow(desk: PolicyDesk, inputs: VerifierInputs): Promise<Verificati
  * Export a span named `outer`, carrying `policyId` as `policy_id`, with one
  * child named `inner` started inside it, as the Service; wait until both are
  * stored and return the trace ID. Stored spans order by start time, so `outer`
- * is the trace document's `spans[0]` and `inner` its `spans[1]`.
+ * is the trace document's `spans[0]` and `inner` its `spans[1]`; the SDK's
+ * default start time has millisecond precision, so `inner` starts 1ms later.
  */
 async function recordTrace(
   server: { flushBifrost(): void },
@@ -218,8 +219,9 @@ async function recordTrace(
 ): Promise<string> {
   const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(spanExporter(desk.client))] });
   const tracer = provider.getTracer("journey.service");
-  const span = tracer.startSpan(outer, { attributes: { policy_id: policyId } });
-  tracer.startSpan(inner, {}, trace.setSpan(context.active(), span)).end();
+  const start = Date.now();
+  const span = tracer.startSpan(outer, { attributes: { policy_id: policyId }, startTime: new Date(start) });
+  tracer.startSpan(inner, { startTime: new Date(start + 1) }, trace.setSpan(context.active(), span)).end();
   span.end();
   await provider.shutdown();
   const traceId = span.spanContext().traceId;

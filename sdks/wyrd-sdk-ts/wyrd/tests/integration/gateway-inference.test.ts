@@ -384,6 +384,9 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
 
+/** The portable `{{question}}` or native `${question}` placeholder of an authored Prompt. */
+const QUESTION = /\{\{question\}\}|\$\{question\}/g;
+
 /**
  * Ask the `alias` Agent of `state` `question` on `deployment` as `caller`, the
  * way an application calls its model: the Agent's authored Prompt messages,
@@ -400,12 +403,10 @@ async function askAgent(
   question: string,
 ): Promise<string> {
   const { spec } = state.agent(alias).prompt();
-  const [authored, placeholder] = spec.messages
-    ? [spec.messages, "{{question}}"]
-    : [(spec.body?.messages ?? []) as readonly { role: string; content: string }[], "${question}"];
+  const authored = spec.messages ?? ((spec.body?.messages ?? []) as readonly { role: string; content: string }[]);
   const messages = authored.map(({ role, content }) => ({
     role,
-    content: String(content).replaceAll(placeholder, () => question),
+    content: String(content).replace(QUESTION, () => question),
   })) as OpenAI.ChatCompletionMessageParam[];
   const run = state.run(alias);
   const client = new OpenAI({
@@ -444,9 +445,9 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
       expect(await askAgent(state, caller, alias, deployment, question)).toBe("hi");
     }
   }
-  const upstream = provider.received.slice(before).map(
-    ({ body }) => JSON.parse(body) as { model: string; messages: unknown[] },
-  );
+  const upstream = provider.received
+    .slice(before)
+    .map(({ body }) => JSON.parse(body) as { model: string; messages: unknown[] });
   expect(upstream.map(({ model }) => model)).toEqual(Array(4).fill("gpt-4o"));
   expect(upstream.map(({ messages }) => messages)).toEqual(asked.map((content) => [{ role: "user", content }]));
 

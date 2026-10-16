@@ -894,10 +894,10 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
                 Instant::now() + Duration::from_secs(60),
             )
             .await;
-        let reason = match (&refused, too_large) {
-            (Err(EngineError::InputInvalid(reason)), false)
-            | (Err(EngineError::InputTooLarge(reason)), true) => reason,
-            _ => panic!("expected a refusal containing {expected:?}: {refused:?}"),
+        let ((Err(EngineError::InputInvalid(reason)), false)
+        | (Err(EngineError::InputTooLarge(reason)), true)) = (&refused, too_large)
+        else {
+            panic!("expected a refusal containing {expected:?}: {refused:?}")
         };
         assert!(reason.contains(expected), "{reason}");
         assert!(

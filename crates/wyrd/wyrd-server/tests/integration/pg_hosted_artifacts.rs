@@ -1181,10 +1181,10 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
             .map(|(name, declaration)| (slot(name), declaration))
             .collect();
         let refused = run(spec, evidence).await;
-        let reason = match (&refused, too_large) {
-            (Err(EngineError::InputInvalid(reason)), false)
-            | (Err(EngineError::InputTooLarge(reason)), true) => reason,
-            _ => panic!("expected a refusal containing {expected:?}: {refused:?}"),
+        let ((Err(EngineError::InputInvalid(reason)), false)
+        | (Err(EngineError::InputTooLarge(reason)), true)) = (&refused, too_large)
+        else {
+            panic!("expected a refusal containing {expected:?}: {refused:?}")
         };
         assert!(reason.contains(expected), "{reason}");
     }

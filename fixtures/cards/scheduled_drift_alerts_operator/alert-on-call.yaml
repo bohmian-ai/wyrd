@@ -12,3 +12,6 @@ spec:
   auth:
     scheme: bearer
     connection: on-call-hooks
+  body:
+    execution_id: "{{execution_id}}"
+    summary: "{{summary}}"

@@ -76,11 +76,11 @@ READ_POLICY = {
         {
             "id": "call-read-policy",
             "type": "function",
-            "function": {"name": "fs.read", "arguments": '{"path":"/inputs/policy.pdf"}'},
+            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.pdf"}'},
         }
     ],
 }
-"""The refund reader's first turn: read its workspace copy of the policy."""
+"""The refund reader's first turn: read its workspace copy of the policy as ``fs_read``."""
 
 
 INVESTIGATE = {
@@ -90,7 +90,7 @@ INVESTIGATE = {
         {
             "id": id,
             "type": "function",
-            "function": {"name": tool, "arguments": json.dumps(arguments)},
+            "function": {"name": tool.replace(".", "_"), "arguments": json.dumps(arguments)},
         }
         for id, tool, arguments in (
             (
@@ -110,11 +110,15 @@ INVESTIGATE = {
                 "bifrost.query",
                 {"sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1},
             ),
-            ("call-code", "code.run", {"code": "print(6 * 7)"}),
+            ("call-code", "code.run", {"source": "6 * 7"}),
         )
     ],
 }
-"""The investigator's first turn: call the Card, Bifrost, and code tools at once."""
+"""The investigator's first turn: call the Card, Bifrost, and code tools at once.
+
+The model names each tool by its provider-facing name, the dotted wire name
+spelled with underscores.
+"""
 
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""

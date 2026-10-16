@@ -283,7 +283,7 @@ impl PolicyDesk {
                     "id": "call-read-policy",
                     "type": "function",
                     "function": {
-                        "name": "fs.read",
+                        "name": "fs_read",
                         "arguments": "{\"path\":\"/inputs/policy.pdf\"}",
                     },
                 }],
@@ -301,7 +301,6 @@ impl PolicyDesk {
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
         let deployment = Deployment::start_with(
             WyrdTestServer::builder()
-                .without_process_telemetry_for_test()
                 .with_verification_runtime_for_test()
                 .with_gateway_provider_root_for_test(
                     upstream.uri().parse().expect("upstream URL parses"),

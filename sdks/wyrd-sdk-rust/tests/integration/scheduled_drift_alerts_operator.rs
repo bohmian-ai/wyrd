@@ -298,6 +298,9 @@ async fn passing_window_alerts_no_one() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn empty_window_is_inconclusive_and_alerts_no_one() {
     let mut watch = Watch::start().await;
+    // The Service runs and authenticates, so its binding is active, but
+    // submits nothing.
+    watch.submit(std::iter::empty::<u32>()).await;
 
     let result = watch.judge().await;
 

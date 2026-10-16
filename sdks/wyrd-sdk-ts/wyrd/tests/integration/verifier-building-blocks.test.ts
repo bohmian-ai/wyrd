@@ -75,9 +75,10 @@ const DENIED = "WYRD_PERMISSION_403_DENIED_RBAC";
 /** The permissions every `tool-review` principal holds: run any Verifier and invoke the gateway its investigator calls the model through. */
 const VERIFIES = ["verifier:run", "gateway:invoke"];
 
-/** One assistant tool call of `tool` with JSON `args`, as the model returns it. */
+/** One assistant tool call of `tool` with JSON `args`, as the model returns it: under the provider-facing name, which spells the dotted wire name with underscores. */
 function toolCall(id: string, tool: string, args: unknown): unknown {
-  return { id, type: "function", function: { name: tool, arguments: JSON.stringify(args) } };
+  const name = tool.replaceAll(".", "_");
+  return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
 }
 
 /** The investigator's one tool turn: one call of each of {@link TOOLS}, in order. */
@@ -86,7 +87,7 @@ const INVESTIGATION = [
     card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0", space: "default" },
   }),
   toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM vala.verification.results", max_rows: 1 }),
-  toolCall("call-code", TOOLS[2], { code: "print(6 * 7)" }),
+  toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
 
 /** The policy every review reads: the support desk's checked-in refund policy. */

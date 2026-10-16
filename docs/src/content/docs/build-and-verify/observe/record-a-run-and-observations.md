@@ -1,6 +1,6 @@
 ---
 title: Record a run and observations
-description: Load your Service's bundle, record custom rows and verification evidence inside a run, and read them back by run ID.
+description: Load your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
 pillar: wyrd
 section: Build and verify
 topic: Observe
@@ -9,7 +9,7 @@ draft: true
 status: runnable
 ---
 
-Load the exact Service version you deployed, wrap each request in a run, and record what each component saw and did. Verifiers judge these rows, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
+Load the exact Service version you deployed, wrap each request in a run, record what each component saw and did, and hand it to a Verifier with `verify` or `submit`. Verifiers judge these runs, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
 
 [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/) explains the model behind these calls.
 
@@ -75,79 +75,41 @@ await state.startBifrost();
 
 ## 3. Record inside a run
 
-Open one run per request with `run(alias)`, which scopes it to one component. Every row records which Card it is about, and all of them share one `run_id`. This is the support desk's handler:
+Open one run per request. `state.run()` scopes it to the Service; `state.run("agent")` or `run.for_card("agent")` scopes it to one component. Every view of a run shares one `run_id`, and every row records which Card it is about. This is the support desk's handler from the [quickstart](/get-started/quickstart/):
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```python
-def answer_question(ticket_id: str, question: str) -> str:
-    with state.run("agent") as run:
-        answer = run.invoke({"question": question})
-        run.observe.record(
-            "vala.datasets.tickets",
-            {"ticket_id": ticket_id, "question": question, "answer": answer, "refund": "refund" in question},
-        )
-    return answer
-```
+<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="answer" title="desk.py" />
 
 </LangTab>
 <LangTab lang="rust">
 
-```rust
-use serde_json::json;
-
-async fn answer_question(state: &WyrdState, ticket_id: &str, question: &str) -> Result<String, WyrdError> {
-    let run = state.run_for_card("agent")?;
-    let answer = run.invoke(&[("question", question)]).await?;
-    run.observe()
-        .record(
-            "vala.datasets.tickets",
-            &json!({ "ticket_id": ticket_id, "question": question, "answer": answer, "refund": question.contains("refund") }),
-        )
-        .await?;
-    Ok(answer)
-}
-```
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="answer" title="lib.rs" />
 
 </LangTab>
 <LangTab lang="typescript">
 
-```typescript
-async function answerQuestion(ticketId: string, question: string): Promise<string> {
-  const run = state.run("agent");
-  const answer = await run.invoke({ question });
-  await run.observe.record("vala.datasets.tickets", {
-    ticket_id: ticketId,
-    question,
-    answer,
-    refund: question.includes("refund"),
-  });
-  return answer;
-}
-```
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="answer" title="server.ts" />
 
 </LangTab>
 </LangTabs>
 
-`invoke` runs the Agent's Prompt through the AI Gateway, so the model call lands in `vala.gateway.calls` under the same run. It needs a gateway deployment for the Prompt's model. If your service calls its model itself, skip `invoke` and record what it did; the observations work the same.
+The Python and TypeScript handlers call the model through the gateway with the OpenAI Agents SDK, and pass `wyrd-run-id` so the gateway files the call under the run. The Rust handler uses `run.invoke`, which runs the Agent's Prompt through the gateway for you. Either way the model call lands in `vala.gateway.calls` with the run's `run_id`. If your service calls its model directly, record what it did; observations work the same.
 
-When one request touches several components, such as an agent and a model that scores the customer, `run.for_card(alias)` rescopes the same run to each one, so the rows still share one `run_id`. A `session_id`, a UUID, groups the runs of one conversation.
+`run` gives you three calls:
 
-What each call is for:
-
-| Call | Records | Use it when |
+| Call | Does | Returns |
 | --- | --- | --- |
-| `observe.record(table, row)` | One row in your own `vala.datasets` table | You want the data for your own queries |
-| `observe.verify(name, inputs)` | The inputs and the result; returns the verdict now | Your code needs the answer before it responds. See [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) |
-| `observe.submit(name, inputs)` | The inputs, then a queued execution; returns its handle | A slower check should judge it in the background. See [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) |
-| `observe.submit(name, samples)` on a drift Verifier | One flat row of feature values, stored one row per feature | A [drift Verifier](/build-and-verify/verify/monitor-drift/) should compare them with a baseline on its schedule |
+| `observe.record(table, row)` | Queues one row for your own `vala.datasets` table | Nothing; the row is stored at the next flush |
+| `observe.verify(name, **inputs)` | Runs a bound Verifier on the inputs and waits for it | The verdict and requirement breakdown |
+| `observe.submit(name, **inputs)` | Queues a bound Verifier on the server | An execution handle you can read later, from any process |
 
 `record` needs the table to exist first. Declare it under the Service's `spec.tables` so it is created on registration, or register it with the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/#1-register-a-table).
 
 The Python `with` block tags every OpenTelemetry span started inside it with the run, so traces line up with observations. It does not flush. In TypeScript, `run.scope(fn)` does the same for spans started in `fn`; in Rust, `run.scope(future)`.
 
-Drift samples return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
+`record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
 
 ### Trace an agent framework
 
@@ -355,7 +317,85 @@ You own this provider: `shutdown` on the state never flushes it, so shut it down
 
 Either provider samples by the standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables; a span the sampler drops is never exported. The server stores a span only when the credential may attribute it: a span naming a Card outside the credential's scope or tenant is rejected on its own, and the rest of the export is stored.
 
-## 4. Shut down cleanly
+## 4. Verify inside the run
+
+`verify` and `submit` are how a run gets judged. Both take the name of a Verifier bound to the run's subject, plus one keyword per input slot the Verifier declares. Both record the inputs as evidence under the run, so the verdict joins back to the ticket, the trace, and the model call.
+
+### Verify now
+
+Use `verify` when your code needs the verdict before it replies. It blocks until the Verifier finishes. The support desk checks every answer this way, once on the Service and once on the agent:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="check" title="desk.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="check" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="check" title="server.ts" />
+
+</LangTab>
+</LangTabs>
+
+The view decides which bindings apply. `no-refund-promise` is bound to the Service, so it runs on `run`. `ticket-complete` is bound to the agent component, so it runs on `run.for_card("agent")`. Ask a view for a Verifier that isn't bound to its Card and the call fails with `WYRD_SDK_404_UNKNOWN_VERIFIER`.
+
+The result carries `verdict` (`passed`, `failed`, or `inconclusive`) and one entry per requirement with its `outcome`, `reason`, and `citations`. A failed verdict is a normal return, not an error. What to do about it is your call: the support desk returns it to the caller, and a stricter service would swap the answer for a handoff.
+
+Keep `verify` for checks that are quick. Each call blocks the request for the whole execution, so a Verifier that calls a model belongs in `submit`.
+
+### Submit for later
+
+Use `submit` when a slower check, such as a model judge, should run in the background. It uploads the inputs, queues one execution on the server, and returns at once:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="submit" title="desk.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="submit" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="submit" title="server.ts" />
+
+</LangTab>
+</LangTabs>
+
+`verify.File(path)` fills a `media` input slot; the file is hashed and uploaded during the call. The handle's `id` is all anyone needs to read the result later. Store it, return it to your caller, or hand it to a worker:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/support-desk-app/python/app.py" lang="python" region="status" title="app.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="status" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="status" title="server.ts" />
+
+</LangTab>
+</LangTabs>
+
+`status()` returns the execution's `status` (`pending`, `running`, `retrying`, `completed`, `cancelled`, `timed_out`, or `errored`), plus `result` once it completed or `error` once it failed. To block until it is done instead, call `execution.wait(timeout)`, which polls and returns the same result `verify` would.
+
+On a drift Verifier, `submit` records samples for its schedule rather than queueing an execution, and returns `Recorded`. [Monitor drift](/build-and-verify/verify/monitor-drift/) covers that path.
+
+## 5. Shut down cleanly
 
 Queued rows are not stored yet. Flush before you depend on them, and shut down once when the process stops:
 
@@ -387,7 +427,7 @@ await state.shutdown();
 
 `shutdown` sends everything still queued and returns once the server has it. A process killed without it can lose its last rows. `flush` does the same without closing the writer, for tests and batch jobs. With `start_telemetry`, both first flush the tracer provider it installed, and still drain the writer if that flush fails.
 
-## 5. Read a run back
+## 6. Read a run back
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -396,7 +436,7 @@ await state.shutdown();
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
-    "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+    "SELECT question, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
     [run.run_id],
 )
 print(rows.to_pandas())
@@ -411,7 +451,7 @@ use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
-        "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+        "SELECT question, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
         &[QueryParam::String(run.run_id().to_string())],
     )
     .await?;
@@ -425,7 +465,7 @@ import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(
-  "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+  "SELECT question, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
   [run.runId],
 );
 ```

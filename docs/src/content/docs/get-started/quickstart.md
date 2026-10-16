@@ -37,38 +37,85 @@ The `agents` extra brings the OpenAI Agents SDK, `gateway` the HTTP client the g
 
 ## 2. Connect the model
 
-The agent calls OpenAI through Wyrd's gateway, so the server needs your key and a deployment that routes to it. Store the key first. It goes to the server over stdin, never into a file or your shell history:
+Wyrd calls OpenAI for you, so your code never holds the OpenAI key. The server needs two things, and both are a JSON document piped to `wyrd gateway ... put --file -`:
 
-```bash
-printf '{"name":"openai-key","provider":"openai","source":{"managed_secret":{"secret":"%s"}}}' \
-  "$OPENAI_API_KEY" | wyrd gateway credential put --file -
-```
+1. A **credential** named `openai-key` that holds your key. The server encrypts it, and no read ever returns it:
 
-Wyrd encrypts the key with the server's sealing key, and no read returns it. Now name an `openai` deployment on it. Every Agent Card in the example routes to it with `execution_route: {kind: wyrd_gateway, deployment: openai}`:
+   ```bash
+   wyrd gateway credential put --file - <<JSON
+   {"name": "openai-key", "provider": "openai", "source": {"managed_secret": {"secret": "$OPENAI_API_KEY"}}}
+   JSON
+   ```
 
-```bash
-wyrd gateway deployment put --file - <<'JSON'
-{
-  "name": "openai",
-  "adapter": "openai",
-  "auth": { "bearer": { "credential": "openai-key" } }
-}
-JSON
-```
+2. A **deployment** named `openai` that sends requests to OpenAI with that credential:
 
-[Set up the LLM gateway](/connect/set-up-the-llm-gateway/) covers other providers.
+   ```bash
+   wyrd gateway deployment put --file - <<'JSON'
+   {"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}
+   JSON
+   ```
+
+Both commands print the stored document, with the secret redacted. Agents now reach OpenAI models as `openai/<model>`, and every Agent Card in the example asks for exactly that with `execution_route: {kind: wyrd_gateway, deployment: openai}`. [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) uses the same two commands for other providers.
 
 ## 3. Read what is declared
 
-The Service Card is the contract. It names the components, the table the app records tickets into, and which Verifier checks what:
+The example is eight Cards in `service/`. The Service names the others by relative path, such as `ref: ./support-agent.yaml`, so switch tabs to follow each reference:
+
+<Tabs>
+<Tab label="support-desk.yaml">
 
 <CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
 
-`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. The simplest Verifier is one assertion:
+</Tab>
+<Tab label="support-agent.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-agent.yaml" lang="yaml" title="service/support-agent.yaml" />
+
+</Tab>
+<Tab label="support-prompt.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-prompt.yaml" lang="yaml" title="service/support-prompt.yaml" />
+
+</Tab>
+<Tab label="no-refund-promise.yaml">
 
 <CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
 
-The other two use a sandboxed `code` check and an `agent` check; open them in `service/` when you want to see more.
+</Tab>
+<Tab label="ticket-complete.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/ticket-complete.yaml" lang="yaml" title="service/ticket-complete.yaml" />
+
+</Tab>
+<Tab label="follows-policy.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/follows-policy.yaml" lang="yaml" title="service/follows-policy.yaml" />
+
+</Tab>
+<Tab label="policy-reader.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/policy-reader.yaml" lang="yaml" title="service/policy-reader.yaml" />
+
+</Tab>
+<Tab label="policy-judge.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/policy-judge.yaml" lang="yaml" title="service/policy-judge.yaml" />
+
+</Tab>
+</Tabs>
+
+| Card | Role |
+| --- | --- |
+| `support-desk.yaml` | The Service: its components, its `tickets` table, and which Verifier checks what |
+| `support-agent.yaml` | The agent. It runs `support-prompt` through the gateway's `openai` deployment |
+| `support-prompt.yaml` | The prompt and model the agent runs |
+| `no-refund-promise.yaml` | Bound to the Service. One assertion, no model |
+| `ticket-complete.yaml` | Bound to the agent. A sandboxed Python check, no model |
+| `follows-policy.yaml` | Bound to the agent. Reads the policy PDF with `policy-reader`, then asks `policy-judge` |
+| `policy-reader.yaml` | An Agent that reads the PDF from its workspace and lists the rules with their pages |
+| `policy-judge.yaml` | A tool-less Agent that returns a verdict citing a policy page |
+
+`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. Registering the Service registers every Card it references, so the next step registers all eight.
 
 ## 4. Deploy the Cards
 
@@ -76,7 +123,7 @@ The other two use a sandboxed `code` check and an `agent` check; open them in `s
 python deploy.py
 ```
 
-This registers the Service and every Card it references, which creates the `vala.datasets.tickets` table. It then downloads the registered versions into `.wyrd-bundle/`, so the app runs exactly what the server holds, and turns on gateway metadata capture, so each model call is recorded with its Run:
+This registers all eight Cards, which creates the `vala.datasets.tickets` table. It then downloads the registered versions into `.wyrd-bundle/`, so the app runs exactly what the server holds, and turns on gateway metadata capture, so each model call is recorded with its Run:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">

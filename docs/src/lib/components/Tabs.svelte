@@ -51,6 +51,10 @@
 </script>
 
 <div class="tabs">
+  <!-- Panels render first so every <Tab> has registered before the strip
+       renders; a prerendered page then ships its full tab strip. CSS `order`
+       puts the strip back on top. -->
+  {@render children?.()}
   {#if tabs.length > 0}
     <div class="tabs-strip" role="tablist">
       {#each tabs as t (t.id)}
@@ -71,14 +75,19 @@
       {/each}
     </div>
   {/if}
-  {@render children?.()}
 </div>
 
 <style>
   .tabs {
+    display: flex;
+    flex-direction: column;
     margin: 1.5rem 0;
   }
   .tabs-strip {
+    order: -1;
+    align-self: flex-start;
+    max-width: 100%;
+    flex-wrap: wrap;
     display: inline-flex;
     gap: 0;
     border: 1px solid var(--border);

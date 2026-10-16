@@ -49,52 +49,46 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
    This saves the server URL and an admin credential for the `acme` tenant. Every later command reads them; you export nothing.
 
-2. Write the provider credential to a file outside your repository:
+Every gateway resource is a JSON document piped to `wyrd gateway <resource> put --file -`. Each command prints what it stored, and running it again changes nothing.
+
+2. Store the Anthropic key as a credential named `anthropic-key`. The server encrypts it, and every read of it is redacted:
 
    ```bash
-   umask 077
-   printf '{"name":"anthropic-key","provider":"anthropic","source":{"managed_secret":{"secret":"%s"}}}\n' \
-     "$ANTHROPIC_API_KEY" > anthropic-credential.json
+   wyrd gateway credential put --file - <<JSON
+   {"name": "anthropic-key", "provider": "anthropic", "source": {"managed_secret": {"secret": "$ANTHROPIC_API_KEY"}}}
+   JSON
    ```
 
-   `umask 077` makes the file readable only by you. Don't commit it.
+   The key goes to the server over stdin. It never lands in a file or your shell history.
 
-3. Store the credential. The server seals the secret, and every later read of it is redacted:
+3. Create the `claude-prod` deployment, which sends requests to Anthropic with that credential:
 
    ```bash
-   wyrd gateway credential put --file anthropic-credential.json
-   rm anthropic-credential.json
+   wyrd gateway deployment put --file - <<'JSON'
+   {"name": "claude-prod", "adapter": "anthropic", "auth": {"api_key_header": {"header": "x-api-key", "credential": "anthropic-key"}}}
+   JSON
    ```
 
-4. Save this deployment as `claude-prod.json` and apply it:
+   The `auth` block says how the adapter sends the key: Anthropic and Gemini take it in a header, OpenAI and Jev as a bearer token. [Add more providers](#add-more-providers) has each one.
 
-   ```json
-   {
-     "name": "claude-prod",
-     "adapter": "anthropic",
-     "auth": { "api_key_header": { "header": "x-api-key", "credential": "anthropic-key" } },
-     "capabilities": ["chat_completions"]
-   }
-   ```
+4. Turn on call recording. A new tenant's capture policy is `disabled`, so it records nothing, and Wyrd doesn't backfill: a call made before this step is never recorded.
 
    ```bash
-   wyrd gateway deployment put --file claude-prod.json
-   wyrd gateway deployment get claude-prod
-   ```
-
-   `get` prints the deployment you just applied. Applying the same file again changes nothing.
-
-5. Turn on call recording. A new tenant's capture policy is `disabled`, so it records nothing. Wyrd doesn't backfill, so a call made before this step is never recorded. Save this as `capture-policy.json` and apply it:
-
-   ```json
-   { "mode": "metadata", "payload_fields": [] }
-   ```
-
-   ```bash
-   wyrd gateway capture-policy put --file capture-policy.json
+   wyrd gateway capture-policy put --file - <<'JSON'
+   {"mode": "metadata", "payload_fields": []}
+   JSON
    ```
 
    `metadata` records each call's caller, deployment, model, outcome, and token usage, but never the prompt or the reply, and its `payload_fields` must stay empty. We recommend starting here. `payload` mode also stores the redacted request or response, which usually carries user data; turn it on only when you need the content.
+
+5. Check what you stored:
+
+   ```bash
+   wyrd gateway deployment get claude-prod
+   wyrd gateway credential get anthropic-key
+   ```
+
+   The credential prints with its secret redacted.
 
 6. Make the first request. The Anthropic SDK sends it to Wyrd instead of Anthropic, and `wyrd.http_auth` swaps the placeholder `api_key` for your Wyrd access token:
 
@@ -131,7 +125,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
    print(rows)
    ```
 
-   The newest row has `requested_model` `{'deployment': 'claude-prod', 'model': 'claude-sonnet-4-5'}` and `outcome` `succeeded`. Rows show up a few seconds after the call. If the result is empty right away, wait and query again. If it stays empty, run `wyrd gateway capture-policy get`: a `disabled` mode means step 5 didn't apply, and calls made before it won't appear.
+   The newest row has `requested_model` `{'deployment': 'claude-prod', 'model': 'claude-sonnet-4-5'}` and `outcome` `succeeded`. Rows show up a few seconds after the call. If the result is empty right away, wait and query again. If it stays empty, run `wyrd gateway capture-policy get`: a `disabled` mode means step 4 didn't apply, and calls made before it won't appear.
 
 Calling from another framework or language? [Make gateway requests from a framework](/connect/call-wyrd-from-a-stock-client/) has the OpenAI, Anthropic, Google GenAI, OpenAI Agents SDK, and Pydantic AI versions of step 6.
 
@@ -168,7 +162,7 @@ Calling from another framework or language? [Make gateway requests from a framew
 ]
 ```
 
-Put one credential per provider first (`openai-key`, `anthropic-key`, `gemini-key`, `jev-key`), written as in step 2 with that provider's name and key. The list applies in order. If one entry fails, for example because its credential doesn't exist, the entries after it are not attempted and the command exits non-zero. Fix the entry and apply the whole list again.
+Put one credential per provider first (`openai-key`, `anthropic-key`, `gemini-key`, `jev-key`), as in step 2 with that provider's name and key. Save the list as `gateway.json` and apply it with `wyrd gateway deployment put --file gateway.json`. The list applies in order. If one entry fails, for example because its credential doesn't exist, the entries after it are not attempted and the command exits non-zero. Fix the entry and apply the whole list again.
 
 Each adapter serves its provider's own request format on its own route:
 

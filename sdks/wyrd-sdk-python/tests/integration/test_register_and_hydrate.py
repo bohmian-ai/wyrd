@@ -99,9 +99,9 @@ def test_cards_get_returns_every_kind_as_envelope(
     assert model.metadata["artifact_hash"]
     assert prompt.spec["model"] == "gpt-4o"
     assert agent.spec["run_config"]["max_iterations"] == 2
-    assert verifier.spec["implementation"]["kind"] == "eval"
+    assert verifier.spec["requirements"][0]["check"]["kind"] == "assert"
     assert service.spec["service_type"] == "agent"
-    assert trigger.spec["kind"] == "observations_ready"
+    assert trigger.spec["kind"] == "schedule"
     assert operator.spec["kind"] == "http"
 
 

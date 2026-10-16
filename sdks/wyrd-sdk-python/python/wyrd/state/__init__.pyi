@@ -406,7 +406,7 @@ class WyrdState:
     def verifier(self, alias: str) -> CardEnvelope:
         """Return the kind-checked Verifier envelope selected by ``alias``.
 
-        The typed Drift or Eval body lives under ``spec["implementation"]``.
+        Its typed inputs, steps, and requirements live under ``spec``.
 
         Args:
             alias: A friendly alias of a Verifier Card.

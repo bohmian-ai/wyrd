@@ -27,7 +27,7 @@ def run_cli(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def eval_run(fixtures_dir: Path, tmp_path: Path) -> list[str]:
-    """An ``eval run`` of the ok-check Verifier, short of its records."""
+    """An ``eval run`` of the bare ok-check Eval spec, short of its records."""
     return [
         "eval",
         "run",

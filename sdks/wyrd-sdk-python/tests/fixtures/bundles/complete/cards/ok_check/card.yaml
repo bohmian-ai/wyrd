@@ -8,18 +8,17 @@ metadata:
   labels: {}
   annotations: {}
 spec:
-  implementation:
-    kind: eval
-    spec:
-      tasks:
-        ok_check:
-          kind: assertion
-          id: ok_check
-          context_path: $.ok
-          operator: equals
-          expected: true
-      pass_gate:
-        kind: all_pass
+  inputs:
+    ok:
+      type: json
+  requirements:
+    - id: ok-check
+      statement: The record is ok.
+      check:
+        kind: assert
+        path: inputs.ok
+        operator: equals
+        expected: true
 relationships:
   outbound: []
   outbound_refs: []

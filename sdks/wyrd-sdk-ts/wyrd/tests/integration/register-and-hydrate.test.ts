@@ -85,7 +85,7 @@ test("cards get returns every kind typed", async ({ cards, model, desk }) => {
     "Verifier",
   ]);
   const verifier = read.find((card) => card.kind === "Verifier");
-  expect(verifier?.kind === "Verifier" && verifier.spec.implementation.kind).toBe("eval");
+  expect(verifier?.kind === "Verifier" && verifier.spec.requirements?.[0]?.check.kind).toBe("assert");
   const data = read.find((card) => card.kind === "Data");
   expect(data?.kind === "Data" && data.spec.stats?.row_count).toBe(100);
 });

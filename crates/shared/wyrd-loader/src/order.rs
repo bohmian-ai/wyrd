@@ -278,7 +278,14 @@ mod tests {
         let verifier = authored(
             "quality",
             &CardKind::Verifier,
-            serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+            serde_json::json!({
+                "inputs": { "answer": { "type": "json" } },
+                "requirements": [{
+                    "id": "answered",
+                    "statement": "The agent produced an answer.",
+                    "check": { "kind": "assert", "path": "inputs.answer", "operator": "is_not_null" }
+                }]
+            }),
         );
 
         let diagnostics =
@@ -298,7 +305,14 @@ mod tests {
         let verifier = authored(
             "quality",
             &CardKind::Verifier,
-            serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+            serde_json::json!({
+                "inputs": { "answer": { "type": "json" } },
+                "requirements": [{
+                    "id": "answered",
+                    "statement": "The agent produced an answer.",
+                    "check": { "kind": "assert", "path": "inputs.answer", "operator": "is_not_null" }
+                }]
+            }),
         );
 
         let diagnostics =

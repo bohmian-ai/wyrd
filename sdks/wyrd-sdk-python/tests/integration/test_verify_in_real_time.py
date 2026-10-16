@@ -74,7 +74,7 @@ def result_with_its_judge_calls(
             "c.act_principal_id AS call_actor, c.run_id AS call_run "
             "FROM vala.verification.results r "
             "JOIN vala.gateway.calls c ON c.card_uid = r.card_uid "
-            f"WHERE r.result_id = $1 AND {on} = $2",
+            f"WHERE r.execution_id = $1 AND {on} = $2",
             [execution_id, value],
         )
         .to_arrow()

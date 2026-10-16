@@ -206,7 +206,7 @@ impl Assistant {
                         c.act_principal_id AS call_actor, c.run_id AS call_run \
                    FROM vala.verification.results r \
                    JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
-                  WHERE r.result_id = $1",
+                  WHERE r.execution_id = $1",
                 &[QueryParam::String(execution_id.to_owned())],
             )
             .await

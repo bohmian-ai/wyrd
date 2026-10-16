@@ -162,7 +162,7 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
 class Retained(BaseModel):
     """One ``vala.verification.results`` row's execution identity."""
 
-    result_id: str
+    execution_id: str
 
 
 def scheduled_result(
@@ -176,11 +176,11 @@ def scheduled_result(
     """
     admin = client_of(server)
     bifrost = Bifrost(client=admin)
-    query = "SELECT result_id FROM vala.verification.results WHERE binding_id = $1"
+    query = "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1"
 
     def retained() -> set[str]:
         server.flush_bifrost()
-        return {row.result_id for row in bifrost.sql(query, [binding_id], model=Retained)}
+        return {row.execution_id for row in bifrost.sql(query, [binding_id], model=Retained)}
 
     earlier = retained()
     server.make_binding_due(binding_id)

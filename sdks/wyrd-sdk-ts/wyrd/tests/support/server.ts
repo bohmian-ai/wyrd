@@ -93,12 +93,12 @@ export async function scheduledResult(
   for (;;) {
     server.flushBifrost();
     const [row] = await bifrost.sql(
-      "SELECT result_id FROM vala.verification.results WHERE binding_id = $1",
+      "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1",
       [bindingId],
-      z.object({ result_id: z.string() }),
+      z.object({ execution_id: z.string() }),
     );
     if (row !== undefined) {
-      return (await verify.Execution.connect(row.result_id)).wait({ timeoutMs });
+      return (await verify.Execution.connect(row.execution_id)).wait({ timeoutMs });
     }
     if (Date.now() >= deadline) {
       throw new Error(`binding ${bindingId} retained no result within ${timeoutMs} ms`);

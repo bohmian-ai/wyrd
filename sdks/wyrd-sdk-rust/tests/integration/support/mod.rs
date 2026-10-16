@@ -288,7 +288,7 @@ impl Deployment {
         #[derive(serde::Deserialize)]
         struct Retained {
             /// The execution the result belongs to.
-            result_id: String,
+            execution_id: String,
         }
         let admin = self.admin();
         let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default())
@@ -299,13 +299,13 @@ impl Deployment {
             self.server.flush_bifrost().await.expect("rows publish");
             let rows: Vec<Retained> = bifrost
                 .sql_as(
-                    "SELECT result_id FROM vala.verification.results WHERE binding_id = $1",
+                    "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1",
                     &[QueryParam::String(binding.to_string())],
                 )
                 .await
                 .expect("results read back");
             if let Some(row) = rows.into_iter().next() {
-                break row.result_id;
+                break row.execution_id;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -315,7 +315,7 @@ impl Deployment {
         };
         Execution::connect_with(
             id.parse::<ExecutionId>()
-                .expect("result ID is an execution ID"),
+                .expect("the row names an execution ID"),
             &admin,
         )
         .await

@@ -2401,7 +2401,7 @@ dependencies = [
 [[package]]
 name = "datafusion-distributed"
 version = "4.0.0"
-source = "git+https://github.com/bohmian-ai/datafusion-distributed?rev=8fac2a978bdcf8e06457238ebfe9c7f35023c123#8fac2a978bdcf8e06457238ebfe9c7f35023c123"
+source = "git+https://github.com/bohmian-ai/datafusion-distributed?rev=bbbd1d9af4633499b736a98da62868ce32bc3d16#bbbd1d9af4633499b736a98da62868ce32bc3d16"
 dependencies = [
  "arrow-flight",
  "arrow-ipc",

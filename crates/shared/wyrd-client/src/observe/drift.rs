@@ -11,7 +11,6 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, Stri
 use arrow::compute::cast;
 use arrow_schema::DataType;
 use chrono::Utc;
-#[cfg(feature = "internal")]
 use serde_json::{Map, Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::FeatureName;

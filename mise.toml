@@ -255,12 +255,13 @@ dir = "sdks/wyrd-sdk-python"
 run = "uv run python -m pytest -q -m integration tests/integration/gateway tests/integration/test_gateway_admin.py tests/integration/test_gateway_inference.py tests/integration/test_gateway_jev.py"
 
 [tasks."test:gateway:smoke:live"]
-description = """Opt-in live provider smoke lane: real OpenAI, Anthropic, Gemini, and Jev upstreams through the gateway.
-Operator credentials come from the environment, normally an untracked mise.local.toml: the
-conventional OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, and TYPESAFE_API_KEY are read directly and submitted
-as managed secrets through the CLI. A provider whose credential is absent is skipped explicitly.
-Vertex is excluded: its credential is a short-lived OAuth token, which never enters managed-secret
-storage. Deliberately outside test:gateway:journey and the CI gate.
+description = """Opt-in live provider sweep against real OpenAI, Anthropic, Gemini, and Jev with the operator's own keys.
+Part 1 sends each provider's own client through a live gateway; part 2 runs portable and native Wyrd Prompts
+through a native-route Agent straight to the provider, isolating Prompt lowering from the gateway. Credentials
+come from the environment, normally an untracked mise.local.toml: OPENAI_API_KEY, ANTHROPIC_API_KEY,
+GOOGLE_API_KEY or GEMINI_API_KEY, and TYPESAFE_API_KEY. A provider without a key is skipped explicitly.
+WYRD_SMOKE_<PROVIDER>_MODEL overrides a provider's model. Vertex is excluded: its credential is a short-lived
+OAuth token, which never enters managed-secret storage. Deliberately outside test:gateway:journey and the CI gate.
 """
 depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:smoke:live:inner'"

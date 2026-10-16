@@ -1,12 +1,11 @@
 """Opt-in live provider smoke journeys through the Wyrd gateway.
 
-This lane is the only place a gateway call reaches a real upstream. Operator
-credentials come from the environment — normally exported by an untracked
-``mise.local.toml`` — and a provider whose credential is absent is skipped
-explicitly instead of failing the lane. Nothing here asserts token counts or
-deterministic failures: the proof is connectivity and a parseable response
-shape. Credentials are never printed, logged, or written to a fixture; only the
-provider name and model reach the skip and failure messages.
+This lane is the only place a gateway call reaches a real upstream. Each
+provider's own client calls its deployment on the session's one live server, so
+a failure here is a gateway relay defect or a provider refusal, never a Wyrd
+Prompt lowering defect (``test_prompt_live_providers`` isolates those). Nothing
+here asserts token counts or deterministic failures: the proof is connectivity
+and a parseable response shape.
 
 Run with ``mise run test:gateway:smoke:live``; the credential-free
 ``test:gateway:journey`` lane never selects it.
@@ -14,63 +13,27 @@ Run with ``mise run test:gateway:smoke:live``; the credential-free
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import pathlib
-import subprocess
-from collections.abc import Iterator, Sequence
 from typing import Any, Literal
 
 import anthropic
 import httpx
 import openai
 import pytest
+from anthropic.types import RawContentBlockDeltaEvent, TextBlock, TextDelta, ToolUseBlock
 from google import genai
+from openai.types.chat import ChatCompletionMessageFunctionToolCall
 from openai.types.responses import ResponseCompletedEvent
-from wyrd.client import WyrdClient
-from wyrd.gateway import (
-    Gateway,
-    GatewayOperation,
-    ProviderAuth,
-    ProviderDeployment,
+
+from .conftest import (
+    JEV_QUESTIONS,
+    JEV_STATE,
+    LiveGateway,
+    assert_jev_answers,
+    credential,
+    model,
+    operation_model,
 )
-from wyrd.testing import WyrdTestServer
-
-# Provider → environment variables carrying that provider's own credential,
-# most specific first. These are the conventional names a provider's own SDK
-# reads, so an operator environment already holding them needs no second copy
-# and this lane owns no private alias.
-CREDENTIAL_VARIABLES = {
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
-    "jev": ("TYPESAFE_API_KEY",),
-}
-
-# Provider → model this lane calls.
-MODELS = {
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-sonnet-4-5",
-    "gemini": "gemini-3.7-flash",
-    "jev": "jev-latest",
-}
-
-# Provider → header its deployment authenticates with; bearer when absent.
-API_KEY_HEADERS = {"anthropic": "x-api-key", "gemini": "x-goog-api-key"}
-
-# Operation family → the OpenAI model this lane calls for it. Only OpenAI
-# serves these families: `ProviderAdapter` restricts the Anthropic, Gemini, and
-# Vertex adapters to Chat Completions.
-OPERATION_MODELS = {
-    "embeddings": "text-embedding-3-small",
-    "speech": "tts-1",
-    "transcription": "whisper-1",
-    "images": "gpt-image-1-mini",
-}
-
-# Repository root, so the tenant administrator's submission runs the real CLI.
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 MESSAGES: list[Any] = [{"role": "user", "content": "Reply with the single word: ready"}]
 
@@ -85,209 +48,331 @@ PROMPT = "Reply with the single word: ready"
 # connectivity.
 MAX_OUTPUT_TOKENS = 512
 
+SYSTEM = "You answer every question with the single word: ready"
 
-def credential(provider: str) -> str:
-    """Operator credential for ``provider``, skipping the test when unset.
+# The one function every forced tool call names. Its schema is plain JSON
+# Schema with no keyword a provider's function parameters refuse.
+TOOL_NAME = "get_weather"
+TOOL_DESCRIPTION = "Return the current weather for a city."
+TOOL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+}
+TOOL_PROMPT = "What is the weather in Paris?"
 
-    The first variable of ``CREDENTIAL_VARIABLES[provider]`` that is set wins.
-    The value is returned but never rendered: the skip message names only the
-    variables an operator may export.
-    """
-    variables = CREDENTIAL_VARIABLES[provider]
-    for variable in variables:
-        secret = os.environ.get(variable)
-        if secret:
-            return secret
-    # ty does not yet read pytest.skip's signature through its exception decorator.
-    pytest.skip(f"{provider} smoke skipped: none of {', '.join(variables)} is set")  # ty: ignore[too-many-positional-arguments]
+# Structured-output schema. OpenAI strict mode and Anthropic require the
+# closed object; Gemini's ``responseSchema`` refuses ``additionalProperties``,
+# so its native call sends the open form.
+ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+OPEN_ANSWER_SCHEMA: dict[str, Any] = {
+    key: value for key, value in ANSWER_SCHEMA.items() if key != "additionalProperties"
+}
+STRUCTURED_PROMPT = "Reply with JSON whose answer is the single word: ready"
 
 
-def model(provider: str) -> str:
-    """Model this lane calls on ``provider``."""
-    return MODELS[provider]
+def openai_compatible(live: LiveGateway) -> openai.OpenAI:
+    """The unmodified OpenAI client aimed at the live server's ``/v1`` routes."""
+    return openai.OpenAI(base_url=f"{live.base_url}/v1", api_key=live.token, max_retries=0)
 
 
-def operation_model(family: str) -> str:
-    """OpenAI model this lane calls for operation ``family``."""
-    return OPERATION_MODELS[family]
+@pytest.fixture
+def openai_client(live_gateway: LiveGateway) -> openai.OpenAI:
+    """The OpenAI client for the OpenAI cases, skipping them without an OpenAI key."""
+    credential("openai")
+    return openai_compatible(live_gateway)
 
 
-def submit(server: WyrdTestServer, provider: str, secret: str) -> str:
-    """Submit ``secret`` as a managed credential and return the credential name.
-
-    The tenant administrator writes the key through the real CLI on stdin,
-    which is the public submission path: no SDK exposes a managed-secret
-    mutation helper, the secret never reaches a process argument or a file on
-    disk, and neither the command nor the server's answer may echo it.
-    """
-    name = f"{provider}-live"
-    body = json.dumps(
-        {
-            "name": name,
-            "provider": provider,
-            "source": {"managed_secret": {"secret": secret}},
-        }
+@pytest.fixture
+def anthropic_client(live_gateway: LiveGateway) -> anthropic.Anthropic:
+    """The official Anthropic client aimed at the live server's native ingress."""
+    credential("anthropic")
+    return anthropic.Anthropic(
+        base_url=live_gateway.base_url, api_key=live_gateway.token, max_retries=0
     )
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"WYRD_API_KEY", "WYRD_TENANT", "WYRD_WORKLOAD_TOKEN"}
-    }
-    environment["WYRD_ACCESS_TOKEN"] = server.access_token()
-    finished = subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "cargo",
-            "run",
-            "--locked",
-            "--quiet",
-            "-p",
-            "wyrd-cli",
-            "--bin",
-            "wyrd",
-            "--",
-            "gateway",
-            "credential",
-            "put",
-            "--file",
-            "-",
-            "--server",
-            server.base_url,
-        ],
-        input=body,
-        cwd=REPO_ROOT,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
+
+
+@pytest.fixture
+def gemini_client(live_gateway: LiveGateway) -> genai.Client:
+    """The official Google GenAI client aimed at the live server's native ingress."""
+    credential("gemini")
+    return genai.Client(
+        api_key=live_gateway.token,
+        http_options=genai.types.HttpOptions(base_url=live_gateway.base_url, retry_options=None),
     )
-    assert finished.returncode == 0, f"{provider} submission failed: {finished.stderr}"
-    assert secret not in finished.stdout, "the CLI echoed the submitted secret"
-    assert secret not in finished.stderr, "the CLI echoed the submitted secret"
-    assert json.loads(finished.stdout)["source"] == "managed_secret"
-    return name
-
-
-def caller(server: WyrdTestServer, provider: str, models: Sequence[str]) -> str:
-    """Access token of a non-admin principal that may only invoke ``models``.
-
-    Administration and invocation are separate principals here for the same
-    reason they are in production: the key submitted above is never readable
-    by the identity that calls the provider.
-    """
-    key = server.scoped_api_key(
-        f"{provider}_live_invoker",
-        [
-            {
-                "resource": "gateway",
-                "action": "invoke",
-                "scope": {"gateway": {"model": {"deployment": provider, "model": native}}},
-            }
-            for native in models
-        ],
-    )
-    return WyrdClient(server_url=server.base_url, credential=key).access_token()
-
-
-@contextlib.contextmanager
-def live_server(
-    provider: Literal["openai", "anthropic", "gemini", "jev"],
-    secret: str,
-    *,
-    deployments: Sequence[tuple[str, Sequence[GatewayOperation]]] | None = None,
-) -> Iterator[tuple[WyrdTestServer, str]]:
-    """Yield a server whose built-in adapters reach real providers, plus a caller token.
-
-    The sequence is the production one: the tenant administrator submits the
-    operator's own provider key as a managed secret through the CLI, declares
-    the deployments that may use it, and a separate principal scoped to exactly
-    those models receives the token every call below carries. ``deployments``
-    lists each ``(model, capabilities)`` pair on one deployment named
-    ``provider``, defaulting to the provider's chat model, because an operation
-    family is only reachable through a deployment that declares it.
-    """
-    with WyrdTestServer(mutate_env=True, live_providers=True) as server:
-        name = submit(server, provider, secret)
-        header = API_KEY_HEADERS.get(provider)
-        auth: ProviderAuth = (
-            {"api_key_header": {"header": header, "credential": name}}
-            if header
-            else {"bearer": {"credential": name}}
-        )
-        declared: list[tuple[str, Sequence[GatewayOperation]]] = list(
-            deployments or [(model(provider), ["chat_completions"])]
-        )
-        gateway = Gateway(WyrdClient(server_url=server.base_url, credential=server.api_key))
-        deployment: ProviderDeployment = {
-            "name": provider,
-            "adapter": provider,
-            "auth": auth,
-            "models": [native for native, _ in declared],
-            "capabilities": list(dict.fromkeys(op for _, ops in declared for op in ops)),
-        }
-        gateway.put_deployment(deployment)
-        yield server, caller(server, provider, [native for native, _ in declared])
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini"])
 def test_openai_compatible_client_reaches_a_live_provider(
-    provider: Literal["openai", "anthropic", "gemini"],
+    provider: Literal["openai", "anthropic", "gemini"], live_gateway: LiveGateway
 ) -> None:
-    """The unmodified OpenAI client reaches each real provider through the server."""
-    secret = credential(provider)
-    with live_server(provider, secret) as (server, token):
-        client = openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=token, max_retries=0)
-        completion = client.chat.completions.create(
-            model=f"{provider}/{model(provider)}",
-            messages=MESSAGES,
-            max_completion_tokens=MAX_OUTPUT_TOKENS,
-        )
-        assert completion.choices, f"{provider} returned no choice"
-        assert isinstance(completion.choices[0].message.content, str)
-        assert completion.usage is not None, f"{provider} reported no usage"
+    """The unmodified OpenAI client reaches each real provider through the server.
+
+    For OpenAI this is also the plain-text native Chat Completions case.
+    """
+    credential(provider)
+    completion = openai_compatible(live_gateway).chat.completions.create(
+        model=f"{provider}/{model(provider)}",
+        messages=MESSAGES,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+    )
+    assert completion.choices, f"{provider} returned no choice"
+    assert isinstance(completion.choices[0].message.content, str)
+    assert completion.usage is not None, f"{provider} reported no usage"
 
 
 @pytest.mark.smoke
-def test_anthropic_client_reaches_live_anthropic() -> None:
+def test_openai_chat_relays_a_system_message(openai_client: openai.OpenAI) -> None:
+    """A Chat Completions system message reaches OpenAI and text comes back."""
+    messages: list[Any] = [{"role": "system", "content": SYSTEM}, *MESSAGES]
+    completion = openai_client.chat.completions.create(
+        model=f"openai/{model('openai')}",
+        messages=messages,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+    )
+    assert completion.choices[0].message.content, "openai returned no text"
+
+
+@pytest.mark.smoke
+def test_openai_chat_relays_a_stream(openai_client: openai.OpenAI) -> None:
+    """A streamed Chat Completion arrives as relayed chunks carrying text."""
+    chunks = openai_client.chat.completions.create(
+        model=f"openai/{model('openai')}",
+        messages=MESSAGES,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+        stream=True,
+    )
+    text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+    assert text.strip(), "the relayed stream carried no text"
+
+
+@pytest.mark.smoke
+def test_openai_chat_relays_a_forced_tool_call(openai_client: openai.OpenAI) -> None:
+    """A forced function tool comes back as one call with parseable arguments.
+
+    ``reasoning_effort: none`` is the model's own requirement: a reasoning
+    model refuses function tools while it reasons.
+    """
+    tools: list[Any] = [
+        {
+            "type": "function",
+            "function": {
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parameters": TOOL_PARAMETERS,
+            },
+        }
+    ]
+    completion = openai_client.chat.completions.create(
+        model=f"openai/{model('openai')}",
+        messages=[{"role": "user", "content": TOOL_PROMPT}],
+        tools=tools,
+        tool_choice={"type": "function", "function": {"name": TOOL_NAME}},
+        reasoning_effort="none",
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+    )
+    calls = completion.choices[0].message.tool_calls
+    assert calls, "openai returned no tool call"
+    call = calls[0]
+    assert isinstance(call, ChatCompletionMessageFunctionToolCall)
+    assert call.function.name == TOOL_NAME
+    assert json.loads(call.function.arguments)["city"]
+
+
+@pytest.mark.smoke
+def test_openai_chat_relays_structured_output(openai_client: openai.OpenAI) -> None:
+    """A strict JSON Schema ``response_format`` comes back as parseable JSON."""
+    completion = openai_client.chat.completions.create(
+        model=f"openai/{model('openai')}",
+        messages=[{"role": "user", "content": STRUCTURED_PROMPT}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": ANSWER_SCHEMA, "strict": True},
+        },
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+    )
+    content = completion.choices[0].message.content
+    assert content is not None, "openai returned no content"
+    assert isinstance(json.loads(content)["answer"], str)
+
+
+@pytest.mark.smoke
+def test_anthropic_client_reaches_live_anthropic(anthropic_client: anthropic.Anthropic) -> None:
     """The official Anthropic client reaches real Anthropic through native ingress.
 
-    Native ingress names an exact provider model, never a ``provider/model``
-    projection: that is the id the provider's own client would send.
+    Native ingress names the ``<deployment>/<model>`` projection, as every
+    gateway route does; the gateway sends the provider its own model id.
     """
-    secret = credential("anthropic")
-    with live_server("anthropic", secret) as (server, token):
-        client = anthropic.Anthropic(base_url=server.base_url, api_key=token, max_retries=0)
-        message = client.messages.create(
-            model=model("anthropic"),
+    message = anthropic_client.messages.create(
+        model=f"anthropic/{model('anthropic')}",
+        max_tokens=MAX_OUTPUT_TOKENS,
+        messages=MESSAGES,
+    )
+    assert message.content, "anthropic returned no content block"
+    assert message.usage.output_tokens >= 0
+
+
+@pytest.mark.smoke
+def test_anthropic_messages_relays_a_system_instruction(
+    anthropic_client: anthropic.Anthropic,
+) -> None:
+    """A Messages ``system`` field reaches Anthropic and text comes back."""
+    message = anthropic_client.messages.create(
+        model=f"anthropic/{model('anthropic')}",
+        max_tokens=MAX_OUTPUT_TOKENS,
+        system=SYSTEM,
+        messages=MESSAGES,
+    )
+    assert any(isinstance(block, TextBlock) and block.text for block in message.content)
+
+
+@pytest.mark.smoke
+def test_anthropic_messages_relays_a_stream(anthropic_client: anthropic.Anthropic) -> None:
+    """A streamed Message arrives as relayed events ending in ``message_stop``."""
+    events = list(
+        anthropic_client.messages.create(
+            model=f"anthropic/{model('anthropic')}",
             max_tokens=MAX_OUTPUT_TOKENS,
             messages=MESSAGES,
+            stream=True,
         )
-        assert message.content, "anthropic returned no content block"
-        assert message.usage.output_tokens >= 0
+    )
+    text = "".join(
+        event.delta.text
+        for event in events
+        if isinstance(event, RawContentBlockDeltaEvent) and isinstance(event.delta, TextDelta)
+    )
+    assert text.strip(), "the relayed stream carried no text"
+    assert events[-1].type == "message_stop", "the relayed stream carried no terminal event"
 
 
 @pytest.mark.smoke
-def test_google_client_reaches_live_gemini() -> None:
-    """The official Google GenAI client reaches real Gemini through native ingress.
-
-    The model is the exact Gemini id: ``/v1beta/models/{target}`` is one path
-    segment, so a ``provider/model`` projection would not route at all.
-    """
-    secret = credential("gemini")
-    with live_server("gemini", secret) as (server, token):
-        client = genai.Client(
-            api_key=token,
-            http_options=genai.types.HttpOptions(base_url=server.base_url, retry_options=None),
-        )
-        answer = client.models.generate_content(
-            model=model("gemini"),
-            contents="Reply with the single word: ready",
-        )
-        assert answer.candidates, "gemini returned no candidate"
+def test_anthropic_messages_relays_a_forced_tool_call(
+    anthropic_client: anthropic.Anthropic,
+) -> None:
+    """A forced tool comes back as one ``tool_use`` block with parsed input."""
+    message = anthropic_client.messages.create(
+        model=f"anthropic/{model('anthropic')}",
+        max_tokens=MAX_OUTPUT_TOKENS,
+        messages=[{"role": "user", "content": TOOL_PROMPT}],
+        tools=[
+            {
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "input_schema": TOOL_PARAMETERS,
+            }
+        ],
+        tool_choice={"type": "tool", "name": TOOL_NAME},
+    )
+    calls = [block for block in message.content if isinstance(block, ToolUseBlock)]
+    assert calls, "anthropic returned no tool_use block"
+    assert calls[0].name == TOOL_NAME
+    assert isinstance(calls[0].input, dict)
+    assert calls[0].input["city"]
 
 
 @pytest.mark.smoke
-def test_jev_answers_live_typed_questions() -> None:
+def test_anthropic_messages_relays_structured_output(
+    anthropic_client: anthropic.Anthropic,
+) -> None:
+    """A JSON Schema ``output_config`` comes back as parseable JSON text."""
+    message = anthropic_client.messages.create(
+        model=f"anthropic/{model('anthropic')}",
+        max_tokens=MAX_OUTPUT_TOKENS,
+        messages=[{"role": "user", "content": STRUCTURED_PROMPT}],
+        output_config={"format": {"type": "json_schema", "schema": ANSWER_SCHEMA}},
+    )
+    text = "".join(block.text for block in message.content if isinstance(block, TextBlock))
+    assert isinstance(json.loads(text)["answer"], str)
+
+
+@pytest.mark.smoke
+def test_google_client_reaches_live_gemini(gemini_client: genai.Client) -> None:
+    """The official Google GenAI client reaches real Gemini through native ingress."""
+    answer = gemini_client.models.generate_content(
+        model=f"gemini/{model('gemini')}", contents=PROMPT
+    )
+    assert answer.candidates, "gemini returned no candidate"
+
+
+@pytest.mark.smoke
+def test_gemini_generate_content_relays_a_system_instruction(gemini_client: genai.Client) -> None:
+    """A ``systemInstruction`` reaches Gemini and text comes back."""
+    answer = gemini_client.models.generate_content(
+        model=f"gemini/{model('gemini')}",
+        contents=PROMPT,
+        config=genai.types.GenerateContentConfig(system_instruction=SYSTEM),
+    )
+    assert answer.text, "gemini returned no text"
+
+
+@pytest.mark.smoke
+def test_gemini_generate_content_relays_a_stream(gemini_client: genai.Client) -> None:
+    """A ``streamGenerateContent`` answer arrives as relayed chunks carrying text."""
+    chunks = list(
+        gemini_client.models.generate_content_stream(
+            model=f"gemini/{model('gemini')}", contents=PROMPT
+        )
+    )
+    assert chunks, "the relayed stream carried no chunk"
+    assert "".join(chunk.text or "" for chunk in chunks).strip(), "the stream carried no text"
+
+
+@pytest.mark.smoke
+def test_gemini_generate_content_relays_a_forced_tool_call(gemini_client: genai.Client) -> None:
+    """A forced function declaration comes back as one call with parsed arguments."""
+    answer = gemini_client.models.generate_content(
+        model=f"gemini/{model('gemini')}",
+        contents=TOOL_PROMPT,
+        config=genai.types.GenerateContentConfig(
+            tools=[
+                genai.types.Tool(
+                    function_declarations=[
+                        genai.types.FunctionDeclaration(
+                            name=TOOL_NAME,
+                            description=TOOL_DESCRIPTION,
+                            parameters_json_schema=TOOL_PARAMETERS,
+                        )
+                    ]
+                )
+            ],
+            tool_config=genai.types.ToolConfig(
+                function_calling_config=genai.types.FunctionCallingConfig(
+                    mode=genai.types.FunctionCallingConfigMode.ANY,
+                    allowed_function_names=[TOOL_NAME],
+                )
+            ),
+        ),
+    )
+    calls = answer.function_calls
+    assert calls, "gemini returned no function call"
+    assert calls[0].name == TOOL_NAME
+    assert calls[0].args and calls[0].args["city"]
+
+
+@pytest.mark.smoke
+def test_gemini_generate_content_relays_structured_output(gemini_client: genai.Client) -> None:
+    """A JSON ``responseSchema`` comes back as parseable JSON text."""
+    answer = gemini_client.models.generate_content(
+        model=f"gemini/{model('gemini')}",
+        contents=STRUCTURED_PROMPT,
+        config=genai.types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=OPEN_ANSWER_SCHEMA,
+        ),
+    )
+    assert answer.text is not None, "gemini returned no text"
+    assert isinstance(json.loads(answer.text)["answer"], str)
+
+
+@pytest.mark.smoke
+def test_jev_answers_live_typed_questions(live_gateway: LiveGateway) -> None:
     """Real Jev answers one typed question of each form on both routes.
 
     The native body is what a Jev client sends to ``POST /v1/systemone``; its
@@ -297,59 +382,34 @@ def test_jev_answers_live_typed_questions() -> None:
     which proves the request bounds, the pass-through, and the typed answer
     decoding against the real provider.
     """
-    secret = credential("jev")
-    questions = {
-        "polite": {"type": "noul", "instructions": "Is the reply polite?"},
-        "tone": {
-            "type": "choice",
-            "instructions": "What is the tone of the reply?",
-            "criteria": {"polite": "courteous", "rude": "curt"},
-        },
-        "quality": {
-            "type": "score",
-            "instructions": "How good is the reply?",
-            "criteria": ["poor", "ok", "great"],
-        },
-    }
-    state = 'Thank you for waiting; "your refund" has been issued.\nAnything else?'
-    with live_server(
-        "jev", secret, deployments=[("jev-latest", ["system_one", "chat_completions"])]
-    ) as (server, token):
-        native = httpx.post(
-            f"{server.base_url}/v1/systemone",
-            json={"model": "jev-latest", "state": state, "questions": questions},
-            headers={"authorization": f"Bearer {token}"},
-            timeout=60,
-        )
-        assert native.status_code == 200, f"jev native call answered {native.status_code}"
-        client = openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=token, max_retries=0)
-        completion = client.chat.completions.create(
-            model="jev/jev-latest",
-            messages=[
-                {"role": "system", "content": "Judge the reply."},
-                {"role": "user", "content": json.dumps({"state": state, "questions": questions})},
-            ],
-        )
-        content = completion.choices[0].message.content
-        assert content is not None
-        assert completion.usage is not None
-        for answer in (native.json(), json.loads(content)):
-            answers = answer["answers"]
-            assert 0.0 <= answers["polite"]["noul"] <= 1.0
-            assert answers["tone"]["choice"] in {"polite", "rude"}
-            assert answers["quality"]["type"] == "score"
-
-
-@contextlib.contextmanager
-def openai_live(*deployments: tuple[str, Sequence[GatewayOperation]]) -> Iterator[openai.OpenAI]:
-    """Yield an OpenAI client aimed at a live server administering ``deployments``."""
-    secret = credential("openai")
-    with live_server("openai", secret, deployments=list(deployments)) as (server, token):
-        yield openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=token, max_retries=0)
+    credential("jev")
+    jev = model("jev")
+    native = httpx.post(
+        f"{live_gateway.base_url}/v1/systemone",
+        json={"model": f"jev/{jev}", "state": JEV_STATE, "questions": JEV_QUESTIONS},
+        headers={"authorization": f"Bearer {live_gateway.token}"},
+        timeout=60,
+    )
+    assert native.status_code == 200, f"jev native call answered {native.status_code}"
+    completion = openai_compatible(live_gateway).chat.completions.create(
+        model=f"jev/{jev}",
+        messages=[
+            {"role": "system", "content": "Judge the reply."},
+            {
+                "role": "user",
+                "content": json.dumps({"state": JEV_STATE, "questions": JEV_QUESTIONS}),
+            },
+        ],
+    )
+    content = completion.choices[0].message.content
+    assert content is not None
+    assert completion.usage is not None
+    for answer in (native.json(), json.loads(content)):
+        assert_jev_answers(answer["answers"])
 
 
 @pytest.mark.smoke
-def test_openai_client_reaches_live_responses() -> None:
+def test_openai_client_reaches_live_responses(openai_client: openai.OpenAI) -> None:
     """Real Responses answers decode buffered and as a relayed event stream.
 
     Both shapes are covered because the streamed answer is a different wire
@@ -357,86 +417,76 @@ def test_openai_client_reaches_live_responses() -> None:
     rather than a top-level object.
     """
     projection = f"openai/{model('openai')}"
-    with openai_live((model("openai"), ["chat_completions", "responses"])) as client:
-        answer = client.responses.create(
+    answer = openai_client.responses.create(
+        model=projection,
+        input=PROMPT,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+    )
+    assert answer.output_text.strip(), "responses returned no output text"
+    assert answer.usage is not None, "responses reported no usage"
+
+    completed = [
+        event
+        for event in openai_client.responses.create(
             model=projection,
             input=PROMPT,
             max_output_tokens=MAX_OUTPUT_TOKENS,
+            stream=True,
         )
-        assert answer.output_text.strip(), "responses returned no output text"
-        assert answer.usage is not None, "responses reported no usage"
-
-        completed = [
-            event
-            for event in client.responses.create(
-                model=projection,
-                input=PROMPT,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                stream=True,
-            )
-            if isinstance(event, ResponseCompletedEvent)
-        ]
-        assert completed, "the relayed stream carried no terminal event"
-        assert completed[-1].response.usage is not None, "the terminal event reported no usage"
+        if isinstance(event, ResponseCompletedEvent)
+    ]
+    assert completed, "the relayed stream carried no terminal event"
+    assert completed[-1].response.usage is not None, "the terminal event reported no usage"
 
 
 @pytest.mark.smoke
-def test_openai_client_reaches_live_embeddings() -> None:
+def test_openai_client_reaches_live_embeddings(openai_client: openai.OpenAI) -> None:
     """A real embedding answer decodes with its vector and usage intact."""
     embedding = operation_model("embeddings")
-    with openai_live((embedding, ["embeddings"])) as client:
-        answer = client.embeddings.create(model=f"openai/{embedding}", input="ready")
-        assert answer.data, "embeddings returned no vector"
-        assert len(answer.data[0].embedding) > 1, "the vector did not survive the gateway"
-        assert answer.usage.prompt_tokens > 0, "embeddings reported no usage"
+    answer = openai_client.embeddings.create(model=f"openai/{embedding}", input="ready")
+    assert answer.data, "embeddings returned no vector"
+    assert len(answer.data[0].embedding) > 1, "the vector did not survive the gateway"
+    assert answer.usage.prompt_tokens > 0, "embeddings reported no usage"
 
 
 @pytest.mark.smoke
-def test_openai_client_round_trips_live_audio() -> None:
+def test_openai_client_round_trips_live_audio(openai_client: openai.OpenAI) -> None:
     """Speech bytes come back verbatim and transcribe through the multipart route.
 
     The generated audio is fed straight back as the transcription upload, so
     the two Audio directions prove each other without a fixture file.
     """
-    speech_model = operation_model("speech")
-    transcription_model = operation_model("transcription")
-    with openai_live(
-        (speech_model, ["audio"]),
-        (transcription_model, ["audio"]),
-    ) as client:
-        spoken = client.audio.speech.create(
-            model=f"openai/{speech_model}",
-            voice="alloy",
-            input="ready",
-            response_format="mp3",
-        )
-        audio = spoken.read()
-        assert len(audio) > 1024, "speech returned no audio payload"
+    spoken = openai_client.audio.speech.create(
+        model=f"openai/{operation_model('speech')}",
+        voice="alloy",
+        input="ready",
+        response_format="mp3",
+    )
+    audio = spoken.read()
+    assert len(audio) > 1024, "speech returned no audio payload"
 
-        transcript = client.audio.transcriptions.create(
-            model=f"openai/{transcription_model}",
-            file=("speech.mp3", audio, "audio/mpeg"),
-        )
-        assert transcript.text.strip(), "transcription returned no text"
+    transcript = openai_client.audio.transcriptions.create(
+        model=f"openai/{operation_model('transcription')}",
+        file=("speech.mp3", audio, "audio/mpeg"),
+    )
+    assert transcript.text.strip(), "transcription returned no text"
 
 
 @pytest.mark.smoke
-def test_openai_client_reaches_live_images() -> None:
+def test_openai_client_reaches_live_images(openai_client: openai.OpenAI) -> None:
     """A real image answer decodes and its bytes survive the gateway."""
-    image_model = operation_model("images")
-    with openai_live((image_model, ["images"])) as client:
-        answer = client.images.generate(
-            model=f"openai/{image_model}",
-            prompt="a plain blue square on a white background",
-            n=1,
-            size="1024x1024",
-        )
-        assert answer.data, "images returned no item"
-        assert answer.data[0].b64_json, "the image bytes did not survive the gateway"
+    answer = openai_client.images.generate(
+        model=f"openai/{operation_model('images')}",
+        prompt="a plain blue square on a white background",
+        n=1,
+        size="1024x1024",
+    )
+    assert answer.data, "images returned no item"
+    assert answer.data[0].b64_json, "the image bytes did not survive the gateway"
 
 
 @pytest.mark.smoke
-def test_openai_client_runs_a_live_batch_lifecycle() -> None:
+def test_openai_client_runs_a_live_batch_lifecycle(openai_client: openai.OpenAI) -> None:
     """Upload, create, retrieve, and cancel a real batch under Wyrd ids.
 
     The batch is cancelled rather than awaited: completion takes up to a day,
@@ -445,27 +495,29 @@ def test_openai_client_runs_a_live_batch_lifecycle() -> None:
     projection, which the gateway rewrites to the provider's own model before
     the file is uploaded.
     """
-    chat = model("openai")
     line = json.dumps(
         {
             "custom_id": "smoke-1",
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {"model": f"openai/{chat}", "messages": MESSAGES, "max_tokens": 16},
+            "body": {
+                "model": f"openai/{model('openai')}",
+                "messages": MESSAGES,
+                "max_completion_tokens": 16,
+            },
         }
     )
-    with openai_live((chat, ["chat_completions", "batches"])) as client:
-        upload = client.files.create(
-            file=("batch.jsonl", f"{line}\n".encode(), "application/jsonl"),
-            purpose="batch",
-        )
-        assert upload.id.startswith("file-"), f"unexpected file id: {upload.id}"
+    upload = openai_client.files.create(
+        file=("batch.jsonl", f"{line}\n".encode(), "application/jsonl"),
+        purpose="batch",
+    )
+    assert upload.id.startswith("file-"), f"unexpected file id: {upload.id}"
 
-        batch = client.batches.create(
-            input_file_id=upload.id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h",
-        )
-        assert batch.id.startswith("batch_"), f"unexpected batch id: {batch.id}"
-        assert client.batches.retrieve(batch.id).id == batch.id
-        assert client.batches.cancel(batch.id).status in {"cancelling", "cancelled"}
+    batch = openai_client.batches.create(
+        input_file_id=upload.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+    )
+    assert batch.id.startswith("batch_"), f"unexpected batch id: {batch.id}"
+    assert openai_client.batches.retrieve(batch.id).id == batch.id
+    assert openai_client.batches.cancel(batch.id).status in {"cancelling", "cancelled"}

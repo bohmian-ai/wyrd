@@ -8,6 +8,7 @@ import { afterEach, expect, vi } from "vitest";
 import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
 
 import {
+  answer,
   check,
   deploy,
   explain,
@@ -81,9 +82,10 @@ test("support desk answers, verifies, and explains every request", async ({ serv
     credential: server.bootstrapService(["viewer"], "desk-viewer"),
     grpcUrl: server.grpcUrl,
   });
-  await expect(
-    WyrdState.fromPath(bundle, { client: viewer }).run("agent").invoke({ question: "Where is order 1?" }),
-  ).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
+  const viewing = WyrdState.fromPath(bundle, { client: viewer });
+  await expect(answer(viewer, viewing, viewing.run("agent"), "Where is order 1?")).rejects.toThrow(
+    "WYRD_PERMISSION_403_DENIED_RBAC",
+  );
   expect(provider.received, "the refusal precedes upstream IO").toEqual([]);
 
   const promise = await check(desk, "You have a guaranteed refund.");

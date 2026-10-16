@@ -6,8 +6,9 @@
  * {@link deploy} registers the checked-in Cards under `service/`, which
  * ensures the declared `vala.datasets.tickets` table, turns on metadata
  * capture, and checks the Agent's model is deployed. {@link serve} answers
- * every question in its own Agent Run and submits each answer for a
- * background policy check. {@link waitForVerdicts} resumes each check from
+ * every question in its own Agent Run with {@link answer}, which calls the
+ * model through the Wyrd gateway, and submits each answer for a background
+ * policy check. {@link waitForVerdicts} resumes each check from
  * its execution ID alone and waits for its result, {@link check} judges one
  * answer immediately, and {@link explain} joins one Run's evidence over MCP.
  *
@@ -23,6 +24,7 @@ import {
   Cards,
   Gateway,
   type RegistrationReceipt,
+  type Run,
   type VerificationResult,
   type VerifierInputs,
   verify,
@@ -43,6 +45,8 @@ const MCP_VERSION = "2026-07-28";
 export interface Desk {
   readonly receipt: RegistrationReceipt;
   readonly state: WyrdState;
+  /** The client the desk's model calls go through the gateway as. */
+  readonly client: WyrdClient;
 }
 
 /** One answered request. */
@@ -93,7 +97,7 @@ export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> 
   }
   const { execution_route: executionRoute } = agent.spec;
   if (executionRoute.kind === "native") {
-    return { receipt, state };
+    return { receipt, state, client };
   }
   const route = `${executionRoute.deployment}/${prompt.spec.model}`;
   const deployed = await gateway.deployments();
@@ -103,7 +107,48 @@ export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> 
         `for ${route} (PUT /v1/admin/gateway/provider-deployments/{name})`,
     );
   }
-  return { receipt, state };
+  return { receipt, state, client };
+}
+
+/**
+ * Answer `asked` as the support Agent of `run` through the Wyrd gateway: send
+ * its Prompt, with `{{question}}` bound, to `<deployment>/<model>` on the
+ * OpenAI-compatible ingress as `client`, tagged with the Run and Agent Card
+ * so the gateway's capture, accounting, and audit join the Run's evidence.
+ *
+ * @throws Error - carrying the gateway's stable code, such as
+ *   `WYRD_PERMISSION_403_DENIED_RBAC`, when it refuses the call.
+ */
+export async function answer(client: WyrdClient, state: WyrdState, run: Run, asked: string): Promise<string> {
+  const agent = state.agent("agent");
+  const route = agent.spec.execution_route;
+  if (route.kind !== "wyrd_gateway") {
+    throw new Error("the support Agent must route through the Wyrd gateway");
+  }
+  const prompt = agent.prompt().spec;
+  const reply = await client.httpAuth(`${client.serverUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "wyrd-run-id": run.runId,
+      "wyrd-card-uid": state.cardRef("agent").uid ?? "",
+    },
+    body: JSON.stringify({
+      model: `${route.deployment}/${prompt.model}`,
+      messages: (prompt.messages ?? []).map((message) => ({
+        role: message.role,
+        content: String(message.content).replaceAll("{{question}}", asked),
+      })),
+    }),
+  });
+  const body = (await reply.json()) as {
+    error?: { code: string; message: string };
+    choices?: { message: { content: string } }[];
+  };
+  if (!reply.ok) {
+    throw new Error(`the gateway refused the call: ${body.error?.code}: ${body.error?.message}`);
+  }
+  return body.choices?.[0]?.message.content ?? "";
 }
 
 /** The customer question of request `index`. */
@@ -113,12 +158,12 @@ export function question(index: number): string {
 
 /**
  * Answer {@link REQUESTS} questions, each in its own Agent Run inside a
- * `support-desk.request` span: invoke the Agent through the gateway, record
+ * `support-desk.request` span: {@link answer} through the gateway, record
  * the ticket, and submit the answer for a background `policy-check` without
  * waiting for it. Telemetry and tickets are flushed on return.
  */
 export async function serve(desk: Desk): Promise<Served[]> {
-  const { state } = desk;
+  const { state, client } = desk;
   await state.startBifrost();
   await state.startTelemetry();
   const tracer = trace.getTracer("support-desk");
@@ -129,15 +174,15 @@ export async function serve(desk: Desk): Promise<Served[]> {
     const executionId = await run.scope(() =>
       tracer.startActiveSpan("support-desk.request", async (span) => {
         try {
-          const answer = await run.invoke({ question: asked });
+          const reply = await answer(client, state, run, asked);
           const { observe } = run;
           await observe.record("vala.datasets.tickets", {
             ticket_id: `T-${index}`,
             question: asked,
-            answer,
+            answer: reply,
             refund: asked.includes("refund"),
           });
-          const submitted = await observe.submit("policy-check", policyCheck(answer));
+          const submitted = await observe.submit("policy-check", policyCheck(reply));
           if (submitted.kind !== "queued") {
             throw new Error("policy-check judges Run evidence, not a window");
           }

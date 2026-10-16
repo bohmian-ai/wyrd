@@ -384,6 +384,27 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
 
+/**
+ * Ask the `alias` Agent of `state` `hi` on `deployment` as `caller`, the way an
+ * application calls its model: the Agent's Prompt model addressed at
+ * `deployment` through the stock OpenAI client, correlated to a fresh Run of
+ * the Agent with the `wyrd-run-id` and `wyrd-card-uid` headers.
+ */
+async function askAgent(state: WyrdState, caller: WyrdClient, alias: string, deployment: string): Promise<string> {
+  const run = state.run(alias);
+  const client = new OpenAI({
+    baseURL: `${caller.serverUrl}/v1`,
+    apiKey: "wyrd",
+    fetch: caller.httpAuth,
+    maxRetries: 0,
+  });
+  const completion = await client.chat.completions.create(
+    { model: `${deployment}/${state.agent(alias).prompt().spec.model}`, messages: [{ role: "user", content: "hi" }] },
+    { headers: { "wyrd-run-id": run.runId, "wyrd-card-uid": state.cardRef(alias).uid ?? "" } },
+  );
+  return completion.choices[0]?.message.content ?? "";
+}
+
 test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const gateway = await Gateway.connect();
   await gateway.putDeployment(openaiDeployment("openai-backup"));
@@ -393,15 +414,15 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.hydrate(receipt.root, bundle);
   const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0", space: "default" });
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
-  const backup = { kind: "wyrd_gateway", deployment: "openai-backup" } as const;
+  const caller = WyrdClient.connect({ credential: issued.key });
+  const state = WyrdState.fromPath(bundle, { client: caller });
   const before = provider.received.length;
 
   for (const alias of ["agent", "body-agent"]) {
-    const run = state.run(alias);
-    expect(await run.invoke({ question: "hi" })).toBe("hi");
-    expect(await run.invoke({ question: "hi" }, { route: backup })).toBe("hi");
-    expect(state.agent(alias).spec.execution_route).toEqual({ kind: "wyrd_gateway", deployment: "openai" });
+    const { execution_route: route } = state.agent(alias).spec;
+    expect(route).toEqual({ kind: "wyrd_gateway", deployment: "openai" });
+    expect(await askAgent(state, caller, alias, route.kind === "wyrd_gateway" ? route.deployment : "")).toBe("hi");
+    expect(await askAgent(state, caller, alias, "openai-backup")).toBe("hi");
   }
   const upstream = provider.received.slice(before);
   expect(upstream.map(({ body }) => (JSON.parse(body) as { model: string }).model)).toEqual(Array(4).fill("gpt-4o"));
@@ -417,11 +438,8 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   ).toArrow();
   expect(columnValues(calls.getChild("deployment"))).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
 
-  await expect(
-    state.run("agent").invoke({ question: "hi" }, { route: { kind: "wyrd_gateway", deployment: "openai-granted" } }),
-  ).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
-  await expect(
-    state.run("agent").invoke({ question: "hi" }, { route: { kind: "elsewhere" } as never }),
-  ).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+  await expect(askAgent(state, caller, "agent", "openai-granted")).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
   expect(provider.received.length - before).toBe(4);
 });

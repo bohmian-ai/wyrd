@@ -110,14 +110,21 @@ export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> 
   return { receipt, state, client };
 }
 
+/** The total budget of one gateway model call, through the last reply byte. */
+const ANSWER_TIMEOUT_MS = 10 * 60_000;
+
 /**
  * Answer `asked` as the support Agent of `run` through the Wyrd gateway: send
  * its Prompt, with `{{question}}` bound, to `<deployment>/<model>` on the
  * OpenAI-compatible ingress as `client`, tagged with the Run and Agent Card
  * so the gateway's capture, accounting, and audit join the Run's evidence.
+ * `asked` is inserted literally, and the whole exchange, through reading the
+ * reply body, is bounded by {@link ANSWER_TIMEOUT_MS}.
  *
  * @throws Error - carrying the gateway's stable code, such as
  *   `WYRD_PERMISSION_403_DENIED_RBAC`, when it refuses the call.
+ * @throws DOMException - `TimeoutError` when the budget runs out; the gateway
+ *   may still have completed the call, and nothing retries it.
  */
 export async function answer(client: WyrdClient, state: WyrdState, run: Run, asked: string): Promise<string> {
   const agent = state.agent("agent");
@@ -128,6 +135,7 @@ export async function answer(client: WyrdClient, state: WyrdState, run: Run, ask
   const prompt = agent.prompt().spec;
   const reply = await client.httpAuth(`${client.serverUrl}/v1/chat/completions`, {
     method: "POST",
+    signal: AbortSignal.timeout(ANSWER_TIMEOUT_MS),
     headers: {
       "content-type": "application/json",
       "wyrd-run-id": run.runId,
@@ -137,7 +145,7 @@ export async function answer(client: WyrdClient, state: WyrdState, run: Run, ask
       model: `${route.deployment}/${prompt.model}`,
       messages: (prompt.messages ?? []).map((message) => ({
         role: message.role,
-        content: String(message.content).replaceAll("{{question}}", asked),
+        content: String(message.content).replaceAll("{{question}}", () => asked),
       })),
     }),
   });

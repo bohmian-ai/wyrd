@@ -87,6 +87,11 @@ test("support desk answers, verifies, and explains every request", async ({ serv
     "WYRD_PERMISSION_403_DENIED_RBAC",
   );
   expect(provider.received, "the refusal precedes upstream IO").toEqual([]);
+  const literal = "Is $& or $$ or $' my order?";
+  expect(await answer(desk.client, desk.state, desk.state.run("agent"), literal)).toBe("Your order is on its way.");
+  expect(provider.received.at(-1)?.body, "the question is sent literally").toContain(
+    JSON.stringify(`Answer the customer: ${literal}`),
+  );
 
   const promise = await check(desk, "You have a guaranteed refund.");
   expect(promise.outcome.verdict).toBe("failed");

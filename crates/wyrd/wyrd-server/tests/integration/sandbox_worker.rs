@@ -148,6 +148,17 @@ async fn sandbox_runs_entrypoints_without_shared_state() {
     assert_eq!(ran.value, json!({"sum": 2}));
     assert_eq!(ran.output.len(), 64);
 
+    let (value, output) = sandbox
+        .exec(
+            "print('hi')\nx = 2\nx * 21".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            far(),
+        )
+        .await
+        .expect("exec");
+    assert_eq!((value.py_repr().as_str(), output.as_str()), ("42", "hi\n"));
+
     let reason = terminal(run(&sandbox, "def g():\n    return seen", "g", json!({})).await);
     assert!(reason.contains("NameError"), "{reason}");
     assert!(

@@ -101,12 +101,8 @@ impl Sandbox {
         })
     }
 
-    /// Run `source`, then return `entrypoint(**inputs)` as JSON.
-    ///
-    /// The operation ends by `deadline` or the code timeout, whichever is
-    /// first, including the wait for a worker. `mounts` are the only paths
-    /// the code can reach; every other OS call, host function, or undefined
-    /// name is refused inside the sandbox.
+    /// Run `source`, then return `entrypoint(**inputs)` as JSON, through
+    /// [`Self::exec`].
     ///
     /// # Errors
     /// Returns [`BlockError::Retryable`] when admission is full, no worker
@@ -132,6 +128,43 @@ impl Sandbox {
                 "{entrypoint:?} is not a Python function name"
             )));
         }
+        let code = format!(
+            "{source}\n\nimport json as _wyrd_json\n_wyrd_json.dumps({entrypoint}(**_wyrd_json.loads({INPUTS_GLOBAL})))\n"
+        );
+        let arguments = vec![(
+            INPUTS_GLOBAL.to_owned(),
+            MontyObject::string(Value::Object(inputs.clone()).to_string()),
+        )];
+        let (value, output) = self.exec(code, arguments, mounts, deadline).await?;
+        let text = String::try_from(&value)
+            .map_err(|_| terminal("the entrypoint result is not JSON text".to_owned()))?;
+        Ok(CodeRun {
+            value: serde_json::from_str(&text)
+                .map_err(|error| terminal(format!("the entrypoint result is not JSON: {error}")))?,
+            output,
+        })
+    }
+
+    /// Run `code` with `globals` on a fresh worker and return the value of
+    /// its last expression plus its bounded printed output.
+    ///
+    /// The operation ends by `deadline` or the code timeout, whichever is
+    /// first, including the wait for a worker. `mounts` are the only paths
+    /// the code can reach; every other OS call, host function, or undefined
+    /// name is refused inside the sandbox. The worker is killed afterwards.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when admission is full, no worker
+    /// frees up in time, or the pool fails, and [`BlockError::Terminal`] for
+    /// a Python error (including memory exhaustion), a crashed or killed
+    /// worker, or a timeout while running.
+    pub async fn exec(
+        &self,
+        code: String,
+        globals: Vec<(String, MontyObject)>,
+        mounts: Vec<MountSpec>,
+        deadline: Instant,
+    ) -> Result<(MontyObject, String), BlockError> {
         let _admitted = self
             .admission
             .try_acquire()
@@ -156,13 +189,6 @@ impl Sandbox {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(pid);
         }
-        let code = format!(
-            "{source}\n\nimport json as _wyrd_json\n_wyrd_json.dumps({entrypoint}(**_wyrd_json.loads({INPUTS_GLOBAL})))\n"
-        );
-        let arguments = vec![(
-            INPUTS_GLOBAL.to_owned(),
-            MontyObject::string(Value::Object(inputs.clone()).to_string()),
-        )];
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
         let mut on_print = on_print_sync(|_, text: &str| {
@@ -172,7 +198,7 @@ impl Sandbox {
         });
         let ran = tokio::time::timeout_at(deadline, async {
             let mut event = checkout
-                .feed(code, arguments, mounts, true, &mut on_print)
+                .feed(code, globals, mounts, true, &mut on_print)
                 .await?;
             loop {
                 event = match event {
@@ -217,13 +243,7 @@ impl Sandbox {
         let value = ran
             .map_err(|_| terminal("Python exceeded its time limit".to_owned()))?
             .map_err(|error| failed(&error))?;
-        let text = String::try_from(&value)
-            .map_err(|_| terminal("the entrypoint result is not JSON text".to_owned()))?;
-        Ok(CodeRun {
-            value: serde_json::from_str(&text)
-                .map_err(|error| terminal(format!("the entrypoint result is not JSON: {error}")))?,
-            output,
-        })
+        Ok((value, output))
     }
 
     /// Cap worker `pid`'s address space at the process ceiling before it

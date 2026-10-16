@@ -436,7 +436,7 @@ impl Workspace {
                 break;
             }
             let text = if used > budget {
-                truncate(text, budget)
+                &text[..text.floor_char_boundary(budget)]
             } else {
                 text.as_str()
             };
@@ -545,22 +545,10 @@ fn walkdir(dir: &Path) -> Vec<(String, u64)> {
     found
 }
 
-/// `text` cut to at most `max` bytes on a character boundary.
-fn truncate(text: &str, max: usize) -> &str {
-    let mut end = max.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
 /// About 80 bytes of `text` around the match at byte `at`.
 fn snippet(text: &str, at: usize, len: usize) -> String {
-    let mut start = at.saturating_sub(40).min(text.len());
-    while !text.is_char_boundary(start) {
-        start -= 1;
-    }
-    truncate(&text[start..], 80 + len).to_owned()
+    let text = &text[text.floor_char_boundary(at.saturating_sub(40))..];
+    text[..text.floor_char_boundary(80 + len)].to_owned()
 }
 
 /// A terminal error with `reason`.

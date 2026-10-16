@@ -123,6 +123,33 @@ async fn sandbox_runs_entrypoints_without_shared_state() {
     );
 }
 
+/// Printed output is cut on a character boundary: a multibyte character
+/// that would cross the cap is dropped whole, one that exactly fills it is
+/// kept, and the sandbox keeps serving.
+///
+/// # Panics
+/// Panics when output splits a character or the sandbox stops serving.
+#[tokio::test]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn sandbox_cuts_output_on_character_boundaries() {
+    let sandbox = start(HostedLimits {
+        tool_result_max_bytes: 4,
+        ..HostedLimits::default()
+    })
+    .await;
+    for (text, kept) in [("abcé", "abc"), ("abé", "abé")] {
+        let ran = run(
+            &sandbox,
+            &format!("def f():\n    print('{text}', end='')"),
+            "f",
+            json!({}),
+        )
+        .await
+        .expect("runs");
+        assert_eq!(ran.output, kept);
+    }
+}
+
 /// Host files and functions are unreachable; mounts are the only paths, and
 /// `/inputs` is read-only.
 ///

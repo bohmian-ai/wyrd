@@ -176,9 +176,7 @@ impl Sandbox {
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
         let mut on_print = on_print_sync(|_, text: &str| {
-            if output.len() < budget {
-                output.push_str(&text[..text.len().min(budget - output.len())]);
-            }
+            output.push_str(&text[..text.floor_char_boundary(budget - output.len())]);
         });
         let ran = tokio::time::timeout_at(deadline, async {
             let mut event = checkout

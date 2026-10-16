@@ -9821,6 +9821,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "url",
  "wyrd-auth-verify",

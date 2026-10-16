@@ -186,14 +186,17 @@ EXECUTION_ID = "0190b2a4-0000-7000-8000-000000000000"
 
 class _ExecutionServer(BaseHTTPRequestHandler):
     """A local Wyrd server for one execution: it refuses the API-key exchange
-    while ``refuse`` is set and answers the status read with ``running``."""
+    while ``refuse`` is set, answers it ``exchange_seconds`` late, and answers
+    the status read with ``running``."""
 
     refuse = True
+    exchange_seconds = 0.0
     requests: list[str] = []
 
     def do_POST(self) -> None:  # noqa: N802 - http.server's handler name
         self.rfile.read(int(self.headers.get("content-length", 0)))
         type(self).requests.append(self.path)
+        time.sleep(type(self).exchange_seconds)
         if type(self).refuse:
             self._send(401, {"code": "WYRD_AUTH_401_UNAUTHENTICATED", "detail": "refused"})
         else:
@@ -219,6 +222,7 @@ class _ExecutionServer(BaseHTTPRequestHandler):
 def execution_server() -> Iterator[str]:
     """Serve ``_ExecutionServer`` on a free port, refusing exchanges at first."""
     _ExecutionServer.refuse, _ExecutionServer.requests = True, []
+    _ExecutionServer.exchange_seconds = 0.0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ExecutionServer)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
@@ -252,6 +256,68 @@ def test_execution_connect_exchanges_now(execution_server: str) -> None:
     _ExecutionServer.refuse = False
     Execution.connect(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
     assert _ExecutionServer.requests == ["/auth/token", "/auth/token"]
+
+
+SLOW_EXCHANGE_SECONDS = 3.0
+"""How late the slow exchange answers; far above every bounded wait below."""
+
+WAIT_BUDGET_SECONDS = 0.2
+"""The caller's wait budget, far below the slow exchange."""
+
+WAIT_TIMEOUT = "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT"
+
+
+def test_execution_zero_wait_starts_no_connection(execution_server: str) -> None:
+    """An expired budget times out before the first connection exchanges."""
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(0)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert _ExecutionServer.requests == []
+
+
+def test_execution_first_wait_bounds_a_slow_exchange_and_retries_after(
+    execution_server: str,
+) -> None:
+    """A slow first exchange loses to the wait budget without a status read,
+    and the abandoned connection leaves the next read free to connect."""
+    _ExecutionServer.refuse, _ExecutionServer.exchange_seconds = False, SLOW_EXCHANGE_SECONDS
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    started = time.monotonic()
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(WAIT_BUDGET_SECONDS)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert time.monotonic() - started < SLOW_EXCHANGE_SECONDS / 2
+    assert _ExecutionServer.requests == ["/auth/token"]
+
+    _ExecutionServer.exchange_seconds = 0.0
+    assert execution.status()["status"] == "running"
+    assert execution.status()["status"] == "running"
+    status = f"/v1/verification/executions/{EXECUTION_ID}"
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token", status, status]
+
+
+def test_execution_wait_behind_another_first_connection_keeps_its_budget(
+    execution_server: str,
+) -> None:
+    """A wait queued behind another caller's slow first connection times out
+    within its own budget instead of waiting for that connection."""
+    _ExecutionServer.refuse, _ExecutionServer.exchange_seconds = False, SLOW_EXCHANGE_SECONDS
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    first = threading.Thread(target=execution.status)
+    first.start()
+    while _ExecutionServer.requests != ["/auth/token"]:
+        time.sleep(0.01)
+    started = time.monotonic()
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(WAIT_BUDGET_SECONDS)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert time.monotonic() - started < SLOW_EXCHANGE_SECONDS / 2
+    first.join()
+    assert _ExecutionServer.requests == [
+        "/auth/token",
+        f"/v1/verification/executions/{EXECUTION_ID}",
+    ]
 
 
 def test_verification_types_are_exported_and_judge_surfaces_are_gone() -> None:

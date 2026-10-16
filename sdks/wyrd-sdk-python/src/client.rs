@@ -5,11 +5,13 @@
 //! exchange, caching, renewal, and errors stay in the Rust owner.
 
 use std::future::Future;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use secrecy::SecretString;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::client_from_options;
 use wyrd_client::transport::trace::with_caller_trace;
@@ -88,7 +90,8 @@ pub(crate) struct LazyConnection<T> {
     /// The connected native handle, set once.
     handle: OnceLock<T>,
     /// Serializes first connections so concurrent first operations connect
-    /// once; taken only with the GIL released.
+    /// once; awaited only with the GIL released, so a deadline-bounded
+    /// caller can stop waiting for another caller's first connection.
     gate: Mutex<()>,
 }
 
@@ -137,24 +140,90 @@ impl<T: Send + Sync> LazyConnection<T> {
     /// # Errors
     /// Returns `connect`'s error unchanged; nothing is stored, so a later call
     /// connects again.
+    ///
+    /// # Panics
+    /// Never in practice: only a deadline-bounded connection can expire, and
+    /// this one has no deadline.
     pub(crate) fn get<E, F, Fut>(&self, py: Python<'_>, connect: F) -> Result<&T, E>
     where
         E: Send,
         F: FnOnce(Option<WyrdClient>) -> Fut + Send,
         Fut: Future<Output = Result<T, E>> + Send,
     {
+        self.connect_by(py, None, connect)
+            .expect("a connection without a deadline never expires")
+    }
+
+    /// [`LazyConnection::get`] bounded by `deadline`: waiting for another
+    /// caller's first connection and this caller's own `connect` both stop
+    /// when it passes, and an expired deadline starts no connection.
+    ///
+    /// An abandoned connection stores nothing and releases the gate, so a
+    /// later call connects again; a connected handle returns at once.
+    ///
+    /// # Arguments
+    /// * `py` - The attached interpreter, released while connecting.
+    /// * `deadline` - When the caller stops waiting for the connection.
+    /// * `connect` - The shared Rust connection for this handle kind.
+    ///
+    /// # Errors
+    /// Returns `None` when `deadline` passes first, and otherwise `connect`'s
+    /// error unchanged.
+    pub(crate) fn get_before<E, F, Fut>(
+        &self,
+        py: Python<'_>,
+        deadline: Instant,
+        connect: F,
+    ) -> Option<Result<&T, E>>
+    where
+        E: Send,
+        F: FnOnce(Option<WyrdClient>) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        self.connect_by(py, Some(deadline), connect)
+    }
+
+    /// Connect once under the gate, stopping at `deadline` when one is given.
+    ///
+    /// Returns `None` only when `deadline` passed before the handle was
+    /// connected; it is checked before any work, so an expired deadline
+    /// takes no gate and performs no IO.
+    ///
+    /// # Errors
+    /// Returns `connect`'s error unchanged; nothing is stored.
+    fn connect_by<E, F, Fut>(
+        &self,
+        py: Python<'_>,
+        deadline: Option<Instant>,
+        connect: F,
+    ) -> Option<Result<&T, E>>
+    where
+        E: Send,
+        F: FnOnce(Option<WyrdClient>) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
         if let Some(handle) = self.handle.get() {
-            return Ok(handle);
+            return Some(Ok(handle));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
         }
         let caller = crate::trace::active_trace_context(py);
-        py.detach(|| {
-            let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        let connected = async {
+            let _gate = self.gate.lock().await;
             if let Some(handle) = self.handle.get() {
                 return Ok(handle);
             }
-            let handle = wyrd_runtime::runtime()
-                .block_on(with_caller_trace(caller, connect(self.client.clone())))?;
+            let handle = connect(self.client.clone()).await?;
             Ok(self.handle.get_or_init(|| handle))
+        };
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(with_caller_trace(caller, async {
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, connected).await.ok(),
+                    None => Some(connected.await),
+                }
+            }))
         })
     }
 }

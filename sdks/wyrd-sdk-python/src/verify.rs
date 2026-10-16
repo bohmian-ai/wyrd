@@ -10,8 +10,11 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
+use tokio::time::Instant;
 use wyrd_cards::card_ref::CardRefPy;
+use wyrd_client::WyrdClient;
 use wyrd_client::verify::{ArtifactRef, Execution, File};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::verification::execution::VerificationResult;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
@@ -120,12 +123,18 @@ impl PyExecution {
     /// error; nothing is retained, so the next operation connects again.
     fn handle(&self, py: Python<'_>) -> WyrdPyResult<&Execution> {
         let id = self.id;
-        Ok(self.inner.get(py, |client| async move {
-            match client {
-                Some(client) => Execution::connect_with(id, &client).await,
-                None => Execution::connect(id).await,
-            }
-        })?)
+        Ok(self.inner.get(py, |client| Self::open(id, client))?)
+    }
+
+    /// Connect the handle of `id` as `client`, or the ambient client.
+    ///
+    /// # Errors
+    /// Returns the client's configuration or credential error.
+    async fn open(id: ExecutionId, client: Option<WyrdClient>) -> Result<Execution, WyrdError> {
+        match client {
+            Some(client) => Execution::connect_with(id, &client).await,
+            None => Execution::connect(id).await,
+        }
     }
 }
 
@@ -189,6 +198,11 @@ impl PyExecution {
 
     /// Poll until a result, the execution's own error, or `timeout` seconds.
     ///
+    /// One deadline starts at the call and bounds the whole wait: a first
+    /// connection, including waiting for another caller's, and every status
+    /// read. An expired budget performs no IO, and an abandoned first
+    /// connection leaves the next operation free to connect.
+    ///
     /// # Errors
     /// Raises `WYRD_SPEC_400_VALIDATION` for a negative or non-finite
     /// `timeout`, the client's connection error on first use, the
@@ -198,7 +212,13 @@ impl PyExecution {
     fn wait(&self, py: Python<'_>, timeout: f64) -> WyrdPyResult<PyVerificationResult> {
         let timeout = Duration::try_from_secs_f64(timeout)
             .map_err(|error| invalid_argument("timeout", error))?;
-        crate::trace::block_on(py, self.handle(py)?.wait(timeout))
+        let deadline = Instant::now() + timeout;
+        let id = self.id;
+        let execution = self
+            .inner
+            .get_before(py, deadline, |client| Self::open(id, client))
+            .ok_or_else(|| Execution::wait_timed_out(&id, None))??;
+        crate::trace::block_on(py, execution.wait_until(deadline))
             .map(PyVerificationResult)
             .map_err(WyrdPyError::from)
     }

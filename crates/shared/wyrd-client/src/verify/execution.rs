@@ -88,28 +88,46 @@ impl Execution {
 
     /// Poll until the execution yields a result, fails, or `timeout` passes.
     ///
+    /// Equivalent to [`Execution::wait_until`] with a deadline `timeout`
+    /// from now.
+    ///
+    /// # Arguments
+    /// * `timeout` - How long to keep polling.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::wait_until`].
+    ///
+    /// # Cancellation
+    /// Dropping the future stops polling; the execution is unaffected.
+    pub async fn wait(&self, timeout: Duration) -> Result<VerificationResult, WyrdError> {
+        self.wait_until(Instant::now() + timeout).await
+    }
+
+    /// Poll until the execution yields a result, fails, or `deadline` passes.
+    ///
     /// Polls back off from 100 ms to at most 2 s and never sleep past the
     /// deadline. The deadline also bounds each status read, including its
     /// credential resolution, transport retries, and body decoding, and no
-    /// read starts once it has passed, so a zero `timeout` reads nothing.
+    /// read starts once it has passed, so an expired deadline reads nothing.
+    /// A caller that spends part of its budget before polling, such as
+    /// connecting the handle, passes the deadline it started with.
     /// Not-found and server-unavailable reads are retried until
     /// then, since a staged submission becomes visible only after the queue
     /// accepts it. A completed execution whose result is not visible yet
     /// keeps being polled: a result is never invented from a status.
     ///
     /// # Arguments
-    /// * `timeout` - How long to keep polling.
+    /// * `deadline` - When to stop polling.
     ///
     /// # Errors
     /// Returns the execution's own structured error when it settled as
     /// errored, cancelled, or timed out, including a delayed
-    /// idempotency conflict; `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when
-    /// `timeout` passes first; and any other status-read error unchanged.
+    /// idempotency conflict; [`Execution::wait_timed_out`]'s error when
+    /// `deadline` passes first; and any other status-read error unchanged.
     ///
     /// # Cancellation
     /// Dropping the future stops polling; the execution is unaffected.
-    pub async fn wait(&self, timeout: Duration) -> Result<VerificationResult, WyrdError> {
-        let deadline = Instant::now() + timeout;
+    pub async fn wait_until(&self, deadline: Instant) -> Result<VerificationResult, WyrdError> {
         let mut pause = FIRST_POLL;
         let mut last = None;
         loop {
@@ -119,10 +137,7 @@ impl Execution {
                 None
             };
             let Some(read) = read else {
-                return Err(WyrdError::SdkVerificationWaitTimedOut {
-                    message: format!("execution {} did not settle within {timeout:?}", self.id),
-                    details: json!({ "execution_id": self.id, "last_status": last }),
-                });
+                return Err(Self::wait_timed_out(&self.id, last));
             };
             match read {
                 Ok(state) => match (state.status, state.result, state.error) {
@@ -150,6 +165,20 @@ impl Execution {
             }
             tokio::time::sleep_until(deadline.min(Instant::now() + pause)).await;
             pause = (pause * 2).min(MAX_POLL);
+        }
+    }
+
+    /// The `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` error a wait on `id`
+    /// returns when its deadline passes, with the `last` status it read, if
+    /// any; shared by every phase of a wait, including connecting the handle.
+    #[must_use]
+    pub fn wait_timed_out(
+        id: &ExecutionId,
+        last: Option<VerificationExecutionStatus>,
+    ) -> WyrdError {
+        WyrdError::SdkVerificationWaitTimedOut {
+            message: format!("execution {id} did not settle before the wait deadline"),
+            details: json!({ "execution_id": id, "last_status": last }),
         }
     }
 }

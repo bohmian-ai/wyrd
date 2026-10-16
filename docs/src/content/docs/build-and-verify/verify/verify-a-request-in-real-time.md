@@ -40,7 +40,7 @@ with state.run("agent") as run:
     result = run.observe.verify(
         "policy-check",
         answer={"text": answer},
-        policy=wyrd.File("refund-policy.pdf"),
+        policy=wyrd.verify.File("refund-policy.pdf"),
     )
     if result.outcome.verdict != "passed":
         answer = hand_to_person(ticket_id)  # your fallback
@@ -100,11 +100,11 @@ Python blocks until the result arrives; Rust and TypeScript await it. The server
 
 | Language | From a path | From bytes |
 | --- | --- | --- |
-| Python | `wyrd.File("refund-policy.pdf")` | `wyrd.File(data, format="pdf", filename="policy.pdf")` |
-| Rust | `File::path("refund-policy.pdf")` | `File::bytes(data).with_format(MediaFormat::Pdf)` |
-| TypeScript | `File.path("refund-policy.pdf")` | `File.bytes(data, { format: "pdf" })` |
+| Python | `wyrd.verify.File("refund-policy.pdf")` | `wyrd.verify.File(data, format="pdf", filename="policy.pdf")` |
+| Rust | `verify::File::path("refund-policy.pdf")` | `verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
+| TypeScript | `verify.File.path("refund-policy.pdf")` | `verify.File.bytes(data, { format: "pdf" })` |
 
-To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.ArtifactRef(card_ref, path="refund-policy.pdf")`, `ArtifactRef::new(card_ref, Some(path))`, or `new ArtifactRef(cardRef, { path })`. It is read with the Artifact's own authorization.
+To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="refund-policy.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, { path })`. It is read with the Artifact's own authorization.
 
 ## 2. Read the breakdown
 

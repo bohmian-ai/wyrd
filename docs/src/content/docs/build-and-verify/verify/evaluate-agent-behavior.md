@@ -184,7 +184,7 @@ with state.run("agent") as run:
     execution = run.observe.submit(
         "answer-behavior",
         answer={"text": answer},
-        policy=wyrd.File("refund-policy.pdf"),
+        policy=wyrd.verify.File("refund-policy.pdf"),
         trace=run.trace_id,
     )
     save_review(ticket_id, execution.id)

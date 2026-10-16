@@ -28,7 +28,7 @@ with state.run("agent") as run:
     execution = run.observe.submit(
         "answer-behavior",
         answer={"text": answer},
-        policy=wyrd.File("refund-policy.pdf"),
+        policy=wyrd.verify.File("refund-policy.pdf"),
         trace=run.trace_id,
     )
 db.save(ticket_id=ticket_id, execution_id=execution.id)
@@ -95,10 +95,10 @@ From the same process, or from another one using only the ID:
 <LangTab lang="python">
 
 ```python
-from wyrd import VerificationExecution
+import wyrd
 
-execution = VerificationExecution.connect(execution_id)
-result = execution.wait(timeout_seconds=900)
+execution = wyrd.verify.Execution.connect(execution_id)
+result = execution.wait(900)
 print(result.outcome.verdict)
 ```
 
@@ -107,9 +107,9 @@ print(result.outcome.verdict)
 
 ```rust
 use std::time::Duration;
-use wyrd_ai::observe::VerificationExecution;
+use wyrd_ai::verify::Execution;
 
-let execution = VerificationExecution::connect(execution_id.parse()?).await?;
+let execution = Execution::connect(execution_id.parse()?).await?;
 let result = execution.wait(Duration::from_secs(900)).await?;
 println!("{:?}", result.outcome.verdict);
 ```
@@ -118,9 +118,9 @@ println!("{:?}", result.outcome.verdict);
 <LangTab lang="typescript">
 
 ```typescript
-import { VerificationExecution } from "wyrd-ai";
+import { verify } from "wyrd-ai";
 
-const execution = await VerificationExecution.connect(executionId);
+const execution = await verify.Execution.connect(executionId);
 const result = await execution.wait({ timeoutMs: 900_000 });
 console.log(result.outcome.verdict);
 ```

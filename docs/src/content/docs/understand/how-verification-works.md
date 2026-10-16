@@ -181,7 +181,7 @@ with state.run("agent") as run:
     result = run.observe.verify(
         "policy-check",
         answer={"text": answer},
-        policy=wyrd.File("refund-policy.pdf"),
+        policy=wyrd.verify.File("refund-policy.pdf"),
     )
     if result.outcome.verdict != "passed":
         answer = hand_to_person(ticket_id)  # your fallback
@@ -235,7 +235,7 @@ if (result.outcome.verdict !== "passed") {
 
 ### submit: queue it
 
-`submit` uploads missing files, stages the evidence, and returns a `VerificationExecution` with a server-issued execution ID. The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
+`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
 
 `202` means the server staged the evidence in memory, not that the queue has durably accepted it. The SDK sends one `Idempotency-Key` and reuses it on every transport retry. A conflicting reuse of a key is refused when the queue writer accepts the request, and you see it as an `errored` execution with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. Evidence lost before the queue accepts it, such as on an abrupt restart, has no outcome; `wait` ends with a timeout rather than an invented result.
 

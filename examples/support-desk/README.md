@@ -24,7 +24,7 @@ Each language exports five steps and a runnable main:
 | `explain` | Joins one Run's ticket, span, gateway call, and verdict through MCP `bifrost.query`. |
 
 The main also resumes the first failed check by its ID alone, as another
-process would (`VerificationExecution::connect(id).wait(...)` in Rust), and
+process would (`verify::Execution::connect(id).wait(...)` in Rust), and
 prints each requirement's outcome and reason.
 
 Run it against a server that has a `gpt-4o` deployment, with `WYRD_SERVER_URL`

@@ -4,7 +4,6 @@ description: The exact JSON an extract step returns for every media format, how 
 pillar: wyrd
 section: Reference
 order: 4
-draft: true
 status: runnable
 ---
 

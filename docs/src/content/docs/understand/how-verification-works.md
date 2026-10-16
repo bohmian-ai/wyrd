@@ -4,7 +4,6 @@ description: Inputs, steps, requirements, and decide; verify versus submit; exec
 pillar: wyrd
 section: Understand
 order: 2
-draft: true
 ---
 
 A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. Every Verifier is built from the same four parts, whether it checks one request, reviews a PDF, inspects an agent trace, or watches a feature distribution drift:

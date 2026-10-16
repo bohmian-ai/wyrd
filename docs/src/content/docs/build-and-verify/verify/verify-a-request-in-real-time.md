@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 1
-draft: true
 status: runnable
 ---
 

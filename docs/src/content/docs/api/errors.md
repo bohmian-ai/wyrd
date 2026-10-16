@@ -4,7 +4,6 @@ description: Every stable Wyrd error code with its HTTP status, title, and fix.
 pillar: wyrd
 section: Reference
 order: 21
-draft: true
 status: runnable
 ---
 

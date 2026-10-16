@@ -4,7 +4,6 @@ description: Install the Python worker, choose which processes run Verifiers, si
 pillar: wyrd
 section: Operate
 order: 4
-draft: true
 status: runnable
 ---
 

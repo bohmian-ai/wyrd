@@ -4,7 +4,6 @@ description: Every field of a Verifier spec, its input slots, steps, checks, ope
 pillar: wyrd
 section: Reference
 order: 1
-draft: true
 status: runnable
 ---
 

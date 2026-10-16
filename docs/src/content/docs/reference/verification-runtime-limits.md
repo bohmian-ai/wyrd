@@ -4,7 +4,6 @@ description: Server environment settings that bound Verifier files, extraction, 
 pillar: wyrd
 section: Reference
 order: 5
-draft: true
 status: runnable
 ---
 

@@ -4,7 +4,6 @@ description: How Wyrd records what a declared service actually does, and ties ea
 pillar: wyrd
 section: Understand
 order: 3
-draft: true
 ---
 
 Observe is how you record what the declared system actually does. Observations go straight into Bifrost, the Wyrd data plane. You can record:

@@ -4,7 +4,6 @@ description: Wyrd's analytical warehouse, the two ways to write to it, and when 
 pillar: wyrd
 section: Understand
 order: 4
-draft: true
 ---
 
 Bifrost is the analytical warehouse inside every Wyrd server. Every observation, verdict, trace, audit record, and custom row lands in it, and all of it is queryable with SQL. It runs inside `wyrd-server`; there is nothing extra to deploy.

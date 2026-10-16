@@ -4,7 +4,6 @@ description: A Service declaration is a set of versioned Cards, each one a defin
 pillar: wyrd
 section: Understand
 order: 1
-draft: true
 ---
 
 A Card is a versioned declaration: one model, prompt, agent, or dataset in your system, or one rule for checking them. You declare a whole service as a folder of Card files in YAML, whatever language the service is written in, and a Service Card ties the set together by naming its components.

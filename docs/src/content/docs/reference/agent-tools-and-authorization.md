@@ -4,7 +4,6 @@ description: The built-in tools a Verifier's Agent can call, how they are select
 pillar: wyrd
 section: Reference
 order: 6
-draft: true
 status: runnable
 ---
 

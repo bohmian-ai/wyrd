@@ -4,7 +4,6 @@ description: Exact Wyrd tool names, permissions, argument and result shapes, ref
 pillar: wyrd
 section: Reference
 order: 3
-draft: true
 status: runnable
 ---
 

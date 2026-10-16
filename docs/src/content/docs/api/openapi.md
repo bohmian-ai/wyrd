@@ -4,7 +4,6 @@ description: Where a Wyrd server serves its OpenAPI document and how to use it.
 pillar: wyrd
 section: Reference
 order: 22
-draft: true
 status: runnable
 ---
 

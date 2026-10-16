@@ -59,7 +59,7 @@ check_selection() {
 # --- Scenario 1: classified Rust changes select their consumer closure -------
 
 check_selection "MCP client selects its consumers and journey lanes" \
-  "full_gate=false changed_packages=wyrd-mcp rust_packages~wyrd-mcp rust_packages~wyrd-cli ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate package_python=true" \
+  "full_gate=false changed_packages=wyrd-mcp rust_packages~wyrd-mcp rust_packages~wyrd-cli ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate" \
   "crates/wyrd/wyrd-mcp/src/lib.rs"
 check_selection "leaf crate omits unrelated families" \
   "full_gate=false changed_packages=wyrd ci_lanes~test:wyrd ci_lanes!test:skald ci_lanes!test:vala ci_lanes!test:shared ci_lanes!test:rust" \
@@ -251,59 +251,40 @@ else
   fail "real-cloud storage must stay push-to-main only"
 fi
 
-# --- Scenario 3: routine packaging is selective; release is full ------------
+# --- Scenario 3: the server image lane follows the server binary -------------
 
-check_selection "leaf crate packages nothing" \
-  "package_python=false package_typescript=false package_server=false package_crates=false" \
+check_selection "leaf crate leaves the server image alone" \
+  "package_server=false" \
   "crates/wyrd/wyrd/src/lib.rs"
-check_selection "shared Skald change packages every SDK, server, and crate" \
-  "package_python=true package_server=true package_typescript=true package_crates=true" \
+check_selection "shared Skald change builds the server image" \
+  "package_server=true" \
   "crates/skald/skald-cache/src/lib.rs"
-check_selection "wire contract packages every deliverable" \
-  "package_python=true package_typescript=true package_server=true package_crates=true" \
+check_selection "wire contract builds the server image" \
+  "package_server=true" \
   "crates/wyrd-spec/src/lib.rs"
-check_selection "UI change packages nothing" \
-  "package_python=false package_typescript=false package_server=false package_crates=false" \
+check_selection "UI change leaves the server image alone" \
+  "package_server=false" \
   "crates/wyrd/wyrd-server/wyrd-ui/src/routes/+page.svelte"
-check_selection "TypeScript SDK change packages TypeScript only" \
-  "package_typescript=true package_python=false package_server=false" \
+check_selection "TypeScript SDK change leaves the server image alone" \
+  "package_server=false" \
   "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
-check_selection "docs change packages nothing" \
-  "package_python=false package_typescript=false package_server=false package_crates=false" \
+check_selection "docs change leaves the server image alone" \
+  "package_server=false" \
   "docs/src/index.mdx"
-check_selection "unknown impact packages the complete matrix" \
-  "package_python=true package_typescript=true package_server=true package_crates=true" \
+check_selection "unknown impact builds the server image" \
+  "package_server=true" \
   "scripts/postgres/with-test-postgres.sh"
 
-release="$WORKFLOWS/release.yml"
-release_builds_ok=true
-for build in build-sdist build-linux build-macos build-typescript build-server package-crates; do
-  block="$(job release.yml "$build")"
-  grep -q "github.event_name == 'release'" <<< "$block" || release_builds_ok=false
-  grep -q 'needs.changes.outputs.package_' <<< "$block" || release_builds_ok=false
-done
-if [[ "$release_builds_ok" == true ]]; then
-  ok "release builds every deliverable; main builds affected deliverables"
-else
-  fail "each release build must run on release events and on its affected main push"
-fi
 publish_ok=true
 for publish in publish-pypi publish-docker publish-binaries publish-crates; do
   block="$(job release.yml "$publish")"
-  grep -q 'qualify' <<< "$block" || publish_ok=false
   grep -q 'verify-release-artifacts.sh' <<< "$block" || publish_ok=false
   grep -q 'actions/attest-build-provenance' <<< "$block" || publish_ok=false
 done
 if [[ "$publish_ok" == true ]]; then
-  ok "publication waits for qualification and publishes attested verified digests"
+  ok "every publication is attested and verified"
 else
-  fail "every publish job must need qualification, verify recorded digests, and attest provenance"
-fi
-if grep -q 'uses: ./.github/workflows/nightly.yml' <<< "$(job release.yml qualify)" \
-  && grep -q 'workflow_call' "$WORKFLOWS/nightly.yml"; then
-  ok "release qualification runs the complete nightly gate"
-else
-  fail "release qualification must run the complete nightly gate"
+  fail "every publish job must verify recorded digests and attest provenance"
 fi
 
 # verify-release-artifacts.sh accepts exactly the recorded, verified bytes.

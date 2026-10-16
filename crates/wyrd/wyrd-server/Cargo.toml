@@ -91,7 +91,7 @@ thiserror = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-vala-sql = { path = "../../vala/vala-sql", version = "0.1.0" }
+vala-sql = { path = "../../vala/vala-sql", version = "0.1.1" }
 vala-bifrost-redux = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-types = { workspace = true }
@@ -101,14 +101,14 @@ wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-crypt = { workspace = true }
-wyrd-sql = { path = "../wyrd-sql", version = "0.1.0" }
+wyrd-sql = { path = "../wyrd-sql", version = "0.1.1" }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 http-body = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }
-wyrd-client = { path = "../../shared/wyrd-client", version = "0.1.0" }
+wyrd-client = { path = "../../shared/wyrd-client", version = "0.1.1" }
 wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
@@ -131,12 +131,12 @@ temp-env = { workspace = true }
 tokio-stream = "0.1"
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
-wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.1.0", features = ["pg"] }
-wyrd-testing = { path = "../wyrd-testing", version = "0.1.0" }
+wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.1.1", features = ["pg"] }
+wyrd-testing = { path = "../wyrd-testing", version = "0.1.1" }
 wyrd-tonic = { workspace = true, features = ["client"] }
-wyrd-sql = { path = "../wyrd-sql", version = "0.1.0", features = ["test-support"] }
-vala-sql = { path = "../../vala/vala-sql", version = "0.1.0" }
-wyrd-loader = { path = "../../shared/wyrd-loader", version = "0.1.0" }
+wyrd-sql = { path = "../wyrd-sql", version = "0.1.1", features = ["test-support"] }
+vala-sql = { path = "../../vala/vala-sql", version = "0.1.1" }
+wyrd-loader = { path = "../../shared/wyrd-loader", version = "0.1.1" }
 
 [lints]
 workspace = true

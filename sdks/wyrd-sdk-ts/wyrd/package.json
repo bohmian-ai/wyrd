@@ -1,6 +1,11 @@
 {
   "name": "wyrd-ai",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bohmian-ai/wyrd.git",
+    "directory": "sdks/wyrd-sdk-ts/wyrd"
+  },
   "license": "Apache-2.0",
   "private": false,
   "type": "module",
@@ -36,9 +41,9 @@
     ]
   },
   "optionalDependencies": {
-    "wyrd-ai-darwin-arm64": "0.1.0",
-    "wyrd-ai-linux-arm64-gnu": "0.1.0",
-    "wyrd-ai-linux-x64-gnu": "0.1.0"
+    "wyrd-ai-darwin-arm64": "0.1.1",
+    "wyrd-ai-linux-arm64-gnu": "0.1.1",
+    "wyrd-ai-linux-x64-gnu": "0.1.1"
   },
   "dependencies": {
     "apache-arrow": "21.1.0"

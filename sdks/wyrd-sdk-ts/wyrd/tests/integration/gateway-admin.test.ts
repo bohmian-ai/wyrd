@@ -70,7 +70,7 @@ test("deleting a credential twice succeeds", async ({ gateway }) => {
   });
 });
 
-test("deployment without capabilities is refused", async ({ gateway }) => {
+test("deployment with an empty capabilities list is refused", async ({ gateway }) => {
   await cli.putProviderCredential(environmentCredential("no-capability-key"));
 
   await expect(

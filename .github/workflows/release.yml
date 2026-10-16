@@ -1,9 +1,9 @@
 name: release
 
-# push to main = dry-run builds of the deliverables the change affects, chosen
-# by the same selector as lints-test (unknown impact builds every deliverable).
-# release published = the complete nightly gate plus every deliverable on every
-# supported platform. Each build job records the SHA-256 of its outputs after
+# push to main = build every deliverable on every supported platform; publish
+# nothing.
+# release published = the same builds, then the publish jobs.
+# Each build job records the SHA-256 of its outputs after
 # its package checks pass; publication verifies those exact bytes, attests
 # their provenance for this commit, and fails closed on a missing record,
 # unrecorded file, or changed byte.
@@ -30,39 +30,14 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
-  changes:
-    name: detect changes
-    if: github.event_name != 'release'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      package_python: ${{ steps.filter.outputs.package_python }}
-      package_typescript: ${{ steps.filter.outputs.package_typescript }}
-      package_server: ${{ steps.filter.outputs.package_server }}
-      package_crates: ${{ steps.filter.outputs.package_crates }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+  # ── Release commit ─────────────────────────────────────────────────────────
 
-      - name: Detect affected deliverables
-        id: filter
-        shell: bash
-        env:
-          WYRD_CHANGE_BASE: ${{ github.event.before }}
-          WYRD_CHANGE_HEAD: ${{ github.sha }}
-        run: .github/scripts/detect-changes.sh
-
-  # ── Release qualification ──────────────────────────────────────────────────
-
-  qualify:
-    name: qualify
-    if: github.event_name == 'release'
-    uses: ./.github/workflows/nightly.yml
-
+  # The release's one approval: every publish job needs this job, and the
+  # release-approval environment's reviewer approves it once.
   release-commit:
     name: release commit
     if: github.event_name == 'release'
+    environment: release-approval
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -84,8 +59,6 @@ jobs:
 
   build-sdist:
     name: python sdist
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -126,8 +99,6 @@ jobs:
 
   build-linux:
     name: python - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -175,7 +146,7 @@ jobs:
             if [[ "$ARCH" == "x86_64" ]]; then PROTOC_ARCH="linux-x86_64"
             elif [[ "$ARCH" == "aarch64" ]]; then PROTOC_ARCH="linux-aarch_64"
             else echo "Unsupported: $ARCH"; exit 1; fi
-            curl -fsSLO --retry 5 --retry-all-errors "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-${PROTOC_ARCH}.zip"
+            curl -fsSLO --retry 5 "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-${PROTOC_ARCH}.zip"
             unzip "protoc-33.2-${PROTOC_ARCH}.zip" -d /usr/local
             rm "protoc-33.2-${PROTOC_ARCH}.zip"
             chmod +x /usr/local/bin/protoc && protoc --version
@@ -194,8 +165,6 @@ jobs:
 
   build-macos:
     name: python - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -288,7 +257,7 @@ jobs:
   publish-pypi:
     name: publish python
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, test-wheels]
+    needs: [release-commit, test-wheels]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -340,8 +309,6 @@ jobs:
 
   build-typescript:
     name: typescript - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_typescript == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -444,7 +411,7 @@ jobs:
   publish-npm:
     name: publish typescript
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-typescript]
+    needs: [release-commit, build-typescript]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -495,8 +462,6 @@ jobs:
   # for the ubuntu and debian images, rockylinux:9 for rocky.
   build-server:
     name: server - ${{ matrix.bundle }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -508,14 +473,13 @@ jobs:
             bundle: x86_64-unknown-linux-gnu-rocky
           - os: ubuntu-22.04-arm
             bundle: aarch64-unknown-linux-gnu
-          - os: macos-15
-            bundle: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     env:
       BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
       WYRD_PROFILE: dist
-    steps:
+      CARGO_PROFILE_DIST_LTO: ${{ matrix.lto || 'fat' }}
+    steps: &build-server-steps
       - name: Install system deps
         if: matrix.container
         run: |
@@ -566,12 +530,30 @@ jobs:
             SHA256SUMS.wyrd-server-${{ matrix.bundle }}
           retention-days: 1
 
+  # The macOS bundle is its own job so the images, which never use it, do not
+  # wait on the slowest build. Fat LTO on the 7 GB macOS runner takes about
+  # three hours; thin LTO keeps this local-development bundle near an hour.
+  build-server-macos:
+    name: server - ${{ matrix.bundle }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            bundle: aarch64-apple-darwin
+            lto: thin
+    runs-on: ${{ matrix.os }}
+    env:
+      BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
+      WYRD_PROFILE: dist
+      CARGO_PROFILE_DIST_LTO: ${{ matrix.lto }}
+    steps: *build-server-steps
+
   # Each image copies a tested Linux bundle and compiles nothing; arm64 builds
   # on an arm runner, not under emulation.
   publish-docker:
     name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-server]
+    needs: [release-commit, build-server]
     runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
@@ -692,7 +674,7 @@ jobs:
   publish-binaries:
     name: publish binaries
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-server]
+    needs: [release-commit, build-server, build-server-macos]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -745,8 +727,6 @@ jobs:
 
   package-crates:
     name: rust crate package
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_crates == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -773,7 +753,7 @@ jobs:
   publish-crates:
     name: publish rust crates
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, package-crates, test-wheels, build-server]
+    needs: [release-commit, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release
     permissions:

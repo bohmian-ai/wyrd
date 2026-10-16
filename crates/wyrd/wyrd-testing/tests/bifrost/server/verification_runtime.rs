@@ -521,6 +521,16 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     }
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
+    // Each run stages its result on the Oracle node's outbox after settling;
+    // the results reach the peer Scribe only once that outbox drains.
+    let unwritten = oracle
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached the peer Scribe").into());
+    }
     scribe.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
 

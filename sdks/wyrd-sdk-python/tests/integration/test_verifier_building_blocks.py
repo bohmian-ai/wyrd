@@ -276,10 +276,13 @@ def test_submitted_review_is_judged_in_the_background(
     )
     assert isinstance(execution, verify.Execution)
 
-    result = verify.Execution.connect(execution.id, WyrdClient(credential=policy_desk_key)).wait(
-        WAIT_SECONDS
-    )
+    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=policy_desk_key))
+    result = resumed.wait(WAIT_SECONDS)
+    status = resumed.status()
 
+    assert status["status"] == "completed"
+    assert status["result"]["execution_id"] == execution.id
+    assert "error" not in status
     assert result.verdict == "failed"
     assert requirement(result, "refund-within-limit")["outcome"] == "failed"
 

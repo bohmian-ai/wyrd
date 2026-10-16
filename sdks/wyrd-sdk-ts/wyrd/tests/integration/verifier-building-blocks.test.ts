@@ -275,10 +275,13 @@ test("submitted review is judged in the background", async ({ desk }) => {
     throw new Error("Run evidence queues an execution");
   }
 
-  const result = await (await verify.Execution.connect(submitted.execution.id, { client: desk.client })).wait({
-    timeoutMs: WAIT_MS,
-  });
+  const resumed = await verify.Execution.connect(submitted.execution.id, { client: desk.client });
+  const result = await resumed.wait({ timeoutMs: WAIT_MS });
+  const status = await resumed.status();
 
+  expect(status.status).toBe("completed");
+  expect(status.result).toEqual(result);
+  expect(status.error).toBeUndefined();
   expect(result.outcome.verdict).toBe("failed");
   expect(requirement(result, "refund-within-limit").outcome).toBe("failed");
 });

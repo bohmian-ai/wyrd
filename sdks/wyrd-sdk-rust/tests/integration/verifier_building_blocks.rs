@@ -586,13 +586,18 @@ async fn submitted_review_is_judged_in_the_background() {
     else {
         panic!("Run evidence queues an execution");
     };
-    let result = Execution::connect_with(*execution.id(), &desk.client)
+    let resumed = Execution::connect_with(*execution.id(), &desk.client)
         .await
-        .expect("the handle rebuilds from its ID")
-        .wait(WAIT)
-        .await
-        .expect("the review settles");
+        .expect("the handle rebuilds from its ID");
+    let result = resumed.wait(WAIT).await.expect("the review settles");
+    let status = resumed.status().await.expect("the settled status reads");
 
+    assert_eq!(
+        status.result.as_ref(),
+        Some(&result),
+        "status carries the result wait returned"
+    );
+    assert!(status.error.is_none());
     assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
     assert_eq!(
         requirement(&result, "refund-within-limit").outcome,

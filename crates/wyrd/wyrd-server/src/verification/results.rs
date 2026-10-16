@@ -38,7 +38,7 @@ use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, RequirementDetail, RequirementResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{
-    DriftReport, DriftWindow, FeatureDriftReport, FrozenTarget, VerificationVerdict,
+    DriftReport, DriftVerdict, DriftWindow, FeatureDriftReport, FrozenTarget, VerificationVerdict,
 };
 use wyrd_sql::queries::verifier_executions::Submission;
 
@@ -397,8 +397,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let verdicts = rows
             .iter()
-            .map(|row| serialized_name(&row.feature.verdict))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|row| Some(drift_verdict(row.feature.verdict)));
         Ok(Some(vec![
             (
                 "result_id",
@@ -565,6 +564,17 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError>
     Ok(serde_json::to_value(value)?.as_str().map(str::to_owned))
 }
 
+/// The stored value of a Drift feature verdict: the snake_case spelling the
+/// published `vala.drift.result_features.verdict` column carries, matching
+/// `vala.verification.results.verdict`.
+const fn drift_verdict(verdict: DriftVerdict) -> &'static str {
+    match verdict {
+        DriftVerdict::NoDrift => "no_drift",
+        DriftVerdict::Drift => "drift",
+        DriftVerdict::Inconclusive => "inconclusive",
+    }
+}
+
 /// Build a nullable UTF-8 column.
 fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef {
     Arc::new(StringArray::from_iter(values))
@@ -597,7 +607,6 @@ mod tests {
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::ids::FeatureName;
     use wyrd_spec::vala::eval::TaskId;
-    use wyrd_spec::verification::DriftVerdict;
     use wyrd_spec::verification::execution::RequirementOutcome;
 
     use super::*;
@@ -760,7 +769,7 @@ mod tests {
             assert_eq!(cell(rows, "method", row).as_deref(), Some("Psi"));
         }
         assert_eq!(cell(rows, "feature", 0).as_deref(), Some("dti"));
-        assert_eq!(cell(rows, "verdict", 1).as_deref(), Some("Drift"));
+        assert_eq!(cell(rows, "verdict", 1).as_deref(), Some("drift"));
         let scores = rows
             .column_by_name("score")
             .expect("score column")

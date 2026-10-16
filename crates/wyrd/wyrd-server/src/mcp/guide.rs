@@ -144,15 +144,11 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 ),
                 sql_example(
                     "Read a completed judgment",
-                    "SELECT result_id, implementation, execution_status, verdict, card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20",
+                    "SELECT result_id, execution_id, execution_status, verdict, card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20",
                 ),
                 sql_example(
                     "Read scored Drift features",
                     "SELECT result_id, feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '<result_id>' LIMIT 20",
-                ),
-                sql_example(
-                    "Read Eval outcomes without sensitive payloads",
-                    "SELECT result_id, task_id, outcome_kind, passed, skip_reason FROM vala.eval.result_items WHERE result_id = '<result_id>' LIMIT 20",
                 ),
                 sql_example(
                     "Read a described custom table",

@@ -1,7 +1,9 @@
 //! HTTP projection of the Verification control plane.
 //!
 //! Five operations: evidence upload planning, direct execution, background
-//! submission, execution status, and binding status. Each handler parses its
+//! submission, execution status, and binding status. On the local storage
+//! backend a sixth, the evidence body upload, is the target of each evidence
+//! plan, since local storage has no presigned URL. Each handler parses its
 //! path, header, and body, then delegates to [`VerificationControl`], which
 //! owns authorization, audit, tenancy, and error mapping.
 
@@ -10,6 +12,7 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
+use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, ExecutionId};
 use wyrd_spec::verification::execution::{
@@ -17,6 +20,7 @@ use wyrd_spec::verification::execution::{
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{MAX_EXECUTE_BODY_BYTES, VerificationBindingStatus};
+use wyrd_storage::BackendConfig;
 
 use super::service::VerificationControl;
 use crate::components::auth::Caller;
@@ -28,13 +32,21 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 /// Build the Verification routes for the `/v1` group.
-pub fn verification_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
+///
+/// The local evidence upload route is mounted only on the local storage
+/// backend, the one backend whose evidence plans point at it.
+pub fn verification_router(state: &AppState) -> OpenApiRouter<AppState> {
+    let router = OpenApiRouter::new()
         .routes(routes!(get_binding))
         .routes(routes!(evidence))
         .routes(routes!(execute))
         .routes(routes!(enqueue))
-        .routes(routes!(get_execution))
+        .routes(routes!(get_execution));
+    if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
+        router.routes(routes!(local_evidence))
+    } else {
+        router
+    }
 }
 
 /// Read a bounded JSON body and decode it as `T`.
@@ -136,6 +148,56 @@ async fn evidence(
             .evidence(&caller, &request)
             .await?,
     ))
+}
+
+/// Store one evidence body on the local storage backend.
+///
+/// The target of every local evidence plan. The body must hash to the path
+/// digest; a repeated upload rewrites identical bytes.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the digest is malformed, the caller lacks
+/// `verifier:run`, the body exceeds the file limit or hashes to another
+/// digest, or the write fails.
+#[utoipa::path(
+    put,
+    path = "/verification/evidence/local/{sha256}",
+    params(("sha256" = String, Path, description = "Lowercase hex SHA-256 of the body, from \
+        the evidence plan")),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "Stored"),
+        (status = 400, description = "The digest is malformed or the body hashes to another \
+          digest (WYRD_SPEC_400_VALIDATION, WYRD_STORAGE_400_SHA256_MISMATCH)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:run \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 413, description = "The body exceeds the file limit \
+          (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
+        (status = 500, description = "The write failed (WYRD_STORAGE_500_BACKEND)",
+         body = WyrdProblem),
+        (status = 503, description = "This process hosts no Verifier execution \
+          (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "verification.evidence.upload")
+)]
+async fn local_evidence(
+    State(state): State<AppState>,
+    caller: Caller,
+    sha256: Result<Path<Sha256Hex>, PathRejection>,
+    body: Body,
+) -> Result<StatusCode, WyrdErrorResponse> {
+    let Path(sha256) = sha256.map_err(|rejection| path_rejection(&rejection))?;
+    VerificationControl::new(&state)
+        .upload_local_evidence(&caller, &sha256, body)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Stage one background Verifier execution and return its ID.

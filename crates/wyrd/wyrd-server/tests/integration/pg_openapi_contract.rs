@@ -1296,19 +1296,21 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly five typed operations.
+/// The Verification surface is exactly five typed operations, plus the
+/// local evidence upload on the local storage backend.
 ///
 /// Binding status, evidence planning, direct execution, enqueue, and
 /// execution status publish their typed request and response schemas,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
-/// operation is routed.
+/// operation is routed. The in-process server uses local storage, so its
+/// evidence plans target the digest-keyed local upload route.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, or when a Verification path,
 /// method, status, or schema reference differs.
 #[tokio::test]
-async fn verification_contract_publishes_exactly_five_typed_operations() {
+async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1332,6 +1334,7 @@ async fn verification_contract_publishes_exactly_five_typed_operations() {
             ("/v1/verification/bindings/{binding_id}", "get"),
             ("/v1/verification/enqueue", "post"),
             ("/v1/verification/evidence", "post"),
+            ("/v1/verification/evidence/local/{sha256}", "put"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
         ])

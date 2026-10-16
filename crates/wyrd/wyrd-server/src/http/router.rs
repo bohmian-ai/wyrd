@@ -74,7 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(storage_router(&state))
         .merge(cards_router())
         .merge(principals_router())
-        .merge(verification_router())
+        .merge(verification_router(&state))
         .merge(operator_connections_router())
         .merge(admin_router())
         .merge(identity_router())

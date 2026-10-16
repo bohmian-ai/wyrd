@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_eval::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::{AcceptedAuthority, Permission};
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{PrincipalId, Sha256Hex};
 use wyrd_spec::card::verifier::{CheckEvidence, VerifierSpec};
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -57,6 +57,9 @@ const GET_EXECUTION: &str = "verification.execution.read";
 
 /// Audit operation of an evidence upload plan.
 const EVIDENCE: &str = "verification.evidence";
+
+/// Audit operation of a local-backend evidence body upload.
+const EVIDENCE_UPLOAD: &str = "verification.evidence.upload";
 
 /// Audit operation of a direct execution.
 const EXECUTE: &str = "verification.execute";
@@ -356,19 +359,66 @@ impl<'a> VerificationControl<'a> {
                 Ok(_) | Err(StorageError::ObjectNotFound { .. }) => {}
                 Err(error) => return Err(storage_error(error)),
             }
-            let plan = self
-                .state
-                .storage
-                .signer()
-                .presign_single_put(&path, file.size_bytes, EVIDENCE_UPLOAD_TTL)
-                .await
-                .map_err(storage_error)?;
+            let plan = wyrd_storage::service::evidence_upload_plan(
+                &self.state.storage,
+                &path,
+                &file.sha256,
+                file.size_bytes,
+                EVIDENCE_UPLOAD_TTL,
+            )
+            .await
+            .map_err(storage_error)?;
             uploads.push(EvidenceUpload {
                 sha256: file.sha256,
                 plan,
             });
         }
         Ok(EvidencePlanResponse { uploads })
+    }
+
+    /// Store one evidence body on the local backend, where an evidence plan
+    /// is the authenticated route rather than a presigned URL.
+    ///
+    /// Authorizes and audits `verifier:run` on any Verifier like
+    /// [`Self::evidence`], reads at most the Deployment `file_max_bytes`, and
+    /// writes the body to `<tenant>/evidence/sha256/<digest>` only when it
+    /// hashes to `sha256`. Writes nothing to Postgres.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run`,
+    /// [`WyrdError::VerificationInputTooLarge`] past `file_max_bytes`,
+    /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
+    /// blocks, the storage `Sha256Mismatch` error for a body of another
+    /// digest, and the storage error when the write fails.
+    pub(crate) async fn upload_local_evidence(
+        &self,
+        caller: &Caller,
+        sha256: &Sha256Hex,
+        body: axum::body::Body,
+    ) -> Result<(), WyrdError> {
+        let max_bytes = self.blocks()?.limits().file_max_bytes;
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::verifier_run_any(),
+            EVIDENCE_UPLOAD,
+            "verification.evidence",
+        )?;
+        let too_large = || WyrdError::VerificationInputTooLarge {
+            message: format!("evidence files may be at most {max_bytes} bytes"),
+            details: serde_json::json!({ "sha256": sha256, "max_bytes": max_bytes }),
+        };
+        let limit = usize::try_from(max_bytes).map_err(|_| too_large())?;
+        let body = axum::body::to_bytes(body, limit)
+            .await
+            .map_err(|_| too_large())?;
+        wyrd_storage::service::upload_local_evidence(
+            &self.state.storage,
+            caller.data_tenant_id,
+            sha256,
+            &body,
+        )
+        .await
     }
 
     /// Execute one exact Verifier over supplied evidence and return its

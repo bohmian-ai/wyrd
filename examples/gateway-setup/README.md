@@ -51,8 +51,8 @@ fixtures.
    | `gemini-team` | `POST /v1beta/models/gemini-team/gemini-2.5-flash:generateContent` | in the path |
    | `judge-pool` | `POST /v1/systemone` | `judge-pool/jev-latest` |
 
-5. Register one Agent per provider from `agents/`, download them, and run
-   each downloaded Agent through its deployment. Each Agent's
+5. Register one Agent per provider from `agents/`, download them, and call
+   each downloaded Agent's deployment from your application. Each Agent's
    `execution_route` names its deployment; its Prompt keeps the provider and
    the model the upstream receives (`acme/gpt-4o-agent`, `claude-haiku-4-5`,
    `tuned/gemini-2.5-pro`, `jev-judge`).
@@ -63,19 +63,42 @@ fixtures.
      --output-dir gateway-agents
    ```
 
+   The application renders each Prompt and sends it to the ingress of the
+   table above, addressed as `<deployment>/<model>`, with a Wyrd access token
+   and the Run and Agent Card as correlation headers:
+
    ```python
+   from urllib.parse import quote
+
+   import httpx
    from wyrd.client import WyrdClient
    from wyrd.state import WyrdState
 
-   state = WyrdState.from_path("gateway-agents", WyrdClient())
+   client = WyrdClient()
+   state = WyrdState.from_path("gateway-agents", client)
    for alias in ("openai", "anthropic", "google", "jev"):
-       run = state.run(alias)
-       print(alias, run.invoke({"question": "Is Wyrd running?"}))
+       deployment = state.card(alias).spec["execution_route"]["deployment"]
+       prompt = state.agent(alias).prompt().prompt
+       body = prompt.render(question="Is Wyrd running?").model_dump()
+       path = {
+           "openai": "/v1/chat/completions",
+           "anthropic": "/v1/messages",
+           "google": f"/v1beta/models/{deployment}/{quote(prompt.model, safe='')}:generateContent",
+           "jev": "/v1/systemone",
+       }[prompt.provider]
+       if prompt.provider != "google":
+           body["model"] = f"{deployment}/{prompt.model}"
+       reply = httpx.post(
+           f"{client.server_url}{path}",
+           json=body,
+           headers={"wyrd-run-id": state.run(alias).run_id, "wyrd-card-uid": str(state.card_ref(alias).uid)},
+           auth=client.http_auth,
+       )
+       print(alias, reply.json())
    ```
 
    Every call is retained in `vala.gateway.calls` under its `run_id` and the
-   Agent's `card_uid`. The Jev Agent returns its `answers` as JSON text and
-   takes no tools.
+   Agent's `card_uid`. The Jev deployment returns keyed `answers`.
 
 `wyrd gateway credential revoke <name>` is permanent: every deployment using
 that credential stops serving, and the name cannot be put again. To recover,

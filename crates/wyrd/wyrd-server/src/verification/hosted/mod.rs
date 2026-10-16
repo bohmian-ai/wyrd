@@ -88,6 +88,7 @@ impl HostedLimits {
 impl Default for HostedLimits {
     /// The approved Deployment limit defaults.
     fn default() -> Self {
+        /// One mebibyte, the unit the byte limits are stated in.
         const MIB: u64 = 1024 * 1024;
         Self {
             file_max_bytes: 20 * MIB,

@@ -101,6 +101,9 @@ impl AgentToolset for FixedToolset {
     ///
     /// # Errors
     /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses its one tool.
     async fn open(
         &self,
         _call: &BlockCall<'_, Action>,
@@ -115,6 +118,9 @@ impl AgentToolset for FixedToolset {
 }
 
 /// An OpenAI text Prompt over `{{document}}`.
+///
+/// # Panics
+/// Panics when the static Prompt is invalid.
 fn text_prompt() -> Prompt {
     openai_chat(
         "gpt-test",
@@ -127,6 +133,9 @@ fn text_prompt() -> Prompt {
 }
 
 /// An OpenAI Prompt over `{{response}}` answering with any JSON object.
+///
+/// # Panics
+/// Panics when the static Prompt or schema is invalid.
 fn verdict_prompt() -> Prompt {
     openai_chat(
         "gpt-test",
@@ -218,6 +227,9 @@ fn read_call() -> ProviderResponse {
 }
 
 /// Run `call` as a step action with `inputs`.
+///
+/// # Errors
+/// Returns the executor's [`BlockError`] for the step.
 async fn step(
     executor: &AgentExecutor,
     call: &AgentCall,
@@ -240,6 +252,9 @@ async fn step(
 }
 
 /// Run `call` as a Verifier requirement check with `inputs`.
+///
+/// # Errors
+/// Returns the executor's [`BlockError`] for the check.
 async fn check(
     executor: &AgentExecutor,
     call: &AgentCall,
@@ -404,6 +419,9 @@ impl EvidenceReader for PinnedDeck {
 }
 
 /// One JSON input derived from the `deck` slot.
+///
+/// # Panics
+/// Never; the slot name is valid.
 fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),

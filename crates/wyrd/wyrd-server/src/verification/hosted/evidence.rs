@@ -467,6 +467,9 @@ mod pg_tests {
     }
 
     /// Evidence citing `slots` read by a caller with no grants.
+    ///
+    /// # Panics
+    /// Panics when the shared Postgres fixture is unavailable.
     async fn reader(slots: BTreeMap<SlotName, InputDeclaration>) -> TenantEvidence {
         TenantEvidence::new(
             test_state().await,
@@ -477,6 +480,10 @@ mod pg_tests {
     }
 
     /// Evidence over the fixture tenant holding `bytes` under their digest.
+    ///
+    /// # Panics
+    /// Panics when the write fails or the shared Postgres fixture is
+    /// unavailable.
     async fn stored(bytes: &[u8]) -> (TenantEvidence, Sha256Hex) {
         let sha256 = put(bytes).await;
         (reader(BTreeMap::new()).await, sha256)

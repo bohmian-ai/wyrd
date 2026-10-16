@@ -860,6 +860,11 @@ impl TenantRegistry {
 #[async_trait]
 impl AgentCardResolver for TenantRegistry {
     /// Resolve an Agent Card of this tenant.
+    ///
+    /// # Errors
+    /// Returns the registry's [`BlockError::Retryable`] connection failure
+    /// or [`BlockError::Terminal`] lookup failure, and
+    /// [`BlockError::Terminal`] when the Card is not an Agent.
     async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, BlockError> {
         match self.spec(agent_ref).await? {
             Spec::Agent(spec) => Ok(spec),
@@ -873,6 +878,11 @@ impl AgentCardResolver for TenantRegistry {
 #[async_trait]
 impl PromptCardResolver for TenantRegistry {
     /// Resolve a Prompt Card of this tenant into its runtime prompt.
+    ///
+    /// # Errors
+    /// Returns the registry's [`BlockError::Retryable`] connection failure
+    /// or [`BlockError::Terminal`] lookup failure, and
+    /// [`BlockError::Terminal`] when the Card is not a Prompt.
     async fn resolve(&self, prompt_ref: &CardRef) -> Result<skald_prompt::Prompt, BlockError> {
         match self.spec(prompt_ref).await? {
             Spec::Prompt(spec) => Ok(skald_prompt::Prompt::from_native(spec.prompt)),

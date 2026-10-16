@@ -51,6 +51,12 @@ async fn start(limits: HostedLimits) -> Sandbox {
 }
 
 /// Run `entrypoint` in `source` with `inputs` and no mounts.
+///
+/// # Errors
+/// Returns the sandbox's [`BlockError`] for refused or failed code.
+///
+/// # Panics
+/// Panics when `inputs` is not a JSON object.
 async fn run(
     sandbox: &Sandbox,
     source: &str,
@@ -215,6 +221,10 @@ async fn sandbox_reaches_only_its_mounts() {
 
 /// Run `source` in `workspace` the way `code.run` does: as the only `/work`
 /// writer, with the mounts measured when its turn comes.
+///
+/// # Errors
+/// Returns the mount or sandbox [`BlockError`]; files written before a
+/// failure stay and keep counting.
 async fn write(sandbox: &Sandbox, workspace: &Workspace, source: &str) -> Result<(), BlockError> {
     let _writer = workspace.writer().await;
     let mounts = workspace.mounts()?;

@@ -11,6 +11,9 @@ use zip::write::SimpleFileOptions;
 use super::*;
 
 /// A stored zip container holding `parts`.
+///
+/// # Panics
+/// Panics when the in-memory zip cannot be written.
 pub(crate) fn ooxml(parts: &[(&str, &str)]) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, body) in parts {
@@ -26,6 +29,9 @@ pub(crate) fn ooxml(parts: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// A PDF whose pages show `texts`, an empty text drawing nothing.
+///
+/// # Panics
+/// Panics when the in-memory document cannot be encoded.
 pub(crate) fn pdf(texts: &[&str]) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -71,7 +77,11 @@ pub(crate) fn pdf(texts: &[&str]) -> Vec<u8> {
 
 /// A two-slide deck: a titled slide with body text, a merged table, and
 /// notes, then an untitled empty slide.
+///
+/// # Panics
+/// Panics when the in-memory zip cannot be written.
 pub(crate) fn pptx() -> Vec<u8> {
+    /// The namespace declarations every slide part carries.
     const P: &str = r#"xmlns:p="p" xmlns:a="a" xmlns:r="r""#;
     ooxml(&[
         (
@@ -116,6 +126,9 @@ pub(crate) fn pptx() -> Vec<u8> {
 
 /// A document with a styled heading, a merged table, a content control, and
 /// an empty paragraph.
+///
+/// # Panics
+/// Panics when the in-memory zip cannot be written.
 pub(crate) fn docx() -> Vec<u8> {
     ooxml(&[(
         "word/document.xml",
@@ -134,7 +147,11 @@ pub(crate) fn docx() -> Vec<u8> {
 
 /// A sparse workbook: strings, a number, a formula error, a boolean, a
 /// cached formula result, and a serial date, on two sheets.
+///
+/// # Panics
+/// Panics when the in-memory zip cannot be written.
 pub(crate) fn xlsx() -> Vec<u8> {
+    /// The SpreadsheetML namespace declarations every sheet part carries.
     const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
     ooxml(&[
         (
@@ -175,11 +192,17 @@ pub(crate) fn xlsx() -> Vec<u8> {
 }
 
 /// Extract under default limits.
+///
+/// # Errors
+/// Returns the extractor's [`BlockError`] for refused or malformed input.
 fn extract(bytes: &[u8], format: MediaFormat) -> Result<ExtractOutput, BlockError> {
     Extraction::new(&HostedLimits::default()).run(bytes, format)
 }
 
 /// The JSON of a successful extraction.
+///
+/// # Panics
+/// Panics when extraction fails.
 fn extracted(bytes: &[u8], format: MediaFormat) -> Value {
     serde_json::to_value(extract(bytes, format).expect("extracts")).expect("serializes")
 }

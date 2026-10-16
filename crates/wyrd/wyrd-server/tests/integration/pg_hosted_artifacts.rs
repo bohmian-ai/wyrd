@@ -440,6 +440,9 @@ fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
 
 /// A native-route Agent answering any JSON object about `{{document}}`,
 /// declaring `tools`.
+///
+/// # Panics
+/// Panics when the static Prompt or schema is invalid.
 fn reviewer(tools: &[&str]) -> AgentCall {
     let prompt = openai_chat(
         "gpt-test",
@@ -466,6 +469,9 @@ fn reviewer(tools: &[&str]) -> AgentCall {
 }
 
 /// The `document` input carrying `value`, sourced from the `notes` slot.
+///
+/// # Panics
+/// Never; the slot name is valid.
 fn document(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "document".to_owned(),
@@ -492,8 +498,11 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn recovered_authority_bounds_every_agent_tool() {
+    /// A query of the one granted table.
     const LOGS: &str = "SELECT severity_text FROM vala.logs.records";
+    /// A query of a table the authority does not hold.
     const SPANS: &str = "SELECT name FROM vala.traces.spans";
+    /// One plan reaching both tables.
     const MIXED: &str = "SELECT r.severity_text, s.name \
          FROM vala.logs.records r JOIN vala.traces.spans s ON r.trace_id = s.trace_id";
     let registered = Registered::start().await;

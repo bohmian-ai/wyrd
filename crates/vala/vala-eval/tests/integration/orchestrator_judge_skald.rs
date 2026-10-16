@@ -58,6 +58,10 @@ impl AgentCardResolver for StaticAgentResolver {
 
 #[async_trait]
 impl PromptCardResolver for StaticResolver {
+    /// Returns the fixture Prompt for any reference.
+    ///
+    /// # Errors
+    /// Never fails.
     async fn resolve(&self, _judge_ref: &CardRef) -> Result<skald_prompt::Prompt, BlockError> {
         Ok(self.prompt.clone())
     }

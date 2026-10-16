@@ -469,6 +469,10 @@ struct CodeArgs {
 
 /// The description and argument schema of `tool`; Card and Bifrost tools
 /// reuse the MCP catalog's.
+///
+/// # Panics
+/// Panics when the MCP catalog lacks a Card or Bifrost built-in, an
+/// invariant the catalog's own tests hold.
 fn descriptor(tool: BuiltinTool) -> (String, Value) {
     let path =
         json!({"type": "string", "description": "Absolute workspace path under /inputs or /work."});

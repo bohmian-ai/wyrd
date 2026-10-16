@@ -8,7 +8,10 @@ use serde_json::json;
 use super::super::extract::tests::{docx, ooxml, pdf};
 use super::*;
 
-/// One staged file from `slot`.
+/// One staged file at `path`, sourced from the `evidence` slot.
+///
+/// # Panics
+/// Never; the slot name is valid.
 fn staged(path: &str, bytes: Vec<u8>, format: MediaFormat) -> Staged {
     Staged {
         path: path.to_owned(),
@@ -19,16 +22,25 @@ fn staged(path: &str, bytes: Vec<u8>, format: MediaFormat) -> Staged {
 }
 
 /// `locator` as its wire JSON.
+///
+/// # Panics
+/// Panics when the locator does not serialize.
 fn loc(locator: Locator) -> Value {
     serde_json::to_value(locator).expect("locator serializes")
 }
 
 /// Materialize `files` under default limits.
+///
+/// # Errors
+/// Returns [`Workspace::materialize`]'s refusal.
 fn open(files: Vec<Staged>) -> Result<Workspace, BlockError> {
     Workspace::materialize(files, HostedLimits::default(), None)
 }
 
 /// A gzip tar holding `entries`, each a raw header name, type, and body.
+///
+/// # Panics
+/// Panics when a name exceeds the header or the archive cannot be written.
 fn targz(entries: &[(&[u8], tar::EntryType, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
     for (name, kind, body) in entries {

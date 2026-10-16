@@ -48,10 +48,10 @@ wyrd-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-wyrd-telemetry = { workspace = true, features = ["test-support"] }
+wyrd-telemetry = { path = "../../shared/wyrd-telemetry", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
-skald-providers = { workspace = true }
+skald-providers = { package = "wyrd-skald-providers", path = "../skald-providers" }
 
 [lints]
 workspace = true

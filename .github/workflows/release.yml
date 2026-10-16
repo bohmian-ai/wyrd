@@ -739,6 +739,7 @@ jobs:
       # release-plz publishes the crates named in release-plz.toml.
       - name: Package and record published crates
         run: |
+          python3 .github/scripts/check-crate-publish.py
           cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           mkdir -p dist
           cp target/package/*.crate dist/

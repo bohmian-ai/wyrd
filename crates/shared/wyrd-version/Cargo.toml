@@ -6,6 +6,7 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+description = "Semantic version primitives shared by Wyrd crates."
 
 [lib]
 doctest = false

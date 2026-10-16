@@ -7,18 +7,20 @@
 //! resolves each declared name through the registry, wraps every tool in a
 //! [`RecordedTool`] that records the call for provenance, and attaches the
 //! tools to the ordinary Skald Agent loop. A tool whose failure's cause is
-//! [`BlockError::Busy`] raises the session's refusal; the session's
-//! `before_model` hook then ends the loop before the model sees the refusal,
-//! so the Agent fails busy. Nothing here is
-//! shared between invocations.
+//! [`BlockError::Busy`] raises the session's refusal, which wakes the Agent
+//! executor so the invocation fails busy at once, dropping sibling tool calls
+//! still in flight; the session's `before_model` hook also ends the loop
+//! before the model sees the refusal. Nothing here is shared between
+//! invocations.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use skald_agent::{BeforeModelFn, CallbackOutcome};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
+use tokio::sync::watch;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::card::verifier::Action;
@@ -85,7 +87,23 @@ impl ToolSession {
     /// The Agent executor reads it once the loop ends: a raised refusal
     /// makes the invocation [`BlockError::Busy`] whatever the loop returned.
     pub(crate) fn refused(&self) -> Option<String> {
-        self.refusal.reason.get().cloned()
+        self.refusal.reason.borrow().clone()
+    }
+
+    /// Resolves once any tool of this session is refused process capacity,
+    /// immediately when one already was.
+    ///
+    /// The Agent executor races the loop against it, so a refusal ends the
+    /// invocation while sibling tool calls are still pending; dropping the
+    /// loop drops those calls. Never resolves for a session without a
+    /// refusal.
+    pub(crate) async fn refusal_raised(&self) {
+        let mut raised = self.refusal.reason.subscribe();
+        // The sender lives in `self`, so the wait cannot observe a closed
+        // channel; an error would only mean no refusal can ever be raised.
+        if raised.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// A `before_model` hook that aborts the Agent loop once any tool of this
@@ -93,7 +111,7 @@ impl ToolSession {
     /// model and no further model call is made.
     pub(crate) fn halt_on_refusal(&self) -> BeforeModelFn {
         let refusal = self.refusal.clone();
-        Arc::new(move |_, _| match refusal.reason.get() {
+        Arc::new(move |_, _| match refusal.reason.borrow().as_deref() {
             Some(reason) => CallbackOutcome::Abort(wyrd_spec::error::WyrdError::internal(format!(
                 "a tool was refused process capacity: {reason}"
             ))),
@@ -146,10 +164,21 @@ pub fn provider_tool_name(tool: BuiltinTool) -> String {
 }
 
 /// One session's capacity refusal: the first reason wins and stays raised.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Refusal {
     /// The first refused call's bounded reason; unset until one is refused.
-    reason: Arc<OnceLock<String>>,
+    /// A watch channel so the executor can wait for it without missing a
+    /// refusal raised before it subscribed.
+    reason: Arc<watch::Sender<Option<String>>>,
+}
+
+impl Default for Refusal {
+    /// An unraised refusal.
+    fn default() -> Self {
+        Self {
+            reason: Arc::new(watch::channel(None).0),
+        }
+    }
 }
 
 impl Refusal {
@@ -162,7 +191,13 @@ impl Refusal {
         } = error
             && let Some(BlockError::Busy { reason }) = cause.downcast_ref::<BlockError>()
         {
-            let _ = self.reason.set(reason.clone());
+            self.reason.send_if_modified(|current| {
+                let first = current.is_none();
+                if first {
+                    *current = Some(reason.clone());
+                }
+                first
+            });
         }
     }
 }

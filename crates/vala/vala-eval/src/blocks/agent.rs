@@ -269,13 +269,18 @@ impl AgentExecutor {
     /// Check calls must declare neither tools nor a workspace. Step calls get
     /// exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
-    /// process capacity ends the loop before its next model call, and the
-    /// invocation then fails busy.
+    /// process capacity ends the invocation busy at once: the loop is raced
+    /// against the session's refusal and dropped with any sibling tool calls
+    /// still pending, so no further model call or tool result follows.
     ///
     /// # Errors
     /// Returns resolution, binding, route, tool, and run failures as
     /// [`BlockError`]s, and [`BlockError::Busy`] when the workspace or a tool
     /// is refused process capacity.
+    ///
+    /// # Panics
+    /// Never panics: the loop stops before completing only once a refusal
+    /// is raised, and a raised refusal returns busy first.
     async fn invoke(
         &self,
         id: &TaskId,
@@ -334,13 +339,22 @@ impl AgentExecutor {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        let run = agent.run_prompt(&self.providers, &prompt, &borrowed).await;
+        let run = agent.run_prompt(&self.providers, &prompt, &borrowed);
+        let run = match &session {
+            Some(session) => tokio::select! {
+                run = run => Some(run),
+                () = session.refusal_raised() => None,
+            },
+            None => Some(run.await),
+        };
         let refused = session.as_ref().and_then(ToolSession::refused);
         drop(session);
         if let Some(reason) = refused {
             return Err(BlockError::Busy { reason });
         }
-        let run = run.map_err(block_error)?;
+        let run = run
+            .expect("the loop only stops early for a raised refusal")
+            .map_err(block_error)?;
         Ok(Invoked {
             structured: run.structured_output,
             text: run.output,

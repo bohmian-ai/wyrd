@@ -548,3 +548,248 @@ async fn route_override_replaces_declared_route() {
     .expect_err("the override needs a gateway");
     assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
 }
+
+/// A `code.run` double refused process capacity, as the hosted sandbox
+/// refuses it.
+struct BusyCode;
+
+#[async_trait]
+impl AgentTool for BusyCode {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::CodeRun.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "run code"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Fail with a [`BlockError::Busy`] cause.
+    ///
+    /// # Errors
+    /// Always [`ToolError::Invocation`] caused by [`BlockError::Busy`].
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        let busy = BlockError::Busy {
+            reason: "no worker".to_owned(),
+        };
+        Err(ToolError::Invocation {
+            detail: busy.to_string(),
+            cause: Some(Box::new(busy)),
+        })
+    }
+}
+
+/// A `bifrost.query` double that never answers and raises `dropped` when
+/// its pending call is dropped.
+struct PendingQuery {
+    /// Set once a pending call's future is dropped.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Raises its flag when dropped with the pending call that owns it.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    /// Record that the owning future was dropped.
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl AgentTool for PendingQuery {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::BifrostQuery.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "query"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Wait forever while holding a [`DropFlag`].
+    ///
+    /// # Errors
+    /// Never returns.
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        let _flag = DropFlag(Arc::clone(&self.dropped));
+        std::future::pending().await
+    }
+}
+
+/// A toolset binding [`BusyCode`] and a [`PendingQuery`] sharing `dropped`.
+struct BusyToolset {
+    /// Flag handed to the pending query.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl AgentToolset for BusyToolset {
+    /// Open a session holding [`BusyCode`] and [`PendingQuery`].
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses either tool.
+    async fn open(
+        &self,
+        _call: &BlockCall<'_, Action>,
+        _tools: &[BuiltinTool],
+    ) -> Result<ToolSession, BlockError> {
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(BusyCode))
+            .expect("code registers");
+        registry
+            .register(Arc::new(PendingQuery {
+                dropped: Arc::clone(&self.dropped),
+            }))
+            .expect("query registers");
+        Ok(ToolSession::new(registry, 1024, Box::new(())))
+    }
+}
+
+/// An OpenAI answer calling `code_run` and `bifrost_query` in parallel.
+fn busy_and_pending_calls() -> ProviderResponse {
+    let call = |id: &str, name: &str| OpenAiToolCall {
+        id: id.to_owned(),
+        kind: "function".to_owned(),
+        function: OpenAiToolFunctionCall {
+            name: name.to_owned(),
+            arguments: "{}".to_owned(),
+        },
+    };
+    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
+        id: "resp_tools".to_owned(),
+        object: "chat.completion".to_owned(),
+        created: 0,
+        model: "gpt-test".to_owned(),
+        choices: vec![OpenAiChatChoice {
+            index: 0,
+            message: OpenAiChatMessage {
+                role: "assistant".to_owned(),
+                tool_calls: Some(vec![
+                    call("call_code", "code_run"),
+                    call("call_query", "bifrost_query"),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: Some("tool_calls".to_owned()),
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        service_tier: None,
+    })
+}
+
+/// A `code.run` refused process capacity while a parallel sibling tool is
+/// still pending ends the engine's timed Agent step busy at once: the step
+/// deadline is not reached, no authored retry or further model call runs,
+/// and the pending sibling's future is dropped.
+///
+/// # Panics
+/// Panics when the execution is not [`vala_eval::blocks::EngineError::Busy`],
+/// waits for the step deadline, retries, calls the model again, or leaves
+/// the sibling pending.
+#[tokio::test(start_paused = true)]
+async fn busy_tool_ends_the_agent_step_before_a_pending_sibling() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mock = MockProvider::new(ProviderName::OpenAi);
+    mock.push_response(busy_and_pending_calls());
+    mock.push_response(busy_and_pending_calls());
+    mock.push_response(openai_text_response("unreachable"));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(mock.clone()));
+    let executor = Arc::new(
+        AgentExecutor::new(
+            Arc::new(registry),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_toolset(Arc::new(BusyToolset {
+            dropped: Arc::clone(&dropped),
+        })),
+    );
+    let mut action = serde_json::to_value(Action::Agent(agent(
+        text_prompt(),
+        &["code.run", "bifrost.query"],
+    )))
+    .expect("action serializes");
+    action["inputs"] = json!({"document": "inputs.document"});
+    let spec: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(json!({
+        "inputs": {"document": {"type": "json"}},
+        "steps": [{
+            "id": "draft",
+            "action": action,
+            "timeout_seconds": 30,
+            "retries": 1
+        }],
+        "requirements": [{"id": "drafted", "statement": "Drafted", "check": {
+            "kind": "assert", "path": "steps.draft.output", "operator": "is_not_null"
+        }}]
+    }))
+    .expect("Verifier");
+    spec.validate().expect("valid Verifier");
+    let engine = vala_eval::blocks::VerificationEngine::new(
+        Arc::clone(&executor) as Arc<dyn ActionExecutor>,
+        executor as Arc<dyn CheckExecutor>,
+        Arc::new(vala_eval::InMemoryTraceSource::new()),
+        std::num::NonZeroUsize::new(1).expect("positive"),
+    );
+    let started = Instant::now();
+    let refused = engine
+        .run(
+            Arc::new(spec),
+            BTreeMap::from([(
+                SlotName::new("document").expect("slot"),
+                InputDeclaration::Json {
+                    value: json!("report"),
+                },
+            )]),
+            started + Duration::from_secs(60),
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(vala_eval::blocks::EngineError::Busy(ref reason)) if reason == "no worker"),
+        "{refused:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the refusal waited for the step deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        mock.remaining(),
+        2,
+        "neither a retry nor a second model call ran"
+    );
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the pending sibling was dropped"
+    );
+}

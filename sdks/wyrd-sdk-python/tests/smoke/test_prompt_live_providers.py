@@ -41,20 +41,26 @@ MAX_OUTPUT_TOKENS = 512
 SYSTEM = "You answer every question with the single word: ready"
 INPUT = "Reply with the single word: ready"
 
-# Structured-output schema per provider, each in the form that provider's
-# structured-output field accepts: OpenAI strict mode and Anthropic require
-# the closed object, and Gemini's ``responseSchema`` refuses
-# ``additionalProperties``.
-CLOSED_ANSWER_SCHEMA: dict[str, Any] = {
+# One structured-output schema for every provider: closed, nested, nullable,
+# and `$ref`-bearing, the shape OpenAI strict mode demands. A portable Prompt
+# authors it once; lowering must carry it to each provider's JSON Schema field.
+ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"answer": {"type": "string"}},
-    "required": ["answer"],
+    "properties": {
+        "answer": {"type": "string"},
+        "note": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+    },
+    "required": ["answer", "note", "items"],
     "additionalProperties": False,
-}
-ANSWER_SCHEMAS = {
-    "openai": CLOSED_ANSWER_SCHEMA,
-    "anthropic": CLOSED_ANSWER_SCHEMA,
-    "gemini": {k: v for k, v in CLOSED_ANSWER_SCHEMA.items() if k != "additionalProperties"},
+    "$defs": {
+        "item": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        }
+    },
 }
 
 # Settings each provider's model needs on every portable Prompt: Anthropic
@@ -145,8 +151,8 @@ def test_portable_max_output_tokens(provider: Portable) -> None:
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", PORTABLE)
 def test_portable_response_format(provider: Portable) -> None:
-    """A portable JSON Schema lands in the structured-output field and decodes."""
-    authored = portable(provider, response_format=ANSWER_SCHEMAS[provider])
+    """One closed, nested JSON Schema reaches every provider and decodes."""
+    authored = portable(provider, response_format=ANSWER_SCHEMA)
     answer = run(authored)
     assert answer.error is None, f"the run failed: {answer.error}"
     assert answer.structured_output is not None, "the run decoded no structured output"
@@ -219,17 +225,13 @@ def test_native_messages() -> None:
 
 @pytest.mark.smoke
 def test_native_generate_content() -> None:
-    """A native Gemini GenerateContent body runs as written.
-
-    The ``role`` on ``system_instruction`` is Wyrd's requirement, not
-    Gemini's: the native body decoder refuses a system instruction without
-    one (finding PRM-2).
-    """
+    """A native Gemini GenerateContent body runs as written, with the
+    role-less ``system_instruction`` Gemini's own API accepts."""
     authored = prompt(
         "gemini",
         format="generate_content",
         body={
-            "system_instruction": {"role": "user", "parts": [{"text": SYSTEM}]},
+            "system_instruction": {"parts": [{"text": SYSTEM}]},
             "contents": [],
         },
     )

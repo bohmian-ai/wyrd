@@ -791,8 +791,8 @@ fn anthropic(
 /// Builds the portable Google/Vertex GenerateContent request.
 ///
 /// Assistant turns take the `model` role, system text becomes
-/// `system_instruction`, and a schema becomes `response_schema` with a JSON
-/// response MIME type. An all-default generation config is omitted.
+/// `system_instruction`, and a schema becomes `response_json_schema` with a
+/// JSON response MIME type, so it reaches Gemini as authored JSON Schema. An all-default generation config is omitted.
 ///
 /// # Errors
 ///
@@ -847,7 +847,7 @@ fn google(
             2.0,
         )?,
         response_mime_type: schema.as_ref().map(|_| "application/json".to_owned()),
-        response_schema: schema.map(Value::Object),
+        response_json_schema: schema.map(Value::Object),
         ..Default::default()
     };
     Ok(GoogleGenerateContentRequest {
@@ -1139,7 +1139,7 @@ mod tests {
             gemini["generation_config"]["response_mime_type"],
             "application/json"
         );
-        assert_eq!(gemini["generation_config"]["response_schema"], schema);
+        assert_eq!(gemini["generation_config"]["response_json_schema"], schema);
         let vertex = compile(authored("vertex", &document)).expect("vertex compiles");
         assert_eq!(vertex.provider(), ProviderName::Vertex);
 
@@ -1484,7 +1484,7 @@ mod tests {
         for (provider, path) in [
             ("openai", "/response_format/json_schema/schema"),
             ("anthropic", "/output_config/format/schema"),
-            ("google", "/generation_config/response_schema"),
+            ("google", "/generation_config/response_json_schema"),
         ] {
             let compiled =
                 body(&compile(portable(provider, nested.clone())).expect("nested schema compiles"));
@@ -1981,5 +1981,25 @@ mod tests {
             "a mutated Prompt serializes natively"
         );
         assert_eq!(authored["model"], "claude-next");
+    }
+
+    /// Proves a native GenerateContent body may omit `role`, as Gemini's own
+    /// API allows, on its `system_instruction` and on a turn, and that the
+    /// absent role round-trips as absent rather than as an empty string.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body does not compile or does not round-trip.
+    #[test]
+    fn native_generate_content_role_is_optional() {
+        let native = json!({
+            "provider": "google", "model": "gemini-3.8-flash", "format": "generate_content",
+            "body": {
+                "system_instruction": {"parts": [{"text": "Answer briefly."}]},
+                "contents": [{"parts": [{"text": "hi"}]}],
+            },
+        });
+        let prompt = compile(native.clone()).expect("role-less native compiles");
+        assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
     }
 }

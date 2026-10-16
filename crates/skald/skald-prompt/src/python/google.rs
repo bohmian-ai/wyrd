@@ -574,9 +574,18 @@ impl PyGoogleFunctionDeclaration {
     fn description(&self) -> Option<&str> {
         self.f().description.as_deref()
     }
+    /// The declared parameter schema, from `parameters_json_schema` or the
+    /// OpenAPI-subset `parameters`, or `None` when the declaration has neither.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the schema does not convert to a Python value.
     #[getter]
     fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        wyrd_utils::py::json_to_pyobject(py, &self.f().parameters).map_err(Into::into)
+        let schema = self
+            .f()
+            .parameter_schema()
+            .unwrap_or(&serde_json::Value::Null);
+        wyrd_utils::py::json_to_pyobject(py, schema).map_err(Into::into)
     }
     fn __repr__(&self) -> String {
         format!("GoogleFunctionDeclaration(name={:?})", self.f().name)

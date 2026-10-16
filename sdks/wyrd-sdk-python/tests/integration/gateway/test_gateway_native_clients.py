@@ -222,10 +222,13 @@ def test_gemini_refusals_never_reach_the_provider(
 
     reader = gemini_client(server, access_token(server, viewer_key))
     ambiguous_client = gemini_client(server, token, Authorization=f"Bearer {token}")
+    caller = gemini_client(server, token)
     with pytest.raises(genai_errors.ClientError) as denied:
         reader.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
     with pytest.raises(genai_errors.ClientError) as ambiguous:
         ambiguous_client.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
+    with pytest.raises(genai_errors.ClientError) as unaddressed:
+        caller.models.generate_content(model="gemini-2.5-flash", contents="hi")
 
     assert (denied.value.code, denied.value.status) == (403, "PERMISSION_DENIED")
     assert (
@@ -234,6 +237,11 @@ def test_gemini_refusals_never_reach_the_provider(
     assert ambiguous.value.details["error"]["details"][0]["reason"] == (
         "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
     )
+    assert (unaddressed.value.code, unaddressed.value.status) == (400, "INVALID_ARGUMENT")
+    assert unaddressed.value.details["error"]["details"][0]["reason"] == (
+        "WYRD_GATEWAY_400_INVALID_REQUEST"
+    )
+    assert "<deployment>/<model>" in unaddressed.value.details["error"]["message"]
     assert upstream.deliveries == []
 
 

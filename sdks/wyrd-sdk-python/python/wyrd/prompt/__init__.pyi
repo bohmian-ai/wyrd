@@ -1161,7 +1161,7 @@ class ResponseFormat:
     OpenAI Chat writes ``response_format``, OpenAI Responses writes
     ``text.format``, Anthropic writes ``output_config`` (JSON Schema only),
     and Gemini and Vertex write ``generation_config.response_mime_type`` and
-    ``response_schema``.
+    ``response_json_schema``.
     """
 
     @staticmethod

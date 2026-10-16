@@ -609,7 +609,7 @@ async fn openai_chat_translates_to_gemini_and_back() {
                 {"role": "user", "parts": [{"function_response": {"name": "weather", "response": {"temp": 20}}}]}
             ],
             "system_instruction": {"role": "user", "parts": [{"text": "Be brief."}]},
-            "tools": [{"function_declarations": [{"name": "weather", "parameters": {"type": "object"}}]}],
+            "tools": [{"function_declarations": [{"name": "weather", "parameters_json_schema": {"type": "object"}}]}],
             "tool_config": {"function_calling_config": {"mode": "ANY", "allowed_function_names": ["weather"]}},
             "generation_config": {"candidate_count": 2, "max_output_tokens": 64, "response_mime_type": "application/json"}
         })

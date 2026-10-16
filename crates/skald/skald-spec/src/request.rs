@@ -305,10 +305,12 @@ fn google_tool(tools: &[ToolDescriptor]) -> GoogleTool {
         function_declarations: Some(
             tools
                 .iter()
-                .map(|tool| GoogleFunctionDeclaration {
-                    name: tool.name.clone(),
-                    description: Some(tool.description.clone()),
-                    parameters: tool.parameters.clone(),
+                .map(|tool| {
+                    GoogleFunctionDeclaration::json_schema(
+                        tool.name.clone(),
+                        Some(tool.description.clone()),
+                        tool.parameters.clone(),
+                    )
                 })
                 .collect(),
         ),

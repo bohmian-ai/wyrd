@@ -100,7 +100,7 @@ pub(super) fn request(
     )?;
     super::reject_extra(ADAPTER, &extra)?;
     let (system, offset) = super::system_prefix(&messages)?;
-    let (response_mime_type, response_schema) = output(response_format)?;
+    let (response_mime_type, response_json_schema) = output(response_format)?;
     let generation = GoogleGenerationConfig {
         temperature,
         top_p,
@@ -108,7 +108,7 @@ pub(super) fn request(
         max_output_tokens: max_completion_tokens.or(max_tokens),
         stop_sequences: super::stop_sequences(stop),
         response_mime_type,
-        response_schema,
+        response_json_schema,
         presence_penalty,
         frequency_penalty,
         seed,
@@ -278,11 +278,11 @@ fn translate_tools(tools: Vec<OpenAiTool>) -> Result<Vec<GoogleTool>, Unsupporte
                         parameters,
                         strict,
                     },
-            } if strict != Some(true) => Ok(GoogleFunctionDeclaration {
+            } if strict != Some(true) => Ok(GoogleFunctionDeclaration::json_schema(
                 name,
                 description,
-                parameters: super::parameters(parameters),
-            }),
+                super::parameters(parameters),
+            )),
             _ => Err(UnsupportedRequest::new(
                 format!("tools[{index}]"),
                 "only non-strict function tools are supported by the google adapter",

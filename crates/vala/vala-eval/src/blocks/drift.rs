@@ -29,6 +29,9 @@ pub struct DriftChecks {
     baselines: BTreeMap<TaskId, FittedBaseline>,
     /// Window samples keyed by samples slot.
     samples: BTreeMap<SlotName, RecordBatch>,
+    /// Reports a caller already scored from server-side aggregates, keyed by
+    /// requirement; they take precedence over samples and fitted state.
+    reports: BTreeMap<TaskId, DriftReport>,
 }
 
 impl DriftChecks {
@@ -45,11 +48,24 @@ impl DriftChecks {
             window,
             baselines,
             samples,
+            reports: BTreeMap::new(),
         }
+    }
+
+    /// Judge `requirement` from `report`, scored by the caller from
+    /// server-side window aggregates instead of raw samples.
+    ///
+    /// The caller owns reading, completeness, and scoring through
+    /// `vala-drift`; an unscorable window is [`DriftReport::unscored`].
+    #[must_use]
+    pub fn with_report(mut self, requirement: TaskId, report: DriftReport) -> Self {
+        self.reports.insert(requirement, report);
+        self
     }
 
     /// Judge one drift requirement.
     ///
+    /// A caller-scored report of the requirement maps directly.
     /// Missing samples, an unready baseline, and any scoring refusal are
     /// inconclusive with the cause as reason; a scored report maps `NoDrift`
     /// to passed, `Drift` to failed, and `Inconclusive` to inconclusive.
@@ -58,6 +74,9 @@ impl DriftChecks {
     /// only the non-null rows; nulls in other columns do not matter.
     #[must_use]
     pub fn judge(&self, requirement: &TaskId, check: &DriftCheck) -> CheckOutput {
+        if let Some(report) = self.reports.get(requirement) {
+            return self.scored(report);
+        }
         let Some(samples) = check.on.slot().and_then(|slot| self.samples.get(slot)) else {
             return self.inconclusive(format!("no samples were recorded for `{}`", check.on));
         };

@@ -1243,6 +1243,42 @@ async fn drift_requirements_score_through_vala_drift() {
     assert!(script.calls().is_empty());
 }
 
+/// A caller-scored drift report maps without samples or fitted state, so
+/// server-side window aggregates reach the same requirement projection.
+///
+/// # Panics
+/// Panics when the pre-scored report is not the requirement's outcome.
+#[tokio::test(start_paused = true)]
+async fn drift_requirement_maps_caller_scored_report() {
+    let spec = verifier(json!({
+        "inputs": {"current": {"type": "samples", "features": ["x"]}},
+        "requirements": [drift_requirement(
+            "psi-shift",
+            "current",
+            json!({"method": "Psi",
+            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+            "profile": {"kind": "Psi", "binning_strategy": {"kind": "EqualWidth", "n_bins": 4}, "threshold": {"kind": "Fixed", "value": 0.2}}}),
+        )]
+    }));
+    let report: vala_drift::DriftReport = serde_json::from_value(json!({
+        "method": "Psi",
+        "features": {"x": {"feature": "x", "score": 0.9, "threshold": 0.2, "verdict": "Drift"}},
+        "verdict": "Drift"
+    }))
+    .expect("report");
+    let drift = DriftChecks::default().with_report(TaskId::new("psi-shift").expect("id"), report);
+    let script = Arc::new(Script::default());
+    let outcome = engine(&script, InMemoryTraceSource::new(), 1)
+        .with_drift(drift)
+        .run(spec, BTreeMap::new(), Instant::now() + Duration::from_secs(60))
+        .await
+        .expect("outcome");
+    let shifted = requirement(&outcome, "psi-shift");
+    assert_eq!(shifted.outcome, RequirementOutcome::Failed);
+    assert_eq!(shifted.reason, "1 of 1 features drifted (Drift)");
+    assert!(matches!(shifted.detail, Some(RequirementDetail::Drift(_))));
+}
+
 /// A Custom drift window with a null measurement of its configured metric
 /// is unscored and inconclusive, keeping its window and empty report, rather
 /// than passing on the non-null mean; nulls in unrelated columns do not

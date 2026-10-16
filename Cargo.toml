@@ -12,7 +12,7 @@ members = [
     "sdks/wyrd-sdk-ts/native",
     "sdks/wyrd-sdk-ts/native-testing",
 ]
-exclude = []
+exclude = ["crates/wyrd/wyrd-monty-worker"]
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
@@ -144,6 +144,11 @@ calamine = { version = "0.36", default-features = false }
 csv = "1.4"
 lopdf = { version = "0.45", default-features = false }
 quick-xml = "0.41"
+# Sandboxed Verifier Python pool. The worker binary it spawns builds in its
+# own excluded workspace: Monty's interpreter graph declares pyo3 0.29, whose
+# `links = "python"` conflicts with the Python SDK's pyo3 during resolution.
+monty-pool = "1.1"
+monty-types = "1.1"
 tar = { version = "0.4", default-features = false }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13"

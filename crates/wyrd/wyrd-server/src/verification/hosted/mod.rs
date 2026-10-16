@@ -7,8 +7,11 @@
 //! own: each execution composes them with its accepted authority and pinned
 //! evidence, and every limit comes from [`HostedLimits`].
 
+use std::time::Duration;
+
 pub mod evidence;
 pub mod extract;
+pub mod sandbox;
 pub mod workspace;
 
 /// The Deployment limits the hosted capabilities enforce.
@@ -39,6 +42,22 @@ pub struct HostedLimits {
     pub tool_result_max_bytes: usize,
     /// Most concurrent workspaces per process.
     pub max_workspaces: usize,
+    /// Prewarmed Python worker processes.
+    pub monty_min_workers: usize,
+    /// Most live Python worker processes.
+    pub monty_max_workers: usize,
+    /// Most Python operations waiting for a worker.
+    pub monty_max_waiters: usize,
+    /// Monty allocation budget per Python operation, in bytes.
+    pub monty_memory_bytes: u64,
+    /// Hard address-space ceiling of one worker process, in bytes.
+    pub monty_process_memory_bytes: u64,
+    /// Combined resident-memory ceiling of every worker process, in bytes.
+    pub monty_pool_memory_bytes: u64,
+    /// One complete Python operation, from checkout wait to result.
+    pub code_timeout: Duration,
+    /// Cumulative Python-operation time within one Agent invocation.
+    pub agent_code_budget: Duration,
 }
 
 impl Default for HostedLimits {
@@ -57,6 +76,14 @@ impl Default for HostedLimits {
             work_write_max_bytes: 50 * MIB,
             tool_result_max_bytes: 64 * 1024,
             max_workspaces: 16,
+            monty_min_workers: 2,
+            monty_max_workers: 8,
+            monty_max_waiters: 16,
+            monty_memory_bytes: 256 * MIB,
+            monty_process_memory_bytes: 384 * MIB,
+            monty_pool_memory_bytes: 2048 * MIB,
+            code_timeout: Duration::from_secs(10),
+            agent_code_budget: Duration::from_secs(60),
         }
     }
 }

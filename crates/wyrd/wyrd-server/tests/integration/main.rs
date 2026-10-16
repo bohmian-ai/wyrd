@@ -26,5 +26,7 @@ mod pg_verification_routes;
 mod pg_verification_runtime;
 #[cfg(feature = "test-support")]
 mod platform_admin_e2e;
+/// The Python sandbox against the real hardened worker.
+mod sandbox_worker;
 #[cfg(feature = "storage-emulator")]
 mod storage_e2e;

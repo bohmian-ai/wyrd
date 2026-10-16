@@ -459,7 +459,7 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
 }
 
 /// Malformed and oversized bodies, an invalid Idempotency-Key, a caller
-/// without `verifier:run`, and a caller holding only `evals:run` are refused
+/// without `verifier:run`, and a caller holding only an unrelated `operators:invoke` are refused
 /// with stable codes before anything is staged, each authorization refusal
 /// auditing exactly one `verifier:run` denial; unknown and malformed
 /// execution reads are refused with their stable codes.
@@ -516,16 +516,16 @@ async fn enqueue_refusals_fail_before_staging() {
         vec![run_decision("denied")]
     );
     server
-        .seed_role("vr_evals_only", &[Permission::eval_run()])
+        .seed_role("vr_operators_only", &[Permission::operator_invoke()])
         .await
         .expect("role seeds");
-    let (evals_only, evals_only_jwt) =
-        user(&server, "vr-evals-only-user", &["vr_evals_only"]).await;
-    let (status, problem) = enqueue(&server, &evals_only_jwt, &body, None).await;
+    let (operators_only, operators_only_jwt) =
+        user(&server, "vr-operators-only-user", &["vr_operators_only"]).await;
+    let (status, problem) = enqueue(&server, &operators_only_jwt, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        decisions(&server, "verification.enqueue", evals_only).await,
+        decisions(&server, "verification.enqueue", operators_only).await,
         vec![run_decision("denied")]
     );
 
@@ -958,7 +958,7 @@ async fn direct_execution_judges_inline_without_enqueueing() {
 
 /// Malformed, oversized, unknown, and non-Verifier executions and a Drift
 /// Verifier, which judges only scheduled windows, are refused with stable
-/// codes. A caller without `verifier:run`, holding only `evals:run`, or
+/// codes. A caller without `verifier:run`, holding only an unrelated `operators:invoke`, or
 /// granted only an unrelated Verifier UID is refused with one audited denial,
 /// while a Card-bound principal granted exactly that Verifier UID is allowed
 /// whatever its observation scope; nothing is ever enqueued.
@@ -1030,7 +1030,7 @@ async fn direct_execution_refusals_are_stable() {
         vec![run_decision("denied")]
     );
     for (role, permission) in [
-        ("vx_evals_only", Permission::eval_run()),
+        ("vx_operators_only", Permission::operator_invoke()),
         (
             "vx_other_verifier",
             Permission::verifier_run(fixture.drift.clone()),

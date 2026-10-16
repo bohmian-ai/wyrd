@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+────────────
+ Nextest run ID cb29fa68-e499-40be-9e83-5d3167485393 with nextest profile: default
+    Starting 3 tests across 3 binaries (1066 tests skipped)
+        PASS [   0.003s] (1/3) vala-eval blocks::tests::action_executor_receives_resolved_inputs
+        PASS [   0.004s] (2/3) wyrd-spec refs::blocks_tests::blocks_verifier_yields_every_reference_slot
+        PASS [   0.019s] (3/3) wyrd-spec card::blocks::validate::tests::verifier_spec_enforces_agent_positions_and_media
+────────────
+     Summary [   0.021s] 3 tests run: 3 passed, 1066 skipped

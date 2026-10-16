@@ -1,0 +1,20 @@
+[codegen:check] $ GENERATED="crates/wyrd-spec/schemas/ui_problem_examples.json sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts"
+[codegen:regen] $ cargo run --locked -p wyrd-spec --example gen_schemas --features server
+   Compiling wyrd-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-verifier-building-blocks/crates/wyrd-spec)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.93s
+     Running `target/debug/examples/gen_schemas`
+Wrote 438 wire types to /home/thorrester/Documents/GitHub/wyrd-verifier-building-blocks/sdks/wyrd-sdk-ts/wyrd/src/card-types.ts
+✔ both application projections carry every approved role value in both modes (0.87501ms)
+✔ projections emit no retired hard-shadow, arcade, or superseded font contract (0.277319ms)
+✔ every Wyrd mark rendering keeps the exact README geometry (0.444849ms)
+✔ an undocumented or aliased token is rejected (0.271808ms)
+✔ a used pair below its contrast floor fails in the mode that breaks it (0.912792ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 34.496062
+All targets are in sync with palette.json.

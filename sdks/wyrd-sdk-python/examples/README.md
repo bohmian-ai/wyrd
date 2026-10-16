@@ -1,6 +1,6 @@
 # wyrd-sdk-python examples
 
-Examples use the built-in `mock` provider so they run without credentials.
+Each example runs without credentials or a server.
 
-- `structured_pipeline.py` runs one Agent with structured output and typed
-  callbacks.
+- `transport_http.py`, `transport_grpc.py`, and `transport_mock.py` build
+  client transport configuration.

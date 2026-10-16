@@ -11461,23 +11461,14 @@ name = "wyrd-rust-examples"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "reqwest 0.13.4",
- "schemars 0.8.22",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",
- "wyrd",
  "wyrd-ai",
- "wyrd-skald-agent",
- "wyrd-skald-prompt",
- "wyrd-skald-runtime",
- "wyrd-skald-spec",
- "wyrd-skald-tool",
- "wyrd-spec",
 ]
 
 [[package]]
@@ -11506,10 +11497,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
- "wyrd-skald-agent",
  "wyrd-skald-prompt",
- "wyrd-skald-runtime",
- "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-types",
@@ -11685,7 +11673,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "pyo3",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11695,7 +11682,6 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
  "wyrd-skald-runtime",
@@ -11703,7 +11689,6 @@ dependencies = [
  "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-telemetry",
- "wyrd-utils",
 ]
 
 [[package]]
@@ -11769,7 +11754,6 @@ name = "wyrd-skald-runtime"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "pyo3",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -11801,17 +11785,14 @@ name = "wyrd-skald-tool"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "pyo3",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-skald-spec",
  "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]

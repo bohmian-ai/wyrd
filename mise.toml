@@ -1198,11 +1198,6 @@ dir = "examples/support-desk/typescript"
 depends = ["ts:build"]
 run = "pnpm start"
 
-[tasks."examples:rust:smoke"]
-hide = true
-description = "Run the credential-free Rust agent smoke example"
-run = "cargo run -p wyrd-rust-examples --bin agent_smoke"
-
 [tasks."examples:cli:registration-progress"]
 description = "Show Card registration terminal progress rendering"
 run = "cargo run --locked -p wyrd-cli --example registration_progress"

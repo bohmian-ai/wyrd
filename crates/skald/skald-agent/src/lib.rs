@@ -23,9 +23,6 @@ pub mod error;
 pub mod gateway;
 pub mod journal;
 pub mod loop_runtime;
-#[cfg(feature = "python")]
-#[cfg(feature = "python")]
-pub mod python;
 pub mod registry;
 pub mod request_builder;
 pub mod run;
@@ -49,8 +46,6 @@ pub use gateway::{
     wyrd_gateway_registry,
 };
 pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
-#[cfg(feature = "python")]
-pub use python::python_register;
 pub use registry::system_messages;
 pub use run::{AgentRun, FinishReason, RunConfig, RunError};
 pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};

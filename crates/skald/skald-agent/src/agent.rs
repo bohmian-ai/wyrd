@@ -166,10 +166,6 @@ pub struct AgentCallbacks {
 /// # }
 /// ```
 #[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "wyrd.agent", name = "Agent", skip_from_py_object)
-)]
 pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
@@ -212,13 +208,6 @@ pub struct Agent {
     /// Host-supplied gateway seam a `wyrd_gateway` route dispatches through.
     /// Runtime state only, never serialized.
     pub(crate) gateway_caller: Option<Arc<dyn WyrdGatewayCaller>>,
-    /// Python class retained for structured-output instantiation.
-    ///
-    /// Set via `Agent(output_type=...)` or `agent.run(output_type=...)`.
-    /// Overrides `Prompt.py_output_cls` when both are set.
-    /// Only present under the `python` feature.
-    #[cfg(feature = "python")]
-    pub(crate) py_output_cls: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
 }
 
 impl fmt::Debug for Agent {
@@ -793,8 +782,6 @@ impl Agent {
             provider_override: None,
             execution_route: ExecutionRoute::Native {},
             gateway_caller: None,
-            #[cfg(feature = "python")]
-            py_output_cls: None,
         }
     }
 

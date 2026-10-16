@@ -169,6 +169,10 @@ fn decode<T: DeserializeOwned>(path: &Path, value: &Value) -> T {
 }
 
 /// Resolves a Card-relative reference against the referencing Card's directory.
+///
+/// # Panics
+/// Panics when `card` has no parent directory; every fixture path is a file
+/// inside `fixtures/cards/<journey>/`, so this is an invariant.
 fn sibling(card: &Path, reference: &str) -> PathBuf {
     card.parent()
         .expect("a fixture has a parent directory")
@@ -186,6 +190,12 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// Every fixture Verifier satisfies the staged blocks contract, and every
 /// schedule binding maps that Verifier's slots exactly.
+///
+/// # Panics
+/// Panics when a fixture cannot be loaded or decoded, a referenced Agent or
+/// Prompt cannot be resolved, a Verifier fails `validate_with`, a binding
+/// names a non-Verifier or fails `validate_schedule`, or no Verifiers or
+/// bindings are found.
 #[test]
 fn fixture_verifiers_satisfy_the_staged_contract() {
     let fixtures = Fixtures::load();

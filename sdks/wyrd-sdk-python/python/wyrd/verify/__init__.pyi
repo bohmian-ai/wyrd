@@ -160,6 +160,83 @@ class RequirementDetail(TypedDict):
 
     drift: DriftReport
 
+class SiblingRefWire(TypedDict):
+    """A loader-projected reference to another Card in the same submission."""
+
+    sibling: CardRefWire
+
+CardRefTarget: TypeAlias = CardRefWire | SiblingRefWire | str
+"""A registered, sibling, or authored-path (``str``) Card reference."""
+
+ComparisonOperatorWire: TypeAlias = str | dict[str, JsonValue]
+"""A scalar operator discriminator, or a parameterized operator object."""
+
+class AssertCheck(TypedDict):
+    """Typed comparison over one value (``path``) or every match (``each``)."""
+
+    kind: Literal["assert"]
+    path: NotRequired[str]
+    each: NotRequired[str]
+    operator: ComparisonOperatorWire
+    expected: NotRequired[JsonValue]
+
+class TraceCheck(TypedDict):
+    """Comparison over one span selected from a trace slot."""
+
+    kind: Literal["trace"]
+    on: str
+    span_selector: str
+    operator: ComparisonOperatorWire
+    expected: NotRequired[JsonValue]
+
+class AgentCheck(TypedDict):
+    """A tool-less Agent returning the Verdict schema.
+
+    ``agent`` is a Card reference or an inline Agent spec object.
+    """
+
+    kind: Literal["agent"]
+    agent: CardRefTarget | dict[str, JsonValue]
+    inputs: NotRequired[dict[str, str]]
+    workspace: NotRequired[dict[str, str]]
+
+class InlineCodeSource(TypedDict):
+    """Source text embedded in the Verifier version."""
+
+    inline: str
+
+class _ArtifactFile(TypedDict):
+    card: CardRefTarget
+    path: NotRequired[str]
+
+class ArtifactCodeSource(TypedDict):
+    """A file inside an exact Artifact Card version."""
+
+    artifact: _ArtifactFile
+
+class CodeCheck(TypedDict):
+    """Sandboxed code returning the Verdict schema."""
+
+    kind: Literal["code"]
+    runtime: NotRequired[Literal["python"]]
+    source: InlineCodeSource | ArtifactCodeSource
+    entrypoint: str
+    inputs: NotRequired[dict[str, str]]
+
+class DriftCheck(TypedDict):
+    """Statistical drift over a samples slot, with the drift spec flattened."""
+
+    kind: Literal["drift"]
+    on: str
+    description: NotRequired[str]
+    method: Literal["Psi", "Spc", "Custom"]
+    signal: dict[str, JsonValue]
+    condition: dict[str, JsonValue]
+    profile: NotRequired[dict[str, JsonValue]]
+
+Check: TypeAlias = AssertCheck | TraceCheck | AgentCheck | CodeCheck | DriftCheck
+"""The requirement's check, tagged by ``kind``."""
+
 RequirementOutcome: TypeAlias = Literal["passed", "failed", "inconclusive", "not_applicable"]
 
 class RequirementResult(TypedDict):
@@ -177,7 +254,7 @@ class RequirementResult(TypedDict):
     actual: NotRequired[JsonValue]
     citations: NotRequired[list[Citation]]
     detail: NotRequired[RequirementDetail]
-    check: dict[str, JsonValue]
+    check: Check
     provenance: NotRequired[CallProvenance]
 
 BuiltinTool: TypeAlias = Literal[

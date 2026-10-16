@@ -66,8 +66,10 @@ def test_failed_schedule_alerts_its_operator_on_the_connection_origin(
     assert provenance is not None and provenance["kind"] == "drift", provenance
     window = provenance.get("window")
     assert window is not None and window["start"] < window["end"], window
-    check = cast("dict[str, Any]", requirement["check"])
-    assert check["signal"]["baseline_ref"]["name"] == "latency-baseline"
+    check = requirement["check"]
+    assert check["kind"] == "drift", check
+    signal = cast("dict[str, Any]", check["signal"])
+    assert signal["baseline_ref"]["name"] == "latency-baseline"
     score = requirement["detail"]["drift"]["features"]["latency"]["score"]
     assert score is not None and score > 0.25
 
@@ -103,7 +105,9 @@ def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> 
     assert result.verifier.name == "latency-control"
     [requirement] = result.requirements
     assert (requirement["id"], requirement["outcome"]) == ("latency-in-control", "failed")
-    assert requirement["check"]["method"] == "Spc", requirement["check"]
+    check = requirement["check"]
+    assert check["kind"] == "drift", check
+    assert check["method"] == "Spc", check
     latency = requirement["detail"]["drift"]["features"]["latency"]
     assert (latency["score"], latency["threshold"]) == (4.0, 0.0), latency
     chart = cast("dict[str, Any]", latency.get("evidence"))["Spc"]

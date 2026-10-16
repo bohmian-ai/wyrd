@@ -2,8 +2,10 @@ name: release
 
 # push to main = dry-run builds of the deliverables the change affects, chosen
 # by the same selector as lints-test (unknown impact builds every deliverable).
-# release published = the complete nightly gate plus every deliverable on every
-# supported platform. Each build job records the SHA-256 of its outputs after
+# release published = every deliverable on every supported platform; server
+# binaries attach to the release at once, registry publishes wait for the
+# complete nightly gate.
+# Each build job records the SHA-256 of its outputs after
 # its package checks pass; publication verifies those exact bytes, attests
 # their provenance for this commit, and fails closed on a missing record,
 # unrecorded file, or changed byte.
@@ -691,7 +693,7 @@ jobs:
   publish-binaries:
     name: publish binaries
     if: github.event_name == 'release'
-    needs: [qualify, release-commit, build-server]
+    needs: [release-commit, build-server]
     runs-on: ubuntu-latest
     environment: release
     permissions:

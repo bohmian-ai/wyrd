@@ -290,14 +290,15 @@ fi
 publish_ok=true
 for publish in publish-pypi publish-docker publish-binaries publish-crates; do
   block="$(job release.yml "$publish")"
-  grep -q 'qualify' <<< "$block" || publish_ok=false
+  # Server binaries publish with the release itself; registries wait for qualification.
+  [[ "$publish" == publish-binaries ]] || grep -q 'qualify' <<< "$block" || publish_ok=false
   grep -q 'verify-release-artifacts.sh' <<< "$block" || publish_ok=false
   grep -q 'actions/attest-build-provenance' <<< "$block" || publish_ok=false
 done
 if [[ "$publish_ok" == true ]]; then
-  ok "publication waits for qualification and publishes attested verified digests"
+  ok "registry publication waits for qualification; every publication is attested and verified"
 else
-  fail "every publish job must need qualification, verify recorded digests, and attest provenance"
+  fail "every registry publish job must need qualification, and every publish job must verify recorded digests and attest provenance"
 fi
 if grep -q 'uses: ./.github/workflows/nightly.yml' <<< "$(job release.yml qualify)" \
   && grep -q 'workflow_call' "$WORKFLOWS/nightly.yml"; then

@@ -289,8 +289,8 @@ Authored FIND-004-5 cases. The Rust name is canonical; Python adds a `test_` pre
 
 Material limits:
 
-- `wyrd plan` cannot validate r7 Verifier Cards on this branch: existing `policy-review`, `document-formats` and `latency-watch` fail the same way until TASK-005 lands the spec cutover. The new Cards follow the existing fixtures' r7 shapes.
-- The hosted tool runtime is absent on this branch. Tool argument shapes reuse the MCP shapes for `cards.get_by_ref` and `bifrost.query`; for `code.run` they assume `{"code": ...}`. TASK-005 must reconcile these if its arguments differ.
+- `wyrd plan` cannot validate r7 Verifier Cards on this branch until TASK-005 switches the Card loader to `blocks::VerifierSpec`. Meanwhile `crates/wyrd-spec/tests/verifier_fixtures.rs` decodes every fixture Verifier into `blocks::VerifierSpec`, runs `validate_with` with path-referenced Agents and Prompts resolved from disk, and runs `validate_schedule` on every schedule binding: `mise exec -- cargo nextest run --locked -p wyrd-spec --test verifier_fixtures -E 'test(=fixture_verifiers_satisfy_the_staged_contract)'` passes. Mutating a Prompt placeholder or a binding feature makes it fail.
+- Tool arguments reuse the existing contracts: `GetCardByRefArgs{card_ref}` for `cards.get_by_ref` and `{sql, max_rows}` for `bifrost.query`. Only `code.run` has no argument contract yet; `{"code": ...}` is provisional and TASK-005 defines it.
 - SPC evidence assertions follow the `vala-drift` `FeatureEvidence` serde shape (`{"Spc": {...}}`).
 - No Custom scenario was added; the PSI tests are unchanged in behavior.
 - Incidental fixes:

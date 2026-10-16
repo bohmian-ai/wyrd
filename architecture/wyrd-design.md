@@ -765,7 +765,8 @@ Server spans export twice from one tracer provider:
   with the client's, and a queued write's `bifrost.gate.write` CONSUMER span,
   which reaches the server with its producers as links and no `traceparent`,
   reads back as a trace linked to them. The tenant copy carries only the
-  behavior-span catalog — the request span, `verification.*`, `dispatch`,
+  behavior-span catalog — the request span, `verification.*`, the Agent
+  loop's `invoke_agent`, `chat`, and `execute_tool`, `dispatch`,
   `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
   `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
   whose ancestors up to the span that opened the copy are all catalog

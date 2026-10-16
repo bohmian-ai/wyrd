@@ -1,354 +1,207 @@
 ---
 id: SPEC-agent-runtime-composition
-revision: 2
-status: draft
+revision: 3
+status: approved
 ---
 
-# Agent runtime composition
+# Remove the public SDK Agent runtime
 
 ## Objective and user value
 
-A Wyrd Agent is one runtime: a Prompt, tools and a run configuration, running
-one lifecycle. Where it runs should change only how its model calls and tools
-are wired, not whether it can have them, and not which code path it takes.
+Wyrd is verification and assurance infrastructure, not a general-purpose agent
+framework. Users build and execute applications with their chosen libraries;
+Wyrd identifies their components, records behavior, governs gateway and MCP
+access, evaluates evidence, and retains attributable results.
 
-| | Model calls | Tools |
-|---|---|---|
-| **Client** (SDK `Agent`) | Through the tenant gateway, using the Agent's `WyrdClient` | Local `@tool` functions, plus Wyrd's server tools reached over Wyrd MCP with the same `WyrdClient` |
-| **Server** (server-hosted Agent) | Through the gateway in process | Server built-ins bound in process |
+Remove Wyrd's public executable Agent surface from all first-class SDKs.
+Preserve declarative Agent Cards and the internal Skald engine needed by Vala
+and server-owned Verifier workflows. Do not replace the removed runtime with
+another SDK execution abstraction.
 
-Today:
+This revision replaces the composition objective in revisions 1–2. The user
+explicitly approved SDK Agent deletion and then Run invocation deletion on
+2026-10-16. Those instructions are the approval authority for this revision.
 
-- **Runtime:**
-  - Skald has two entry points with drifted copies of the same setup:
-    `run_with` (user text, session, `before_agent`) and `run_prompt`
-    (template variables, no session).
-  - `run_with` always validates the request as a conversation, so a Jev
-    `system_one` Prompt never reaches its single-call path. The live sweep
-    recorded this as JEV-1.
-  - The single-call path in `run_prompt` skips the model callbacks,
-    `after_agent` and the zero-iteration check. `run_prompt` itself skips
-    `before_agent`.
-- **Client:**
-  - The SDK `Agent` cannot hold a `WyrdClient`.
-  - A `wyrd_gateway` route is refused before any IO.
-  - No MCP tool source exists.
-  - The only SDK path that attaches a gateway caller is `Run.invoke`, which
-    refuses any Agent with tools.
-  - The Rust and TypeScript SDKs expose no Agent runtime at all.
-- **Server:** built-in tools exist, but they are bound only inside Verifier
-  step execution. This spec keeps that, and see D5.
+## Current evidence
 
-`wyrd-design.md` already says an Agent's tool names resolve through "host
-tools + MCP server registrations". This change makes the implementation match
-that design.
-
-The target shape matches the installed agent SDKs we reviewed (OpenAI Agents
-0.23.1, Pydantic AI 2.56.0, Google ADK 2.12.0):
-
-- the Agent is configuration only;
-- one loop, with run variants that differ only in sync, async or streaming;
-- one run input;
-- the gateway is a model provider;
-- MCP is a toolset beside function tools.
-
-User value:
-
-- An ML engineer runs the same Agent locally and through their governed
-  gateway, with tools, from Rust, Python or TypeScript.
-- Every model call and every server tool call carries the caller's identity,
-  authorization and audit, because both go through existing server surfaces.
-- One tool name means the same contract on the client and the server.
-- Every Prompt format, Jev included, runs through the same Agent and the
-  same callbacks.
+- Python exports an executable `Agent`, execution results, local tools,
+  callbacks, sessions, and runtime helpers through `wyrd.agent` and root
+  imports. The Python extension registers `wyrd._wyrd.agent` using Skald's
+  `python_register` in `sdks/wyrd-sdk-python/src/lib.rs`.
+- The Rust and TypeScript SDKs do not currently expose an equivalent public
+  Agent constructor/loop. Do not add one. Both still expose Agent Cards and
+  Run invocation, which are separate surfaces.
+- `crates/shared/wyrd-client/src/observe/invoke.rs::Run::invoke_on` constructs
+  a Skald Agent from a hydrated Agent Card, installs a gateway caller, and
+  invokes `run_prompt`. It refuses tools but still owns application execution.
+- The three support-desk examples, gateway-inference journeys, and
+  local-development consumers currently rely on Run invocation. Migration
+  must preserve their useful behavior, including correlation and permission
+  refusals, rather than merely deleting their assertions.
+- Existing native gateway APIs accept `wyrd-run-id` and `wyrd-card-uid`.
+  Rust `gateway_inference::gateway_call_records_whichever_attribution_it_carries`
+  proves caller/subject capture, with and without each optional header.
+  Python and TypeScript gateway-inference journeys also prove header capture.
+- Vala's Agent executor and simulator use Skald internally. Server Verifier
+  workflows use the existing hosted tool binder. These owners do not require
+  exposing an application Agent runtime in a language SDK.
 
 ## Requirements
 
-### Runtime (Skald)
+New IDs distinguish this deletion scope from the retired composition
+requirements REQ-001–011 and acceptance criteria AC-001–006.
 
-- **REQ-001: One run entry point.**
-  - An Agent runs through one `run(input)`. The run input carries:
-    - optional user text or messages;
-    - template variables;
-    - an optional session or history;
-    - per-run overrides: the execution route, and a Prompt override.
-  - `run_with` and `run_prompt` are folded into it, with no alias.
-  - All current callers use it:
-    - Verifier step Agents;
-    - the simulator;
-    - delegation;
-    - the Python `Agent`.
-  - Language variants differ only in their execution model (Python `run`
-    and `run_sync`), never in the input they accept.
-- **REQ-002: One lifecycle.**
-  - Every run goes through the same prepare, dispatch and finish steps.
-    Prepare covers the route registry, span, journal and timeout.
-  - `before_agent`, the model callbacks and `after_agent` run on every
-    dispatch.
-  - The zero-iteration check applies on every dispatch.
-- **REQ-003: Single-call dispatch is explicit.**
-  - Dispatch is chosen once, from the Prompt format:
-    - a single call for `system_one`;
-    - the conversation loop for every other format.
-  - A single-call Agent refuses, before any model call and with a stable
-    error, if it is given:
-    - tools;
-    - a session or history;
-    - appended user text.
-  - Conversation-request validation reports its real reason, such as an
-    unsupported dialect, rather than a "tool-loop dispatch" message.
-
-### Client
-
-- **REQ-004: An Agent can hold a client.** It follows the shared handle
-  convention (§Client model):
-  - Rust: `connect()` and `connect_with(&client)`, both eager.
-  - TypeScript: `static async connect({ client? })`, eager.
-  - Python: `client=None` on an IO-free constructor, which connects once on
-    the first operation that needs the server.
-- **REQ-005: A gateway route works from the client, with correlation.**
-  - An Agent on a `wyrd_gateway` route sends every model call to
-    `<deployment>/<Prompt model>` through the tenant gateway, as its client.
-    Ordinary gateway authorization, capture and audit apply.
-  - The refusal "no gateway caller is configured" is removed.
-  - A run may name a subject: a Run, and optionally an Agent Card. When it
-    does, every gateway call in that run records the subject. This is the
-    correlation `Run.invoke` provides today.
-  - A `native` route is unchanged.
-- **REQ-006: Wyrd MCP is a client toolset.**
-  - An Agent accepts Wyrd's server tools as a toolset, for example
-    `toolsets=[WyrdMcp(client)]`. The tools are discovered from the
-    server's `/mcp` catalog and authenticated as the Agent's client.
-  - Each call is an ordinary MCP tool call, so the server applies that
-    tool's permissions and audit.
-  - The tools available are exactly those in the caller's catalog: read
-    tools always, write tools by scope.
-- **REQ-007: Local and MCP tools compose.**
-  - Local tools and toolsets resolve into one registry and run in one loop.
-  - A duplicate is refused before any model or tool call, never silently
-    shadowed. Names are compared both as catalog names and as the names the
-    provider sees after conversion.
-- **REQ-008: Declared server tool names resolve on the client.**
-  - An Agent with a client resolves every declared tool name it does not
-    serve locally through Wyrd MCP, before any model or tool call (D1b).
-  - A name the client cannot serve fails before any model or tool call, with
-    a stable error naming the tool. Examples are `fs.*` and `code.run`, which
-    need a server workspace.
-
-### Server
-
-- **REQ-009: One contract per tool name.**
-  - A built-in that also appears in the MCP catalog (`cards.*`, `bifrost.*`)
-    keeps one name, one description and one argument schema across both
-    surfaces, as `HostedTools` already does for Cards and Bifrost.
-
-### Cross-surface
-
-- **REQ-010: A full Agent runtime in all three languages.**
-  - Rust, Python and TypeScript each expose REQ-001 and REQ-004 to REQ-008
-    by projecting `wyrd-client`, including:
-    - Prompt construction and loading;
-    - local tools and toolsets;
-    - run results;
-    - stable errors.
-  - No language implements its own gateway transport, MCP client or loop.
-- **REQ-011: `Run.invoke` is replaced, then deleted.**
-  - `Run.invoke` and `Run.invoke_on` are removed from `wyrd-client` and
-    from all three SDKs, with no compatibility alias.
-  - Current callers move to the SDK `Agent` first:
-    - the support-desk examples (Rust, Python, TypeScript);
-    - the gateway-inference journeys;
-    - the local-development journeys.
-  - The deletion happens in this change, only once the replacement journeys
-    pass with correlation preserved (REQ-005).
-  - Hydrated state is unchanged: `state.agent(...)` keeps returning an
-    `AgentCard`. No conversion from `AgentCard` to `Agent` is added.
+- **REQ-012: Remove executable SDK Agents.** Remove public runtime Agent
+  construction and execution from Python, Rust, and TypeScript packages,
+  including native registration, imports, exports, authored typing, generated
+  declarations, and published-package reachability where present. No
+  compatibility alias, private-extension escape hatch, or renamed runtime
+  replacement remains.
+- **REQ-013: Close runtime-only consumers.** Remove SDK helpers whose only
+  purpose is the deleted Agent runtime, including its execution results,
+  local-tool registration, lifecycle callbacks, session-memory interfaces,
+  and mock-provider facilities where exclusively owned by that surface.
+  Inspect actual consumers before deletion: shared observation identifiers,
+  server error contracts, Prompt authoring, and external-framework integration
+  are not runtime-only merely because their names mention agents or sessions.
+  Migrate runtime-dependent examples, documentation, tests, and test utilities
+  to the surviving product boundary; retain meaningful coverage elsewhere.
+- **REQ-014: Preserve declarative and internal Agent capabilities.** Keep
+  `AgentCard`, `AgentSpec`, Agent Card registration/versioning, hydration,
+  Prompt navigation, lineage, verification bindings, and `state.agent(...)`.
+  Keep the internal Skald runtime and Vala/server Agent execution, including
+  existing tool, route, workspace, resource, budget, and cleanup semantics.
+- **REQ-015: Delete Run invocation.** Delete `Run.invoke`
+  and `Run.invoke_on` and every SDK projection of that execution capability.
+  Migrate actual consumers to application-owned execution through existing
+  native gateway APIs or supported external-framework integrations. Do not
+  add `Run.execute`, a new Prompt runner, an SDK Agent, or an equivalent
+  renamed execution convenience.
+- **REQ-016: Preserve correlated application workflows.**
+  Migrated support-desk, gateway-inference, and local-development workflows
+  continue to authenticate as the same caller, target the intended gateway
+  deployment/model, and preserve Run/Card correlation, observations, and
+  verification. Use existing gateway correlation headers and authentication
+  integrations. Preserve gateway denials and server-side subject
+  authorization. Add no new durable correlation state or SDK execution loop.
+- **REQ-017: Preserve supported integrations.** External agents may continue
+  to call Wyrd's gateway and MCP tools and emit traces/observations. Preserve
+  the existing authentication adapters, trace processors, observation scopes,
+  MCP permissions, and framework integration behavior. Removing Wyrd's own
+  runtime does not remove support for observing or verifying other agents.
+- **REQ-018: Publish an accurate product boundary.** Update owning
+  architecture explanations and user documentation to distinguish declarative
+  Agent Cards, internal Verifier execution, and application-owned inference.
+  Replace executable-Wyrd-Agent examples with supported existing surfaces;
+  remove obsolete runtime APIs from published docs and generated surfaces.
 
 ## Invariants
 
 - **INV-001:** Durable behavior stays on the server: gateway authorization,
-  capture, accounting, tool permissions and audit. The client only routes
-  calls to existing server surfaces.
-- **INV-002:** A client Agent never receives a provider credential. Gateway
-  calls carry only the caller's Wyrd token.
-- **INV-003:** Tool permissions are never inferred:
-  - from `gateway:invoke`;
-  - from the Agent declaration;
-  - from holding a client;
-  - from a tool appearing in a catalog.
-- **INV-004:** Tool permission models differ by who acts, and stay that way.
-  - A server-hosted Agent acts on a caller's behalf, so a built-in needs
-    `tool:invoke` and then the domain permission.
-  - A client MCP call is the caller acting directly, so it needs only the
-    domain permission.
-- **INV-005:** Server-controlled execution still refuses a `native` route.
-- **INV-006:** Skald stays Wyrd-agnostic. It sees only `AgentTool` and
-  `WyrdGatewayCaller`.
-- **INV-007:** It works on macOS and Linux, on x86_64 and arm64, with no
-  platform-specific mechanism.
+  capture, accounting, tool permissions and audit. Clients route calls to
+  existing server surfaces.
+- **INV-002:** Gateway calls carry the caller's Wyrd credential; provider
+  credentials remain server-owned and never reach SDK users through Wyrd.
+- **INV-003:** Tool permission is never inferred from gateway access, Agent
+  declarations, holding a client, or catalog visibility.
+- **INV-004:** Server-hosted tools retain delegated `tool:invoke` and domain
+  checks; direct MCP calls retain domain checks as the caller. Audit remains
+  non-blocking and follows the existing server write path.
+- **INV-005:** Server-controlled execution still refuses native routes.
+- **INV-006:** Skald remains independent of Wyrd client/server mechanics;
+  SDK deletion does not move internal execution into a language binding.
+- **INV-007:** Surviving behavior remains portable across macOS/Linux and
+  x86_64/arm64 without platform-specific execution mechanisms.
+- **INV-008:** This change removes public application execution, not Card
+  kinds, persisted Agent contracts, evidence, or server-owned verification.
 
 ## Scope and non-goals
 
-In scope:
-
-- the unified Skald run entry point and lifecycle, including Jev parity;
-- the SDK `Agent` with a client and correlation;
-- the client gateway route;
-- Wyrd MCP as a toolset;
-- a full Agent runtime in Rust and TypeScript;
-- the `Run.invoke` migration and deletion;
-- journeys in all three languages.
+In scope: SDK runtime deletion and its necessary public/native/typing/docs/
+consumer closure; preservation of declarative Agent operations and internal
+Verifier workflows; Run invocation removal and necessary consumer migration.
 
 Out of scope:
 
-- **A public "run this Agent on the server" API.** Wyrd verifies agents and
-  is not a general Agent runtime. Server-hosted Agents stay inside server
-  workflows, which today means Verifiers.
-- **Moving the server's built-in tool binder out of `verification/`.** It
-  stays until a second server consumer exists (D5).
-- **Third-party MCP servers**, including `Mcp` Card registrations, stdio and
-  SSE transports. Only Wyrd's own `/mcp` over Streamable HTTP is in scope.
-- **Exposing `fs.*` or `code.run` over MCP.** They need a server workspace.
-- **Streaming run variants.** Add them when a caller needs one; they must
-  reuse REQ-001's input.
-- Tool approval and per-tool blocks. These belong on `Policy`.
-- Vertex Prompts on a client gateway route. The existing refusal stays.
+- The unified Skald run-input/lifecycle refactor and Jev fixes from revision 2.
+  Internal defects can be addressed separately when required by their owner;
+  they are not justification to rebuild a public SDK Agent.
+- A new public Agent, Runner, Prompt execution API, or general framework.
+- Client MCP toolsets, MCP transport relocation, third-party MCP expansion,
+  new public server Agent execution, or moving the hosted server tool binder.
+- Removing Prompt authoring/loading, Agent Cards, native gateway protocols,
+  external-framework integrations, Wyrd MCP tools, or observational sessions.
+- Persisted/wire migrations, changed permission or audit semantics, provider
+  credential changes, or removing shared public error codes still emitted by
+  the server.
+- Compatibility aliases, deprecation shims, and unrelated package cleanups.
 
 ## Decisions that are expensive to reverse
 
-- **Skald public API:** one run input type replaces two public entry
-  points. Every Skald consumer migrates.
-- **Ownership:**
-  - The authenticated Streamable HTTP MCP client moves from `wyrd-mcp` into
-    `wyrd-client` as `wyrd_client::mcp`, beside `bifrost`. The Wyrd MCP
-    toolset lives there too.
-  - `wyrd-cli` consumes it from `wyrd-client`. This removes the cycle an
-    adapter in `wyrd-mcp` would create, since `wyrd-mcp` depends on
-    `wyrd-client`.
-  - The client tier gains `rmcp`, an MCP client dependency rather than a
-    server-tier one.
-  - The connected Agent and the gateway caller (`PublicWyrdGatewayCaller`)
-    live in `wyrd-client`.
-  - `vala-eval` keeps its `AgentToolset` injection point.
-- **Public SDK surface:**
-  - the `Agent` client parameter and the Rust and TypeScript `connect`
-    forms;
-  - the run subject used for correlation;
-  - the Wyrd MCP toolset;
-  - new stable errors for a declared tool the client cannot serve, a
-    duplicate tool name, and a refused single-call input.
-- **Tool naming:** client MCP tools use the server's catalog names unchanged,
-  so a tool name means the same thing on both sides.
-
-## Resolved decisions
-
-- **D1. How MCP tools attach. Resolved: (a) and (b).**
-  - (a) Explicit composition as a toolset (REQ-006).
-  - (b) Implicit resolution of declared tool names (REQ-008). This is
-    specific to Wyrd, because only Wyrd has registered Agent Cards.
-- **D2. When a client is resolved. Resolved: the shared handle convention.**
-  - Eager `connect` in Rust and TypeScript, and lazy `client=None` in
-    Python (REQ-004).
-  - The Agent introduces no Agent-specific client resolution.
-- **D3. The fate of `Run.invoke`. Resolved: replace, then delete in this
-  change (REQ-011).** No `AgentCard`-to-`Agent` conversion replaces it.
-- **D4. Correlation. Resolved: included (REQ-005).**
-  - Revision 1 deferred it. Deferring would make deleting `Run.invoke` a
-    regression.
-  - `PublicWyrdGatewayCaller::with_subject` already provides the
-    mechanism.
-- **D5. Server tool binder. Resolved: unchanged.**
-  - Revision 1 moved it (the old REQ-006). Without a second consumer, moving
-    it is speculative.
-  - The move also risked dropping code budgets, resource guards and result
-    limits.
-- **D6. Single-call dispatch. Resolved: one lifecycle with explicit
-  rules (REQ-002, REQ-003).**
-  - Letting Jev through the conversation validator is rejected: message
-    rebuilding has no Jev implementation.
-  - A Jev branch inside the conversation entry point is rejected.
-
-Signal that would reopen REQ-001: if Verifier steps need semantics that one
-run input with a Prompt override can't express. Then the fallback is two thin
-entry points over the shared lifecycle, never two lifecycles.
+- Public SDK Agent execution is removed instead of expanded to three languages.
+  Internal Skald/Vala/server behavior remains within its current owners.
+- Runtime-only native and language exports are deleted together, with no
+  alternate public path to the same SDK-owned execution capability.
+- Agent Cards remain declarative and registrable; SDK deletion does not change
+  their wire schema or turn a hydrated Card into a runtime object.
+- **D1 — resolved: delete Run invocation.** The user explicitly rejected
+  retaining the correlated Prompt-execution convenience. Remove both Run
+  invocation methods and their SDK projections. Application code owns
+  inference through existing native gateway APIs and may supply correlation
+  headers. Existing Run identity/scoping and observation behavior are unchanged.
 
 ## Acceptance criteria and evidence
 
-- **AC-001** (REQ-001, REQ-002, REQ-003):
-  - `run_with` and `run_prompt` no longer exist.
-  - The Verifier building-block journeys (`test_verifier_building_blocks.py`
-    and the Rust and TypeScript equivalents) pass unchanged.
-  - The live sweep's native Jev `system_one` case passes through the SDK
-    `Agent`.
-  - Unit tests show:
-    - callbacks fire on single-call dispatch;
-    - a single-call Agent with tools, a session or user text is refused
-      before any model call.
-- **AC-002** (REQ-004, REQ-005, REQ-010): In each of Rust, Python and
-  TypeScript, a journey against a real server and a mock upstream runs an
-  SDK `Agent` on `wyrd_gateway`.
-  - The gateway capture records the caller, and the Run and Agent Card when
-    the run names a subject.
-  - An under-privileged caller gets the gateway's own
-    `WYRD_PERMISSION_403_DENIED_RBAC`.
-- **AC-003** (REQ-006, REQ-007, INV-004): A journey shows an SDK `Agent`
-  that:
-  - calls `cards.get_by_ref` and `bifrost.query` over Wyrd MCP and a local
-    tool in one loop;
-  - fails a tool call cleanly when a caller lacks the tool's domain
-    permission, with the server's code;
-  - is refused before any model or tool call when names collide, including
-    a local `cards_list` against MCP `cards.list`.
-- **AC-004** (REQ-008):
-  - An SDK `Agent` with a client that declares `cards.list` runs it over
-    Wyrd MCP.
-  - One that declares `code.run` is refused before any model or tool call,
-    with the new stable error.
-- **AC-005** (REQ-011):
-  - `Run.invoke` no longer exists in `wyrd-client`, in any SDK stub or in
-    any declaration.
-  - The migrated examples and journeys pass on the SDK `Agent`.
-  - Support-desk still records Run and Card correlation on its gateway
-    calls.
-- **AC-006** (live): Part 3 of the provider sweep (`TASK-005-S1`), for each
-  provider with a key, runs portable and native Prompts, local tools and
-  Wyrd MCP tools through the gateway. It adds:
-  - expected-rejection cases for the settings a model refuses;
-  - closed, nested, nullable and `$ref` tool schemas, and the real built-in
-    descriptors;
-  - Gemini thought-signature replay across tool turns.
-- **Gates:**
-  - `mise run check:deps`:
-    - Skald gains no Wyrd dependency;
-    - client crates gain no server dependency;
-    - `wyrd-client` gains only the `rmcp` client.
-  - `mise run codegen:check` for any wire or error-catalog change.
-  - `py:typecheck` for the stubs.
+- **AC-007** (REQ-012/013): Public packages, native exports, authored stubs,
+  generated declarations, and docs expose no executable Wyrd SDK Agent or
+  runtime-only companion surface. Import/export inspection, language compile/
+  typing checks, package checks, and source-driven regeneration prove absence.
+  Do not create a permanent name-ban check or indiscriminately ban `Agent`.
+- **AC-008** (REQ-014, INV-008): Existing Agent Card registration, hydration,
+  Prompt navigation, and verification journeys retain their behavior across
+  all SDKs. Internal Vala and server Verifier tests continue to cover Agent
+  steps/checks, delegated tools, route restrictions, and workspace guards.
+- **AC-009** (REQ-015/016): Run invocation is absent from
+  every public and native projection. Migrated real-server/mock-upstream
+  support-desk, gateway-inference, and local-development journeys in all three
+  SDKs preserve caller attribution, Run/Card capture, observations,
+  verification, and under-privileged gateway denial. No substitute runtime
+  is introduced to make migration pass.
+- **AC-010** (REQ-017, INV-001–007): Existing external-framework gateway/MCP
+  and telemetry journeys remain valid. Gateway subject headers are captured
+  and authorized and are not forwarded upstream; provider secrets remain
+  server-owned. Existing tenant, permission, audit, and dependency checks
+  remain intact.
+- **AC-011** (REQ-018): Architecture and user documentation describe the
+  surviving boundary consistently. Examples and generated/export artifacts
+  reference supported APIs; owning docs, typing, codegen, package, format,
+  lint, and dependency checks pass for the actual deletion write set.
+
+## Approval and open decisions
+
+Revision 3 is approved by the user's explicit deletion instructions on
+2026-10-16. No material decision remains open. Revision 2's composition task is
+replaced by one deletion task; the previous runtime-expansion plan must not run.
 
 ## Authority
 
-- `architecture/wyrd-design.md`:
-  - §Agent ("host tools + MCP server registrations"; route semantics);
-  - §Verifier "Agents, tools, and workspaces";
-  - §Client model.
-- `architecture/wyrd-doctrine.mdx`: tools are Skald runtime names, not
-  Cards.
-- `AGENTS.md` §2:
-  - MCP is first-class;
-  - the client/server split;
-  - Skald and Vala dependency direction;
-  - Rust, Python and TypeScript are first-class.
-- Reviewed external precedent, from installed sources:
-  - `openai-agents` 0.23.1: `Agent`, `Runner.run`, `RunConfig.model_provider`
-    and `mcp_servers`;
-  - `pydantic-ai-slim` 2.56.0: `Agent.run` and `iter`, `gateway_provider`
-    and `MCPToolset`;
-  - `google-adk` 2.12.0: `LlmAgent`, `Runner.run_async` and `McpToolset`.
+- `architecture/wyrd-design.md`: protocol, Agent/Verifier, and client/server
+  ownership.
+- `architecture/wyrd-doctrine.mdx`: runtime boundary; user code owns inference
+  loops and agent processes; Wyrd owns verification and assurance.
+- `AGENTS.md`: first-class SDKs, ownership, test integrity, and journey coverage.
+- `architecture/references/languages/spec-driven-development.md`: material
+  revisions return to draft and require explicit human approval.
+- `crates/shared/wyrd-client/src/observe/invoke.rs`: current Run execution owner.
+- `docs/src/content/docs/connect/call-wyrd-from-a-stock-client.md`: existing
+  native client and external-agent integration paths.
 
 ## Revision history
 
 | Rev | Status | Change |
 |---|---|---|
+| 3 | approved | User approved SDK Agent deletion and explicitly chose Run invocation deletion. Preserve declarative Cards, internal execution, and correlated application workflows. Replaces revision 2 composition scope with one deletion task. |
+| 2 | approved | Approved by the user on 2026-10-16; requested one implementation task covering the complete change. |
 | 2 | draft | From the independent review and the external SDK review. Changes: one Skald run entry point and lifecycle with explicit single-call dispatch (REQ-001 to REQ-003); eager `connect` in Rust and TypeScript (REQ-004); correlation included (D4); MCP client ownership moved to `wyrd_client::mcp` to avoid a cycle; collisions checked on provider-visible names; the permission difference written as INV-004; server binder move dropped (D5); full Rust and TypeScript runtime (REQ-010); `Run.invoke` deletion gated on replacement journeys (REQ-011); "before IO" changed to "before any model or tool call"; sweep hardening added to AC-006. |
 | 1 | draft | Correlation deferred; D4 dropped as a reversible implementation choice. No open decisions. |
 | 1 | draft | D3 resolved: `Run.invoke` deleted, no AgentCard-to-Agent conversion; REQ-005 reworded to the SDK Agent; D5 opened. |

@@ -17,6 +17,7 @@ from wyrd.testing import WyrdTestServer, cli
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam
+    from wyrd.observe import Run
 
 from .gateway.support import PROVIDER_KEY, calls, deploy
 from .support import (
@@ -46,12 +47,20 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
     )
 
 
-def answer(caller: WyrdClient, state: WyrdState, alias: str, deployment: str) -> str:
-    """Send Agent ``alias``'s rendered Prompt to ``deployment`` as the application's own call."""
-    prompt = state.agent(alias).prompt().prompt
+def answer(caller: WyrdClient, state: WyrdState, run: Run, deployment: str) -> str:
+    """Send ``run``'s Agent's rendered Prompt to ``deployment`` as the application's own call.
+
+    The ``wyrd-run-id`` and ``wyrd-card-uid`` headers tie the gateway's record
+    of the call to ``run`` and its Agent Card.
+    """
+    prompt = state.agent(run.alias).prompt().prompt
     completion = openai_client(caller).chat.completions.create(
         model=f"{deployment}/{prompt.model}",
         messages=cast("list[ChatCompletionMessageParam]", prompt.render(question="hi").messages),
+        extra_headers={
+            "wyrd-run-id": run.run_id,
+            "wyrd-card-uid": str(state.card_ref(run.alias).uid),
+        },
     )
     return completion.choices[0].message.content or ""
 
@@ -204,22 +213,35 @@ def test_agent_prompt_routes(
     caller = client_of(server, key.key)
     state = WyrdState.from_path(bundle, caller)
 
+    expected = []
     for alias in ("agent", "body-agent"):
         declared = state.card(alias).spec["execution_route"]["deployment"]
         assert declared == "openai"
-        assert answer(caller, state, alias, declared) == "hi"
-        assert answer(caller, state, alias, "openai-backup") == "hi"
+        for deployment in (declared, "openai-backup"):
+            run = state.run(alias)
+            assert answer(caller, state, run, deployment) == "hi"
+            expected.append(
+                {
+                    "run_id": run.run_id,
+                    "card_uid": str(state.card_ref(alias).uid),
+                    "sub_principal_id": key.principal_id,
+                    "deployment": deployment,
+                }
+            )
 
     assert [delivery.body["model"] for delivery in upstream.to("/v1/chat/completions")] == [
         "gpt-4o"
     ] * 4
-    assert calls(
-        server,
-        f"sub_principal_id = '{key.principal_id}'",
-        "requested_model.deployment AS deployment",
-    ) == [{"deployment": deployment} for deployment in ("openai", "openai-backup") * 2]
+    assert (
+        calls(
+            server,
+            f"sub_principal_id = '{key.principal_id}'",
+            "run_id, card_uid, sub_principal_id, requested_model.deployment AS deployment",
+        )
+        == expected
+    )
 
     with pytest.raises(openai.PermissionDeniedError) as refused:
-        answer(caller, state, "agent", "openai-granted")
+        answer(caller, state, state.run("agent"), "openai-granted")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert model_calls(upstream) == 4, "the refusal precedes upstream IO"

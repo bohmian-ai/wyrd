@@ -66,6 +66,7 @@ def test_cards_get_returns_every_kind_as_envelope(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
     baseline = register(cards, "cards/latency_baseline/latency-baseline.yaml")["latency-baseline"]
+    daily = register(cards, "cards/scheduled_drift_alerts_operator/daily.yaml")["daily"]
     refs = [
         (CardKind.Data, baseline),
         (CardKind.Model, support_desk["support-model"]),
@@ -73,7 +74,7 @@ def test_cards_get_returns_every_kind_as_envelope(
         (CardKind.Agent, support_desk["support-agent"]),
         (CardKind.Verifier, support_desk["no-refund-promise"]),
         (CardKind.Service, support_desk["support-desk"]),
-        (CardKind.Trigger, support_desk["every-batch"]),
+        (CardKind.Trigger, daily),
         (CardKind.Operator, support_desk["notify-support"]),
     ]
 

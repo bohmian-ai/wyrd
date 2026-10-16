@@ -1,23 +1,21 @@
 //! Agent actions and checks on the shared Skald Agent loop.
 
-use crate::orchestrator_support;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use orchestrator_support::{openai_text_response, structured_prompt, tid};
 use serde_json::{Value, json};
 use skald_prompt::{OpenAiChatOptions, Prompt, ResponseFormat, openai_chat};
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
-    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiToolCall, OpenAiToolFunctionCall,
+    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiToolCall,
+    OpenAiToolFunctionCall,
 };
 use skald_spec::{MediaRef, ProviderName, ProviderResponse};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::time::Instant;
-use vala_eval::blocks::{
+use vala_verify::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall, BlockError,
     CallInput, CallValue, CheckExecutor, EvidenceReader, Position, PromptCardResolver, ToolSession,
 };
@@ -26,8 +24,56 @@ use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, Executi
 use wyrd_spec::card::verifier::{Action, AgentCall, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+
+/// A static Verifier task id.
+fn tid(value: &str) -> TaskId {
+    TaskId::new(value).expect("static task id is valid")
+}
+
+/// A structured judge prompt returning `{"passed": bool}`.
+fn structured_prompt() -> Prompt {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["passed"],
+        "properties": { "passed": { "type": "boolean" } }
+    });
+    openai_chat(
+        "gpt-test",
+        OpenAiChatOptions {
+            messages: vec!["Judge: {{response}}".to_owned()],
+            output: Some(ResponseFormat::json_schema("judge_result", schema).expect("schema")),
+            ..OpenAiChatOptions::default()
+        },
+    )
+    .expect("static prompt is valid")
+}
+
+/// One mocked OpenAI chat completion answering `text`.
+fn openai_text_response(text: &str) -> ProviderResponse {
+    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
+        id: "resp_1".to_owned(),
+        object: "chat.completion".to_owned(),
+        created: 0,
+        model: "gpt-test".to_owned(),
+        choices: vec![OpenAiChatChoice {
+            index: 0,
+            message: OpenAiChatMessage {
+                role: "assistant".to_owned(),
+                content: Some(OpenAiMessageContent::Text(text.to_owned())),
+                ..Default::default()
+            },
+            finish_reason: Some("stop".to_owned()),
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        service_tier: None,
+    })
+}
 
 /// Refuses every registry lookup; the tests author Agents inline.
 struct NoRegistry;
@@ -234,7 +280,7 @@ async fn step(
     executor: &AgentExecutor,
     call: &AgentCall,
     inputs: BTreeMap<String, CallInput>,
-) -> Result<vala_eval::blocks::ActionOutput, BlockError> {
+) -> Result<vala_verify::blocks::ActionOutput, BlockError> {
     let id = tid("summarize");
     let action = Action::Agent(call.clone());
     ActionExecutor::execute(
@@ -259,7 +305,7 @@ async fn check(
     executor: &AgentExecutor,
     call: &AgentCall,
     inputs: BTreeMap<String, CallInput>,
-) -> Result<vala_eval::blocks::CheckOutput, BlockError> {
+) -> Result<vala_verify::blocks::CheckOutput, BlockError> {
     let id = tid("grounded");
     let block = Check::Agent(call.clone());
     CheckExecutor::execute(
@@ -712,7 +758,7 @@ fn busy_and_pending_calls() -> ProviderResponse {
 /// and the pending sibling's future is dropped.
 ///
 /// # Panics
-/// Panics when the execution is not [`vala_eval::blocks::EngineError::Busy`],
+/// Panics when the execution is not [`vala_verify::blocks::EngineError::Busy`],
 /// waits for the step deadline, retries, calls the model again, or leaves
 /// the sibling pending.
 #[tokio::test(start_paused = true)]
@@ -754,10 +800,10 @@ async fn busy_tool_ends_the_agent_step_before_a_pending_sibling() {
     }))
     .expect("Verifier");
     spec.validate().expect("valid Verifier");
-    let engine = vala_eval::blocks::VerificationEngine::new(
+    let engine = vala_verify::blocks::VerificationEngine::new(
         Arc::clone(&executor) as Arc<dyn ActionExecutor>,
         executor as Arc<dyn CheckExecutor>,
-        Arc::new(vala_eval::InMemoryTraceSource::new()),
+        Arc::new(vala_verify::InMemoryTraceSource::new()),
         std::num::NonZeroUsize::new(1).expect("positive"),
     );
     let started = Instant::now();
@@ -775,7 +821,7 @@ async fn busy_tool_ends_the_agent_step_before_a_pending_sibling() {
         .await;
 
     assert!(
-        matches!(refused, Err(vala_eval::blocks::EngineError::Busy(ref reason)) if reason == "no worker"),
+        matches!(refused, Err(vala_verify::blocks::EngineError::Busy(ref reason)) if reason == "no worker"),
         "{refused:?}"
     );
     assert!(

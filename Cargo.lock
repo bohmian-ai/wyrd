@@ -10150,41 +10150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vala-eval"
-version = "0.2.0"
-dependencies = [
- "arrow",
- "async-trait",
- "chrono",
- "jsonpath-rust",
- "jsonschema",
- "regex",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "vala-drift",
- "workspace-hack",
- "wyrd-error-derive",
- "wyrd-semver",
- "wyrd-skald-agent",
- "wyrd-skald-prompt",
- "wyrd-skald-providers",
- "wyrd-skald-runtime",
- "wyrd-skald-spec",
- "wyrd-skald-tool",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
 name = "vala-ingest"
 version = "0.2.0"
 dependencies = [
@@ -10212,6 +10177,34 @@ dependencies = [
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
+]
+
+[[package]]
+name = "vala-verify"
+version = "0.2.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "jsonpath-rust",
+ "jsonschema",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+ "vala-drift",
+ "workspace-hack",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-spec",
 ]
 
 [[package]]
@@ -11394,7 +11387,6 @@ dependencies = [
  "tokio",
  "uuid",
  "vala-bifrost-redux",
- "vala-eval",
  "wiremock",
  "workspace-hack",
  "wyrd-client",
@@ -11641,8 +11633,8 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-drift",
- "vala-eval",
  "vala-sql",
+ "vala-verify",
  "wiremock",
  "workspace-hack",
  "wyrd-auth",
@@ -11983,7 +11975,6 @@ dependencies = [
  "url",
  "uuid",
  "vala-bifrost-redux",
- "vala-eval",
  "vala-sql",
  "wiremock",
  "workspace-hack",

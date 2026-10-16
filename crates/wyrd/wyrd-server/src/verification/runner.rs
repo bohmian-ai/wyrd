@@ -37,7 +37,7 @@ use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::{Empty, display};
-use vala_eval::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::operator::DriftCounts;

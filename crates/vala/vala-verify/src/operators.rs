@@ -21,10 +21,10 @@
 //!
 //! ## Errors
 //!
-//! Type mismatches produce [`EvalExecError::OperatorMismatch`]. Operator
+//! Type mismatches produce [`ExecError::OperatorMismatch`]. Operator
 //! parameters that are well-formed at the wire layer but nonsense at runtime
-//! produce [`EvalExecError::OperatorInvalidConfig`]. Regex compile failure
-//! produces [`EvalExecError::OperatorRegexInvalid`]. Operators never panic.
+//! produce [`ExecError::OperatorInvalidConfig`]. Regex compile failure
+//! produces [`ExecError::OperatorRegexInvalid`]. Operators never panic.
 //!
 //! ## Determinism
 //!
@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use wyrd_spec::vala::eval::operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 
-use crate::error::EvalExecError;
+use crate::error::ExecError;
 
 /// Verdict produced by one operator evaluation.
 ///
@@ -78,7 +78,7 @@ pub fn evaluate_operator(
     left: &Value,
     op: &ComparisonOperator,
     right: &Value,
-) -> Result<OperatorVerdict, EvalExecError> {
+) -> Result<OperatorVerdict, ExecError> {
     use ComparisonOperator::{
         AllOf, AnyOf, ApproximatelyEquals, BetweenPercentiles, Contains, ContainsIgnoreCase,
         CosineSimilarityAtLeast, DivergenceLessThan, EndsWith, Equals, GreaterThan,
@@ -436,7 +436,7 @@ pub fn evaluate_operator(
         } => {
             let l = require_number_left(op, left)?;
             if *std_dev < 0.0 {
-                return Err(EvalExecError::OperatorInvalidConfig {
+                return Err(ExecError::OperatorInvalidConfig {
                     op: op.discriminator().to_string(),
                     message: format!("std_dev must be non-negative, got {std_dev}"),
                 });
@@ -456,7 +456,7 @@ pub fn evaluate_operator(
                 || !(0.0..=1.0).contains(upper_pct)
                 || lower_pct > upper_pct
             {
-                return Err(EvalExecError::OperatorInvalidConfig {
+                return Err(ExecError::OperatorInvalidConfig {
                     op: op.discriminator().to_string(),
                     message: format!(
                         "percentile bounds must satisfy 0 <= lower_pct ({lower_pct}) \
@@ -497,8 +497,8 @@ pub fn evaluate_operator(
     }
 }
 
-fn mismatch(op: &ComparisonOperator, left: &Value, right: &Value) -> EvalExecError {
-    EvalExecError::OperatorMismatch {
+fn mismatch(op: &ComparisonOperator, left: &Value, right: &Value) -> ExecError {
+    ExecError::OperatorMismatch {
         op: op.discriminator().to_string(),
         left_kind: json_kind(left),
         right_kind: json_kind(right),
@@ -542,25 +542,25 @@ fn require_numbers(
     op: &ComparisonOperator,
     left: &Value,
     right: &Value,
-) -> Result<(f64, f64), EvalExecError> {
+) -> Result<(f64, f64), ExecError> {
     match (left.as_f64(), right.as_f64()) {
         (Some(l), Some(r)) => Ok((l, r)),
         _ => Err(mismatch(op, left, right)),
     }
 }
 
-fn require_number_left(op: &ComparisonOperator, left: &Value) -> Result<f64, EvalExecError> {
+fn require_number_left(op: &ComparisonOperator, left: &Value) -> Result<f64, ExecError> {
     left.as_f64()
-        .ok_or_else(|| EvalExecError::OperatorMismatch {
+        .ok_or_else(|| ExecError::OperatorMismatch {
             op: op.discriminator().to_string(),
             left_kind: json_kind(left),
             right_kind: "null",
         })
 }
 
-fn check_range_bounds(op: &ComparisonOperator, min: f64, max: f64) -> Result<(), EvalExecError> {
+fn check_range_bounds(op: &ComparisonOperator, min: f64, max: f64) -> Result<(), ExecError> {
     if min > max {
-        Err(EvalExecError::OperatorInvalidConfig {
+        Err(ExecError::OperatorInvalidConfig {
             op: op.discriminator().to_string(),
             message: format!("range bounds invalid: min ({min}) > max ({max})"),
         })
@@ -573,7 +573,7 @@ fn require_strings<'a>(
     op: &ComparisonOperator,
     left: &'a Value,
     right: &'a Value,
-) -> Result<(&'a str, &'a str), EvalExecError> {
+) -> Result<(&'a str, &'a str), ExecError> {
     match (left.as_str(), right.as_str()) {
         (Some(l), Some(r)) => Ok((l, r)),
         _ => Err(mismatch(op, left, right)),
@@ -583,17 +583,17 @@ fn require_strings<'a>(
 fn require_string_left<'a>(
     op: &ComparisonOperator,
     left: &'a Value,
-) -> Result<&'a str, EvalExecError> {
+) -> Result<&'a str, ExecError> {
     left.as_str()
-        .ok_or_else(|| EvalExecError::OperatorMismatch {
+        .ok_or_else(|| ExecError::OperatorMismatch {
             op: op.discriminator().to_string(),
             left_kind: json_kind(left),
             right_kind: "null",
         })
 }
 
-fn compile_regex(op: &ComparisonOperator, pattern: &str) -> Result<Regex, EvalExecError> {
-    Regex::new(pattern).map_err(|source| EvalExecError::OperatorRegexInvalid {
+fn compile_regex(op: &ComparisonOperator, pattern: &str) -> Result<Regex, ExecError> {
+    Regex::new(pattern).map_err(|source| ExecError::OperatorRegexInvalid {
         op: op.discriminator().to_string(),
         pattern: pattern.to_string(),
         source,
@@ -632,9 +632,9 @@ fn validate_url_lite(s: &str) -> bool {
 fn require_array_left<'a>(
     op: &ComparisonOperator,
     left: &'a Value,
-) -> Result<&'a Vec<Value>, EvalExecError> {
+) -> Result<&'a Vec<Value>, ExecError> {
     left.as_array()
-        .ok_or_else(|| EvalExecError::OperatorMismatch {
+        .ok_or_else(|| ExecError::OperatorMismatch {
             op: op.discriminator().to_string(),
             left_kind: json_kind(left),
             right_kind: "null",
@@ -644,10 +644,10 @@ fn require_array_left<'a>(
 fn require_array_right<'a>(
     op: &ComparisonOperator,
     right: &'a Value,
-) -> Result<&'a Vec<Value>, EvalExecError> {
+) -> Result<&'a Vec<Value>, ExecError> {
     right
         .as_array()
-        .ok_or_else(|| EvalExecError::OperatorMismatch {
+        .ok_or_else(|| ExecError::OperatorMismatch {
             op: op.discriminator().to_string(),
             left_kind: "null",
             right_kind: json_kind(right),
@@ -658,19 +658,19 @@ fn require_arrays<'a>(
     op: &ComparisonOperator,
     left: &'a Value,
     right: &'a Value,
-) -> Result<(&'a Vec<Value>, &'a Vec<Value>), EvalExecError> {
+) -> Result<(&'a Vec<Value>, &'a Vec<Value>), ExecError> {
     match (left.as_array(), right.as_array()) {
         (Some(l), Some(r)) => Ok((l, r)),
         _ => Err(mismatch(op, left, right)),
     }
 }
 
-fn container_length(op: &ComparisonOperator, left: &Value) -> Result<usize, EvalExecError> {
+fn container_length(op: &ComparisonOperator, left: &Value) -> Result<usize, ExecError> {
     match left {
         Value::Array(a) => Ok(a.len()),
         Value::Object(o) => Ok(o.len()),
         Value::String(s) => Ok(s.chars().count()),
-        _ => Err(EvalExecError::OperatorMismatch {
+        _ => Err(ExecError::OperatorMismatch {
             op: op.discriminator().to_string(),
             left_kind: json_kind(left),
             right_kind: "null",
@@ -716,10 +716,10 @@ fn require_vector_pair(
     op: &ComparisonOperator,
     left: &Value,
     right: &Value,
-) -> Result<(Vec<f64>, Vec<f64>), EvalExecError> {
+) -> Result<(Vec<f64>, Vec<f64>), ExecError> {
     let (la, ra) = require_arrays(op, left, right)?;
     if la.len() != ra.len() {
-        return Err(EvalExecError::OperatorInvalidConfig {
+        return Err(ExecError::OperatorInvalidConfig {
             op: op.discriminator().to_string(),
             message: format!(
                 "vector lengths differ: observed {}, expected {}",
@@ -737,10 +737,10 @@ fn require_distribution_pair(
     op: &ComparisonOperator,
     left: &Value,
     right: &Value,
-) -> Result<(Vec<f64>, Vec<f64>), EvalExecError> {
+) -> Result<(Vec<f64>, Vec<f64>), ExecError> {
     let (l, r) = require_vector_pair(op, left, right)?;
     if l.is_empty() {
-        return Err(EvalExecError::OperatorInvalidConfig {
+        return Err(ExecError::OperatorInvalidConfig {
             op: op.discriminator().to_string(),
             message: "distribution vectors must be non-empty".to_string(),
         });
@@ -752,12 +752,12 @@ fn to_float_vec(
     op: &ComparisonOperator,
     values: &[Value],
     side: &str,
-) -> Result<Vec<f64>, EvalExecError> {
+) -> Result<Vec<f64>, ExecError> {
     values
         .iter()
         .map(|v| {
             v.as_f64()
-                .ok_or_else(|| EvalExecError::OperatorInvalidConfig {
+                .ok_or_else(|| ExecError::OperatorInvalidConfig {
                     op: op.discriminator().to_string(),
                     message: format!("{side} vector contains non-numeric entry: {v}"),
                 })
@@ -838,7 +838,7 @@ mod tests {
         let err = evaluate_operator(&json!("seven"), &Op::GreaterThan, &json!(3)).unwrap_err();
         assert!(matches!(
             err,
-            EvalExecError::OperatorMismatch {
+            ExecError::OperatorMismatch {
                 op,
                 left_kind: "string",
                 right_kind: "number",
@@ -872,7 +872,7 @@ mod tests {
             &Value::Null,
         )
         .unwrap_err();
-        assert!(matches!(err, EvalExecError::OperatorInvalidConfig { .. }));
+        assert!(matches!(err, ExecError::OperatorInvalidConfig { .. }));
     }
 
     #[test]
@@ -898,7 +898,7 @@ mod tests {
             &Value::Null,
         )
         .unwrap_err();
-        assert!(matches!(err, EvalExecError::OperatorRegexInvalid { .. }));
+        assert!(matches!(err, ExecError::OperatorRegexInvalid { .. }));
     }
 
     #[test]
@@ -988,7 +988,7 @@ mod tests {
             &Value::Null,
         )
         .unwrap_err();
-        assert!(matches!(err, EvalExecError::OperatorInvalidConfig { .. }));
+        assert!(matches!(err, ExecError::OperatorInvalidConfig { .. }));
     }
 
     #[test]

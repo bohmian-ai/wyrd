@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use monty_pool::PoolError;
-use vala_eval::blocks::{
+use vala_verify::blocks::{
     ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockError,
     CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
     VerificationEngine,

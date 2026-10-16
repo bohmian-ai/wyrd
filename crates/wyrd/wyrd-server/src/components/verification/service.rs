@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use vala_eval::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::auth::{PrincipalId, Sha256Hex};

@@ -22,7 +22,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{ProviderName, ProviderResponse};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use vala_eval::blocks::{
+use vala_verify::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockError, CallInput, CallValue,
     CheckExecutor, DriftChecks, EngineError, EvidenceReader, Position, PromptCardResolver,
 };

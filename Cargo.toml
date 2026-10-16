@@ -45,7 +45,7 @@ vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux" }
 vala-sql = { path = "crates/vala/vala-sql", version = "0.2.0" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.2.0" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.2.0" }
-vala-eval = { path = "crates/vala/vala-eval", version = "0.2.0" }
+vala-verify = { path = "crates/vala/vala-verify", version = "0.2.0" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.2.0" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.2.0" }
 wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.2.0" }

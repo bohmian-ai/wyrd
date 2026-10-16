@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use base64::Engine as _;
 use skald_spec::{MediaFormat, MediaRef, MediaSource};
-use vala_eval::blocks::{
+use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
 use wyrd_spec::auth::Sha256Hex;
@@ -534,7 +534,7 @@ mod pg_tests {
 
     use std::future::Future;
 
-    use vala_eval::blocks::{CallInput, Position};
+    use vala_verify::blocks::{CallInput, Position};
     use wyrd_spec::vala::eval::TaskId;
 
     use super::*;

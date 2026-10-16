@@ -45,13 +45,13 @@ use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EvidenceReader, Position,
 };
-use crate::context::extract_jsonpath_from;
-use crate::error::EvalExecError;
-use crate::executor::{Prepared, RunLedger, walk};
+use crate::jsonpath::extract_jsonpath_from;
+use crate::error::ExecError;
+use crate::walk::{Prepared, RunLedger, walk};
 use crate::operators;
-use crate::results::capture_actual;
-use crate::tasks::assertion::{Compared, evaluate_item_mode, evaluate_single};
-use crate::tasks::trace::project_spans;
+use crate::assertion::capture_actual;
+use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
+use crate::trace_source::project_spans;
 use crate::trace_source::TraceSource;
 
 /// An execution-wide failure: no verdict was produced.
@@ -65,7 +65,7 @@ pub enum EngineError {
     DeadlineExceeded,
     /// A requirement's actual value could not be captured.
     #[error("a requirement actual value cannot be captured: {0}")]
-    Capture(#[from] EvalExecError),
+    Capture(#[from] ExecError),
     /// A block task panicked or was aborted.
     #[error("a verification block task stopped unexpectedly: {0}")]
     Join(String),
@@ -783,7 +783,7 @@ impl Judged {
 
     /// A deterministic comparison: passed or failed, or inconclusive when the
     /// values cannot be compared.
-    fn compared(compared: Result<Compared, EvalExecError>) -> Self {
+    fn compared(compared: Result<Compared, ExecError>) -> Self {
         match compared {
             Ok((passed, actual, _, message)) => {
                 let outcome = if passed {

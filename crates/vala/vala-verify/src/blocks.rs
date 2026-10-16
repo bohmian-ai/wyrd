@@ -4,7 +4,7 @@
 //! an [`ActionExecutor`] (steps, which produce data) or a [`CheckExecutor`]
 //! (requirement checks, which produce a [`Verdict`]). Executors receive
 //! values, never references, and return outputs rather than writing shared
-//! state, mirroring [`crate::TaskExecutor`].
+//! state, mirroring the stage walk.
 //!
 //! The engine owns the deadline and cancellation: it races each call against
 //! [`BlockCall::deadline`] and drops the future to cancel it, so an executor

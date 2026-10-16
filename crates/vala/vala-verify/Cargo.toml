@@ -1,12 +1,12 @@
 [package]
-name = "vala-eval"
+name = "vala-verify"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-description = "In-memory eval engine: DAG-stage execution, operator runtime, scoring, aggregation, and comparison over the wyrd-spec eval contract."
+description = "The Verifier engine: building-block steps, requirement checks, operator runtime, and the decide rule over the wyrd-spec verification contract."
 
 [lib]
 path = "src/lib.rs"
@@ -18,10 +18,8 @@ chrono = { workspace = true }
 jsonpath-rust = { workspace = true }
 jsonschema = { workspace = true }
 regex = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 skald-agent = { workspace = true }
 skald-prompt = { workspace = true }
@@ -34,17 +32,12 @@ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macr
 tracing = { workspace = true }
 uuid = { workspace = true }
 vala-drift = { workspace = true }
-wyrd-error-derive = { workspace = true }
 wyrd-spec = { workspace = true }
-wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-wyrd-semver = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }
-tokio-util = { workspace = true }
 
 [lints]
 workspace = true

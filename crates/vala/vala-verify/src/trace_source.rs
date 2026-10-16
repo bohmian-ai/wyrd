@@ -4,14 +4,15 @@
 //! injects a [`TraceSource`], and that source decides whether spans live in an
 //! in-memory capture buffer, an archive reader, or a future server-backed store.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use wyrd_spec::vala::ids::TraceId;
+use serde_json::Value;
 use wyrd_spec::vala::trace::SpanRecord;
 
 /// Failure returned by a trace source when spans cannot be supplied yet or at
@@ -104,42 +105,31 @@ impl TraceSource for InMemoryTraceSource {
     }
 }
 
-/// Scripted trace source for executor tests.
-pub struct MockTraceSource {
-    scripted: Mutex<VecDeque<Result<Arc<Vec<SpanRecord>>, TraceUnavailable>>>,
-    seen: Mutex<Vec<(TraceId, Duration)>>,
+/// Project a trace's spans into the JSON document span selectors read.
+///
+/// Read by Verifier `trace` checks.
+pub(crate) fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
+    let projected: Vec<Value> = spans.iter().map(project_one).collect();
+    serde_json::json!({
+        "trace_id": trace_id.to_hex(),
+        "spans": projected,
+    })
 }
 
-impl MockTraceSource {
-    /// Build a mock source from scripted fetch results.
-    #[must_use]
-    pub fn new<I>(scripted: I) -> Self
-    where
-        I: IntoIterator<Item = Result<Arc<Vec<SpanRecord>>, TraceUnavailable>>,
-    {
-        Self {
-            scripted: Mutex::new(scripted.into_iter().collect()),
-            seen: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Return fetch calls observed by the mock.
-    pub async fn calls(&self) -> Vec<(TraceId, Duration)> {
-        self.seen.lock().await.clone()
-    }
-}
-
-#[async_trait]
-impl TraceSource for MockTraceSource {
-    async fn fetch(
-        &self,
-        trace_id: TraceId,
-        deadline: Duration,
-    ) -> Result<Arc<Vec<SpanRecord>>, TraceUnavailable> {
-        self.seen.lock().await.push((trace_id, deadline));
-        match self.scripted.lock().await.pop_front() {
-            Some(result) => result,
-            None => Err(TraceUnavailable::NotFound { trace_id }),
-        }
-    }
+/// Project one span into its selector document.
+fn project_one(span: &SpanRecord) -> Value {
+    serde_json::json!({
+        "trace_id": span.trace_id.to_hex(),
+        "span_id": span.span_id.to_hex(),
+        "parent_span_id": span.parent_span_id.map(|id| id.to_hex()),
+        "name": &span.name,
+        "kind": &span.kind,
+        "start_time": span.start_time,
+        "end_time": span.end_time,
+        "duration_ms": span.duration_ms,
+        "status": &span.status,
+        "attributes": &span.attributes,
+        "events": &span.events,
+        "links": &span.links,
+    })
 }

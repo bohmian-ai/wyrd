@@ -10,13 +10,61 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::{Barrier, Notify};
+use chrono::TimeZone as _;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
+use wyrd_spec::vala::trace::{
+    InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus,
+};
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::execution::Verdict;
 
 use super::*;
 use crate::InMemoryTraceSource;
-use crate::tasks::trace::trace_executor::span;
+
+/// One finished one-second span named `name` in `trace`.
+fn span(trace: TraceId, span: SpanId, name: &str) -> SpanRecord {
+    let start_time = chrono::Utc
+        .with_ymd_and_hms(2026, 6, 10, 12, 0, 0)
+        .single()
+        .expect("static timestamp is valid");
+    let end_time = chrono::Utc
+        .with_ymd_and_hms(2026, 6, 10, 12, 0, 1)
+        .single()
+        .expect("static timestamp is valid");
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("gen_ai.system".to_owned(), json!("wyrd-test"));
+    SpanRecord {
+        trace_id: trace,
+        span_id: span,
+        parent_span_id: None,
+        flags: 0,
+        trace_state: String::new(),
+        name: name.to_owned(),
+        kind: SpanKind::Internal,
+        start_time,
+        end_time,
+        duration_ms: 1000,
+        status: SpanStatus::Ok,
+        attributes,
+        dropped_attributes_count: 0,
+        events: Vec::new(),
+        dropped_events_count: 0,
+        links: Vec::new(),
+        dropped_links_count: 0,
+        scope: InstrumentationScope {
+            name: "vala-verify-test".to_owned(),
+            version: None,
+            attributes: serde_json::Map::new(),
+        },
+        resource: Resource {
+            service_name: "verify-test".to_owned(),
+            service_namespace: None,
+            service_version: None,
+            service_instance_id: None,
+            attributes: serde_json::Map::new(),
+        },
+    }
+}
 
 /// What a scripted block does when called.
 enum Behavior {
@@ -284,7 +332,6 @@ async fn no_step_verifier_judges_inputs_and_traces() {
                 trace,
                 SpanId::from_hex("b7ad6b7169203331").expect("span id"),
                 "retrieve",
-                "s",
             )],
         )
         .await;
@@ -362,7 +409,7 @@ async fn context_capture_hashes_or_redacts_actual_values() {
         (
             "hash",
             Some(Value::String(
-                crate::results::capture_actual(Some(json!(4)), EvalContextCapture::Hash)
+                crate::assertion::capture_actual(Some(json!(4)), EvalContextCapture::Hash)
                     .expect("hash")
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .expect("digest"),

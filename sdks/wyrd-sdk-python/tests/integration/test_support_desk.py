@@ -128,7 +128,7 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
             viewing = WyrdState.from_path(bundle, viewer)
             with pytest.raises(openai.PermissionDeniedError) as denied:
                 desk_example.answer(
-                    desk_example.gateway(viewer),
+                    desk_example.gateway_client(viewer),
                     viewing,
                     viewing.run("agent"),
                     "Where is order 1?",

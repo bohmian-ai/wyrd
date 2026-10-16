@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import openai
 from opentelemetry import trace
@@ -34,6 +34,9 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.observe import Run
 from wyrd.state import WyrdState
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageParam
 
 REQUESTS = 100
 """How many requests ``serve`` answers; every tenth asks for a refund."""
@@ -76,7 +79,7 @@ def policy_check(answer: str) -> dict[str, Any]:
     return {"answer": answer, "policy": verify.File(SERVICE / "refund-policy.pdf")}
 
 
-def gateway(client: WyrdClient) -> openai.OpenAI:
+def gateway_client(client: WyrdClient) -> openai.OpenAI:
     """An OpenAI client for the Wyrd gateway that authenticates as ``client``.
 
     ``http_auth`` replaces the placeholder key with a fresh Wyrd access token on
@@ -106,7 +109,7 @@ def answer(gateway: openai.OpenAI, state: WyrdState, run: Run, asked: str) -> st
     headers = {"wyrd-run-id": run.run_id, "wyrd-card-uid": str(state.card_ref("agent").uid)}
     completion = gateway.chat.completions.create(
         model=f"{deployment}/{prompt.model}",
-        messages=prompt.render(question=asked).messages,
+        messages=cast("list[ChatCompletionMessageParam]", prompt.render(question=asked).messages),
         extra_headers=headers,
     )
     return completion.choices[0].message.content or ""
@@ -135,7 +138,7 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
             f"the support Agent's model {route} is not deployed; configure a gateway "
             f"provider deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
         )
-    return Desk(receipt, state, gateway(client))
+    return Desk(receipt, state, gateway_client(client))
 
 
 def question(index: int) -> str:

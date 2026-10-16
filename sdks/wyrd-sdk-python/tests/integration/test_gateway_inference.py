@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import openai
 import pytest
@@ -13,6 +14,9 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageParam
 
 from .gateway.support import PROVIDER_KEY, calls, deploy
 from .support import (
@@ -46,7 +50,8 @@ def answer(caller: WyrdClient, state: WyrdState, alias: str, deployment: str) ->
     """Send Agent ``alias``'s rendered Prompt to ``deployment`` as the application's own call."""
     prompt = state.agent(alias).prompt().prompt
     completion = openai_client(caller).chat.completions.create(
-        model=f"{deployment}/{prompt.model}", messages=prompt.render(question="hi").messages
+        model=f"{deployment}/{prompt.model}",
+        messages=cast("list[ChatCompletionMessageParam]", prompt.render(question="hi").messages),
     )
     return completion.choices[0].message.content or ""
 

@@ -242,9 +242,10 @@ Commits `178129c6c`..`c2d0db662` on `change/agent-runtime-composition`.
 
 Retired tests and assertions (sole contract was the deleted API):
 `tests/unit/runtime/agent/`, `test_callbacks.py`, `test_session.py`,
-`test_validate_registrable.py`, the opt-in live smoke
-`tests/smoke/test_prompt_live_providers.py` (its execution vehicle was the
-runtime Agent; no live-provider replacement), the Rust examples
+`test_validate_registrable.py`, the live smoke's local-tool-loop case and
+its AgentRun result/iteration/callback assertions (TASK-001-R1 restored the
+other 17 cases of `tests/smoke/test_prompt_live_providers.py` as rendered
+native requests sent straight to each provider), the Rust examples
 `agent_smoke`/`agent_openai` and Python `agent_smoke`/`structured_pipeline`,
 `wyrd-client` `gateway_caller` and `local_development::cli_gateway_agents`
 (the Rust child of the Python CLI journey, with its native-route trap), the

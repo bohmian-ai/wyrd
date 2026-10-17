@@ -1245,7 +1245,6 @@ bound subject:
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
     runs_on?: InlineableRef<TriggerSpec>     # schedule; absent means caller-driven only
-    inputs?: { <samples slot>: { features: [name] } | { metric: name } }
     on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
 ```
 
@@ -1255,8 +1254,10 @@ and Operator Cards may be reused by any number of bindings. Registration
 UID-pins every referenced Verifier, Trigger, and Operator, and rejects
 unresolved, wrong-kind, unauthorized, and cross-tenant references, duplicate
 bindings to the same Verifier version for one subject, `workflow` in
-`on_failure`, and a schedule binding whose `inputs` cannot fill every required
-`samples` slot. The runtime direction is fixed:
+`on_failure`, and a schedule binding to a Verifier without `samples` slots.
+A binding has no `inputs`: a scheduled execution judges every drift
+requirement of the pinned Verifier from the samples recorded under each
+`samples` slot's own `features`, and every `samples` slot is required. The runtime direction is fixed:
 
 ```text
 verify ───────────────► execute inline ─► VerificationResult (no dispatch)
@@ -1597,8 +1598,8 @@ spec:
 
 `schedule` is the only automatic activation. Each due occurrence creates one
 execution per active binding over that binding's subject window
-`[previous boundary, due)`, filling `samples` slots from the binding's
-`inputs` map. Missed occurrences are skipped, not backfilled. A Trigger never
+`[previous boundary, due)`, filling each `samples` slot from its own
+`features`. Missed occurrences are skipped, not backfilled. A Trigger never
 fires on its own: nothing runs merely because a Trigger Card is registered,
 and one schedule occurrence shared by two subjects creates two subject-scoped
 executions, never one mixed-subject execution.

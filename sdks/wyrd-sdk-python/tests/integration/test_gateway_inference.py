@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import openai
 import pytest
-from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageParam
+    from wyrd.observe import Run
 
 from .gateway.support import PROVIDER_KEY, calls, deploy
 from .support import (
@@ -41,6 +45,24 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
     return openai.OpenAI(
         base_url=f"{caller.server_url}/v1", api_key=caller.access_token(), max_retries=0
     )
+
+
+def answer(caller: WyrdClient, state: WyrdState, run: Run, deployment: str) -> str:
+    """Send ``run``'s Agent's rendered Prompt to ``deployment`` as the application's own call.
+
+    The ``wyrd-run-id`` and ``wyrd-card-uid`` headers tie the gateway's record
+    of the call to ``run`` and its Agent Card.
+    """
+    prompt = state.agent(run.alias).prompt().prompt
+    completion = openai_client(caller).chat.completions.create(
+        model=f"{deployment}/{prompt.model}",
+        messages=cast("list[ChatCompletionMessageParam]", prompt.render(question="hi").messages),
+        extra_headers={
+            "wyrd-run-id": run.run_id,
+            "wyrd-card-uid": str(state.card_ref(run.alias).uid),
+        },
+    )
+    return completion.choices[0].message.content or ""
 
 
 @pytest.fixture
@@ -188,33 +210,38 @@ def test_agent_prompt_routes(
     key = cli.issue_key(
         kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
     )
-    state = WyrdState.from_path(bundle, client_of(server, key.key))
-    backup = {"kind": "wyrd_gateway", "deployment": "openai-backup"}
+    caller = client_of(server, key.key)
+    state = WyrdState.from_path(bundle, caller)
 
+    expected = []
     for alias in ("agent", "body-agent"):
-        run = state.run(alias)
-        assert run.invoke({"question": "hi"}) == "hi"
-        assert run.invoke({"question": "hi"}, route=backup) == "hi"
-        assert state.card(alias).spec["execution_route"] == {
-            "kind": "wyrd_gateway",
-            "deployment": "openai",
-        }, "an override never changes the declared route"
+        declared = state.card(alias).spec["execution_route"]["deployment"]
+        assert declared == "openai"
+        for deployment in (declared, "openai-backup"):
+            run = state.run(alias)
+            assert answer(caller, state, run, deployment) == "hi"
+            expected.append(
+                {
+                    "run_id": run.run_id,
+                    "card_uid": str(state.card_ref(alias).uid),
+                    "sub_principal_id": key.principal_id,
+                    "deployment": deployment,
+                }
+            )
 
     assert [delivery.body["model"] for delivery in upstream.to("/v1/chat/completions")] == [
         "gpt-4o"
     ] * 4
-    assert calls(
-        server,
-        f"sub_principal_id = '{key.principal_id}'",
-        "requested_model.deployment AS deployment",
-    ) == [{"deployment": deployment} for deployment in ("openai", "openai-backup") * 2]
-
-    with pytest.raises(WyrdError) as refused:
-        state.run("agent").invoke(
-            {"question": "hi"}, route={"kind": "wyrd_gateway", "deployment": "openai-granted"}
+    assert (
+        calls(
+            server,
+            f"sub_principal_id = '{key.principal_id}'",
+            "run_id, card_uid, sub_principal_id, requested_model.deployment AS deployment",
         )
+        == expected
+    )
+
+    with pytest.raises(openai.PermissionDeniedError) as refused:
+        answer(caller, state, state.run("agent"), "openai-granted")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    with pytest.raises(WyrdError) as malformed:
-        state.run("agent").invoke({"question": "hi"}, route={"kind": "elsewhere"})
-    assert malformed.value.code == "WYRD_SPEC_400_VALIDATION"
-    assert model_calls(upstream) == 4, "both refusals precede upstream IO"
+    assert model_calls(upstream) == 4, "the refusal precedes upstream IO"

@@ -19,20 +19,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 wyrd-spec = { workspace = true }
-pyo3 = { workspace = true, optional = true }
-
-[features]
-default = []
-python = ["dep:pyo3", "dep:wyrd-utils", "dep:wyrd-runtime"]
-
-[dependencies.wyrd-utils]
-workspace = true
-optional = true
-features = ["python"]
-
-[dependencies.wyrd-runtime]
-workspace = true
-optional = true
 
 [dev-dependencies]
 workspace-hack.workspace = true

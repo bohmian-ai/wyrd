@@ -16,6 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import openai
 import pytest
 from wyrd import WyrdError
 from wyrd.bifrost import TableConfig
@@ -124,9 +125,13 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
                 credential=server.bootstrap_service(["viewer"], name="desk-viewer"),
                 grpc_url=server.grpc_url,
             )
-            with pytest.raises(WyrdError) as denied:
-                WyrdState.from_path(bundle, viewer).run("agent").invoke(
-                    {"question": "Where is order 1?"}
+            viewing = WyrdState.from_path(bundle, viewer)
+            with pytest.raises(openai.PermissionDeniedError) as denied:
+                desk_example.answer(
+                    desk_example.gateway_client(viewer),
+                    viewing,
+                    viewing.run("agent"),
+                    "Where is order 1?",
                 )
             assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
             assert recorded.deliveries == [], "the refusal precedes upstream IO"
@@ -143,6 +148,13 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
 
             served = desk_example.serve(desk)
             assert len(served) == desk_example.REQUESTS
+            leaked = {
+                name
+                for delivery in recorded.deliveries
+                for name in delivery.headers
+                if name.lower().startswith(("wyrd-", "x-wyrd"))
+            }
+            assert leaked == set(), "Wyrd correlation and credentials stay out of the upstream"
             results = desk_example.wait_for_verdicts(admin, served, timeout=180)
             for index, result in enumerate(results):
                 refund = "refund" in desk_example.question(index)

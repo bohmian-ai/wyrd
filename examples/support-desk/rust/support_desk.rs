@@ -5,7 +5,8 @@
 //! [`deploy`] registers the checked-in Cards under `service/`, which ensures
 //! the declared `vala.datasets.tickets` table, turns on metadata capture, and
 //! checks the Agent's model is deployed. [`serve`] answers every question in
-//! its own Agent Run and submits each answer for a background policy check.
+//! its own Agent Run with [`answer`], which calls the model through the Wyrd
+//! gateway, and submits each answer for a background policy check.
 //! [`wait_for_verdicts`] resumes each check from its execution ID alone and
 //! waits for its result, [`check`] judges one answer immediately, and
 //! [`explain`] joins one Run's evidence over MCP.
@@ -19,6 +20,7 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
+use wyrd_ai::observe::Run;
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
@@ -164,13 +166,76 @@ pub fn question(index: usize) -> String {
     }
 }
 
-/// Answer [`REQUESTS`] questions, each in its own Agent Run inside a
-/// `support-desk.request` span: invoke the Agent through the gateway, record
-/// the ticket, and submit the answer for a background `policy-check` without
-/// waiting for it. Telemetry and tickets are flushed on return.
+/// The total budget of one gateway model call, from connecting through the
+/// last byte of the reply.
+const ANSWER_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Answer `question` as `run`'s Agent through the Wyrd gateway.
+///
+/// Renders the Agent's Prompt with `question`, sends it to the
+/// OpenAI-compatible gateway ingress as `<deployment>/<model>` with the
+/// state's access token, and tags the call with the Run and Agent Card so
+/// the gateway's capture, accounting, and audit join the Run's evidence.
+/// The whole exchange, through reading the reply body, is bounded by
+/// [`ANSWER_TIMEOUT`].
 ///
 /// # Errors
-/// Returns the first refused step.
+/// Returns the Prompt render error when it does not bind `question`, a token
+/// failure, a transport failure or timeout, an undecodable reply, an error
+/// when the Agent does not route through the gateway or the reply carries no
+/// text, and the gateway's refusal, whose body carries its stable Wyrd code
+/// such as `WYRD_PERMISSION_403_DENIED_RBAC`.
+///
+/// # Cancellation
+/// Dropping the future or a transport error after the request is sent leaves
+/// the remote outcome unknown: the gateway may still have dispatched, billed,
+/// and captured the call. Nothing retries or deduplicates it.
+pub async fn answer(state: &WyrdState, run: &Run, question: &str) -> Result<String, Error> {
+    let agent = state.agent(run.alias())?;
+    let ExecutionRoute::WyrdGateway { deployment } = &agent.card().spec.execution_route else {
+        return Err("the support Agent does not route through the Wyrd gateway".into());
+    };
+    let prompt = &agent.prompt().metadata.prompt;
+    let mut body = serde_json::to_value(prompt.render(&[("question", question)])?)?["body"].take();
+    body["model"] = json!(format!("{deployment}/{}", prompt.model));
+    let client = state.client()?;
+    let reply = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", client.server_url()))
+        .bearer_auth(client.access_token().await?.expose())
+        .header("wyrd-run-id", run.run_id().as_str())
+        .header("wyrd-card-uid", run.subject_uid().as_str())
+        .json(&body)
+        .timeout(ANSWER_TIMEOUT)
+        .send()
+        .await?;
+    let status = reply.status();
+    let reply: Value = reply.json().await?;
+    if !status.is_success() {
+        return Err(format!("the gateway refused the call with {status}: {reply}").into());
+    }
+    Ok(reply["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("the gateway reply carries no text")?
+        .to_owned())
+}
+
+/// Answer [`REQUESTS`] questions, each in its own Agent Run inside a
+/// `support-desk.request` span: [`answer`] through the gateway, record
+/// the ticket, and submit the answer for a background `policy-check` without
+/// waiting for it. Telemetry and tickets are flushed on return only when
+/// every request succeeds.
+///
+/// # Errors
+/// Returns the first refused step: a Bifrost or telemetry start failure, an
+/// [`answer`] error, a ticket record or check submission refusal, or a
+/// shutdown failure. On an error it returns without shutting telemetry or
+/// Bifrost down, so this call does not flush their buffered records.
+///
+/// # Cancellation
+/// Requests run in order and nothing is rolled back. On an error or a dropped
+/// future, earlier requests keep their gateway calls, tickets, and queued
+/// checks. The failing request's model call may have completed with no ticket
+/// or check recorded for it. Nothing replays the remaining requests.
 pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
     let state = &desk.state;
     state.start_bifrost().await?;
@@ -180,7 +245,7 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
         let run = state.run_for_card("agent")?;
         let question = question(index);
         let request = async {
-            let answer = run.invoke(&[("question", &question)]).await?;
+            let answer = answer(state, &run, &question).await?;
             let observe = run.observe();
             observe
                 .record(
@@ -197,11 +262,12 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
                 .submit("policy-check", policy_check(&answer))
                 .await?
             {
-                Submission::Queued(execution) => Ok(*execution.id()),
+                Submission::Queued(execution) => Ok::<_, Error>(*execution.id()),
                 Submission::Recorded => Err(WyrdError::Internal {
                     message: "policy-check judges Run evidence, not a window".to_owned(),
                     details: json!({ "verifier": "policy-check" }),
-                }),
+                }
+                .into()),
             }
         };
         let execution_id = run

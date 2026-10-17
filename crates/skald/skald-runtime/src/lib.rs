@@ -10,8 +10,6 @@ pub mod dispatch;
 pub mod error;
 pub mod mock;
 pub mod provider;
-#[cfg(feature = "python")]
-pub mod python;
 pub mod runtime;
 
 pub use dispatch::{dispatch, dispatch_stream};
@@ -20,6 +18,4 @@ pub use mock::{MockExchange, MockExpectation, MockProvider};
 pub use provider::{
     Provider, ProviderRegistry, default_registry, refresh_default_registry_from_env,
 };
-#[cfg(feature = "python")]
-pub use python::python_register;
 pub use runtime::{RuntimeConfig, SkaldRuntime};

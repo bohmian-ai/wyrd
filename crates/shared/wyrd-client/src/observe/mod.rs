@@ -16,7 +16,6 @@
 //! into three projections.
 
 pub mod drift;
-mod invoke;
 pub mod lifecycle;
 #[cfg(test)]
 mod tests;

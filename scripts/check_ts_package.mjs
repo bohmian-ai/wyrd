@@ -88,6 +88,7 @@ async function walkFiles(root) {
 }
 
 const rootAllowed = new Set([
+  "README.md",
   "dist/card-types.d.ts",
   "dist/card-types.js",
   "dist/cli.d.ts",

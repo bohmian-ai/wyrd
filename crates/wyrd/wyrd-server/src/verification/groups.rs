@@ -108,7 +108,9 @@ impl GroupPoller {
     ///
     /// Discovery reads at most [`GROUPS_PER_POLL`] candidates; each candidate
     /// is skipped when it is not yet due, has an outstanding group execution,
-    /// or is already covered by the latest one. A candidate whose rows exceed
+    /// or is already covered by the latest one. Rows of a submission the
+    /// queue refused, such as an idempotency conflict, are not source rows
+    /// and are dropped before the end is judged. A candidate whose rows exceed
     /// [`ROWS_PER_GROUP`] is logged and skipped. The caller commits the
     /// returned enqueues together with the binding's advanced cursor.
     ///
@@ -154,11 +156,14 @@ impl GroupPoller {
         };
         let mut enqueued = Vec::new();
         for group in poll.candidates().await? {
-            let rows = poll.identities(&group).await?;
+            let mut rows = poll.identities(&group).await?;
             if rows.len() > ROWS_PER_GROUP {
                 tracing::warn!(binding_id = %due.binding_id, group_id = %group, "group exceeds its source row bound; not judged");
                 continue;
             }
+            let ids: Vec<ExecutionId> = rows.iter().map(|row| row.execution_id).collect();
+            let refused = queue.refused_submissions(conn, &ids).await?;
+            rows.retain(|row| !refused.contains(&row.execution_id));
             let Some(ended) = Ended::judge(&rows, &due.settings, due.clock) else {
                 continue;
             };

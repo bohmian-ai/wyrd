@@ -16,7 +16,7 @@
 //! reclaimed affects zero rows and observes [`Settlement::StaleLease`].
 // raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 
 use chrono::{DateTime, Duration, Utc};
@@ -251,6 +251,16 @@ const SELECTED_RESULTS_SQL: &str = r"
     SELECT execution_id, result_id
       FROM wyrd.verifier_executions
      WHERE execution_id = ANY($1)
+";
+
+/// The submissions among `$1` the queue writer settled `errored` without
+/// accepting them: an idempotency conflict or a refused target, never
+/// claimed.
+const REFUSED_SUBMISSIONS_SQL: &str = r"
+    SELECT execution_id
+      FROM wyrd.verifier_executions
+     WHERE execution_id = ANY($1) AND origin = 'manual'
+       AND status = 'errored' AND attempts = 0
 ";
 
 /// The settled group result admitted immediately before execution `$1` for
@@ -1704,6 +1714,30 @@ impl VerifierExecutionQueue {
                         .transpose()?,
                 ))
             })
+            .collect()
+    }
+
+    /// The executions among `executions` whose staged submission the queue
+    /// writer refused: settled `errored` on acceptance for an idempotency
+    /// conflict or an unavailable target, so they never ran and their staged
+    /// inputs are no execution's evidence. Accepted, direct, and not yet
+    /// accepted executions are absent.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored identity is malformed.
+    pub async fn refused_submissions(
+        &self,
+        conn: &mut TenantConn<'_>,
+        executions: &[ExecutionId],
+    ) -> Result<BTreeSet<ExecutionId>, SqlxError> {
+        let ids: Vec<Uuid> = executions.iter().map(ExecutionId::as_uuid).collect();
+        let rows: Vec<Uuid> = sqlx::query_scalar(REFUSED_SUBMISSIONS_SQL)
+            .bind(ids)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        rows.into_iter()
+            .map(|execution| stored(ExecutionId::new(execution)))
             .collect()
     }
 

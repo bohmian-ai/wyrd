@@ -21,6 +21,8 @@ use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_ai::verify::Execution;
 use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
 use wyrd_spec::ids::BindingId;
+use wyrd_spec::verification::VerificationExecutionStatus;
+use wyrd_spec::verification::execution::VerificationExecutionState;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
@@ -365,6 +367,45 @@ impl Deployment {
         .wait(timeout)
         .await
         .expect("the retained result reads")
+    }
+
+    /// The newest completed execution of group `binding` other than `after`,
+    /// read as the administrator: publish captured rows so the group poller
+    /// discovers them, then read the binding's `last_execution_id` and its
+    /// execution state until that execution completes with a result.
+    ///
+    /// # Panics
+    /// Panics when no such execution completes within `timeout` or a read
+    /// fails.
+    pub async fn group_execution(
+        &self,
+        binding: &BindingId,
+        after: Option<&ExecutionId>,
+        timeout: Duration,
+    ) -> VerificationExecutionState {
+        let admin = self.admin();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.server.flush_bifrost().await.expect("rows publish");
+            let latest = self.binding_status(binding).await.last_execution_id;
+            if let Some(id) = latest.filter(|id| Some(id) != after) {
+                let state = Execution::connect_with(id, &admin)
+                    .await
+                    .expect("the execution handle connects")
+                    .status()
+                    .await
+                    .expect("the execution reads");
+                if state.status == VerificationExecutionStatus::Completed && state.result.is_some()
+                {
+                    return state;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "group binding {binding} completed no new execution within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Stop the server.

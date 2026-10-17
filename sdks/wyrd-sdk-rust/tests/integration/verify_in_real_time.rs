@@ -15,19 +15,20 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::CardRef;
+use wyrd_ai::cards::{CardRef, CardSelector, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
-    VerificationVerdict, WyrdClient, WyrdError, cli,
+    Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
+    SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
 };
+use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, coordinates, fixture, hydrate, register, registered};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);
@@ -1115,5 +1116,264 @@ async fn another_tenant_cannot_verify_the_assistant() {
             "{verifier}"
         );
     }
+    assistant.deployment.shutdown().await;
+}
+
+/// A registered Service whose component binds a `group_end` Verifier, with
+/// its hydrated bundle loaded as the Service itself.
+struct Grouped {
+    /// The Service registration, naming every Card it registered.
+    receipt: RegistrationReceipt,
+    /// The hydrated bundle the Service state and any other caller load.
+    bundle: TempDir,
+    /// The Service's API key.
+    key: String,
+    /// The Service's state, started with Bifrost.
+    state: WyrdState,
+    /// The Service's `group_end` binding.
+    binding: BindingId,
+}
+
+impl Assistant {
+    /// Register and hydrate the Service fixture at `relative`, start its
+    /// state with the Service's own key, and find the binding whose status
+    /// pins `group_end` settings.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails or the Service has no `group_end`
+    /// binding.
+    async fn grouped(&self, relative: &str) -> Grouped {
+        let cards = self.deployment.cards().await;
+        let receipt = register(&cards, relative).await;
+        let bundle = hydrate(&cards, &receipt.root).await;
+        let key = self.deployment.service_key(&receipt.root).await;
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
+                .expect("bundle loads");
+        state.start_bifrost().await.expect("Bifrost starts");
+        let ids = cards
+            .get(CardSelector::exact(receipt.root.clone()))
+            .await
+            .expect("the Service reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the Service serves verification status")
+            .binding_ids;
+        let mut binding = None;
+        for id in ids {
+            if self
+                .deployment
+                .binding_status(&id)
+                .await
+                .group_end
+                .is_some()
+            {
+                binding = Some(id);
+            }
+        }
+        Grouped {
+            receipt,
+            bundle,
+            key,
+            state,
+            binding: binding.expect("the Service binds a group_end Verifier"),
+        }
+    }
+}
+
+impl Grouped {
+    /// Enqueue `body` over plain HTTP as the Service with `idempotency_key`,
+    /// the way an agent replays a submission, and return the accepted
+    /// execution.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the submission is not accepted.
+    async fn enqueue_over_http(
+        &self,
+        deployment: &Deployment,
+        idempotency_key: &str,
+        body: &serde_json::Value,
+    ) -> ExecutionId {
+        let token = deployment
+            .client(&self.key)
+            .access_token()
+            .await
+            .expect("access token mints");
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/verification/enqueue",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header("idempotency-key", idempotency_key)
+            .json(body)
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
+        assert_eq!(status, 202, "{accepted}");
+        accepted["execution_id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .expect("the response names its execution")
+    }
+}
+
+/// A support conversation resumed over two Runs, a background submit, and an
+/// agent's replayed HTTP enqueue, all sharing one `group_id`, is judged once
+/// it goes idle: the group execution reads back its group and owner and
+/// judges the Service's six turns in call order. The replay counts once; a
+/// key conflict, a same-group verify the administrator made with no owning
+/// Service, and a turn from a principal without `verifier:run` on the source
+/// Verifier are all excluded, and the binding status names the execution.
+/// Binding the source Verifier itself to `group_end` is refused at
+/// registration, naming the binding's `runs_on` field.
+///
+/// # Panics
+/// Panics when a step fails, the group is not judged in time, or the
+/// judgment or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_support_resumes() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let group = GroupId::new("conv-1").expect("group id");
+    let turns: Vec<_> = (1..=6)
+        .map(|turn| json!({"turn": turn, "answer": format!("answer {turn}")}))
+        .collect();
+    let first = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens");
+    for turn in &turns[..3] {
+        first
+            .observe()
+            .group_id(group.clone())
+            .verify("turn-check", turn.clone())
+            .await
+            .expect("the turn is judged");
+    }
+    let resumed = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens");
+    resumed
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", turns[3].clone())
+        .await
+        .expect("the resumed turn is judged");
+    let Submission::Queued(queued) = resumed
+        .observe()
+        .group_id(group.clone())
+        .submit("turn-check", turns[4].clone())
+        .await
+        .expect("the turn is submitted")
+    else {
+        panic!("a turn-check submission queues an execution");
+    };
+    queued.wait(WAIT).await.expect("the queued turn is judged");
+    let body = |turn: &serde_json::Value| {
+        json!({
+            "verifier_card_uid": registered(&support.receipt, "turn-check").uid,
+            "card_uid": registered(&support.receipt, "assistant-agent").uid,
+            "group_id": group,
+            "inputs": {"turn": {"kind": "json", "value": turn}},
+        })
+    };
+    let replayed = support
+        .enqueue_over_http(deployment, "support-turn-0006", &body(&turns[5]))
+        .await;
+    assert_eq!(
+        support
+            .enqueue_over_http(deployment, "support-turn-0006", &body(&turns[5]))
+            .await,
+        replayed,
+        "the same key and body replay one execution"
+    );
+    let conflict = support
+        .enqueue_over_http(deployment, "support-turn-0006", &body(&json!({"answer": ""})))
+        .await;
+    let conflicted = Execution::connect_with(conflict, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect_err("the key conflict settles errored");
+    assert_eq!(conflicted.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
+    Execution::connect_with(replayed, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the enqueued turn is judged");
+    WyrdState::from_path_with(support.bundle.path().join("bundle"), deployment.admin())
+        .expect("bundle loads")
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", json!({"answer": ""}))
+        .await
+        .expect("an ownerless turn is judged");
+    let unauthorized = deployment
+        .verifier_key("other_verifier", &assistant.answer_check)
+        .await;
+    let denied = WyrdState::from_path_with(
+        support.bundle.path().join("bundle"),
+        deployment.client(&unauthorized),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(group.clone())
+    .verify("turn-check", json!({"answer": ""}))
+    .await
+    .expect_err("verifier:run on another Verifier is no grant");
+    assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC", "{denied}");
+    support.state.shutdown().await.expect("Bifrost stops");
+
+    let judged = deployment
+        .group_execution(&support.binding, None, WAIT)
+        .await;
+
+    assert_eq!(judged.group_id.as_ref(), Some(&group));
+    assert_eq!(judged.owner_card_uid, support.receipt.root.uid);
+    let slot = "turns".parse().expect("slot name");
+    let coverage = judged.group.expect("the execution pins its snapshot");
+    assert_eq!(coverage.members, 12, "six inputs and six results: {coverage:?}");
+    assert_eq!(coverage.sources[&slot].execution_ids.len(), 6);
+    assert_eq!(coverage.sources[&slot].execution_ids[5], replayed);
+    let outcome = judged.result.expect("the result is visible").outcome;
+    assert_eq!(
+        serde_json::to_value(&outcome.evidence[&slot]).expect("evidence encodes"),
+        json!({"kind": "json", "value": turns}),
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+    let status = deployment.binding_status(&support.binding).await;
+    assert_eq!(status.last_execution_id, Some(judged.execution_id));
+    let refused = deployment
+        .cards()
+        .await
+        .register_from_path(&fixture("cards/verify_in_real_time/support-unsourced.yaml"))
+        .await
+        .expect_err("a group_end binding needs a Verifier with sources");
+    assert_eq!(
+        refused.code(),
+        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("verified_by[0].runs_on"),
+        "{refused}"
+    );
     assistant.deployment.shutdown().await;
 }

@@ -902,7 +902,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
 def converse(
     child: subprocess.Popen[bytes], master: int, answers: list[tuple[bytes, bytes]]
 ) -> tuple[bytes, bytes]:
-    """Answer each expected question, in order, until readiness.
+    """Answer each expected question, in order, until the whole ready message.
 
     Returns everything the CLI printed and everything the terminal echoed or
     was sent, so callers can prove what was and was not disclosed.
@@ -912,7 +912,8 @@ def converse(
     seen = 0
     pending = list(answers)
     deadline = time.monotonic() + 150
-    while b"Local Wyrd ready at " not in shown:
+    # The ready message arrives one line per write; wait for its last line.
+    while b"Press Ctrl-C to stop." not in shown:
         assert time.monotonic() < deadline, f"guided startup deadline: {shown!r}"
         readable, _, _ = select.select([child.stdout, master], [], [], 1)
         for source in readable:

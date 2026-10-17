@@ -632,6 +632,15 @@ mod tests {
 
     /// Proves the catalog advertises every gateway tool once, in order, with
     /// object input schemas and effect annotations matching its operation.
+    ///
+    /// # Panics
+    /// Panics when the advertised names or order differ from [`TOOLS`], when
+    /// a tool lacks annotations, has effect hints that disagree with its
+    /// read/destructive operation, or a non-object input schema, when the
+    /// credential write (index 7) lacks its description, a required storage
+    /// claim, or still denies accepting secrets, and when the collection
+    /// apply (index 9) or the name-keyed tool at index 14 has a different
+    /// schema title or required fields.
     #[test]
     fn gateway_catalog_annotates_every_administration_operation() {
         let tools = descriptors();

@@ -217,13 +217,20 @@ impl InstallArgs {
 }
 
 /// Offer the existing host installer after a local deployment is usable.
-/// Scripts select no hosts implicitly; no detected hosts is a harmless skip.
+/// Explicit `hosts` install without a question; otherwise detected hosts are
+/// offered only when the caller's resolved policy is `interactive`, so
+/// unattended runs select none implicitly. No detected hosts is a harmless
+/// skip.
 ///
 /// # Errors
 /// Returns the same per-host failures as independent MCP installation.
-pub(crate) async fn offer_local(hosts: &[McpHost], server: &str) -> Result<(), WyrdCliError> {
+pub(crate) async fn offer_local(
+    hosts: &[McpHost],
+    server: &str,
+    interactive: bool,
+) -> Result<(), WyrdCliError> {
     if hosts.is_empty()
-        && (!io::stdin().is_terminal()
+        && (!interactive
             || HostInstaller::from_process(Some(server))
                 .detected()
                 .is_empty())

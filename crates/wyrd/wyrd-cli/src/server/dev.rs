@@ -124,15 +124,25 @@ impl DevArgs {
     /// Refuses invalid local inputs, an incompatible release, failed server
     /// operations, unsafe storage, unusable saved credentials, or failed hosts.
     /// Committed migration/provisioning steps remain on failure; reruns never
-    /// reissue an active tenant's key. Cancellation settles the owned server.
+    /// reissue an active tenant's key. Interruption is observed from before
+    /// the first question, so an unanswered concealed question is dropped with
+    /// echo restored; later, cancellation settles the owned server.
     ///
     /// # Panics
     /// Panics if the compile-time package version is not valid semver.
     pub async fn run(self) -> Result<ExitCode, WyrdCliError> {
         let installer = ServerInstaller::official()?;
-        let inputs = self.resolve(installer.root()).await?;
         let interrupted = interruption();
         tokio::pin!(interrupted);
+        // Biased: the signal listeners register before any question is asked.
+        let inputs = tokio::select! {
+            biased;
+            signal = &mut interrupted => {
+                eprintln!("Local setup stopped before installation, migration, or provisioning; rerun the same command.");
+                return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
+            }
+            inputs = self.resolve(installer.root()) => inputs?,
+        };
         let installed = tokio::select! {
             biased;
             signal = &mut interrupted => {
@@ -526,7 +536,7 @@ impl DevServer {
         };
         if !inputs.configured || !hosts.is_empty() {
             tokio::select! {
-                offered = mcp::offer_local(hosts, endpoint) => offered?,
+                offered = mcp::offer_local(hosts, endpoint, inputs.interactive) => offered?,
                 exited = Self::exited(child) => return exited,
             }
         }

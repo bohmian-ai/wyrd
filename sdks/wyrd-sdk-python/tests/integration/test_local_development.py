@@ -849,6 +849,66 @@ def converse(
     return shown, disclosed
 
 
+def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], sent: int) -> None:
+    """Send ``sent`` while the first concealed question waits on a real terminal.
+
+    The CLI must exit with 130, leave terminal echo restored, disclose nothing,
+    and install, migrate, or save nothing.
+    """
+    master, slave = pty.openpty()
+    try:
+        child = subprocess.Popen(
+            [cli_path, "server", "dev"],
+            cwd=home,
+            env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=terminal_session,
+        )
+        assert child.stdout is not None
+        shown = b""
+        deadline = time.monotonic() + 60
+        while b"(input hidden): " not in shown:
+            assert time.monotonic() < deadline, f"hidden question deadline: {shown!r}"
+            chunk = os.read(child.stdout.fileno(), 4096)
+            assert chunk, f"CLI exited before asking: {shown!r}"
+            shown += chunk
+        while termios.tcgetattr(slave)[3] & termios.ECHO:
+            assert time.monotonic() < deadline, "echo was never disabled"
+            time.sleep(0.05)
+        os.write(master, b"postgres://typed-but-unsent")
+        child.send_signal(sent)
+        stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 130, stderr
+        assert termios.tcgetattr(slave)[3] & termios.ECHO, "echo left disabled"
+        assert b"typed-but-unsent" not in shown + stdout + stderr
+        assert not (home / "wyrd/config.toml").exists()
+        assert not (home / "wyrd/credentials.toml").exists()
+        assert not (home / "wyrd/server/sealing.key").exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def unattended_terminal_offers_no_hosts(cli_path: str) -> None:
+    """A complete ``--non-interactive`` run on a terminal never asks about hosts.
+
+    A detected host is left unchanged on first setup; an explicit ``--host``
+    on the configured restart still installs it without a question.
+    """
+    with local_deployment() as (home, env):
+        host_config = home / "codex/config.toml"
+        before = host_config.read_bytes()
+        with installed_local_cli(cli_path, home, env, "restart", extra=("--non-interactive",)):
+            pass
+        assert host_config.read_bytes() == before, "unattended setup changed a host"
+        with installed_local_cli(
+            cli_path, home, env, "restart", extra=("--non-interactive", "--host", "codex")
+        ):
+            assert host_config.read_bytes() != before, "explicit host was not installed"
+
+
 @pytest.mark.local_dev
 def test_installed_cli_guided_setup() -> None:
     """Guided first setup asks only for missing inputs and approved providers.
@@ -859,6 +919,8 @@ def test_installed_cli_guided_setup() -> None:
     selected from ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY`` and renamed, is
     applied. Fresh CLI processes then read it with saved settings alone, and
     no key or database URL reaches output or general configuration.
+    Interrupting the first hidden question restores echo and changes nothing,
+    and an unattended run on a terminal never offers hosts.
     """
     root = Path(__file__).resolve().parents[4]
     cli_path = str(root / "target/debug/wyrd")
@@ -880,6 +942,8 @@ def test_installed_cli_guided_setup() -> None:
         assert unattended.returncode != 0
         assert "WYRD_DATABASE_URL" in unattended.stderr and "--tenant" in unattended.stderr
         assert not (home / "wyrd/credentials.toml").exists()
+        for sent in (signal.SIGINT, signal.SIGTERM):
+            interrupt_hidden_question(cli_path, home, env, sent)
 
         master, slave = pty.openpty()
         stderr = tempfile.TemporaryFile()  # noqa: SIM115 - read after the child exits
@@ -940,6 +1004,7 @@ def test_installed_cli_guided_setup() -> None:
         assert database.encode() not in disclosed
         assert database.encode() in protected
         assert not any(value.encode() in protected for value in secrets.values())
+    unattended_terminal_offers_no_hosts(cli_path)
 
 
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")

@@ -2316,7 +2316,7 @@ export interface InputDeclarationTrace {
 }
 
 /**
- * One named evidence slot. Slots are required unless `required: false`.
+ * One named evidence slot. Slots are required unless `required: false`; samples slots are always required.
  */
 export type InputSlot = InputSlotJson | InputSlotMedia | InputSlotTrace | InputSlotSamples;
 
@@ -2356,16 +2356,14 @@ export interface InputSlotMedia {
 
 /**
  * Feature measurements or metric samples recorded for a scheduled window.
+ *
+ * Always required: a schedule binding supplies every samples slot of its Verifier from the subject's recorded measurements, so the slot has no `required` field and no drift check can be omitted by configuration.
  */
 export interface InputSlotSamples {
   /**
    * Measurement names, including metric names.
    */
   readonly features: readonly FeatureName[];
-  /**
-   * Whether the schedule binding must fill the slot.
-   */
-  readonly required?: boolean;
   readonly type: "samples";
 }
 
@@ -4749,25 +4747,6 @@ export interface SampleInput {
 export type SampleInputKind = "Pandas" | "Polars" | "Arrow" | "Numpy" | "Torch" | "Tf" | "Dict" | "List" | "Tuple" | "Str" | "None";
 
 /**
- * One scheduled-evidence source selector in a binding's `inputs` map.
- */
-export type ScheduledInput = ScheduledInputFeatures | ScheduledInputMetric;
-
-/**
- * Recorded feature measurements.
- */
-export interface ScheduledInputFeatures {
-  readonly features: readonly FeatureName[];
-}
-
-/**
- * One recorded metric.
- */
-export interface ScheduledInputMetric {
-  readonly metric: FeatureName;
-}
-
-/**
  * Operator-configured external secret backend identity.
  */
 export type SecretBackendName = string;
@@ -5620,12 +5599,6 @@ export interface UpdateOperatorConnectionRequestSlack {
  * Authored on a Service, a Service component occurrence, or a standalone Agent. Registration resolves and UID-pins the Verifier, the effective Trigger, and every effective Operator before the owning Card persists.
  */
 export interface VerificationBinding {
-  /**
-   * Scheduled evidence: the recorded measurements filling each samples slot of the Verifier within the subject's schedule window.
-   *
-   * Checked against the Verifier with [`VerifierSpec::validate_schedule`]; names are never inferred.
-   */
-  readonly inputs?: Readonly<Record<string, ScheduledInput>>;
   /**
    * Operators dispatched independently after a `failed` verdict.
    *

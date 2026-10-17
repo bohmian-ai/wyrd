@@ -30,7 +30,6 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
-use wyrd_spec::card::verifier::ScheduledInput;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{
     BindingId, CardUid, ExecutionId, OperatorDispatchId, SlotName, VerificationResultId,
@@ -249,8 +248,6 @@ const CLAIM_SQL: &str = r"
                 WHERE a.principal_kind = 'system' AND a.status = 'active') AS system_principal_id,
               (SELECT c.status FROM wyrd.cards c
                 WHERE c.card_uid = e.verifier_card_uid) AS verifier_status,
-              (SELECT b.inputs FROM wyrd.verification_bindings b
-                WHERE b.binding_id = e.binding_id) AS schedule_inputs,
               (SELECT jsonb_object_agg(f.requirement_id, f.fitted)
                  FROM wyrd.drift_baselines f
                 WHERE f.verifier_uid = e.verifier_card_uid
@@ -470,13 +467,11 @@ impl ExecutionOrigin {
 /// The frozen input one claimed execution judges.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionInput {
-    /// A scheduled occurrence: its fixed window and the binding's selector
-    /// for each samples slot.
+    /// A scheduled occurrence: its fixed window. Every samples slot of the
+    /// exact Verifier is read for the subject within it.
     Scheduled {
         /// The occurrence's comparison window.
         window: DriftWindow,
-        /// Recorded measurements filling each samples slot within `window`.
-        slots: BTreeMap<SlotName, ScheduledInput>,
     },
     /// A caller submission, exactly as it was accepted.
     Submitted {
@@ -1917,8 +1912,6 @@ struct ClaimedRow {
     system_principal_id: Option<Uuid>,
     /// The exact Verifier Card's status; `None` when the Card is absent.
     verifier_status: Option<String>,
-    /// The binding's scheduled input selectors; `None` for a submission.
-    schedule_inputs: Option<Json<BTreeMap<SlotName, ScheduledInput>>>,
     /// The Verifier's ready fitted baselines by requirement; `None` when none.
     fitted_baselines: Option<Json<BTreeMap<TaskId, Value>>>,
 }
@@ -1934,15 +1927,13 @@ impl ClaimedRow {
         let input = match (
             self.window_start,
             self.window_end,
-            self.schedule_inputs,
             self.inputs,
             self.route_overrides,
         ) {
-            (Some(start), Some(end), Some(Json(slots)), None, None) => ExecutionInput::Scheduled {
+            (Some(start), Some(end), None, None) => ExecutionInput::Scheduled {
                 window: DriftWindow { start, end },
-                slots,
             },
-            (None, None, _, Some(Json(inputs)), Some(Json(route_overrides))) => {
+            (None, None, Some(Json(inputs)), Some(Json(route_overrides))) => {
                 ExecutionInput::Submitted {
                     run_id: self.run_id.map(RunId::from_string),
                     inputs,

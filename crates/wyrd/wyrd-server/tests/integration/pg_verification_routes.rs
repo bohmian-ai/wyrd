@@ -102,26 +102,11 @@ impl Fixture {
             .await
             .expect("PSI Verifier registers");
         let ready_binding = seed
-            .bind_schedule(
-                &service,
-                &service,
-                &drift,
-                "0 2 * * *",
-                VerificationFixture::metric_inputs("latency"),
-                Vec::new(),
-            )
+            .bind_schedule(&service, &service, &drift, "0 2 * * *", Vec::new())
             .await
             .expect("ready binding projects");
         let unready_binding = seed
-            .bind_schedule(
-                &service,
-                &service,
-                &psi,
-                "0 2 * * *",
-                serde_json::from_value(json!({ "samples": { "features": ["score"] } }))
-                    .expect("distribution inputs decode"),
-                Vec::new(),
-            )
+            .bind_schedule(&service, &service, &psi, "0 2 * * *", Vec::new())
             .await
             .expect("unready binding projects");
         Self {

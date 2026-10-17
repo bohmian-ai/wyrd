@@ -4,10 +4,9 @@
 //! contract until its cutover, so `wyrd plan` cannot yet prove the journey
 //! fixtures. This test decodes every fixture Verifier into
 //! [`blocks::VerifierSpec`], validates it with every path-referenced Agent and
-//! Prompt resolved from disk, and validates each schedule binding's `inputs`
-//! against the Verifier it names.
+//! Prompt resolved from disk.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,8 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_yaml::Value;
 use wyrd_spec::Prompt;
 use wyrd_spec::card::agent::AgentSpec;
-use wyrd_spec::card::verifier::{ResolvedAgent, ScheduledInput, VerifierSpec};
-use wyrd_spec::ids::SlotName;
+use wyrd_spec::card::verifier::{ResolvedAgent, VerifierSpec};
 use wyrd_spec::reference::InlineableRef;
 
 /// Every fixture Card decoded by kind and keyed by its canonical path.
@@ -28,8 +26,6 @@ struct Fixtures {
     prompts: HashMap<PathBuf, Prompt>,
     /// Verifier Card specs decoded into the staged blocks contract.
     verifiers: HashMap<PathBuf, VerifierSpec>,
-    /// Schedule bindings as `(declaring Card, Verifier path, inputs)`.
-    bindings: Vec<(PathBuf, PathBuf, BTreeMap<SlotName, ScheduledInput>)>,
 }
 
 impl Fixtures {
@@ -37,7 +33,7 @@ impl Fixtures {
     ///
     /// # Panics
     /// Panics when a fixture cannot be read or parsed, or when an Agent,
-    /// Prompt, Verifier, or binding `inputs` map fails to decode.
+    /// Prompt, or Verifier fails to decode.
     fn load() -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/cards");
         let mut fixtures = Self::default();
@@ -56,7 +52,7 @@ impl Fixtures {
         fixtures
     }
 
-    /// Decodes one Card by kind and collects every schedule binding in it.
+    /// Decodes one Card by kind.
     ///
     /// # Panics
     /// Panics when the Card cannot be read, parsed, or decoded.
@@ -74,35 +70,6 @@ impl Fixtures {
             Some("Verifier") => {
                 self.verifiers
                     .insert(path.to_path_buf(), decode(path, spec));
-            }
-            _ => {}
-        }
-        self.collect_bindings(path, spec);
-    }
-
-    /// Walks `value` for verification bindings that carry an `inputs` map.
-    ///
-    /// # Panics
-    /// Panics when a binding's `inputs` map does not decode.
-    fn collect_bindings(&mut self, path: &Path, value: &Value) {
-        match value {
-            Value::Mapping(map) => {
-                if let (Some(verifier), Some(inputs)) = (
-                    map.get("verifier").and_then(Value::as_str),
-                    map.get("inputs").filter(|_| map.contains_key("runs_on")),
-                ) {
-                    let target = canonical(&sibling(path, verifier));
-                    self.bindings
-                        .push((path.to_path_buf(), target, decode(path, inputs)));
-                }
-                for child in map.values() {
-                    self.collect_bindings(path, child);
-                }
-            }
-            Value::Sequence(items) => {
-                for child in items {
-                    self.collect_bindings(path, child);
-                }
             }
             _ => {}
         }
@@ -188,14 +155,12 @@ fn canonical(path: &Path) -> PathBuf {
         .unwrap_or_else(|error| panic!("{} does not resolve: {error}", path.display()))
 }
 
-/// Every fixture Verifier satisfies the staged blocks contract, and every
-/// schedule binding maps that Verifier's slots exactly.
+/// Every fixture Verifier satisfies the staged blocks contract.
 ///
 /// # Panics
 /// Panics when a fixture cannot be loaded or decoded, a referenced Agent or
-/// Prompt cannot be resolved, a Verifier fails `validate_with`, a binding
-/// names a non-Verifier or fails `validate_schedule`, or no Verifiers or
-/// bindings are found.
+/// Prompt cannot be resolved, a Verifier fails `validate_with`, or no
+/// Verifiers are found.
 #[test]
 fn fixture_verifiers_satisfy_the_staged_contract() {
     let fixtures = Fixtures::load();
@@ -204,14 +169,5 @@ fn fixture_verifiers_satisfy_the_staged_contract() {
         verifier
             .validate_with(|agent| Some(fixtures.resolve(path, agent)))
             .unwrap_or_else(|error| panic!("{} is invalid: {error}", path.display()));
-    }
-    assert!(!fixtures.bindings.is_empty(), "no schedule bindings found");
-    for (card, target, inputs) in &fixtures.bindings {
-        let verifier = fixtures.verifiers.get(target).unwrap_or_else(|| {
-            panic!("{} binds non-Verifier {}", card.display(), target.display())
-        });
-        verifier
-            .validate_schedule(inputs)
-            .unwrap_or_else(|error| panic!("{} binding is invalid: {error}", card.display()));
     }
 }

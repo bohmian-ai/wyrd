@@ -31,6 +31,8 @@ serde = { workspace = true }
 serde_jcs = { workspace = true }
 # `ServiceTable.schema` property order is its declared column order.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Decode errors name the authored field path.
+serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 strum = { workspace = true }
 petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }

@@ -15,7 +15,7 @@ use super::reference::{Reference, ReferenceRoot};
 use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
-    InputSlot, MAX_STEP_RETRIES, Requirement, ScheduledInput, Step, VerifierSpec,
+    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -866,50 +866,6 @@ fn ancestors<'a>(
     ancestors
 }
 
-impl VerifierSpec {
-    /// Validates a schedule binding's `inputs` map against this Verifier.
-    ///
-    /// Every required slot must be mapped, every mapped slot must be a
-    /// samples slot of this Verifier, and each selector must name exactly
-    /// the slot's measurements. Names are never inferred.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `scheduled_input`.
-    pub fn validate_schedule(
-        &self,
-        inputs: &BTreeMap<SlotName, ScheduledInput>,
-    ) -> Result<(), WyrdError> {
-        for (slot, input) in &self.inputs {
-            if input.required() && !inputs.contains_key(slot) {
-                return Err(invalid(
-                    "scheduled_input",
-                    &format!("inputs.{slot}"),
-                    "the schedule binding must map every required slot",
-                ));
-            }
-        }
-        for (slot, selector) in inputs {
-            let path = format!("inputs.{slot}");
-            let Some(InputSlot::Samples { features, .. }) = self.inputs.get(slot) else {
-                return Err(invalid(
-                    "scheduled_input",
-                    &path,
-                    "only samples slots of this Verifier are scheduled",
-                ));
-            };
-            let selected: BTreeSet<_> = selector.names().iter().collect();
-            if selected != features.iter().collect() {
-                return Err(invalid(
-                    "scheduled_input",
-                    &path,
-                    "the selector must name exactly the slot's measurements",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Registration refusals and acceptances for authored Verifiers, driven
@@ -917,7 +873,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::super::{ScheduledInput, VerifierSpec};
+    use super::super::VerifierSpec;
     use crate::error::WyrdError;
 
     /// Parses an authored Verifier body.
@@ -1709,34 +1665,6 @@ mod tests {
                 })
             });
             assert_eq!(outcome.is_ok(), valid, "{selector}: {outcome:?}");
-        }
-    }
-
-    /// Schedule bindings map every required samples slot by exact names.
-    ///
-    /// # Panics
-    /// Panics when a binding mapping is classified incorrectly.
-    #[test]
-    fn verifier_spec_validates_schedule_inputs() {
-        let spec = parse(&drift());
-        let mapping =
-            |value: Value| -> std::collections::BTreeMap<crate::ids::SlotName, ScheduledInput> {
-                serde_json::from_value(value).expect("mapping")
-            };
-        spec.validate_schedule(&mapping(
-            json!({"current": {"features": ["dti", "income"]}}),
-        ))
-        .expect("exact selector");
-        for invalid in [
-            json!({}),
-            json!({"current": {"features": ["income"]}}),
-            json!({"current": {"metric": "income"}}),
-            json!({"current": {"features": ["income", "dti"]}, "other": {"metric": "x"}}),
-        ] {
-            assert!(
-                spec.validate_schedule(&mapping(invalid.clone())).is_err(),
-                "{invalid}"
-            );
         }
     }
 }

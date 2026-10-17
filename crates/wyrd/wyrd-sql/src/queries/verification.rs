@@ -11,7 +11,6 @@
 //! transaction under forced RLS and never commits.
 // raw-query grep allowlist: verification tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -20,9 +19,8 @@ use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_spec::card::verifier::ScheduledInput;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{BindingId, CardUid, SlotName};
+use wyrd_spec::ids::{BindingId, CardUid};
 use wyrd_spec::verification::DriftWindow;
 /// The frozen Trigger/Operator identity is the wire contract's own type, so
 /// stored JSON, dispatch rows, and Run GET share one shape.
@@ -43,8 +41,8 @@ const PROJECT_BINDING_SQL: &str = r"
         binding_id, data_tenant_id, owner_card_uid, owner_card_kind,
         subject_occurrence_key, card_uid, verifier_card_uid,
         trigger_uid, trigger_digest, operators, activation,
-        schedule_cron, schedule_tz, inputs
-    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, 'schedule', $10, $11, $12)
+        schedule_cron, schedule_tz
+    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, 'schedule', $10, $11)
     ON CONFLICT ON CONSTRAINT verification_bindings_natural_key
     DO UPDATE SET binding_id = wyrd.verification_bindings.binding_id
     RETURNING binding_id
@@ -300,9 +298,6 @@ pub struct NewBinding {
     pub cron: String,
     /// Authored IANA timezone of the schedule; absent means UTC.
     pub tz: Option<String>,
-    /// Recorded measurements filling each samples slot of the Verifier for
-    /// every scheduled window.
-    pub inputs: BTreeMap<SlotName, ScheduledInput>,
 }
 
 /// Project an owner Card version's effective bindings.
@@ -343,7 +338,6 @@ pub async fn project_bindings(
             .bind(Json(&binding.operators))
             .bind(binding.cron.as_str())
             .bind(binding.tz.as_deref())
-            .bind(Json(&binding.inputs))
             .fetch_one(&mut **conn.transaction())
             .await?;
         ids.push(stored_binding_id(id)?);

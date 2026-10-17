@@ -747,7 +747,6 @@ mod completeness_tests {
                 InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
                 InlineableRef::Inline(Box::new(notify_operator())),
             ],
-            inputs: BTreeMap::new(),
         }
     }
 

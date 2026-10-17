@@ -331,7 +331,6 @@ mod tests {
                 },
             }))),
             on_failure: Vec::new(),
-            inputs: BTreeMap::new(),
         }
     }
 }

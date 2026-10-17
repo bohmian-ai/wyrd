@@ -4,17 +4,15 @@
 //! Every test runs against the repository managed Postgres through tenant
 //! connections, so forced RLS applies.
 
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
 use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
+use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{BindingId, CardUid, FeatureName, SlotName};
+use wyrd_spec::ids::{BindingId, CardUid};
 use wyrd_spec::registry::RegistrationOperationId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -80,10 +78,6 @@ fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
         operators: vec![FrozenTarget::Uid(uid())],
         cron: "0 2 * * *".to_owned(),
         tz: None,
-        inputs: BTreeMap::from([(
-            SlotName::new("current").expect("valid slot name"),
-            ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),
-        )]),
     }
 }
 

@@ -125,7 +125,8 @@ impl VerifierSpec {
     }
 }
 
-/// One named evidence slot. Slots are required unless `required: false`.
+/// One named evidence slot. Slots are required unless `required: false`;
+/// samples slots are always required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -158,12 +159,13 @@ pub enum InputSlot {
         required: bool,
     },
     /// Feature measurements or metric samples recorded for a scheduled window.
+    ///
+    /// Always required: a schedule binding supplies every samples slot of its
+    /// Verifier from the subject's recorded measurements, so the slot has no
+    /// `required` field and no drift check can be omitted by configuration.
     Samples {
         /// Measurement names, including metric names.
         features: Vec<FeatureName>,
-        /// Whether the schedule binding must fill the slot.
-        #[serde(default = "required_default", skip_serializing_if = "is_true")]
-        required: bool,
     },
 }
 
@@ -174,8 +176,8 @@ impl InputSlot {
         match self {
             Self::Json { required, .. }
             | Self::Media { required, .. }
-            | Self::Trace { required }
-            | Self::Samples { required, .. } => *required,
+            | Self::Trace { required } => *required,
+            Self::Samples { .. } => true,
         }
     }
 }
@@ -518,28 +520,6 @@ impl Decide {
     }
 }
 
-/// One scheduled-evidence source selector in a binding's `inputs` map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ScheduledInput {
-    /// Recorded feature measurements.
-    Features(Vec<FeatureName>),
-    /// One recorded metric.
-    Metric(FeatureName),
-}
-
-impl ScheduledInput {
-    /// Returns the measurement names the selector reads.
-    #[must_use]
-    pub fn names(&self) -> &[FeatureName] {
-        match self {
-            Self::Features(names) => names,
-            Self::Metric(name) => std::slice::from_ref(name),
-        }
-    }
-}
-
 /// Reserved subject-occurrence key of a Service-level or standalone-Agent
 /// verification binding.
 ///
@@ -669,11 +649,4 @@ pub struct VerificationBinding {
     /// Empty means a failed result stays durable with no reaction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_failure: Vec<InlineableRef<OperatorSpec>>,
-    /// Scheduled evidence: the recorded measurements filling each samples
-    /// slot of the Verifier within the subject's schedule window.
-    ///
-    /// Checked against the Verifier with [`VerifierSpec::validate_schedule`];
-    /// names are never inferred.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub inputs: BTreeMap<SlotName, ScheduledInput>,
 }

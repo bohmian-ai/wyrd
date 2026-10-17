@@ -1317,7 +1317,6 @@ mod pg_tests {
                 operators: Vec::new(),
                 cron: "0 2 * * *".to_owned(),
                 tz: None,
-                inputs: std::collections::BTreeMap::new(),
             }],
         )
         .await

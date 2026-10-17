@@ -18,11 +18,9 @@ use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
+use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{
-    BindingId, CardUid, ExecutionId, FeatureName, SlotName, VerificationResultId,
-};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::RegistrationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
@@ -227,17 +225,6 @@ async fn register_verifier(
     card_uid
 }
 
-/// The scheduled samples selector every test binding stores.
-///
-/// # Panics
-/// Never in practice: the literals match the slot and feature grammars.
-fn scheduled_inputs() -> BTreeMap<SlotName, ScheduledInput> {
-    BTreeMap::from([(
-        SlotName::new("current").expect("valid slot name"),
-        ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),
-    )])
-}
-
 /// Project one owner-level daily-at-02:00-UTC binding of `verifier` on
 /// `owner` with `operators`.
 ///
@@ -261,7 +248,6 @@ async fn bind(
             operators,
             cron: "0 2 * * *".to_owned(),
             tz: None,
-            inputs: scheduled_inputs(),
         }],
     )
     .await
@@ -646,10 +632,7 @@ async fn scheduled_and_submitted_executions_freeze_their_inputs() {
     assert_eq!(bound_claim.card_uid, owner);
     assert_eq!(
         bound_claim.input,
-        ExecutionInput::Scheduled {
-            window: window(),
-            slots: scheduled_inputs(),
-        }
+        ExecutionInput::Scheduled { window: window() }
     );
     assert_eq!((bound_claim.attempt, bound_claim.max_attempts), (1, 3));
 
@@ -1164,21 +1147,12 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         claimed.authority,
         owner_authority(fixture.data_tenant_id(), principal)
     );
-    let ExecutionInput::Scheduled {
-        window: occurrence,
-        slots,
-    } = claimed.input
-    else {
+    let ExecutionInput::Scheduled { window: occurrence } = claimed.input else {
         panic!(
             "a scheduled execution analyzes a window, got {:?}",
             claimed.input
         );
     };
-    assert_eq!(
-        slots,
-        scheduled_inputs(),
-        "the binding's selectors are frozen"
-    );
     assert_eq!(
         occurrence.end, due,
         "the occurrence closes at its due instant"

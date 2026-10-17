@@ -395,10 +395,10 @@ impl VerifierRunner {
         }
         let (no_inputs, no_routes) = (BTreeMap::new(), BTreeMap::new());
         let (drift, evidence, routes, run_id) = match &run.input {
-            ExecutionInput::Scheduled { window, slots } => {
+            ExecutionInput::Scheduled { window } => {
                 match self
                     .drift
-                    .checks(tenant, run, spec, window, slots, telemetry)
+                    .checks(tenant, run, spec, window, telemetry)
                     .await
                 {
                     Ok(drift) => (drift, &no_inputs, &no_routes, None),

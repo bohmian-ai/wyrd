@@ -16,7 +16,7 @@ use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{AcceptedAuthority, PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput, VerifierSpec};
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName};
 use wyrd_spec::registry::RegistrationOperationId;
@@ -301,8 +301,7 @@ impl VerificationFixture {
     }
 
     /// Project one scheduled binding of `verifier` owned by the Service
-    /// `owner` and verifying `subject`, filling each samples slot from
-    /// `inputs` and dispatching `operators` on failure.
+    /// `owner` and verifying `subject`, dispatching `operators` on failure.
     ///
     /// A `subject` equal to `owner` is an owner-level binding keyed by
     /// [`OWNER_OCCURRENCE_KEY`]; any other subject is a component binding keyed
@@ -318,7 +317,6 @@ impl VerificationFixture {
         subject: &CardUid,
         verifier: &CardUid,
         cron: &str,
-        inputs: BTreeMap<SlotName, ScheduledInput>,
         operators: Vec<FrozenTarget>,
     ) -> Result<BindingId, VerificationFixtureError> {
         let occurrence = if subject == owner {
@@ -339,7 +337,6 @@ impl VerificationFixture {
                 operators,
                 cron: cron.to_owned(),
                 tz: None,
-                inputs,
             }],
         )
         .await?;
@@ -348,17 +345,6 @@ impl VerificationFixture {
             .first()
             .copied()
             .ok_or_else(|| VerificationFixtureError::Card("no binding projected".to_owned()))
-    }
-
-    /// The scheduled input map of [`Self::drift_verifier`]: its `samples`
-    /// slot reads the `metric` series.
-    ///
-    /// # Panics
-    /// Panics when `metric` is not a valid feature name.
-    #[must_use]
-    pub fn metric_inputs(metric: &str) -> BTreeMap<SlotName, ScheduledInput> {
-        serde_json::from_value(serde_json::json!({ "samples": { "metric": metric } }))
-            .expect("invariant: the fixture metric is a valid feature name")
     }
 
     /// Record a qualifying machine authentication of `owner`, which activates

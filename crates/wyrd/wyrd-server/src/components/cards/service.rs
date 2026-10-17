@@ -1361,7 +1361,6 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     operators,
                     cron,
                     tz,
-                    inputs: binding.inputs.clone(),
                 });
             }
         }

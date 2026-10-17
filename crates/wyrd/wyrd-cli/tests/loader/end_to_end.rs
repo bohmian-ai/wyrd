@@ -110,7 +110,6 @@ fn load_end_to_end_reference_tree() {
                 model_binding.on_failure.as_slice(),
                 [InlineableRef::Sibling { .. }]
             ));
-            assert_eq!(model_binding.inputs.len(), 1);
             let [agent_binding, component_task] = service.components[1].verified_by.as_slice()
             else {
                 panic!("agent1 component must carry its two explicit bindings");

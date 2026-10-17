@@ -37,25 +37,20 @@ The `agents` extra brings the OpenAI Agents SDK, `gateway` the HTTP client the g
 
 ## 2. Connect the model
 
-Wyrd calls OpenAI for you, so your code never holds the OpenAI key. The server needs two things, and both are a JSON document piped to `wyrd gateway ... put --file -`:
+Wyrd calls OpenAI for you, so your code never holds the OpenAI key. If you accepted the OpenAI key during setup, with the proposed deployment name `openai`, this step is already done.
 
-1. A **credential** named `openai-key` that holds your key. The server encrypts it, and no read ever returns it:
+Otherwise, with `OPENAI_API_KEY` exported, apply one document. It names the variable instead of holding the key; the CLI reads the value and sends it once, and the server encrypts it, so no read ever returns it:
 
-   ```bash
-   wyrd gateway credential put --file - <<JSON
-   {"name": "openai-key", "provider": "openai", "source": {"managed_secret": {"secret": "$OPENAI_API_KEY"}}}
-   JSON
-   ```
+```bash
+wyrd gateway deployment put --file - <<'JSON'
+{
+  "credentials": [{"name": "openai-key", "provider": "openai", "source": {"local_env": "OPENAI_API_KEY"}}],
+  "deployments": [{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}]
+}
+JSON
+```
 
-2. A **deployment** named `openai` that sends requests to OpenAI with that credential:
-
-   ```bash
-   wyrd gateway deployment put --file - <<'JSON'
-   {"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}
-   JSON
-   ```
-
-Both commands print the stored document, with the secret redacted. Agents now reach OpenAI models as `openai/<model>`, and both Agent Cards in the example ask for exactly that with `execution_route: {kind: wyrd_gateway, deployment: openai}`. [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) uses the same two commands for other providers.
+The server creates the **credential** `openai-key` and the **deployment** `openai` together, or neither, and prints both with the secret redacted. Agents now reach OpenAI models as `openai/<model>`, and both Agent Cards in the example ask for exactly that with `execution_route: {kind: wyrd_gateway, deployment: openai}`. [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) covers other providers and the separate credential and deployment commands.
 
 ## 3. Read what is declared
 
@@ -287,7 +282,7 @@ It prints one row per gateway call and verdict for that Run. The same SQL runs f
 | --- | --- | --- |
 | A gateway error naming `openai/gpt-4o` or `openai/gpt-6-luna` | No `openai` deployment, or the key lacks that model | Run [step 2](#2-connect-the-model) and check the key's model access |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | The app found no saved credential | Run it with the same `WYRD_CONFIG_HOME` as the server from setup |
-| `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | A `vala.datasets.tickets` table with different columns already exists in this tenant | Use a fresh tenant, such as `wyrd server dev --tenant quickstart` |
+| `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | A `vala.datasets.tickets` table with different columns already exists in this tenant | Use a fresh tenant in its own config directory, such as `WYRD_CONFIG_HOME=~/.config/wyrd-quickstart wyrd server dev --tenant quickstart` |
 | The app can't find `.wyrd-bundle` | The Cards were never deployed | Run `python deploy.py` from the `python/` directory |
 | A review stays `pending` | The server is not running background verification | Check the server terminal for errors |
 

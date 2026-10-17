@@ -7,7 +7,7 @@ order: 2
 status: runnable
 ---
 
-`wyrd server dev --tenant acme` starts a local Wyrd server, creates the `acme` tenant, and saves its credential and endpoint so every CLI and SDK process on your machine can call it. You supply PostgreSQL; the command does the rest.
+`wyrd server dev` starts a local Wyrd server, creates a tenant, optionally configures the LLM gateway from provider keys in your environment, and saves everything so every CLI and SDK process on your machine can call it. You supply PostgreSQL; the command does the rest.
 
 ## Prerequisites
 
@@ -32,24 +32,49 @@ SQL
 
 ## Start local Wyrd
 
-Run this from a directory you will keep. Local artifacts and Bifrost data live under `.wyrd/` there.
+```bash
+wyrd server dev
+```
+
+On a terminal, the command asks for what it cannot find: the PostgreSQL URL (typed with echo off, for example `postgresql://wyrd:wyrd@127.0.0.1:5432/wyrd`) and the tenant slug, such as `acme`. Each input is taken from, in order, a command argument, its environment variable, the saved setting, and finally that question:
+
+| Input | Argument | Environment | Saved in |
+| --- | --- | --- | --- |
+| Database | none: never an argument | `WYRD_DATABASE_URL`, optional `WYRD_PLATFORM_DATABASE_URL` | `credentials.toml` `[dev]` |
+| Tenant | `--tenant` | none | `config.toml` `[dev].tenant` |
+| HTTP listener | `--bind` | `WYRD_SERVER_BIND` | `config.toml` `[dev].bind` |
+| gRPC listener | `--grpc-bind` | `WYRD_GRPC_BIND` | `config.toml` `[dev].grpc_bind` |
+| Object storage | `--storage-url` (no credentials) | `WYRD_STORAGE_URL` | `config.toml` `[dev].storage_url` |
+| Bifrost data | none | `WYRD_BIFROST_DATA_DIR` | `config.toml` `[dev].bifrost_data_dir` |
+
+Listeners default to `127.0.0.1:8080` (HTTP) and `127.0.0.1:50051` (gRPC) and must be loopback. Without `WYRD_STORAGE_URL`, the command says so and uses `server/data/storage` and `server/data/bifrost` under the config directory, saved as absolute paths, so the working directory no longer matters. An existing `./.wyrd` directory is never adopted silently; to keep using it, pass `--storage-url file:///abs/path/.wyrd/storage` and set `WYRD_BIFROST_DATA_DIR`.
+
+Scripts and agents pass everything up front and add `--non-interactive`. A run without a terminal, or with that flag, never asks; it lists every missing input together and exits before downloading, migrating, or creating anything:
 
 ```bash
 export WYRD_DATABASE_URL="postgresql://wyrd:wyrd@127.0.0.1:5432/wyrd"
-wyrd server dev --tenant acme
+wyrd server dev --tenant acme --non-interactive
 ```
 
-The first run downloads the newest server release, migrates the database, starts the server, and creates the `acme` tenant. It ends with:
+The first run downloads the newest server release, migrates the database, starts the server, saves its settings, and creates the tenant. It ends with a summary:
 
 ```text
-Migrating the installed Wyrd server <version>.
-Tenant acme (<tenant-id>) is active; saving local client configuration.
-Local Wyrd ready at http://127.0.0.1:8080 for tenant acme. The saved endpoint and credential are available to fresh clients; press Ctrl-C to stop.
+Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
+  gRPC: http://127.0.0.1:50051
+  Storage: file:///home/you/.config/wyrd/server/data/storage
+  Bifrost data: /home/you/.config/wyrd/server/data/bifrost
+  Saved settings: /home/you/.config/wyrd/config.toml ([client], [dev]); key and database URLs: /home/you/.config/wyrd/credentials.toml
+  Gateway: skipped; configure it later with wyrd gateway deployment put --file
+Fresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.
 ```
 
-The server listens on `127.0.0.1:8080` for HTTP and `127.0.0.1:50051` for gRPC; set `WYRD_SERVER_BIND` or `WYRD_GRPC_BIND` to another loopback address to change them.
-
 The first run also creates the platform root, whose credential administers tenants. It is printed once, to your terminal only, never to stdout or stderr. Store it somewhere safe: it is how you recover a lost tenant credential.
+
+### Optional: the LLM gateway
+
+A first interactive run offers the provider keys it finds in the environment: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` (else `GEMINI_API_KEY`), and `TYPESAFE_API_KEY` for Jev. It shows only provider, variable, and proposed deployment name, never a value. Pick any subset, rename the deployments, and confirm; the server seals the keys and creates the credentials and deployments in one transaction. Declining, or having no keys, still ends ready. No provider is called, so the summary does not claim a key works.
+
+Unattended runs skip the offer. To configure the gateway without questions, pass a document whose credentials name environment variables, such as [`examples/gateway-setup/gateway.json`](https://github.com/bohmian-ai/wyrd/tree/main/examples/gateway-setup); `--gateway-file` applies it on every run that passes it, restarts included. `--skip-gateway` skips the offer explicitly. See [Set up the LLM gateway](/connect/set-up-the-llm-gateway/).
 
 Interactive runs then offer to connect the coding agents they find, such as Claude Code or Codex, through MCP. Accept, or skip and run `wyrd mcp install` later.
 
@@ -57,9 +82,10 @@ What the command saved, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else 
 
 | File | Holds |
 | --- | --- |
-| `credentials.toml` | The tenant administrator's API key, as `[default].api_key`, readable only by you |
-| `config.toml` | The HTTP and gRPC endpoints, as `[client].http_url` and `[client].grpc_url` |
+| `credentials.toml` | The tenant administrator's API key, as `[default].api_key`, and the database URLs, as `[dev]`, readable only by you |
+| `config.toml` | The HTTP and gRPC endpoints, as `[client].http_url` and `[client].grpc_url`, and the non-secret `[dev]` settings above |
 | `server/sealing.key` | The key that encrypts stored secrets such as gateway provider keys, readable only by you |
+| `server/data/` | Local object storage and Bifrost data, unless you chose other locations |
 
 ## Check it works
 
@@ -112,21 +138,27 @@ Even a new tenant lists Wyrd's built-in tables. `connect` checks the credential 
 
 ## Stop and restart
 
-Press Ctrl-C in the server terminal. To restart, run the same command from the same directory:
+Press Ctrl-C in the server terminal. To restart, from any directory, with nothing exported:
 
 ```bash
-wyrd server dev --tenant acme
+wyrd server dev
 ```
 
-Migrations are safe to rerun, and an existing tenant keeps its key. Your data lives in three places; keep all of them: the PostgreSQL database, `.wyrd/`, and the config directory. Lose `server/sealing.key` and stored provider keys can no longer be decrypted, so you would put them again.
+The restart reuses the saved database, listeners, tenant, data paths, key, and sealing key, and asks nothing. Migrations are safe to rerun, and an existing tenant keeps its key; the command never issues a replacement just because it restarted. An argument or environment variable overrides only its own saved setting. A different `--tenant` while a key is saved is refused; use a separate `WYRD_CONFIG_HOME` for another tenant.
+
+Your data lives in two places; keep both: the PostgreSQL database and the config directory. Lose `server/sealing.key` and stored provider keys can no longer be decrypted, so you would put them again.
 
 ## If it fails
 
 | You see | Cause | Fix |
 | --- | --- | --- |
+| `WYRD_CLI_503_SERVER_DEV` naming the `input` stage | An input is missing or invalid | Set the named variable or argument, or run on a terminal to be asked |
 | `WYRD_CLI_503_SERVER_DEV` naming the `migration` stage | The database is unreachable, or the login does not own it | Check `WYRD_DATABASE_URL` and the `OWNER` of the `wyrd` database, then rerun |
 | `WYRD_CLI_503_SERVER_DEV` naming the `listener` stage | Port 8080 is taken | Set `WYRD_SERVER_BIND` to a free loopback address and rerun |
 | `is a superuser` or `BYPASSRLS` | `WYRD_DATABASE_URL` names an administrator login | Use the `wyrd` login created above |
+| `WYRD_CLI_503_SERVER_DEV` naming the `local persistence` stage | The config directory is not writable | Restore its permissions and rerun; no tenant key was issued |
+| `WYRD_CLI_503_SERVER_DEV` naming the `saved credential` stage after the tenant is active | The one-time tenant key was lost | Rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set to the platform root and confirm rotation, or run `wyrd platform tenant recover-admin` |
+| A gateway problem after the server is ready | The server refused the gateway document; nothing was applied | Correct the document or keys and rerun, or pass `--skip-gateway` |
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | No server release exists for this machine | Use a supported host from the prerequisites |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` from `wyrd list` or `connect` | No saved credential is visible to this process | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | Calls go to the wrong server, or a key is refused | `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or `WYRD_SERVER_URL` is exported from other work, and it wins over the saved config | Unset them |

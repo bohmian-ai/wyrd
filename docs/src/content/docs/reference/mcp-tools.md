@@ -111,6 +111,7 @@ Gateway tools address resources in the authenticated tenant by exact `name`. The
 | `gateway.get_capture_policy` | Read; `gateway:read` | `{}` → versioned capture policy | Read payload capture configuration |
 | `gateway.put_provider_credential` | Write; `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate an operator/external binding or write-only managed secret |
 | `gateway.put_provider_deployment` | Write; `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
+| `gateway.apply_provider_deployments` | Write; `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Create or rotate credentials and create or replace deployments in one transaction; secrets are write-only |
 | `gateway.put_fallback_policy` | Write; `gateway:write` | FallbackPolicy → fallback policy | Replace routing fallback |
 | `gateway.put_governance_policy` | Write; `gateway:write` | GovernancePolicy → governance policy | Replace limits, budgets, pricing |
 | `gateway.put_capture_policy` | Write; `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace payload capture configuration |

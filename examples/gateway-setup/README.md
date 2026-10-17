@@ -2,44 +2,48 @@
 
 Four named deployments, one per built-in provider, set up with the installed
 `wyrd` CLI against a local development server. `gateway.json` and
-`capture-policy.json` hold no secrets. Provider keys go into credential files you write outside the
-repository; never commit them.
+`capture-policy.json` hold no secrets: each credential in `gateway.json` names
+the environment variable holding its key (`local_env`), which the CLI reads
+and sends once. The server seals the keys and applies every credential and
+deployment in one transaction.
 
 The `local_dev` journey
 `sdks/wyrd-sdk-python/tests/integration/test_local_development.py::test_installed_cli_gateway_setup`
 runs these exact commands and this `gateway.json` against local provider
 fixtures.
 
-1. Start the server and keep it running in its own terminal:
+1. Export your provider keys:
 
    ```bash
-   wyrd server dev --tenant acme
+   export OPENAI_API_KEY=... ANTHROPIC_API_KEY=... GOOGLE_API_KEY=... TYPESAFE_API_KEY=...
    ```
 
-2. Write one credential file per provider from your own keys:
+2. Start the server with the gateway document and keep it running in its own
+   terminal. On first use it also asks for anything it cannot find, such as
+   the PostgreSQL URL:
 
    ```bash
-   umask 077
-   for provider in openai anthropic gemini jev; do
-     key_var="$(echo "$provider" | tr a-z A-Z)_API_KEY"
-     printf '{"name":"%s-key","provider":"%s","source":{"managed_secret":{"secret":"%s"}}}\n' \
-       "$provider" "$provider" "${!key_var}" > "$provider-credential.json"
-   done
+   wyrd server dev --tenant acme --gateway-file gateway.json
    ```
 
-3. Store the credentials, sealed by the server, apply the deployments, and
-   retain call metadata in `vala.gateway.calls`. Reapplying converges; a
-   malformed list or a repeated name writes nothing.
+   Or apply the document to a server that is already running. Reapplying
+   converges; a refused document, such as one naming an unset variable,
+   applies nothing:
 
    ```bash
-   wyrd gateway credential put --file openai-credential.json
-   wyrd gateway credential put --file anthropic-credential.json
-   wyrd gateway credential put --file gemini-credential.json
-   wyrd gateway credential put --file jev-credential.json
    wyrd gateway deployment put --file gateway.json
+   ```
+
+3. Check the deployments and retain call metadata in `vala.gateway.calls`:
+
+   ```bash
    wyrd gateway deployment list
    wyrd gateway capture-policy put --file capture-policy.json
    ```
+
+   Credentials can also be stored one at a time, with
+   `wyrd gateway credential put --file -` and a `managed_secret` piped on
+   stdin; a JSON list of deployments then refers to them by name.
 
 4. Call a deployment by name with any SDK signed in to the saved deployment.
    The model after the deployment name reaches the provider unchanged:

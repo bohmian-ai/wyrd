@@ -516,6 +516,7 @@ impl VerificationFixture {
                 verifier_card_uid: verifier.clone(),
                 card_uid: subject.clone(),
                 run_id: None,
+                group_id: None,
                 inputs,
                 execution_route_overrides: BTreeMap::new(),
             },

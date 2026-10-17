@@ -23,7 +23,7 @@ use crate::auth::Sha256Hex;
 use crate::card::agent::{BuiltinTool, ExecutionRoute};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, ExecutionId, SlotName};
+use crate::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use crate::reference::CardRef;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
@@ -44,6 +44,11 @@ pub struct VerificationRequest {
     /// The caller's application Run, when the execution belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// Caller-chosen group this execution belongs to, scoped to the tenant
+    /// and authenticated owner Service. Grouped Verifier bindings discover
+    /// executions sharing it; omitting it keeps the invocation ungrouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<GroupId>,
     /// Input declarations keyed by the Verifier's slot names.
     #[serde(default)]
     pub inputs: BTreeMap<SlotName, InputDeclaration>,

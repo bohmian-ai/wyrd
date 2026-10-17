@@ -780,11 +780,19 @@ fn verdict_schema() -> Value {
 /// Validates one slot's own constraints.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] with rule `slot` for an empty media
-/// format list, a zero `max_bytes`, a samples slot without measurements, or a
-/// non-schema JSON `schema`.
+/// Returns [`WyrdError::Validation`] with rule `slot` for the reserved
+/// `group_id` slot name, which collides with the SDK verify/submit argument,
+/// an empty media format list, a zero `max_bytes`, a samples slot without
+/// measurements, or a non-schema JSON `schema`.
 fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
     let path = format!("inputs.{slot}");
+    if slot.as_str() == "group_id" {
+        return Err(invalid(
+            "slot",
+            &path,
+            "group_id is reserved for the verify/submit group_id argument; rename the slot",
+        ));
+    }
     match input {
         InputSlot::Media {
             formats, max_bytes, ..
@@ -1136,6 +1144,32 @@ mod tests {
             let body = json!({"decide": {"pass_rate": {"threshold": threshold}}});
             assert_eq!(parse(&body).validate().is_ok(), valid, "{threshold}");
         }
+    }
+
+    /// `group_id` is reserved for the SDK argument, so a slot of that name is
+    /// refused under rule `slot` at `inputs.group_id` whatever its type.
+    ///
+    /// # Panics
+    /// Panics when the reserved slot is accepted or refused under the wrong
+    /// rule or path.
+    #[test]
+    fn verifier_spec_reserves_group_id_slot() {
+        for slot in [json!({"type": "json"}), json!({"type": "trace"})] {
+            let body = json!({"inputs": {"group_id": slot}});
+            match parse(&body).validate() {
+                Err(WyrdError::Validation { details, message }) => {
+                    assert_eq!(details["rule"], "slot", "{body}");
+                    assert_eq!(details["path"], "inputs.group_id", "{body}");
+                    assert!(message.contains("group_id"), "{message}");
+                }
+                other => panic!("expected a slot refusal for {body}, got {other:?}"),
+            }
+        }
+        assert!(
+            parse(&json!({"inputs": {"group": {"type": "json"}}}))
+                .validate()
+                .is_ok()
+        );
     }
 
     /// Unknown authored fields and malformed shapes are refused at decode.

@@ -801,7 +801,11 @@ fn result(
             run_id,
             verifier_version: &run.verifier_version,
             card_uid: &run.card_uid,
-            owner_card_uid: run.owner_card_uid.as_ref(),
+            owner_card_uid: run
+                .owner_card_uid
+                .as_ref()
+                .or_else(|| run.authority.principal.owner_service_uid()),
+            group_id: run.group_id.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),
             window,

@@ -23,7 +23,10 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// exact Verifier, route overrides, idempotency key and request hash, and the
 /// accepted authority — and is null for a direct execution. `recorded_at` is
 /// the server-recorded input time, distinct from execution start/completion
-/// and from sample window time. The managed `run_id` is the application Run,
+/// and from sample window time. `owner_card_uid` is the authenticated
+/// caller's owner Service, null when none was available, and `group_id` the
+/// caller's group, null when ungrouped; grouped bindings discover source rows
+/// by both. The managed `run_id` is the application Run,
 /// null when there is none; the managed `card_uid` is the subject verified.
 pub struct ExecutionInputsTable;
 
@@ -49,8 +52,10 @@ impl DomainTable for ExecutionInputsTable {
     fn arrow_fields() -> Vec<Field> {
         vec![
             utf8("execution_id", false),
+            utf8("owner_card_uid", true),
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
+            utf8("group_id", true),
             boolean("queue_execution", false),
             variant_field(INPUTS, false),
             variant_field(ACTIVATION, true),
@@ -58,12 +63,13 @@ impl DomainTable for ExecutionInputsTable {
         ]
     }
 
-    /// Daily partitions sorted newest first, Bloom-pruned on the execution a runner reads back.
+    /// Daily partitions sorted newest first, Bloom-pruned on the execution a
+    /// runner reads back and the group a grouped binding discovers.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             "recorded_at",
             vec![sort_desc("recorded_at")],
-            &["execution_id"],
+            &["execution_id", "group_id"],
         )
     }
 }

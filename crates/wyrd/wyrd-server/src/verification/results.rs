@@ -28,7 +28,7 @@ use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_runtime::request_context::AcceptedAuthority;
 use wyrd_spec::card::agent::ExecutionRoute;
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::ids::RunId;
@@ -151,8 +151,11 @@ pub struct ResultRun<'a> {
     pub verifier_version: &'a str,
     /// The Card verified, stored as the managed `card_uid`.
     pub card_uid: &'a CardUid,
-    /// Binding owner; `None` for an execution with no binding.
+    /// Owner Service: the binding owner for binding-created work, else the
+    /// authenticated caller's owner Service; `None` when neither is known.
     pub owner_card_uid: Option<&'a CardUid>,
+    /// Caller group the execution belongs to; `None` when ungrouped.
+    pub group_id: Option<&'a GroupId>,
     /// Binding; `None` for an execution with no binding.
     pub binding_id: Option<BindingId>,
     /// Frozen Trigger; `None` for an execution with no binding.
@@ -272,6 +275,7 @@ impl<'a> ResultPayloadBuilder<'a> {
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
+            ("group_id", text([self.group()])),
             ("trigger_identity", text([trigger])),
             (
                 "window_start",
@@ -323,11 +327,13 @@ impl<'a> ResultPayloadBuilder<'a> {
                 "execution_id",
                 text([Some(self.run.execution_id.to_string())]),
             ),
+            ("owner_card_uid", text([self.owner()])),
             (
                 "verifier_card_uid",
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
+            ("group_id", text([self.group()])),
             (
                 "queue_execution",
                 Arc::new(BooleanArray::from(vec![submission.is_some()])),
@@ -537,6 +543,11 @@ impl<'a> ResultPayloadBuilder<'a> {
     fn binding(&self) -> Option<String> {
         self.run.binding_id.map(|binding| binding.to_string())
     }
+
+    /// The caller group, null for an ungrouped execution.
+    fn group(&self) -> Option<&str> {
+        self.run.group_id.map(GroupId::as_str)
+    }
 }
 
 /// Encode `value` as canonical (RFC 8785) JSON.
@@ -652,6 +663,7 @@ mod tests {
                     verifier_version: "1.2.0",
                     card_uid: &self.subject,
                     owner_card_uid: Some(&self.owner),
+                    group_id: None,
                     binding_id: Some(self.binding),
                     trigger: Some(&self.trigger),
                     window: Some(&self.window),

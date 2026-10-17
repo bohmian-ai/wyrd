@@ -26,7 +26,9 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// application Run judged, null when there is none, as for scheduled drift;
 /// the managed `card_uid` is the Card verified. The Verifier Card is the
 /// `verifier_card_uid` payload column; the binding owner is `owner_card_uid`
-/// and `binding_id` the binding, both null for an execution with no binding.
+/// and `binding_id` the binding, both null for an execution with no binding;
+/// a caller execution records its authenticated owner Service instead, when
+/// one was available. `group_id` is the caller's group, null when ungrouped.
 /// The managed `sub_principal_id`/`act_principal_id` pair records whom the
 /// execution served and who executed it.
 pub struct ResultsTable;
@@ -60,6 +62,7 @@ impl DomainTable for ResultsTable {
             utf8("owner_card_uid", true),
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
+            utf8("group_id", true),
             utf8("trigger_identity", true),
             ts_us_utc("window_start", true),
             ts_us_utc("window_end", true),
@@ -69,7 +72,7 @@ impl DomainTable for ResultsTable {
         ]
     }
 
-    /// Daily partitions sorted newest first, Bloom-pruned on result, execution, Verifier, and binding lookups.
+    /// Daily partitions sorted newest first, Bloom-pruned on result, execution, Verifier, binding, and group lookups.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             "ended_at",
@@ -79,6 +82,7 @@ impl DomainTable for ResultsTable {
                 "execution_id",
                 "verifier_card_uid",
                 "binding_id",
+                "group_id",
             ],
         )
     }

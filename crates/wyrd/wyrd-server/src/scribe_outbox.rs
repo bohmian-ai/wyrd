@@ -1091,6 +1091,7 @@ mod tests {
                 verifier_version: "1.0.0",
                 card_uid: subject,
                 owner_card_uid: None,
+                group_id: None,
                 binding_id: None,
                 trigger: None,
                 window: Some(&window),

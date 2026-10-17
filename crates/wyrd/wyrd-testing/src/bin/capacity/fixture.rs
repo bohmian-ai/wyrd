@@ -72,6 +72,7 @@ pub fn request(
         verifier_card_uid: verifier.clone(),
         card_uid: subject.clone(),
         run_id: None,
+        group_id: None,
         inputs: [(
             SlotName::new(CONTEXT_SLOT)?,
             InputDeclaration::Json {

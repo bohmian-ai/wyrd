@@ -625,7 +625,8 @@ impl<'a> VerificationControl<'a> {
                 // The inputs row records no Verifier version.
                 verifier_version: "",
                 card_uid: &submission.request.card_uid,
-                owner_card_uid: None,
+                owner_card_uid: caller.principal.owner_service_uid(),
+                group_id: submission.request.group_id.as_ref(),
                 binding_id: None,
                 trigger: None,
                 window: None,
@@ -654,8 +655,8 @@ impl<'a> VerificationControl<'a> {
     /// The payload mints its own result identity and correlates with the
     /// execution through `execution_id`. Its rows name the subject
     /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
-    /// attributed to the caller, carry the caller's application Run, and have
-    /// no owner, binding, or Trigger. The inputs row never queues work. The
+    /// attributed to the caller, carry the caller's application Run, group,
+    /// and authenticated owner Service, and have no binding or Trigger. The inputs row never queues work. The
     /// verdict is already decided, so an unbuildable payload is logged and
     /// not recorded.
     fn stage_direct(
@@ -674,7 +675,8 @@ impl<'a> VerificationControl<'a> {
                 run_id: request.run_id.as_ref(),
                 verifier_version: &verifier_version,
                 card_uid: &request.card_uid,
-                owner_card_uid: None,
+                owner_card_uid: caller.principal.owner_service_uid(),
+                group_id: request.group_id.as_ref(),
                 binding_id: None,
                 trigger: None,
                 window: None,

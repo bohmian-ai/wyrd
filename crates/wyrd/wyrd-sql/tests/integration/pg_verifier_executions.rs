@@ -505,6 +505,7 @@ fn request(verifier: &CardUid, subject: &CardUid) -> VerificationRequest {
         verifier_card_uid: verifier.clone(),
         card_uid: subject.clone(),
         run_id: None,
+        group_id: None,
         inputs: BTreeMap::from([(
             SlotName::new("answer").expect("valid slot name"),
             InputDeclaration::Json {

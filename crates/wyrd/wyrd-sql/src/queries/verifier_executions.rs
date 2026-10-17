@@ -33,7 +33,7 @@ use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
 use wyrd_spec::card::verifier::ScheduledInput;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{
-    BindingId, CardUid, ExecutionId, OperatorDispatchId, SlotName, VerificationResultId,
+    BindingId, CardUid, ExecutionId, GroupId, OperatorDispatchId, SlotName, VerificationResultId,
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
@@ -120,14 +120,14 @@ const INSERT_SUBMISSION_SQL: &str = r"
         origin, run_id, inputs, route_overrides,
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
-        next_attempt_at, settled_at, created_at, updated_at, cause_sampled
+        next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id
     )
     SELECT $1, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
            'manual', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
            CASE WHEN $15::jsonb IS NULL THEN 'pending' ELSE 'errored' END, $15, $14,
            CASE WHEN $15::jsonb IS NULL THEN statement_timestamp() END,
            CASE WHEN $15::jsonb IS NOT NULL THEN statement_timestamp() END,
-           statement_timestamp(), statement_timestamp(), $16
+           statement_timestamp(), statement_timestamp(), $16, $17
       FROM wyrd.cards v, wyrd.cards s
      WHERE v.card_uid = $2 AND s.card_uid = $3
     ON CONFLICT DO NOTHING
@@ -240,7 +240,7 @@ const CLAIM_SQL: &str = r"
               e.run_id, e.inputs, e.route_overrides,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled,
+              e.cause_sampled, e.group_id,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -877,6 +877,8 @@ pub struct ClaimedExecution {
     pub trigger: Option<FrozenTarget>,
     /// Frozen input.
     pub input: ExecutionInput,
+    /// Caller group the execution belongs to; `None` when ungrouped.
+    pub group_id: Option<GroupId>,
     /// Who the execution serves and who accepted it, frozen at admission.
     pub attribution: Attribution,
     /// The effective authority accepted with the execution; every Agent call
@@ -1202,6 +1204,7 @@ impl VerifierExecutionQueue {
             .bind(self.retry.max_attempts)
             .bind(error.map(Json))
             .bind(submission.cause.as_ref().map(|cause| cause.sampled))
+            .bind(request.group_id.as_ref().map(GroupId::as_str))
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -1909,6 +1912,8 @@ struct ClaimedRow {
     cause_span_id: Option<Vec<u8>>,
     /// Whether the submitting request's caller sampled it.
     cause_sampled: Option<bool>,
+    /// Caller group the execution belongs to.
+    group_id: Option<String>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -1982,6 +1987,10 @@ impl ClaimedRow {
                 .transpose()?,
             trigger,
             input,
+            group_id: self
+                .group_id
+                .map(|id| stored(GroupId::new(id)))
+                .transpose()?,
             attribution: Attribution::new(
                 PrincipalId::new(self.sub_principal_id),
                 PrincipalId::new(self.act_principal_id),
@@ -2158,6 +2167,7 @@ mod tests {
             verifier_card_uid: verifier,
             card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("v7 Card UID"),
             run_id: None,
+            group_id: None,
             inputs: BTreeMap::new(),
             execution_route_overrides: BTreeMap::new(),
         }

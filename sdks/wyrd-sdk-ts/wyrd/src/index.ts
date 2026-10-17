@@ -2098,6 +2098,12 @@ export interface VerifierInputOptions {
    * it is a JSON object that would otherwise read as slot names.
    */
   readonly positional?: boolean;
+  /**
+   * The caller's group, such as a conversation or order ID, that grouped
+   * Verifiers judge together. Never an input slot; omitted, the execution is
+   * ungrouped.
+   */
+  readonly group_id?: string;
 }
 
 /** What `submit` did: Window samples were recorded, or Run evidence was queued. */
@@ -2285,7 +2291,8 @@ export class Observe {
    * @param verifier - The bound Verifier's name.
    * @param inputs - Values keyed by input slot name, or the one value of a
    * single-slot Verifier: a scalar, array, `verify.File`, or `verify.ArtifactRef`.
-   * @param options - `{ positional: true }` passes a JSON object whole as that one value.
+   * @param options - `{ positional: true }` passes a JSON object whole as that
+   * one value; `group_id` names the caller group the execution belongs to.
    * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER`,
    * `WYRD_VERIFICATION_400_INPUT_INVALID`, `WYRD_VERIFICATION_413_INPUT_TOO_LARGE`,
    * `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` for a scheduled-window Verifier,
@@ -2296,7 +2303,9 @@ export class Observe {
     inputs: VerifierInput | VerifierInputs,
     options?: VerifierInputOptions,
   ): Promise<VerificationResult> {
-    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs, options)));
+    return lifecycleValue(
+      await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id),
+    );
   }
 
   /**
@@ -2315,7 +2324,7 @@ export class Observe {
     inputs: VerifierInput | VerifierInputs,
     options?: VerifierInputOptions,
   ): Promise<Submission> {
-    const submission = await this.#native.submit(verifier, nativeInputs(inputs, options));
+    const submission = await this.#native.submit(verifier, nativeInputs(inputs, options), options?.group_id);
     if (submission.execution == null && submission.error == null) {
       return { kind: "recorded" };
     }

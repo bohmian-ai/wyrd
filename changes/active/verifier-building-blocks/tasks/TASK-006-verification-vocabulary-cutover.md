@@ -413,8 +413,8 @@ Status: `IMPLEMENTED`. Candidate: commits `f711c6834`..`72d0fe4e0` on
 - Retired-table SQL reports the same refusal as a never-existing namespace
   (`vala.absent`), which is `WYRD_VALA_400_QUERY_INVALID_SQL`, not a 404; the
   journeys assert equality with that baseline.
-- `ts:format` (the repository's TS format task) was run in place of the
-  task's `ts:format:check`, which does not exist; its only change was
-  committed. Full `test:sql` and full journey suites were not run; they belong
+- Correction (TASK-006-R1): `ts:format:check` does exist. The `ts:format`
+  run recorded here was write mode, not a check-mode execution; its only
+  change was committed, and R1 records the check-mode run. Full `test:sql` and full journey suites were not run; they belong
   to change review.
 - Brand SVG text renames were not visually inspected for overflow.

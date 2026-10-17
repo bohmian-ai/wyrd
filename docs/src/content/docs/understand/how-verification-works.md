@@ -99,7 +99,7 @@ An Agent step has two input channels. `inputs` values are injected into the mode
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | PSI, SPC, or Custom over a `samples` slot (`on`), with full statistics |
 
-Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no tools and no workspace; registration refuses one that does.
+Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no workspace and may declare only the `bifrost.query` tool, for example to read the spans of trace IDs it was given; registration refuses any other tool. That query reads live data under the ordinary tool and query permissions, so its results are not part of the pinned evidence.
 
 A citation names an original input `slot` and a locator: `page`, `slide`, `lines`, `json_pointer`, or `region`. A step can return citations in its ordinary output, and a downstream judge can reuse them through its input bindings. The server checks that every cited location exists in the pinned evidence. An `agent` check that says `passed` without a valid citation becomes `inconclusive`.
 

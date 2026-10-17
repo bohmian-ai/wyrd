@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use skald_spec::MediaFormat;
-use vala_verify::blocks::Position;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 
@@ -214,24 +213,24 @@ fn workspace_tools_need_a_declared_workspace() {
             limits,
         );
         let id = TaskId::new("review").expect("task id");
-        let action: Action =
-            serde_json::from_value(json!({"kind": "extract", "from": "inputs.deck"}))
-                .expect("action parses");
-        let call = || BlockCall {
-            id: &id,
-            position: Position::Step,
-            block: &action,
-            inputs: BTreeMap::new(),
-            workspace: BTreeMap::new(),
-            deadline: Instant::now() + Duration::from_secs(30),
-        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let none = BTreeMap::new();
         for tool in [BuiltinTool::FsRead, BuiltinTool::CodeRun] {
-            let refused = tools.open(&call(), &[tool]).await.err().expect("refused");
+            let refused = tools
+                .open(&id, &none, deadline, &[tool])
+                .await
+                .err()
+                .expect("refused");
             assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
         }
         assert!(
             tools
-                .open(&call(), &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery])
+                .open(
+                    &id,
+                    &none,
+                    deadline,
+                    &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery]
+                )
                 .await
                 .is_ok()
         );

@@ -164,7 +164,9 @@ impl AgentToolset for FixedToolset {
     /// Panics when the empty registry refuses its one tool.
     async fn open(
         &self,
-        _call: &BlockCall<'_, Action>,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
         _tools: &[BuiltinTool],
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();
@@ -566,12 +568,13 @@ async fn check_agent_rejects_non_verdict() {
     assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
 }
 
-/// A check Agent declaring tools is refused before any model call.
+/// A check Agent declaring a tool other than `bifrost.query` is refused
+/// before any model call.
 ///
 /// # Panics
-/// Panics when the check runs.
+/// Panics when the check runs or the refusal does not name the allowed tool.
 #[tokio::test(flavor = "multi_thread")]
-async fn check_agent_refuses_tools() {
+async fn check_agent_refuses_tools_other_than_bifrost_query() {
     let executor = executor(Vec::new()).with_toolset(Arc::new(FixedToolset));
     let error = check(
         &executor,
@@ -579,8 +582,11 @@ async fn check_agent_refuses_tools() {
         input("response", json!("ok")),
     )
     .await
-    .expect_err("check Agents have no tools");
-    assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
+    .expect_err("check Agents may declare only bifrost.query");
+    assert!(
+        matches!(&error, BlockError::Terminal { reason } if reason.contains("bifrost.query")),
+        "{error}"
+    );
 }
 
 /// A per-call route override replaces the declared route: a gateway override
@@ -714,7 +720,9 @@ impl AgentToolset for BusyToolset {
     /// Panics when the empty registry refuses either tool.
     async fn open(
         &self,
-        _call: &BlockCall<'_, Action>,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
         _tools: &[BuiltinTool],
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();

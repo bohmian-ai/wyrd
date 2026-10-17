@@ -558,11 +558,14 @@ where
                 ));
             }
         } else {
-            if !tools.is_empty() {
+            if tools
+                .iter()
+                .any(|name| name != BuiltinTool::BifrostQuery.as_str())
+            {
                 return Err(invalid(
                     "check_agent_tools",
                     path,
-                    "check Agents have no tools",
+                    "check Agents may declare only the bifrost.query tool",
                 ));
             }
             let produces_verdict = match &resolved.prompt.response_type {
@@ -1398,7 +1401,8 @@ mod tests {
         assert_eq!(rule(&bad), "drift_source");
     }
 
-    /// Agent calls follow their Prompt placeholders and position rules.
+    /// Agent calls follow their Prompt placeholders and position rules; a
+    /// check Agent may declare `bifrost.query` and no other tool.
     ///
     /// # Panics
     /// Panics when an Agent rule is not enforced.
@@ -1498,6 +1502,17 @@ mod tests {
         parse(&registered)
             .validate()
             .expect("an unresolved registered Agent is validated by its resolver");
+        let live_query = with(
+            "/requirements/2/check/agent",
+            agent(
+                &["bifrost.query"],
+                json!([{"type": "document", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]),
+                Some(verdict_schema()),
+            ),
+        );
+        parse(&live_query)
+            .validate()
+            .expect("a check Agent may query Bifrost live");
     }
 
     /// Every built-in tool validates on a step Agent, with a workspace only

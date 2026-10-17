@@ -587,6 +587,7 @@ fn slot_type(slot: &InputSlot) -> &'static str {
         InputSlot::Media { .. } => "media",
         InputSlot::Trace { .. } => "trace",
         InputSlot::Samples { .. } => "samples",
+        InputSlot::Source(_) => "source",
     }
 }
 

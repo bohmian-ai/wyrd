@@ -9,7 +9,9 @@
 //! with it and executed by the tenant SYSTEM principal; a scheduled window
 //! first scores its drift requirements through [`DriftEngine`]. Each attempt
 //! ends in exactly one fenced transition the runner applies itself. A
-//! completed outcome becomes one result payload, staged on the process
+//! completed outcome becomes one result payload, staged on an outbox slot
+//! reserved before the engine ran (a full reserved share defers the
+//! execution instead) on the process
 //! [`ScribeOutbox`] attributed to the execution's subject and SYSTEM inside
 //! the fenced transaction that completes the execution, so a visible
 //! completion always has its result staged; delivery belongs to the outbox
@@ -38,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::{Empty, display};
 use vala_verify::blocks::{DriftChecks, EngineError};
+use wyrd_runtime::outbox::Reservation;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::operator::DriftCounts;
@@ -67,8 +70,12 @@ use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallSubject;
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
+
+/// A completed execution's result write and the outbox slot reserved for it
+/// before the engine ran.
+type StagedResult = (Reservation<ScribeSink>, ScribeWrite);
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -328,8 +335,11 @@ impl VerifierRunner {
     /// Run the execution and map the attempt to a transition.
     ///
     /// An execution without a loadable Verifier or a SYSTEM principal
-    /// terminates; otherwise the engine runs within the execution deadline
-    /// and a completed outcome is built into its result write, which
+    /// terminates. One outbox slot is then reserved for its result; when the
+    /// reserved share is full the execution defers without spending an
+    /// attempt, so a full outbox backs claims off instead of losing results.
+    /// Otherwise the engine runs within the execution deadline and a
+    /// completed outcome is built into its result write, which
     /// [`settle`](Self::settle) stages inside the lease-fenced transaction
     /// that completes the execution. Never fails: every failure becomes the
     /// [`Transition`] it maps to.
@@ -339,7 +349,7 @@ impl VerifierRunner {
         run: &ClaimedExecution,
         verifier: Result<Arc<CachedVerifier>, VerificationError>,
         telemetry: &ExecutionTelemetry,
-    ) -> (Transition, Option<ScribeWrite>) {
+    ) -> (Transition, Option<StagedResult>) {
         let verifier = match verifier {
             Ok(verifier) => verifier,
             Err(error) => return (Transition::Terminate(TerminalStatus::Errored, error), None),
@@ -347,6 +357,15 @@ impl VerifierRunner {
         let system = match system_principal(run) {
             Ok(system) => system,
             Err(transition) => return (transition, None),
+        };
+        let Ok(slot) = self.outbox.reserve(1) else {
+            return (
+                Transition::Defer(failure(
+                    RUNTIME_BUSY,
+                    "the verification result staging share is full",
+                )),
+                None,
+            );
         };
         let started_at = Utc::now();
         let deadline = tokio::time::Instant::now() + self.limits.execution_timeout;
@@ -362,7 +381,10 @@ impl VerifierRunner {
             .await;
         let outcome = executed.unwrap_or_else(|_| timed_out());
         match outcome {
-            EngineOutcome::Completed(outcome) => result(run, &outcome, system, started_at),
+            EngineOutcome::Completed(outcome) => {
+                let (transition, write) = result(run, &outcome, system, started_at);
+                (transition, write.map(|write| (slot, write)))
+            }
             EngineOutcome::Retry(error) => (Transition::Retry(error), None),
             EngineOutcome::Deferred(error) => (Transition::Defer(error), None),
             EngineOutcome::Terminal(status, error) => (Transition::Terminate(status, error), None),
@@ -454,7 +476,7 @@ impl VerifierRunner {
     /// Apply `transition` to `run` in one tenant transaction.
     ///
     /// When a [`Transition::Complete`] applies under this lease, the write in
-    /// `result` is taken and staged on the outbox before the transaction
+    /// `result` is taken and staged on its reserved slot before the transaction
     /// commits, so no reader sees the run `completed` before its result is
     /// pending. A stale lease stages nothing. If the commit then fails, the
     /// already-staged write keeps its result ID: a retried settlement under
@@ -474,7 +496,7 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         transition: Transition,
-        result: &Mutex<Option<ScribeWrite>>,
+        result: &Mutex<Option<StagedResult>>,
     ) -> Result<&'static str, SqlError> {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
@@ -493,10 +515,10 @@ impl VerifierRunner {
                     .complete(&mut conn, lease, result_id, verdict, &summary, drift)
                     .await?;
                 if settlement == Settlement::Applied
-                    && let Some(write) =
+                    && let Some((slot, write)) =
                         result.lock().unwrap_or_else(PoisonError::into_inner).take()
                 {
-                    self.outbox.stage(tenant, write);
+                    slot.stage(tenant, write);
                 }
                 settled(settlement, "completed")
             }

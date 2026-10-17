@@ -21,12 +21,14 @@
 //! waiting, retrying, or being written, plus slots reserved and not yet
 //! staged. An item stays admitted until it is written or lost, never merely
 //! dequeued, and a retried slice is admitted once however often it is
-//! retried. A producer that must refuse its caller rather than lose an item
-//! takes a [`Reservation`] first; [`Outbox::reserve`] refuses with
-//! [`OutboxFull`] once reservations would hold more than [`RESERVED_SHARE`]
-//! of the capacity, so the remaining share stays free for [`Outbox::stage`].
-//! `stage` never fails or waits: past capacity its item is counted lost and
-//! logged, so a full outbox never blocks or fails the operation staging it.
+//! retried. The capacity is split in two shares. A producer that must refuse
+//! its caller rather than lose an item takes a [`Reservation`] first;
+//! [`Outbox::reserve`] refuses with [`OutboxFull`] once reserved slots and
+//! the unwritten items staged through them would exceed [`RESERVED_SHARE`]
+//! of the capacity. Unreserved items from [`Outbox::stage`] hold the rest,
+//! so neither share can crowd out the other. `stage` never fails or waits:
+//! past its share an item is counted lost and logged, so a full outbox never
+//! blocks or fails the operation staging it.
 //!
 //! Nothing is preallocated. Items are lost when the process stops abruptly,
 //! when graceful shutdown reaches its deadline, when an item is staged after
@@ -60,8 +62,9 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Share of an outbox's capacity, as a fraction `(numerator, denominator)`,
-/// that reservations may hold; the rest stays free for unreserved staging,
-/// so a refusing producer's burst cannot crowd out audit decisions.
+/// that reservations may hold; the rest is unreserved staging's, so a
+/// refusing producer's burst cannot crowd out audit decisions and their
+/// traffic cannot refuse the producer.
 pub const RESERVED_SHARE: (usize, usize) = (3, 4);
 
 /// Refusal of a [`Reservation`] because the outbox holds its reserved share.
@@ -72,7 +75,8 @@ pub const RESERVED_SHARE: (usize, usize) = (3, 4);
 pub struct OutboxFull {
     /// The refusing outbox's [`OutboxSink::NAME`].
     pub outbox: &'static str,
-    /// Items admitted when the reservation was refused.
+    /// Reserved slots and unwritten reserved items when the reservation was
+    /// refused.
     pub admitted: usize,
     /// Items reservations may hold in this outbox.
     pub limit: usize,
@@ -108,8 +112,12 @@ pub trait OutboxSink: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Sending half of an outbox queue: a tenant and one of its items.
-type QueueSender<S> = mpsc::UnboundedSender<(DataTenantId, <S as OutboxSink>::Item)>;
+/// One queued item: its tenant, the item, and whether it was staged on a
+/// reserved slot.
+type Queued<S> = (DataTenantId, <S as OutboxSink>::Item, bool);
+
+/// Sending half of an outbox queue.
+type QueueSender<S> = mpsc::UnboundedSender<Queued<S>>;
 
 /// The handle callers stage through; owns the queue and its writer task.
 pub struct Outbox<S: OutboxSink> {
@@ -120,9 +128,8 @@ pub struct Outbox<S: OutboxSink> {
     queue: RwLock<Option<QueueSender<S>>>,
     /// Items queued, waiting, or being written, not yet written or lost.
     pending: Arc<AtomicUsize>,
-    /// `pending` plus reserved slots not yet staged; the count `capacity`
-    /// bounds. The writer releases written and lost items from both.
-    admitted: Arc<AtomicUsize>,
+    /// Admission counts the writer releases written and lost items from.
+    admission: Arc<Admission>,
     /// Most items this outbox admits at once.
     capacity: usize,
     /// Signalled whenever a settled write or abandonment leaves nothing
@@ -167,10 +174,10 @@ impl<S: OutboxSink> Outbox<S> {
     /// spawned immediately.
     #[must_use]
     pub fn new(sink: S, concurrency: usize, capacity: usize) -> Arc<Self> {
-        // The channel is unbounded because `admitted` already bounds it.
+        // The channel is unbounded because `admission` already bounds it.
         let (queue, requests) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
-        let admitted = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(Admission::default());
         let idle = Arc::new(Notify::new());
         let abandon = CancellationToken::new();
         let writer = TaskTracker::new();
@@ -186,7 +193,7 @@ impl<S: OutboxSink> Outbox<S> {
                 retry_at: HashMap::new(),
                 concurrency: concurrency.max(1),
                 pending: Arc::clone(&pending),
-                admitted: Arc::clone(&admitted),
+                admission: Arc::clone(&admission),
                 idle: Arc::clone(&idle),
                 abandon: abandon.clone(),
             }
@@ -196,7 +203,7 @@ impl<S: OutboxSink> Outbox<S> {
         Arc::new(Self {
             queue: RwLock::new(Some(queue)),
             pending,
-            admitted,
+            admission,
             capacity,
             idle,
             abandon,
@@ -214,74 +221,75 @@ impl<S: OutboxSink> Outbox<S> {
     /// Queues one item for `tenant` without waiting and never fails.
     ///
     /// The item is admitted and counted pending before it is sent, so the
-    /// writer can never release it first. When the outbox already admits
-    /// `capacity` items, once shutdown has begun, or if the writer is gone,
-    /// the item never enters the queue; it is counted lost and logged instead.
+    /// writer can never release it first. When the unreserved share is full,
+    /// once shutdown has begun, or if the writer is gone, the item never
+    /// enters the queue; it is counted lost and logged instead.
     pub fn stage(&self, tenant: DataTenantId, item: impl Into<S::Item>) {
-        if self.admit(1, self.capacity).is_err() {
+        let limit = self.capacity - self.reservable();
+        if admit(&self.admission.unreserved, 1, limit).is_err() {
             count_lost::<S>(1);
             tracing::error!(outbox = S::NAME, %tenant, capacity = self.capacity, "outbox is full; the staged item was lost");
             return;
         }
-        self.send(tenant, item.into());
+        self.send(tenant, item.into(), false);
     }
 
     /// Reserves `slots` items of capacity for a producer that must refuse its
     /// caller instead of losing what it stages.
     ///
     /// The reservation is admitted at once and holds its slots until each is
-    /// staged through it or it is dropped, which releases the unused rest.
+    /// staged through it or it is dropped, which releases the unused rest. An
+    /// item staged through it keeps its slot until it is written or lost.
+    /// Unreserved items never count against reservations.
     ///
     /// # Errors
     ///
     /// Returns [`OutboxFull`], admitting nothing, when the reservation would
     /// take reservations past [`RESERVED_SHARE`] of the capacity.
     pub fn reserve(self: &Arc<Self>, slots: usize) -> Result<Reservation<S>, OutboxFull> {
-        let limit = self.capacity * RESERVED_SHARE.0 / RESERVED_SHARE.1;
-        self.admit(slots, limit)
-            .map_err(|admitted| OutboxFull {
-                outbox: S::NAME,
-                admitted,
-                limit,
-            })?;
+        let limit = self.reservable();
+        admit(&self.admission.reserved, slots, limit).map_err(|admitted| OutboxFull {
+            outbox: S::NAME,
+            admitted,
+            limit,
+        })?;
         Ok(Reservation {
             outbox: Arc::clone(self),
             slots: AtomicUsize::new(slots),
         })
     }
 
-    /// Admits `count` items unless that takes the admitted total past
-    /// `limit`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the admitted total, admitting nothing, when `count` more would
-    /// exceed `limit`.
-    fn admit(&self, count: usize, limit: usize) -> Result<(), usize> {
-        self.admitted
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
-                admitted.checked_add(count).filter(|total| *total <= limit)
-            })
-            .map(|_| ())
+    /// The most slots reservations may hold: [`RESERVED_SHARE`] of the
+    /// capacity, rounded down.
+    const fn reservable(&self) -> usize {
+        self.capacity * RESERVED_SHARE.0 / RESERVED_SHARE.1
     }
 
-    /// Sends one admitted item to the writer, counting it pending first.
+    /// Sends one admitted item to the writer, counting it pending first;
+    /// `reserved` says which share admitted it.
     ///
     /// Once shutdown has begun, or if the writer is gone, the item is released
-    /// from admission, counted lost, and logged.
-    fn send(&self, tenant: DataTenantId, item: S::Item) {
+    /// from its share, counted lost, and logged.
+    fn send(&self, tenant: DataTenantId, item: S::Item, reserved: bool) {
         let queue = self.queue.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(queue) = queue.as_ref() {
             let gauge = metrics::gauge!("outbox_pending", "outbox" => S::NAME);
+            let reserved_count = usize::from(reserved);
             self.pending.fetch_add(1, Ordering::AcqRel);
+            self.admission
+                .staged_reserved
+                .fetch_add(reserved_count, Ordering::AcqRel);
             gauge.increment(1.0);
-            if queue.send((tenant, item)).is_ok() {
+            if queue.send((tenant, item, reserved)).is_ok() {
                 return;
             }
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.admission
+                .staged_reserved
+                .fetch_sub(reserved_count, Ordering::AcqRel);
             gauge.decrement(1.0);
         }
-        self.admitted.fetch_sub(1, Ordering::AcqRel);
+        self.admission.release(1, usize::from(reserved));
         count_lost::<S>(1);
         tracing::error!(outbox = S::NAME, %tenant, "outbox item staged after shutdown was lost");
     }
@@ -338,7 +346,8 @@ impl<S: OutboxSink> Outbox<S> {
             self.writer.wait().await;
         }
         let lost = self.pending.swap(0, Ordering::AcqRel);
-        self.admitted.fetch_sub(lost, Ordering::AcqRel);
+        let reserved = self.admission.staged_reserved.swap(0, Ordering::AcqRel);
+        self.admission.release(lost, reserved);
         if lost > 0 {
             count_lost::<S>(lost);
             metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(lost as f64);
@@ -378,7 +387,7 @@ impl<S: OutboxSink> Reservation<S> {
                 slots.checked_sub(1)
             });
         if spent.is_ok() {
-            self.outbox.send(tenant, item.into());
+            self.outbox.send(tenant, item.into(), true);
         } else {
             self.outbox.stage(tenant, item);
         }
@@ -387,10 +396,11 @@ impl<S: OutboxSink> Reservation<S> {
 
 /// Releases the slots this reservation never spent.
 impl<S: OutboxSink> Drop for Reservation<S> {
-    /// Returns the unspent slots to the outbox's admission count.
+    /// Returns the unspent slots to the reserved share.
     fn drop(&mut self) {
         self.outbox
-            .admitted
+            .admission
+            .reserved
             .fetch_sub(*self.slots.get_mut(), Ordering::AcqRel);
     }
 }
@@ -410,6 +420,45 @@ impl<S: OutboxSink> std::fmt::Debug for Reservation<S> {
     }
 }
 
+/// The two shares an [`Outbox`] admits items into, shared with its writer.
+#[derive(Debug, Default)]
+struct Admission {
+    /// Unreserved items not yet written or lost.
+    unreserved: AtomicUsize,
+    /// Unspent reserved slots plus reserved items not yet written or lost.
+    reserved: AtomicUsize,
+    /// Reserved items pending in the writer, which shutdown releases from
+    /// `reserved` when it abandons them.
+    staged_reserved: AtomicUsize,
+}
+
+impl Admission {
+    /// Releases `count` written or lost items, `reserved` of them reserved,
+    /// from their shares.
+    fn release(&self, count: usize, reserved: usize) {
+        self.reserved.fetch_sub(reserved, Ordering::AcqRel);
+        self.unreserved
+            .fetch_sub(count - reserved, Ordering::AcqRel);
+    }
+}
+
+/// Admits `count` items into `share` unless that takes it past `limit`.
+///
+/// # Errors
+///
+/// Returns the share's count, admitting nothing, when `count` more would
+/// exceed `limit`.
+fn admit(share: &AtomicUsize, count: usize, limit: usize) -> Result<(), usize> {
+    share
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            admitted.checked_add(count).filter(|total| *total <= limit)
+        })
+        .map(|_| ())
+}
+
+/// One tenant's items in arrival order and how many of them are reserved.
+type Backlog<I> = (Vec<I>, usize);
+
 /// Outcome of one spawned tenant write: the tenant, its items, and the result,
 /// whose error is the sink's error or the message of a contained panic.
 type Written<S> = (
@@ -426,16 +475,17 @@ struct OutboxWriter<S: OutboxSink> {
     /// Destination every write goes to.
     sink: Arc<S>,
     /// Receiving half of the queue.
-    requests: mpsc::UnboundedReceiver<(DataTenantId, S::Item)>,
+    requests: mpsc::UnboundedReceiver<Queued<S>>,
     /// Received items per tenant, in arrival order, not being written.
-    waiting: HashMap<DataTenantId, Vec<S::Item>>,
+    waiting: HashMap<DataTenantId, Backlog<S::Item>>,
     /// The exact slice of each tenant whose last write failed; it is that
     /// tenant's next write, unmerged with `waiting`.
-    failed: HashMap<DataTenantId, Vec<S::Item>>,
+    failed: HashMap<DataTenantId, Backlog<S::Item>>,
     /// In-flight tenant writes.
     writing: JoinSet<Written<S>>,
-    /// Tenant and item count of each in-flight write, keyed by its task.
-    in_flight: HashMap<Id, (DataTenantId, usize)>,
+    /// Tenant, item count, and reserved item count of each in-flight write,
+    /// keyed by its task.
+    in_flight: HashMap<Id, (DataTenantId, usize, usize)>,
     /// Earliest retry time and current backoff of each tenant whose last
     /// write failed.
     retry_at: HashMap<DataTenantId, (Instant, Duration)>,
@@ -443,8 +493,8 @@ struct OutboxWriter<S: OutboxSink> {
     concurrency: usize,
     /// Count shared with the handle; decremented once items are written.
     pending: Arc<AtomicUsize>,
-    /// Admission count shared with the handle; decremented with `pending`.
-    admitted: Arc<AtomicUsize>,
+    /// Admission shares shared with the handle; released with `pending`.
+    admission: Arc<Admission>,
     /// Woken whenever a settled write leaves nothing pending.
     idle: Arc<Notify>,
     /// Cancelled when shutdown reaches its deadline.
@@ -476,8 +526,10 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 }
                 count = self.requests.recv_many(&mut received, usize::MAX), if open => {
                     open = count != 0;
-                    for (tenant, item) in received.drain(..) {
-                        self.waiting.entry(tenant).or_default().push(item);
+                    for (tenant, item, reserved) in received.drain(..) {
+                        let (items, reserved_count) = self.waiting.entry(tenant).or_default();
+                        items.push(item);
+                        *reserved_count += usize::from(reserved);
                     }
                 }
                 () = async {
@@ -515,7 +567,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
             if self.writing.len() >= self.concurrency {
                 return;
             }
-            let Some(items) = self
+            let Some((items, reserved)) = self
                 .failed
                 .remove(&tenant)
                 .or_else(|| self.waiting.remove(&tenant))
@@ -548,13 +600,13 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 });
                 (tenant, items, result)
             });
-            self.in_flight.insert(task.id(), (tenant, count));
+            self.in_flight.insert(task.id(), (tenant, count, reserved));
         }
     }
 
     /// Whether `tenant` has no write in flight and its backoff has elapsed.
     fn is_ready(&self, tenant: DataTenantId, now: Instant) -> bool {
-        !self.in_flight.values().any(|(busy, _)| *busy == tenant)
+        !self.in_flight.values().any(|(busy, ..)| *busy == tenant)
             && self.retry_at.get(&tenant).is_none_or(|(at, _)| *at <= now)
     }
 
@@ -581,16 +633,19 @@ impl<S: OutboxSink> OutboxWriter<S> {
     /// lost; with sink panics contained that needs a panic that escapes
     /// containment, such as one raised while dropping a panic payload.
     fn finish(&mut self, done: Result<(Id, Written<S>), JoinError>) {
-        let (tenant, items, result) = match done {
+        let ((tenant, items, result), reserved) = match done {
             Ok((id, written)) => {
-                self.in_flight.remove(&id);
-                written
+                let reserved = self
+                    .in_flight
+                    .remove(&id)
+                    .map_or(0, |(.., reserved)| reserved);
+                (written, reserved)
             }
             Err(error) => {
-                if let Some((tenant, count)) = self.in_flight.remove(&error.id()) {
+                if let Some((tenant, count, reserved)) = self.in_flight.remove(&error.id()) {
                     count_lost::<S>(count);
                     tracing::error!(outbox = S::NAME, %tenant, %error, lost = count, "outbox write task failed");
-                    self.release(count);
+                    self.release(count, reserved);
                 }
                 return;
             }
@@ -598,7 +653,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let error = match result {
             Ok(()) => {
                 self.retry_at.remove(&tenant);
-                self.release(items.len());
+                self.release(items.len(), reserved);
                 return;
             }
             Err(error) => error,
@@ -618,14 +673,18 @@ impl<S: OutboxSink> OutboxWriter<S> {
             retry_in_ms = backoff.as_millis(),
             "outbox write failed; retrying"
         );
-        self.failed.insert(tenant, items);
+        self.failed.insert(tenant, (items, reserved));
     }
 
-    /// Releases `count` written or lost items from the pending and admitted
-    /// totals and wakes settlers when nothing remains pending.
-    fn release(&self, count: usize) {
+    /// Releases `count` written or lost items, `reserved` of them reserved,
+    /// from pending and their shares, and wakes settlers when nothing remains
+    /// pending.
+    fn release(&self, count: usize, reserved: usize) {
         metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(count as f64);
-        self.admitted.fetch_sub(count, Ordering::AcqRel);
+        self.admission
+            .staged_reserved
+            .fetch_sub(reserved, Ordering::AcqRel);
+        self.admission.release(count, reserved);
         if self.pending.fetch_sub(count, Ordering::AcqRel) == count {
             self.idle.notify_waiters();
         }
@@ -1033,11 +1092,17 @@ mod tests {
         await_failures(&state, 3).await;
         assert_eq!(outbox.pending(), 3, "a retried slice is admitted once");
 
-        let refused = outbox.reserve(1).expect_err("in-flight and retrying work fill the share");
+        let refused = outbox
+            .reserve(1)
+            .expect_err("in-flight and retrying work fill the share");
         assert_eq!((refused.admitted, refused.limit), (3, 3));
         outbox.stage(failing, 4_u32);
         outbox.stage(failing, 5_u32);
-        assert_eq!(outbox.pending(), 4, "unreserved staging past capacity is lost");
+        assert_eq!(
+            outbox.pending(),
+            4,
+            "unreserved staging past capacity is lost"
+        );
 
         {
             let mut state = state.lock().expect("unpoisoned");
@@ -1045,9 +1110,15 @@ mod tests {
             state.failing.clear();
         }
         hang.notify_one();
-        assert_eq!(outbox.settle(within(10)).await, 0, "the bounded work drains");
+        assert_eq!(
+            outbox.settle(within(10)).await,
+            0,
+            "the bounded work drains"
+        );
         drop((reserved, retried));
-        let recovered = outbox.reserve(3).expect("written work releases its capacity");
+        let recovered = outbox
+            .reserve(3)
+            .expect("written work releases its capacity");
         recovered.stage(hanging, 6_u32);
         assert_eq!(outbox.settle(within(10)).await, 0);
         let state = state.lock().expect("unpoisoned");
@@ -1057,7 +1128,8 @@ mod tests {
 
     /// Unreserved staging on a full outbox, as audit decisions use it, returns
     /// at once and counts the item lost; reservations cannot take the share
-    /// kept for it, and a dropped reservation returns its unspent slots.
+    /// kept for it, unreserved items never count against reservations, and a
+    /// dropped reservation returns its unspent slots.
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_audit_staging_remains_nonblocking() {
         let metrics = TestMetrics::default();
@@ -1069,17 +1141,31 @@ mod tests {
         state.lock().expect("unpoisoned").hanging.insert(tenant);
 
         let unspent = outbox.reserve(3).expect("the reserved share");
-        outbox.reserve(1).expect_err("reservations hold their whole share");
+        outbox
+            .reserve(1)
+            .expect_err("reservations hold their whole share");
         outbox.stage(tenant, 1_u32);
-        assert_eq!(outbox.pending(), 1, "the kept share admits unreserved staging");
+        assert_eq!(
+            outbox.pending(),
+            1,
+            "the kept share admits unreserved staging"
+        );
         outbox.stage(tenant, 2_u32);
-        assert_eq!(outbox.pending(), 1, "a full outbox refuses without waiting");
-        assert_eq!(metrics.counter("outbox_events_lost_total"), 1, "the refusal is counted");
+        assert_eq!(
+            outbox.pending(),
+            1,
+            "a full unreserved share refuses without waiting"
+        );
+        assert_eq!(
+            metrics.counter("outbox_events_lost_total"),
+            1,
+            "the refusal is counted"
+        );
 
         drop(unspent);
         outbox
-            .reserve(2)
-            .expect("a dropped reservation returns its slots beside the hanging item");
+            .reserve(3)
+            .expect("a dropped reservation returns its slots despite the hanging item");
     }
 
     /// Shutdown keeps retrying until the deadline and writes what recovers.

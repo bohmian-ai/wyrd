@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::CardRef;
+use wyrd_ai::cards::{CardRef, Cards};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Inputs, Submission};
@@ -24,7 +24,7 @@ use wyrd_ai::{
     VerificationVerdict, WyrdClient, WyrdError, cli,
 };
 use wyrd_spec::verification::VerifierReadiness;
-use wyrd_testing::server::WyrdTestServer;
+use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
@@ -65,25 +65,38 @@ impl Assistant {
     /// # Panics
     /// Panics when a setup step fails.
     pub(crate) async fn start() -> Self {
+        Self::start_on(WyrdTestServer::builder(), Duration::ZERO).await
+    }
+
+    /// Start the assistant deployment on `builder`, with the local judge
+    /// answering each call after `judge_delay`, as [`Self::start`] does.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start_on(builder: WyrdTestServerBuilder, judge_delay: Duration) -> Self {
         let judge = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-judge",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": { "role": "assistant", "content": AGREES },
-                }],
-                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 },
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(judge_delay)
+                    .set_body_json(json!({
+                        "id": "chatcmpl-judge",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": { "role": "assistant", "content": AGREES },
+                        }],
+                        "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 },
+                    })),
+            )
             .mount(&judge)
             .await;
         let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
+            builder
                 .with_verification_runtime_for_test()
                 .with_gateway_provider_root_for_test(
                     judge.uri().parse().expect("judge URL parses"),
@@ -132,6 +145,58 @@ impl Assistant {
         let state = self.state_as(self.deployment.client(&key));
         state.start_bifrost().await.expect("Bifrost starts");
         state
+    }
+
+    /// The assistant registered and hydrated in a new tenant `slug`, loaded
+    /// as that tenant's assistant Service with Bifrost started, beside the
+    /// bundle directory it was loaded from.
+    ///
+    /// # Panics
+    /// Panics when the tenant, a registration, the hydration, the key, or
+    /// Bifrost startup fails.
+    async fn in_tenant(&self, slug: &str) -> (WyrdState, TempDir) {
+        let admin = self
+            .deployment
+            .client(&self.deployment.other_tenant_admin(slug).await);
+        let cards = Cards::connect_with(&admin).await.expect("handle connects");
+        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+        let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+        let bundle = hydrate(&cards, &assistant.root).await;
+        let [kind, name, version, space] = coordinates(&assistant.root);
+        let key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(admin))
+            .await
+            .expect("the CLI issues the Service key");
+        let state = WyrdState::from_path_with(
+            bundle.path().join("bundle"),
+            self.deployment.client(key.key.expose()),
+        )
+        .expect("bundle loads offline");
+        state.start_bifrost().await.expect("Bifrost starts");
+        (state, bundle)
+    }
+
+    /// Wait until the judge has received `calls` requests, so that many
+    /// judged executions are in flight.
+    ///
+    /// # Panics
+    /// Panics when the judge stops recording or the calls never arrive.
+    async fn await_judge_calls(&self, calls: usize) {
+        let deadline = std::time::Instant::now() + WAIT;
+        while self
+            .judge
+            .received_requests()
+            .await
+            .expect("the judge records requests")
+            .len()
+            < calls
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the judge never received {calls} calls"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// The hydrated assistant, loaded with its server calls fixed to
@@ -1115,5 +1180,148 @@ async fn another_tenant_cannot_verify_the_assistant() {
             "{verifier}"
         );
     }
+    assistant.deployment.shutdown().await;
+}
+
+/// Scribe outbox capacity of the staging-pressure story: three quarters of
+/// it, four writes, is what two direct judgments reserve.
+const STAGING_CAPACITY: usize = 6;
+
+/// How long the slow judge of the staging-pressure story holds each call.
+const JUDGE_DELAY: Duration = Duration::from_secs(15);
+
+/// Stable code of a call refused for this server's staging capacity.
+const STAGING_FULL: &str = "WYRD_VERIFICATION_429_STAGING_FULL";
+
+/// The count of one tenant's `vala.verification.execution_inputs` rows.
+#[derive(Debug, Deserialize)]
+struct InputRows {
+    /// Rows the tenant has recorded.
+    rows: i64,
+}
+
+/// A tenant's slow judgments fill the server's reserved staging share while
+/// another tenant's submission is accepted and judged beside the first of
+/// them; once the share is full, further verify and submit calls are refused
+/// with typed retryable pressure before staging anything. Once the burst
+/// drains, the identical refused call is accepted and judged once, and the
+/// bursting tenant holds exactly one inputs row per accepted call.
+///
+/// # Panics
+/// Panics when a refusal is missing or untyped, the neighbor's execution
+/// does not complete during the burst, the recovery fails, or the recorded
+/// inputs differ from the accepted calls.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn verification_staging_refuses_and_recovers() {
+    let assistant = Assistant::start_on(
+        WyrdTestServer::builder().with_scribe_outbox_capacity_for_test(STAGING_CAPACITY),
+        JUDGE_DELAY,
+    )
+    .await;
+    let (neighbor, _neighbor_bundle) = assistant.in_tenant("burst-neighbor").await;
+    let state = assistant.state().await;
+    let server = assistant.deployment.server();
+    server.flush_bifrost().await.expect("setup settles");
+
+    let mut burst = Vec::new();
+    for in_flight in 1..=2 {
+        let judging = state.clone();
+        burst.push(tokio::spawn(async move {
+            judging
+                .run_for_card("agent")
+                .expect("agent run opens")
+                .observe()
+                .verify("answer-judged", json!("yes"))
+                .await
+        }));
+        assistant.await_judge_calls(in_flight).await;
+        if in_flight == 1 {
+            let Submission::Queued(accepted) = neighbor
+                .run_for_card("agent")
+                .expect("agent run opens")
+                .observe()
+                .submit("answer-check", json!("yes"))
+                .await
+                .expect("the neighbor's answer is accepted during the burst")
+            else {
+                panic!("Run evidence queues an execution");
+            };
+            let neighbor_result = accepted
+                .wait(WAIT)
+                .await
+                .expect("the neighbor's accepted execution completes during the burst");
+            assert_eq!(neighbor_result.outcome.verdict, VerificationVerdict::Passed);
+            assert!(
+                !burst[0].is_finished(),
+                "the bursting tenant's judgment is still in flight"
+            );
+            server.flush_bifrost().await.expect("the neighbor settles");
+        }
+    }
+
+    let refused_run = state.run_for_card("agent").expect("agent run opens");
+    let refused_verify = refused_run
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect_err("a full server refuses the verify");
+    let refused_submit = refused_run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect_err("a full server refuses the submit after its own retries");
+    for refused in [&refused_verify, &refused_submit] {
+        assert_eq!(refused.code(), STAGING_FULL, "{refused}");
+        assert_eq!(refused.status(), 429);
+        assert_eq!(
+            refused.as_problem_json()["details"]["retry_after_seconds"],
+            json!(1)
+        );
+    }
+
+    assert!(
+        burst.iter().all(|judging| !judging.is_finished()),
+        "the bursting tenant's judgments are still in flight"
+    );
+
+    for judging in burst {
+        let judged = judging
+            .await
+            .expect("the judgment joins")
+            .expect("each accepted judgment completes");
+        assert_eq!(judged.outcome.verdict, VerificationVerdict::Passed);
+    }
+    server.flush_bifrost().await.expect("the burst drains");
+    let Submission::Queued(recovered) = refused_run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect("the identical call is accepted once the burst drains")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let recovered = recovered
+        .wait(WAIT)
+        .await
+        .expect("the recovered call is judged");
+    assert_eq!(recovered.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(recovered.run_id.as_ref(), Some(refused_run.run_id()));
+
+    server.flush_bifrost().await.expect("rows publish");
+    let recorded = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as::<InputRows>(
+            "SELECT count(*) AS rows FROM vala.verification.execution_inputs",
+            &[],
+        )
+        .await
+        .expect("the inputs rows count");
+    assert_eq!(
+        recorded.iter().map(|count| count.rows).collect::<Vec<_>>(),
+        [3],
+        "two burst judgments and the recovered call; nothing of the refused calls"
+    );
     assistant.deployment.shutdown().await;
 }

@@ -37,7 +37,10 @@ pub mod reference;
 mod schema_path;
 mod validate;
 
-pub use reference::{PathSegment, Reference, ReferenceError, ReferenceRoot, VerdictField};
+pub use reference::{
+    PathSegment, Reference, ReferenceError, ReferenceRoot, SourceField, SourceReference,
+    SourceText, VerdictField,
+};
 pub use validate::ResolvedAgent;
 
 /// Most retries one step may declare after its first attempt.
@@ -165,6 +168,12 @@ pub enum InputSlot {
         #[serde(default = "required_default", skip_serializing_if = "is_true")]
         required: bool,
     },
+    /// A group Verifier's input authored as a source reference string,
+    /// `verifiers.<name>.inputs.<slot>` or
+    /// `verifiers.<name>.requirements.<requirement>.outcome`, resolved at
+    /// group execution to one ordered value per source execution.
+    #[serde(untagged)]
+    Source(SourceText),
 }
 
 impl InputSlot {
@@ -176,6 +185,7 @@ impl InputSlot {
             | Self::Media { required, .. }
             | Self::Trace { required }
             | Self::Samples { required, .. } => *required,
+            Self::Source(_) => true,
         }
     }
 }

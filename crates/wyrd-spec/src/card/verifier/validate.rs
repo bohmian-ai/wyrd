@@ -783,7 +783,9 @@ fn verdict_schema() -> Value {
 /// Returns [`WyrdError::Validation`] with rule `slot` for the reserved
 /// `group_id` slot name, which collides with the SDK verify/submit argument,
 /// an empty media format list, a zero `max_bytes`, a samples slot without
-/// measurements, or a non-schema JSON `schema`.
+/// measurements, or a non-schema JSON `schema`, and with rule `source` for a
+/// source declaration that is not a whole-slot or requirement-outcome
+/// reference.
 fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
     let path = format!("inputs.{slot}");
     if slot.as_str() == "group_id" {
@@ -814,6 +816,11 @@ fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
                 &path,
                 "samples slots name at least one measurement",
             ));
+        }
+        InputSlot::Source(source) => {
+            source
+                .parse()
+                .map_err(|error| invalid("source", &path, error))?;
         }
         InputSlot::Json {
             schema: Some(schema),
@@ -1169,6 +1176,47 @@ mod tests {
             parse(&json!({"inputs": {"group": {"type": "json"}}}))
                 .validate()
                 .is_ok()
+        );
+    }
+
+    /// A string slot is a source declaration: valid forms decode, validate,
+    /// and serialize back as the same string; a malformed source is refused
+    /// under rule `source` at its own slot path.
+    ///
+    /// # Panics
+    /// Panics when a source declaration is decoded, printed, or refused
+    /// incorrectly.
+    #[test]
+    fn verifier_spec_declares_source_slots() {
+        let body = json!({"inputs": {
+            "turns": "verifiers.turn-verifier.inputs.turn",
+            "checks": "verifiers.turn-verifier.requirements.on-topic.outcome",
+        }});
+        let spec = parse(&body);
+        spec.validate().expect("source slots validate");
+        assert_eq!(
+            serde_json::to_value(&spec).expect("serializes")["inputs"],
+            body["inputs"]
+        );
+        for source in [
+            "verifiers.turn-verifier.inputs.turn.text",
+            "verifiers.turn-verifier.inputs.turn[0]",
+            "verifiers.turn-verifier.inputs.turn[*]",
+            "verifiers.turn-verifier.requirements.on-topic.reason",
+            "steps.a.output",
+        ] {
+            let body = json!({"inputs": {"turns": source}});
+            match parse(&body).validate() {
+                Err(WyrdError::Validation { details, .. }) => {
+                    assert_eq!(details["rule"], "source", "{source}");
+                    assert_eq!(details["path"], "inputs.turns", "{source}");
+                }
+                other => panic!("expected a source refusal for {source}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            rule(&json!({"inputs": {"group_id": "verifiers.turn-verifier.inputs.turn"}})),
+            "slot"
         );
     }
 

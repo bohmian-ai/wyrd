@@ -100,8 +100,8 @@ const EVALUATION_PRODUCTS: [&str; 8] = [
     "run", "suite", "task", "job", "dataset", "report", "record", "workflow",
 ];
 
-/// Return a 60-character snippet for every retired evaluation name in `served`,
-/// mirroring the `check:deps` vocabulary rule over the served document.
+/// Return a 60-character snippet for every retired evaluation name in the
+/// served document `served`.
 ///
 /// Each case-folded `eval` occurrence must open a word: `eval` after no
 /// letter, `Eval`/`EVAL` after no uppercase letter (a camel boundary). It is
@@ -1376,9 +1376,8 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// evidence plans target the digest-keyed local upload route. The served
 /// document names no retired evaluation identifier — neither an abbreviation
 /// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
-/// `evaluation_runs`, `/evaluations`) — mirroring the `check:deps` vocabulary
-/// rule, while descriptive `Evaluation` prose and words such as `retrieval`
-/// stay legal.
+/// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
+/// and words such as `retrieval` stay legal.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, when a Verification path,

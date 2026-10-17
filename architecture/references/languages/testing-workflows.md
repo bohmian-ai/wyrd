@@ -184,7 +184,7 @@ a specific change will trip:
 | Gate | What it enforces |
 |---|---|
 | `lints` | Workspace Clippy policy from `Cargo.toml` `[lints]`, including `unwrap_used` and reasoned suppressions |
-| `check:deps` | Crate boundaries on the resolved graph: client tier, PyO3 scope, test tooling out of production, Skald foundation edges, one Arrow/DataFusion stack, AWS-LC-only Rustls, no test seams in the shipped server, no retired abbreviated evaluation names |
+| `check:deps` | Crate boundaries on the resolved graph: client tier, PyO3 scope, test tooling out of production, Skald foundation edges, one Arrow/DataFusion stack, AWS-LC-only Rustls, no test seams in the shipped server |
 | `check:tenant-isolation` | Query and server code reach tenant tables only through `TenantConn`; RLS itself is proven by Postgres readiness |
 | `check:storage:drift` | Storage credential and tenancy guardrails |
 | `check:py-wheel-no-testing` | Production `wyrd-sdk-python` wheel does not expose `wyrd.testing` |

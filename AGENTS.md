@@ -609,12 +609,6 @@ impl, generated-artifact drift, ownership of a durable resource. Those
 describe an invariant that can be violated by code someone could write
 tomorrow, so they stay regardless of age.
 
-The one owner-required exception is the verification vocabulary rule in
-`check:deps`: Wyrd has one verification model, and string-typed permissions,
-tables, generated contracts, and docs can reintroduce the retired abbreviated evaluation model
-where the compiler cannot see it. It exempts history, refusal tests, and
-external syntax only.
-
 Removing a check is a material decision: say which check, which property it
 claimed, and why that property is now unreachable or enforced elsewhere. This
 is not a licence to delete a check that is merely inconvenient or currently

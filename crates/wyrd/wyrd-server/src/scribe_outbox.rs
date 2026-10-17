@@ -587,9 +587,10 @@ impl ScribeRoute {
 
 /// Most tenant span copies one process holds unwritten at once.
 ///
-/// The outbox admits at most [`SCRIBE_CAPACITY`] writes; this smaller cap on
-/// the span producer keeps a sustained Scribe outage's span copies from
-/// filling that shared capacity ahead of audit, capture, and result writes.
+/// The outbox admits at most [`SCRIBE_CAPACITY`] writes, a quarter of them
+/// unreserved; this smaller cap on the span producer keeps a sustained Scribe
+/// outage's span copies from filling that unreserved share ahead of audit and
+/// capture writes.
 const TENANT_SPAN_PERMITS: usize = 2_048;
 
 /// Stages the tenant copies of server spans on the process Scribe outbox.
@@ -996,8 +997,8 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        SCRIBE_CAPACITY, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
+        Outbox, SCRIBE_CAPACITY, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal,
+        ScribeRoute, ScribeSink, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};

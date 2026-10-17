@@ -126,7 +126,12 @@ const STAGING_RETRY_AFTER_SECONDS: u64 = 1;
 ///
 /// The refusal admitted nothing, so the identical call may be retried whole.
 fn staging_full(full: OutboxFull) -> WyrdError {
-    tracing::warn!(outbox = full.outbox, admitted = full.admitted, limit = full.limit, "verification staging refused");
+    tracing::warn!(
+        outbox = full.outbox,
+        admitted = full.admitted,
+        limit = full.limit,
+        "verification staging refused"
+    );
     metrics::counter!("verification_staging_refused_total", "outbox" => full.outbox).increment(1);
     WyrdError::VerificationStagingFull {
         message: "this server has no verification staging capacity now".to_owned(),
@@ -566,7 +571,15 @@ impl<'a> VerificationControl<'a> {
         span.record("outcome", label);
         telemetry.finish(label, label != "completed");
         let outcome = result?;
-        Self::stage_direct(&staged, caller, execution_id, request, &target, &outcome, started_at);
+        Self::stage_direct(
+            &staged,
+            caller,
+            execution_id,
+            request,
+            &target,
+            &outcome,
+            started_at,
+        );
         Ok(VerificationResult {
             execution_id,
             run_id: request.run_id.clone(),

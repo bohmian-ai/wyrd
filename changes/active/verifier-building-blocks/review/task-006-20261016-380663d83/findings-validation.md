@@ -1,0 +1,140 @@
+# TASK-006 independent findings validation
+
+**Four bounded causes remain.** The final ledger contains FIND-TASK-006-1 through FIND-TASK-006-4. No material specification decision is needed for these corrections. This is the independent validator's ledger; the orchestrator packages the task verdict and remediation.
+
+## Subject, inputs, and method
+
+Source/authority/Git reads used only `/tmp/wyrd-task006-review-380663d83`, candidate `380663d83f3d120d3833ea807d29b7444929d392`, exclusive base `b323327f4cbb690628303d3a6b5249a67af50c9b`. The cumulative range includes first implementation commit f711 and its CLI deletion. HEAD and clean status were checked; no CodeGraph directory exists. Read subject, claim comparison and verification evidence first, then frozen task-review validator instructions, Ponytail full, the original task/spec r10, governing repository rules and applicable architecture/reference passages, all nine discovery reports and the focused follow-up. Source and full-range changes, rather than agreement among reports, ground the decisions below.
+
+Inspected producer/consumer closure for each proposed correction: the existing deps script and its file/line selection; actual SDK accessor signatures and generated Verifier type; full extracted JSONPath/assertion/error owners, fixture/test bodies and their base counterparts; the current UI ledger, SVG text and removed routes versus surviving navigation. Separately checked permission parsing/issuance, catalog namespace/list ownership, migration/FK ordering, promotion-debt decoding and MetricEntry's generic typed envelope path. No additional discovery agent was used.
+
+Fresh read-only checks: candidate matcher/exemption probes through installed rg; base/candidate function-body comparisons, including moved aggregate tests; image inspection with view_image; Git identity/status inspection. No source probes, archives, generators, builds, tests, gates, live services or external calls were made. Recorded GREEN results remain supplied implementation evidence.
+
+## Adjudication of every proposal
+
+| Discovery proposal / correction | Decision | Independent source resolution |
+|---|---|---|
+| BEHAVIOR-1 / INV-R1 / MAINT-002 / VOC-1: blanket test-file exemptions | CONFIRMED → FIND-1 | `deps.sh:129–140` removes every matching line from multipurpose current CLI/MCP/SDK/observe files. These contain positive fixtures and calls as well as refusals. A positive `from wyrd import EvalSpec` in the existing Python real-time target passes the actual filter. Negative-literal authorization does not authorize an entire current file. |
+| Same proposals: content-only scan omits filename-only violations | CONFIRMED → FIND-1 | `deps.sh:149` uses content matching only. A neutral-content `eval.rs` or `tests/fixtures/eval.yaml` cannot emit a hit. Required owned-path coverage is absent. |
+| VOC-1: mixed allowed/prohibited line is discarded | CONFIRMED → FIND-1 | `permission.rs` declaration `pub const EVAL_SCOPE: &str = "evals"; // retired `evals`` passes, as does `eval_fixture = XGBClassifier(eval_metric="logloss")`. The exemption discards the record, including the unrelated prohibited identifier. The latter is ordinary mixed dependency syntax, not an adversarial comment requirement. |
+| INV-R2 original: rename MetricEntry.is_evaluation to verification vocabulary | REJECTED | `card/common.rs:26–46` describes an authored numeric metric and its origin; `ExperimentSpec.summary_metrics` is the only typed container. Searches find no dedicated producer, reader, dispatch predicate or old engine writer of this bool. Generic envelope parsing, canonical serialization and Card submission retain it; public schema exposure is real, but does not establish a separate product. REQ-022 permits ordinary compute words, not only functions. A verification-origin bool would imply different semantics without evidence. No field change, alias removal, new metric producer or new schema test is required by this rejected proposal. |
+| INV-R2 / follow-up: universal expanded-word exemption misses product-shaped owned names | REVISED → FIND-1 | Actual regex passes `pub struct EvaluationRun;` and `evaluation_runs`, while rejecting `EvalRun`. REQ-019/022 distinguish actual product names from ordinary computation and faithful standard projections. This is an enforcement gap, not proof that MetricEntry or a current served schema is forbidden. Preserve `is_evaluation`; reject clearly product-shaped owned reintroductions. No universal expanded-word ban or semantic-classifier framework is authorized. |
+| Follow-up: served matcher repeats that expansion hole | CONFIRMED as the same cause → FIND-1 | `pg_openapi_contract.rs:1406–1442` filters out every Eval followed by lowercase `u`. It scans the actual document, but the restored `Evaluation` probe proves only permissiveness. Existing matcher/assertion should cover forbidden expanded owned contract names while allowing ordinary descriptions, current metric origin and standard projections. This is incomplete proof of required vocabulary behavior, not a currently served stale-contract allegation. |
+| BEHAVIOR-2: SDK docs teach a nonexistent discriminator | CONFIRMED → FIND-2 | Actual Rust accessor returns `&VerifierSpec`; TS returns RegisteredVerifierCard whose generated `spec` is VerifierSpec. That spec has inputs/steps/requirements/decide/context_capture and deny_unknown_fields, no implementation. Both changed instructions direct literal API consumers to invalid member access. This crosses the public-contract threshold despite unchanged executable signatures. |
+| STD-006-1 / MAINT-001 mandatory rustdoc | REVISED → FIND-3 | Mandatory rule applies to actual extracted/narrowed owners and new/materially adapted fixtures/tests. It does not justify sweeping unchanged relocated ID/operator tests or import-only callers. Inventory is bounded below. No runtime defect is inferred from missing docs. |
+| MAINT-003 / UI-01 current route/state references retain obsolete workflows | CONFIRMED → FIND-4 | Product README:3–7 keeps route/IA/state authority while superseding styling only. C-10 and O-08/O-09 still positively prescribe the removed evaluations route and workflow/task model under new names. Those actual route files/projectors were removed; remaining navigation has no such destination. |
+| UI-01 Service mobile nav overlap | CONFIRMED within FIND-4 | Viewed `/tmp/t6-ui-service-mobile.png` (both themes) and crop `/tmp/t6-ui-service-mobile-nav.png`: Verifiers and Drift overlap. SVG SM-01 coordinates retain x=210.05 and x=242.30 at y=804 after label expansion. Runtime ServiceOverview already removes the extra investigation entry; reuse that four-link choice in surviving reference artboards. No runtime Svelte overlap is alleged. |
+| INV-R2 reference path/live links and service lists | REVISED to nonblocking acceptance shortfall | REQ-022 explicitly requests the current evaluation reference path/consumers and service lists cut over. Path remains, linked by router:58/73 and advise skill:106; doctrine:78 and positioning vocabulary:24 retain service-list evaluation. The actual reference teaches the declarative Verifier and forbids a parallel ontology. No broken link, separate service implementation or invalid API access is demonstrated. This alone must not produce FIX_REQUIRED or force a universal word ban. |
+
+System/security/data reports propose no material findings. Their conclusions were checked against changed producers, not treated as votes. Nonblocking maintainer preference about test-helper parsing, CLI test placement without a demonstrated fast-lane regression, malformed ordinary words in SVGs, and unrelated untouched commentary/conversion debt do not become separate blockers. Correct surviving malformed words while editing the affected reference, rather than launch a prose or implementation sweep.
+
+## Final deduplicated ledger
+
+### FIND-TASK-006-1 — REVISED / INCORRECT: required vocabulary enforcement skips required inputs
+
+**Sources:** BEHAVIOR-1, INV-R1, MAINT-002, VOC-1, and the validated enforcement portion of INV-R2/follow-up. **Obligations:** REQ-019/022; AC-011/014/016; task Scenario 4. **Locations:** `scripts/checks/deps.sh:127–150`; corresponding served-document proof `crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs:1406–1442`.
+
+**Cause/consequence:** the one check receives only content hits, drops entire files/records on any permitted fragment, and never matches expanded product names. Positive current names or a prohibited filename can be produced and accepted with a GREEN required check. This is reachable required check behavior, expressly in scope even though no current production reintroduction is demonstrated. The served matcher has the same expanded-name gap.
+
+**Minimum correction:** extend the existing block only. Check current owned paths independently of content; replace blanket current-file and mixed-line exemptions with exclusions that suppress only the actual permitted occurrences. Use the existing rg/shell mechanism and explicit narrow exceptions for actual negative/check/history/external occurrences. Detect clearly product-shaped expanded owned identifiers in the same rule and served assertion; preserve ordinary computation, unrelated lexical matches and faithful GenAI projections. Do not widen whole-file/directory exclusions, delete the owner-required rule, add another checker owner/dependency/framework, or invent runtime guards. Applied migration/history exclusions remain; the new approved retirement migration is legitimate historical schema content, not a new live API.
+
+**Preserve:** real negative permission/table/CLI literals; canonical `gen_ai.evaluation.*`; `GenAiEvaluationResult`, `evaluation_results` and expanded projection module; MetricEntry.is_evaluation; evaluate_operator/CEL/Variant computation; shell eval/literal_eval/dependency eval_metric; retrieval/revalidate/WireValue; existing dependency/security checks and normal diagnostic failure.
+
+**Closure:** use the task's existing reversible probe procedure, remove probes afterward. Reject positive old import/permission/table/export probes in currently exempt Rust/Python/TS targets; filename-only source/fixture probes; mixed external/prohibited and inline-refusal/prohibited records; expanded owned `EvaluationRun`/`evaluation_runs`. Existing legitimate controls must pass. Test expanded served schema/tag reintroduction through the existing served-document seam, preserving descriptive Evaluation prose and actual permitted schemas. Run the existing deps owner and exact served assertion/owning principals lane if its matcher changes. No permanent checker self-test or broad new runtime suite.
+
+### FIND-TASK-006-2 — CONFIRMED / INCORRECT: public state accessor documentation uses the removed contract
+
+**Source:** BEHAVIOR-2 (standards note corroborates only). **Obligations:** REQ-001/017; INV-008; AC-009/016. **Locations:** `crates/shared/wyrd-client/src/state.rs:1041–1043`; `sdks/wyrd-sdk-ts/wyrd/src/index.ts:2807`.
+
+**Trace/consequence:** WyrdState::verifier borrows the actual typed VerifierSpec through spec_of_kind. TS native projection returns the existing envelope; generated RegisteredVerifierCard.spec points to that same building-block shape. The changed Rust text says match implementation for Drift/check, and changed TS text says spec.implementation. A human or agent following those public contracts reaches a nonexistent member, giving a type error or undefined JS data.
+
+**Minimum correction:** delete those two obsolete access instructions and describe the existing pure spec return versus envelope.spec building blocks accurately. Compare sibling current accessor prose for this exact obsolete instruction; keep runtime, signatures, generated schema, error behavior, and existing accessors. No compatibility field, union, wrapper, dispatch change or new test is needed. The separate preexisting state.rs:713 staging comment/conversion is not a newly validated TASK-006 runtime defect and is not bundled into this correction.
+
+**Closure:** compare both descriptions with `VerifierSpec` at `card/verifier/mod.rs:50–72` and generated `card-types.ts:4425–4445,5772+`; normal touched-language formatting/lint checks suffice. No manufactured compile failure, generation or SDK journey for prose-only edits.
+
+### FIND-TASK-006-3 — REVISED / VIOLATION: mandatory documentation is incomplete in extracted and materially changed Rust owners
+
+**Sources:** STD-006-1, MAINT-001. **Obligation:** AGENTS §16, agent rules Rust documentation, rust-core Documentation (explicit blocking exception in task-review). **Primary location:** `crates/vala/vala-verify/src/jsonpath.rs:23,43`.
+
+**Bounded validated inventory:**
+
+- `vala-verify/src/jsonpath.rs`: extracted `extract_jsonpath_values` needs workflow/error contract; `values_to_value` needs null/scalar/array normalization contract. The new narrow owning test module and adapted four tests need module/panic documentation. The locally extracted `path` helper must document its invalid-static-expression panic when completing this new owner.
+- `vala-verify/src/assertion.rs:119–164`: hash helper needs Errors and accurate serde_json byte semantics (do not change hashing to JCS); the newly narrowed direct-capture test module and adapted three tests need module/panic contracts.
+- `vala-verify/src/error.rs:18–46`: fields of the newly narrowed ExecError variants need their payload roles documented. Fix its new owner description: the type is exported, although internal to engine failure handling; JSONPath zero matches normalize to null rather than raise JsonPathFailure. Retain the actual enum/errors and public failure mapping.
+- `vala-verify/src/blocks/engine/tests.rs:22–31`: reconstructed span fixture needs Panics for timestamp invariant failure. `vala-verify/tests/integration/blocks_agent.rs:31–54`: locally extracted tid/structured_prompt fixture helpers need the retained constructor/schema panic conditions; no algorithm or fixture change.
+- `wyrd-spec/src/verification/plan.rs:246–346`: newly adapted test owner and plan helper need module/Errors/Panics contracts; seven adapted graph tests need their actual assertion/expect/panic conditions. The names helper's existing useful summary does not need padding.
+- `wyrd-spec/src/vala/trace/mod.rs:2071–2095`: materially extended two-entry projection test needs its new-key/no-alias intent and panic contract.
+
+**Narrowing/rejected inventory:** all 24 ID tests in verification/ids.rs, all 14 operator tests in verification/operator.rs and the four vala/ids.rs tests match the base deleted aggregate bodies after whitespace normalization. They are mechanical retained-coverage moves, not new logic. Do not require retroactive test/production-helper docs there, on import/type-path-only callers, or throughout whole renamed crates. Merely adding a new container for unchanged tests does not justify documenting every old test. The remaining new/extracted/materially adapted items above independently establish the mandatory blocker.
+
+**Minimum correction/preservation:** substantive rustdoc in place; describe actual errors/panics/normalization and owner role, without rewriting pure algorithms, changing hash bytes, adding lint allows, deleting tests, or adding a documentation checker. Existing walk, comparison and capture public docs provide the house pattern. Existing tests remain the behavioral proof; source review establishes documentation closure.
+
+**Closure:** inspect the bounded items against the cumulative base; run standard Rust formatting/lints for these Rust edits. No new runtime logic/test harness, generator or full journey is needed for documentation changes. Existing focused primitive/contract tests may be used as regression iteration, but documentation closure itself is static.
+
+### FIND-TASK-006-4 — CONFIRMED / INCORRECT: current product references keep the deleted workflow under Verifier labels
+
+**Sources:** MAINT-003, UI-01. **Obligations:** REQ-017/018/022; AC-009/016. **Locations:** `crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md:3–7,184–194,309–327`; corresponding `cards.svg`, `observe.svg`, `mobile.svg`, `golden-O-09.svg` and retained Service `cards/service/{overview,mobile}.svg` (single-line SVG: use artboard IDs C-10, O-08/O-09, M-02, SM-01).
+
+**Trace/consequence:** ledger declares these current route/IA/state references. The changed C-10 still teaches six-task workflow definitions and a Workflow Card; O-08/O-09 still route to /observe/evaluations, now absent, with the old workflow drawer/task model. Related artboards/annotations and retained Home/Observe/Service links project the same obsolete consumer. Mechanical label expansion also leaves the Service investigation item overlapping Drift in the both-theme mobile reference. Runtime routes/projectors/nav were correctly removed/updated; the reference is the missed consumer, not authority to restore the product.
+
+**Minimum correction:** delete obsolete inventory/detail/task-workflow artboards and their positive ledger/link entries through this existing reference package. Remove the unused extra investigation item from retained Service/M-02/SM-01 references, following existing runtime four-signal navigation; align surviving check links with the already chosen current Verifier Card destination. Update counts/golden description as needed for the actual deletions. Preserve unaffected artboards, current Verifier/Changes references and all runtime behavior. Do not create routes/screens, redesign the old styling, recover historical assets, or restore a removed model to make mocks executable. Retire rather than redesign obsolete golden O-09 content.
+
+**Closure:** inspect remaining positive route/model references across this package and compare destinations with current routes. View retained affected artboards in both themes and at existing mobile width. Existing ObserveJourney and ServiceWorkspace assertions remain the regression controls if executable UI code changes; asset-only removal needs source/XML and visual inspection, without a new screenshot framework or backend journey.
+
+## Acceptance reconciliation
+
+| Obligation | Reconciled evidence / result |
+|---|---|
+| REQ-001–016; AC-001–008 as TASK-006 regression constraints | Existing declarative contract and server-owned behavior retained. Engine change is paths/capture/error names; extracted comparison, JSONPath, trace and walk bodies retain algorithms. No new engine, store, graph, transport or lifecycle owner found. Earlier tasks' acceptance is not independently granted by this review. |
+| REQ-017; AC-009 | FAIL for FIND-2/FIND-4 consumer closure; generated exports/current runtime consumers otherwise agree. |
+| REQ-018 | Runtime deletion PASS: CLI dispatch/dependency, obsolete contracts/scenario code/errors/permissions/table removed. FIND-4 leaves positive current reference content, not an executable second product. |
+| REQ-019 | Retained engine/contracts and faithful GenAI projection move PASS; reject MetricEntry semantic-rename demand. Required enforcement/consumer closure still fails FIND-1/2. |
+| REQ-020; AC-012 | PASS task scope: existing clap/closed permission/closed namespace owners refuse; real raw stored grants reach issuance failure, stale MCP registration is tested; no aliases/custom compatibility service. Public OAuth error and SQL baseline are ordinary existing mappings. |
+| REQ-021; AC-015 | Source and focused proof PASS within stated limits: approved forward migration deletes dependent claims before retired tasks, narrows only retired namespace; demands already dropped by applied migration. Catalog list filters under TenantConn; describe/query/write resolve through the shared closed namespace. No current data deletion or historical/object cleanup required. Full SQL is change-review evidence. |
+| REQ-022; AC-011/016 | FAIL FIND-1/FIND-4. Explicit reference-path/service-list cleanup is also still incomplete but nonblocking alone under review materiality. Ordinary computation/standard semantics must remain. |
+| INV-001–009 | No material runtime violation found in this cutover: pure contracts/Vala/shared-client/server ownership; exact grants/tenant/audit; bounded hosted execution, current results and cancellation; retained algorithms and assertions. Mandatory documentation gap is FIND-3, not evidence of an algorithm change. |
+| AC-010 | Supplied focused and touched-lane GREEN evidence credible as recorded, with discrepancies/limits below; no fresh aggregate PASS implied. |
+| AC-013 | Retained focused engine/background evidence and unchanged drift/result owners support task regression. Full Bifrost/Verifier lanes correctly deferred. P10 client reconnect is not server crash-recovery proof. |
+| AC-014 | GenAI roundtrips/canonical content and generated exports PASS; served expanded-name proof needs FIND-1 correction. No currently published forbidden expanded contract was established. |
+| No compatibility/history conversion/object GC/new dependency/runtime feature | PASS. Approved r10 forward development-schema retirement is necessary scope, not forbidden migration drift. |
+
+## Evidence reconciliation, rejected adjacent corrections, and limits
+
+- TASK-005's latest committed independent verdict is FIX_REQUIRED, with later source corrections present but no subsequent independent PASS artifact. TASK-006's explicit sequencing prerequisite is therefore unestablished. Do not mark TASK-005 complete, reopen its findings here or retroactively assign TASK-006 IDs. Orchestration must reconcile that evidence separately from these bounded source findings.
+- P2 historical RED was not captured. Final parser and actual issuer-boundary negative coverage exist; do not manufacture a retrospective RED or require production churn to recreate it.
+- P3 does not seed snapshot-expiration claims. Source migration orders the exact FK-dependent delete correctly; claims reference task_id without cascading, and no other conflicting task FK was established. This is a proof limit, not demonstrated broken upgrade behavior or grounds for extra cleanup machinery. Integrated SQL proof remains due as approved.
+- Promotion-debt recovery reads all unpromoted file_list identities through ForgeTaskTableIdentity::new; an unsupported historical row could fail the sweep before current per-table work. Traced producer scope does not establish a required current retired-table hot-object writer: removed ResultItemsTable was reserved, registration is dataset-only, and base had no current production result-items writer. REQ-021 promises inaccessible stale catalog state, not historical hot-object recovery. Reject adding conversion/filters/GC/recovery protocols for that hypothetical history.
+- `ts:format:check` exists at candidate mise.toml:1459 and in the base. The task evidence's “does not exist” statement is inaccurate. Recorded ts:format runs the same Biome formatter with --write, supplying substantive formatting proof, not a check-mode execution. Correct the evidence wording; do not claim a missing task or unexecuted check-mode result. No separate behavioral finding.
+- Token issuance for stale role grants maps RoleCorrupt through existing OAuth server_error to public WYRD_SPEC_500_INTERNAL. Retired SQL equals vala.absent query-invalid-SQL. The task permits ordinary refusal, not a newly invented 404/legacy-specific error.
+- Viewed supplied `/tmp/t6-ui-service-mobile.png`, crop and golden-O-09 overview. Service label collision is visible in both themes; golden shows the obsolete workflow rather than a new product proof. These were offline installed-Chrome renders using system fallback fonts; unavailable remote font metrics, runtime UI interaction/accessibility, all-asset visual coverage and screenshot baselines are not proved. No runtime app was launched. Implementation records UI check/178 tests but no explicit build or visual inspection; preserve that limit for integrated UI verification.
+- Current reference/service-list omissions are explicitly required cleanup yet nonblocking alone. A simple current-file move plus live-link updates can satisfy that wording without changing ordinary evaluation meaning, metric origin or Audit semantics; preserve immutable active historical evidence. Do not turn this note into an expanded semantic policy or a fifth blocker.
+
+## Compact implementation handoff
+
+Reuse/delete wins for all four causes: extend the existing vocabulary rule/assertion; delete false public instructions; document only the bounded changed Rust owners; delete obsolete reference artboards/links and reuse existing navigation. No new framework, dependency, public primitive, migration, runtime behavior or historical recovery is needed.
+
+Narrow command guidance for that actual write set (commands are recommendations, not executed here):
+
+- `mise run check:deps` after reversible vocabulary probes; remove probes before final run.
+- If changing the served matcher, run `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(=pg_openapi_contract::verification_contract_publishes_five_typed_operations_and_the_local_upload)'`, plus its owning `mise run test:principals:integration` per served-OpenAPI policy. This is the existing setup wrapper/test, not a new journey suite.
+- `mise run fmt` and `mise run lints` for Rust edits; `mise run ts:format:check` and `mise run ts:lints` for TS prose. No codegen/SDK rebuild or language journeys merely for accessor documentation.
+- `mise run docs:check` if current docs/reference links are changed. For SVG/ledger-only corrections use source/XML inspection and existing offline render/view procedure. If executable UI files are additionally changed, `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build` follow the UI skill; focused existing tests depend on that actual write set. No full gate/full journeys are warranted by these four corrections.
+
+Exact existing UI regression controls, if needed for the retained navigation/link closure (both launch their own mock UI dev server; no Postgres/backend wrapper):
+
+```bash
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/observe/core/ObserveJourney.test.ts -t '^overview restores the shared scope and carries it into every signal link$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/workspaces/service/ServiceWorkspace.test.ts -t '^drift/verification intelligence keeps subject, version, threshold and scope-preserving Observe links$'
+```
+
+For the retained asset proof, use the installed browser directly from the remediation checkout; no new renderer/script/dependency. The existing Service mobile SVG contains both themes in one 956×2136 sheet:
+
+```bash
+mise exec -- /usr/bin/google-chrome --headless --no-sandbox --disable-gpu --disable-background-networking --host-resolver-rules='MAP * ~NOTFOUND' --hide-scrollbars --window-size=956,2136 --screenshot=/tmp/task006-service-mobile-after.png "file://$PWD/crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/service/mobile.svg"
+```
+
+Then view that PNG with view_image, checking SM-01 light/dark nav separation. Repeat for retained M-02 in product/mobile.svg using its source sheet dimensions (currently 956×9894), or a crop through the same existing offline procedure; inspect every retained changed artboard. No rerender of a deleted obsolete artboard is needed. Remote fonts stay unavailable in this procedure, so retain the explicit fallback-font limit; do not claim exact webfont/browser-interaction coverage.
+
+Final detached HEAD remained pinned and git status --porcelain empty. Only this report was written; peer/user files were preserved.
+
+Skipped builds, gates, generators, fresh runtime proof and live calls. Risk: recorded GREEN proof does not close the four findings or establish the missing TASK-005 independent PASS.

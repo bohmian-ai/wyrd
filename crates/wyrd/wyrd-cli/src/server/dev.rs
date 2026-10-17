@@ -100,9 +100,6 @@ struct DevInputs {
     /// Whether an earlier run already completed setup for this endpoint;
     /// it suppresses the automatic gateway and host offers.
     configured: bool,
-    /// Whether a tenant key is saved, which the selected server must accept
-    /// before any saved setting changes or setup runs.
-    key_saved: bool,
 }
 
 /// The CLI's owned foreground server, also settled after a failed startup.
@@ -346,7 +343,6 @@ impl DevArgs {
         Ok(DevInputs {
             offer_gateway: interactive && !self.skip_gateway && !configured,
             configured,
-            key_saved: key.is_some(),
             database,
             platform_database: secret_var("WYRD_PLATFORM_DATABASE_URL").or(saved_platform),
             tenant,
@@ -539,7 +535,10 @@ impl DevServer {
     async fn run(&mut self, hosts: &[McpHost]) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
         let grpc = format!("http://{}", self.inputs.grpc);
-        if self.inputs.key_saved {
+        if GlobalConfig::local_api_key(&Environment::Process)
+            .map_err(map_client_error)?
+            .is_some()
+        {
             saved_client(&self.endpoint, &grpc).await.map_err(|_| {
                 dev_error(
                     "saved credential",

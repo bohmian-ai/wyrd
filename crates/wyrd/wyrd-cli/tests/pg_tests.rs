@@ -781,7 +781,9 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
 /// A bare unattended restart from another working directory, with no
 /// database, listener, storage, or tenant inputs, reuses the saved settings,
 /// key, and data. Unattended runs missing inputs list them all before any
-/// effect, and conflicting or credential-bearing arguments are refused.
+/// effect, and conflicting or credential-bearing arguments are refused. A
+/// later listener override of the same deployment keeps its key and resaves
+/// the endpoint.
 ///
 /// # Panics
 /// Panics when the restart changes identity or data, or a refusal has effects.
@@ -877,6 +879,30 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
     assert!(!elsewhere.path().join(".wyrd").exists());
     let output = local.stop("-INT").await;
     assert!(output.contains("Gateway: skipped"), "{output}");
+
+    // A listener override of the same deployment is accepted: the saved key
+    // authenticates against the newly selected listener, which is resaved.
+    local.bind = free_bind();
+    let mut moved = local.command();
+    moved
+        .current_dir(elsewhere.path())
+        .env_remove("WYRD_DATABASE_URL")
+        .args(["server", "dev", "--non-interactive"]);
+    local.start_with(moved).await;
+    let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
+    assert_eq!(
+        global.client.http_url,
+        Some(format!("http://{}", local.bind))
+    );
+    assert_eq!(global.dev.bind.as_deref(), Some(local.bind.as_str()));
+    assert_eq!(
+        GlobalConfig::local_api_key(&local.environment())
+            .expect("protected")
+            .expect("key")
+            .expose_secret(),
+        key.expose_secret()
+    );
+    local.stop("-INT").await;
 }
 
 /// The selected host configuration discovers and calls a read tool using

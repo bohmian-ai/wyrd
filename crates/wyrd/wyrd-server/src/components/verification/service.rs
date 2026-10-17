@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use vala_eval::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::auth::{PrincipalId, Sha256Hex};
@@ -432,11 +432,16 @@ impl<'a> VerificationControl<'a> {
     /// the Verifier, [`WyrdError::VerificationTargetNotFound`] for an
     /// unknown, inactive, or non-Verifier target,
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
+    /// [`WyrdError::VerificationInputInvalid`] for evidence that does not
+    /// conform to the Verifier's input slots,
+    /// [`WyrdError::VerificationInputTooLarge`] for evidence past a slot or
+    /// combined input-file limit,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks or a block is refused process capacity (a Python worker or a
-    /// workspace), a registry unavailability error when a read fails, and the
-    /// Verifier's planning refusal.
+    /// blocks, a block is refused process capacity (a Python worker or a
+    /// workspace), or evidence metadata cannot be read now, a registry
+    /// unavailability error when a read fails, and the Verifier's planning
+    /// refusal.
     #[tracing::instrument(
         name = "verification.execute",
         skip_all,
@@ -514,6 +519,27 @@ impl<'a> VerificationControl<'a> {
                 Err(WyrdError::ServiceUnavailable {
                     message: "the verification runtime has no capacity for this Verifier now"
                         .to_owned(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::InputInvalid(reason)) => (
+                "refused",
+                Err(WyrdError::VerificationInputInvalid {
+                    message: reason.clone(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::InputTooLarge(reason)) => (
+                "refused",
+                Err(WyrdError::VerificationInputTooLarge {
+                    message: reason.clone(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::EvidenceUnavailable(reason)) => (
+                "unavailable",
+                Err(WyrdError::ServiceUnavailable {
+                    message: "the verification evidence cannot be admitted now".to_owned(),
                     details: serde_json::json!({ "reason": reason }),
                 }),
             ),
@@ -625,7 +651,8 @@ impl<'a> VerificationControl<'a> {
     /// Stage a completed direct execution's inputs and result on the Scribe
     /// outbox.
     ///
-    /// The result takes the execution's identity. Its rows name the subject
+    /// The payload mints its own result identity and correlates with the
+    /// execution through `execution_id`. Its rows name the subject
     /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, and have
     /// no owner, binding, or Trigger. The inputs row never queues work. The

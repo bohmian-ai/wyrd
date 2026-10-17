@@ -411,7 +411,9 @@ mod pg_tests {
         /// # Errors
         /// Returns principal, transport, or response failures.
         async fn enforce_permissions(&self) -> Result<(), McpJourneyError> {
-            self.server.seed_role("mcp_no_cards", &[]).await?;
+            self.server
+                .seed_role::<serde_json::Value>("mcp_no_cards", &[])
+                .await?;
             let principal = self
                 .server
                 .bootstrap_service("denied", &["mcp_no_cards"])
@@ -845,7 +847,7 @@ mod pg_tests {
     /// `passed` or `failed` outcome of the one assertion requirement; nothing
     /// is enqueued. The Service plans an evidence upload for a new digest,
     /// and direct execution of its bound drift Verifier is refused as
-    /// unsupported input. A reader and a caller holding only `evals:run` are
+    /// unsupported input. A reader and a caller holding only an unrelated `operators:invoke` are
     /// neither offered the write tools nor allowed `verification.execute`,
     /// and another tenant's administrator cannot resolve this tenant's Cards.
     ///
@@ -924,13 +926,13 @@ mod pg_tests {
 
         server
             .seed_role(
-                "mcp_evals_only",
-                &[Permission::card_read(), Permission::eval_run()],
+                "mcp_operators_only",
+                &[Permission::card_read(), Permission::operator_invoke()],
             )
             .await?;
         for (name, role) in [
             ("mcp-execute-reader", "viewer"),
-            ("mcp-execute-evals-only", "mcp_evals_only"),
+            ("mcp-execute-operators-only", "mcp_operators_only"),
         ] {
             let caller = server.bootstrap_service(name, &[role]).await?;
             let caller_client = connect(&server, &caller).await?;

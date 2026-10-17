@@ -108,7 +108,7 @@ impl<'a> ResponseAdapter<'a> {
                         .parts
                         .iter()
                         .filter_map(|part| match part {
-                            GooglePart::FunctionCall { function_call } => Some(ToolCallView {
+                            GooglePart::FunctionCall { function_call, .. } => Some(ToolCallView {
                                 id: Cow::Borrowed(&function_call.name),
                                 name: Cow::Borrowed(&function_call.name),
                                 // Gemini function calls do not expose a

@@ -50,7 +50,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-server",
 ] }
 vala-drift = { workspace = true }
-vala-eval = { workspace = true }
+vala-verify = { workspace = true }
 skald-agent = { workspace = true }
 skald-prompt = { workspace = true }
 skald-providers = { workspace = true }

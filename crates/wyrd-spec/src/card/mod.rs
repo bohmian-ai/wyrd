@@ -6,7 +6,6 @@ pub mod audit;
 pub mod common;
 pub mod data;
 pub mod drift;
-pub mod eval;
 pub mod experiment;
 pub mod field;
 pub mod mcp;

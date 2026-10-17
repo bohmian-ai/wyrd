@@ -1,9 +1,0 @@
-tasks:
-  ok_check:
-    kind: assertion
-    id: ok_check
-    context_path: $.ok
-    operator: equals
-    expected: true
-pass_gate:
-  kind: all_pass

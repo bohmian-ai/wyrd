@@ -111,12 +111,9 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_400_CARD_LOAD` | 400 | Card load failed | Fix the card files and local references, then retry. |
 | `WYRD_CLI_400_CLIENT_CONFIG` | 400 | Client configuration failed | Pass a valid server URL and configure a Wyrd credential. |
 | `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --space, --name, and --version. |
-| `WYRD_CLI_400_EVAL_SPEC_INVALID` | 400 | Eval spec invalid | Fix the Eval spec file before running the evaluation. |
 | `WYRD_CLI_400_INVALID_ARGUMENT` | 400 | Invalid CLI argument | Fix the argument and retry. |
 | `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | MCP host selection required | Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected. |
-| `WYRD_CLI_400_PARSE` | 400 | CLI input parse failed | Check the file against the expected Wyrd YAML or JSON shape. |
 | `WYRD_CLI_400_QUERY_CONFIG` | 400 | Query configuration missing | Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain. |
-| `WYRD_CLI_400_RECORDS_PARSE` | 400 | Records JSONL parse failed | Verify each non-empty line is one EvalRecordObservation JSON object. |
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | 400 | Server host unsupported | Run the server on macOS on aarch64 or Linux (glibc) on x86_64 or aarch64, or use the official container image. |
 | `WYRD_CLI_401_NO_CREDENTIALS` | 401 | No Wyrd credentials | Set WYRD_ACCESS_TOKEN, configure workload identity or WYRD_API_KEY, or add [default].api_key to ~/.config/wyrd/credentials.toml. |
 | `WYRD_CLI_401_NO_PLATFORM_CREDENTIAL` | 401 | No platform credential | Set WYRD_PLATFORM_CREDENTIAL to a platform credential for this deployment. |
@@ -124,9 +121,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | MCP host installation failed | Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected. |
 | `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (pip install -U wyrd, or npm install wyrd-ai@latest), then retry. |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | Server release unverified | Retry the install; if it fails again, report the release. The current installation is unchanged. |
-| `WYRD_CLI_500_EVAL_ENGINE` | 500 | Eval engine failed | Inspect the Eval spec, records, scenarios, and CLI logs. |
 | `WYRD_CLI_500_IO` | 500 | CLI filesystem IO failed | Check file paths and permissions, then retry. |
-| `WYRD_CLI_500_ORCHESTRATOR` | 500 | Eval orchestrator failed | Inspect agent endpoint responses and scenario configuration. |
 | `WYRD_CLI_500_OUTPUT` | 500 | CLI output failed | Retry the command or use --format text. |
 | `WYRD_CLI_500_QUERY` | 500 | Oracle query failed | Inspect the stable query error and terminal diagnostics, then retry. |
 | `WYRD_CLI_503_CLIENT_TRANSPORT` | 503 | Wyrd server unavailable | Check the server URL and network connectivity, then retry. |
@@ -152,20 +147,6 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_DRIFT_400_PROFILE_REQUIRED` | 400 | Drift profile required | Attach the method-matching DriftProfile (PsiProfile, SpcProfile, or CustomProfile). |
 | `WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH` | 400 | Drift signal/method mismatch | Use a signal variant supported by the chosen DriftMethod (see DriftSpec docs). |
 | `WYRD_DRIFT_400_VALIDATION` | 400 | Drift Verifier validation failed | Fix the drift implementation profile, condition, or signal fields. |
-
-## WYRD_EVAL
-
-| Code | Status | Title | Fix |
-| --- | ---: | --- | --- |
-| `WYRD_EVAL_400_SCENARIO_LOADER_FAILURE` | 400 | Scenario loader failure | Fix the JSONL / JSON / YAML scenario payload; consult the source path and line in details. |
-| `WYRD_EVAL_404_RECORD_MISSING` | 404 | Eval record missing | Confirm the record_id was persisted and has not been redacted by retention; retry after ingestion catches up. |
-| `WYRD_EVAL_404_TASK_NOT_FOUND` | 404 | Eval task not found | Check the task_id against EvalSpec.tasks; spec validation should have caught this earlier. |
-| `WYRD_EVAL_422_DAG_INVALID` | 422 | Eval task DAG invalid | Remove cycles, self-loops, or references to tasks that the EvalSpec does not define. |
-| `WYRD_EVAL_422_DEPENDENCY_MISSING` | 422 | Eval task dependency missing | Confirm the depended-on task is not gated by an EvalCondition that always skips, or remove the dependency. |
-| `WYRD_EVAL_422_JSONPATH_FAILURE` | 422 | JsonPath evaluation failed | Check the JsonPath against the actual record / span shape; JsonPath conforms to the RFC 9535 subset declared on wyrd_spec::vala::eval::ids::JsonPath. |
-| `WYRD_EVAL_422_OPERATOR_MISMATCH` | 422 | Operator mismatch | Pick a ComparisonOperator that matches the actual value's JSON shape, or adjust the JsonPath that produced the actual value. |
-| `WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED` | 500 | Eval results persistence failed | Check server storage availability and permissions; retry after the underlying I/O issue is resolved. |
-| `WYRD_EVAL_504_TRACE_UNAVAILABLE` | 504 | Trace unavailable | Wait for trace ingestion to land the spans, raise the per-call deadline, or schedule a retry via the AwaitingTrace lifecycle. |
 
 ## WYRD_GATEWAY
 
@@ -452,14 +433,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING` | 400 | Tenant isolation column missing | Add the server-managed data_tenant_id Utf8 column to the physical table schema. |
 | `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | 400 | Undeclared Bifrost field | Remove the key or declare it on the table; store open data in a Variant field. |
 | `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` | 400 | Unsupported Bifrost type | Use a supported Bifrost column type; store open data in a Variant field. |
-| `WYRD_VALA_400_EVAL_REF_KIND_MISMATCH` | 400 | Eval reference kind mismatch | Use the required CardRef kind for the eval field being validated. |
 | `WYRD_VALA_400_FILTER_INVALID` | 400 | Query filter invalid | Correct the filter value; see the error detail for the offending field. |
 | `WYRD_VALA_400_INGEST_PROTO` | 400 | Invalid ingest request | Fix the ingest request fields and retry with a valid Wyrd ingest payload. |
 | `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` | 400 | OTLP request body malformed | The OTLP request body could not be decoded. Verify the Content-Type matches the encoding (application/x-protobuf or application/json) and that the payload is a valid OTLP ExportRequest. |
 | `WYRD_VALA_400_PAGE_TOKEN_INVALID` | 400 | Page token invalid | Restart the query from page 1 without a page_token. |
 | `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected. |
 | `WYRD_VALA_400_SCHEMA_PARSE` | 400 | Bifrost schema parse failed | Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data. |
-| `WYRD_VALA_400_TASK_DAG_INVALID` | 400 | Eval task DAG validation failed | Remove cycles, self-dependencies, or references to missing eval tasks. |
 | `WYRD_VALA_400_VARIANT_INVALID_JSON` | 400 | Invalid Variant JSON | Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null. |
 | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` | 400 | Variant numeric value out of range | Send integers within the signed 64-bit or Variant decimal range, or send the number as a string. |
 | `WYRD_VALA_400_VARIANT_TOO_DEEP` | 400 | Variant value too deep | Flatten the value so it nests at most 64 levels, counting the root container as one. |

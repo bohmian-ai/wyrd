@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use tempfile::TempDir;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use vala_eval::blocks::{BlockError, CallInput, CallValue};
+use vala_verify::blocks::{BlockError, CallInput, CallValue};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::Locator;
 

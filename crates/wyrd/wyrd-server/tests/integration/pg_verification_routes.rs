@@ -459,7 +459,7 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
 }
 
 /// Malformed and oversized bodies, an invalid Idempotency-Key, a caller
-/// without `verifier:run`, and a caller holding only `evals:run` are refused
+/// without `verifier:run`, and a caller holding only an unrelated `operators:invoke` are refused
 /// with stable codes before anything is staged, each authorization refusal
 /// auditing exactly one `verifier:run` denial; unknown and malformed
 /// execution reads are refused with their stable codes.
@@ -516,16 +516,16 @@ async fn enqueue_refusals_fail_before_staging() {
         vec![run_decision("denied")]
     );
     server
-        .seed_role("vr_evals_only", &[Permission::eval_run()])
+        .seed_role("vr_operators_only", &[Permission::operator_invoke()])
         .await
         .expect("role seeds");
-    let (evals_only, evals_only_jwt) =
-        user(&server, "vr-evals-only-user", &["vr_evals_only"]).await;
-    let (status, problem) = enqueue(&server, &evals_only_jwt, &body, None).await;
+    let (operators_only, operators_only_jwt) =
+        user(&server, "vr-operators-only-user", &["vr_operators_only"]).await;
+    let (status, problem) = enqueue(&server, &operators_only_jwt, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        decisions(&server, "verification.enqueue", evals_only).await,
+        decisions(&server, "verification.enqueue", operators_only).await,
         vec![run_decision("denied")]
     );
 
@@ -958,7 +958,7 @@ async fn direct_execution_judges_inline_without_enqueueing() {
 
 /// Malformed, oversized, unknown, and non-Verifier executions and a Drift
 /// Verifier, which judges only scheduled windows, are refused with stable
-/// codes. A caller without `verifier:run`, holding only `evals:run`, or
+/// codes. A caller without `verifier:run`, holding only an unrelated `operators:invoke`, or
 /// granted only an unrelated Verifier UID is refused with one audited denial,
 /// while a Card-bound principal granted exactly that Verifier UID is allowed
 /// whatever its observation scope; nothing is ever enqueued.
@@ -1030,7 +1030,7 @@ async fn direct_execution_refusals_are_stable() {
         vec![run_decision("denied")]
     );
     for (role, permission) in [
-        ("vx_evals_only", Permission::eval_run()),
+        ("vx_operators_only", Permission::operator_invoke()),
         (
             "vx_other_verifier",
             Permission::verifier_run(fixture.drift.clone()),
@@ -1069,6 +1069,110 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", machine.id().as_uuid()).await,
         vec![run_decision("allowed")]
     );
+    assert_eq!(fixture.queued().await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Evidence that does not conform to the selected Verifier's declared slots
+/// is refused by the server before any block runs: an undeclared slot, a
+/// declaration of another kind, a JSON value violating its slot schema, a
+/// file in a format its media slot refuses, a file above the slot's
+/// `max_bytes`, an unused file in an uncapped slot above the individual
+/// input-file limit but within the combined one, and files whose declared
+/// lengths together exceed the combined input-file limit. Conforming evidence still passes, an omitted
+/// optional slot reads as null, and a missing required slot stays
+/// inconclusive rather than refused. Nothing is enqueued.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route
+/// fails to respond, or a status, code, verdict, or queue expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_refuses_nonconforming_evidence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vx-conform-writer", &["editor"]).await;
+    let typed = fixture
+        .seed
+        .verifier(
+            "vx-typed",
+            &json!({
+                "inputs": {
+                    "x": { "type": "json", "schema": { "type": "integer" } },
+                    "note": { "type": "json", "required": false },
+                    "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false },
+                    "pages": { "type": "media", "formats": ["pdf"], "required": false }
+                },
+                "requirements": [
+                    { "id": "x-present", "statement": "x is present.",
+                      "check": { "kind": "assert", "path": "inputs.x", "operator": "is_not_null" } },
+                    { "id": "no-note", "statement": "No note.",
+                      "check": { "kind": "assert", "path": "inputs.note", "operator": "is_null" } }
+                ]
+            }),
+        )
+        .await
+        .expect("typed Verifier registers");
+    let body = |inputs: Value| {
+        json!({ "verifier_card_uid": typed, "card_uid": fixture.service, "inputs": inputs })
+            .to_string()
+    };
+    let file = |format: &str, size_bytes: u64| json!({ "kind": "file", "sha256": "ab".repeat(32), "size_bytes": size_bytes, "format": format });
+    let x = json!({ "kind": "json", "value": 1 });
+    let mib = 1024 * 1024;
+    let cases = [
+        (
+            json!({ "x": x, "extra": x }),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            json!({ "x": { "kind": "trace", "trace_id": "0af7651916cd43dd8448eb211c80319c" } }),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            json!({ "x": { "kind": "json", "value": "one" } }),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            json!({ "x": x, "policy": file("png", 5) }),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            json!({ "x": x, "policy": file("pdf", 11) }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            json!({ "x": x, "pages": file("pdf", 21 * mib) }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            json!({ "x": x, "policy": file("pdf", 10), "pages": file("pdf", 200 * mib) }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+    ];
+    for (inputs, status, code) in cases {
+        let (actual, problem) = execute(&server, &jwt, body(inputs.clone())).await;
+        assert_eq!(
+            (actual, problem["code"].as_str()),
+            (status, Some(code)),
+            "{inputs} -> {problem}"
+        );
+    }
+
+    let (status, passed) = execute(&server, &jwt, body(json!({ "x": x }))).await;
+    assert_eq!(status, StatusCode::OK, "{passed}");
+    assert_eq!(passed["outcome"]["verdict"], "passed", "{passed}");
+    let (status, missing) = execute(&server, &jwt, body(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+    assert_eq!(missing["outcome"]["verdict"], "inconclusive", "{missing}");
     assert_eq!(fixture.queued().await, 0);
     server.shutdown().await.expect("test server shuts down");
 }

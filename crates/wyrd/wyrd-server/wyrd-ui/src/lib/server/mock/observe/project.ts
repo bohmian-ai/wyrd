@@ -2,8 +2,6 @@ import type {
   DashboardDetail,
   DashboardsView,
   DriftView,
-  EvalDetail,
-  EvalsView,
   GenAiView,
   LogsView,
   MetricsView,
@@ -17,8 +15,6 @@ import {
   driftFeatures,
   driftHistory,
   driftHistoryLabels,
-  evalDetails,
-  evalRows,
   genaiRows,
   logRecords,
   metricCatalog,
@@ -112,9 +108,9 @@ export function projectOverview(
   };
   if (!populated)
     return {
-      tiles: ['Logs', 'Metrics', 'Traces', 'Eval', 'Drift'].map((signal) => ({
+      tiles: ['Logs', 'Metrics', 'Traces', 'Drift'].map((signal) => ({
         signal,
-        href: `${base}/observe/${signal === 'Eval' ? 'evaluations' : signal.toLowerCase()}${q()}`,
+        href: `${base}/observe/${signal.toLowerCase()}${q()}`,
         value: '—',
         unit: '',
         status: { label: 'No data in range', tone: 'neutral' },
@@ -134,23 +130,19 @@ export function projectOverview(
     (row) => !scope.service || row.service === scope.service
   );
   const traceErrors = scopedTraces.filter((row) => row.status.tone === 'danger').length;
-  const evalFailed = evalRows.filter((row) => row.status.tone === 'danger').length;
   return {
     tiles: [
       { signal: 'Logs', href: `${base}/observe/logs${q()}`, value: fmtCount(scopedLogs.length), unit: 'records', status: logErrors ? { label: `${logErrors} error`, tone: 'warn' as const } : { label: 'No errors', tone: 'ok' as const } },
       { signal: 'Metrics', href: `${base}/observe/metrics${q()}`, value: `${metricCatalog.length}`, unit: 'metrics', status: { label: 'Series healthy', tone: 'ok' } },
       { signal: 'Traces', href: `${base}/observe/traces${q()}`, value: fmtCount(scopedTraces.length), unit: 'traces', status: traceErrors ? { label: `${traceErrors} error`, tone: 'warn' as const } : { label: 'No errors', tone: 'ok' as const } },
-      { signal: 'Eval', href: `${base}/observe/evaluations${q()}`, value: `${evalRows.length}`, unit: 'events', status: { label: `${evalFailed} failed`, tone: evalFailed ? 'danger' : 'ok' } },
       { signal: 'Drift', href: `${base}/observe/drift${q()}`, value: '—', unit: '', status: { label: 'No report in range', tone: 'neutral' }, noData: true }
     ],
     attention: [
       { signal: 'Traces', what: 'capture 504 from ledger-api', service: 'checkout-api', state: { label: 'Attention', tone: 'warn' }, since: '12m', href: `${base}/observe/traces${q({ status: 'error', service: 'checkout-api' })}` },
-      { signal: 'Eval', what: 'groundedness 0.61 < 0.80', service: 'checkout-agent', state: { label: 'Failed', tone: 'danger' }, since: '18m', href: `${base}/observe/evaluations/eval_record_01?task=groundedness` },
       { signal: 'Drift', what: 'score psi 0.31 > 0.20', service: 'ranking-api', state: { label: 'Failed', tone: 'danger' }, since: '3h', href: `${base}/observe/drift?service=ranking-api&feature=score&range=30d` }
     ],
     recent: [
       { time: '12:41', signal: 'Traces', event: 'trace_01 recorded with an error root span', service: 'checkout-api', href: `${base}/observe/traces/trace_01${q()}` },
-      { time: '12:41', signal: 'Eval', event: 'eval_record_01 completed · failed', service: 'checkout-agent', href: `${base}/observe/evaluations/eval_record_01` },
       { time: '12:38', signal: 'Logs', event: 'error volume crossed the 1h baseline', service: 'checkout-api', href: `${base}/observe/logs${q({ level: 'error' })}` },
       { time: '12:20', signal: 'Metrics', event: 'p95 latency series refreshed', service: 'checkout-api', href: `${base}/observe/metrics${q()}` },
       { time: '09:40', signal: 'Drift', event: 'calculated report published for 30d window', service: 'ranking-api', href: `${base}/observe/drift?service=ranking-api&range=30d` }
@@ -407,32 +399,6 @@ export function projectDashboard(id: string, variables: Record<string, string>):
     const requested = variables[variable.name];
     if (requested && variable.options.includes(requested)) variable.value = requested;
   }
-  return clone;
-}
-
-/** O-08 — evaluation event inventory with URL-restored filters. */
-export function projectEvals(filters: Record<string, string>, populated = true): EvalsView {
-  const rows = evalRows.filter(
-    (row) =>
-      (!filters.service || row.subject === filters.service) &&
-      (!filters.status || row.status.label.toLowerCase() === filters.status) &&
-      (!filters.origin || row.origin === filters.origin) &&
-      (!filters.evalCard || filters.evalCard === 'card_eval_01') &&
-      row.recordId.includes(filters.q ?? '')
-  );
-  return structuredClone({
-    matching: rows.length ? 41 : 0,
-    subjects: populated ? [...new Set(evalRows.map((row) => row.subject))] : [],
-    rows
-  });
-}
-
-/** O-09 — one evaluation event with its workflow drawer and selected task. */
-export function projectEval(recordId: string, task: string): EvalDetail | null {
-  const detail = evalDetails[recordId];
-  if (!detail) return null;
-  const clone = structuredClone(detail);
-  clone.selected = clone.tasks.find((candidate) => candidate.name === task) ?? clone.tasks[0];
   return clone;
 }
 

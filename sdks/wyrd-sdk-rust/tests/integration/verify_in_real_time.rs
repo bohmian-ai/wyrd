@@ -21,7 +21,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
-    VerificationVerdict, WyrdClient, cli,
+    VerificationVerdict, WyrdClient, WyrdError, cli,
 };
 use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
@@ -955,9 +955,9 @@ async fn input_that_does_not_fit_its_slot_fails_locally() {
     assistant.deployment.shutdown().await;
 }
 
-/// A principal holding only `evals:run`, or `verifier:run` on another
-/// Verifier, cannot verify with `answer-check`: neither grant names it, and
-/// the binding is no grant.
+/// A principal holding only an unrelated `operators:invoke`, or
+/// `verifier:run` on another Verifier, cannot verify with `answer-check`:
+/// neither grant names it, and the binding is no grant.
 ///
 /// # Panics
 /// Panics when a verify succeeds or is refused with another code.
@@ -965,16 +965,16 @@ async fn input_that_does_not_fit_its_slot_fails_locally() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn caller_without_the_verifier_grant_is_refused() {
     let assistant = Assistant::start().await;
-    let evals_only = assistant
+    let operators_only = assistant
         .deployment
-        .scoped_key("evals_only", &["evals:run"])
+        .scoped_key("operators_only", &["operators:invoke"])
         .await;
     let other_verifier = assistant
         .deployment
         .verifier_key("other_verifier", &assistant.answer_judged)
         .await;
 
-    for key in [evals_only, other_verifier] {
+    for key in [operators_only, other_verifier] {
         let refused = assistant
             .state_as(assistant.deployment.client(&key))
             .run_for_card("agent")
@@ -985,6 +985,73 @@ async fn caller_without_the_verifier_grant_is_refused() {
             .expect_err("no grant names answer-check");
         assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     }
+    assistant.deployment.shutdown().await;
+}
+
+/// The retired verification contracts are unknown at the server: a principal
+/// whose stored role still grants `evals:run` or `evals:invoke` is refused by
+/// issuance before anything runs — the token endpoint's ordinary RFC 6749
+/// `server_error` for a role that no longer decodes — and the retired Eval
+/// tables are listed nowhere and refused for describe, read, and write exactly
+/// as a never-existing namespace is, while the current verification table
+/// still answers.
+///
+/// # Panics
+/// Panics when a retired contract is accepted, a refusal carries another
+/// code, or the current table does not answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn retired_verification_contracts_are_refused() {
+    let assistant = Assistant::start().await;
+    for action in ["run", "invoke"] {
+        let stale = assistant
+            .deployment
+            .granted_key(
+                &format!("evals_{action}"),
+                &[json!({ "resource": "evals", "action": action, "scope": "all" })],
+            )
+            .await;
+        let refused = assistant
+            .state_as(assistant.deployment.client(&stale))
+            .run_for_card("agent")
+            .expect("agent run opens")
+            .observe()
+            .verify("answer-check", json!("yes"))
+            .await
+            .expect_err("a stale evals grant is no grant");
+        assert_eq!(refused.code(), "WYRD_SPEC_500_INTERNAL", "{action}");
+    }
+
+    let bifrost = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
+    let listed = bifrost.list_tables().await.expect("tables list");
+    assert!(
+        listed.iter().all(|table| table.namespace != "vala.eval"),
+        "retired tables are listed: {listed:?}"
+    );
+    // A retired name is refused exactly as a namespace that never existed.
+    let refusals = async |namespace: &str, name: &str| {
+        let fqn = format!("{namespace}.{name}");
+        [
+            bifrost
+                .sql(&format!("SELECT * FROM {fqn}"), &[])
+                .await
+                .map(drop),
+            bifrost.describe_table(namespace, name).await.map(drop),
+            bifrost.writer_table(&fqn).await.map(drop),
+        ]
+        .map(|outcome| outcome.map_err(|error| WyrdError::from(error).code().to_owned()))
+    };
+    for name in ["result_items", "observations"] {
+        let retired = refusals("vala.eval", name).await;
+        assert!(retired.iter().all(Result::is_err), "{name}: {retired:?}");
+        assert_eq!(retired, refusals("vala.absent", name).await, "{name}");
+    }
+    bifrost
+        .sql("SELECT COUNT(*) AS n FROM vala.verification.results", &[])
+        .await
+        .expect("the current verification table answers");
     assistant.deployment.shutdown().await;
 }
 

@@ -174,10 +174,6 @@ fn is_problem(content: Option<&Content>) -> bool {
             description = "OTLP/HTTP ingest for traces, metrics, and logs"
         ),
         (
-            name = "Eval",
-            description = "Evaluation pull protocol: open a run and drive its turns"
-        ),
-        (
             name = "Platform",
             description = "Platform control plane: tenant lifecycle, platform identity, and platform credentials"
         ),

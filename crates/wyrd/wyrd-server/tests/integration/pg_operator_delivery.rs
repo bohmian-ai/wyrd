@@ -33,7 +33,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::verifier::Check;
 use wyrd_spec::ids::{CardUid, ExecutionId, FeatureName};
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };

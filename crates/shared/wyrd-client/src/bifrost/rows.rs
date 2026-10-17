@@ -3,7 +3,7 @@
 //!
 //! Cell readers index each column in its stored Arrow type rather than casting
 //! it, and report a missing or mistyped column as a description the caller
-//! wraps in its own error. The trace timeline read and the server's Eval
+//! wraps in its own error. The trace timeline read and the server's Verifier
 //! evidence read decode spans through the one [`span_record`].
 
 use arrow::array::{Array, ArrayRef, AsArray as _};

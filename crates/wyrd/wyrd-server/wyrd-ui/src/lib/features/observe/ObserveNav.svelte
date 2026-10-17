@@ -23,7 +23,6 @@
     ['Traces', '/traces'],
     ['GenAI', '/genai'],
     ['Dashboards', '/dashboards'],
-    ['Evaluations', '/evaluations'],
     ['Drift', '/drift']
   ];
 </script>

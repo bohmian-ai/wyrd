@@ -15,7 +15,7 @@ def complete_bundle(fixtures_dir: Path) -> Path:
     """A complete Service bundle: two custom Models, Data, a Prompt, two Agents, a Verifier.
 
     ``model`` and ``primary_model`` alias one Model Card, and the root Service
-    binds the ``ok-check`` Eval Verifier.
+    binds the ``ok-check`` assertion Verifier.
     """
     return fixtures_dir / "bundles" / "complete"
 

@@ -50,7 +50,6 @@ other resource — including `AnyOf` and `Wildcard` — is rejected at decode.
 - `Cards`
 - `Services`
 - `Operators`
-- `Evals`
 - `Drift`
 - `Artifacts`
 - `Audit`
@@ -103,7 +102,7 @@ Examples:
 - `{ Cards, Wildcard, All }` covers `{ Cards, Read, All }` and
   `{ Cards, Write, All }`.
 - `{ Wildcard, Wildcard, All }` covers every permission.
-- `{ AnyOf([Operators, Evals]), Invoke, All }` covers operator and eval
+- `{ AnyOf([Operators, Triggers]), Invoke, All }` covers operator and trigger
   invokes, but not card invokes.
 - `{ BifrostQuery, Read, Bifrost(Schema(vala, logs)) }` covers a required
   `{ BifrostQuery, Read, Bifrost(Table(vala, logs, <any uid>)) }`, but not a
@@ -148,7 +147,7 @@ Roles persist permissions as a JSONB array of permission objects in
 [
   {"resource": "cards", "action": "write", "scope": "all"},
   {"resource": "cards", "action": "read", "scope": "all"},
-  {"resource": {"any_of": ["operators", "evals"]}, "action": "invoke", "scope": "all"},
+  {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
   {"resource": "wildcard", "action": "wildcard", "scope": "all"}
 ]
 ```

@@ -2,9 +2,6 @@ import type {
   DashboardDetail,
   DashboardRow,
   DriftFeature,
-  EvalDetail,
-  EvalRow,
-  EvalTask,
   GenAiRow,
   GenAiSpan,
   LogRecord,
@@ -20,7 +17,7 @@ import type {
  * Development fixtures for the Observe workspace, tenant `acme` only.
  *
  * One coherent incident: checkout-api capture failures against ledger-api
- * around 12:41, a failed groundedness evaluation on checkout-agent, and a
+ * around 12:41, a failed groundedness verification on checkout-agent, and a
  * 30-day ranking-api score drift breach. Projected through `WyrdClient`
  * exactly like live data; these are not durable domain records.
  */
@@ -1101,7 +1098,7 @@ export const dashboardRows: DashboardRow[] = [
   { id: 'dashboard_01', name: 'Checkout health', folder: 'payments', tags: ['checkout', 'slo'], owner: 'j.reyes', updated: '2h ago' },
   { id: 'dashboard_02', name: 'Ledger capture', folder: 'payments', tags: ['ledger'], owner: 'j.reyes', updated: '1d ago' },
   { id: 'dashboard_03', name: 'Ranking quality', folder: 'ml', tags: ['ranking', 'drift'], owner: 'm.linden', updated: '2d ago' },
-  { id: 'dashboard_04', name: 'Agent decisions', folder: 'ml', tags: ['agent', 'eval'], owner: 'm.linden', updated: '3d ago' },
+  { id: 'dashboard_04', name: 'Agent decisions', folder: 'ml', tags: ['agent', 'verification'], owner: 'm.linden', updated: '3d ago' },
   { id: 'dashboard_05', name: 'Cost and spend', folder: 'platform', tags: ['cost'], owner: 'r.okafor', updated: '5d ago' },
   { id: 'dashboard_06', name: 'Platform SLOs', folder: 'platform', tags: ['slo'], owner: 'j.reyes', updated: '1w ago' }
 ];
@@ -1210,266 +1207,6 @@ export const dashboardDetails: Record<string, DashboardDetail> = {
     ]
   }
 };
-
-/** Evaluation event rows keyed by record_id; run_id is correlation. */
-export const evalRows: EvalRow[] = [
-  { recordId: 'eval_record_01', eval: 'Checkout agent eval', subject: 'checkout-agent', runId: 'run_88a1', status: { label: 'Failed', tone: 'danger' }, passed: 4, total: 6, duration: '12.4s', origin: 'online', scenario: null },
-  { recordId: 'eval_record_02', eval: 'Checkout agent eval', subject: 'checkout-agent', runId: 'run_88a0', status: { label: 'Passed', tone: 'ok' }, passed: 6, total: 6, duration: '11.9s', origin: 'online', scenario: null },
-  { recordId: 'eval_record_03', eval: 'Ranking quality eval', subject: 'ranking-api', runId: 'run_871f', status: { label: 'Failed', tone: 'danger' }, passed: 3, total: 5, duration: '9.7s', origin: 'online', scenario: null },
-  { recordId: 'eval_record_04', eval: 'Refund agent scenarios', subject: 'local · unregistered', runId: 'run_local_2e', status: { label: 'Passed', tone: 'ok' }, passed: 4, total: 4, duration: '8.2s', origin: 'offline', scenario: { id: 'refund-partial-3', collection: 'customer-support-v2' } },
-  { recordId: 'eval_record_05', eval: 'Refund agent scenarios', subject: 'local · unregistered', runId: 'run_local_2e', status: { label: 'Failed', tone: 'danger' }, passed: 2, total: 4, duration: '9.1s', origin: 'offline', scenario: { id: 'refund-escalate-1', collection: 'customer-support-v2' } }
-];
-
-/** Task results inside eval_record_01's workflow. */
-const evalTasks: EvalTask[] = [
-  {
-    name: 'groundedness',
-    method: 'judge',
-    stage: 'stage 3',
-    status: { label: 'Failed', tone: 'danger' },
-    score: '0.61',
-    detail: {
-      type: 'assertion',
-      weight: '1.0',
-      started: '12:41:09.4Z',
-      duration: '1.4s',
-      attempt: '1 of 2 · provider-error retry only',
-      cost: '$0.0041',
-      scoreValue: 0.61,
-      threshold: 0.8,
-      comparison: 'judge (>=) · scored 0.61 vs >= 0.80 — fails',
-      judgeExplanation:
-        'The answer cites a cart total that does not appear in the retrieved cart record. Two of three grounding checks failed on the cited fields.',
-      expected: ['grounded >= 0.80', 'cart_total: 84.10', 'items: 3 · risk_tier: high'],
-      actual: ['grounded 0.61', 'cart_total: 91.55 ← uncited', 'items: 3 · risk_tier: high'],
-      withheldReason: null,
-      history: ['pass', 'pass', 'fail', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'fail'],
-      traceLink: { label: 'open trace_01 · span rank.candidates', href: 'trace_01' }
-    }
-  },
-  {
-    name: 'tool-selection',
-    method: 'exact',
-    stage: 'stage 2',
-    status: { label: 'Passed', tone: 'ok' },
-    score: '1.00',
-    detail: {
-      type: 'assertion',
-      weight: '0.5',
-      started: '12:41:04.1Z',
-      duration: '0.2s',
-      attempt: '1 of 1',
-      cost: '—',
-      scoreValue: 1,
-      threshold: 1,
-      comparison: 'exact (==) · ledger.capture == ledger.capture — passes',
-      judgeExplanation: null,
-      expected: ['tool: ledger.capture'],
-      actual: ['tool: ledger.capture'],
-      withheldReason: null,
-      history: ['pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass'],
-      traceLink: null
-    }
-  },
-  {
-    name: 'pii-leak',
-    method: 'regex',
-    stage: 'stage 2',
-    status: { label: 'Passed', tone: 'ok' },
-    score: '1.00',
-    detail: {
-      type: 'assertion',
-      weight: '1.0',
-      started: '12:41:04.3Z',
-      duration: '0.1s',
-      attempt: '1 of 1',
-      cost: '—',
-      scoreValue: 1,
-      threshold: 1,
-      comparison: 'regex (no match) · no PII pattern matched — passes',
-      judgeExplanation: null,
-      expected: ['no card number, SSN or address in the response'],
-      actual: null,
-      withheldReason: 'Actual values withheld — this task inspects raw response content and your principal is not authorized to read it.',
-      history: ['pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass'],
-      traceLink: null
-    }
-  },
-  {
-    name: 'latency-budget',
-    method: '<=',
-    stage: 'stage 3',
-    status: { label: 'Failed', tone: 'danger' },
-    score: '1.84s',
-    detail: {
-      type: 'assertion',
-      weight: '0.5',
-      started: '12:41:08.9Z',
-      duration: '0.1s',
-      attempt: '1 of 1',
-      cost: '—',
-      scoreValue: 1.84,
-      threshold: 1.5,
-      comparison: '<= · measured 1.84s vs <= 1.50s — fails',
-      judgeExplanation: null,
-      expected: ['end-to-end <= 1.50s'],
-      actual: ['end-to-end 1.84s'],
-      withheldReason: null,
-      history: ['pass', 'pass', 'pass', 'fail', 'pass', 'pass', 'fail', 'pass', 'fail', 'fail'],
-      traceLink: { label: 'open trace_01 · root span', href: 'trace_01' }
-    }
-  },
-  {
-    name: 'refusal-rate',
-    method: 'ratio',
-    stage: 'stage 4',
-    status: { label: 'Skipped', tone: 'neutral' },
-    score: '—',
-    detail: {
-      type: 'assertion',
-      weight: '0.5',
-      started: '—',
-      duration: '—',
-      attempt: '—',
-      cost: '—',
-      scoreValue: null,
-      threshold: null,
-      comparison: 'skipped — its condition gates on stage 3 passing',
-      judgeExplanation: null,
-      expected: ['refusal ratio <= 0.02 over the session'],
-      actual: null,
-      withheldReason: null,
-      history: [],
-      traceLink: null
-    }
-  },
-  {
-    name: 'tone',
-    method: 'judge',
-    stage: 'stage 3',
-    status: { label: 'Error', tone: 'warn' },
-    score: '—',
-    detail: {
-      type: 'assertion',
-      weight: '0.25',
-      started: '12:41:09.6Z',
-      duration: '2.0s',
-      attempt: '2 of 2 · provider-error retry only',
-      cost: '$0.0038',
-      scoreValue: null,
-      threshold: 0.7,
-      comparison: 'judge (>=) · provider errored twice — no score recorded',
-      judgeExplanation: 'The judge provider returned 429 on both attempts. An errored task is reported as error, never as a pass or fail.',
-      expected: ['tone >= 0.70'],
-      actual: null,
-      withheldReason: null,
-      history: ['pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass'],
-      traceLink: null
-    }
-  }
-];
-
-/** Fully drawn evaluation events addressable by record_id. */
-export const evalDetails: Record<string, EvalDetail> = {
-  eval_record_01: {
-    recordId: 'eval_record_01',
-    runId: 'run_88a1',
-    eval: 'Checkout agent eval',
-    evalCardHref: 'card_eval_01',
-    subject: 'checkout-agent',
-    subjectHref: 'card_service_04',
-    workflow: { name: 'Checkout quality workflow', version: 'card_eval_01 v7', started: '12:41:02Z' },
-    status: { label: 'Failed', tone: 'danger' },
-    duration: '12.4s',
-    passed: 4,
-    total: 6,
-    origin: 'online',
-    scenario: null,
-    stages: [
-      { name: '1 · load', state: 'completed', tone: 'ok' },
-      { name: '2 · run', state: 'completed', tone: 'ok' },
-      { name: '3 · judge', state: '1 failed', tone: 'danger' },
-      { name: '4 · gate', state: 'running', tone: 'running' }
-    ],
-    tasks: evalTasks,
-    selected: evalTasks[0]
-  },
-  eval_record_04: {
-    recordId: 'eval_record_04',
-    runId: 'run_local_2e',
-    eval: 'Refund agent scenarios',
-    evalCardHref: '',
-    subject: 'local · unregistered',
-    subjectHref: '',
-    workflow: { name: 'Offline scenario run', version: 'collection customer-support-v2', started: '09:12:44Z' },
-    status: { label: 'Passed', tone: 'ok' },
-    duration: '8.2s',
-    passed: 4,
-    total: 4,
-    origin: 'offline',
-    scenario: {
-      id: 'refund-partial-3',
-      collection: 'customer-support-v2',
-      initialQuery: 'I want a refund for two of the three items in order ord_5512.'
-    },
-    stages: [
-      { name: '1 · drive', state: 'completed', tone: 'ok' },
-      { name: '2 · score', state: 'completed', tone: 'ok' }
-    ],
-    tasks: [
-      {
-        name: 'outcome-match',
-        method: 'judge',
-        stage: 'stage 2',
-        status: { label: 'Passed', tone: 'ok' },
-        score: '0.92',
-        detail: {
-          type: 'scenario task',
-          weight: '1.0',
-          started: '09:12:47Z',
-          duration: '1.1s',
-          attempt: '1 of 1',
-          cost: '$0.0032',
-          scoreValue: 0.92,
-          threshold: 0.8,
-          comparison: 'judge (>=) · scored 0.92 vs >= 0.80 — passes',
-          judgeExplanation: 'The response issues a partial refund for exactly the two requested items and confirms the remaining item ships.',
-          expected: ['partial refund for 2 of 3 items', 'expected_outcome met'],
-          actual: ['partial refund issued for 2 items', 'third item unchanged'],
-          withheldReason: null,
-          history: ['pass', 'pass', 'pass', 'pass', 'pass'],
-          traceLink: null
-        }
-      },
-      {
-        name: 'turn-budget',
-        method: '<=',
-        stage: 'stage 1',
-        status: { label: 'Passed', tone: 'ok' },
-        score: '3',
-        detail: {
-          type: 'scenario task',
-          weight: '0.5',
-          started: '09:12:44Z',
-          duration: '—',
-          attempt: '1 of 1',
-          cost: '—',
-          scoreValue: 3,
-          threshold: 8,
-          comparison: '<= · 3 turns vs max_turns 8 — passes',
-          judgeExplanation: null,
-          expected: ['<= 8 turns'],
-          actual: ['3 turns'],
-          withheldReason: null,
-          history: ['pass', 'pass', 'pass', 'pass', 'pass'],
-          traceLink: null
-        }
-      }
-    ],
-    selected: null as unknown as EvalTask
-  }
-};
-evalDetails.eval_record_04.selected = evalDetails.eval_record_04.tasks[0];
 
 /** Per-feature results of the calculated 30d ranking drift report. */
 export const driftFeatures: DriftFeature[] = [

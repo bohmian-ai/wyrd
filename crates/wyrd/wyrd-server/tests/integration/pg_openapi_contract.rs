@@ -93,6 +93,75 @@ fn api_key_exchange(api_key: &str) -> String {
         .finish()
 }
 
+/// Product nouns that turn an expanded `evaluation` word into an owned Wyrd
+/// product name (`EvaluationRun`, `evaluation_runs`), as opposed to prose or a
+/// faithful standard projection such as `GenAiEvaluationResult`.
+const EVALUATION_PRODUCTS: [&str; 8] = [
+    "run", "suite", "task", "job", "dataset", "report", "record", "workflow",
+];
+
+/// Return a 60-character snippet for every retired evaluation name in the
+/// served document `served`.
+///
+/// Each case-folded `eval` occurrence must open a word: `eval` after no
+/// letter, `Eval`/`EVAL` after no uppercase letter (a camel boundary). It is
+/// retired when the abbreviation ends there (optionally plural), when the
+/// expanded `evaluation(s)` is followed, directly or after one `_`/`-`, by an
+/// [`EVALUATION_PRODUCTS`] noun that itself ends the word, or when it is the
+/// bare `/evaluations` route segment. A word ends at a character that cannot
+/// continue it: not lowercase for `eval`/`Eval`, not uppercase for `EVAL`.
+/// Descriptive `Evaluation` prose and standard projections stay legal.
+fn retired_vocabulary(served: &str) -> Vec<String> {
+    let folded = served.to_ascii_lowercase();
+    folded
+        .match_indices("eval")
+        .map(|(start, _)| start)
+        .filter(|&start| {
+            let word = &served[start..start + 4];
+            let before = served[..start].chars().next_back();
+            let opens = match word {
+                "eval" => !before.is_some_and(|c| c.is_ascii_alphabetic()),
+                "Eval" | "EVAL" => !before.is_some_and(|c| c.is_ascii_uppercase()),
+                _ => false,
+            };
+            let ends = |at: usize| {
+                let rest = served[at..].trim_start_matches(['s', 'S']);
+                !rest.chars().next().is_some_and(|c| {
+                    if word == "EVAL" {
+                        c.is_ascii_uppercase()
+                    } else {
+                        c.is_ascii_lowercase()
+                    }
+                })
+            };
+            let expanded = start + "evaluation".len();
+            if !opens {
+                return false;
+            }
+            if ends(start + 4) {
+                return true;
+            }
+            if !folded[start..].starts_with("evaluation") {
+                return false;
+            }
+            if before == Some('/') && folded[expanded..].starts_with('s') && ends(expanded) {
+                return true;
+            }
+            let noun_at = expanded
+                + usize::from(folded[expanded..].starts_with('s'))
+                + usize::from(
+                    folded[expanded..]
+                        .trim_start_matches('s')
+                        .starts_with(['_', '-']),
+                );
+            EVALUATION_PRODUCTS
+                .iter()
+                .any(|noun| folded[noun_at..].starts_with(noun) && ends(noun_at + noun.len()))
+        })
+        .map(|start| served[start..].chars().take(60).collect())
+        .collect()
+}
+
 /// Pull every `WYRD_…` stable code named in a response description.
 ///
 /// Descriptions are prose with codes in parentheses rather than a structured
@@ -1304,11 +1373,16 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
 /// operation is routed. The in-process server uses local storage, so its
-/// evidence plans target the digest-keyed local upload route.
+/// evidence plans target the digest-keyed local upload route. The served
+/// document names no retired evaluation identifier — neither an abbreviation
+/// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
+/// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
+/// and words such as `retrieval` stay legal.
 ///
 /// # Panics
-/// Panics when the server fails to start or stop, or when a Verification path,
-/// method, status, or schema reference differs.
+/// Panics when the server fails to start or stop, when a Verification path,
+/// method, status, or schema reference differs, or when the document names a
+/// retired evaluation identifier.
 #[tokio::test]
 async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
@@ -1399,6 +1473,12 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             .iter()
             .all(|status| documented.contains(status)),
         "{documented:?}"
+    );
+
+    let retired = retired_vocabulary(&document.to_string());
+    assert!(
+        retired.is_empty(),
+        "served OpenAPI names the retired evaluation vocabulary: {retired:?}"
     );
 
     server.shutdown().await.expect("server shuts down");

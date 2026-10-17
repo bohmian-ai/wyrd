@@ -25,7 +25,6 @@ use wyrd_spec::card::data::{
     DataInterface, DataSchema, DataSpec, DataSplit, DataStats, SplitStrategy, SqlLogic,
 };
 use wyrd_spec::card::drift::DriftSpec;
-use wyrd_spec::card::eval::EvalSpec as CardEvalSpec;
 use wyrd_spec::card::experiment::ExperimentSpec;
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::card::mcp::McpSpec;
@@ -168,7 +167,6 @@ fn contracts() -> Value {
         PromptRef,
         ParameterName,
         AgentSpec,
-        CardEvalSpec,
         DriftSpec,
         TriggerSpec,
         TriggerActivation,

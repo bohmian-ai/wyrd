@@ -2804,7 +2804,9 @@ export class WyrdState {
    * The Verifier Card an alias names.
    *
    * @param alias - A bundle alias of a Verifier Card.
-   * @returns The envelope; its Drift or Eval body is `spec.implementation`.
+   * @returns The envelope; its building blocks are `spec.inputs`,
+   * `spec.steps`, `spec.requirements`, `spec.decide`, and
+   * `spec.context_capture`.
    * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown
    * alias, or `WYRD_SDK_400_CARD_KIND_MISMATCH` for another kind.
    */

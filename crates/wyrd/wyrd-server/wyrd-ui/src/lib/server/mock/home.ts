@@ -155,9 +155,9 @@ export function mockHome(tenant: Tenant): HomeView {
         href: `${base}/observe/traces/trace_01`
       },
       {
-        title: 'eval_record_01',
-        detail: 'groundedness failed',
-        href: `${base}/observe/evaluations/eval_record_01`
+        title: 'drift / ranking-api',
+        detail: 'score drift breached',
+        href: `${base}/observe/drift?service=ranking-api&range=30d`
       },
       { title: `${base}/query`, detail: 'session history: 3 queries', href: `${base}/query` }
     ]

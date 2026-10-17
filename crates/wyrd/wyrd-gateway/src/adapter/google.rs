@@ -159,6 +159,7 @@ fn conversation(
                             name: call.function.name.clone(),
                             args: super::arguments(call, &field)?,
                         },
+                        thought_signature: None,
                     });
                 }
                 ("model", parts)
@@ -381,7 +382,7 @@ pub(super) fn response(
             match part {
                 GooglePart::Text { text } => content.push_str(&text),
                 GooglePart::Thought { .. } => {}
-                GooglePart::FunctionCall { function_call } => calls.push(OpenAiToolCall {
+                GooglePart::FunctionCall { function_call, .. } => calls.push(OpenAiToolCall {
                     id: format!("call_{index}_{}", calls.len()),
                     kind: "function".to_owned(),
                     function: OpenAiToolFunctionCall {

@@ -298,7 +298,7 @@ impl PyGoogleFunctionCall {
             &req.contents[self.content_index]
         };
         match &c.parts[self.part_index] {
-            GooglePart::FunctionCall { function_call } => function_call,
+            GooglePart::FunctionCall { function_call, .. } => function_call,
             _ => unreachable!(),
         }
     }
@@ -579,6 +579,12 @@ impl PyGoogleFunctionDeclaration {
     ///
     /// # Errors
     /// Raises `WyrdError` when the schema does not convert to a Python value.
+    ///
+    /// # Panics
+    /// Panics if the retained request is not a Gemini request or no longer
+    /// holds the tool and declaration indices this wrapper was built from;
+    /// both are fixed when the wrapper is constructed from that immutable
+    /// request.
     #[getter]
     fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let schema = self

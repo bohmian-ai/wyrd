@@ -9,7 +9,7 @@ use std::time::Duration;
 use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
-use vala_eval::blocks::BlockError;
+use vala_verify::blocks::BlockError;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{Staged, Workspace};

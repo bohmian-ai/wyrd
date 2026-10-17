@@ -29,12 +29,11 @@ const STALE_AT = '2026-09-08T15:17:00Z';
 const observe = (signal: string, extra = '') =>
   `/observe/${signal}?service=checkout-api${extra}&range={range}`;
 
-/** The five inline investigations; `note` marks an unauthorized signal (S-05). */
+/** The four inline investigations; `note` marks an unauthorized signal (S-05). */
 const investigations = (driftNote?: string) => [
   { label: 'Logs', href: observe('logs') },
   { label: 'Metrics', href: observe('metrics') },
   { label: 'Traces', href: observe('traces') },
-  { label: 'Evaluations', href: observe('evaluations') },
   driftNote ? { label: 'Drift', note: driftNote } : { label: 'Drift', href: observe('drift') }
 ];
 
@@ -135,10 +134,10 @@ function driftSignal(breached: boolean, stamp: string): ServiceSignal {
   };
 }
 
-/** The published checkout-agent-eval intelligence panel. */
-function evalSignal(stamp: string): ServiceSignal {
+/** The published checkout-agent-check intelligence panel. */
+function checkSignal(stamp: string): ServiceSignal {
   return {
-    title: 'CHECKOUT-AGENT-EVAL (Verifier v4)',
+    title: 'CHECKOUT-AGENT-CHECK (Verifier v4)',
     stamp,
     verdict: { label: '✓ PASSING', tone: 'ok' },
     subject: 'subject checkout-agent (agent_triage · Agent v6)',
@@ -151,7 +150,7 @@ function evalSignal(stamp: string): ServiceSignal {
       qualifier: 'pass rate'
     },
     context: '1,240 scenarios per run · deterministic assertions',
-    link: { label: 'Evaluations →', href: observe('evaluations') }
+    link: { label: 'Verifier card →', href: '/cards/card_verifier_03' }
   };
 }
 
@@ -172,7 +171,7 @@ const attention: ServiceOverviewState = {
   channelNote: 'latest change: v12 deployed 09:12 — correlation, not proven cause',
   charts: currentCharts('0.31%', 0.31),
   addChart,
-  signals: [driftSignal(true, 'calc 15:30 · 12m ago'), evalSignal('calc 14:41 · 1h ago')],
+  signals: [driftSignal(true, 'calc 15:30 · 12m ago'), checkSignal('calc 14:41 · 1h ago')],
   attention: {
     title: 'ATTENTION — 1 ACTIVE',
     note: 'server-ordered · degraded first',
@@ -189,7 +188,7 @@ const attention: ServiceOverviewState = {
       text: 'ranker v12 ▲ · checkout-agent v6 ✓ · fraud-review v2 ✓ · +2 ✓',
       href: 'composition'
     },
-    activity: '15:00 drift breach began · 14:41 eval pass 96.4% · 09:12 v12 deploy',
+    activity: '15:00 drift breach began · 14:41 verification pass 96.4% · 09:12 v12 deploy',
     investigations: investigations(),
     foot: 'scope preserved'
   }
@@ -211,7 +210,7 @@ const healthy: ServiceOverviewState = {
     { label: 'FRESHNESS', value: '✓ 41s' }
   ],
   charts: currentCharts('0.19%', 0.19),
-  signals: [driftSignal(false, 'calc 15:30 · 12m ago'), evalSignal('calc 14:41 · 1h ago')],
+  signals: [driftSignal(false, 'calc 15:30 · 12m ago'), checkSignal('calc 14:41 · 1h ago')],
   attention: {
     title: 'ATTENTION — NONE ACTIVE',
     note: 'server-ordered · degraded first',
@@ -220,7 +219,7 @@ const healthy: ServiceOverviewState = {
   context: {
     ...attention.context,
     components: { text: 'ranker v12 ✓ · checkout-agent v6 ✓ · fraud-review v2 ✓ · +2 ✓', href: 'composition' },
-    activity: '15:30 drift calc ✓ · 14:41 eval pass 96.4% · 09:12 v12 deploy'
+    activity: '15:30 drift calc ✓ · 14:41 verification pass 96.4% · 09:12 v12 deploy'
   }
 };
 
@@ -249,7 +248,7 @@ const stale: ServiceOverviewState = {
     note: 'gap — not zero',
     endsAt: STALE_AT
   })),
-  signals: [driftSignal(false, 'calc 14:30 · 1h 12m ago — aged'), evalSignal('calc 14:41 · 1h ago — aged')],
+  signals: [driftSignal(false, 'calc 14:30 · 1h 12m ago — aged'), checkSignal('calc 14:41 · 1h ago — aged')],
   attention: {
     title: 'ATTENTION — CANNOT EVALUATE',
     note: 'server-ordered · degraded first',
@@ -261,7 +260,7 @@ const stale: ServiceOverviewState = {
   context: {
     ...healthy.context,
     components: { text: 'all five ◔ stale — no observation since 15:17 · details', href: 'composition' },
-    activity: '15:17 last observation · 14:41 eval pass 96.4% · 09:12 v12 deploy'
+    activity: '15:17 last observation · 14:41 verification pass 96.4% · 09:12 v12 deploy'
   }
 };
 
@@ -292,7 +291,7 @@ const partial: ServiceOverviewState = {
         'binding from the v12 declaration'
       ]
     },
-    evalSignal('calc 14:41 · 1h ago')
+    checkSignal('calc 14:41 · 1h ago')
   ],
   attention: {
     title: 'ATTENTION — MAY BE INCOMPLETE',
@@ -387,7 +386,7 @@ const composition: ServiceComposition = {
             }
           }
         },
-        { uid: 'card_eval_02', kind: 'Verifier', name: 'checkout-agent-eval', version: 'v4', status: '✓ active', note: 'verified by · on checkout-agent' }
+        { uid: 'card_verifier_03', kind: 'Verifier', name: 'checkout-agent-check', version: 'v4', status: '✓ active', note: 'verified by · on checkout-agent' }
       ]
     },
     {
@@ -401,7 +400,7 @@ const composition: ServiceComposition = {
   ],
   edges: [
     { from: 'card_prompt_02', to: 'card_agent_01', label: 'prompt' },
-    { from: 'card_agent_01', to: 'card_eval_02', label: 'verified by' },
+    { from: 'card_agent_01', to: 'card_verifier_03', label: 'verified by' },
     { from: 'card_model_01', to: 'card_drift_01', label: 'verified by' },
     { from: 'card_drift_01', to: 'card_trigger_01', label: 'fires' },
     { from: 'card_trigger_01', to: 'card_operator_01', label: 'invokes', route: 'down' },
@@ -434,7 +433,7 @@ spec:
     - alias: agent_triage
       ref: { kind: Agent, name: checkout-agent, version: v6 }
       verified_by:
-        - verifier: { kind: Verifier, name: checkout-agent-eval, version: v4 }
+        - verifier: { kind: Verifier, name: checkout-agent-check, version: v4 }
     - alias: agent_inline
       ref: { kind: Agent, name: fraud-review, version: v2 }
     - alias: model_shadow
@@ -460,7 +459,7 @@ const definition: ServiceDefinition = {
     note: 'aliases are runtime names; each ref keeps its own Card',
     rows: [
       { alias: 'model_primary', ref: 'ranker · v12', href: '/cards/card_model_01', kind: 'Model', publishes: 'model-drift (Verifier)', publishesHref: '/cards/card_drift_01' },
-      { alias: 'agent_triage', ref: 'checkout-agent · v6', href: '/cards/card_agent_01', kind: 'Agent', publishes: 'checkout-agent-eval (Verifier)', publishesHref: '/cards/card_eval_02' },
+      { alias: 'agent_triage', ref: 'checkout-agent · v6', href: '/cards/card_agent_01', kind: 'Agent', publishes: 'checkout-agent-check (Verifier)', publishesHref: '/cards/card_verifier_03' },
       { alias: 'agent_inline', ref: 'fraud-review · v2', href: '/cards/card_agent_02', kind: 'Agent', publishes: '—' },
       { alias: 'model_shadow', ref: 'ranker-shadow · v11', href: '/cards/card_model_02', kind: 'Model', publishes: '—' },
       { alias: 'capture_prompt', ref: 'capture-review · v3', href: '/cards/card_prompt_02', kind: 'Prompt', publishes: '—' },
@@ -479,7 +478,7 @@ const definition: ServiceDefinition = {
         },
         {
           from: { label: 'checkout-agent (Agent v6)', href: '/cards/card_agent_01' },
-          to: { label: 'checkout-agent-eval (Verifier v4)', href: '/cards/card_eval_02' }
+          to: { label: 'checkout-agent-check (Verifier v4)', href: '/cards/card_verifier_03' }
         }
       ]
     },
@@ -541,7 +540,7 @@ const v11Overview: ServiceOverviewState = {
       body: ['No drift calculation exists for a v11 publication in this range — stated, never inferred from v12 results.']
     },
     {
-      title: 'CHECKOUT-AGENT-EVAL — NO v11 RESULT',
+      title: 'CHECKOUT-AGENT-CHECK — NO v11 RESULT',
       state: 'nodata',
       body: ['No evaluation result is bound to a v11 publication in this range — stated, never inferred from v12 results.']
     }
@@ -618,7 +617,7 @@ const v11Presentation: ServicePresentation = {
       component: {
         label: definition.publications.component.label,
         flows: [],
-        absent: 'NONE DECLARED — v11 predates the model-drift and checkout-agent-eval bindings.'
+        absent: 'NONE DECLARED — v11 predates the model-drift and checkout-agent-check bindings.'
       },
       service: {
         label: definition.publications.service.label,
@@ -631,7 +630,7 @@ const v11Presentation: ServicePresentation = {
       summary: 'spec.yaml — v11 declaration · validated wyrd/v1',
       yaml: specYaml
         .split('\n')
-        .filter((line) => !/model-drift|checkout-agent-eval|verified_by|runs_on|model_shadow|ranker-shadow|shared_prompt/.test(line))
+        .filter((line) => !/model-drift|checkout-agent-check|verified_by|runs_on|model_shadow|ranker-shadow|shared_prompt/.test(line))
         .join('\n')
         .replace('version: v12 }', 'version: v11 }')
     }
@@ -675,7 +674,7 @@ export const serviceDetail: CardDetailFixture = {
   relationships: [
     { relation: 'components', label: '7 refs → 6 Cards (aliases)' },
     { relation: 'publication', label: 'model-drift (Verifier)', href: '/cards/card_drift_01' },
-    { relation: 'publication', label: 'checkout-agent-eval (Verifier)', href: '/cards/card_eval_02' },
+    { relation: 'publication', label: 'checkout-agent-check (Verifier)', href: '/cards/card_verifier_03' },
     { relation: 'governed by', label: 'checkout-guardrails (Policy)', href: '/cards/card_policy_01' },
     { relation: 'reaction', label: 'ranking-drift-response (Trigger)', href: '/cards/card_trigger_01' }
   ]

@@ -38,7 +38,7 @@ fn load_end_to_end_reference_tree() {
     let service_position = position("churn-response-service");
     assert!(position("churn-classifier-drift") < service_position);
     assert!(position("churn-classifier") < service_position);
-    assert!(position("churn-triage-eval") < service_position);
+    assert!(position("churn-triage-check") < service_position);
     assert!(position("cohort-check") < position("churn-triage"));
     assert!(position("churn-triage") < service_position);
     assert!(position("retention-runbook") < service_position);

@@ -174,7 +174,7 @@ async fn unwritten_builtin_table_reads_as_empty() {
     let rows: Vec<Count> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
-        .sql_as("SELECT COUNT(*) AS n FROM vala.eval.result_items", &[])
+        .sql_as("SELECT COUNT(*) AS n FROM vala.drift.result_features", &[])
         .await
         .expect("query runs");
 
@@ -412,12 +412,11 @@ async fn type_mismatch_and_ambiguous_reference_carry_the_planners_detail() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn unauthorized_table_refusal_reveals_no_columns() {
     let (deployment, _) = live().await;
-    let datasets_only = serde_json::from_value(json!({
+    let datasets_only = json!({
         "resource": "bifrost_query",
         "action": "read",
         "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "datasets" } } },
-    }))
-    .expect("permission parses");
+    });
     deployment
         .server()
         .seed_role("datasets_reader", &[datasets_only])

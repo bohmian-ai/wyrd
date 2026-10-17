@@ -272,7 +272,7 @@ mod tests {
     /// Serving an accepted delegated authority adds its subject and history
     /// to the SYSTEM read context and nothing else (FIND-TASK-001-6).
     ///
-    /// The Drift and Eval readers both build their context through
+    /// The Drift reader builds its context through
     /// [`SystemReadAuthority::serving`]. The served context keeps SYSTEM as
     /// its principal with exactly its one table grant, records User A as the
     /// served subject and `[B]` as the chain, and keeps both across the JSON
@@ -298,7 +298,7 @@ mod tests {
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
                 catalog: "vala".to_owned(),
-                schema: "eval".to_owned(),
+                schema: "drift".to_owned(),
                 table_uid: uuid::Uuid::now_v7(),
             })),
         };

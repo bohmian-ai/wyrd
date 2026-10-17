@@ -17,7 +17,7 @@ use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::RegistrationOperationId;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{

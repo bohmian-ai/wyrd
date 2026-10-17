@@ -6,14 +6,14 @@
 //! lifts every key in [`crate::vala::trace::attributes::GEN_AI_KEYS`] into
 //! a typed column on this record, stores remaining `gen_ai.*` keys in
 //! [`GenAiSpanRecord::extra`], and reads `gen_ai.evaluation.result` events
-//! into [`GenAiSpanRecord::eval_results`].
+//! into [`GenAiSpanRecord::evaluation_results`].
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
 use crate::vala::ids::{SpanId, TraceId};
-use crate::vala::trace::{GenAiEvalResult, Resource, SpanStatus};
+use crate::vala::trace::{GenAiEvaluationResult, Resource, SpanStatus};
 
 /// OTel GenAI semantic-convention span projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -264,7 +264,7 @@ pub struct GenAiSpanRecord {
 
     /// Extracted `gen_ai.evaluation.result` events on the source span.
     #[serde(default)]
-    pub eval_results: Vec<GenAiEvalResult>,
+    pub evaluation_results: Vec<GenAiEvaluationResult>,
 
     /// Any `gen_ai.*` attribute on the source span that does not have a
     /// dedicated typed column above.
@@ -376,10 +376,10 @@ impl GenAiSpanRecord {
         }
 
         self.resource.validate()?;
-        for (index, eval_result) in self.eval_results.iter().enumerate() {
-            eval_result.validate().map_err(|error| match error {
+        for (index, evaluation_result) in self.evaluation_results.iter().enumerate() {
+            evaluation_result.validate().map_err(|error| match error {
                 WyrdError::Validation { message, .. } => WyrdError::Validation {
-                    message: format!("eval_results[{index}]: {message}"),
+                    message: format!("evaluation_results[{index}]: {message}"),
                     details: serde_json::Value::Null,
                 },
                 other => other,

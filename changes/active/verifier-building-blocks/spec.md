@@ -1,6 +1,6 @@
 ---
 id: SPEC-verifier-building-blocks
-revision: 9
+revision: 11
 status: approved
 ---
 
@@ -46,7 +46,22 @@ repositories into Task 005: refactor `wyrd-example-ts` and create
 Revision 9 records the owner's explicit approval ("Approve the revision") of
 the local-backend evidence upload route in REQ-010/REQ-012, resolving
 FIND-TASK-005-6.
-The remaining approved behavior is unchanged.
+Revision 10 absorbs the separate untracked remove-eval-naming revision 1 draft
+into this change. The owner explicitly approved the complete revision on
+2026-10-16: "$wyrd-plan approve. write the task". Unchanged requirements retain
+their prior approvals.
+
+Owner direction (2026-10-16): "the completion of verifier-building blocks
+makes the whole premise of eval obsolete … we no longer need to keep the old
+naming around. it should all be repurposed for verification" and "this should
+have been taken care of. the deletion and remediation work needs to be task
+006". D1 was explicitly confirmed: "Delete obsolete machinery (recommended)".
+The owner added: "the only thing eval related that should stay is genai otel
+semantics (we dont own that standard). Unless there are other things that im
+not thinking of". The owner subsequently clarified: "nothing has ever
+shipped". This is an unreleased development cutover, not a shipped-contract
+migration; no compatibility or historical-access preservation is required for
+the obsolete subsystem. Revision 10 is approved as a whole.
 
 The five agreed simplifications remain: preserve missing results in aggregation;
 carry original-source citations through derived output; use unique names and
@@ -56,8 +71,9 @@ at batched acceptance rather than promising synchronous conflict rejection.
 
 The owner also requires a working TypeScript demo, equivalent examples in
 Python, first-class Rust support alongside both languages, docsite and
-architecture updates, and delivery in four or five cohesive tasks with
-parallel work where dependencies allow. This specification creates no tasks.
+architecture updates, and originally requested four or five cohesive tasks
+with parallel work where dependencies allow. Revision 10 adds the explicitly requested TASK-006 after
+TASK-005 and before final change review. This specification creates no tasks.
 
 ## Baseline and authority
 
@@ -98,6 +114,9 @@ In scope:
 - Real-time `verify`, background `submit`, execution status and bounded waiting.
 - Rust, Python, and TypeScript SDKs over the shared client, HTTP, MCP, and
   affected CLI/UI consumers, schemas, errors, and documentation.
+- Remove obsolete evaluation machinery and repurpose live Verifier dependencies,
+  including contracts, CLI, permissions, analytical registrations, errors,
+  SDKs, UI mocks, checks and documentation (REQ-018–022).
 - Matching runnable support-policy examples in all three languages, the
   standalone `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs`
   developer example repositories, and docsite/architecture updates.
@@ -106,8 +125,9 @@ Out of scope: nested Verifiers, loops, a new Workflow Card or application
 runtime, human verdict submission, scenario simulation as a new graph action,
 server-side Office/PDF rendering, new drift algorithms, external writes from
 checks, regulated-data erasure guarantees, and a new durable job or result
-recovery system. Existing scenario simulation is not removed merely because
-it is not a new action. Evidence garbage collection is not introduced here.
+recovery system. Obsolete scenario simulation and scoring are removed under
+REQ-018, reversing revision 9's retention. Evidence garbage collection is not
+introduced here.
 
 ## Required behavior
 
@@ -863,6 +883,132 @@ rules; do not turn architecture into a private-method description. Keep
 Card kinds at the base's 14; this change adds no new Card kind and does not
 repeat Workflow removal as new work.
 
+### REQ-018 Delete what the Verifier superseded
+
+Agentic-evaluation machinery that no Verifier path uses has no verification
+purpose to be repurposed for. It is deleted, not renamed. This covers:
+
+- the `wyrd eval` CLI command;
+- the `Eval*` Card specs and the legacy DAG executor, orchestrator and
+  scenario modules;
+- the `vala.eval` tables and namespace registration;
+- the `evals` permission resource;
+- every error code reachable only from deleted code.
+
+### REQ-019 Repurpose what the Verifier reuses
+
+Approved D2: `vala-eval` becomes `vala-verify`; shared contracts move into
+existing `wyrd_spec::verification`; `EvalContextCapture` becomes
+`ContextCapture`. Owner approval (2026-10-16): "i approve".
+
+The Verifier engine, and the shared identifiers, operators, paths, planning
+and result types it uses, are repurposed under verification-named owners.
+Subject to the narrow exclusions below, no public Rust path, crate, module,
+type, error code, permission, table, namespace, attribute, env var, config key, CLI command, MCP tool, SDK export or
+generated schema contains "eval" as a word or word part.
+
+### REQ-020 No compatibility aliases
+
+There are no re-exports, deprecated aliases, route aliases, permission
+aliases or table views under old names (AGENTS.md §9). An old permission
+string in a role or token, or an old table name in SQL, receives the
+ordinary unknown-permission or unknown-table refusal.
+
+### REQ-021 Unreleased schema cutover
+
+Nothing has shipped (owner clarification, 2026-10-16). Remove obsolete Eval
+contracts directly; do not add compatibility, historical-reader, archival,
+quarantine, recovery or data-conversion machinery for them. INV-008's former
+preservation of scenario evaluation and historical Eval access is superseded.
+
+Applied migrations remain unchanged. Add a forward migration removing
+`vala.eval` from Forge namespace CHECK constraints. Remove obsolete
+`vala.eval` Forge task/demand rows before validating the new constraints so
+an upgrade from the current development schema succeeds. Preserve all other
+namespace state and existing verification evidence. Retired table identities
+must be inaccessible through Wyrd, including stale development catalog entries.
+
+No migration of old Eval rows into generic verification results is required.
+This task adds no object-store deletion or garbage-collection workflow; any
+leftover development objects may remain unreferenced. There is no promise of
+continued historical Eval access or dedicated historical-data management.
+
+### REQ-022 Verification-only naming
+
+No current Wyrd surface introduces an "eval" identifier outside the exclusions
+below. The served OpenAPI contract test rejects retired names in the served
+document; every other surface is held by review. There is no repository-wide
+name-scan check.
+
+#### Source-backed retention and remediation boundary
+
+Current `blocks::engine` calls graph walking/ledger, JSONPath extraction,
+assertion comparison, trace projection/source, and context capture in legacy
+modules. Retain those live helpers while deleting unused workflows. Directory
+names are not evidence of dead code. The move preserves algorithms and uses
+existing owners; no replacement engine or orchestration layer is authorized.
+Delete errors reached only by removed code; rename still-reachable errors into
+the existing verification domain and regenerate their consumed projections.
+
+TASK-005 already removed the LLM judge, `observe.eval`, `observations_ready`,
+writer-Card Eval fan-out, `vala.eval.observations`, and old verification-run
+contracts/MCP tools. Do not repeat that work. Correct stale positive references
+in the Python state stub, queue batch-builder rustdoc, result-items prose,
+and every other current consumer. An old name may remain only as an explicit
+negative input or historical decision context, never as a current reserved
+writable table. TASK-006 owns any remaining cleanup, without editing immutable
+TASK-005 review evidence.
+
+| Surface | Existing owners / consumer closure | Disposition |
+|---|---|---|
+| CLI | `wyrd-cli/src/eval/{mod,run,output,local_records}.rs`, `Command::Eval`, `tests/eval_support`, `tests/eval_local_records.rs`, related fixtures | Delete command, support and obsolete fixtures |
+| Engine | `vala-eval` legacy `executor`, `orchestrator`, `scenario`, `sampling`, `store`, `tasks`, `trace_source`, `compare`, `results`, `context` | Delete unused workflows; retain live `blocks` dependencies under verification owner |
+| Contracts | `wyrd-spec/src/vala/eval/`, `card/eval.rs`, `examples/gen_schemas.rs` | Delete unused Eval specs/protocols; move live contracts |
+| Consumers | `wyrd-server`, `wyrd-mcp`, `wyrd-cli`, `wyrd-testing`, workspace manifests/lockfiles | Consume renamed engine/contracts |
+| Bifrost | `tables/eval/`, Gate registration, `wyrd.eval.record_uid`, Forge namespace validators/constraints | Retire obsolete development contracts/state; no compatibility machinery |
+| RBAC | `wyrd-runtime/src/permission.rs::Resource::Evals`, workload-role documentation, TS real-time scoped-key test | Delete resource/grants; exercise ordinary unknown permission |
+| Errors | `WYRD_EVAL_400_SCENARIO_LOADER_FAILURE`, `_404_RECORD_MISSING`, `_404_TASK_NOT_FOUND`, `_422_DAG_INVALID`, `_422_DEPENDENCY_MISSING`, `_422_JSONPATH_FAILURE`, `_422_OPERATOR_MISMATCH`, `_500_RESULTS_PERSISTENCE_FAILED`, `_504_TRACE_UNAVAILABLE` | Prove reachability; delete dead codes, rename live codes |
+| SDKs | `EvalContextCapture`, generated TS card types, Python state stub, Rust/TS/Python exports and tests | Regenerate generated outputs; update authored stubs |
+| UI | `features/observe/` and `server/mock/observe/` Eval task/row types and fixtures | Remove obsolete model; preserve surviving verification consumers |
+| Architecture/docs | Design `EvalScore` / Eval-score prose, doctrine Vala row and service lists, evaluation reference and links | Verification vocabulary with unchanged surviving meaning |
+
+Inventory is current at planning inspection on 2026-10-16, not an exhaustive
+implementation allowlist. The removed observations table is stale-reference
+cleanup, not another table deletion.
+
+The owner removed the repository-wide name scan from `check:deps` as overkill
+(revision 11). AGENTS.md §12's default against completed name bans applies
+without exception; do not reintroduce a name-scan check or checker framework.
+The served OpenAPI assertion remains because it proves a published contract,
+not a source-tree naming rule.
+
+#### Vocabulary exclusions and GenAI projections
+
+- Preserve external `gen_ai.evaluation.*` events and attributes exactly.
+  Wyrd's direct projections use the full standard word:
+  `GenAiEvaluationResult`, an expanded `evaluation` module name, and
+  `GenAiSpanRecord.evaluation_results` in place of `eval_results`, across
+  wire/schema/consumer surfaces, without aliases. This applies the owner's
+  standard-only exception; it does not create a separate Wyrd product.
+  Stored lossless OTel payloads and canonical trace storage keep their
+  existing semantics and contents.
+- Ordinary compute words such as `evaluate_operator`, CEL evaluation and
+  Variant evaluation remain; they do not name another Wyrd product.
+- External language/dependency syntax and APIs Wyrd does not own, such as
+  shell `eval`, remain unchanged. Unrelated lexical matches such as retrieval,
+  revalidate and WireValue are outside scope.
+- Applied migration files and `changes/completed/` are historical exclusions.
+  Explicit refusal-test literals, matcher definitions, and historical
+  decision/evidence text in the active packet may name removed contracts.
+  None authorizes an old import/export, positive fixture, alias, or usage guide.
+
+Current design/doctrine/reference service lists use verification vocabulary.
+Update `EvalScore`, Eval-score method prose and the current
+`architecture/references/domain/evaluation.md` path and consumers without
+changing an Audit signal's semantics merely to rename it. Remove obsolete UI
+mock types and fixtures through the existing UI owners; no redesign is added.
+Update SDKs and generators from source; Python `.pyi` stubs are authored.
+
 ## Invariants and required boundaries
 
 - **INV-001 Server ownership.** Pure contracts/validation/errors belong to
@@ -905,10 +1051,17 @@ repeat Workflow removal as new work.
   obsolete direct input unions, old verification-run terminology/contracts,
   `observe.eval`, `observe.drift`, `observations_ready`, writer-Card Eval
   fan-out, and their replaced observation table path when consumers move.
-  No aliases or second workflow. Existing unrelated observations and scenario
-  evaluation are preserved. No deletion or reinterpretation of historical
-  evidence merely to simplify the cutover; historical data is not relabelled
-  as new generic results.
+  No aliases or second workflow. Existing unrelated observations are preserved;
+  obsolete scenario evaluation is deleted (D1), reversing revision 9.
+  Nothing has shipped: remove obsolete Eval development contracts and
+  maintenance state under REQ-021 without compatibility or historical-access
+  preservation. Preserve unrelated and current verification evidence. Old
+  Eval evidence is never relabelled as generic verification results.
+- **INV-009 Naming-only engine move.** Surviving Verifier behavior, verdicts,
+  `vala.verification.*` and drift results, other permissions, audit, tenancy,
+  and lifecycle are unchanged. Existing Verifier tests retain their assertions
+  with naming/import updates only. The owned GenAI projection rename
+  is the explicit wire-name exception; standard semantics remain unchanged.
 
 ### Deployment limits
 
@@ -990,7 +1143,8 @@ These are completion obligations, not claims that tests have run. Planning
 maps them to the smallest complete repository lanes and exact focused commands.
 Per the owner's execution instruction, modules receive focused isolated proof
 while developed in parallel. Full integration and user-journey suites run once
-on the candidate with all five tasks merged, with failure-driven reruns only.
+on the candidate with all tasks, including TASK-006, integrated,
+with failure-driven reruns only.
 The journey tests are still authored with the owning behavior; this changes
 when the full suites run, not the required coverage.
 
@@ -1005,7 +1159,13 @@ when the full suites run, not the required coverage.
 | AC-007 | Scheduled drift integration/journey evidence for REQ-014: correct slot/source selection and cron window, all existing methods, baseline/readiness and insufficient data, full statistical detail, failed-only Operators, and preserved accepted authority on queued retry/restart. |
 | AC-008 | Runnable matched Rust/Python/TypeScript support-policy examples, and standalone `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs` repositories that build against the real SDK, follow the shared layout and REQ-016 conventions, and pass their automated tests against the integrated server, covering immediate pass/fail verdicts, a background review read back by execution ID, and the requirement breakdown. Provider mocks support reproducible automated journeys; live-provider demo setup is explicit and not required by unit tests. |
 | AC-009 | Consumer and documentation evidence for REQ-017/INV-008: served OpenAPI and runtime MCP schemas/behavior; typed exports, authored Python stubs, generated TypeScript declarations/errors; affected CLI/UI; no obsolete active contract/examples; aligned design, doctrine, references, and Bifrost descriptions. Docsite checks/build and example checks pass. |
-| AC-010 | Format/lint, dependency and tenant-boundary checks, contract generation, relevant Rust/Python/TypeScript suites and journeys pass under repository verification policy. Evidence names the commands actually run; aggregate claims reflect `mise.toml`. No new permanent check is required merely to police this change's prose or task count. |
+| AC-010 | Format/lint, dependency and tenant-boundary checks, contract generation, relevant Rust/Python/TypeScript suites and journeys pass under repository verification policy. Evidence names the commands actually run; aggregate claims reflect `mise.toml`. No permanent check is required merely to police naming, prose or task count. |
+| AC-011 | REQ-018/019/020/022: review of current surfaces finds no prohibited Wyrd name outside the documented exceptions, and no repository-wide name-scan check exists; caller evidence proves no live Verifier dependency was deleted, and no obsolete workflow, alias, permission alias or table view remains. |
+| AC-012 | REQ-018/020/021: `wyrd eval` is an unknown command, `evals:run` / `evals:invoke` are unknown permissions, and SQL over `vala.eval.*` is unknown-table refusal. CLI parsing and real Rust/Python/TypeScript SDK and HTTP/MCP negative journeys prove the applicable boundaries, including upgraded catalogs. SDKs need not implement a CLI command. |
+| AC-013 | REQ-019/INV-009: existing real-time/background Verifier journeys, scheduled drift, result queries and engine assertions pass through renamed owners. Full Bifrost and Verifier journey lanes run once at integrated change review; task proof stays focused. |
+| AC-014 | REQ-019: source regeneration / `codegen:check`, served OpenAPI (`test:principals:integration`), runtime MCP catalog, SDK exports/typing and GenAI projection roundtrips contain no prohibited Wyrd names while preserving standard OTel semantics; the served OpenAPI assertion rejects abbreviated and expanded product-shaped retired names and permits descriptive prose and standard projections. |
+| AC-015 | REQ-021/INV-008: fresh and upgraded migrations pass (`test:sql`); remaining Forge namespaces and current verification evidence stay valid; obsolete Eval task/demand rows are removed before constraint validation; retired tables are unreachable; no historical-reader, conversion or object-deletion machinery is introduced. |
+| AC-016 | REQ-017/019/021/022: docsite (`docs:check`), design, doctrine, references, UI mocks, examples and SDK prose agree on verification vocabulary; removed observation paths have no stale positive references. |
 
 ## Expensive-to-reverse decisions
 
@@ -1022,6 +1182,10 @@ when the full suites run, not the required coverage.
   and completed does not mean the result has reached analytical storage.
 - All three SDKs, matched examples, working TypeScript application, docsite,
   architecture, and agent-facing contracts are part of delivery.
+- Revision 10 retires a public CLI command, permission resource, unused error
+  codes and analytical namespace without aliases; selects replacement public
+  names, faithful GenAI projection spelling, and the unreleased development
+  schema cutover. No shipped compatibility contract is being changed.
 
 Private helper names, module organization, executor trait signatures, caches,
 worker-pool API calls, test fixture layout, and internal Arrow column layout
@@ -1029,6 +1193,24 @@ remain implementation choices within these contracts. A task's need to change
 one is not a reason to add a new public primitive.
 
 ## Open material decisions
+
+No open material decision remains for revision 10. The owner approved the
+whole revision on 2026-10-16: "$wyrd-plan approve. write the task". Individual
+spelling or historical-access approval rounds are not required.
+
+Decision record (2026-10-16):
+
+- Delete obsolete machinery: owner selected "Delete obsolete machinery
+  (recommended)".
+- Replacement names: owner approved `vala-verify`, existing
+  `wyrd_spec::verification`, and `ContextCapture`: "i approve".
+- External semantics: "the only thing eval related that should stay is genai
+  otel semantics (we dont own that standard). Unless there are other things
+  that im not thinking of". Wyrd's direct standard projections use expanded
+  `evaluation`; other live Wyrd product names use verification vocabulary.
+- Cutover context: "nothing has ever shipped". REQ-021 removes assumptions of
+  shipped compatibility and historical Eval access, while retaining applied
+  migration history and unrelated/current verification evidence.
 
 Revision 7's handoff decisions and revision 8's example-repository scope are
 approved by the owner's explicit instructions recorded above. No new multi-check drift-count meaning is approved: if adapting
@@ -1056,6 +1238,8 @@ solve for this delivery.
 | 7 | approved | Owner approved the Task 004 handoff proposal. Names MCP tools and binding latest-execution identity; preserves dispatch reads and existing Operator plumbing; cuts templates over to execution identity; fixes the drift error contract; names published analytical correlation/time fields; requires affected lineage and connected-handle journey closure. Multi-check drift-count semantics must not be guessed. |
 | 8 | approved | Owner moved the developer example repositories into Task 005: fully refactor `wyrd-example-ts` and create `wyrd-example-py` and `wyrd-example-rs` as standalone, developer-friendly examples with their own Cards, using current Verifier, transport-hook (Rust: Wyrd Agent Run), and OTel conventions. Not production hardening. |
 | 9 | approved | Owner approved the local-backend evidence upload route (`PUT /v1/verification/evidence/local/{sha256}`) as a published, local-only verification operation with caller-derived tenant, operation-level `verifier:run`, size/digest refusal, idempotent same-digest writes, and no metadata row. Resolves FIND-TASK-005-6; served OpenAPI publishes it only when mounted. |
+| 10 | approved | Absorbs remove-eval-naming revision 1 into TASK-006 scope; adds REQ-018–022, INV-009 and AC-011–016; reverses scenario retention after D1 confirmation; records approved naming and owner GenAI direction, and removes shipped-data assumptions after the owner clarified "nothing has ever shipped". Owner approved the complete revision: "$wyrd-plan approve. write the task". |
+| 11 | approved | Owner removed the repository-wide retired-vocabulary scan from `check:deps` as overkill ("remove the vocab scan block from deps.sh. its overkill"; "change the spec"). REQ-022 now relies on the served OpenAPI assertion plus review; AC-011 drops the permanent check; AC-014 names the served assertion; the AGENTS.md §12 exception is withdrawn. Naming requirements and exclusions are unchanged. |
 
 Material sources beyond the governing authorities:
 
@@ -1075,8 +1259,9 @@ Material sources beyond the governing authorities:
 - [Existing SDK verification-control spec](../sdk-verification-control/spec.md):
   overlapping control projection, superseded where this approved revision
   changes it; do not run its conflicting implementation independently.
-- Existing owners: [Vala executor](../../../crates/vala/vala-eval/src/executor.rs),
-  [judge invoker](../../../crates/vala/vala-eval/src/orchestrator/judge.rs),
+- Current owners (paths before TASK-006 rename):
+  [Verifier engine](../../../crates/vala/vala-eval/src/blocks/engine.rs),
+  [shared contracts](../../../crates/wyrd-spec/src/vala/eval/mod.rs),
   [server verification](../../../crates/wyrd/wyrd-server/src/verification),
   [verification edge](../../../crates/wyrd/wyrd-server/src/components/verification),
   and [shared observation client](../../../crates/shared/wyrd-client/src/observe).

@@ -17,7 +17,7 @@ Wyrd works in three steps, and each one leaves a durable record the next step bu
 | Step | You provide | Wyrd records |
 | --- | --- | --- |
 | Declare | A Service declaration: its components and the Verifiers bound to check them | Versioned Cards in the registry |
-| Observe | Your service's behavior: eval and drift observations, telemetry, and custom data | Rows in Bifrost, the Wyrd data plane |
+| Observe | Your service's behavior: verification results and drift observations, telemetry, and custom data | Rows in Bifrost, the Wyrd data plane |
 | Verify | Nothing extra for triggered checks; the declaration says what is checked, when, and what happens on failure. Real-time checks are one call from your code | A verdict tied to the exact versions that ran, plus any failure actions the declaration names |
 
 **Declare.** You declare a whole service in YAML, independent of the language it is written in. The declaration is a set of Cards. A Card is a versioned declaration of one part of your system, or of how that part is checked. See [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).

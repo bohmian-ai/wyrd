@@ -6,7 +6,6 @@ use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _, symlink};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use wyrd_client::bifrost::BifrostOptions;
 
@@ -297,36 +296,17 @@ impl LocalDev {
 
 /// Select an isolated loopback address for one child listener.
 ///
-/// The CLI and the server bind this address themselves, so the fixture
-/// cannot hold it, and it sits unbound between runs. A port the kernel
-/// handed out from `bind(:0)` returns to the ephemeral range then, where any
-/// concurrent `bind(:0)` or outbound connection can take it. Ports below
-/// `ip_local_port_range` are never assigned automatically, so this probes
-/// upward from a per-process start in `10000..low` and returns the first
-/// free one; only another explicit picker can collide with it.
+/// The operating system assigns a free loopback port, which is released
+/// before return: the CLI and the server bind it themselves, so the fixture
+/// cannot hold it across runs.
 ///
 /// # Panics
-/// Panics if the ephemeral range is unreadable or no port below it is free.
+/// Panics if no loopback port can be bound.
 fn free_bind() -> String {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let low: u32 = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .expect("the kernel's ephemeral port range")
-        .split_whitespace()
-        .next()
-        .and_then(|low| low.parse().ok())
-        .expect("the ephemeral range's lower bound");
-    let span = low
-        .checked_sub(10_000)
-        .expect("ports below the ephemeral range");
-    (0..span)
-        .map(|_| {
-            let offset = std::process::id()
-                .wrapping_mul(97)
-                .wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed));
-            format!("127.0.0.1:{}", 10_000 + offset % span)
-        })
-        .find(|address| TcpListener::bind(address).is_ok())
-        .expect("a free loopback port below the ephemeral range")
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free loopback port")
+        .to_string()
 }
 
 /// First use migrates an empty database, saves a private key and both

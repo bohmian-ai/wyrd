@@ -11,12 +11,19 @@ use wyrd_testing::server::TEST_GATEWAY_CREDENTIAL_BINDING;
 /// Runs `wyrd gateway <args>` against `endpoint`, supplying `token` through
 /// the installed credential resolver's `WYRD_ACCESS_TOKEN` environment input
 /// with an empty configuration home and no competing credentials.
+///
+/// # Panics
+/// Panics as [`gateway_env`] does.
 fn gateway(endpoint: &str, token: &str, args: &[&str]) -> Output {
     gateway_env(endpoint, token, args, &[])
 }
 
 /// Runs [`gateway`] with `vars` added to the command's environment, the way
 /// an administrator exports provider keys a document names.
+///
+/// # Panics
+/// Panics when the empty configuration home cannot be created, the compiled
+/// `wyrd` binary is missing, or the command cannot be run to completion.
 fn gateway_env(endpoint: &str, token: &str, args: &[&str], vars: &[(&str, &str)]) -> Output {
     let empty_config = tempfile::tempdir().expect("empty config home");
     Command::cargo_bin("wyrd")
@@ -458,10 +465,17 @@ async fn deployment_file_accepts_one_or_many() {
 /// documents are refused before any request, a server refusal of a later
 /// deployment commits nothing, a valid document commits together with only
 /// redacted output, and reapplying converges.
+///
+/// # Panics
+/// Panics when the test server or admin cannot be prepared, a document cannot
+/// be written, a command's output is not the expected JSON or problem, any
+/// output discloses the key, or a refusal leaves a resource behind.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn deployment_document_applies_local_environment() {
+    /// Process environment variable the documents' `local_env` source names.
     const VARIABLE: &str = "WYRD_JOURNEY_OPENAI_KEY";
+    /// Provider key value that must never appear in any command output.
     const SECRET: &str = "sk-live-local-env-sentinel";
     let server = WyrdTestServer::start_bound()
         .await

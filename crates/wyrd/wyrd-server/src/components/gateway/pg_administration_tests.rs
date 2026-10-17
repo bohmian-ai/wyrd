@@ -1478,6 +1478,9 @@ async fn resource_names(
 }
 
 /// Decodes a composite apply document from its wire JSON.
+///
+/// # Panics
+/// Panics when `value` is not a valid composite apply document.
 fn apply_document(value: Value) -> ProviderDeploymentsApply {
     serde_json::from_value(value).expect("apply document decodes")
 }
@@ -1493,6 +1496,7 @@ fn apply_document(value: Value) -> ProviderDeploymentsApply {
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_apply_is_atomic_and_tenant_scoped() {
+    /// Managed-secret value submitted inline, which no answer may repeat.
     const SUBMITTED: &str = "sk-live-apply-submission";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();

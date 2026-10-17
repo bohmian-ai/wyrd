@@ -94,6 +94,8 @@ mod pg_tests {
         // same tool, a write-only source, and a unit view in every answer.
         const SUBMITTED: &str = "sk-live-mcp-submission";
         const ROTATED: &str = "sk-live-mcp-rotation";
+        /// Managed secret submitted through the composite apply tool, which
+        /// no MCP or HTTP answer may repeat.
         const APPLIED: &str = "sk-live-mcp-apply";
         let server = WyrdTestServer::start_bound().await?;
         let admin = server

@@ -286,6 +286,7 @@ mod pg_tests {
                 "operator_connections.disable",
                 "gateway.put_provider_credential",
                 "gateway.put_provider_deployment",
+                "gateway.apply_provider_deployments",
                 "gateway.put_fallback_policy",
                 "gateway.put_governance_policy",
                 "gateway.put_capture_policy",

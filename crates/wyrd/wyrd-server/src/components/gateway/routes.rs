@@ -35,6 +35,7 @@ use wyrd_spec::gateway::{
     GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayContractError, GatewayDecimal,
     GatewayFallbackPolicy, GatewayGovernancePolicy, GatewayOperation, GatewayUsageAmount, ModelRef,
     ProviderCredentialView, ProviderCredentialWrite, ProviderDeployment,
+    ProviderDeploymentsApplied, ProviderDeploymentsApply,
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 use wyrd_storage::StorageError;
@@ -70,7 +71,7 @@ pub fn gateway_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_credentials))
         .routes(routes!(put_credential, get_credential, delete_credential))
         .routes(routes!(revoke_credential))
-        .routes(routes!(list_deployments))
+        .routes(routes!(list_deployments, apply_deployments))
         .routes(routes!(put_deployment, get_deployment, delete_deployment))
         .routes(routes!(put_fallback, get_fallback, delete_fallback))
         .routes(routes!(put_governance, get_governance, delete_governance))
@@ -534,6 +535,44 @@ pub(crate) async fn list_deployments(
     Ok(Json(
         GatewayAdministration::new(&state)
             .deployments(&caller)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/gateway/provider-deployments",
+    request_body = ProviderDeploymentsApply,
+    responses(
+        (status = 200, body = ProviderDeploymentsApplied),
+        (status = 400, description = "Invalid document, credential source, or credential reference; nothing is applied (WYRD_GATEWAY_400_INVALID_CONFIGURATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "A submitted credential is revoked or its provider change would orphan a deployment; nothing is applied (WYRD_GATEWAY_409_RESOURCE_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Credential protection, administration store, or token verification unavailable; nothing is applied (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
+    ),
+    tag = "Gateway"
+)]
+/// `POST /v1/admin/gateway/provider-deployments`.
+///
+/// Creates or replaces credentials and the deployments using them in one
+/// tenant transaction; answers with redacted credential views.
+///
+/// # Errors
+/// Returns `GatewayInvalidConfiguration` for an invalid document, source, or
+/// reference, `GatewayResourceConflict` for a revoked credential, and
+/// authentication, permission, sealing, or storage errors.
+#[tracing::instrument(skip_all, fields(operation = "gateway.provider_deployments.apply"))]
+pub(crate) async fn apply_deployments(
+    State(state): State<AppState>,
+    caller: Caller,
+    apply: Result<Json<ProviderDeploymentsApply>, JsonRejection>,
+) -> GatewayResult<Json<ProviderDeploymentsApplied>> {
+    let apply = body(apply)?;
+    Ok(Json(
+        GatewayAdministration::new(&state)
+            .apply_deployments(&caller, apply)
             .await?,
     ))
 }

@@ -39,9 +39,9 @@ pub(super) struct EvidenceInvestigation {
     agent: RunningService<RoleClient, ()>,
     /// Exact subject Card whose evidence is investigated.
     subject: CardRef,
-    /// Drift execution, whose UUID is its result ID, used as a detail pivot.
+    /// Drift execution; its result row names the result ID used as a detail pivot.
     drift_result: ExecutionId,
-    /// Assertion execution, whose UUID is its result ID, used as a pivot.
+    /// Assertion execution whose result the subject pivot selects.
     eval_result: ExecutionId,
     /// Exact Drift Verifier matching the retained feature report.
     drift_verifier: CardRef,
@@ -307,7 +307,8 @@ impl EvidenceInvestigation {
         Ok(())
     }
 
-    /// A subject Card pivot selects judgments, whose result ID selects the Drift detail.
+    /// A subject Card pivot selects judgments by execution, and the Drift
+    /// execution's result ID selects its feature detail.
     ///
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
@@ -325,14 +326,27 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT result_id, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
+        let rows = self.query(&format!("SELECT execution_id, verdict, result_id FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY execution_id LIMIT 20")).await?;
         let mut expected = [self.drift_result.to_string(), self.eval_result.to_string()];
         expected.sort();
+        let judged: Vec<_> = rows
+            .as_array()
+            .ok_or("result rows")?
+            .iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect();
         assert_eq!(
-            rows,
-            json!(expected.map(|result_id| json!([result_id, "failed"])))
+            judged,
+            expected.map(|execution_id| (json!(execution_id), json!("failed")))
         );
-        let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
+        let drift_result = rows
+            .as_array()
+            .ok_or("result rows")?
+            .iter()
+            .find(|row| row[0] == json!(self.drift_result.to_string()))
+            .and_then(|row| row[2].as_str())
+            .ok_or("Drift execution's result ID")?;
+        let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{drift_result}' LIMIT 20")).await?;
         assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));
         Ok(())
     }

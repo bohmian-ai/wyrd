@@ -71,7 +71,7 @@ check_selection "dev-dependency consumers are tested but not propagated" \
   "full_gate=false rust_packages~wyrd-ai rust_packages~wyrd-server rust_packages!wyrd-rust-examples" \
   "crates/wyrd/wyrd-testing/src/lib.rs"
 check_selection "rename inside one crate keeps its closure" \
-  "full_gate=false changed_packages=wyrd rust_packages~wyrd rust_packages~wyrd-rust-examples rust_packages!wyrd-cli ci_lanes~test:wyrd" \
+  "full_gate=false changed_packages=wyrd rust_packages=wyrd ci_lanes~test:wyrd" \
   "crates/wyrd/wyrd/src/old_name.rs" "crates/wyrd/wyrd/src/new_name.rs"
 check_selection "deleted crate path takes the full gate" \
   "full_gate=true" \

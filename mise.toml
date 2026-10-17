@@ -80,7 +80,11 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:wyrd:inner"]
 hide = true
 description = "Run wyrd family tests with the lifecycle already provisioned; packages are the crates under the family directory"
-run = "bash scripts/run-family-tests.sh wyrd"
+# The wyrd-cli server_dev tests install the worker binary beside wyrd-server.
+run = [
+  "cargo build --locked -p wyrd-monty-worker",
+  "bash scripts/run-family-tests.sh wyrd",
+]
 
 [tasks."test:cards:unit"]
 hide = true

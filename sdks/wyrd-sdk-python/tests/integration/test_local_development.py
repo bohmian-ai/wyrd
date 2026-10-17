@@ -24,7 +24,7 @@ import tempfile
 import termios
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 
 import openai
 import pytest
+import tomllib
 from opentelemetry import trace
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost
@@ -994,6 +995,51 @@ def unattended_terminal_offers_no_hosts(cli_path: str) -> None:
             assert host_config.read_bytes() != before, "explicit host was not installed"
 
 
+def restart_on_another_listener(
+    cli_path: str, home: Path, env: dict[str, str], listed: Callable[[str], list[str]]
+) -> None:
+    """Resume completed setup on a terminal with only the HTTP listener changed.
+
+    Provider keys and a detected host remain, yet no gateway or host question
+    is asked: the saved key, proven against the server, marks the deployment
+    as configured. The key and gateway state are unchanged, the new endpoint
+    is saved and usable, and the owned server settles on interruption.
+    """
+    rebound = local_listener()
+    protected = home / "wyrd/credentials.toml"
+    key = tomllib.loads(protected.read_text())["default"]["api_key"]
+    master, slave = pty.openpty()
+    child = subprocess.Popen(
+        [cli_path, "server", "dev", "--bind", rebound],
+        cwd=home,
+        env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=terminal_session,
+    )
+    os.close(slave)
+    try:
+        shown, _ = converse(child, master, [])
+        assert child.stdout is not None
+        threading.Thread(target=child.stdout.read, daemon=True).start()
+        assert b"Configure which providers" not in shown, "restart offered providers"
+        assert b"Connect which hosts" not in shown, "restart offered hosts"
+        assert f"Local Wyrd ready at http://{rebound} for tenant guided.".encode() in shown
+        assert listed("deployment") == ["gemini-local"]
+        assert listed("credential") == ["gemini-key"]
+    finally:
+        stop_local_cli(child)
+        os.close(master)
+    assert tomllib.loads(protected.read_text())["default"]["api_key"] == key
+    saved = tomllib.loads((home / "wyrd/config.toml").read_text())
+    assert saved["client"]["http_url"] == f"http://{rebound}"
+    assert saved["dev"]["bind"] == rebound
+    host, port = rebound.rsplit(":", 1)
+    with socket.socket() as settled:
+        settled.bind((host, int(port)))
+
+
 @pytest.mark.local_dev
 def test_installed_cli_guided_setup() -> None:
     """Guided first setup asks only for missing inputs and approved providers.
@@ -1089,6 +1135,7 @@ def test_installed_cli_guided_setup() -> None:
         assert database.encode() not in disclosed
         assert database.encode() in protected
         assert not any(value.encode() in protected for value in secrets.values())
+        restart_on_another_listener(cli_path, home, env, listed)
     unattended_terminal_offers_no_hosts(cli_path)
 
 

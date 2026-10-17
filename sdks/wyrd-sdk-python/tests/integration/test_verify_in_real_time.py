@@ -19,6 +19,7 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
@@ -518,3 +519,94 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
         register(cards, "cards/verify_in_real_time/support-unsourced.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
     assert "verified_by[0].runs_on" in str(refused.value)
+
+
+def test_grouped_refund_changes_verdict(
+    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
+) -> None:
+    admin = client_of(wyrd_server)
+    OperatorConnections(admin).create(
+        {
+            "provider": "http",
+            "name": "refund-hooks",
+            "origin": receiver.url,
+            "auth": {"scheme": "bearer", "token": "refund-hook-token"},
+        }
+    )
+    registered = register(cards, "cards/verify_in_real_time/refund.yaml")
+    bundle = download(cards, "refund", tmp_path)
+    [binding_id] = [
+        binding
+        for binding in binding_ids(cards, registered["refund"])
+        if binding_status(wyrd_server, binding).get("group_end") is not None
+    ]
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("refund")))
+    state.start_bifrost()
+    group = f"order-{secrets.token_hex(4)}"
+    opened = time.monotonic()
+
+    def turn(overdue: bool) -> None:
+        state.run("agent").observe.verify(
+            "refund-turn", {"order": "A-1", "overdue": overdue}, group_id=group
+        )
+
+    turn(False)
+    turn(False)
+    promised = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+    for overdue in [False, True, False]:
+        turn(overdue)
+    corrected = group_execution(wyrd_server, binding_id, WAIT_SECONDS, promised["execution_id"])
+    turn(False)
+    unchanged = group_execution(wyrd_server, binding_id, WAIT_SECONDS, corrected["execution_id"])
+
+    assert [
+        (
+            len(review["group"]["sources"]["facts"]["execution_ids"]),
+            review["result"]["outcome"]["verdict"],
+            len(review["dispatches"]),
+        )
+        for review in [promised, corrected, unchanged]
+    ] == [(2, "passed", 0), (5, "failed", 1), (6, "failed", 0)], (
+        "only the verdict change dispatches"
+    )
+    history = (
+        Bifrost(client=admin)
+        .sql(
+            "SELECT execution_id, result_id, verdict FROM vala.verification.results "
+            "WHERE binding_id = $1 ORDER BY ended_at",
+            [binding_id],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert [(row["execution_id"], row["verdict"]) for row in history] == [
+        (promised["execution_id"], "passed"),
+        (corrected["execution_id"], "failed"),
+        (unchanged["execution_id"], "failed"),
+    ], "every review stays retained"
+    alert = receiver.wait_for("/hooks/refund-review", WAIT_SECONDS)
+    assert alert.body == {
+        "execution_id": corrected["execution_id"],
+        "result_id": history[1]["result_id"],
+        "verdict": "failed",
+        "group_id": group,
+        "previous_result_id": history[0]["result_id"],
+        "previous_verdict": "passed",
+    }
+
+    # The fixture's 40 s finality, counted from the group's first turn, must
+    # pass before the late turn; waiting for it is the scenario.
+    time.sleep(max(0.0, opened + 41 - time.monotonic()))
+    turn(True)
+    state.shutdown()
+    quiet = time.monotonic() + 8
+    while time.monotonic() < quiet:
+        wyrd_server.flush_bifrost()
+        status = binding_status(wyrd_server, binding_id)
+        assert status["last_execution_id"] == unchanged["execution_id"], "late turns open no review"
+        time.sleep(0.5)
+    assert len(receiver.to("/hooks/refund-review")) == 1
+    with pytest.raises(WyrdError) as refused:
+        register(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
+    assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    assert "verified_by[1].on_failure" in str(refused.value)

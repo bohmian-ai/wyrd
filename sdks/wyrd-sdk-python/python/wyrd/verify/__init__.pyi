@@ -320,6 +320,24 @@ ExecutionStatus: TypeAlias = Literal[
     "pending", "running", "retrying", "completed", "cancelled", "timed_out", "errored"
 ]
 
+class FrozenUid(TypedDict):
+    """A dispatch's frozen Operator Card UID."""
+
+    uid: str
+
+class FrozenDigest(TypedDict):
+    """A dispatch's frozen inline Operator spec digest."""
+
+    digest: str
+
+class OperatorDispatchState(TypedDict):
+    """One Operator dispatch's independent delivery state."""
+
+    dispatch_id: str
+    operator: FrozenUid | FrozenDigest
+    status: Literal["pending", "running", "retrying", "delivered", "failed"]
+    error: VerificationError | None
+
 class GroupSourceSnapshot(TypedDict):
     """One source slot's pinned selection: its declaration and source executions in list order."""
 
@@ -341,6 +359,7 @@ class ExecutionState(TypedDict):
     status: ExecutionStatus
     error: NotRequired[VerificationError]
     result: NotRequired[VerificationResultWire]
+    dispatches: list[OperatorDispatchState]
     group_id: NotRequired[str]
     owner_card_uid: NotRequired[str]
     group: NotRequired[GroupCoverage]

@@ -15,6 +15,7 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_verify::blocks::{DriftChecks, EngineError};
+use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::auth::{PrincipalId, Sha256Hex};
@@ -44,7 +45,7 @@ use crate::components::gateway::GatewayCallSubject;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::query::scheduled::ScheduledQueryCaller;
-use crate::scribe_outbox::ScribeWrite;
+use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::results::{ResultPayloadBuilder, ResultPayloadError, ResultRun};
@@ -115,6 +116,21 @@ fn payload_error(error: &ResultPayloadError) -> WyrdError {
         _ => WyrdError::internal(format!(
             "the verification record cannot be encoded: {error}"
         )),
+    }
+}
+
+/// Seconds a caller refused staging capacity waits before retrying.
+const STAGING_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// Map a refused outbox reservation to the caller's retryable pressure.
+///
+/// The refusal admitted nothing, so the identical call may be retried whole.
+fn staging_full(full: OutboxFull) -> WyrdError {
+    tracing::warn!(outbox = full.outbox, admitted = full.admitted, limit = full.limit, "verification staging refused");
+    metrics::counter!("verification_staging_refused_total", "outbox" => full.outbox).increment(1);
+    WyrdError::VerificationStagingFull {
+        message: "this server has no verification staging capacity now".to_owned(),
+        details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
     }
 }
 
@@ -462,6 +478,8 @@ impl<'a> VerificationControl<'a> {
             request.verifier_card_uid, request.card_uid
         );
         self.authorize_run(caller, &request.verifier_card_uid, None, EXECUTE, &resource)?;
+        // The inputs and result rows, reserved before any work is done.
+        let staged = self.state.scribe_outbox.reserve(2).map_err(staging_full)?;
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
         let target = telemetry
             .phase(
@@ -548,7 +566,7 @@ impl<'a> VerificationControl<'a> {
         span.record("outcome", label);
         telemetry.finish(label, label != "completed");
         let outcome = result?;
-        self.stage_direct(caller, execution_id, request, &target, &outcome, started_at);
+        Self::stage_direct(&staged, caller, execution_id, request, &target, &outcome, started_at);
         Ok(VerificationResult {
             execution_id,
             run_id: request.run_id.clone(),
@@ -636,13 +654,15 @@ impl<'a> VerificationControl<'a> {
         )
         .inputs(&submission.request.inputs, Some(&submission))
         .map_err(|error| payload_error(&error))?;
+        let queued = submissions.reserve(1).map_err(staging_full)?;
+        let staged = self.state.scribe_outbox.reserve(1).map_err(staging_full)?;
         let execution_id = submission.execution_id;
-        self.state.scribe_outbox.stage(
+        staged.stage(
             caller.data_tenant_id,
             ScribeWrite::ExecutionInputs {
                 row,
                 attribution: caller.attribution(),
-                queued: Some((Arc::clone(submissions), Box::new(submission))),
+                queued: Some((queued, Box::new(submission))),
             },
         );
         Ok(EnqueueVerificationResponse { execution_id })
@@ -651,15 +671,16 @@ impl<'a> VerificationControl<'a> {
     /// Stage a completed direct execution's inputs and result on the Scribe
     /// outbox.
     ///
-    /// The payload mints its own result identity and correlates with the
-    /// execution through `execution_id`. Its rows name the subject
+    /// Both rows are staged on the slots `staged` reserved before the
+    /// execution ran. The payload mints its own result identity and
+    /// correlates with the execution through `execution_id`. Its rows name the subject
     /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, and have
     /// no owner, binding, or Trigger. The inputs row never queues work. The
     /// verdict is already decided, so an unbuildable payload is logged and
     /// not recorded.
     fn stage_direct(
-        &self,
+        staged: &Reservation<ScribeSink>,
         caller: &Caller,
         execution_id: ExecutionId,
         request: &VerificationRequest,
@@ -688,7 +709,7 @@ impl<'a> VerificationControl<'a> {
             .and_then(|row| Ok((row, builder.build(outcome)?)));
         match built {
             Ok((row, payload)) => {
-                self.state.scribe_outbox.stage(
+                staged.stage(
                     caller.data_tenant_id,
                     ScribeWrite::ExecutionInputs {
                         row,
@@ -696,7 +717,7 @@ impl<'a> VerificationControl<'a> {
                         queued: None,
                     },
                 );
-                self.state.scribe_outbox.stage(
+                staged.stage(
                     caller.data_tenant_id,
                     ScribeWrite::Result {
                         payload,

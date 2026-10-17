@@ -110,6 +110,7 @@ pub fn wyrd_error_response_from_parts(
     let retry_after = matches!(
         &error,
         WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::VerificationStagingFull { .. }
             | WyrdError::Vala {
                 error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
                     | wyrd_spec::vala::error::BifrostError::QueryQueueFull

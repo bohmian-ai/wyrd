@@ -3,8 +3,10 @@
 //! Both capabilities drain a durable, tenant-scoped, leased queue the same
 //! way: claim one item per due tenant each round in its own committed
 //! transaction that races shutdown, then spawn the claimed item. A round
-//! considers every tenant with claimable work; there is no tenant limit. Only
-//! Operator delivery takes execution permits before claiming. An item refused
+//! considers every tenant with claimable work; there is no tenant limit. A
+//! loop runs at most its `active` items at once and claims nothing more until
+//! one finishes; Operator delivery also takes execution permits before
+//! claiming. An item refused
 //! by a full shared resource pauses claiming until a running item finishes.
 //! On shutdown admit no further claim, give in-flight work the drain grace,
 //! then cancel and let it release its lease. [`ClaimLoop`] owns that
@@ -89,6 +91,8 @@ pub(super) struct ClaimLoop {
     postgres: WyrdPostgres,
     /// Operator delivery capacity; Verifier execution has no permit gate.
     permits: Option<OperatorPermits>,
+    /// Most items this loop runs at once in this process.
+    active: usize,
     /// Idle wait between empty claim rounds.
     poll_interval: Duration,
     /// How long shutdown waits for in-flight items before cancelling them.
@@ -99,15 +103,18 @@ pub(super) struct ClaimLoop {
 }
 
 impl ClaimLoop {
-    /// Build a loop claiming through `postgres` under `permits` and `limits`.
+    /// Build a loop claiming through `postgres` under `permits` and `limits`,
+    /// running at most `active` items at once.
     pub(super) fn new(
         postgres: WyrdPostgres,
         permits: Option<OperatorPermits>,
+        active: usize,
         limits: &RuntimeLimits,
     ) -> Self {
         Self {
             postgres,
             permits,
+            active: active.max(1),
             poll_interval: limits.poll_interval,
             drain_grace: limits.drain_grace,
             #[cfg(feature = "test-support")]
@@ -124,8 +131,8 @@ impl ClaimLoop {
     /// Claim and process `work` until `stop` is cancelled, then drain.
     ///
     /// Each turn claims one item per due tenant and spawns it; Operator work
-    /// holds its delivery permit. An empty round waits the poll interval or until an
-    /// item finishes. Once an item reports a shared-resource refusal, rounds
+    /// holds its delivery permit. While `active` items run no round is claimed.
+    /// An empty round waits the poll interval or until an item finishes. Once an item reports a shared-resource refusal, rounds
     /// are skipped until a running item finishes (or none is running). On
     /// `stop` no further claim is admitted (an uncommitted
     /// claim rolls back and a claim committed after `stop` is released
@@ -147,7 +154,7 @@ impl ClaimLoop {
                 crash.check(W::CAPABILITY);
             }
             paused &= !spawned.is_empty();
-            let claimed = if paused {
+            let claimed = if paused || spawned.len() >= self.active {
                 0
             } else {
                 match self.claim_round(work, &stop, &abandon, &mut spawned).await {
@@ -193,7 +200,8 @@ impl ClaimLoop {
         self.record_active::<W>(spawned.len());
     }
 
-    /// Claim at most one item for each due tenant.
+    /// Claim at most one item for each due tenant, stopping once `active`
+    /// items run.
     ///
     /// Only Operator work takes delivery permits before the claim and drops
     /// them unused when the tenant has nothing claimable. A claim committed after `stop`
@@ -227,6 +235,7 @@ impl ClaimLoop {
         let mut claimed = 0;
         for tenant in tenants {
             if stop.is_cancelled()
+                || spawned.len() >= self.active
                 || self
                     .permits
                     .as_ref()

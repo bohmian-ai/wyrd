@@ -52,7 +52,7 @@ use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, SpansTable,
 };
-use wyrd_runtime::outbox::{Outbox, OutboxSink, count_lost};
+use wyrd_runtime::outbox::{Outbox, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL};
@@ -67,13 +67,19 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerS
 
 use crate::components::gateway::{CallCapture, CaptureDrop};
 use crate::verification::results::{ResultBatch, ResultPayload};
-use crate::verification::submissions::SubmissionOutbox;
+use crate::verification::submissions::SubmissionSink;
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
 
 /// Most tenants whose slices are written at once.
 const SCRIBE_WRITERS: usize = 4;
+
+/// Default of `scribe.outbox_capacity`: the most writes the process Scribe
+/// outbox admits at once, queued, retrying, or in flight. Every write's rows
+/// are bounded by its producer's input limits, so this also bounds the
+/// outbox's memory.
+pub(crate) const SCRIBE_CAPACITY: usize = 65_536;
 
 /// Longest a peer Scribe may take to acknowledge one frame.
 ///
@@ -122,9 +128,10 @@ pub enum ScribeWrite {
         row: ResultBatch,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
-        /// A submitted execution and the outbox that queues it once Scribe
-        /// acknowledges the row; `None` for a direct execution.
-        queued: Option<(Arc<SubmissionOutbox>, Box<Submission>)>,
+        /// A submitted execution and its reserved slot on the outbox that
+        /// queues it once Scribe acknowledges the row, so the handoff is never
+        /// refused; `None` for a direct execution.
+        queued: Option<(Reservation<SubmissionSink>, Box<Submission>)>,
     },
     /// One server span's tenant copy, attributed to the operation that
     /// emitted it.
@@ -580,9 +587,9 @@ impl ScribeRoute {
 
 /// Most tenant span copies one process holds unwritten at once.
 ///
-/// The outbox queue itself is unbounded; this caps only the span producer, so
-/// a sustained Scribe outage cannot grow the heap without limit while audit,
-/// capture, and result writes keep their own semantics.
+/// The outbox admits at most [`SCRIBE_CAPACITY`] writes; this smaller cap on
+/// the span producer keeps a sustained Scribe outage's span copies from
+/// filling that shared capacity ahead of audit, capture, and result writes.
 const TENANT_SPAN_PERMITS: usize = 2_048;
 
 /// Stages the tenant copies of server spans on the process Scribe outbox.
@@ -642,13 +649,24 @@ pub struct ScribeSink {
 
 impl ScribeSink {
     /// Starts an outbox submitting along `route`, or dropping every write
-    /// when `route` is `None`.
+    /// when `route` is `None`, at the default capacity.
     ///
     /// `request_bytes` is the deployment's configured Scribe request ceiling
     /// (`scribe.ingest_request_bytes`), which every Scribe a frame can reach
     /// enforces.
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
+        Self::bounded_outbox(route, request_bytes, SCRIBE_CAPACITY)
+    }
+
+    /// Starts an outbox like [`Self::outbox`] admitting at most `capacity`
+    /// writes (`scribe.outbox_capacity`).
+    #[must_use]
+    pub(crate) fn bounded_outbox(
+        route: Option<ScribeRoute>,
+        request_bytes: usize,
+        capacity: usize,
+    ) -> Arc<ScribeOutbox> {
         Outbox::new(
             Self {
                 route,
@@ -656,6 +674,7 @@ impl ScribeSink {
                 frame_budget: frame_budget(request_bytes),
             },
             SCRIBE_WRITERS,
+            capacity,
         )
     }
 
@@ -920,12 +939,12 @@ impl OutboxSink for ScribeSink {
         count_lost::<Self>(lost.len());
         for (index, item) in items.iter().enumerate() {
             if let ScribeWrite::ExecutionInputs {
-                queued: Some((outbox, submission)),
+                queued: Some((reserved, submission)),
                 ..
             } = item
                 && !lost.contains(&index)
             {
-                outbox.stage(tenant, (**submission).clone());
+                reserved.stage(tenant, (**submission).clone());
             }
         }
         Ok(())
@@ -978,7 +997,7 @@ mod tests {
 
     use super::{
         Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
+        SCRIBE_CAPACITY, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -1447,6 +1466,7 @@ mod tests {
                 frame_budget: frame_budget(request_bytes),
             },
             SCRIBE_WRITERS,
+            SCRIBE_CAPACITY,
         )
     }
 

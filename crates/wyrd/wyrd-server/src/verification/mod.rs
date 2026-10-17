@@ -53,6 +53,9 @@ use self::scheduler::VerificationScheduler;
 /// Bounds every runtime loop, lease, and drain obeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimits {
+    /// Process-wide ceiling of concurrently running claimed Verifier
+    /// executions; further queued executions wait in Postgres.
+    pub execution_slots: usize,
     /// Process-wide ceiling of concurrent Operator deliveries.
     pub operator_global_permits: usize,
     /// Ceiling of concurrent Operator deliveries for one tenant.
@@ -93,12 +96,13 @@ pub struct RuntimeLimits {
 }
 
 impl Default for RuntimeLimits {
-    /// Production bounds: 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
+    /// Production bounds: 64 running Verifier executions, 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
     /// renewed lease over a five-minute execution, a
     /// thirty-second drain, and a five-minute rewrap interval whose passes stop after
     /// two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
+            execution_slots: 64,
             operator_global_permits: 16,
             operator_tenant_permits: 4,
             lease: Duration::from_mins(10),

@@ -3,7 +3,7 @@
 //! A submitted execution's inputs row is staged on the Scribe outbox with its
 //! [`Submission`]; once Scribe acknowledges the row, the Scribe sink stages
 //! the submission here without waiting. The generic [`Outbox`] owns the
-//! unbounded queue, per-tenant batching, retry with backoff, and shutdown;
+//! bounded queue, per-tenant batching, retry with backoff, and shutdown;
 //! [`SubmissionSink`] is its one durable write: one tenant transaction that
 //! accepts the batch through [`VerifierExecutionQueue::accept_submissions`].
 //! Replay, idempotency conflicts, and refusals are decided there, so a
@@ -23,6 +23,11 @@ use wyrd_sql::{SqlError, WyrdPostgres};
 /// Tenants the queue writer accepts for at once, which bounds the Wyrd pool
 /// connections it may hold.
 const SUBMISSION_WRITER_CONNECTIONS: usize = 4;
+
+/// Most acknowledged submissions the process holds unqueued at once. A
+/// submission reserves its slot here before its inputs are staged, so the
+/// Scribe acknowledgement never hands off into a full outbox.
+const SUBMISSION_CAPACITY: usize = 16_384;
 
 /// The process outbox of acknowledged submissions: the generic outbox over
 /// [`SubmissionSink`].
@@ -51,6 +56,7 @@ impl SubmissionSink {
                 queue: VerifierExecutionQueue::default(),
             },
             SUBMISSION_WRITER_CONNECTIONS,
+            SUBMISSION_CAPACITY,
         )
     }
 }

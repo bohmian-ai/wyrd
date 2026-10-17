@@ -1983,6 +1983,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// This server process has no staging capacity for a verification now.
+    ///
+    /// Admission is refused before anything is staged, so no source row of
+    /// the refused call exists and the identical call may be retried whole.
+    #[error("[WYRD_VERIFICATION_429_STAGING_FULL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_429_STAGING_FULL",
+        status = 429,
+        title = "Verification staging is full",
+        remediation = "Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate."
+    )]
+    VerificationStagingFull {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// An Operator template, URL origin, or header violates the Operator contract.
     #[error("[WYRD_SPEC_400_INVALID_OPERATOR] {message}")]
     #[wyrd_error(
@@ -3775,6 +3792,7 @@ impl WyrdError {
             | Self::VerificationInputUnsupported { message, details }
             | Self::VerificationDependencyFailed { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
+            | Self::VerificationStagingFull { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
             | Self::OperatorConnectionNotFound { message, details }

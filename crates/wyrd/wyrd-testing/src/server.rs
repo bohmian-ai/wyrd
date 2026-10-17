@@ -482,6 +482,8 @@ pub struct WyrdTestServerBuilder {
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
     scribe_ingest_limits: IngestLimits,
+    /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
+    scribe_outbox_capacity: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -653,6 +655,7 @@ impl Default for WyrdTestServerBuilder {
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
+            scribe_outbox_capacity: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -4470,6 +4473,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Lowers `scribe.outbox_capacity` so a journey can fill the production
+    /// Scribe outbox bound with a handful of calls.
+    #[must_use]
+    pub const fn with_scribe_outbox_capacity_for_test(mut self, capacity: usize) -> Self {
+        self.scribe_outbox_capacity = Some(capacity);
+        self
+    }
+
     /// Select a scaled Scribe geometry for a real-server journey.
     ///
     /// This installs no second lifecycle policy: the value is the same
@@ -4980,6 +4991,9 @@ impl WyrdTestServerBuilder {
             .transpose()?;
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        if let Some(capacity) = self.scribe_outbox_capacity {
+            bifrost_config.scribe.outbox_capacity = capacity;
+        }
         bifrost_config.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {
             bifrost_config.oracle = oracle;

@@ -185,6 +185,7 @@ impl OperatorWorker {
                     limits.operator_global_permits,
                     limits.operator_tenant_permits,
                 )),
+                limits.operator_global_permits,
                 &limits,
             ),
             postgres,

@@ -224,7 +224,7 @@ impl VerifierRunner {
     ) -> Self {
         let postgres = state.postgres.wyrd().clone();
         Self {
-            claims: ClaimLoop::new(postgres.clone(), None, &limits),
+            claims: ClaimLoop::new(postgres.clone(), None, limits.execution_slots, &limits),
             renewal: Arc::new(LeaseRenewal::new(postgres.clone(), queue, limits.lease)),
             drift: DriftEngine::new(state.clone(), limits.execution_timeout),
             state,

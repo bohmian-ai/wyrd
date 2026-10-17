@@ -137,13 +137,13 @@ impl ObservationWindow {
     }
 
     /// Render `value` as an escaped SQL string literal.
-    fn text(value: &str) -> String {
+    pub(super) fn text(value: &str) -> String {
         Value::SingleQuotedString(value.to_owned()).to_string()
     }
 
     /// Render `value` as a microsecond UTC timestamp string literal, which
     /// Oracle coerces to the `created_at` column type.
-    fn instant(value: DateTime<Utc>) -> String {
+    pub(super) fn instant(value: DateTime<Utc>) -> String {
         Self::text(&value.to_rfc3339_opts(SecondsFormat::Micros, true))
     }
 

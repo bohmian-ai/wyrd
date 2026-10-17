@@ -9,6 +9,12 @@
 //! `SKIP LOCKED` and dedupes an occurrence's run, so concurrent schedulers on
 //! many processes, duplicate ticks, and a restart mid-pass never create a
 //! second run for one occurrence.
+//!
+//! In a process hosting Verifier blocks the same pass also polls each
+//! tenant's due `group_end` bindings through [`GroupPoller`]: one binding
+//! per short transaction, its cursor advanced by
+//! [`VerifierExecutionQueue::claim_due_group`] and committed with the group
+//! executions the poll enqueued.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +22,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
-    QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick, VerifierExecutionQueue,
+    EnqueueOutcome, QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick,
+    VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 
 use super::authority::BackgroundAuthority;
+use super::groups::{GroupPollError, GroupPoller};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
@@ -45,6 +53,8 @@ pub struct VerificationScheduler {
     authority: BackgroundAuthority,
     /// Idle wait between passes.
     poll_interval: Duration,
+    /// Group discovery, present only where Verifier blocks are hosted.
+    groups: Option<GroupPoller>,
     /// Test-only crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
@@ -70,9 +80,17 @@ impl VerificationScheduler {
             queue,
             authority,
             poll_interval,
+            groups: None,
             #[cfg(feature = "test-support")]
             crash: None,
         }
+    }
+
+    /// Also poll due `group_end` bindings through `groups`.
+    #[must_use]
+    pub fn with_groups(mut self, groups: GroupPoller) -> Self {
+        self.groups = Some(groups);
+        self
     }
 
     /// Let `crash` panic this scheduler's loop.
@@ -151,6 +169,11 @@ impl VerificationScheduler {
             if let Err(error) = self.schedule_tenant(tenant, stop, &mut ticks).await {
                 tracing::warn!(%tenant, %error, "tenant verification schedule failed");
             }
+            if let Some(groups) = &self.groups
+                && let Err(error) = self.poll_groups(groups, tenant, stop).await
+            {
+                tracing::warn!(%tenant, %error, "tenant group poll failed");
+            }
         }
         Ok(ticks)
     }
@@ -214,6 +237,76 @@ impl VerificationScheduler {
         Ok(())
     }
 
+    /// Poll up to [`TICKS_PER_TENANT`] due `group_end` bindings of `tenant`,
+    /// one transaction each.
+    ///
+    /// Each transaction claims one binding (advancing its cursor), resolves
+    /// the owner/SYSTEM authority, enqueues the groups `groups` finds ended,
+    /// and commits. A binding without authority only advances its cursor. A
+    /// failed Bifrost read is logged and the advanced cursor still commits,
+    /// so the next poll retries discovery rather than this pass spinning.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when a tenant transaction fails; earlier polls
+    /// stay committed.
+    ///
+    /// # Cancellation
+    /// As [`Self::schedule_tenant`]: cancellation before commit selection
+    /// rolls back the in-progress poll.
+    async fn poll_groups(
+        &self,
+        groups: &GroupPoller,
+        tenant: DataTenantId,
+        stop: &CancellationToken,
+    ) -> Result<(), SqlError> {
+        for _ in 0..TICKS_PER_TENANT {
+            let applied = async {
+                let mut conn = self.postgres.tenant_conn(tenant).await?;
+                let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
+                    return Ok::<_, SqlError>(None);
+                };
+                let authority = match due.owner {
+                    Some(owner) => self.authority.resolve(&mut conn, owner).await?,
+                    None => None,
+                };
+                if let Some(authority) = authority {
+                    match groups
+                        .poll(&mut conn, &self.queue, tenant, &due, &authority)
+                        .await
+                    {
+                        Ok(enqueued) => {
+                            for outcome in enqueued {
+                                metrics::counter!(
+                                    crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
+                                    "outcome" => group_label(&outcome)
+                                )
+                                .increment(1);
+                            }
+                        }
+                        Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
+                        Err(error) => {
+                            tracing::warn!(binding_id = %due.binding_id, %error, "group poll failed");
+                        }
+                    }
+                }
+                Ok(Some(conn))
+            };
+            let applied = tokio::select! {
+                biased;
+                () = stop.cancelled() => return Ok(()),
+                applied = applied => applied?,
+            };
+            let Some(conn) = applied else {
+                return Ok(());
+            };
+            conn.commit().await?;
+            if stop.is_cancelled() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Publish the cross-tenant queue depth gauges.
     ///
     /// # Errors
@@ -241,6 +334,15 @@ fn record_depth(queue: &'static str, counts: QueueCounts) {
             "status" => status
         )
         .set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
+    }
+}
+
+/// Stable telemetry label of one group enqueue outcome.
+const fn group_label(outcome: &EnqueueOutcome) -> &'static str {
+    match outcome {
+        EnqueueOutcome::Enqueued(_) => "group_enqueued",
+        EnqueueOutcome::AlreadyEnqueued(_) => "group_already_enqueued",
+        EnqueueOutcome::Refused(_) => "group_refused",
     }
 }
 

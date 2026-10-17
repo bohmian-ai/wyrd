@@ -17,6 +17,7 @@ pub mod engines;
 #[cfg(feature = "test-support")]
 pub mod fault;
 pub mod fitter;
+pub mod groups;
 pub mod health;
 pub mod hosted;
 mod leases;
@@ -43,6 +44,7 @@ use self::authority::BackgroundAuthority;
 #[cfg(feature = "test-support")]
 use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
+use self::groups::GroupPoller;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
 #[cfg(feature = "test-support")]
@@ -359,7 +361,9 @@ impl VerificationRuntimeBuilder<'_> {
     /// Scribe outbox to reach a Scribe, in-process or over the peer plane, and
     /// reads its inputs through the ordinary query service, local or
     /// peer-forwarded; without both it is not composed and therefore not required, so
-    /// health is not degraded by an intentionally absent capability. Every
+    /// health is not degraded by an intentionally absent capability. The
+    /// scheduler polls `group_end` bindings only where hosted blocks supply
+    /// the deployment source-execution ceiling. Every
     /// composed capability is marked required on the shared health.
     #[must_use]
     pub fn build(self) -> Option<VerificationRuntime> {
@@ -376,6 +380,14 @@ impl VerificationRuntimeBuilder<'_> {
             BackgroundAuthority::new(self.state.auth.tenant_issuer(&self.state.scribe_outbox)),
             self.limits.poll_interval,
         );
+        let scheduler = match &self.state.verification_blocks {
+            Some(blocks) => scheduler.with_groups(GroupPoller::new(
+                self.state.clone(),
+                blocks.limits().source_executions_max,
+                self.limits.execution_timeout,
+            )),
+            None => scheduler,
+        };
         #[cfg(feature = "test-support")]
         let scheduler = match &self.crash {
             Some(crash) => scheduler.with_crash(crash.clone()),

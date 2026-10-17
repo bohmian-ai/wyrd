@@ -246,6 +246,13 @@ const OUTSTANDING_GROUP_SQL: &str = r"
        AND status IN ('pending', 'running', 'retrying')
 ";
 
+/// The settled result, if any, of each queued execution among `$1`.
+const SELECTED_RESULTS_SQL: &str = r"
+    SELECT execution_id, result_id
+      FROM wyrd.verifier_executions
+     WHERE execution_id = ANY($1)
+";
+
 /// The settled group result admitted immediately before execution `$1` for
 /// the same binding and group, which its verdict is compared with.
 const PREVIOUS_GROUP_SQL: &str = r"
@@ -1663,6 +1670,38 @@ impl VerifierExecutionQueue {
                         through,
                         members: stored(u64::try_from(members))?,
                     },
+                ))
+            })
+            .collect()
+    }
+
+    /// The authoritative result of each queued execution among `executions`.
+    ///
+    /// A queued execution maps to the result its settlement selected, or
+    /// `None` while it has none, so a result row an abandoned attempt
+    /// published is never authoritative. A direct execution was never queued
+    /// and is absent: its one published result is its own.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored identity is malformed.
+    pub async fn selected_results(
+        &self,
+        conn: &mut TenantConn<'_>,
+        executions: &[ExecutionId],
+    ) -> Result<BTreeMap<ExecutionId, Option<VerificationResultId>>, SqlxError> {
+        let ids: Vec<Uuid> = executions.iter().map(ExecutionId::as_uuid).collect();
+        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(SELECTED_RESULTS_SQL)
+            .bind(ids)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        rows.into_iter()
+            .map(|(execution, result)| {
+                Ok((
+                    stored(ExecutionId::new(execution))?,
+                    result
+                        .map(|result| stored(VerificationResultId::new(result)))
+                        .transpose()?,
                 ))
             })
             .collect()

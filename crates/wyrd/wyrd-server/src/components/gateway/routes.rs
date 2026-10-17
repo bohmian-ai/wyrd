@@ -549,7 +549,7 @@ pub(crate) async fn list_deployments(
         (status = 409, description = "A submitted credential is revoked or its provider change would orphan a deployment; nothing is applied (WYRD_GATEWAY_409_RESOURCE_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Credential protection, administration store, or token verification unavailable; nothing is applied (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Credential protection, administration store, or token verification unavailable; a refusal before commit applies nothing, but a failed commit acknowledgement can leave the document applied, so list the resources or reapply the same document (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
@@ -557,7 +557,9 @@ pub(crate) async fn list_deployments(
 /// `POST /v1/admin/gateway/provider-deployments`.
 ///
 /// Creates or replaces credentials and the deployments using them in one
-/// tenant transaction; answers with redacted credential views.
+/// tenant transaction; answers with redacted credential views. The answer is
+/// sent after commit, so a caller that loses it cannot infer noncommit;
+/// reapplying the same named document converges.
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid document, source, or

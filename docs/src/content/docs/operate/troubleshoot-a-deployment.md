@@ -31,7 +31,7 @@ Match the code or message you see below. This page covers server installation, l
 | Readiness | Read the server's diagnostics, correct its configuration, and rerun. Production hardening still applies when `APP_ENV=production`. |
 | Local persistence | Restore safe directory/file permissions and rerun. Settings are saved before the tenant is created, so a failure there issues no key; a key already saved before an endpoint-write failure is retained. |
 | Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant on its own. If the one-time key was lost, rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set and confirm rotation, or follow the steps below. |
-| Gateway | The requested gateway document was refused and nothing was applied; tenant setup remains. Correct it and rerun, or pass `--skip-gateway`. |
+| Gateway | Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the changes may have committed. Inspect with `wyrd gateway deployment list`, then rerun; reapplying the same named document is safe. Or pass `--skip-gateway`. |
 
 If the platform root exists but tenant creation failed, rerun `wyrd server dev` with the stored `WYRD_PLATFORM_CREDENTIAL` set. Retries never recover or reissue a credential on their own.
 

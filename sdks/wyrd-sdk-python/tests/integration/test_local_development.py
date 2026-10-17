@@ -10,6 +10,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 from __future__ import annotations
 
 import fcntl
+import http.client
 import json
 import os
 import pty
@@ -26,8 +27,9 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import openai
 import pytest
@@ -629,6 +631,48 @@ def calls_since(recorded: Receiver, start: int) -> list[tuple[str, str | None]]:
     return [(d.path, d.body.get("model")) for d in recorded.deliveries[start:]]
 
 
+class LosingProxy(BaseHTTPRequestHandler):
+    """Forward-proxies plain HTTP, dropping the answer to every composite gateway apply.
+
+    The apply is forwarded and its full answer read, so the server has
+    committed before the connection closes with no response.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def forward(self) -> None:
+        """Forward one request to its absolute target and relay or drop the answer."""
+        target = urlsplit(self.path)
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        upstream = http.client.HTTPConnection(target.netloc, timeout=60)
+        try:
+            upstream.request(
+                self.command,
+                target.path + (f"?{target.query}" if target.query else ""),
+                body=body,
+                headers={k: v for k, v in self.headers.items() if k.lower() != "proxy-connection"},
+            )
+            answer = upstream.getresponse()
+            payload = answer.read()
+        finally:
+            upstream.close()
+        if self.command == "POST" and target.path == "/v1/admin/gateway/provider-deployments":
+            self.close_connection = True
+            return
+        self.send_response(answer.status)
+        for name, value in answer.getheaders():
+            if name.lower() not in ("transfer-encoding", "connection", "content-length"):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = forward
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
+        """Keep proxy traffic out of test output."""
+
+
 @pytest.mark.local_dev
 def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     """Set up four named deployments with the installed CLI, as ``examples/gateway-setup`` does.
@@ -644,7 +688,10 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     process and by a fresh Rust process through the public Agent loader,
     neither of which calls a native provider. A restarted server still
     decrypts the credentials and serves the same downloaded Agents, and a
-    revoked credential or an under-granted caller is refused.
+    revoked credential or an under-granted caller is refused. A startup whose
+    gateway apply commits but loses its answer fails without claiming
+    noncommit and settles its server; the committed deployment reads back on
+    restart and reapplying the same document succeeds.
     """
     root = Path(__file__).resolve().parents[4]
     cli_path = str(root / "target/debug/wyrd")
@@ -797,6 +844,43 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 delivered = len(recorded.deliveries)
                 run_typescript(env, "cli_gateway_revoked")
                 assert len(recorded.deliveries) == delivered, "a revoked credential was sent"
+            assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
+
+            lost = tmp_path / "lost.json"
+            lost.write_text(json.dumps({"deployments": [{**entries[1], "name": "lost-answer"}]}))
+            proxy = ThreadingHTTPServer(("127.0.0.1", 0), LosingProxy)
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+            via = f"http://127.0.0.1:{proxy.server_address[1]}"
+            try:
+                failed = subprocess.run(
+                    [cli_path, "server", "dev", "--tenant", "acme", "--gateway-file", str(lost)],
+                    cwd=home,
+                    env={
+                        **env,
+                        "HTTP_PROXY": via,
+                        "http_proxy": via,
+                        "NO_PROXY": "",
+                        "no_proxy": "",
+                    },
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=200,
+                )
+            finally:
+                proxy.shutdown()
+            assert failed.returncode not in (0, 130), failed.stderr
+            assert "may have committed" in failed.stderr, failed.stderr
+            assert "nothing was applied" not in failed.stderr
+            assert "wyrd_sk_" not in failed.stdout + failed.stderr
+            host, port = env["WYRD_SERVER_BIND"].rsplit(":", 1)
+            with socket.socket() as settled:
+                settled.bind((host, int(port)))
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                assert deployments() == sorted([*names, "lost-answer"]), "commit not durable"
+                reapplied = wyrd("gateway", "deployment", "put", "--file", str(lost))
+                assert reapplied.returncode == 0, reapplied.stderr
+                assert deployments() == sorted([*names, "lost-answer"])
             assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
             for delivery in recorded.deliveries:
                 gemini = delivery.path.endswith(":generateContent")

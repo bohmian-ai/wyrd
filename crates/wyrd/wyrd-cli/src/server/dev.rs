@@ -1040,8 +1040,10 @@ impl DevInputs {
     /// claimed.
     ///
     /// # Errors
-    /// Returns terminal failures, an invalid offered document, the server's
-    /// refusal (nothing is applied), and a failed read-back.
+    /// Returns terminal failures, an invalid offered document, the apply
+    /// error, and a failed read-back. A refusal applies nothing, but an error
+    /// can also follow a commit whose response was lost, so the failure is
+    /// reported as uncertain; reapplying the same named document is safe.
     async fn configure_gateway(&self, client: WyrdClient) -> Result<String, WyrdCliError> {
         let offered;
         let apply = match &self.gateway {
@@ -1068,7 +1070,7 @@ impl DevInputs {
             .collect();
         if let Err(source) = apply_deployments_with(client, apply).await {
             eprintln!(
-                "Gateway setup failed and nothing was applied; tenant setup remains. Correct the gateway input and rerun, or pass --skip-gateway."
+                "Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the gateway changes may have committed. Inspect them with wyrd gateway deployment list once the server is running, then rerun: reapplying the same named document is safe. Or pass --skip-gateway."
             );
             return Err(WyrdCliError::Server { source });
         }

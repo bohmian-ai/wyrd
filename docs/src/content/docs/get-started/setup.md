@@ -158,7 +158,7 @@ Your data lives in two places; keep both: the PostgreSQL database and the config
 | `is a superuser` or `BYPASSRLS` | `WYRD_DATABASE_URL` names an administrator login | Use the `wyrd` login created above |
 | `WYRD_CLI_503_SERVER_DEV` naming the `local persistence` stage | The config directory is not writable | Restore its permissions and rerun; no tenant key was issued |
 | `WYRD_CLI_503_SERVER_DEV` naming the `saved credential` stage after the tenant is active | The one-time tenant key was lost | Rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set to the platform root and confirm rotation, or run `wyrd platform tenant recover-admin` |
-| A gateway problem after the server is ready | The server refused the gateway document; nothing was applied | Correct the document or keys and rerun, or pass `--skip-gateway` |
+| A gateway problem after the server is ready | Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the changes may have committed | Inspect with `wyrd gateway deployment list`, correct the document or keys, and rerun; reapplying the same named document is safe. Or pass `--skip-gateway` |
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | No server release exists for this machine | Use a supported host from the prerequisites |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` from `wyrd list` or `connect` | No saved credential is visible to this process | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | Calls go to the wrong server, or a key is refused | `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or `WYRD_SERVER_URL` is exported from other work, and it wins over the saved config | Unset them |

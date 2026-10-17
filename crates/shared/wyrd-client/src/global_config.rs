@@ -16,6 +16,46 @@ pub struct GlobalConfig {
     /// Client connection and credential settings.
     #[serde(default)]
     pub client: ClientSection,
+    /// Non-secret settings `wyrd server dev` resolved and reuses on restart.
+    #[serde(default)]
+    pub dev: DevSection,
+}
+
+/// Local development selection saved by `wyrd server dev`.
+///
+/// Every value is non-secret; database URLs live in the protected
+/// `credentials.toml` `[dev]` table instead. Paths are absolute so a restart
+/// from another working directory selects the same data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevSection {
+    /// Tenant slug provisioned for local development.
+    pub tenant: Option<String>,
+    /// HTTP loopback listener.
+    pub bind: Option<String>,
+    /// Public gRPC loopback listener.
+    pub grpc_bind: Option<String>,
+    /// Effective `WYRD_STORAGE_URL`.
+    pub storage_url: Option<String>,
+    /// Effective absolute `WYRD_BIFROST_DATA_DIR`.
+    pub bifrost_data_dir: Option<String>,
+}
+
+/// Database URLs `wyrd server dev` keeps in the protected credentials file.
+#[derive(Default, Deserialize)]
+struct DevDatabaseFile {
+    /// `[dev]`; absent means nothing saved.
+    #[serde(default)]
+    dev: DevDatabase,
+}
+
+/// The protected `[dev]` table.
+#[derive(Default, Deserialize)]
+struct DevDatabase {
+    /// Ordinary migration-owner database URL.
+    database_url: Option<String>,
+    /// Optional separate platform database URL.
+    platform_database_url: Option<String>,
 }
 
 /// User-scoped client settings.
@@ -50,6 +90,19 @@ pub enum TokenCacheKind {
     Disk,
 }
 
+/// Resolve the Wyrd configuration directory local setup writes.
+///
+/// # Errors
+/// Refuses when no configuration home variable resolves.
+fn config_dir(environment: &Environment) -> Result<std::path::PathBuf, WyrdClientError> {
+    environment
+        .config_dir()
+        .ok_or_else(|| WyrdClientError::Config {
+            field: "config_home".to_owned(),
+            reason: "set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME".to_owned(),
+        })
+}
+
 impl GlobalConfig {
     /// Read the protected file-floor key for local setup without consulting
     /// environment credentials or saved human logins.
@@ -59,17 +112,90 @@ impl GlobalConfig {
     pub fn local_api_key(
         environment: &Environment,
     ) -> Result<Option<SecretString>, WyrdClientError> {
-        let dir = environment
-            .config_dir()
-            .ok_or_else(|| WyrdClientError::Config {
-                field: "config_home".to_owned(),
-                reason: "set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME".to_owned(),
-            })?;
+        let dir = config_dir(environment)?;
         let store = CredentialsFile::at(dir.clone());
         let _lock = store.lock()?;
         CredentialsFile::config_at(dir).document()?;
         let document = store.document()?;
         CredentialsFile::api_key(&document)
+    }
+
+    /// Read the database URLs saved by local development, as
+    /// `(database, platform)`, from the protected credentials file.
+    ///
+    /// # Errors
+    /// Refuses unsafe or corrupt credential storage and an unresolved directory.
+    pub fn local_databases(
+        environment: &Environment,
+    ) -> Result<(Option<SecretString>, Option<SecretString>), WyrdClientError> {
+        let store = CredentialsFile::at(config_dir(environment)?);
+        let _lock = store.lock()?;
+        let saved: DevDatabaseFile =
+            toml::from_str(&store.document()?.to_string()).map_err(|_| {
+                WyrdClientError::Config {
+                    field: "credentials".to_owned(),
+                    reason: "credentials.toml has an invalid [dev] table".to_owned(),
+                }
+            })?;
+        let secret = |value: Option<String>| {
+            value
+                .filter(|value| !value.is_empty())
+                .map(SecretString::from)
+        };
+        Ok((
+            secret(saved.dev.database_url),
+            secret(saved.dev.platform_database_url),
+        ))
+    }
+
+    /// Save local development's resolved settings: `dev` in `config.toml`
+    /// and the database URLs in the protected `credentials.toml`, under the
+    /// store lock with atomic replacement and every other setting, key, login,
+    /// and comment preserved. A `None` platform URL removes a saved one.
+    ///
+    /// # Errors
+    /// Refuses unsafe or corrupt files and IO failures; after a configuration
+    /// failure the protected database URLs may already be saved.
+    pub fn save_local_dev(
+        environment: &Environment,
+        dev: &DevSection,
+        database: &SecretString,
+        platform: Option<&SecretString>,
+    ) -> Result<(), WyrdClientError> {
+        let dir = config_dir(environment)?;
+        let credentials = CredentialsFile::at(dir.clone());
+        let _lock = credentials.lock()?;
+        let config = CredentialsFile::config_at(dir);
+        let mut settings = config.document()?;
+        let mut keys = credentials.document()?;
+        toml::from_str::<Self>(&settings.to_string()).map_err(|_| WyrdClientError::Config {
+            field: "global_config".to_owned(),
+            reason: "config.toml contains invalid settings".to_owned(),
+        })?;
+        keys["dev"]["database_url"] = toml_edit::value(database.expose_secret());
+        match platform {
+            Some(platform) => {
+                keys["dev"]["platform_database_url"] = toml_edit::value(platform.expose_secret());
+            }
+            None => {
+                if let Some(table) = keys["dev"].as_table_like_mut() {
+                    table.remove("platform_database_url");
+                }
+            }
+        }
+        credentials.replace(&keys)?;
+        for (field, value) in [
+            ("tenant", &dev.tenant),
+            ("bind", &dev.bind),
+            ("grpc_bind", &dev.grpc_bind),
+            ("storage_url", &dev.storage_url),
+            ("bifrost_data_dir", &dev.bifrost_data_dir),
+        ] {
+            if let Some(value) = value {
+                settings["dev"][field] = toml_edit::value(value.as_str());
+            }
+        }
+        config.replace(&settings)
     }
 
     /// Save local setup's HTTP and gRPC endpoints and expected tenant key in
@@ -90,12 +216,7 @@ impl GlobalConfig {
         grpc: &str,
         credential: Option<&SecretString>,
     ) -> Result<(), WyrdClientError> {
-        let dir = environment
-            .config_dir()
-            .ok_or_else(|| WyrdClientError::Config {
-                field: "config_home".to_owned(),
-                reason: "set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME".to_owned(),
-            })?;
+        let dir = config_dir(environment)?;
         let credentials = CredentialsFile::at(dir.clone());
         let _lock = credentials.lock()?;
         let config = CredentialsFile::config_at(dir);
@@ -187,12 +308,52 @@ impl GlobalConfig {
 mod tests {
     use crate::credentials_file::private_tempdir;
     use crate::environment::Environment;
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use std::fs;
 
     use tempfile::tempdir;
 
-    use super::{GlobalConfig, TokenCacheKind};
+    use super::{DevSection, GlobalConfig, TokenCacheKind};
+
+    /// Local development settings round-trip: non-secret values land in
+    /// `config.toml`, database URLs only in `credentials.toml`, and the saved
+    /// key survives.
+    ///
+    /// # Panics
+    /// Panics when a database URL leaks into general configuration or a saved
+    /// value is lost.
+    #[test]
+    fn local_dev_settings_keep_database_urls_protected() {
+        let dir = private_tempdir();
+        let environment =
+            Environment::from([("WYRD_CONFIG_HOME", dir.path().to_str().expect("UTF-8 path"))]);
+        let key = SecretString::from("dev-key".to_owned());
+        GlobalConfig::save_local(&environment, "http://a", "http://b", Some(&key)).expect("key");
+        let dev = DevSection {
+            tenant: Some("local".to_owned()),
+            storage_url: Some("file:///srv/storage".to_owned()),
+            ..DevSection::default()
+        };
+        let database = SecretString::from("postgres://owner:pw@db/wyrd".to_owned());
+        let platform = SecretString::from("postgres://platform:pw@db/wyrd".to_owned());
+        GlobalConfig::save_local_dev(&environment, &dev, &database, Some(&platform))
+            .expect("first save");
+        GlobalConfig::save_local_dev(&environment, &dev, &database, None).expect("second save");
+        let config = fs::read_to_string(dir.path().join("config.toml")).expect("config");
+        assert!(!config.contains("pw@"));
+        assert_eq!(GlobalConfig::load_in(&environment).expect("loads").dev, dev);
+        let (saved, saved_platform) = GlobalConfig::local_databases(&environment).expect("reads");
+        assert_eq!(
+            saved.expect("database").expose_secret(),
+            database.expose_secret()
+        );
+        assert!(saved_platform.is_none());
+        assert!(
+            GlobalConfig::local_api_key(&environment)
+                .expect("key")
+                .is_some()
+        );
+    }
 
     /// Local bootstrap preserves unrelated settings and refuses to replace a
     /// different default key; a rerun with the saved key is harmless.

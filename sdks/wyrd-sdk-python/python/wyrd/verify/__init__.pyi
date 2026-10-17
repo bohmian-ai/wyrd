@@ -320,13 +320,30 @@ ExecutionStatus: TypeAlias = Literal[
     "pending", "running", "retrying", "completed", "cancelled", "timed_out", "errored"
 ]
 
+class GroupSourceSnapshot(TypedDict):
+    """One source slot's pinned selection: its declaration and source executions in list order."""
+
+    reference: str
+    execution_ids: list[str]
+    exceeded_ceiling: NotRequired[int]
+
+class GroupCoverage(TypedDict):
+    """The source snapshot a group execution judges."""
+
+    through: str
+    members: int
+    sources: dict[str, GroupSourceSnapshot]
+
 class ExecutionState(TypedDict):
-    """``Execution.status()``: the lifecycle, terminal error, and visible result."""
+    """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
     execution_id: str
     status: ExecutionStatus
     error: NotRequired[VerificationError]
     result: NotRequired[VerificationResultWire]
+    group_id: NotRequired[str]
+    owner_card_uid: NotRequired[str]
+    group: NotRequired[GroupCoverage]
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.

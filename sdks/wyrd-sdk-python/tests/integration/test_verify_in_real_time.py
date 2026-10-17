@@ -29,6 +29,8 @@ from .support import (
     binding_ids,
     binding_status,
     client_of,
+    download,
+    group_execution,
     hydrated,
     register,
     service_key,
@@ -433,3 +435,86 @@ def test_another_tenant_cannot_verify_the_assistant(
         with pytest.raises(WyrdError) as raised:
             run.observe.verify(verifier, "yes")
         assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
+
+
+def enqueue_over_http(server: WyrdTestServer, key: str, idempotency_key: str, body: dict) -> str:
+    """Enqueue ``body`` over plain HTTP as ``key`` with ``idempotency_key``; return the execution."""
+    response = httpx.post(
+        f"{server.base_url}/v1/verification/enqueue",
+        headers={
+            "x-wyrd-access-token": f"Bearer {WyrdClient(credential=key).access_token()}",
+            "idempotency-key": idempotency_key,
+        },
+        json=body,
+        timeout=60,
+    )
+    accepted = response.json()
+    assert response.status_code == 202, accepted
+    return accepted["execution_id"]
+
+
+def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path) -> None:
+    registered = register(cards, "cards/verify_in_real_time/support.yaml")
+    bundle = download(cards, "support", tmp_path)
+    key = service_key("support")
+    [binding_id] = [
+        binding
+        for binding in binding_ids(cards, registered["support"])
+        if binding_status(wyrd_server, binding).get("group_end") is not None
+    ]
+    state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+    state.start_bifrost()
+    group = f"conv-{secrets.token_hex(4)}"
+    turns = [{"turn": turn, "answer": f"answer {turn}"} for turn in range(1, 7)]
+    first = state.run("agent")
+    for turn in turns[:3]:
+        first.observe.verify("turn-check", turn, group_id=group)
+    resumed = state.run("agent")
+    resumed.observe.verify("turn-check", turns[3], group_id=group)
+    queued = resumed.observe.submit("turn-check", turns[4], group_id=group)
+    assert isinstance(queued, verify.Execution)
+    queued.wait(WAIT_SECONDS)
+
+    def body(turn: dict) -> dict:
+        return {
+            "verifier_card_uid": str(registered["turn-check"].uid),
+            "card_uid": str(registered["assistant-agent"].uid),
+            "group_id": group,
+            "inputs": {"turn": {"kind": "json", "value": turn}},
+        }
+
+    idempotency_key = f"support-turn-{group}"
+    replayed = enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5]))
+    assert enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5])) == replayed
+    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, body({"answer": ""}))
+    admin = client_of(wyrd_server)
+    with pytest.raises(WyrdError) as conflicted:
+        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
+    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
+    verify.Execution.connect(replayed, admin).wait(WAIT_SECONDS)
+    WyrdState.from_path(bundle, admin).run("agent").observe.verify(
+        "turn-check", {"answer": ""}, group_id=group
+    )
+    other = wyrd_server.scoped_api_key("py_group_other", [verifier_run(cards, "answer-check")])
+    with pytest.raises(WyrdError) as denied:
+        WyrdState.from_path(bundle, WyrdClient(credential=other)).run("agent").observe.verify(
+            "turn-check", {"answer": ""}, group_id=group
+        )
+    assert denied.value.code == DENIED
+    state.shutdown()
+
+    judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+
+    assert (judged["group_id"], judged["owner_card_uid"]) == (group, str(registered["support"].uid))
+    coverage = judged["group"]
+    assert coverage["members"] == 12, "six inputs and six results"
+    assert len(coverage["sources"]["turns"]["execution_ids"]) == 6
+    assert coverage["sources"]["turns"]["execution_ids"][5] == replayed
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["turns"] == {"kind": "json", "value": turns}
+    assert outcome["verdict"] == "passed"
+    assert binding_status(wyrd_server, binding_id)["last_execution_id"] == judged["execution_id"]
+    with pytest.raises(WyrdError) as refused:
+        register(cards, "cards/verify_in_real_time/support-unsourced.yaml")
+    assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    assert "verified_by[0].runs_on" in str(refused.value)

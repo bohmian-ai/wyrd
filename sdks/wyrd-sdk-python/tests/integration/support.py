@@ -207,6 +207,29 @@ def scheduled_result(
     return verify.Execution.connect(execution_id, admin).wait(timeout)
 
 
+def group_execution(
+    server: WyrdTestServer, binding_id: str, timeout: float, after: str | None = None
+) -> verify.ExecutionState:
+    """The newest completed execution of group ``binding_id`` other than ``after``.
+
+    Rows are published so the group poller discovers them, then the binding's
+    ``last_execution_id`` is read until that execution completes with a result.
+    """
+    admin = client_of(server)
+    deadline = time.monotonic() + timeout
+    while True:
+        server.flush_bifrost()
+        latest = binding_status(server, binding_id).get("last_execution_id")
+        if latest is not None and latest != after:
+            state = verify.Execution.connect(latest, admin).status()
+            if state["status"] == "completed" and "result" in state:
+                return state
+        assert time.monotonic() < deadline, (
+            f"group binding {binding_id} completed no new execution in {timeout} s"
+        )
+        time.sleep(0.5)
+
+
 @dataclass
 class Watch:
     """The deployment of one scheduled-drift story.

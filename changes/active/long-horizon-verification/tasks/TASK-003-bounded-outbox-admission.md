@@ -206,3 +206,45 @@ Do not add tasks to the owner-approved four-task split.
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md); implementation returns evidence, not independent task approval.
+
+## Implementation Evidence
+
+Result: `IMPLEMENTED` (commits 2348d34d8, f9cabf895, 2bf02899d, f3c5244fd,
+c0e4da4de, a7578202d, 11c061743, c7471e119, 09ce35d62). Task review pending.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Finite process bound over queued, waiting, retrying and in-flight work; retry and drain accounting; no hidden writer backlog | `wyrd-runtime/src/outbox.rs` `Admission` (reserved and unreserved shares, released on write, loss or shutdown, not on dequeue); `Reservation` RAII slot; config `scribe.outbox_capacity` (`config.rs`, default 65 536, ≥ 1); runner cap `RuntimeLimits::execution_slots` enforced in `ClaimLoop` (`claims.rs`) | `outbox::tests::bounded_staging_covers_retrying_and_inflight_work`, `bounded_audit_staging_remains_nonblocking`; `pg_verification_runtime::the_runner_claims_no_more_than_its_execution_slots` | PASS |
+| Typed retryable refusal before staging; SDK, HTTP and MCP projections; no stronger receipts | `WYRD_VERIFICATION_429_STAGING_FULL` (`wyrd-spec/src/error.rs`), `details.retry_after_seconds=1` and `Retry-After: 1` (`http/error.rs`); direct verify and submit reserve before staging (`components/verification/service.rs`); submission slot carried through the Scribe-ACK handoff (`submissions.rs`, `scribe_outbox.rs`); runner reserves its result slot before the engine runs and defers without an attempt charge when full (`runner.rs`) | Rust, Python and TS `verification_staging_refuses_and_recovers`; MCP `verification::pg_tests::staging_pressure_is_retryable` (EXECUTE and ENQUEUE refused, no `execution_inputs` row); `http::error` Retry-After test; codegen:check | PASS |
+| Audit non-blocking and counted; no audit error in invocation results | Unreserved `stage` never blocks or fails; past its share an item is counted lost and logged (`outbox.rs`); span cap protects that share (`scribe_outbox.rs` `TENANT_SPAN_PERMITS`) | `bounded_audit_staging_remains_nonblocking`; journeys log `outbox is full; the staged item was lost` for setup audits while every call succeeds | PASS |
+| Tenant B progresses during A's burst; accepted work drains; replay and recovery unchanged | Reserved share per call; per-tenant writer dispatch unchanged | All three SDK journeys: the neighbor's queued answer-check passes while the burst's judgments are held; recovery after flush; exactly 3 `execution_inputs` rows; `a_failing_tenant_does_not_delay_another_tenant`, `a_retry_writes_the_identical_failed_slice_without_later_items`, both shutdown tests | PASS |
+| Standalone ordinary-call proof; integrated grouped J-005 recorded when TASK-001 is available | Standalone journeys need no TASK-001 code; `depends_on: []` unchanged | Standalone: PASS. Grouped J-005 rerun with `group_id`: **open**, to run on the integration branch once TASK-001 lands | PASS (standalone) / OPEN (integrated) |
+
+### Commands
+
+- Six exact `wyrd-runtime` outbox selectors (the two new tests and four regressions): 6 passed.
+- Rust journey (`-p wyrd-ai --test integration -P journey`, `=verify_in_real_time::verification_staging_refuses_and_recovers`): passed.
+- Python `test_verify_in_real_time.py::test_verification_staging_refuses_and_recovers`: passed. The whole file: 20 passed (shared fixtures changed).
+- TS `-t "^verification_staging_refuses_and_recovers$"`: passed. The whole file: 20 passed. `verifier-building-blocks` and `scheduled-drift-alerts-operator` (affected by the provider scope): 26 passed.
+- MCP `=verification::pg_tests::staging_pressure_is_retryable`: passed.
+- wyrd-server `--test integration -E 'test(/^(pg_verification_runtime|pg_verification_routes)::/)'`: 51 passed. Lib `verification::runner`, `scribe_outbox`, `components::verification`, `http::error`: 20 passed.
+- `mise run fmt`, `lints`, `check:deps`, `codegen:check`, `docs:check`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `git diff --check`: all passed.
+
+### Diagnoses
+
+1. **Rust journey: judge never received its calls** (`admitted=4 limit=4`). Evidence: the trace showed the reserve check counting unreserved audit and span items, and the request's own audit was staged before `reserve`. Cause: one shared total for reservable and unreserved work. Fix site: `outbox.rs` `Admission` split into reserved (3/4) and unreserved shares, plus the runner result reservation. A diagnostician confirmed the cause.
+2. **Python journey: baseline not ready** for the neighbor tenant. Evidence: `fitter: drift baseline fitted tenant=<neighbor>`, but `WyrdTestServer::wait_for_baseline` (`wyrd-testing/src/server.rs:3885`) reads only the fixture tenant. Fix site: `conftest.py` `registered_assistant` waits only when given `fitted_by`. Then "Card scope does not cover the verified subject": the neighbor needed its own Service key (`support.py` `service_key(..., client)`), as the Rust `in_tenant` does. TS had the same key cause.
+3. **TS staging test fails only in its full file.** Evidence: no judge arrivals; executions admitted. Cause, independently confirmed: Vitest 4 caches file-scoped fixtures by name, so the staging test reused the file's first `provider`. Fix site: `tests/support/server.ts` scopes `provider` like `server`. Other `perTest` files rerun: 26 passed. (Those five failures were first caused by an unbuilt `target/release/wyrd-monty-worker`; `cargo build --release -p wyrd-monty-worker` fixed that. The TS integration lane does not build it.)
+4. **Clippy `large_futures`** across the Rust journey `Assistant::start` callers. Cause: the new builder field pushed `start_on`'s future (it holds the builder across the judge mock await) past the limit. Fix site: `Box::pin` at the two `start_on` callers.
+5. **`every_tenant_is_claimed_in_the_first_round` (`claimed=64`) and `two_hundred_released_runs_complete_on_their_first_attempt` (timeout).** Cause, independently confirmed: the task-required `execution_slots` cap (64) makes more than 64 held runs impossible. The tests' expectations were out of date, not production code. Fix site: the tests give the runner a slot per execution (70 and 200), keeping their unlimited-tenant-round and pool proofs; new `the_runner_claims_no_more_than_its_execution_slots` proves the cap.
+
+### Non-goal and write-set audit
+
+No distributed quota, strict fairness, new durable outbox, queue, transport, alias, platform-specific limiter, or producer Postgres access. One ScribeOutbox write path. The spec and task split are unchanged. All 31 files changed since ef3a57b07 are in the expected owners (runtime outbox, server verification, config and error, spec error catalog, docs and design, test harness knobs, SDK journeys and support). No untracked files.
+
+### Risks and limits
+
+- At tiny test capacities, setup audits, spans and captures are counted lost (by design, never blocking).
+- The unreserved share is a strict 1/4 of capacity, and reserved work cannot borrow from it.
+- The runner defers a completed engine run only before it starts, never after.
+- Production defaults: capacity 65 536 items and 64 execution slots. TASK-004 measures memory and throughput.

@@ -473,7 +473,10 @@ async fn server_dev_first_run_is_client_ready() {
 /// Reruns retain the active release and key; a failed one-time save does not
 /// turn a retry into another issuance. Missing input and a non-loopback
 /// public gRPC bind are refused before setup, and an explicit host selected
-/// on a later start is still connected.
+/// on a later start is still connected. Another database whose server rejects
+/// the saved key, and a configuration directory selecting a remote server
+/// with or without a key, are refused without changing saved files or
+/// creating a tenant, and the saved deployment then resumes.
 ///
 /// # Panics
 /// Panics when a retry changes persisted identity or exposes credentials.
@@ -606,6 +609,112 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         fs::read_link(local.home.path().join("wyrd/server/current")).expect("retained release"),
         installed
     );
+
+    // Selecting another database with the same tenant slug is refused once
+    // its server rejects the saved key: the saved files are untouched, no
+    // tenant is created there, and the saved deployment then resumes.
+    let other = UnmigratedDatabase::create()
+        .await
+        .expect("second managed database");
+    let other_dsn = other.url().expect("second database URL");
+    let saved_files = (
+        fs::read(&credentials).expect("key"),
+        fs::read(&config).expect("config"),
+    );
+    let switched = local
+        .command()
+        .env("WYRD_DATABASE_URL", other_dsn.expose_secret())
+        .args(["server", "dev", "--non-interactive"])
+        .output()
+        .await
+        .expect("another database");
+    let errors = String::from_utf8_lossy(&switched.stderr);
+    assert!(!switched.status.success(), "{errors}");
+    assert!(errors.contains("does not accept the saved key"), "{errors}");
+    let secret = GlobalConfig::local_api_key(&local.environment())
+        .expect("protected key")
+        .expect("key saved");
+    assert!(
+        !format!("{}{errors}", String::from_utf8_lossy(&switched.stdout))
+            .contains(secret.expose_secret()),
+        "the refused key is never printed"
+    );
+    assert_eq!(
+        (
+            fs::read(&credentials).expect("key"),
+            fs::read(&config).expect("config")
+        ),
+        saved_files,
+        "the saved deployment's files are unchanged"
+    );
+    assert!(
+        TcpListener::bind(&local.bind).is_ok(),
+        "refusal settles the server"
+    );
+    let pool = sqlx::PgPool::connect(other_dsn.expose_secret())
+        .await
+        .expect("second database connects");
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("tenant count");
+    pool.close().await;
+    assert_eq!(
+        tenants, 0,
+        "no tenant or key was issued in the other database"
+    );
+    local.start(&[]).await;
+    local.stop("-INT").await;
+    assert_eq!(fs::read(&credentials).expect("key"), saved_files.0);
+
+    // A configuration directory that selects another server, with or without
+    // a saved key and with no local deployment, is refused before anything.
+    for key in [None, Some("wyrd_sk_remote_unrelated")] {
+        let remote = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("remote config home");
+        let remote_config = remote.path().join("config.toml");
+        fs::write(
+            &remote_config,
+            "[client]\nhttp_url = \"https://wyrd.example.com\"\n",
+        )
+        .expect("remote selection");
+        fs::set_permissions(&remote_config, fs::Permissions::from_mode(0o600))
+            .expect("protected config");
+        if let Some(key) = key {
+            let remote_key = remote.path().join("credentials.toml");
+            fs::write(&remote_key, format!("[default]\napi_key = \"{key}\"\n"))
+                .expect("remote key");
+            fs::set_permissions(&remote_key, fs::Permissions::from_mode(0o600))
+                .expect("protected key");
+        }
+        let before: Vec<_> = fs::read_dir(remote.path())
+            .expect("remote files")
+            .map(|entry| {
+                let path = entry.expect("entry").path();
+                (path.clone(), fs::read(path).expect("remote file"))
+            })
+            .collect();
+        let refused = local
+            .command()
+            .env("WYRD_CONFIG_HOME", remote.path())
+            .args(["server", "dev", "--tenant", "local", "--non-interactive"])
+            .output()
+            .await
+            .expect("remote selection");
+        let errors = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{errors}");
+        assert!(errors.contains("selects another Wyrd server"), "{errors}");
+        let after: Vec<_> = fs::read_dir(remote.path())
+            .expect("remote files")
+            .map(|entry| {
+                let path = entry.expect("entry").path();
+                (path.clone(), fs::read(path).expect("remote file"))
+            })
+            .collect();
+        assert_eq!(after, before, "the remote selection is byte-preserved");
+    }
 
     let partial = LocalDev::new().await;
     let directory = partial.home.path().join("wyrd");
@@ -924,14 +1033,20 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
         let kept = fs::read(&retained).expect("retained key");
         let other = local
             .command()
-            .env("WYRD_SEALING_KEY_BASE64", "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=")
+            .env(
+                "WYRD_SEALING_KEY_BASE64",
+                "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
+            )
             .args(["server", "dev", "--non-interactive"])
             .output()
             .await
             .expect("different key");
         let refused = String::from_utf8_lossy(&other.stderr);
         assert!(!other.status.success(), "{source}: {refused}");
-        assert!(refused.contains("differs from the retained"), "{source}: {refused}");
+        assert!(
+            refused.contains("differs from the retained"),
+            "{source}: {refused}"
+        );
         assert_eq!(fs::read(&retained).expect("retained key"), kept);
         assert!(
             !printed.contains(LOCAL_PROVIDER_KEY) && !printed.contains(SUPPLIED_SEALING_KEY),

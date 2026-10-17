@@ -1,6 +1,6 @@
 ---
 id: SPEC-verifier-building-blocks
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -933,10 +933,12 @@ This task adds no object-store deletion or garbage-collection workflow; any
 leftover development objects may remain unreferenced. There is no promise of
 continued historical Eval access or dedicated historical-data management.
 
-### REQ-022 One repository-wide name check
+### REQ-022 Verification-only naming
 
-`check:deps` (or the existing owning boundary check) fails on any new Wyrd
-"eval" identifier outside the exclusions below.
+No current Wyrd surface introduces an "eval" identifier outside the exclusions
+below. The served OpenAPI contract test rejects retired names in the served
+document; every other surface is held by review. There is no repository-wide
+name-scan check.
 
 #### Source-backed retention and remediation boundary
 
@@ -974,12 +976,11 @@ Inventory is current at planning inspection on 2026-10-16, not an exhaustive
 implementation allowlist. The removed observations table is stale-reference
 cleanup, not another table deletion.
 
-The name check protects the single verification model across languages and
-string-based permissions/tables/docs, which compilation alone cannot protect.
-The owner expressly requires this permanent check despite AGENTS.md §12's
-default against completed name bans. Extend the existing owner; do not create
-a checker framework or a check that verifies this check. Authority updates
-must accurately record the scope and exception.
+The owner removed the repository-wide name scan from `check:deps` as overkill
+(revision 11). AGENTS.md §12's default against completed name bans applies
+without exception; do not reintroduce a name-scan check or checker framework.
+The served OpenAPI assertion remains because it proves a published contract,
+not a source-tree naming rule.
 
 #### Vocabulary exclusions and GenAI projections
 
@@ -997,7 +998,7 @@ must accurately record the scope and exception.
   shell `eval`, remain unchanged. Unrelated lexical matches such as retrieval,
   revalidate and WireValue are outside scope.
 - Applied migration files and `changes/completed/` are historical exclusions.
-  Explicit refusal-test literals, check match definitions, and historical
+  Explicit refusal-test literals, matcher definitions, and historical
   decision/evidence text in the active packet may name removed contracts.
   None authorizes an old import/export, positive fixture, alias, or usage guide.
 
@@ -1158,11 +1159,11 @@ when the full suites run, not the required coverage.
 | AC-007 | Scheduled drift integration/journey evidence for REQ-014: correct slot/source selection and cron window, all existing methods, baseline/readiness and insufficient data, full statistical detail, failed-only Operators, and preserved accepted authority on queued retry/restart. |
 | AC-008 | Runnable matched Rust/Python/TypeScript support-policy examples, and standalone `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs` repositories that build against the real SDK, follow the shared layout and REQ-016 conventions, and pass their automated tests against the integrated server, covering immediate pass/fail verdicts, a background review read back by execution ID, and the requirement breakdown. Provider mocks support reproducible automated journeys; live-provider demo setup is explicit and not required by unit tests. |
 | AC-009 | Consumer and documentation evidence for REQ-017/INV-008: served OpenAPI and runtime MCP schemas/behavior; typed exports, authored Python stubs, generated TypeScript declarations/errors; affected CLI/UI; no obsolete active contract/examples; aligned design, doctrine, references, and Bifrost descriptions. Docsite checks/build and example checks pass. |
-| AC-010 | Format/lint, dependency and tenant-boundary checks, contract generation, relevant Rust/Python/TypeScript suites and journeys pass under repository verification policy. Evidence names the commands actually run; aggregate claims reflect `mise.toml`. REQ-022 is the explicit owner-required vocabulary check; no other permanent check is required merely to police prose or task count. |
-| AC-011 | REQ-018/019/020/022: the permanent owning check rejects prohibited Wyrd names across current surfaces and permits only documented exceptions; caller evidence proves no live Verifier dependency was deleted, and no obsolete workflow, alias, permission alias or table view remains. |
+| AC-010 | Format/lint, dependency and tenant-boundary checks, contract generation, relevant Rust/Python/TypeScript suites and journeys pass under repository verification policy. Evidence names the commands actually run; aggregate claims reflect `mise.toml`. No permanent check is required merely to police naming, prose or task count. |
+| AC-011 | REQ-018/019/020/022: review of current surfaces finds no prohibited Wyrd name outside the documented exceptions, and no repository-wide name-scan check exists; caller evidence proves no live Verifier dependency was deleted, and no obsolete workflow, alias, permission alias or table view remains. |
 | AC-012 | REQ-018/020/021: `wyrd eval` is an unknown command, `evals:run` / `evals:invoke` are unknown permissions, and SQL over `vala.eval.*` is unknown-table refusal. CLI parsing and real Rust/Python/TypeScript SDK and HTTP/MCP negative journeys prove the applicable boundaries, including upgraded catalogs. SDKs need not implement a CLI command. |
 | AC-013 | REQ-019/INV-009: existing real-time/background Verifier journeys, scheduled drift, result queries and engine assertions pass through renamed owners. Full Bifrost and Verifier journey lanes run once at integrated change review; task proof stays focused. |
-| AC-014 | REQ-019: source regeneration / `codegen:check`, served OpenAPI (`test:principals:integration`), runtime MCP catalog, SDK exports/typing and GenAI projection roundtrips contain no prohibited Wyrd names while preserving standard OTel semantics. |
+| AC-014 | REQ-019: source regeneration / `codegen:check`, served OpenAPI (`test:principals:integration`), runtime MCP catalog, SDK exports/typing and GenAI projection roundtrips contain no prohibited Wyrd names while preserving standard OTel semantics; the served OpenAPI assertion rejects abbreviated and expanded product-shaped retired names and permits descriptive prose and standard projections. |
 | AC-015 | REQ-021/INV-008: fresh and upgraded migrations pass (`test:sql`); remaining Forge namespaces and current verification evidence stay valid; obsolete Eval task/demand rows are removed before constraint validation; retired tables are unreachable; no historical-reader, conversion or object-deletion machinery is introduced. |
 | AC-016 | REQ-017/019/021/022: docsite (`docs:check`), design, doctrine, references, UI mocks, examples and SDK prose agree on verification vocabulary; removed observation paths have no stale positive references. |
 
@@ -1238,6 +1239,7 @@ solve for this delivery.
 | 8 | approved | Owner moved the developer example repositories into Task 005: fully refactor `wyrd-example-ts` and create `wyrd-example-py` and `wyrd-example-rs` as standalone, developer-friendly examples with their own Cards, using current Verifier, transport-hook (Rust: Wyrd Agent Run), and OTel conventions. Not production hardening. |
 | 9 | approved | Owner approved the local-backend evidence upload route (`PUT /v1/verification/evidence/local/{sha256}`) as a published, local-only verification operation with caller-derived tenant, operation-level `verifier:run`, size/digest refusal, idempotent same-digest writes, and no metadata row. Resolves FIND-TASK-005-6; served OpenAPI publishes it only when mounted. |
 | 10 | approved | Absorbs remove-eval-naming revision 1 into TASK-006 scope; adds REQ-018–022, INV-009 and AC-011–016; reverses scenario retention after D1 confirmation; records approved naming and owner GenAI direction, and removes shipped-data assumptions after the owner clarified "nothing has ever shipped". Owner approved the complete revision: "$wyrd-plan approve. write the task". |
+| 11 | approved | Owner removed the repository-wide retired-vocabulary scan from `check:deps` as overkill ("remove the vocab scan block from deps.sh. its overkill"; "change the spec"). REQ-022 now relies on the served OpenAPI assertion plus review; AC-011 drops the permanent check; AC-014 names the served assertion; the AGENTS.md §12 exception is withdrawn. Naming requirements and exclusions are unchanged. |
 
 Material sources beyond the governing authorities:
 

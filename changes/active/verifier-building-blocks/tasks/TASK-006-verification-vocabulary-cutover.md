@@ -418,3 +418,8 @@ Status: `IMPLEMENTED`. Candidate: commits `f711c6834`..`72d0fe4e0` on
   change was committed, and R1 records the check-mode run. Full `test:sql` and full journey suites were not run; they belong
   to change review.
 - Brand SVG text renames were not visually inspected for overflow.
+
+
+## Spec revision 11 note
+
+The owner removed the repository-wide vocabulary scan from `check:deps` (`10fa9269c`) and approved spec revision 11, which drops the permanent check from REQ-022/AC-011. Evidence above for the `check:deps` vocabulary block and its probes is historical; the served OpenAPI assertion in `pg_openapi_contract.rs` (`retired_vocabulary`) and review are the remaining enforcement. After removal, `mise run check:deps` and `mise run docs:check` pass.

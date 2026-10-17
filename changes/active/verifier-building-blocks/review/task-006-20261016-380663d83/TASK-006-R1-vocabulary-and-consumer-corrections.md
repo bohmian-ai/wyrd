@@ -124,3 +124,8 @@ Commands: `mise run check:deps`, `mise run fmt`, `mise run lints`, `mise run ts:
 Non-goals held: no migration, alias, runtime, schema, signature or executable UI change; MetricEntry untouched; no checker framework, dependency or permanent probe test. Docs-site unchanged, so `docs:check` not run; UI check/build/vitest not run because no executable UI file changed.
 
 Limits: renders use fallback fonts (remote fonts blocked) and prove no runtime interaction. Product-noun list is a bounded heuristic, not a semantic classifier. Out of scope and left as is: C-08 Workflow Card still describes ordered evaluation stages, and Experiment E-07/E-17 reference `?section=evaluations` (no Experiment workspace exists in the app).
+
+
+## Spec revision 11 note
+
+The owner removed the repository-wide vocabulary scan from `check:deps` (`10fa9269c`) and approved spec revision 11, which drops the permanent check from REQ-022/AC-011. Evidence above for the `check:deps` vocabulary block and its probes is historical; the served OpenAPI assertion in `pg_openapi_contract.rs` (`retired_vocabulary`) and review are the remaining enforcement. After removal, `mise run check:deps` and `mise run docs:check` pass.

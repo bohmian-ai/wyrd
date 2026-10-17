@@ -924,8 +924,8 @@ fn decide(rule: Decide, outcomes: impl Iterator<Item = RequirementOutcome>) -> V
 ///
 /// Every supplied slot must be declared, and its declaration must be the
 /// slot's kind: inline JSON for a `json` slot, a file or Artifact for a
-/// `media` slot, and a trace for a `trace` slot; `samples` slots are filled
-/// only by a schedule. A JSON value must satisfy its slot schema, and a file
+/// `media` slot, a trace for a `trace` slot, and an inline JSON list for a
+/// group `source` slot; `samples` slots are filled only by a schedule. A JSON value must satisfy its slot schema, and a file
 /// must be in one of its media slot's formats and within its `max_bytes`.
 /// An Artifact's format and size are known only to the host, which checks
 /// them when it admits the evidence. Missing slots are not refused here.
@@ -977,6 +977,11 @@ fn conform(
             }
             (InputSlot::Media { .. }, InputDeclaration::Artifact { .. })
             | (InputSlot::Trace { .. }, InputDeclaration::Trace { .. }) => {}
+            (InputSlot::Source(_), InputDeclaration::Json { value }) => {
+                if !value.is_array() {
+                    return Err(invalid("a source slot holds one list of source values"));
+                }
+            }
             _ => return Err(invalid("the declaration is not the slot's kind")),
         }
     }

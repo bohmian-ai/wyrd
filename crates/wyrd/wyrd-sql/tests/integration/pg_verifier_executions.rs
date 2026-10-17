@@ -18,18 +18,19 @@ use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
+use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{
-    BindingId, CardUid, ExecutionId, FeatureName, SlotName, VerificationResultId,
+    BindingId, CardUid, ExecutionId, FeatureName, GroupId, SlotName, VerificationResultId,
 };
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::RegistrationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
-    DriftWindow, OperatorDispatchStatus, VerificationError, VerificationExecutionStatus,
-    VerificationVerdict, VerifierReadiness,
+    DriftWindow, GroupCoverage, GroupEndSettings, GroupSourceSnapshot, OperatorDispatchStatus,
+    VerificationError, VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::provision_system_principal;
@@ -43,9 +44,9 @@ use wyrd_sql::queries::verification::{
 };
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
-    ExecutionOrigin, ExecutionStatus, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
-    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    ExecutionOrigin, ExecutionStatus, GROUP_POLL_INTERVAL, GroupSnapshot, QueueCounts,
+    RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, Settlement, Submission,
+    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -2551,4 +2552,230 @@ async fn expired_dispatch_deadline_fails_without_a_claim() {
         dispatch.status == OperatorDispatchStatus::Failed
             && dispatch.error.as_ref().map(|e| e.code.as_str()) == Some("deadline_exceeded")
     }));
+}
+
+/// One pinned group snapshot of `group` covering `members` source rows
+/// through `through`, with one ordered source list.
+///
+/// # Panics
+/// Never in practice: the literals match the slot, group, and source grammars.
+fn group_snapshot(group: &str, through: DateTime<Utc>, members: u64) -> GroupSnapshot {
+    let slot = SlotName::new("turns").expect("valid slot name");
+    GroupSnapshot {
+        group_id: GroupId::new(group).expect("valid group id"),
+        inputs: BTreeMap::from([(
+            slot.clone(),
+            InputDeclaration::Json {
+                value: json!(["passed", null]),
+            },
+        )]),
+        coverage: GroupCoverage {
+            through,
+            members,
+            sources: BTreeMap::from([(
+                slot,
+                GroupSourceSnapshot {
+                    reference: serde_json::from_value(json!(
+                        "verifiers.turn.requirements.promise.outcome"
+                    ))
+                    .expect("source text decodes"),
+                    execution_ids: vec![ExecutionId::new_v7(), ExecutionId::new_v7()],
+                    exceeded_ceiling: None,
+                },
+            )]),
+        },
+    }
+}
+
+/// A `group_end` binding polls on the fixed cadence, holds one outstanding
+/// execution per group, pins its snapshot on the claim, and reacts only to a
+/// changed settled group verdict: the first result is the baseline, an
+/// unchanged verdict dispatches nothing, and a change dispatches once per
+/// Operator with the group context, including on settlement replay.
+///
+/// # Panics
+/// Panics when polling, serialization, the pinned snapshot, coverage, or
+/// verdict-change dispatch differs.
+#[tokio::test]
+async fn group_executions_serialize_and_dispatch_on_verdict_change() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "review", custom_drift()).await;
+    let duration = |text| TriggerDuration::parse(text).expect("valid duration");
+    let settings = GroupEndSettings {
+        idle: duration("2s"),
+        max_age: duration("1h"),
+        finality: duration("1d"),
+        sources: BTreeMap::new(),
+    };
+    let operator = FrozenTarget::Digest("sha256:operator".to_owned());
+    let binding = project_bindings(
+        &mut conn,
+        &owner,
+        &CardKind::Service,
+        &[NewBinding {
+            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+            card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
+            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+            operators: vec![operator.clone()],
+            activation: BindingActivation::GroupEnd(settings.clone()),
+            inputs: BTreeMap::new(),
+        }],
+    )
+    .await
+    .expect("binding projects")[0];
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("poll")
+            .is_none()
+    );
+    record_machine_authentication(&mut conn, principal)
+        .await
+        .expect("owner activates");
+    let due = queue
+        .claim_due_group(&mut conn)
+        .await
+        .expect("poll")
+        .expect("an armed group binding is due at once");
+    assert_eq!(due.binding_id, binding);
+    assert_eq!(due.settings, settings);
+    assert_eq!(due.owner, Some(principal));
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        Some(due.clock + GROUP_POLL_INTERVAL)
+    );
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("poll")
+            .is_none()
+    );
+
+    let authority = background(&mut conn, principal).await;
+    let group = GroupId::new("order-1").expect("valid group id");
+    let first = group_snapshot("order-1", at(1, 0, 0), 2);
+    let EnqueueOutcome::Enqueued(execution) = queue
+        .enqueue_group(&mut conn, binding, &first, &authority)
+        .await
+        .expect("group enqueues")
+    else {
+        panic!("the first snapshot enqueues");
+    };
+    assert_eq!(
+        queue
+            .enqueue_group(
+                &mut conn,
+                binding,
+                &group_snapshot("order-1", at(2, 0, 0), 3),
+                &authority
+            )
+            .await
+            .expect("group enqueue answers"),
+        EnqueueOutcome::AlreadyEnqueued(execution),
+        "one outstanding execution per binding and group"
+    );
+    let states = queue
+        .group_states(&mut conn, binding, std::slice::from_ref(&group))
+        .await
+        .expect("coverage reads");
+    let state = states[&group];
+    assert!(state.outstanding);
+    assert!(state.covers(at(1, 0, 0), 2));
+    assert!(
+        !state.covers(at(1, 0, 0), 3),
+        "a late row timed earlier is new"
+    );
+    assert!(!state.covers(at(1, 0, 1), 2));
+
+    let mut settle = async |snapshot: Option<&GroupSnapshot>, verdict| {
+        if let Some(snapshot) = snapshot {
+            queue
+                .enqueue_group(&mut conn, binding, snapshot, &authority)
+                .await
+                .expect("group enqueues");
+        }
+        let claimed = claim(&queue, &mut conn).await;
+        let result = VerificationResultId::new_v7();
+        for _ in 0..2 {
+            queue
+                .complete(&mut conn, claimed.lease, result, verdict, "review", None)
+                .await
+                .expect("group settles");
+        }
+        (claimed, result)
+    };
+    let (claimed, baseline) = settle(None, VerificationVerdict::Failed).await;
+    assert_eq!(claimed.origin, ExecutionOrigin::Group);
+    assert_eq!(claimed.group_id.as_ref(), Some(&group));
+    assert_eq!(
+        claimed.input,
+        ExecutionInput::Grouped {
+            inputs: first.inputs.clone(),
+            coverage: first.coverage.clone(),
+        }
+    );
+    let (unchanged, preceding) = settle(
+        Some(&group_snapshot("order-1", at(2, 0, 0), 3)),
+        VerificationVerdict::Failed,
+    )
+    .await;
+    let (changed, current) = settle(
+        Some(&group_snapshot("order-1", at(3, 0, 0), 4)),
+        VerificationVerdict::Passed,
+    )
+    .await;
+
+    for execution in [claimed.lease.execution_id, unchanged.lease.execution_id] {
+        let status = queue
+            .execution_status(&mut conn, execution)
+            .await
+            .expect("status reads")
+            .expect("execution exists");
+        assert!(
+            status.state.dispatches.is_empty(),
+            "baseline and unchanged verdicts do not react"
+        );
+    }
+    let status = queue
+        .execution_status(&mut conn, changed.lease.execution_id)
+        .await
+        .expect("status reads")
+        .expect("execution exists");
+    assert_eq!(status.state.group_id.as_ref(), Some(&group));
+    assert_eq!(status.state.owner_card_uid.as_ref(), Some(&owner));
+    assert_eq!(
+        status.state.group.as_ref().map(|coverage| coverage.members),
+        Some(4)
+    );
+    assert_eq!(status.state.dispatches.len(), 1);
+    let contexts: Vec<Value> = sqlx::query_scalar(
+        "SELECT failure_context FROM wyrd.operator_dispatches WHERE execution_id = $1",
+    )
+    .bind(changed.lease.execution_id.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("contexts read");
+    let context: OperatorFailureContext =
+        serde_json::from_value(contexts[0].clone()).expect("context is the closed shape");
+    assert_eq!(context.result_id, current);
+    assert_eq!(context.verdict, VerificationVerdict::Passed);
+    let change = context.group.clone().expect("a group change context");
+    assert_eq!(change.group_id, group);
+    assert_eq!(change.previous_verdict, VerificationVerdict::Failed);
+    assert_eq!(
+        change.previous_result_id, preceding,
+        "compared with the preceding result"
+    );
+    assert_ne!(change.previous_result_id, baseline);
+    assert_eq!(
+        context.render("{{group.previous_verdict}}->{{verdict}}"),
+        Ok("failed->passed".to_owned())
+    );
 }

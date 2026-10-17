@@ -266,6 +266,39 @@ pub struct GroupSource {
     pub verifier_card_uid: CardUid,
 }
 
+/// The source evidence one group execution pinned when it was enqueued.
+///
+/// Every retry of the execution judges exactly this snapshot; later source
+/// rows only ever reach a later group execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupCoverage {
+    /// Newest eligible source row time (input `recorded_at` or result
+    /// `ended_at`) the snapshot covers.
+    pub through: DateTime<Utc>,
+    /// Distinct eligible source rows, inputs and results counted apart, the
+    /// snapshot covers; a later-visible row timed earlier raises it.
+    pub members: u64,
+    /// The pinned selection of each source slot.
+    pub sources: BTreeMap<SlotName, GroupSourceSnapshot>,
+}
+
+/// One source slot's pinned selection within a [`GroupCoverage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupSourceSnapshot {
+    /// The authored source declaration.
+    pub reference: SourceText,
+    /// The source executions the slot's list holds one value for, in list
+    /// order: input `recorded_at`, then execution ID.
+    pub execution_ids: Vec<ExecutionId>,
+    /// The deployment source-execution ceiling, present only when the
+    /// eligible executions exceeded it; nothing was read and the group
+    /// judgment is inconclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exceeded_ceiling: Option<u32>,
+}
+
 /// Current state of one Operator dispatch in an execution status response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

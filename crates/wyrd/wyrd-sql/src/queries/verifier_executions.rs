@@ -41,8 +41,9 @@ use wyrd_spec::verification::execution::{
     InputDeclaration, VerificationExecutionState, VerificationRequest,
 };
 use wyrd_spec::verification::{
-    DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
-    VerificationError, VerificationVerdict, VerifierReadiness,
+    DriftWindow, FrozenTarget, GroupCoverage, GroupEndSettings, GroupSourceSnapshot,
+    OperatorDispatchState, VerificationBindingStatus, VerificationError, VerificationVerdict,
+    VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -187,6 +188,78 @@ const DUE_BINDING_SQL: &str = r"
        FOR UPDATE SKIP LOCKED
 ";
 
+/// How often a `group_end` binding's cursor polls its groups.
+///
+/// A fixed cadence, not configuration: group-end latency is this interval
+/// plus Bifrost visibility lag on top of the Trigger's `idle` or `max_age`.
+// ponytail: one cadence for every group binding; per-binding cadence only if poll cost demands it.
+pub const GROUP_POLL_INTERVAL: Duration = Duration::seconds(2);
+
+/// Briefly lock the earliest due `group_end` binding no other scheduler holds,
+/// returning its frozen targets, settings, and the database instant of the tick.
+const DUE_GROUP_SQL: &str = r"
+    SELECT binding_id, owner_card_uid, card_uid, verifier_card_uid, group_end,
+           statement_timestamp() AS clock
+      FROM wyrd.verification_bindings
+     WHERE activation = 'group_end'
+       AND next_run_at <= statement_timestamp()
+     ORDER BY next_run_at, binding_id
+     LIMIT 1
+       FOR UPDATE SKIP LOCKED
+";
+
+/// The latest group execution of each listed group of one binding.
+///
+/// Admission order is creation time, then identity, so the latest row holds
+/// the newest coverage; `outstanding` is whether it has not settled.
+const GROUP_COVERAGE_SQL: &str = r"
+    SELECT DISTINCT ON (group_id)
+           group_id, status IN ('pending', 'running', 'retrying') AS outstanding,
+           group_through, group_members
+      FROM wyrd.verifier_executions
+     WHERE binding_id = $1 AND origin = 'group' AND group_id = ANY($2)
+     ORDER BY group_id, created_at DESC, execution_id DESC
+";
+
+/// Insert one group execution judging a pinned snapshot, due at PostgreSQL's
+/// statement time; while another execution of the same binding and group is
+/// outstanding, its partial unique index makes this insert nothing.
+const INSERT_GROUP_SQL: &str = r"
+    INSERT INTO wyrd.verifier_executions (
+        execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
+        origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
+        inputs, route_overrides, group_id, group_through, group_members, group_sources,
+        sub_principal_id, act_principal_id, authority,
+        max_attempts, next_attempt_at, created_at, updated_at
+    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, 'group', $5, $6, $7, $8, $9,
+              $10, '{}'::jsonb, $11, $12, $13, $14, $15, $16, $17, $18,
+              statement_timestamp(), statement_timestamp(), statement_timestamp())
+    ON CONFLICT DO NOTHING
+    RETURNING execution_id
+";
+
+/// Find the outstanding execution of one binding and group.
+const OUTSTANDING_GROUP_SQL: &str = r"
+    SELECT execution_id
+      FROM wyrd.verifier_executions
+     WHERE binding_id = $1 AND group_id = $2 AND origin = 'group'
+       AND status IN ('pending', 'running', 'retrying')
+";
+
+/// The settled group result admitted immediately before execution `$1` for
+/// the same binding and group, which its verdict is compared with.
+const PREVIOUS_GROUP_SQL: &str = r"
+    SELECT p.result_id, p.group_verdict
+      FROM wyrd.verifier_executions e
+      JOIN wyrd.verifier_executions p
+        ON p.binding_id = e.binding_id AND p.group_id = e.group_id
+     WHERE e.execution_id = $1
+       AND p.origin = 'group' AND p.group_verdict IS NOT NULL
+       AND (p.created_at, p.execution_id) < (e.created_at, e.execution_id)
+     ORDER BY p.created_at DESC, p.execution_id DESC
+     LIMIT 1
+";
+
 /// Move a claimed binding's cursor; NULL disarms an unparseable schedule.
 const ADVANCE_CURSOR_SQL: &str = r"
     UPDATE wyrd.verification_bindings
@@ -240,7 +313,7 @@ const CLAIM_SQL: &str = r"
               e.run_id, e.inputs, e.route_overrides,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id,
+              e.cause_sampled, e.group_id, e.group_through, e.group_members, e.group_sources,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -279,24 +352,30 @@ const RENEW_LEASES_SQL: &str = r"
 ";
 
 /// Complete a leased execution, or re-apply the same completion idempotently.
+///
+/// A group execution also keeps its verdict (`$4`) so the next group result
+/// of its binding and group can be compared with it.
 const COMPLETE_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = 'completed', result_id = $3, error = NULL,
+           group_verdict = CASE WHEN origin = 'group' THEN $4 END,
            lease_expires_at = NULL, next_attempt_at = NULL,
            settled_at = COALESCE(settled_at, statement_timestamp()),
            updated_at = statement_timestamp()
      WHERE execution_id = $1
        AND lease_token = $2
        AND (status = 'running' OR (status = 'completed' AND result_id = $3))
-    RETURNING binding_id, operators
+    RETURNING binding_id, operators, origin = 'group' AS grouped
 ";
 
 /// Insert one Operator dispatch; the (tenant, execution, Operator) key absorbs retries.
 ///
 /// The failure context is frozen here from the settled execution and its
-/// exact Verifier and subject Cards plus the runner's bounded summary (`$5`)
-/// and, for a Verifier with one drift check, that check's counts (`$6`), so
-/// every delivery attempt renders the same payload.
+/// exact Verifier and subject Cards plus the runner's bounded summary (`$5`),
+/// for a Verifier with one drift check that check's counts (`$6`), the
+/// settled verdict (`$7`) and, for a group verdict change, the preceding
+/// group result and verdict (`$8`, `$9`), so every delivery attempt renders
+/// the same payload.
 const INSERT_DISPATCH_SQL: &str = r"
     INSERT INTO wyrd.operator_dispatches (
         dispatch_id, data_tenant_id, execution_id, operator_uid, operator_digest,
@@ -312,11 +391,16 @@ const INSERT_DISPATCH_SQL: &str = r"
                'verifier_ref', v.space || '/' || v.name || '@' || v.version,
                'subject_uid', e.card_uid,
                'subject_ref', s.space || '/' || s.name || '@' || s.version,
-               'verdict', 'failed',
+               'verdict', $7::text,
                'completed_at', e.settled_at,
                'summary', $5::text
            ) || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb
-                     ELSE jsonb_build_object('drift', $6::jsonb) END,
+                     ELSE jsonb_build_object('drift', $6::jsonb) END
+             || CASE WHEN $9::text IS NULL THEN '{}'::jsonb
+                     ELSE jsonb_build_object('group', jsonb_build_object(
+                              'group_id', e.group_id,
+                              'previous_result_id', $8::uuid,
+                              'previous_verdict', $9::text)) END,
            statement_timestamp(), statement_timestamp(), statement_timestamp()
       FROM wyrd.verifier_executions e
       JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
@@ -370,7 +454,8 @@ const RELEASE_SQL: &str = r"
 /// Read one execution's control-plane status.
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
-           verifier_card_uid, card_uid, result_id, error
+           verifier_card_uid, card_uid, result_id, error,
+           group_id, owner_card_uid, group_through, group_members, group_sources
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -408,15 +493,17 @@ const RUNNABLE_TENANTS_SQL: &str = r"
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
 ";
 
-/// List tenants with due scheduled bindings, most overdue tenant first.
+/// List tenants with due scheduled or `group_end` bindings, most overdue
+/// tenant first.
 ///
-/// Uses the same dueness rule as [`DUE_BINDING_SQL`]: `$2` is
-/// [`SCHEDULE_CLAIM_DELAY`] in milliseconds.
+/// Uses the same dueness rules as [`DUE_BINDING_SQL`], where `$2` is
+/// [`SCHEDULE_CLAIM_DELAY`] in milliseconds, and [`DUE_GROUP_SQL`].
 const DUE_TENANTS_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.verification_bindings
-     WHERE activation = 'schedule'
-       AND next_run_at + ($2::bigint * INTERVAL '1 millisecond') <= statement_timestamp()
+     WHERE (activation = 'schedule'
+            AND next_run_at + ($2::bigint * INTERVAL '1 millisecond') <= statement_timestamp())
+        OR (activation = 'group_end' AND next_run_at <= statement_timestamp())
      GROUP BY data_tenant_id
      ORDER BY min(next_run_at), data_tenant_id
      LIMIT $1
@@ -440,6 +527,8 @@ pub enum ExecutionOrigin {
     Schedule,
     /// A caller's `POST /v1/verification/enqueue` submission.
     Manual,
+    /// A `group_end` binding's judgment of one pinned group snapshot.
+    Group,
 }
 
 impl ExecutionOrigin {
@@ -449,6 +538,7 @@ impl ExecutionOrigin {
         match self {
             Self::Schedule => "schedule",
             Self::Manual => "manual",
+            Self::Group => "group",
         }
     }
 
@@ -461,6 +551,7 @@ impl ExecutionOrigin {
         match value {
             "schedule" => Ok(Self::Schedule),
             "manual" => Ok(Self::Manual),
+            "group" => Ok(Self::Group),
             other => Err(SqlxError::Decode(
                 format!("unknown verifier execution origin {other:?}").into(),
             )),
@@ -487,6 +578,13 @@ pub enum ExecutionInput {
         inputs: BTreeMap<SlotName, InputDeclaration>,
         /// Per-task execution route overrides.
         route_overrides: BTreeMap<TaskId, ExecutionRoute>,
+    },
+    /// A group snapshot pinned when the execution was enqueued.
+    Grouped {
+        /// One ordered JSON list per source slot, aligned to its snapshot.
+        inputs: BTreeMap<SlotName, InputDeclaration>,
+        /// The pinned source selections and coverage.
+        coverage: GroupCoverage,
     },
 }
 
@@ -831,6 +929,64 @@ pub struct ScheduleTick {
     pub outcome: ScheduleOutcome,
     /// The cursor after this tick; `None` only for a disarmed invalid schedule.
     pub next_run_at: Option<DateTime<Utc>>,
+}
+
+/// One due `group_end` binding locked by [`VerifierExecutionQueue::claim_due_group`]
+/// until the caller's transaction ends, with its cursor already advanced by
+/// [`GROUP_POLL_INTERVAL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueGroupBinding {
+    /// The claimed binding.
+    pub binding_id: BindingId,
+    /// Binding owner whose attributed source rows form its groups.
+    pub owner_card_uid: CardUid,
+    /// Exact Card the group Verifier judges.
+    pub card_uid: CardUid,
+    /// Exact group Verifier Card version.
+    pub verifier_card_uid: CardUid,
+    /// The pinned Trigger durations and source bindings.
+    pub settings: GroupEndSettings,
+    /// PostgreSQL's statement instant of this tick; every due decision of the
+    /// tick is made against it.
+    pub clock: DateTime<Utc>,
+    /// The owner's Card-bound principal when it is runtime-active; `None`
+    /// means no group execution may be accepted this tick.
+    pub owner: Option<PrincipalId>,
+}
+
+/// The latest group execution of one binding and group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupState {
+    /// Whether it has not settled, so no other may be enqueued.
+    pub outstanding: bool,
+    /// Newest eligible source row time it covers.
+    pub through: DateTime<Utc>,
+    /// Distinct eligible source rows it covers.
+    pub members: u64,
+}
+
+impl GroupState {
+    /// Whether this execution already covers a group whose newest eligible
+    /// source row is at `newest` among `members` distinct rows.
+    ///
+    /// A later-visible row timed before `through` still raises the row count,
+    /// so it is new activity rather than silently covered.
+    #[must_use]
+    pub fn covers(&self, newest: DateTime<Utc>, members: u64) -> bool {
+        self.through >= newest && self.members >= members
+    }
+}
+
+/// One group snapshot to judge: the group, its ordered source lists, and the
+/// coverage they were selected under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupSnapshot {
+    /// The judged group.
+    pub group_id: GroupId,
+    /// One ordered JSON list per source slot.
+    pub inputs: BTreeMap<SlotName, InputDeclaration>,
+    /// The pinned source selections and coverage.
+    pub coverage: GroupCoverage,
 }
 
 /// Opaque fencing token of one claim.
@@ -1237,16 +1393,10 @@ impl VerifierExecutionQueue {
         window: DriftWindow,
         authority: &ExecutionAuthority,
     ) -> Result<EnqueueOutcome, SqlxError> {
-        let resolved: Option<ResolvedTarget> = sqlx::query_as(RESOLVE_BINDING_SQL)
-            .bind(binding_id.as_uuid())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some(resolved) = resolved else {
-            return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound));
+        let resolved = match resolve_binding(conn, binding_id).await? {
+            Ok(resolved) => resolved,
+            Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
         };
-        if let Some(refusal) = resolved.refusal()? {
-            return Ok(EnqueueOutcome::Refused(refusal));
-        }
         let attribution = authority.attribution();
         let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_SCHEDULED_SQL)
             .bind(ExecutionId::new_v7().as_uuid())
@@ -1434,6 +1584,161 @@ impl VerifierExecutionQueue {
         Ok(())
     }
 
+    /// Lock the earliest due `group_end` binding of the caller's tenant and
+    /// advance its poll cursor.
+    ///
+    /// Locks one binding whose cursor PostgreSQL's statement time has reached
+    /// with `FOR UPDATE SKIP LOCKED`, so concurrent schedulers never poll the
+    /// same binding at once, and moves its cursor [`GROUP_POLL_INTERVAL`] past
+    /// that instant in the same transaction. The caller discovers due groups,
+    /// enqueues them through [`Self::enqueue_group`], and commits; a failed
+    /// discovery still commits the advanced cursor, so the next poll retries
+    /// it rather than this pass spinning on it. Returns `None` when nothing is
+    /// due.
+    ///
+    /// # Errors
+    /// Returns the database error when a statement fails, or a decode error
+    /// when stored identities or settings are malformed.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.group.claim"))]
+    pub async fn claim_due_group(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<Option<DueGroupBinding>, SqlxError> {
+        let due: Option<(
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Json<GroupEndSettings>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(DUE_GROUP_SQL)
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        let Some((binding_id, owner, card, verifier, Json(settings), clock)) = due else {
+            return Ok(None);
+        };
+        let binding_id = stored(BindingId::new(binding_id))?;
+        self.advance_cursor(conn, binding_id, Some(clock + GROUP_POLL_INTERVAL))
+            .await?;
+        let owner_principal = binding_activity(conn, binding_id, self.inactivity)
+            .await?
+            .filter(|activity| activity.active)
+            .and_then(|activity| activity.principal_id);
+        Ok(Some(DueGroupBinding {
+            binding_id,
+            owner_card_uid: stored(CardUid::from_uuid(owner))?,
+            card_uid: stored(CardUid::from_uuid(card))?,
+            verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
+            settings,
+            clock,
+            owner: owner_principal,
+        }))
+    }
+
+    /// Read the latest group execution of each of `groups` for one binding.
+    ///
+    /// A group with no group execution is absent from the result.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored group or coverage is malformed.
+    pub async fn group_states(
+        &self,
+        conn: &mut TenantConn<'_>,
+        binding_id: BindingId,
+        groups: &[GroupId],
+    ) -> Result<BTreeMap<GroupId, GroupState>, SqlxError> {
+        let groups: Vec<&str> = groups.iter().map(GroupId::as_str).collect();
+        let rows: Vec<(String, bool, DateTime<Utc>, i64)> = sqlx::query_as(GROUP_COVERAGE_SQL)
+            .bind(binding_id.as_uuid())
+            .bind(groups)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        rows.into_iter()
+            .map(|(group, outstanding, through, members)| {
+                Ok((
+                    stored(GroupId::new(group))?,
+                    GroupState {
+                        outstanding,
+                        through,
+                        members: stored(u64::try_from(members))?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Enqueue one group execution of `binding_id` judging `snapshot`.
+    ///
+    /// Verifier readiness and subject availability are enforced as for a
+    /// scheduled occurrence. The execution serves the binding owner under
+    /// `authority`, freezes the binding's Trigger and Operators, and pins the
+    /// snapshot's lists and coverage so every retry judges the same evidence.
+    /// While another execution of the binding and group is outstanding the
+    /// insert does nothing and that execution is
+    /// [`EnqueueOutcome::AlreadyEnqueued`]. The caller commits.
+    ///
+    /// # Errors
+    /// Returns the database error when a read or the insert fails, or an
+    /// encode or decode error when the snapshot, authority, or a stored
+    /// identity is malformed.
+    ///
+    /// # Panics
+    /// Never in practice: a ready Verifier's Card row exists, so its version
+    /// is present.
+    #[tracing::instrument(skip(self, conn, snapshot, authority), fields(operation = "verification.group.enqueue", %binding_id, group_id = %snapshot.group_id))]
+    pub async fn enqueue_group(
+        &self,
+        conn: &mut TenantConn<'_>,
+        binding_id: BindingId,
+        snapshot: &GroupSnapshot,
+        authority: &ExecutionAuthority,
+    ) -> Result<EnqueueOutcome, SqlxError> {
+        let resolved = match resolve_binding(conn, binding_id).await? {
+            Ok(resolved) => resolved,
+            Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
+        };
+        let attribution = authority.attribution();
+        let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_GROUP_SQL)
+            .bind(ExecutionId::new_v7().as_uuid())
+            .bind(resolved.verifier_card_uid)
+            .bind(
+                resolved
+                    .verifier_version
+                    .expect("invariant: a ready Verifier has a Card version"),
+            )
+            .bind(resolved.card_uid)
+            .bind(resolved.owner_card_uid)
+            .bind(resolved.binding_id)
+            .bind(resolved.trigger_uid)
+            .bind(resolved.trigger_digest)
+            .bind(resolved.operators)
+            .bind(Json(&snapshot.inputs))
+            .bind(snapshot.group_id.as_str())
+            .bind(snapshot.coverage.through)
+            .bind(stored(i64::try_from(snapshot.coverage.members))?)
+            .bind(Json(&snapshot.coverage.sources))
+            .bind(attribution.sub_principal_id.as_uuid())
+            .bind(attribution.act_principal_id.as_uuid())
+            .bind(Json(authority.authority()))
+            .bind(self.retry.max_attempts)
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        if let Some(execution_id) = inserted {
+            return Ok(EnqueueOutcome::Enqueued(stored(ExecutionId::new(
+                execution_id,
+            ))?));
+        }
+        let existing: Uuid = sqlx::query_scalar(OUTSTANDING_GROUP_SQL)
+            .bind(binding_id.as_uuid())
+            .bind(snapshot.group_id.as_str())
+            .fetch_one(&mut **conn.transaction())
+            .await?;
+        Ok(EnqueueOutcome::AlreadyEnqueued(stored(ExecutionId::new(
+            existing,
+        ))?))
+    }
+
     /// Claim one runnable execution of the caller's tenant under a fresh lease.
     ///
     /// First settles, as `errored`, every expired lease whose attempts are
@@ -1517,6 +1822,14 @@ impl VerifierExecutionQueue {
     /// exactly one. Passed and inconclusive verdicts and submissions create no
     /// dispatch. The verdict itself is not stored: Bifrost owns it.
     ///
+    /// A group execution instead stores its verdict and compares it with the
+    /// settled group result admitted immediately before it for the same
+    /// binding and group: the first result is the baseline and dispatches
+    /// nothing, an unchanged verdict dispatches nothing, and a changed one —
+    /// including to or from `inconclusive` — dispatches once per frozen
+    /// `on_verdict_change` Operator with the group, previous result, and
+    /// previous verdict in its context. Replay inserts no second dispatch.
+    ///
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
     /// when the frozen Operators are malformed.
@@ -1530,32 +1843,51 @@ impl VerifierExecutionQueue {
         summary: &str,
         drift: Option<DriftCounts>,
     ) -> Result<Settlement, SqlxError> {
-        let settled: Option<(Option<Uuid>, Json<Vec<FrozenTarget>>)> = sqlx::query_as(COMPLETE_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(result_id.as_uuid())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some((binding_id, Json(operators))) = settled else {
+        let verdict_text: &'static str = verdict.into();
+        let settled: Option<(Option<Uuid>, Json<Vec<FrozenTarget>>, bool)> =
+            sqlx::query_as(COMPLETE_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(result_id.as_uuid())
+                .bind(verdict_text)
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+        let Some((binding_id, Json(operators), grouped)) = settled else {
             return Ok(Settlement::StaleLease);
         };
-        if verdict == VerificationVerdict::Failed && binding_id.is_some() {
-            let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
-            for operator in &operators {
-                let (uid, digest) = match operator {
-                    FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
-                    FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
-                };
-                sqlx::query(INSERT_DISPATCH_SQL)
-                    .bind(OperatorDispatchId::new_v7().as_uuid())
-                    .bind(lease.execution_id.as_uuid())
-                    .bind(uid)
-                    .bind(digest)
-                    .bind(&summary)
-                    .bind(drift.map(Json))
-                    .execute(&mut **conn.transaction())
-                    .await?;
+        let previous = if grouped {
+            let previous: Option<(Uuid, String)> = sqlx::query_as(PREVIOUS_GROUP_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            match previous {
+                Some(previous) if previous.1 != verdict_text => Some(previous),
+                _ => return Ok(Settlement::Applied),
             }
+        } else if verdict == VerificationVerdict::Failed && binding_id.is_some() {
+            None
+        } else {
+            return Ok(Settlement::Applied);
+        };
+        let (previous_result, previous_verdict) = previous.unzip();
+        let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
+        for operator in &operators {
+            let (uid, digest) = match operator {
+                FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
+                FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
+            };
+            sqlx::query(INSERT_DISPATCH_SQL)
+                .bind(OperatorDispatchId::new_v7().as_uuid())
+                .bind(lease.execution_id.as_uuid())
+                .bind(uid)
+                .bind(digest)
+                .bind(&summary)
+                .bind(drift.map(Json))
+                .bind(verdict_text)
+                .bind(previous_result)
+                .bind(previous_verdict.as_deref())
+                .execute(&mut **conn.transaction())
+                .await?;
         }
         Ok(Settlement::Applied)
     }
@@ -1687,6 +2019,15 @@ impl VerifierExecutionQueue {
                     .into_iter()
                     .map(DispatchRow::into_state)
                     .collect::<Result<_, _>>()?,
+                group_id: row
+                    .group_id
+                    .map(|id| stored(GroupId::new(id)))
+                    .transpose()?,
+                owner_card_uid: row
+                    .owner_card_uid
+                    .map(|uid| stored(CardUid::from_uuid(uid)))
+                    .transpose()?,
+                group: group_coverage(row.group_through, row.group_members, row.group_sources)?,
             },
             attribution: Attribution::new(
                 PrincipalId::new(row.sub_principal_id),
@@ -1870,6 +2211,29 @@ impl ResolvedTarget {
     }
 }
 
+/// Resolve a binding's frozen targets for background work, or the refusal
+/// that keeps it from becoming runnable.
+///
+/// # Errors
+/// Returns the database error when the read fails, or a decode error when the
+/// stored readiness is unknown.
+async fn resolve_binding(
+    conn: &mut TenantConn<'_>,
+    binding_id: BindingId,
+) -> Result<Result<ResolvedTarget, EnqueueRefusal>, SqlxError> {
+    let resolved: Option<ResolvedTarget> = sqlx::query_as(RESOLVE_BINDING_SQL)
+        .bind(binding_id.as_uuid())
+        .fetch_optional(&mut **conn.transaction())
+        .await?;
+    let Some(resolved) = resolved else {
+        return Ok(Err(EnqueueRefusal::BindingNotFound));
+    };
+    Ok(match resolved.refusal()? {
+        Some(refusal) => Err(refusal),
+        None => Ok(resolved),
+    })
+}
+
 /// A claimed execution row from [`CLAIM_SQL`].
 #[derive(sqlx::FromRow)]
 struct ClaimedRow {
@@ -1921,6 +2285,12 @@ struct ClaimedRow {
     cause_sampled: Option<bool>,
     /// Caller group the execution belongs to.
     group_id: Option<String>,
+    /// Newest source row time a group execution covers.
+    group_through: Option<DateTime<Utc>>,
+    /// Distinct source rows a group execution covers.
+    group_members: Option<i64>,
+    /// A group execution's pinned source selections.
+    group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -1943,6 +2313,8 @@ impl ClaimedRow {
     /// origin or input columns violate their closed shapes, or a duration is
     /// negative.
     fn into_claimed(self, token: LeaseToken) -> Result<ClaimedExecution, SqlxError> {
+        let origin = ExecutionOrigin::parse(&self.origin)?;
+        let coverage = group_coverage(self.group_through, self.group_members, self.group_sources)?;
         let input = match (
             self.window_start,
             self.window_end,
@@ -1954,6 +2326,14 @@ impl ClaimedRow {
                 window: DriftWindow { start, end },
                 slots,
             },
+            (None, None, _, Some(Json(inputs)), Some(_)) if origin == ExecutionOrigin::Group => {
+                ExecutionInput::Grouped {
+                    inputs,
+                    coverage: coverage.ok_or_else(|| {
+                        SqlxError::Decode("group execution has no pinned coverage".into())
+                    })?,
+                }
+            }
             (None, None, _, Some(Json(inputs)), Some(Json(route_overrides))) => {
                 ExecutionInput::Submitted {
                     run_id: self.run_id.map(RunId::from_string),
@@ -1983,7 +2363,7 @@ impl ClaimedRow {
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
             card_uid: stored(CardUid::from_uuid(self.card_uid))?,
-            origin: ExecutionOrigin::parse(&self.origin)?,
+            origin,
             owner_card_uid: self
                 .owner_card_uid
                 .map(|uid| stored(CardUid::from_uuid(uid)))
@@ -2065,6 +2445,16 @@ struct StatusRow {
     result_id: Option<Uuid>,
     /// Last execution error.
     error: Option<Json<VerificationError>>,
+    /// Caller group, or the group a group execution judges.
+    group_id: Option<String>,
+    /// Binding owner of a background execution.
+    owner_card_uid: Option<Uuid>,
+    /// Newest source row time a group execution covers.
+    group_through: Option<DateTime<Utc>>,
+    /// Distinct source rows a group execution covers.
+    group_members: Option<i64>,
+    /// A group execution's pinned source selections.
+    group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].
@@ -2103,6 +2493,30 @@ impl DispatchRow {
             status: stored(self.status.parse())?,
             error: self.last_error.map(|Json(error)| error),
         })
+    }
+}
+
+/// Assemble a group execution's stored coverage columns, which the table's
+/// group-shape check keeps all present or all absent.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when only some columns are present or the
+/// row count is negative.
+fn group_coverage(
+    through: Option<DateTime<Utc>>,
+    members: Option<i64>,
+    sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
+) -> Result<Option<GroupCoverage>, SqlxError> {
+    match (through, members, sources) {
+        (Some(through), Some(members), Some(Json(sources))) => Ok(Some(GroupCoverage {
+            through,
+            members: stored(u64::try_from(members))?,
+            sources,
+        })),
+        (None, None, None) => Ok(None),
+        _ => Err(SqlxError::Decode(
+            "group execution coverage is partially stored".into(),
+        )),
     }
 }
 

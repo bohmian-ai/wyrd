@@ -35,15 +35,19 @@ ALTER TABLE wyrd.verifier_executions
         CHECK (group_id IS NULL OR octet_length(group_id) BETWEEN 1 AND 256),
     ADD COLUMN group_through   TIMESTAMPTZ,
     ADD COLUMN group_members   BIGINT CHECK (group_members IS NULL OR group_members > 0),
-    ADD COLUMN group_sources   JSONB;
+    ADD COLUMN group_sources   JSONB,
+    ADD COLUMN group_verdict   TEXT
+        CHECK (group_verdict IS NULL OR group_verdict IN ('passed', 'failed', 'inconclusive'));
 
 -- Exactly one frozen input: a Drift window, a historical Eval record, or a
 -- caller submission's or group snapshot's input declarations and route
 -- overrides. A submitted execution keeps its opaque caller `group_id`; a
 -- `group` execution judges one pinned snapshot of its binding's group, where
 -- `group_through` and `group_members` are the newest eligible source row time
--- and distinct source executions it covers and `group_sources` names each
--- source slot's selected identities or the read ceiling it exceeded.
+-- and distinct source input/result rows it covers, `group_sources` names each
+-- source slot's selected identities or the read ceiling it exceeded, and
+-- `group_verdict` is the settled verdict the next group result is compared
+-- with for `on_verdict_change`.
 ALTER TABLE wyrd.verifier_executions DROP CONSTRAINT verifier_runs_check4;
 ALTER TABLE wyrd.verifier_executions
     ADD CONSTRAINT verifier_executions_input_shape CHECK (
@@ -67,6 +71,7 @@ ALTER TABLE wyrd.verifier_executions
         AND (origin = 'group') = (group_members IS NOT NULL)
         AND (origin = 'group') = (jsonb_typeof(group_sources) IS NOT DISTINCT FROM 'object')
         AND (origin <> 'group' OR group_id IS NOT NULL)
+        AND (group_verdict IS NULL OR (origin = 'group' AND status = 'completed'))
     ),
     ADD CONSTRAINT verifier_executions_live_origin CHECK (
         origin IN ('schedule', 'manual', 'group')

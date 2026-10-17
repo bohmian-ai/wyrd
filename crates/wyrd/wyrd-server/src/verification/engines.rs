@@ -6,11 +6,15 @@
 //! lifecycle transition. The helpers here derive the bounded Operator failure
 //! context from a completed [`VerificationOutcome`].
 
+use std::collections::BTreeMap;
+
 use wyrd_spec::card::operator::DriftCounts;
+use wyrd_spec::card::verifier::{Requirement, SourceText, VerifierSpec};
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, VerificationOutcome,
+    RequirementDetail, RequirementOutcome, RequirementResult, StepResult, StepStatus,
+    VerificationOutcome,
 };
-use wyrd_spec::verification::{DriftVerdict, VerificationError};
+use wyrd_spec::verification::{DriftVerdict, TaskId, VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
 
 /// The typed result of one engine execution.
@@ -40,7 +44,9 @@ pub enum EngineOutcome {
 /// context.
 ///
 /// Only the verdict and requirement counts: never actual values, citations,
-/// or step output. Settlement clips it to the Operator summary bound.
+/// or step output. A group judgment refused by the source-execution ceiling
+/// also carries that reason, which names only the authored source and the
+/// ceiling. Settlement clips it to the Operator summary bound.
 #[must_use]
 pub fn summary(outcome: &VerificationOutcome) -> String {
     let failed = outcome
@@ -48,11 +54,82 @@ pub fn summary(outcome: &VerificationOutcome) -> String {
         .iter()
         .filter(|requirement| requirement.outcome == RequirementOutcome::Failed)
         .count();
-    format!(
+    let mut summary = format!(
         "Verdict {}: {failed} of {} requirements failed.",
         <&str>::from(outcome.verdict),
         outcome.requirements.len()
-    )
+    );
+    if let Some(limit) = outcome.requirements.iter().find(|requirement| {
+        requirement
+            .reason
+            .starts_with(SOURCE_EXECUTION_LIMIT_EXCEEDED)
+    }) {
+        summary.push(' ');
+        summary.push_str(&limit.reason);
+    }
+    summary
+}
+
+/// Requirement reason of a group judgment whose source selection exceeded
+/// the deployment source-execution ceiling.
+pub const SOURCE_EXECUTION_LIMIT_EXCEEDED: &str = "source_execution_limit_exceeded";
+
+/// The inconclusive outcome of a group judgment whose `reference` selected
+/// more than `ceiling` source executions.
+///
+/// Nothing was read for the snapshot, so no truncated list is judged: every
+/// requirement is inconclusive with a reason naming the reference and the
+/// ceiling, and every step is skipped with the same reason.
+#[must_use]
+pub fn source_limit_exceeded(
+    spec: &VerifierSpec,
+    reference: &SourceText,
+    ceiling: u32,
+) -> VerificationOutcome {
+    let reason = format!(
+        "{SOURCE_EXECUTION_LIMIT_EXCEEDED}: {} selected more than {ceiling} source executions",
+        reference.as_str()
+    );
+    let requirement = |step: Option<&TaskId>, requirement: &Requirement| RequirementResult {
+        id: requirement.id.clone(),
+        step: step.cloned(),
+        statement: requirement.statement.clone(),
+        outcome: RequirementOutcome::Inconclusive,
+        reason: reason.clone(),
+        actual: None,
+        citations: Vec::new(),
+        detail: None,
+        check: requirement.check.clone(),
+        provenance: None,
+    };
+    VerificationOutcome {
+        verdict: VerificationVerdict::Inconclusive,
+        requirements: spec
+            .steps
+            .iter()
+            .flat_map(|step| {
+                step.requirements
+                    .iter()
+                    .map(|req| requirement(Some(&step.id), req))
+            })
+            .chain(spec.requirements.iter().map(|req| requirement(None, req)))
+            .collect(),
+        steps: spec
+            .steps
+            .iter()
+            .map(|step| StepResult {
+                id: step.id.clone(),
+                status: StepStatus::Skipped,
+                output: None,
+                attempts: 0,
+                duration_ms: 0,
+                reason: Some(reason.clone()),
+                provenance: None,
+                tool_calls: Vec::new(),
+            })
+            .collect(),
+        evidence: BTreeMap::new(),
+    }
 }
 
 /// The feature counts of the outcome's one drift requirement, frozen beside
@@ -157,5 +234,37 @@ mod tests {
         );
         outcome.requirements.push(requirement("c", Some(drift())));
         assert_eq!(drift_counts(&outcome), None);
+    }
+
+    /// A source over the ceiling judges nothing: every requirement is
+    /// inconclusive and every step skipped with a reason naming the source
+    /// and ceiling, which the summary carries too.
+    ///
+    /// # Panics
+    /// Panics when the outcome judges anything or the reason is not exposed.
+    #[test]
+    fn source_ceiling_is_inconclusive_and_named() {
+        let spec: VerifierSpec = serde_json::from_value(serde_json::json!({
+            "inputs": { "frames": "verifiers.frame.requirements.safe.outcome" },
+            "requirements": [{
+                "id": "all_safe", "statement": "every frame is safe",
+                "check": { "kind": "assert", "path": "inputs.frames[*]",
+                           "operator": "equals", "expected": "passed" }
+            }]
+        }))
+        .expect("group verifier decodes");
+        let reference: SourceText = serde_json::from_value(serde_json::json!(
+            "verifiers.frame.requirements.safe.outcome"
+        ))
+        .expect("source decodes");
+        let outcome = source_limit_exceeded(&spec, &reference, 20);
+        assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
+        let reason = "source_execution_limit_exceeded: verifiers.frame.requirements.safe.outcome \
+                      selected more than 20 source executions";
+        assert!(outcome.requirements.iter().all(|requirement| {
+            requirement.outcome == RequirementOutcome::Inconclusive && requirement.reason == reason
+        }));
+        assert_eq!(outcome.requirements.len(), 1);
+        assert!(summary(&outcome).ends_with(reason));
     }
 }

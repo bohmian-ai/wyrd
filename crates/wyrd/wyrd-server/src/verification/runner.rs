@@ -373,7 +373,9 @@ impl VerifierRunner {
     ///
     /// A scheduled window first scores every drift requirement as the
     /// tenant's SYSTEM read authority, then runs with no pinned evidence; a
-    /// submission runs over its pinned inputs and route overrides. The engine
+    /// submission runs over its pinned inputs and route overrides; a group
+    /// snapshot runs over its pinned source lists, unless a source exceeded
+    /// the read ceiling, which completes inconclusive without running. The engine
     /// executes as the authority accepted with the execution, executed by
     /// `system`, with model calls attributed to the verified Card and the
     /// submission's application Run. Under `test-support` a scripted outcome,
@@ -415,6 +417,23 @@ impl VerifierRunner {
                 route_overrides,
                 run_id.clone(),
             ),
+            ExecutionInput::Grouped { inputs, coverage } => {
+                if let Some((reference, ceiling)) = coverage.sources.values().find_map(|source| {
+                    source
+                        .exceeded_ceiling
+                        .map(|ceiling| (&source.reference, ceiling))
+                }) {
+                    return EngineOutcome::Completed(engines::source_limit_exceeded(
+                        spec, reference, ceiling,
+                    ));
+                }
+                (
+                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    inputs,
+                    &no_routes,
+                    None,
+                )
+            }
         };
         let caller = Caller::accepted(&run.authority, system);
         let accepted_at = Utc::now()
@@ -794,6 +813,7 @@ fn result(
     let (run_id, window) = match &run.input {
         ExecutionInput::Scheduled { window, .. } => (None, Some(window)),
         ExecutionInput::Submitted { run_id, .. } => (run_id.as_ref(), None),
+        ExecutionInput::Grouped { .. } => (None, None),
     };
     let built = ResultPayloadBuilder::new(
         ResultRun {

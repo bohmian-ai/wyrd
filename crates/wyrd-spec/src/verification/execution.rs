@@ -16,7 +16,7 @@ use serde_json::Value;
 use skald_spec::MediaFormat;
 
 use super::{
-    DriftReport, DriftWindow, OperatorDispatchState, VerificationError,
+    DriftReport, DriftWindow, GroupCoverage, OperatorDispatchState, VerificationError,
     VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
@@ -165,11 +165,21 @@ pub struct VerificationExecutionState {
     /// The result once completed and visible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<VerificationResult>,
-    /// Every Operator dispatch of a failed background binding execution, in
-    /// identity order; empty otherwise. Delivery completes independently of
-    /// the execution and never changes its verdict.
+    /// Every Operator dispatch of a failed background binding execution or a
+    /// changed group verdict, in identity order; empty otherwise. Delivery
+    /// completes independently of the execution and never changes its verdict.
     #[serde(default)]
     pub dispatches: Vec<OperatorDispatchState>,
+    /// Caller group the execution belongs to, or the group a group execution
+    /// judges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<GroupId>,
+    /// Binding owner of a background execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_card_uid: Option<CardUid>,
+    /// The source snapshot a group execution judges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupCoverage>,
 }
 
 /// The attributable result of one Verifier execution.

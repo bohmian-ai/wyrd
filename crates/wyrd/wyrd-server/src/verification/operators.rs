@@ -1092,6 +1092,7 @@ mod tests {
                 drifted_features: 3,
                 total_features: 10,
             }),
+            group: None,
         }
     }
 

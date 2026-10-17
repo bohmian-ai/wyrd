@@ -19,12 +19,12 @@ package carries the Change Request review workspace behind CR-01.
 | Sheet | Pages | Artboards | Viewport |
 |---|---|---|---|
 | [`home.svg`](./home.svg) | 2 | 4 | 1440 × 1024 |
-| [`cards.svg`](./cards.svg) | 14 | 28 | 1440 × 1024 |
-| [`observe.svg`](./observe.svg) | 10 | 20 | 1440 × 1024 |
+| [`cards.svg`](./cards.svg) | 13 | 26 | 1440 × 1024 |
+| [`observe.svg`](./observe.svg) | 8 | 16 | 1440 × 1024 |
 | [`changes.svg`](./changes.svg) | 7 | 14 | 1440 × 1024 |
 | [`query.svg`](./query.svg) | 1 | 2 | 1440 × 1024 |
-| [`mobile.svg`](./mobile.svg) | 9 | 18 | 390 × 844 |
-| *existing product set* | *43* | *86* | |
+| [`mobile.svg`](./mobile.svg) | 8 | 16 | 390 × 844 |
+| *existing product set* | *39* | *78* | |
 | [`cards/experiment/overview.svg`](./cards/experiment/overview.svg) | 2 | 4 | 1440 × 1024 |
 | [`cards/experiment/runs.svg`](./cards/experiment/runs.svg) | 5 | 10 | 1440 × 1024 |
 | [`cards/experiment/compare.svg`](./cards/experiment/compare.svg) | 1 | 2 | 1440 × 1024 |
@@ -46,7 +46,7 @@ package carries the Change Request review workspace behind CR-01.
 | [`changes/subjects.svg`](./changes/subjects.svg) | 1 | 2 | 1440 × 1024 |
 | [`changes/mobile.svg`](./changes/mobile.svg) | 3 | 6 | 390 × 844 |
 | *Change Request workspace package* | *10* | *20* | |
-| **complete set** | **83** | **166** | |
+| **complete set** | **79** | **158** | |
 
 Every artboard is a group whose id is `<PAGE-ID>-<theme>` (for example
 `C-04-dark`), carries a `<title>`/`<desc>` pair, and is labeled in the dashed
@@ -55,7 +55,7 @@ annotation strip below it. The sheets carry no image, script or
 Grotesk, JetBrains Mono, Fraunces), so an offline viewer falls back to system
 faces but keeps identical layout.
 
-The three `golden-*.svg` files are the Gate A reference screens (CR-04, O-09,
+The two `golden-*.svg` files are the Gate A reference screens (CR-04 and
 O-04) approved before the grammar was applied to the full set; the same pages
 also appear inside their sheets. Keep the goldens unchanged as the approval
 record.
@@ -65,7 +65,7 @@ principals, signals, a single Change Request `change_01`, and one query session.
 
 ## Artboard ledger
 
-All 83 pages, in sheet order — the 43 general product pages first, then the
+All 79 pages, in sheet order — the 39 general product pages first, then the
 21-page detailed Experiment workspace package, then the 9-page detailed
 Service workspace package, then the 10-page Change Request review workspace
 package.
@@ -89,7 +89,7 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
 - **Material states**: ordinary single-tenant shell (static tenant in topbar); authorized tenant-switcher variant and attention empty state described in the annotation strip
-- **Links**: New Change Request → /t/acme/changes/new; Card lookup → /t/acme/cards; attention row → /t/acme/changes/change_01; Cards summary → /t/acme/cards; Observe summary → /t/acme/observe; Changes summary → /t/acme/changes; recent work → trace/verification/query routes
+- **Links**: New Change Request → /t/acme/changes/new; Card lookup → /t/acme/cards; attention row → /t/acme/changes/change_01; Cards summary → /t/acme/cards; Observe summary → /t/acme/observe; Changes summary → /t/acme/changes; recent work → Change Verification, trace, drift and query routes
 - **Responsive pattern**: R-HOME
 
 ### `cards.svg`
@@ -131,7 +131,7 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
 - **Material states**: populated task/interface, signature, artifacts, deployment relationships and linked verification; earned absent optional section — no Prompt relationship — noted in the rail
-- **Links**: trained_on/produced_by/deployed_by → /t/acme/cards/{uid}; Verifier link → /t/acme/observe/evaluations?verifierCard=card_verifier_03; Drift link → /t/acme/observe/drift
+- **Links**: trained_on/produced_by/deployed_by → /t/acme/cards/{uid}; Verifier link → /t/acme/cards/card_verifier_03; Drift link → /t/acme/observe/drift
 - **Responsive pattern**: R-CARD
 
 #### C-05 — Prompt Card
@@ -141,7 +141,7 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
 - **Material states**: ordered prompt definition dominant — system instructions separate from the conversation, explicit roles on every message, labeled text/image/tool-call content treatment (audio and file parts use the same treatment; unsupported provider parts stay discoverable in Raw definition); provider, model, operation, settings and structured response type; variables and media variables with type, required/default state and where each is used; Response schema (open) and Raw definition (closed) disclosures with copy affordance; no secrets and no execution or playground action
-- **Links**: used by → /t/acme/cards/card_agent_01; component of → /t/acme/cards/card_service_01; Verifier results → /t/acme/observe/evaluations?verifierCard=card_verifier_02; Response schema / Raw definition → ⧉ copy
+- **Links**: used by → /t/acme/cards/card_agent_01; component of → /t/acme/cards/card_service_01; Verifier → /t/acme/cards/card_verifier_02; Response schema / Raw definition → ⧉ copy
 - **Responsive pattern**: R-CARD
 
 #### C-06 — Experiment Card (workspace entry)
@@ -161,7 +161,7 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
 - **Material states**: registered Prompt as the primary linked dependency (name, version, provider/model, message and variable counts) with its raised read-only inspection drawer shown open — a CardRef reuse, never a copy; composition strip Prompt → Agent → runtime tools with component-of and publishes-to edges; run limits (max iterations, tool concurrency, recent sessions, timeout); tools remain Skald runtime registrations, never Card kinds; earned absent — no attached artifacts
-- **Links**: Inspect Prompt → the raised drawer; Open Prompt Card → /t/acme/cards/card_prompt_01; publishes to → /t/acme/cards/card_verifier_02; component of → /t/acme/cards/card_service_01; Traces/Evaluations → filtered /t/acme/observe routes with ?service=checkout-agent
+- **Links**: Inspect Prompt → the raised drawer; Open Prompt Card → /t/acme/cards/card_prompt_01; publishes to → /t/acme/cards/card_verifier_02; component of → /t/acme/cards/card_service_01; Traces → /t/acme/observe/traces?service=checkout-agent
 - **Responsive pattern**: R-CARD
 
 #### C-08 — Workflow Card
@@ -171,7 +171,7 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
 - **Material states**: populated ordered stages, inputs, outputs, owners and governance; earned absent optional section — no execution results are shown on a declaration
-- **Links**: referenced_by/consumes → /t/acme/cards/{uid}; Evaluations → /t/acme/observe/evaluations?verifierCard=card_verifier_02
+- **Links**: referenced_by/consumes → /t/acme/cards/{uid}; Verifier → /t/acme/cards/card_verifier_02
 - **Responsive pattern**: R-CARD
 
 #### C-09 — Service Card (operational Overview)
@@ -181,18 +181,8 @@ package.
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`, `checkout-api` v12, needs-attention
 - **Material states**: a signal-driven mini-dashboard in four layers — trends, not tiles or prose, are the evidence. (1) Compact assessment strip: ▲ NEEDS ATTENTION with one plain-language sentence (model-drift over threshold on ranker), the four state channels visibly separated and labeled (Card state ✓ ACTIVE registry lifecycle; deployment ● 6/6 explicit mock projection; operational ▲ server-projected; freshness ✓ 38s), and the v12 deploy named as correlation, never proven cause. (2) Dominant operating dashboard: six chart slots sharing the exact 1h range — req/s, error rate with the 0.50% budget as a positional line, latency with dash+marker-distinguished p50/p95/p99 and the p95 target line, availability against the 99.9% SLO, one saved custom chart (checkout decline rate), and a restrained + Add chart empty slot; every chart carries its latest value, unit, freshness and source. (3) Published intelligence from the v12 declaration's publication bindings: model-drift with the 30d PSI trend crossing the 0.20 threshold to 0.27 on subject ranker (model_primary · Model v12), baseline/sample/missingness and calculation freshness; checkout-agent-check with the pass-rate trend against ≥ 95% on subject checkout-agent (agent_triage · Agent v6). (4) One supporting context band: server-ordered attention naming the affected component, component chips, state-explaining activity, and inline scope-preserving investigations
-- **Links**: every chart → canonical Metrics/Traces with service+version+range preserved; drift/verification intelligence → /t/acme/observe/{drift,evaluations}; attention → its originating drift signal; inline investigate row → all five signals; subnav → `?view={overview,composition,definition}`; no Alerts route; detailed state pages: [`cards/service/`](./cards/service/)
+- **Links**: every chart → canonical Metrics/Traces with service+version+range preserved; drift intelligence → /t/acme/observe/drift; checkout-agent-check → /t/acme/cards/card_verifier_03; attention → its originating drift signal; inline investigate row → Logs, Metrics, Traces and Drift; subnav → `?view={overview,composition,definition}`; no Alerts route; detailed state pages: [`cards/service/`](./cards/service/)
 - **Responsive pattern**: R-CARD (realized by M-02/SM-01)
-
-#### C-10 — Verifier Card
-
-- **Route**: `/t/acme/cards/card_verifier_02`
-- **URL params**: none
-- **Viewport**: 1440 × 1024 (light + dark)
-- **Fixture**: tenant `acme`
-- **Material states**: definition inspection — dataset/source, workflow stages with dependencies, pass gate and six-task summary; groundedness selected with a raised task-definition drawer (kind, input selector, context path, operator, expected value, dependency condition, judge Agent, retry policy); selecting the workflow opens equivalent workflow-definition detail; no runtime scores or verdicts on the Card; earned absent — no subject_ref and no Verifier-owned schedule
-- **Links**: task row → the definition drawer; Open Workflow Card → /t/acme/cards/card_workflow_01; Results → /t/acme/observe/evaluations?verifierCard=card_verifier_02; runs/consumes/scheduled_by → /t/acme/cards/{uid}
-- **Responsive pattern**: R-CARD
 
 #### C-11 — Drift Card
 
@@ -242,8 +232,8 @@ package.
 - **URL params**: ?service=checkout-api&range=1h
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme`
-- **Material states**: normal summary across five signals; one no-data signal (Drift, with its own rail panel); tenant-wide Attention and Recent activity feeds labeled as such (the chips scope only the signal tiles and signal pages); inherited scope shown as chips and cleared scope described in the Scope rail
-- **Links**: signal summary → /t/acme/observe/{logs|metrics|traces|dashboards|evaluations|drift} preserving service and range; attention row → the same filtered signal route; View all ⨯ → /t/acme/observe
+- **Material states**: normal summary across four signal tiles (Logs, Metrics, Traces, Drift); one no-data signal (Drift, with its own rail panel); tenant-wide Attention and Recent activity feeds labeled as such (the chips scope only the signal tiles and signal pages); inherited scope shown as chips and cleared scope described in the Scope rail
+- **Links**: signal summary → /t/acme/observe/{logs|metrics|traces|dashboards|drift} preserving service and range; attention row → the same filtered signal route; View all ⨯ → /t/acme/observe
 - **Responsive pattern**: R-SIGNAL
 
 #### O-02 — Logs
@@ -305,26 +295,6 @@ package.
 - **Material states**: four successful panels (two charts, one table, one bar chart with labels), one no-data panel and one safe-error panel, all inside one read-only grid; no editor or save action
 - **Links**: Back → /t/acme/observe/dashboards; variables and range → the same route with the parameter changed; panel legends carry markers and dashes rather than colour alone
 - **Responsive pattern**: R-DETAIL
-
-#### O-08 — Verifier inventory
-
-- **Route**: `/t/acme/observe/evaluations`
-- **URL params**: ?service=checkout-agent&status=failed&range=24h
-- **Viewport**: 1440 × 1024 (light + dark)
-- **Fixture**: tenant `acme`
-- **Material states**: populated event list with a selected row; no-matches, loading and safe error occur at the table position (described in the annotation strip); filters direct-restore from the URL
-- **Links**: row → /t/acme/observe/evaluations/verification_record_01?service=checkout-agent; Verifier Card filter → the same route ?verifierCard=card_verifier_02; View all ⨯ → /t/acme/observe/evaluations
-- **Responsive pattern**: R-LIST
-
-#### O-09 — Verifier event
-
-- **Route**: `/t/acme/observe/evaluations/verification_record_01`
-- **URL params**: ?task=groundedness&service=checkout-agent
-- **Viewport**: 1440 × 1024 (light + dark)
-- **Fixture**: tenant `acme`
-- **Material states**: event page behind a 28% scrim under a 75% workflow drawer; stages completed/failed/running; task rows passed/failed/error/skipped; selected task dominant with score, threshold tick, judge explanation and authorized actual value; redaction note for unauthorized principals
-- **Links**: task row → same route ?task={name}; Verifier Card → /t/acme/cards/card_verifier_02; subject → /t/acme/cards/card_service_04; trace link → /t/acme/observe/traces/trace_01; Back to evaluations → the filtered inventory
-- **Responsive pattern**: R-VERIFY
 
 #### O-10 — Drift results
 
@@ -437,7 +407,7 @@ package.
 - **Route**: `/t/acme/cards/card_service_01`
 - **URL params**: `?view=overview&version=v12&range=1h`
 - **Viewport**: 390 × 844 (light + dark)
-- **Material states**: the complete C-09 mini-dashboard stacked with nothing dropped — assessment strip (▲ NEEDS ATTENTION, latest change as correlation), four labeled state channels, six metric trend rows each carrying a sparkline trend, latest value, freshness and a canonical link (four standard + saved custom + Add chart), drift/verification intelligence with score trends and identified subjects, attention naming the affected component (ranker · model_primary · Model v12), component chips, state-explaining activity and all five scope-preserving investigations
+- **Material states**: the complete C-09 mini-dashboard stacked with nothing dropped — assessment strip (▲ NEEDS ATTENTION, latest change as correlation), four labeled state channels, six metric trend rows each carrying a sparkline trend, latest value, freshness and a canonical link (four standard + saved custom + Add chart), drift/verification intelligence with score trends and identified subjects, attention naming the affected component (ranker · model_primary · Model v12), component chips, state-explaining activity and the four scope-preserving investigations (Logs, Metrics, Traces, Drift)
 - **Links**: nav chips → `?view={overview,composition,definition}`; every trend row → its canonical Observe destination with service+version+range preserved; attention → originating drift signal; detailed narrow charts: SM-01 in [`cards/service/`](./cards/service/)
 - **Responsive pattern**: R-SVC realizes C-09
 
@@ -470,16 +440,6 @@ package.
 - **Material states**: selected error span; missing optional AI content stated explicitly; preserved back search context; header and filters kept; the waterfall scrolls while the graph and span tabs stack
 - **Links**: Back to Traces → /t/acme/observe/traces?service=checkout-api&range=1h; card → /t/acme/cards/card_service_01; span row → the same route with that span selected
 - **Responsive pattern**: R-DETAIL
-
-#### M-06 — Verifier detail (mobile)
-
-- **Route**: `/t/acme/observe/evaluations/verification_record_01?task=groundedness`
-- **URL params**: ?task=groundedness
-- **Viewport**: 390 × 844 (light + dark)
-- **Fixture**: tenant `acme`
-- **Material states**: Workflow and Task presented as two views of one event; passed, failed, error and skipped task rows; the selected task preserved in the URL; unauthorized actual-value redaction; correlation and technical detail stacked after the summary
-- **Links**: Task/Workflow view → same route ?view={workflow|task}; task row → same route ?task={name}; trace → /t/acme/observe/traces/trace_01; card → /t/acme/cards/card_verifier_02
-- **Responsive pattern**: R-VERIFY
 
 #### M-07 — Drift (mobile)
 
@@ -756,8 +716,8 @@ what the exact declaration and runtime wiring define.
 #### SM-01 — Service Overview at narrow width, detailed (`mobile.svg`)
 
 - **URL params**: `?view=overview&version=v12&range=1h`
-- **Material states**: the detailed narrow dashboard — the four standard charts render full-width with axes, positional budget/SLO/target markers and dash+marker-distinguished p50/p95/p99, all sharing the exact 1h range; drift/verification intelligence keeps score trends, subjects and calculation freshness; attention (with the affected component), component chips, activity and the five investigations stack below — scrolling, never dropping
-- **Links**: identical to M-02 — chart rows and intelligence link to canonical Metrics/Traces/Drift/Evaluations with scope preserved
+- **Material states**: the detailed narrow dashboard — the four standard charts render full-width with axes, positional budget/SLO/target markers and dash+marker-distinguished p50/p95/p99, all sharing the exact 1h range; drift/verification intelligence keeps score trends, subjects and calculation freshness; attention (with the affected component), component chips, activity and the four investigations stack below — scrolling, never dropping
+- **Links**: identical to M-02 — chart rows and intelligence link to canonical Metrics/Traces/Drift and the checkout-agent-check Verifier Card (/t/acme/cards/card_verifier_03) with scope preserved
 
 #### SM-02 — Service Composition at narrow width (`mobile.svg`)
 
@@ -878,17 +838,16 @@ Locked interaction rules the package demonstrates:
 
 ## Responsive pattern matrix
 
-Every one of the 66 desktop pages is assigned exactly one pattern.
+Every one of the 63 desktop pages is assigned exactly one pattern.
 
 | Pattern | Narrow behavior | Desktop pages |
 |---|---|---|
 | R-ENTRY | Centered identity/choice, no tenant shell | H-01 |
 | R-HOME | Mobile header/menu; summaries stack | H-02 |
-| R-LIST | Accessible filters; labeled rows or controlled table overflow | C-01, O-06, O-08, CR-01, CRW-01 |
-| R-CARD | Primary Card first; metadata/relationships stack | C-02, C-03, C-04, C-05, C-06, C-07, C-08, C-09, C-10, C-11, C-12, C-13, C-14 |
+| R-LIST | Accessible filters; labeled rows or controlled table overflow | C-01, O-06, CR-01, CRW-01 |
+| R-CARD | Primary Card first; metadata/relationships stack | C-02, C-03, C-04, C-05, C-06, C-07, C-08, C-09, C-11, C-12, C-13, C-14 |
 | R-SIGNAL | Visible time/filters; trend then records then detail | O-01, O-02, O-03, O-04 |
 | R-DETAIL | Identity/filters first; dense visual scrolls; rail stacks | O-05, O-07 |
-| R-VERIFY | Workflow/Task are views of the same event | O-09 |
 | R-DRIFT | Definition/results stack without merging | O-10 |
 | R-FORM | One scrolling form; safe actions remain reachable | CR-02, CRW-02 |
 | R-CHANGE | Plain summary first; technical sections stack | CR-03, CR-04, CR-05, CR-06, CRW-03, CRW-04, CRW-05, CRW-06 |
@@ -906,7 +865,6 @@ Mobile artboards realize these patterns at 390 × 844:
 | M-03 | R-FORM | CR-02 |
 | M-04 | R-CHANGE | CR-05 |
 | M-05 | R-DETAIL | O-05 |
-| M-06 | R-VERIFY | O-09 |
 | M-07 | R-DRIFT | O-10 |
 | M-08 | R-QUERY | Q-01 |
 | M-09 | R-CARD (full-width contextual sheet) | C-07 Prompt inspection |
@@ -943,20 +901,17 @@ Where each required state is demonstrated.
 | C-07 | registered Prompt as the primary linked dependency (name, version, provider/model, message and variable counts) with its raised read-only inspection drawer shown open — a CardRef reuse, never a copy; composition strip Prompt → Agent → runtime tools with component-of and publishes-to edges; run limits (max iterations, tool concurrency, recent sessions, timeout); tools remain Skald runtime registrations, never Card kinds; earned absent — no attached artifacts |
 | C-08 | populated ordered stages, inputs, outputs, owners and governance; earned absent optional section — no execution results are shown on a declaration |
 | C-09 | needs-attention operational mini-dashboard — compact assessment strip (four separated state channels, latest change as correlation), dominant six-slot chart grid sharing the exact range (budget/SLO/target as positional lines, dash+marker-distinguished latency percentiles, saved custom chart + restrained Add-chart slot), drift/verification intelligence with score trends vs thresholds and identified subjects, and one supporting context band; healthy/stale/partial/failure/v11 renderings live on S-01/S-04/S-05/S-06/S-07 |
-| C-10 | definition inspection — dataset/source, workflow stages with dependencies, pass gate and six-task summary; groundedness selected with a raised task-definition drawer (kind, input selector, context path, operator, expected value, dependency condition, judge Agent, retry policy); selecting the workflow opens equivalent workflow-definition detail; no runtime scores or verdicts on the Card; earned absent — no subject_ref and no Verifier-owned schedule |
 | C-11 | Definition and Results visibly distinct — Definition (the Card): PSI method with quantile 10-bin profile, Distribution signal, feature `feature`, baseline txns-2026q3 (Data), fixed threshold 0.20, publisher checkout-api/ranker via model_primary, Trigger/Operator chain, no Drift-owned schedule; Results (Vala/Observe projection, never written to the Card): selected feature dominant, current PSI 0.27 breach, 30d series with the plotted 0.20 threshold and positional tick, baseline and sample/missingness context, last calculation, alert history, calculated-vs-raw distinction |
 | C-12 | populated versioned identity, purpose, capabilities, accepted normalized Evidence kinds, result capability, owner/governance and contextual runtime binding; earned absent optional section — no secrets and no closed input world |
 | C-13 | plain-language wiring sentence, exact schedule/source/filter/Operator configuration, flow strip, reachable publishing context and projected firing history separated from the declaration |
 | C-14 | one Workflow action with a human-readable input template and Raw JSON disclosure; execution budget; inbound chain; redacted credential reference; separated recent outcome; Notify/HTTP variants stated, not rendered |
-| O-01 | normal summary across five signals; one no-data signal (Drift, with its own rail panel); tenant-wide Attention and Recent activity feeds labeled as such (the chips scope only the signal tiles and signal pages); inherited scope shown as chips and cleared scope described in the Scope rail |
+| O-01 | normal summary across four signal tiles (Logs, Metrics, Traces, Drift); one no-data signal (Drift, with its own rail panel); tenant-wide Attention and Recent activity feeds labeled as such (the chips scope only the signal tiles and signal pages); inherited scope shown as chips and cleared scope described in the Scope rail |
 | O-02 | partial results (200 of 412 loaded) in the Records table; no-matches and safe search error occur at the records position (described in the annotation strip); selected log record expanded in the right rail |
 | O-03 | successful three-series chart with dash+marker per series and underlying values; loading, no-data-series and safe query error occur at the chart position (described in the annotation strip) |
 | O-04 | partial results (50 of 97 loaded); no-matches and safe search error occur at the table position (described in the annotation strip); selected trace highlighted in the table and detailed in the raised panel |
 | O-05 | selected span (ledger.capture) in the rail; error span highlighted in the waterfall and service graph; missing optional AI content shown as an explicit absent section; preserved back-search context in the Back panel |
 | O-06 | populated inventory with a selected row and preview; loading, empty and safe error occur at the table position (described in the annotation strip) |
 | O-07 | four successful panels (two charts, one table, one bar chart with labels), one no-data panel and one safe-error panel, all inside one read-only grid; no editor or save action |
-| O-08 | populated event list with a selected row; no-matches, loading and safe error occur at the table position (described in the annotation strip); filters direct-restore from the URL |
-| O-09 | event page behind a 28% scrim under a 75% workflow drawer; stages completed/failed/running; task rows passed/failed/error/skipped; selected task dominant with score, threshold tick, judge explanation and authorized actual value; redaction note for unauthorized principals |
 | O-10 | calculated report selected with overall verdict; per-feature pass and fail rows; threshold breach alert panel; + Filter affordance exposing the full subject/principal/Run/method/signal/verdict vocabulary; raw-observation distinction panel; the no-report-for-range alternate state described in the annotation strip |
 | CR-01 · CRW-01 | truthful Needs-attention subset (3 matching rows only, including the draft change_03) with server-projected reason badges, expected actors and per-row owner; separate lifecycle/verification/claims/repos/activity columns; no-match, unauthorized and WYRD_CHANGE_502 states all keep the view and search — the unfiltered list never appears; reason-vocabulary and search-scope contract panels |
 | CR-02 · CRW-02 | operable creation — PR-URL Resolve to exact commits, per-subject Edit/Remove/Repair with the inline error on acme/ranking, + Add subject/Claim/Verifier, Required and Manual/On-new-evidence selects, billable warning, editable owners, earned-absent Evidence, Save draft on an incomplete draft |
@@ -967,11 +922,10 @@ Where each required state is demonstrated.
 | CR-07 · CRW-07 | subject identity with exact commits and stacked relationship; file list with position and Prev/Next navigation; read-only diff with the resolved 118 anchor and the open revision-aware Start-discussion composer on 121; persistent Review changes; no edit, merge or Viewed tracking |
 | Q-01 | empty, running, succeeded, cancelled and failed execution in the Execution states panel; the failed sample carries the structured safe error WYRD-QUERY-COLUMN-UNKNOWN; the Safety panel states authorization, one-SELECT, timeout, function, row and byte ceilings; catalog → schema → table → column explorer with spans selected |
 | M-01 | populated inventory with count, kind, version, status, space and owner retained on every stacked row; removable filter chips that scroll sideways; the open Menu disclosure shown as a compact inset |
-| M-02 | the complete mini-dashboard stacked at 390 × 844 with nothing dropped — assessment strip with the latest change as correlation, four labeled state channels, six metric trend rows (latest value + freshness + link each), drift/verification intelligence with score trends and subjects, attention naming the affected component, component chips, activity and all five scoped investigations; SM-01 shows the same dashboard with full-width detailed charts; composition at this width lives on SM-02 |
+| M-02 | the complete mini-dashboard stacked at 390 × 844 with nothing dropped — assessment strip with the latest change as correlation, four labeled state channels, six metric trend rows (latest value + freshness + link each), drift/verification intelligence with score trends and subjects, attention naming the affected component, component chips, activity and the four scoped investigations; SM-01 shows the same dashboard with full-width detailed charts; composition at this width lives on SM-02 |
 | M-03 · CRWM-01 | stacked operable creation — fields, subject rows with inline error and Repair, add actions, collapsed-but-present Claims, billable warning, progress, sticky Save draft / Discard |
 | M-04 · CRWM-02 | mini shared header with separate state badges and next-action line; composer; open thread with reply and stale recovery; resolved thread with Reopen; full Submit review panel with all three decisions and the exact revision |
 | M-05 | selected error span; missing optional AI content stated explicitly; preserved back search context; header and filters kept; the waterfall scrolls while the graph and span tabs stack |
-| M-06 | Workflow and Task presented as two views of one event; passed, failed, error and skipped task rows; the selected task preserved in the URL; unauthorized actual-value redaction; correlation and technical detail stacked after the summary |
 | M-07 | all three filters visible as chips; the calculated report selected; feature pass and fail rows; a threshold-breach alert; a labeled no-report gap in the range; the calculated-report versus raw-observation distinction stated; dense rows scroll |
 | M-08 | catalog drawer placed above the editor and results; Run and Cancel retained; the succeeded execution state with time, rows and bytes; all three result tabs kept; two-axis result overflow contained inside the Results panel; the Menu carries navigation only, never page actions |
 | M-09 | the C-07 Prompt inspection as a full-width raised sheet with ✕ Close and ‹ Back; roles, content types, variables, provider/model and the direct Prompt link preserved; raw definition scrolls in its own region |
@@ -1109,7 +1063,7 @@ static design.
 
 ## Approved visual grammar (Gate A)
 
-Every artboard follows the grammar approved on the three golden screens:
+Every artboard follows the grammar approved on the golden screens:
 
 - **Shell** — full-height 212px sidebar (logo tile + `bohmian` wordmark) with
   five nav entries (Home, Cards, Observe, Changes, Query); topbar to its right

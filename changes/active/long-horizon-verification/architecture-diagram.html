@@ -1,0 +1,304 @@
+<title>Long-Horizon Verification Architecture</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; the diagram sits in its own horizontal scroller. */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --fg: #1c2330; --muted: #5b6577; --line: #c9cfd9;
+  --new: #0f766e; --new-tint: #e6f4f2; --harden: #a3530b; --harden-tint: #fbf0e3;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161d; --surface: #1a2029; --fg: #e3e7ee; --muted: #9aa4b5; --line: #3a4352;
+  --new: #4fd1c0; --new-tint: #13302d; --harden: #f0a65a; --harden-tint: #33261a; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12161d; --surface: #1a2029; --fg: #e3e7ee; --muted: #9aa4b5; --line: #3a4352;
+  --new: #4fd1c0; --new-tint: #13302d; --harden: #f0a65a; --harden-tint: #33261a; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+main { max-width: 1120px; margin: 0 auto; padding-inline: 16px; padding-block: 32px 64px; display: grid; gap: 40px; }
+h1, h2 { text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: 1.9rem; font-weight: 600; }
+h2 { font-size: 1.25rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.lede { color: var(--muted); margin-top: 8px; }
+section { display: grid; gap: 14px; min-width: 0; }
+code { font: 0.9em var(--mono); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 0.85rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.sw { width: 22px; height: 14px; border-radius: 3px; border: 1.5px solid var(--line); background: var(--surface); }
+.sw.new { border: 1.5px dashed var(--new); background: var(--new-tint); }
+.sw.harden { border: 1.5px solid var(--harden); background: var(--harden-tint); }
+
+.scroller { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+svg { display: block; min-width: 1060px; width: 100%; height: auto; }
+svg text { font-family: var(--sans); fill: var(--fg); font-size: 12.5px; }
+svg .t { font-weight: 600; font-size: 13px; }
+svg .s { fill: var(--muted); font-size: 11.5px; }
+svg .m { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+svg .col { font-size: 11px; letter-spacing: 0.08em; fill: var(--muted); font-weight: 600; }
+svg .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+svg .box.new { fill: var(--new-tint); stroke: var(--new); stroke-dasharray: 5 3; }
+svg .box.harden { fill: var(--harden-tint); stroke: var(--harden); }
+svg .tag-new { fill: var(--new); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
+svg .tag-h { fill: var(--harden); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
+svg .wire { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+svg .wire.new { stroke: var(--new); stroke-dasharray: 5 3; }
+svg .head { fill: var(--muted); }
+svg .head-new { fill: var(--new); }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+.tablewrap { overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+th { font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.pill { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.keep { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+.pill.new { background: var(--new-tint); color: var(--new); }
+.pill.harden { background: var(--harden-tint); color: var(--harden); }
+.compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.compare > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.compare h3 { margin: 0; font-size: 1rem; }
+.compare p { color: var(--muted); font-size: 0.92rem; }
+</style>
+
+<main>
+  <header>
+    <h1>Long-Horizon Verification Architecture</h1>
+    <p class="lede">The proposal from the wyrd-advise review, drawn over today's verification runtime. Everything outlined in grey already exists. The Verifier stays a pure function over a closed evidence bundle; the new parts sit around it.</p>
+  </header>
+
+  <section aria-labelledby="d">
+    <h2 id="d">Architecture</h2>
+    <div class="legend">
+      <span><i class="sw"></i>Exists today</span>
+      <span><i class="sw harden"></i>Exists, needs hardening</span>
+      <span><i class="sw new"></i>New</span>
+    </div>
+    <div class="scroller">
+      <svg viewBox="0 0 1100 560" role="img" aria-label="Evidence flows from any source into either an inline request bundle or a session, which seals into a closed evidence bundle. A direct call or a Trigger activates a binding, the execution passes admission, the queue and the engine, and results flow to Bifrost and Operators.">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="an" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head-new"/></marker>
+        </defs>
+
+        <text class="col" x="20" y="34">EVIDENCE SOURCES</text>
+        <text class="col" x="240" y="34">EVIDENCE ASSEMBLY</text>
+        <text class="col" x="460" y="34">ACTIVATION</text>
+        <text class="col" x="680" y="34">EXECUTION</text>
+        <text class="col" x="900" y="34">RESULTS</text>
+
+        <!-- Sources -->
+        <rect class="box" x="20" y="56" width="180" height="46" rx="6"/>
+        <text class="t" x="32" y="76">SDK / HTTP / MCP call</text>
+        <text class="s" x="32" y="93">Rust, Python, TypeScript</text>
+        <rect class="box" x="20" y="114" width="180" height="46" rx="6"/>
+        <text class="t" x="32" y="134">Media upload</text>
+        <text class="s" x="32" y="151">video, audio, documents</text>
+        <rect class="box" x="20" y="172" width="180" height="46" rx="6"/>
+        <text class="t" x="32" y="192">Trace adapter</text>
+        <text class="s" x="32" y="209">optional; data, not machinery</text>
+        <rect class="box" x="20" y="230" width="180" height="46" rx="6"/>
+        <text class="t" x="32" y="250">Bifrost selection</text>
+        <text class="s" x="32" y="267">copied in, never re-queried</text>
+        <rect class="box" x="20" y="288" width="180" height="46" rx="6"/>
+        <text class="t" x="32" y="308">Source Card</text>
+        <text class="s" x="32" y="325">external system</text>
+
+        <!-- source bus -->
+        <path class="wire" d="M200,79 H220 M200,137 H220 M200,195 H220 M200,253 H220 M200,311 H220 M220,79 V311"/>
+        <path class="wire" d="M220,96 H238" marker-end="url(#a)"/>
+        <path class="wire new" d="M220,236 H238" marker-end="url(#an)"/>
+        <path class="wire" d="M220,311 V402 H238" marker-end="url(#a)"/>
+
+        <!-- Assembly -->
+        <rect class="box" x="240" y="56" width="180" height="80" rx="6"/>
+        <text class="t" x="252" y="77">Evidence store</text>
+        <text class="m" x="252" y="95">/verification/evidence</text>
+        <text class="s" x="252" y="113">tenant-scoped, addressed</text>
+        <text class="s" x="252" y="128">by content digest</text>
+
+        <rect class="box new" x="240" y="164" width="180" height="186" rx="6"/>
+        <text class="tag-new" x="252" y="182">NEW</text>
+        <text class="t" x="252" y="200">Session</text>
+        <text class="s" x="252" y="218">keyed by your ID (order, chat)</text>
+        <text class="m" x="252" y="240">open → sealing → sealed</text>
+        <text class="s" x="252" y="262">first append opens it</text>
+        <text class="s" x="252" y="279">server assigns order</text>
+        <text class="s" x="252" y="296">closes: explicit, idle, max age</text>
+        <text class="s" x="252" y="313">late evidence → revision N+1</text>
+        <text class="s" x="252" y="336">Postgres: lifecycle + members</text>
+        <path class="wire new" d="M330,136 V162" marker-end="url(#an)"/>
+
+        <rect class="box" x="240" y="378" width="180" height="50" rx="6"/>
+        <text class="t" x="252" y="399">Inline request bundle</text>
+        <text class="s" x="252" y="416">today's one-shot evidence</text>
+
+        <!-- Bundle -->
+        <rect class="box" x="460" y="56" width="180" height="72" rx="6"/>
+        <text class="t" x="472" y="78">Closed evidence bundle</text>
+        <text class="s" x="472" y="96">what the Verifier reads</text>
+        <text class="s" x="472" y="113">immutable once sealed</text>
+        <path class="wire new" d="M420,200 H440 V100 H458" marker-end="url(#an)"/>
+        <path class="wire" d="M420,403 H446 V114 H458" marker-end="url(#a)"/>
+
+        <!-- Activation -->
+        <rect class="box" x="460" y="160" width="180" height="56" rx="6"/>
+        <text class="t" x="472" y="181">Direct call</text>
+        <text class="m" x="472" y="199">/execute · /enqueue</text>
+        <rect class="box" x="460" y="228" width="180" height="46" rx="6"/>
+        <text class="t" x="472" y="248">Trigger: schedule</text>
+        <text class="s" x="472" y="265">Window / Drift samples</text>
+        <rect class="box new" x="460" y="286" width="180" height="56" rx="6"/>
+        <text class="tag-new" x="472" y="303">NEW</text>
+        <text class="t" x="472" y="320">Trigger: session sealed</text>
+        <text class="s" x="472" y="335">or evidence appended</text>
+        <rect class="box new" x="460" y="370" width="180" height="58" rx="6"/>
+        <text class="tag-new" x="472" y="387">ADDS FIELD</text>
+        <text class="t" x="472" y="404">Binding</text>
+        <text class="s" x="472" y="420">+ activation scope</text>
+        <path class="wire new" d="M420,330 H458" marker-end="url(#an)"/>
+
+        <!-- activation bus to admission -->
+        <path class="wire" d="M640,92 H660 M640,188 H660 M640,251 H660 M640,314 H660 M640,399 H660 M660,92 V399"/>
+        <path class="wire" d="M660,92 H678" marker-end="url(#a)"/>
+
+        <!-- Execution -->
+        <rect class="box new" x="680" y="56" width="180" height="72" rx="6"/>
+        <text class="tag-new" x="692" y="74">NEW</text>
+        <text class="t" x="692" y="92">Admission</text>
+        <text class="s" x="692" y="109">per-tenant quotas, bounded</text>
+        <text class="s" x="692" y="124">bytes; retryable refusal</text>
+        <rect class="box harden" x="680" y="150" width="180" height="72" rx="6"/>
+        <text class="tag-h" x="692" y="168">HARDEN</text>
+        <text class="t" x="692" y="186">Execution queue</text>
+        <text class="s" x="692" y="203">Postgres claims, leases,</text>
+        <text class="s" x="692" y="218">fenced settlement</text>
+        <rect class="box" x="680" y="244" width="180" height="62" rx="6"/>
+        <text class="t" x="692" y="266">Runner + vala-verify</text>
+        <text class="s" x="692" y="284">same acyclic step graph,</text>
+        <text class="s" x="692" y="299">same checks and decision</text>
+        <rect class="box new" x="680" y="328" width="180" height="100" rx="6"/>
+        <text class="tag-new" x="692" y="346">NEW</text>
+        <text class="t" x="692" y="364">Engine extensions</text>
+        <text class="s" x="692" y="382">step checkpoints</text>
+        <text class="s" x="692" y="398"><tspan class="m">each</tspan> fan-out, bounded</text>
+        <text class="s" x="692" y="414">budgets + coverage aggregates</text>
+        <path class="wire" d="M770,128 V148" marker-end="url(#a)"/>
+        <path class="wire" d="M770,222 V242" marker-end="url(#a)"/>
+        <path class="wire new" d="M770,306 V326" marker-end="url(#an)"/>
+
+        <!-- Results -->
+        <rect class="box harden" x="900" y="150" width="180" height="72" rx="6"/>
+        <text class="tag-h" x="912" y="168">HARDEN</text>
+        <text class="t" x="912" y="186">Stored result</text>
+        <text class="s" x="912" y="203">durable before done;</text>
+        <text class="s" x="912" y="218">older revisions marked replaced</text>
+        <rect class="box" x="900" y="244" width="180" height="62" rx="6"/>
+        <text class="t" x="912" y="266">ScribeOutbox → Bifrost</text>
+        <text class="s" x="912" y="284">verdicts and evidence</text>
+        <text class="s" x="912" y="299">for query and drift</text>
+        <rect class="box" x="900" y="328" width="180" height="46" rx="6"/>
+        <text class="t" x="912" y="348">Operators</text>
+        <text class="s" x="912" y="365">react to verdict changes</text>
+        <path class="wire" d="M860,275 H880 V186 H898" marker-end="url(#a)"/>
+        <path class="wire" d="M990,222 V242" marker-end="url(#a)"/>
+        <path class="wire" d="M990,306 V326" marker-end="url(#a)"/>
+
+        <!-- footer note -->
+        <text class="s" x="20" y="476">Today's path: inline bundle → direct call or schedule → queue → engine → results. Every box on it is grey, so it keeps working unchanged.</text>
+        <text class="s" x="20" y="496">New paths only add a way to assemble the bundle over time (Session), a way to start on it (session Trigger), and ways to run heavy graphs safely (admission, checkpoints, fan-out).</text>
+        <text class="s" x="20" y="516">A session does not depend on tracing. Traces are one optional producer feeding the same append call as the SDK or HTTP.</text>
+      </svg>
+    </div>
+  </section>
+
+
+  <section aria-labelledby="rev">
+    <h2 id="rev">Late evidence: session revisions</h2>
+    <p>A sealed revision and its verdict never change. Evidence that arrives after sealing opens the next revision of the same session key. That revision holds everything before it plus the new items, so the Verifier always judges the whole conversation.</p>
+    <div class="scroller">
+      <svg viewBox="0 0 1100 250" role="img" aria-label="Session order-123: revision 1 sealed and verified as passed. Three days later return and refund events open revision 2, which reuses revision 1 by reference, seals after an idle timeout, and is verified as failed, replacing revision 1's verdict. After the finality window late evidence is refused.">
+        <text class="col" x="20" y="28">SESSION order-123</text>
+        <path class="wire" d="M20,120 H1080" />
+        <text class="m" x="20" y="150">day 0</text><text class="m" x="520" y="150">day 3</text><text class="m" x="940" y="150">day 90</text>
+
+        <rect class="box" x="20" y="50" width="300" height="50" rx="6"/>
+        <text class="t" x="32" y="70">Revision 1 · open → sealed</text>
+        <text class="s" x="32" y="88">chat agent, human handoff, order system</text>
+        <rect class="box" x="340" y="50" width="150" height="50" rx="6"/>
+        <text class="t" x="352" y="70">Verified: passed</text>
+        <text class="s" x="352" y="88">later marked replaced</text>
+        <path class="wire" d="M320,75 H338" marker-end="url(#a)"/>
+
+        <rect class="box new" x="520" y="50" width="290" height="50" rx="6"/>
+        <text class="t" x="532" y="70">Revision 2 = revision 1 + new items</text>
+        <text class="s" x="532" y="88">return, refund events · idle timeout seals</text>
+        <rect class="box new" x="830" y="50" width="160" height="50" rx="6"/>
+        <text class="t" x="842" y="70">Verified: failed</text>
+        <text class="s" x="842" y="88">Operators react to the flip</text>
+        <path class="wire new" d="M810,75 H828" marker-end="url(#an)"/>
+        <path class="wire new" d="M170,100 C170,180 660,180 660,102" marker-end="url(#an)"/>
+        <text class="s" x="330" y="196">parent pointer: reused by reference, not copied</text>
+
+        <rect class="box harden" x="940" y="170" width="140" height="56" rx="6"/>
+        <text class="t" x="952" y="190">Finalized</text>
+        <text class="s" x="952" y="207">late evidence refused</text>
+        <text class="s" x="20" y="236">A burst of late events produces one revision. A queued verification of an older revision is dropped; a running one finishes and is marked replaced.</text>
+      </svg>
+    </div>
+  </section>
+
+  <section aria-labelledby="rr">
+    <h2 id="rr">What “runtime resource” means</h2>
+    <div class="compare">
+      <div>
+        <h3>Card</h3>
+        <p>Declarative and versioned. You author it and register it: a Verifier, a Trigger, an Agent. It describes what should happen and never changes once a version is registered.</p>
+      </div>
+      <div>
+        <h3>Runtime resource</h3>
+        <p>Created by the server while work happens. It has an ID, a lifecycle and state, but nobody authors or versions it. A Verifier execution at <code>/verification/executions/{id}</code> is one today.</p>
+      </div>
+      <div>
+        <h3>Session</h3>
+        <p>The same kind of thing as an execution. It is an evidence bundle that stays open, keyed by an ID the caller already has (an order or conversation ID), so any producer can append without coordinating, and seals into exactly the bundle a Verifier already accepts. It is not a new Card kind.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="c">
+    <h2 id="c">Today's paths keep working</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Current behaviour</th><th>Under the proposal</th><th>Change</th></tr></thead>
+        <tbody>
+          <tr><td>One request carries the whole bundle (<code>/execute</code>, <code>/enqueue</code>)</td><td>Same. An inline bundle is a session that is sealed the moment it arrives.</td><td><span class="pill keep">None</span></td></tr>
+          <tr><td>Media uploaded by digest, referenced from a slot</td><td>Same store. Sessions reference these uploads instead of copying them.</td><td><span class="pill keep">None</span></td></tr>
+          <tr><td>Schedule Trigger with Window samples and Drift checks</td><td>Unchanged. Comparing across sessions stays here.</td><td><span class="pill keep">None</span></td></tr>
+          <tr><td>Step graph, checks, decision rule, retries, timeouts</td><td>Unchanged. <code>each</code>, budgets and coverage aggregates are optional fields.</td><td><span class="pill new">Additive</span></td></tr>
+          <tr><td>Postgres claims, leases and fenced settlement</td><td>Same queue. It gains a cap on executions in flight and step checkpoints.</td><td><span class="pill harden">Harden</span></td></tr>
+          <tr><td><code>202</code> means staged in memory; done can come before results are stored</td><td><code>202</code> means stored; done means the result is stored.</td><td><span class="pill harden">Harden</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="x">
+    <h2 id="x">Is each new piece earned?</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Piece</th><th>Needed when</th><th>Can skip if</th></tr></thead>
+        <tbody>
+          <tr><td>Admission and stored acceptance</td><td>Always. At hundreds of requests per second, unbounded memory queues fail first.</td><td>Never; this fixes today's runtime.</td></tr>
+          <tr><td>Step checkpoints</td><td>A step is expensive enough that redoing it after a crash hurts (extraction, video).</td><td>Every Verifier is cheap and finishes in seconds.</td></tr>
+          <tr><td>Session</td><td>Several producers write to the same session: chat agent, human handoff, order, payment and CRM systems. Common in retail commerce.</td><td><span class="pill new">Earned</span></td></tr>
+          <tr><td>Session Trigger</td><td>Verification must start when the conversation ends without the caller asking.</td><td>The caller always seals and submits explicitly.</td></tr>
+          <tr><td><code>each</code> fan-out + coverage aggregates</td><td>Hundreds of segments or turns are judged one by one with bounded concurrency.</td><td>A single Code step can loop internally and the work is small.</td></tr>
+          <tr><td>Session revisions + finality</td><td>Late evidence (returns, refunds, chargebacks) must change the verdict without rewriting history.</td><td><span class="pill new">Earned</span></td></tr>
+          <tr><td>Human checks</td><td>A person's judgment is part of the verdict.</td><td>Defer until real demand appears.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>

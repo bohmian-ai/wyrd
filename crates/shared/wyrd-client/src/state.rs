@@ -1038,9 +1038,10 @@ impl WyrdState {
 
     /// Resolve an alias to the pure Verifier spec borrowed from its envelope.
     ///
-    /// The caller matches on `implementation` to reach the Drift or check
-    /// payload; there is no separate per-implementation accessor because
-    /// `Verifier` is the only registrable verification kind.
+    /// Returns the declarative building blocks directly: `inputs`, `steps`,
+    /// `requirements`, `decide`, and `context_capture`. Drift and Agent
+    /// judging are requirement check kinds inside those blocks, so one
+    /// accessor covers every Verifier and no per-check accessor exists.
     ///
     /// # Arguments
     /// * `alias` - The bundle alias of a Verifier Card.

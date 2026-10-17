@@ -20,6 +20,19 @@ pub fn extract_jsonpath_from(value: &Value, path: &JsonPath) -> Result<Value, Ex
     Ok(values_to_value(values))
 }
 
+/// Compile `path` with the workspace JSONPath dependency and collect every
+/// match against `value`, in document order.
+///
+/// This is the fallible half of [`extract_jsonpath_from`]: it owns the only
+/// conversion from the upstream error type into [`ExecError`]. Borrowed slice
+/// matches are cloned, computed matches are taken as-is, and the upstream
+/// no-value marker is skipped, so an unmatched path yields an empty vector
+/// rather than an error.
+///
+/// # Errors
+/// Returns [`ExecError::JsonPathFailure`] carrying the authored path and the
+/// upstream message when the expression fails to compile. Matching itself
+/// does not fail.
 fn extract_jsonpath_values(value: &Value, path: &JsonPath) -> Result<Vec<Value>, ExecError> {
     let query = jsonpath_rust::JsonPath::<Value>::try_from(path.as_str()).map_err(|error| {
         ExecError::JsonPathFailure {
@@ -40,6 +53,12 @@ fn extract_jsonpath_values(value: &Value, path: &JsonPath) -> Result<Vec<Value>,
     Ok(values)
 }
 
+/// Normalize the collected JSONPath matches into one evidence value.
+///
+/// Zero matches become `null`, so a missing field is evidence for the
+/// requirement operator to judge instead of an execution failure. Exactly one
+/// match is returned unwrapped as that value, and two or more matches are
+/// returned as a JSON array in match order. Infallible and IO-free.
 fn values_to_value(values: Vec<Value>) -> Value {
     match values.as_slice() {
         [] => Value::Null,
@@ -48,18 +67,31 @@ fn values_to_value(values: Vec<Value>) -> Value {
     }
 }
 
+/// Unit tests for the JSONPath extraction owner: scalar, multi-match, missing
+/// path normalization, and the typed failure for an expression the upstream
+/// library rejects.
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
 
-    /// A static JSONPath.
+    /// Build a [`JsonPath`] from a static test expression.
+    ///
+    /// Only Wyrd's authoring-time validation runs here; the upstream library
+    /// may still reject the expression at extraction time.
+    ///
+    /// # Panics
+    /// Panics when `expr` fails Wyrd [`JsonPath`] validation, which means the
+    /// test literal itself is wrong.
     fn path(expr: &str) -> JsonPath {
         JsonPath::new(expr).expect("static test paths are valid")
     }
 
-    /// A scalar path resolves to the value itself.
+    /// A scalar path resolves to the value itself, not a one-element array.
+    ///
+    /// # Panics
+    /// Panics when extraction fails or the extracted value is not `"hello"`.
     #[test]
     fn extracts_scalar() {
         let extracted = extract_jsonpath_from(&json!({"response": "hello"}), &path("$.response"))
@@ -67,7 +99,10 @@ mod tests {
         assert_eq!(extracted, json!("hello"));
     }
 
-    /// A wildcard path resolves to every match as one array.
+    /// A wildcard path resolves to every match as one array in match order.
+    ///
+    /// # Panics
+    /// Panics when extraction fails or the array differs from the two names.
     #[test]
     fn extracts_nested_array() {
         let value = json!({"tool_calls": [{"name": "search"}, {"name": "summarise"}]});
@@ -77,6 +112,9 @@ mod tests {
     }
 
     /// A path with no match resolves to null rather than failing.
+    ///
+    /// # Panics
+    /// Panics when extraction returns an error or a non-null value.
     #[test]
     fn missing_path_returns_null_not_error() {
         let extracted = extract_jsonpath_from(&json!({"response": "hello"}), &path("$.never"))
@@ -86,6 +124,10 @@ mod tests {
 
     /// A path that compiles at authoring time but fails at runtime surfaces the
     /// typed error naming the path.
+    ///
+    /// # Panics
+    /// Panics when extraction succeeds or returns anything other than
+    /// [`ExecError::JsonPathFailure`] carrying the authored path.
     #[test]
     fn invalid_runtime_path_surfaces_typed_error() {
         let bad = path("$.a[?(@.missing>)]");

@@ -242,11 +242,23 @@ fn self_loops_to(adj: &HashMap<&TaskId, Vec<&TaskId>>, vertex: &TaskId) -> bool 
     adj.get(vertex).is_some_and(|edges| edges.contains(&vertex))
 }
 
+/// Unit tests for [`plan_stages`] over string-named graphs: staged ordering
+/// for chains, diamonds and disconnected roots, and each [`DagError`]
+/// refusal with its deterministic payload.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Plans `nodes`, each named with the ids it depends on.
+    ///
+    /// Converts every literal into a [`TaskId`] and passes the owned graph
+    /// to [`plan_stages`] unchanged, so each test reads as an adjacency list.
+    ///
+    /// # Errors
+    /// Returns whatever [`DagError`] [`plan_stages`] reports for the graph.
+    ///
+    /// # Panics
+    /// Panics when a node or dependency literal fails [`TaskId`] validation.
     fn plan(nodes: &[(&str, &[&str])]) -> Result<ExecutionPlan, DagError> {
         let id = |value: &str| TaskId::new(value).expect("static task id is valid");
         let nodes: Vec<(TaskId, Vec<TaskId>)> = nodes
@@ -263,6 +275,10 @@ mod tests {
 
     /// A three-node cycle yields a closed witness starting and ending at the
     /// smallest id.
+    ///
+    /// # Panics
+    /// Panics unless planning fails with [`DagError::Cycle`] whose witness
+    /// starts and ends at `a` and covers three edges.
     #[test]
     fn triangle_cycle_returns_witness() {
         match plan(&[("a", &["c"]), ("b", &["a"]), ("c", &["b"])]) {
@@ -277,6 +293,10 @@ mod tests {
     }
 
     /// With two cycles, the witness is the smaller one.
+    ///
+    /// # Panics
+    /// Panics unless planning fails with [`DagError::Cycle`] whose witness
+    /// covers three edges rather than the five-edge cycle.
     #[test]
     fn smallest_cycle_witness_picks_3_over_5() {
         let nodes: [(&str, &[&str]); 8] = [
@@ -298,6 +318,10 @@ mod tests {
     }
 
     /// A chain plans one node per stage in dependency order.
+    ///
+    /// # Panics
+    /// Panics when planning fails, the task count is not three, or the
+    /// stages are not `[a]`, `[b]`, `[c]`.
     #[test]
     fn linear_three_stages() {
         let plan = plan(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]).expect("plans");
@@ -307,6 +331,10 @@ mod tests {
     }
 
     /// Independent middle nodes share one sorted stage.
+    ///
+    /// # Panics
+    /// Panics when planning fails, there are not three stages, or the middle
+    /// stage is not `[b, c]`.
     #[test]
     fn diamond_three_stages_parallel_middle() {
         let plan =
@@ -316,6 +344,9 @@ mod tests {
     }
 
     /// Disconnected roots share stage zero.
+    ///
+    /// # Panics
+    /// Panics when planning fails or the single stage is not `[a, b]`.
     #[test]
     fn disconnected_components_share_stage_zero() {
         let plan = plan(&[("a", &[]), ("b", &[])]).expect("plans");
@@ -324,6 +355,10 @@ mod tests {
     }
 
     /// A dependency on an absent node is refused with both ids.
+    ///
+    /// # Panics
+    /// Panics unless planning fails with [`DagError::MissingDependency`]
+    /// naming task `a` and dependency `ghost`.
     #[test]
     fn unknown_dependency_rejected() {
         match plan(&[("a", &["ghost"])]) {
@@ -335,7 +370,10 @@ mod tests {
         }
     }
 
-    /// A node depending on itself is refused.
+    /// A node depending on itself is refused before cycle detection.
+    ///
+    /// # Panics
+    /// Panics unless planning fails with [`DagError::SelfLoop`] naming `loop`.
     #[test]
     fn task_depending_on_itself_rejected() {
         match plan(&[("loop", &["loop"])]) {

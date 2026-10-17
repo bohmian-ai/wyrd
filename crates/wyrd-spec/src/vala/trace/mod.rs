@@ -2067,6 +2067,18 @@ mod gen_ai_span_record_tests {
         back.validate().unwrap();
     }
 
+    /// Two GenAI evaluation results serialize under the `evaluation_results`
+    /// key only and round-trip unchanged.
+    ///
+    /// Pins the wire key of the GenAI evaluation projection: the serialized
+    /// record carries both entries under `evaluation_results`, emits no
+    /// retired abbreviated alias key, and deserializes back to an equal
+    /// record.
+    ///
+    /// # Panics
+    /// Panics when serialization or deserialization fails, the array does not
+    /// hold two entries, the abbreviated alias key is present, or the
+    /// round-tripped record differs.
     #[test]
     fn gen_ai_span_record_evaluation_results_round_trip_with_two_entries() {
         let mut record = gen_ai();

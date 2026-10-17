@@ -116,7 +116,20 @@ pub fn capture_actual(
     }
 }
 
-/// SHA-256 hex digest of `value`'s canonical JSON bytes.
+/// Lowercase SHA-256 hex digest of `value`'s compact `serde_json` bytes.
+///
+/// Backs [`ContextCapture::Hash`] in [`capture_actual`]. The bytes are exactly
+/// what [`serde_json::to_vec`] emits: compact output with no insignificant
+/// whitespace, object keys in the `Value` map's iteration order, and
+/// `serde_json` number and string escaping. Workspace dependencies enable
+/// `serde_json/preserve_order`, so key order is insertion or parse order, not
+/// sorted: equal objects built in different key orders hash differently.
+/// This is not RFC 8785 JCS; changing the byte form changes every stored
+/// digest.
+///
+/// # Errors
+/// Returns [`ExecError::ContextHashFailed`] with the serializer message when
+/// `serde_json` cannot serialize `value`.
 fn hash_context_value(value: &serde_json::Value) -> Result<String, ExecError> {
     let bytes = serde_json::to_vec(value).map_err(|error| ExecError::ContextHashFailed {
         reason: error.to_string(),
@@ -126,6 +139,8 @@ fn hash_context_value(value: &serde_json::Value) -> Result<String, ExecError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Unit tests for [`capture_actual`]: each [`ContextCapture`] mode applied
+/// directly to one actual value, without running a Verifier.
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -133,6 +148,9 @@ mod tests {
     use super::*;
 
     /// `full` keeps the actual value verbatim.
+    ///
+    /// # Panics
+    /// Panics when capture fails or the captured value differs from the input.
     #[test]
     fn context_capture_full_keeps_actual_verbatim() {
         let actual = capture_actual(Some(json!({"x": 1})), ContextCapture::Full)
@@ -141,6 +159,10 @@ mod tests {
     }
 
     /// `hash` replaces the actual value with its lowercase SHA-256 hex digest.
+    ///
+    /// # Panics
+    /// Panics when capture fails, drops the value, returns a non-string, or
+    /// returns anything other than 64 lowercase hex characters.
     #[test]
     fn context_capture_hash_replaces_with_sha256_hex() {
         let actual = capture_actual(Some(json!({"x": 1, "y": "v"})), ContextCapture::Hash)
@@ -155,6 +177,9 @@ mod tests {
     }
 
     /// `redact` drops the actual value.
+    ///
+    /// # Panics
+    /// Panics when capture fails or still returns a value.
     #[test]
     fn context_capture_redact_drops_actual() {
         let actual = capture_actual(Some(json!("pii")), ContextCapture::Redact)

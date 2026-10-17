@@ -28,12 +28,24 @@ use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 
-/// A static Verifier task id.
+/// Build the [`TaskId`] used for a requirement or step in these fixtures.
+///
+/// # Panics
+/// Panics when `value` fails [`TaskId`] validation, which means the static
+/// test literal itself is wrong.
 fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
 }
 
 /// A structured judge prompt returning `{"passed": bool}`.
+///
+/// Builds an OpenAI chat Prompt whose response format is a strict JSON
+/// schema requiring one boolean `passed` field, so Agent checks receive a
+/// structured verdict from the mocked provider.
+///
+/// # Panics
+/// Panics when the static JSON schema is rejected as a response format or
+/// the static prompt fails construction.
 fn structured_prompt() -> Prompt {
     let schema = json!({
         "type": "object",

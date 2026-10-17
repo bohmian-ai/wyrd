@@ -20,6 +20,14 @@ use super::*;
 use crate::InMemoryTraceSource;
 
 /// One finished one-second span named `name` in `trace`.
+///
+/// Rebuilds a complete [`SpanRecord`] fixed at 2026-06-10 12:00:00-12:00:01
+/// UTC with an OK status and one `gen_ai.system` attribute, so trace checks
+/// read a deterministic span through the in-memory trace source.
+///
+/// # Panics
+/// Panics when either static timestamp is not a single valid UTC instant,
+/// which would mean the fixture literals themselves are wrong.
 fn span(trace: TraceId, span: SpanId, name: &str) -> SpanRecord {
     let start_time = chrono::Utc
         .with_ymd_and_hms(2026, 6, 10, 12, 0, 0)

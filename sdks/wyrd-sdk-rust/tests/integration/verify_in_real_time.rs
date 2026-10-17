@@ -65,7 +65,7 @@ impl Assistant {
     /// # Panics
     /// Panics when a setup step fails.
     pub(crate) async fn start() -> Self {
-        Self::start_on(WyrdTestServer::builder(), Duration::ZERO).await
+        Box::pin(Self::start_on(WyrdTestServer::builder(), Duration::ZERO)).await
     }
 
     /// Start the assistant deployment on `builder`, with the local judge
@@ -1214,10 +1214,10 @@ struct InputRows {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn verification_staging_refuses_and_recovers() {
-    let assistant = Assistant::start_on(
+    let assistant = Box::pin(Assistant::start_on(
         WyrdTestServer::builder().with_scribe_outbox_capacity_for_test(STAGING_CAPACITY),
         JUDGE_DELAY,
-    )
+    ))
     .await;
     let (neighbor, _neighbor_bundle) = assistant.in_tenant("burst-neighbor").await;
     let state = assistant.state().await;

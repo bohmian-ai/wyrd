@@ -1488,7 +1488,9 @@ fn apply_document(value: Value) -> ProviderDeploymentsApply {
 /// Proves the composite apply commits every named credential and deployment
 /// or none: a later invalid deployment, a missing sealing key, a denied
 /// caller, another tenant's reference, and a concurrently revoked credential
-/// each leave the earlier resources exactly as they were, while a valid
+/// each leave the earlier resources exactly as they were, a later SQL
+/// foreign-key refusal rolls back an earlier rotation of an existing managed
+/// secret, which still opens to its original value, while a valid
 /// document commits managed and operator-sourced credentials together with
 /// deployments referencing them and answers only with redacted views.
 ///
@@ -1498,6 +1500,9 @@ fn apply_document(value: Value) -> ProviderDeploymentsApply {
 async fn gateway_apply_is_atomic_and_tenant_scoped() {
     /// Managed-secret value submitted inline, which no answer may repeat.
     const SUBMITTED: &str = "sk-live-apply-submission";
+    /// Replacement managed secret of a document the database aborts, which
+    /// must never replace the committed value.
+    const ROTATED: &str = "sk-live-apply-rotation";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let other = fixture
@@ -1659,6 +1664,66 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         )
     );
 
+    // A database-aborted document rolls back its earlier rotation: the
+    // existing managed secret is rotated first, then moving the referenced
+    // `shared` credential to another provider trips the deployments' foreign
+    // key, so the whole transaction, rotation included, is discarded.
+    let rotated_row = stored_credential(&fixture, tenant, "managed-key").await;
+    let referenced = stored_credential(&fixture, tenant, "shared").await;
+    let deployments = gateway.deployments(&admin).await.expect("deployments");
+    let rotate = |name: &str, provider: &str| {
+        json!({
+            "name": name, "provider": provider,
+            "source": {"managed_secret": {"secret": ROTATED}},
+        })
+    };
+    let aborted = gateway
+        .apply_deployments(
+            &admin,
+            apply_document(json!({
+                "credentials": [rotate("managed-key", "openai"), rotate("shared", "anthropic")],
+                "deployments": [bearer("primary", "managed-key"), bearer("secondary", "shared")],
+            })),
+        )
+        .await
+        .expect_err("the foreign key refuses the provider change");
+    assert!(
+        matches!(aborted, WyrdError::GatewayResourceConflict { .. }),
+        "{aborted:?}"
+    );
+    assert!(!format!("{aborted:?}").contains(ROTATED));
+    assert_eq!(
+        stored_credential(&fixture, tenant, "managed-key").await,
+        rotated_row,
+        "the earlier rotation's envelope and metadata rolled back"
+    );
+    assert_eq!(
+        stored_credential(&fixture, tenant, "shared").await,
+        referenced
+    );
+    assert_eq!(
+        gateway.deployments(&admin).await.expect("deployments"),
+        deployments
+    );
+    let snapshot = gateway.snapshot(tenant).await.expect("snapshot");
+    let original = snapshot
+        .credential(&credential_name("managed-key"))
+        .expect("admitted");
+    let GatewayCredentialSource::ManagedSecret { sealed } = &original.source else {
+        panic!("managed source");
+    };
+    assert_eq!(
+        ManagedSecretBinding {
+            tenant,
+            name: &original.name,
+            provider: &original.provider,
+        }
+        .open(state.auth.sealing_key.as_ref().expect("keyring"), sealed)
+        .expect("the original envelope opens")
+        .expose_secret(),
+        SUBMITTED
+    );
+
     // A revoke that commits while the apply waits on the credential row is
     // observed by the apply, which then refuses instead of committing a
     // deployment that names a revoked credential.
@@ -1696,5 +1761,8 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         .filter(|(operation, _)| operation == "gateway.provider_deployments.apply")
         .map(|(_, outcome)| outcome)
         .collect::<Vec<_>>();
-    assert_eq!(applies, ["allowed", "denied", "allowed", "allowed"]);
+    assert_eq!(
+        applies,
+        ["allowed", "denied", "allowed", "allowed", "allowed"]
+    );
 }

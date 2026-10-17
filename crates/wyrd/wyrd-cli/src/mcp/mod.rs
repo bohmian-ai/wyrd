@@ -17,6 +17,7 @@ use serde::Serialize;
 use wyrd_client::transport::HttpConfig;
 use wyrd_spec::error::WyrdError;
 
+pub(crate) use hosts::selected;
 pub use hosts::{McpHost, McpHostReport, McpHostStatus};
 
 use crate::client::map_client_error;

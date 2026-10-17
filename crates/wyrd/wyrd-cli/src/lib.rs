@@ -24,6 +24,8 @@ pub mod query;
 pub mod registration;
 /// `wyrd server`: verified installation of official server releases.
 pub mod server;
+#[cfg(unix)]
+mod terminal;
 
 use clap::{Parser, error::ErrorKind};
 

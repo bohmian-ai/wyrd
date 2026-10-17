@@ -672,15 +672,15 @@ pub(super) fn prompt_selection(
                 "no host selection was entered",
             ));
         }
-        if let Some(chosen) = selected_hosts(detected, &answer) {
+        if let Some(chosen) = selected(detected, &answer) {
             return Ok(chosen);
         }
         writeln!(output, "Enter numbers between 1 and {}.", detected.len())?;
     }
 }
 
-/// Local startup must remain interruptible while offering hosts. Open the
-/// actual tty device: macOS kqueue cannot watch the `/dev/tty` alias.
+/// Local startup must remain interruptible while offering hosts, so the
+/// answer is read through the shared nonblocking [`Terminal`].
 ///
 /// # Errors
 /// Propagates terminal open, registration, input, UTF-8, and output failures.
@@ -689,41 +689,12 @@ pub(super) async fn prompt_local_selection(
     detected: &[McpHost],
     output: &mut impl Write,
 ) -> io::Result<Vec<McpHost>> {
-    use rustix::fs::{Mode, OFlags};
-    use tokio::io::unix::AsyncFd;
-
-    let path = rustix::termios::ttyname(io::stdin(), Vec::new())?;
-    let terminal = AsyncFd::new(rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)?;
+    let terminal = crate::terminal::Terminal::open()?;
     show_hosts(detected, output)?;
+    output.flush()?;
     loop {
-        show_question(output)?;
-        let mut answer = Vec::new();
-        loop {
-            let mut ready = terminal.readable().await?;
-            let mut byte = [0];
-            let Ok(read) = ready
-                .try_io(|fd| rustix::io::read(fd.get_ref(), &mut byte).map_err(io::Error::from))
-            else {
-                continue;
-            };
-            if read? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "no host selection was entered",
-                ));
-            }
-            answer.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        let answer = String::from_utf8(answer)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if let Some(chosen) = selected_hosts(detected, &answer) {
+        let answer = terminal.ask(QUESTION).await?;
+        if let Some(chosen) = selected(detected, &answer) {
             return Ok(chosen);
         }
         writeln!(output, "Enter numbers between 1 and {}.", detected.len())?;
@@ -754,15 +725,16 @@ fn show_hosts(detected: &[McpHost], output: &mut impl Write) -> io::Result<()> {
 /// Propagates a write or flush failure on `output`, so no reader waits on a
 /// question the user never saw.
 fn show_question(output: &mut impl Write) -> io::Result<()> {
-    write!(
-        output,
-        "Connect which hosts to Wyrd? [numbers, all, or empty for none]: "
-    )?;
+    write!(output, "{QUESTION}")?;
     output.flush()
 }
 
-/// Interpret one answer with the installer's existing selection grammar.
-fn selected_hosts(detected: &[McpHost], answer: &str) -> Option<Vec<McpHost>> {
+/// The host-selection question both input paths ask.
+const QUESTION: &str = "Connect which hosts to Wyrd? [numbers, all, or empty for none]: ";
+
+/// Interpret one answer with the installer's selection grammar, shared with
+/// local startup's gateway offer: numbers, `all`, or empty for none.
+pub(crate) fn selected<T: Copy>(detected: &[T], answer: &str) -> Option<Vec<T>> {
     let answer = answer.trim();
     if answer.eq_ignore_ascii_case("all") {
         return Some(detected.to_vec());

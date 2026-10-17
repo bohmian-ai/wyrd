@@ -2,7 +2,7 @@
 //! remain the installed server's `migrate` and `setup` commands.
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -16,9 +16,11 @@ use tokio::process::{Child, Command};
 use wyrd_client::cards::Cards;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::environment::Environment;
+use wyrd_client::global_config::DevSection;
 use wyrd_client::saved_login::{SavedLogins, canonical_origin};
-use wyrd_client::{GlobalConfig, WyrdClient};
+use wyrd_client::{Gateway, GlobalConfig, WyrdClient};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::gateway::ProviderDeploymentsApply;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::registry::ListCardsRequest;
 
@@ -26,29 +28,84 @@ use super::install::compatible;
 use super::{InstalledServer, ServerInstaller};
 use crate::client::map_client_error;
 use crate::error::WyrdCliError;
+use crate::gateway::{AuthoringApply, DeploymentFile, apply_deployments_with};
 use crate::mcp::{self, McpHost};
+use crate::platform::credential::PlatformEndpoint;
+#[cfg(unix)]
+use crate::terminal::Terminal;
 
-/// Local inputs accepted by both installed CLI projections.
+/// Local inputs accepted by both installed CLI projections. Each resolves as
+/// argument, canonical environment variable, saved `[dev]` setting, then a
+/// terminal prompt; secrets are never accepted as arguments.
 #[derive(Debug, Args)]
 pub struct DevArgs {
     /// Tenant to provision on first use; an active tenant is never reissued.
+    /// Defaults to the saved tenant, else is asked on a terminal.
     #[arg(long)]
-    tenant: TenantSlug,
+    tenant: Option<TenantSlug>,
     /// Detected MCP hosts to connect; repeat to select several. Interactive
     /// runs offer detected hosts when omitted; scripts select none implicitly.
     #[arg(long = "host", value_enum)]
     hosts: Vec<McpHost>,
+    /// Never prompt: report every unresolved input together and exit before
+    /// any download, migration, or provisioning.
+    #[arg(long)]
+    non_interactive: bool,
+    /// Loopback HTTP listener; overrides `WYRD_SERVER_BIND` and the saved one.
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<String>,
+    /// Loopback public gRPC listener; overrides `WYRD_GRPC_BIND` and the
+    /// saved one.
+    #[arg(long, value_name = "ADDR")]
+    grpc_bind: Option<String>,
+    /// Storage URL without credentials, query, or fragment; overrides
+    /// `WYRD_STORAGE_URL` and the saved one.
+    #[arg(long, value_name = "URL")]
+    storage_url: Option<String>,
+    /// Gateway document to apply after readiness, also on restart; its
+    /// `local_env` credentials resolve from this process's environment.
+    #[arg(long, value_name = "PATH", conflicts_with = "skip_gateway")]
+    gateway_file: Option<PathBuf>,
+    /// Skip the gateway offer.
+    #[arg(long)]
+    skip_gateway: bool,
+}
+
+/// Effective local deployment inputs, resolved once before any side effect,
+/// supplied unchanged to every server child, and saved for restarts.
+struct DevInputs {
+    /// Migration-owner PostgreSQL URL (`WYRD_DATABASE_URL`).
+    database: SecretString,
+    /// Optional separate platform URL (`WYRD_PLATFORM_DATABASE_URL`).
+    platform_database: Option<SecretString>,
+    /// Tenant provisioned and served.
+    tenant: TenantSlug,
+    /// Loopback HTTP listener.
+    bind: SocketAddr,
+    /// Loopback public gRPC listener.
+    grpc: SocketAddr,
+    /// Effective `WYRD_STORAGE_URL`.
+    storage_url: String,
+    /// Effective absolute `WYRD_BIFROST_DATA_DIR`.
+    bifrost: PathBuf,
+    /// Explicitly requested gateway document, already resolved locally.
+    gateway: Option<ProviderDeploymentsApply>,
+    /// Whether questions may be asked on the invoking terminal.
+    interactive: bool,
+    /// Whether to offer detected provider keys: a fresh interactive setup
+    /// without `--gateway-file` or `--skip-gateway`.
+    offer_gateway: bool,
+    /// Whether an earlier run already completed setup for this endpoint;
+    /// it suppresses the automatic gateway and host offers.
+    configured: bool,
 }
 
 /// The CLI's owned foreground server, also settled after a failed startup.
 struct DevServer {
     /// Verified installation selected without updating an existing release.
     installed: InstalledServer,
-    /// Effective loopback listener supplied to the normal serving path.
-    bind: SocketAddr,
-    /// Effective loopback public gRPC listener, supplied to every child and
-    /// saved as the fresh-client gRPC destination.
-    grpc: SocketAddr,
+    /// Resolved inputs every child receives and restarts reuse.
+    inputs: DevInputs,
     /// HTTP endpoint shared by setup, readiness, clients, and MCP hosts.
     endpoint: String,
     /// macOS memory detected once and supplied only to child processes.
@@ -72,9 +129,8 @@ impl DevArgs {
     /// # Panics
     /// Panics if the compile-time package version is not valid semver.
     pub async fn run(self) -> Result<ExitCode, WyrdCliError> {
-        let (bind, grpc) = local_binds()?;
-        let configured = self.validate_local_config(&format!("http://{bind}"))?;
         let installer = ServerInstaller::official()?;
+        let inputs = self.resolve(installer.root()).await?;
         let interrupted = interruption();
         tokio::pin!(interrupted);
         let installed = tokio::select! {
@@ -91,14 +147,14 @@ impl DevArgs {
             } => installed?,
         };
         let sealing_key = local_sealing_key(installer.root())?;
-        let mut server = DevServer::new(installed, bind, grpc, sealing_key)?;
+        let mut server = DevServer::new(installed, inputs, sealing_key)?;
         let result = tokio::select! {
             biased;
             signal = &mut interrupted => {
                 eprintln!("Local startup stopped. Committed setup steps remain; rerun the same command. An active tenant's key is never reissued.");
                 signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source })
             }
-            result = server.run(&self, configured) => result,
+            result = server.run(&self.hosts) => result,
         };
         let settled = server.stop().await;
         match result {
@@ -110,34 +166,265 @@ impl DevArgs {
         }
     }
 
-    /// Refuse unsafe local files or an unrelated saved identity before setup,
-    /// and report whether an earlier run already completed local setup.
+    /// Resolve every input before any side effect, asking for a missing
+    /// database URL (concealed) and tenant only on a usable terminal.
     ///
-    /// Completed setup means this endpoint and a protected key were saved
-    /// before this invocation wrote anything. It only suppresses the automatic
-    /// host offer; the saved key is still verified after provisioning.
+    /// Unattended runs report all unresolved inputs together. Unset storage
+    /// selects absolute defaults beneath the server directory `root`, which
+    /// are created; an existing working-directory `.wyrd` is never adopted.
     ///
     /// # Errors
-    /// Returns protected-file, configuration, or saved-login validation errors.
-    fn validate_local_config(&self, endpoint: &str) -> Result<bool, WyrdCliError> {
+    /// Refuses unsafe local files, invalid or missing inputs, a saved key or
+    /// login that belongs to another tenant, and an unreadable gateway file.
+    async fn resolve(&self, root: &Path) -> Result<DevInputs, WyrdCliError> {
         // Check local files before any server operation can issue a key.
-        let key = GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?;
+        let environment = Environment::Process;
+        let key = GlobalConfig::local_api_key(&environment).map_err(map_client_error)?;
         let global = GlobalConfig::load().map_err(|_| dev_error("local config", "config.toml is invalid; correct it or use a separate WYRD_CONFIG_HOME; no server setup has run"))?;
-        if let Some(dir) = Environment::Process.config_dir() {
-            let origin = canonical_origin(endpoint).map_err(map_client_error)?;
-            if SavedLogins::at(dir)
-                .select(&origin, global.client.tenant.as_deref())
-                .map_err(map_client_error)?
-                .is_some_and(|login| login.tenant_key != self.tenant)
-            {
+        let (saved_database, saved_platform) =
+            GlobalConfig::local_databases(&environment).map_err(map_client_error)?;
+        let saved = global.dev;
+        let bind = loopback(
+            first(
+                self.bind.as_deref(),
+                "WYRD_SERVER_BIND",
+                saved.bind.as_deref(),
+            ),
+            "127.0.0.1:8080",
+            "--bind / WYRD_SERVER_BIND must be a loopback socket address with a nonzero port",
+        )?;
+        let grpc = loopback(
+            first(
+                self.grpc_bind.as_deref(),
+                "WYRD_GRPC_BIND",
+                saved.grpc_bind.as_deref(),
+            ),
+            "127.0.0.1:50051",
+            "--grpc-bind / WYRD_GRPC_BIND must be a loopback socket address with a nonzero port",
+        )?;
+        if let Some(storage) = &self.storage_url
+            && !url::Url::parse(storage).is_ok_and(|url| {
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
+        {
+            return Err(dev_error(
+                "input",
+                "--storage-url must be a URL without credentials, query, or fragment; supply credential-bearing storage through WYRD_STORAGE_URL and its provider's environment",
+            ));
+        }
+        let gateway = self
+            .gateway_file
+            .as_deref()
+            .map(|path| {
+                Ok::<_, WyrdCliError>(match DeploymentFile::read(path)? {
+                    DeploymentFile::Apply(apply) => apply,
+                    DeploymentFile::One(deployment) => ProviderDeploymentsApply {
+                        credentials: Vec::new(),
+                        deployments: vec![deployment],
+                    },
+                    DeploymentFile::Many(deployments) => ProviderDeploymentsApply {
+                        credentials: Vec::new(),
+                        deployments,
+                    },
+                })
+            })
+            .transpose()?;
+        let saved_tenant = saved
+            .tenant
+            .as_deref()
+            .map(str::parse::<TenantSlug>)
+            .transpose()
+            .map_err(|_| dev_error("local config", "config.toml [dev] tenant is invalid; correct it or use a separate WYRD_CONFIG_HOME"))?;
+        let interactive = cfg!(unix) && !self.non_interactive && std::io::stdin().is_terminal();
+        let database = secret_var("WYRD_DATABASE_URL").or(saved_database);
+        let tenant = self.tenant.clone().or_else(|| saved_tenant.clone());
+        let (database, tenant) = match (database, tenant) {
+            (Some(database), Some(tenant)) => (database, tenant),
+            #[cfg(unix)]
+            (database, tenant) if interactive => {
+                let terminal = Terminal::open().map_err(|source| WyrdCliError::Io { source })?;
+                let database = match database {
+                    Some(database) => database,
+                    None => terminal
+                        .conceal("PostgreSQL URL for WYRD_DATABASE_URL (input hidden): ")
+                        .await
+                        .map_err(|source| WyrdCliError::Io { source })?,
+                };
+                let tenant = match tenant {
+                    Some(tenant) => tenant,
+                    None => terminal
+                        .ask("Tenant slug to provision: ")
+                        .await
+                        .map_err(|source| WyrdCliError::Io { source })?
+                        .trim()
+                        .parse()
+                        .map_err(|_| dev_error("input", "the tenant slug must be 3-64 lowercase letters, digits, '_' or '-', starting with a letter"))?,
+                };
+                (database, tenant)
+            }
+            (None, None) => {
                 return Err(dev_error(
-                    "saved login",
-                    "an unrelated login for this endpoint is preserved; use a separate WYRD_CONFIG_HOME for local setup",
+                    "input",
+                    "unresolved inputs: set WYRD_DATABASE_URL and pass --tenant, or run on a terminal to be asked; nothing has run",
                 ));
             }
+            (None, Some(_)) => {
+                return Err(dev_error(
+                    "input",
+                    "unresolved input: set WYRD_DATABASE_URL to an externally managed PostgreSQL database, or run on a terminal to be asked; nothing has run",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(dev_error(
+                    "input",
+                    "unresolved input: pass --tenant, or run on a terminal to be asked; nothing has run",
+                ));
+            }
+        };
+        if !url::Url::parse(database.expose_secret())
+            .is_ok_and(|url| matches!(url.scheme(), "postgres" | "postgresql"))
+        {
+            return Err(dev_error(
+                "input",
+                "the database URL must be a postgres:// URL for an externally managed database whose migration login owns its objects",
+            ));
         }
-        Ok(key.is_some() && global.client.http_url.as_deref() == Some(endpoint))
+        if key.is_some() && saved_tenant.as_ref().is_some_and(|saved| *saved != tenant) {
+            return Err(dev_error(
+                "saved credential",
+                "the saved key belongs to the saved [dev] tenant and is preserved; use a separate WYRD_CONFIG_HOME for another tenant",
+            ));
+        }
+        let endpoint = format!("http://{bind}");
+        validate_saved_login(&endpoint, &tenant, global.client.tenant.as_deref())?;
+        let (storage_url, bifrost) = local_data(
+            first(
+                self.storage_url.as_deref(),
+                "WYRD_STORAGE_URL",
+                saved.storage_url.as_deref(),
+            ),
+            first(
+                None,
+                "WYRD_BIFROST_DATA_DIR",
+                saved.bifrost_data_dir.as_deref(),
+            ),
+            root,
+        )?;
+        let configured =
+            key.is_some() && global.client.http_url.as_deref() == Some(endpoint.as_str());
+        Ok(DevInputs {
+            offer_gateway: interactive && !self.skip_gateway && !configured,
+            configured,
+            database,
+            platform_database: secret_var("WYRD_PLATFORM_DATABASE_URL").or(saved_platform),
+            tenant,
+            bind,
+            grpc,
+            storage_url,
+            bifrost,
+            gateway,
+            interactive,
+        })
     }
+}
+
+/// Refuse an unrelated saved login for `endpoint` before setup.
+///
+/// # Errors
+/// Returns saved-login validation errors and a refusal naming the
+/// `WYRD_CONFIG_HOME` separation when a login selects another tenant.
+fn validate_saved_login(
+    endpoint: &str,
+    tenant: &TenantSlug,
+    selector: Option<&str>,
+) -> Result<(), WyrdCliError> {
+    if let Some(dir) = Environment::Process.config_dir() {
+        let origin = canonical_origin(endpoint).map_err(map_client_error)?;
+        if SavedLogins::at(dir)
+            .select(&origin, selector)
+            .map_err(map_client_error)?
+            .is_some_and(|login| login.tenant_key != *tenant)
+        {
+            return Err(dev_error(
+                "saved login",
+                "an unrelated login for this endpoint is preserved; use a separate WYRD_CONFIG_HOME for local setup",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The first supplied value: `argument`, then environment `variable`, then
+/// the `saved` setting.
+fn first(argument: Option<&str>, variable: &str, saved: Option<&str>) -> Option<String> {
+    argument
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(variable)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| saved.map(str::to_owned))
+}
+
+/// Read a secret-bearing environment variable; empty means unset.
+fn secret_var(variable: &str) -> Option<SecretString> {
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(SecretString::from)
+}
+
+/// Select the storage URL and absolute Bifrost root, defaulting each to a
+/// created directory beneath the server directory `root`.
+///
+/// A defaulted storage selection is explained once, with its absolute
+/// location; an existing working-directory `.wyrd` is named but not adopted.
+///
+/// # Errors
+/// Refuses an unresolvable Bifrost path and default directories that cannot
+/// be created.
+fn local_data(
+    storage: Option<String>,
+    bifrost: Option<String>,
+    root: &Path,
+) -> Result<(String, PathBuf), WyrdCliError> {
+    let created = |path: PathBuf| {
+        std::fs::create_dir_all(&path).map(|()| path).map_err(|_| {
+            dev_error(
+                "local persistence",
+                "the local data directory could not be created; restore safe permissions on the Wyrd config directory or set WYRD_STORAGE_URL and WYRD_BIFROST_DATA_DIR",
+            )
+        })
+    };
+    let bifrost = match bifrost {
+        Some(path) => std::path::absolute(path).map_err(|_| {
+            dev_error(
+                "input",
+                "WYRD_BIFROST_DATA_DIR must name a resolvable directory",
+            )
+        })?,
+        None => created(root.join("data").join("bifrost"))?,
+    };
+    if let Some(storage) = storage {
+        return Ok((storage, bifrost));
+    }
+    let path = created(root.join("data").join("storage"))?;
+    println!(
+        "WYRD_STORAGE_URL is unset; using local storage at {} (saved as [dev] storage_url).",
+        path.display()
+    );
+    if Path::new(".wyrd").is_dir() {
+        println!(
+            "The existing ./.wyrd directory is not adopted; pass --storage-url and set WYRD_BIFROST_DATA_DIR to use it."
+        );
+    }
+    let storage = url::Url::from_file_path(&path)
+        .map_err(|()| dev_error("input", "the local storage path is not absolute"))?;
+    Ok((storage.to_string(), bifrost))
 }
 
 impl DevServer {
@@ -151,8 +438,7 @@ impl DevServer {
     /// Panics if the compile-time package version is not valid semver.
     fn new(
         installed: InstalledServer,
-        bind: SocketAddr,
-        grpc: SocketAddr,
+        inputs: DevInputs,
         sealing_key: Option<PathBuf>,
     ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -165,27 +451,33 @@ impl DevServer {
         }
         Ok(Self {
             installed,
-            bind,
-            grpc,
-            endpoint: format!("http://{bind}"),
+            endpoint: format!("http://{}", inputs.bind),
+            inputs,
             memory: None,
             sealing_key,
             child: None,
         })
     }
 
-    /// Construct each child with the same local inputs, leaving database and
-    /// storage URLs in the environment and preserving production hardening.
-    /// The selected listeners override any server-file setting, and the local
-    /// sealing key, when the caller supplied none, is the server's ordinary
-    /// `WYRD_SEALING_KEY_FILE`.
+    /// Construct each child with the same resolved inputs as canonical
+    /// server environment variables, never arguments, preserving production
+    /// hardening. The selected listeners override any server-file setting,
+    /// and the local sealing key, when the caller supplied none, is the
+    /// server's ordinary `WYRD_SEALING_KEY_FILE`.
     fn command(&self) -> Command {
+        let inputs = &self.inputs;
         let mut command = Command::new(self.installed.binary());
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
-            .env("WYRD_SERVER_BIND", self.bind.to_string())
-            .env("WYRD_GRPC_BIND", self.grpc.to_string());
+            .env("WYRD_DATABASE_URL", inputs.database.expose_secret())
+            .env("WYRD_SERVER_BIND", inputs.bind.to_string())
+            .env("WYRD_GRPC_BIND", inputs.grpc.to_string())
+            .env("WYRD_STORAGE_URL", &inputs.storage_url)
+            .env("WYRD_BIFROST_DATA_DIR", &inputs.bifrost);
+        if let Some(platform) = &inputs.platform_database {
+            command.env("WYRD_PLATFORM_DATABASE_URL", platform.expose_secret());
+        }
         if let Some(memory) = &self.memory {
             command.env("WYRD_BIFROST_MEMORY_LIMIT_BYTES", memory);
         }
@@ -195,11 +487,15 @@ impl DevServer {
         command
     }
 
-    /// Migrate, serve, provision, persist, authenticate a new client, and wait.
+    /// Migrate, serve, save settings, provision, persist, authenticate a new
+    /// client, apply any requested gateway document, and wait.
     ///
-    /// Only first setup offers detected hosts; `configured` restarts skip the
-    /// offer unless hosts were selected explicitly. The serving child stays
-    /// observed during the offer: its exit cancels any unanswered question.
+    /// Settings are saved before provisioning so a protected-file failure
+    /// surfaces before a one-time key is issued. Only first setup offers the
+    /// gateway and detected hosts; `configured` restarts skip both offers
+    /// unless a gateway file or hosts were selected explicitly. The serving
+    /// child stays observed during every offer: its exit cancels any
+    /// unanswered question.
     ///
     /// # Errors
     /// Returns a stage-specific recovery message without child secret output.
@@ -208,29 +504,133 @@ impl DevServer {
     ///
     /// # Panics
     /// Panics if the serving child is not retained after readiness.
-    async fn run(&mut self, args: &DevArgs, configured: bool) -> Result<ExitCode, WyrdCliError> {
+    async fn run(&mut self, hosts: &[McpHost]) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
-        let tenant = self.provision(&args.tenant).await?;
-        save_local_tenant(&tenant, &args.tenant, &self.endpoint, self.grpc)?;
+        self.save_settings()?;
+        let tenant = self.provision(&self.inputs.tenant).await?;
+        self.save_tenant(&tenant).await?;
         drop(tenant);
-        verify_saved_client().await?;
+        let client = saved_client().await?;
         let Self {
-            child, endpoint, ..
+            child,
+            endpoint,
+            inputs,
+            ..
         } = self;
         let child = child
             .as_mut()
             .expect("the server is retained after readiness");
-        if !configured || !args.hosts.is_empty() {
+        let gateway = tokio::select! {
+            configured = inputs.configure_gateway(client) => configured?,
+            exited = Self::exited(child) => return exited,
+        };
+        if !inputs.configured || !hosts.is_empty() {
             tokio::select! {
-                offered = mcp::offer_local(&args.hosts, endpoint) => offered?,
+                offered = mcp::offer_local(hosts, endpoint) => offered?,
                 exited = Self::exited(child) => return exited,
             }
         }
+        let files = Environment::Process
+            .config_dir()
+            .map_or_else(String::new, |dir| dir.display().to_string());
         println!(
-            "Local Wyrd ready at {endpoint} for tenant {}. The saved endpoint and credential are available to fresh clients; press Ctrl-C to stop.",
-            args.tenant
+            "Local Wyrd ready at {endpoint} for tenant {}.\n  gRPC: http://{}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {gateway}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
+            inputs.tenant,
+            inputs.grpc,
+            inputs.storage_url,
+            inputs.bifrost.display(),
         );
         Self::exited(child).await
+    }
+
+    /// Save the resolved settings and database URLs through the protected
+    /// configuration owner once migration has proven the database.
+    ///
+    /// # Errors
+    /// Refuses unsafe or unwritable configuration before any key is issued.
+    fn save_settings(&self) -> Result<(), WyrdCliError> {
+        let inputs = &self.inputs;
+        GlobalConfig::save_local_dev(
+            &Environment::Process,
+            &DevSection {
+                tenant: Some(inputs.tenant.to_string()),
+                bind: Some(inputs.bind.to_string()),
+                grpc_bind: Some(inputs.grpc.to_string()),
+                storage_url: Some(inputs.storage_url.clone()),
+                bifrost_data_dir: Some(inputs.bifrost.display().to_string()),
+            },
+            &inputs.database,
+            inputs.platform_database.as_ref(),
+        )
+        .map_err(|_| dev_error("local persistence", "local settings could not be saved; restore safe permissions on the Wyrd config directory and rerun. No tenant key has been issued"))
+    }
+
+    /// Commit the issued, saved, or recovered key before its endpoints
+    /// through the existing file owners.
+    ///
+    /// An active tenant whose one-time key was never saved needs platform
+    /// recovery: only an interactive run holding `WYRD_PLATFORM_CREDENTIAL`
+    /// that confirms rotation calls the existing platform recovery. Every
+    /// other run fails with that guidance; nothing is reissued implicitly.
+    ///
+    /// # Errors
+    /// Refuses conflicting keys, unsafe persistence, and a lost key without
+    /// confirmed authority; committed setup remains.
+    async fn save_tenant(&self, tenant: &ProvisionedTenant) -> Result<(), WyrdCliError> {
+        let saved = match (
+            GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?,
+            &tenant.key,
+        ) {
+            (None, None) => Some(self.recover(tenant).await?),
+            (saved, _) => saved,
+        };
+        let candidate = tenant.credential(saved.as_ref())?;
+        println!(
+            "Tenant {} ({}) is active; saving local client configuration.",
+            self.inputs.tenant, tenant.id
+        );
+        GlobalConfig::save_local(
+            &Environment::Process,
+            &self.endpoint,
+            &format!("http://{}", self.inputs.grpc),
+            candidate,
+        )
+        .map_err(|_| dev_error("local persistence", "the tenant may already be active; restore safe local file permissions and rerun. If its one-time key was not saved, use explicit platform tenant recover-admin; rerunning never replaces it"))
+    }
+
+    /// Rotate a lost tenant-admin key through the existing platform recovery
+    /// after explicit terminal confirmation with `WYRD_PLATFORM_CREDENTIAL`.
+    ///
+    /// # Errors
+    /// Refuses without a terminal, platform credential, or confirmation, and
+    /// returns the platform's refusal.
+    async fn recover(&self, tenant: &ProvisionedTenant) -> Result<SecretString, WyrdCliError> {
+        #[cfg(unix)]
+        if self.inputs.interactive && secret_var("WYRD_PLATFORM_CREDENTIAL").is_some() {
+            let answer = Terminal::open()
+                .map_err(|source| WyrdCliError::Io { source })?
+                .ask(&format!(
+                    "Tenant {} is active but its one-time key was not saved. Rotate its administrative key with WYRD_PLATFORM_CREDENTIAL? [y/N]: ",
+                    self.inputs.tenant
+                ))
+                .await
+                .map_err(|source| WyrdCliError::Io { source })?;
+            if answer.trim().eq_ignore_ascii_case("y") {
+                let server = url::Url::parse(&self.endpoint)
+                    .map_err(|_| dev_error("recovery", "the local endpoint is not a URL"))?;
+                let recovered = PlatformEndpoint { server }
+                    .connect()
+                    .await?
+                    .recover_tenant_admin(tenant.id)
+                    .await
+                    .map_err(|source| WyrdCliError::Server { source })?;
+                return Ok(SecretString::from(recovered.credential.expose().to_owned()));
+            }
+        }
+        Err(dev_error(
+            "saved credential",
+            "the tenant is active but its one-time key was not saved and nothing was reissued; rerun on a terminal with WYRD_PLATFORM_CREDENTIAL set and confirm rotation, or use wyrd platform tenant recover-admin",
+        ))
     }
 
     /// Reserve HTTP through migration, then start and await the ordinary server.
@@ -239,7 +639,7 @@ impl DevServer {
     /// Refuses occupied listeners, invalid memory input, migration, or readiness.
     /// Cancellation leaves committed migrations intact and the child owned here.
     async fn start(&mut self) -> Result<(), WyrdCliError> {
-        let reservation = std::net::TcpListener::bind(self.bind)
+        let reservation = std::net::TcpListener::bind(self.inputs.bind)
             .map_err(|_| dev_error("listener", "WYRD_SERVER_BIND is occupied or unavailable; stop the other listener or choose another loopback port"))?;
         self.detect_memory().await?;
         self.migrate().await?;
@@ -572,85 +972,209 @@ fn local_sealing_key(root: &Path) -> Result<Option<PathBuf>, WyrdCliError> {
     }
 }
 
-/// Validate external PostgreSQL and loopback HTTP and public gRPC inputs
-/// before installation, returning the selected HTTP and gRPC listeners.
-///
-/// # Errors
-/// Refuses absent/invalid database URLs and non-loopback or zero-port binds.
-fn local_binds() -> Result<(SocketAddr, SocketAddr), WyrdCliError> {
-    let database = SecretString::from(std::env::var("WYRD_DATABASE_URL").unwrap_or_default());
-    if database.expose_secret().is_empty()
-        || !url::Url::parse(database.expose_secret())
-            .is_ok_and(|url| matches!(url.scheme(), "postgres" | "postgresql"))
-    {
-        return Err(dev_error(
-            "input",
-            "set WYRD_DATABASE_URL to an externally managed PostgreSQL database; the migration login must own its objects",
-        ));
-    }
-    Ok((
-        loopback(
-            "WYRD_SERVER_BIND",
-            "127.0.0.1:8080",
-            "WYRD_SERVER_BIND must be a loopback socket address with a nonzero port",
-        )?,
-        loopback(
-            "WYRD_GRPC_BIND",
-            "127.0.0.1:50051",
-            "WYRD_GRPC_BIND must be a loopback socket address with a nonzero port",
-        )?,
-    ))
-}
-
-/// Select one listener from `variable`, else the ordinary loopback default.
+/// Select one listener from the resolved `value`, else the ordinary
+/// loopback `default`.
 ///
 /// # Errors
 /// Returns `refusal` for an unparsable, non-loopback, or zero-port address.
 fn loopback(
-    variable: &str,
+    value: Option<String>,
     default: &str,
     refusal: &'static str,
 ) -> Result<SocketAddr, WyrdCliError> {
-    std::env::var(variable)
-        .unwrap_or_else(|_| default.to_owned())
+    value
+        .as_deref()
+        .unwrap_or(default)
         .parse::<SocketAddr>()
         .ok()
         .filter(|bind| bind.ip().is_loopback() && bind.port() != 0)
         .ok_or_else(|| dev_error("input", refusal))
 }
 
-/// Commit the validated key before its HTTP and gRPC endpoints through
-/// existing file owners.
-///
-/// # Errors
-/// Refuses conflicting keys or unsafe persistence; committed setup remains.
-fn save_local_tenant(
-    tenant: &ProvisionedTenant,
-    name: &TenantSlug,
-    endpoint: &str,
-    grpc: SocketAddr,
-) -> Result<(), WyrdCliError> {
-    let saved = GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?;
-    let candidate = tenant.credential(saved.as_ref())?;
-    println!(
-        "Tenant {} ({}) is active; saving local client configuration.",
-        name, tenant.id
-    );
-    GlobalConfig::save_local(
-            &Environment::Process,
-            endpoint,
-            &format!("http://{grpc}"),
-            candidate,
-        )
-            .map_err(|_| dev_error("local persistence", "the tenant may already be active; restore safe local file permissions and rerun. If its one-time key was not saved, use explicit platform tenant recover-admin; rerunning never replaces it"))?;
-    Ok(())
+/// Builds a deployment's authentication naming its credential.
+type ProviderAuth = fn(&str) -> serde_json::Value;
+
+/// Known provider keys the gateway offer detects: provider (also its
+/// adapter and default deployment name), variables in precedence order, and
+/// the deployment authentication naming its credential.
+const PROVIDERS: [(&str, &[&str], ProviderAuth); 4] = [
+    (
+        "openai",
+        &["OPENAI_API_KEY"],
+        |credential| serde_json::json!({"bearer": {"credential": credential}}),
+    ),
+    (
+        "anthropic",
+        &["ANTHROPIC_API_KEY"],
+        |credential| serde_json::json!({"api_key_header": {"header": "x-api-key", "credential": credential}}),
+    ),
+    (
+        "gemini",
+        &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        |credential| serde_json::json!({"api_key_header": {"header": "x-goog-api-key", "credential": credential}}),
+    ),
+    (
+        "jev",
+        &["TYPESAFE_API_KEY"],
+        |credential| serde_json::json!({"bearer": {"credential": credential}}),
+    ),
+];
+
+impl DevInputs {
+    /// Apply the explicitly requested gateway document, or on a fresh
+    /// interactive setup the approved offer, through the same atomic owner as
+    /// `wyrd gateway deployment put`, then confirm every applied deployment
+    /// reads back through the redacted administration surface.
+    ///
+    /// Returns the summary line. No provider is called; key validity is not
+    /// claimed.
+    ///
+    /// # Errors
+    /// Returns terminal failures, an invalid offered document, the server's
+    /// refusal (nothing is applied), and a failed read-back.
+    async fn configure_gateway(&self, client: WyrdClient) -> Result<String, WyrdCliError> {
+        let offered;
+        let apply = match &self.gateway {
+            Some(apply) => apply,
+            None if self.offer_gateway => match offer_gateway().await? {
+                Some(apply) => {
+                    offered = apply;
+                    &offered
+                }
+                None => return Ok("skipped".to_owned()),
+            },
+            None => {
+                return Ok(
+                    "skipped; configure it later with wyrd gateway deployment put --file"
+                        .to_owned(),
+                );
+            }
+        };
+        let gateway = Gateway::connect_with(&client).await?;
+        let names: Vec<String> = apply
+            .deployments
+            .iter()
+            .map(|deployment| deployment.name.to_string())
+            .collect();
+        if let Err(source) = apply_deployments_with(client, apply).await {
+            eprintln!(
+                "Gateway setup failed and nothing was applied; tenant setup remains. Correct the gateway input and rerun, or pass --skip-gateway."
+            );
+            return Err(WyrdCliError::Server { source });
+        }
+        let committed = gateway.deployments().await?;
+        if !names.iter().all(|name| {
+            committed
+                .iter()
+                .any(|deployment| deployment.name.as_str() == name)
+        }) {
+            return Err(dev_error(
+                "gateway",
+                "the applied deployments could not be read back; inspect wyrd gateway deployment list and rerun",
+            ));
+        }
+        Ok(format!("configured deployments {}", names.join(", ")))
+    }
 }
 
-/// Authenticate and perform a bounded read using only fresh saved-file inputs.
+/// Offer detected provider keys on the terminal and build the approved
+/// composite document with `local_env` credentials, resolved exactly as a
+/// `--gateway-file` document. Only names are shown, never values.
+///
+/// Returns `None` when no key is detected or the offer is declined.
+///
+/// # Errors
+/// Returns terminal failures and an invalid resulting document.
+#[cfg(unix)]
+async fn offer_gateway() -> Result<Option<ProviderDeploymentsApply>, WyrdCliError> {
+    let io = |source| WyrdCliError::Io { source };
+    let detected: Vec<(&str, &str, ProviderAuth)> = PROVIDERS
+        .iter()
+        .filter_map(|(provider, variables, auth)| {
+            variables
+                .iter()
+                .find(|variable| secret_var(variable).is_some())
+                .map(|variable| (*provider, *variable, *auth))
+        })
+        .collect();
+    if detected.is_empty() {
+        println!(
+            "No provider key variables (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY or GEMINI_API_KEY, TYPESAFE_API_KEY) are set; gateway setup skipped."
+        );
+        return Ok(None);
+    }
+    let terminal = Terminal::open().map_err(io)?;
+    println!("Detected provider keys:");
+    for (index, (provider, variable, _)) in detected.iter().enumerate() {
+        println!(
+            "  {}) {provider} from {variable} as deployment {provider}",
+            index + 1
+        );
+    }
+    let chosen = loop {
+        let answer = terminal
+            .ask("Configure which providers in the gateway? [numbers, all, or empty for none]: ")
+            .await
+            .map_err(io)?;
+        if let Some(chosen) = mcp::selected(&detected, &answer) {
+            break chosen;
+        }
+        println!("Enter numbers between 1 and {}.", detected.len());
+    };
+    if chosen.is_empty() {
+        println!("No provider selected; gateway setup skipped.");
+        return Ok(None);
+    }
+    let (mut credentials, mut deployments) = (Vec::new(), Vec::new());
+    for (provider, variable, auth) in chosen {
+        let name = terminal
+            .ask(&format!("Deployment name for {provider} [{provider}]: "))
+            .await
+            .map_err(io)?;
+        let name = Some(name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(provider);
+        let credential = format!("{provider}-key");
+        credentials.push(serde_json::json!({"name": credential, "provider": provider, "source": {"local_env": variable}}));
+        deployments.push(
+            serde_json::json!({"name": name, "adapter": provider, "auth": auth(&credential)}),
+        );
+    }
+    let document = serde_json::json!({"credentials": credentials, "deployments": deployments});
+    let apply = serde_json::from_value::<AuthoringApply>(document)
+        .map_err(|_| dev_error("gateway", "a deployment name is invalid; use 3-64 lowercase letters, digits, '_' or '-', starting with a letter"))?
+        .resolve(&Environment::Process)
+        .map_err(|_| dev_error("gateway", "the selected provider keys did not form a valid gateway document; rerun or pass --skip-gateway"))?;
+    let names: Vec<String> = apply
+        .deployments
+        .iter()
+        .map(|deployment| deployment.name.to_string())
+        .collect();
+    let confirm = terminal
+        .ask(&format!(
+            "Apply deployments {} (an existing deployment or credential with the same name is replaced)? [Y/n]: ",
+            names.join(", ")
+        ))
+        .await
+        .map_err(io)?;
+    Ok((!confirm.trim().eq_ignore_ascii_case("n")).then_some(apply))
+}
+
+/// Without a terminal reader there is nothing to offer.
+///
+/// # Errors
+/// Never fails.
+#[cfg(not(unix))]
+async fn offer_gateway() -> Result<Option<ProviderDeploymentsApply>, WyrdCliError> {
+    Ok(None)
+}
+
+/// Assemble a client from fresh saved-file inputs only, authenticate it, and
+/// perform a bounded read before returning it for gateway setup.
 ///
 /// # Errors
 /// Returns redacted guidance for unusable configuration or credentials.
-async fn verify_saved_client() -> Result<(), WyrdCliError> {
+async fn saved_client() -> Result<WyrdClient, WyrdCliError> {
     let directory = Environment::Process.config_dir().ok_or_else(|| {
         dev_error(
             "local persistence",
@@ -676,7 +1200,7 @@ async fn verify_saved_client() -> Result<(), WyrdCliError> {
             limit: Some(1), cursor: None,
         }).await
             .map_err(|_| dev_error("saved credential", "the ready server refused a fresh client's saved credential; restore the requested tenant's key or explicitly recover its administration"))?;
-    Ok(())
+    Ok(client)
 }
 
 /// Construct a stable local-stage error with static, secret-free recovery.

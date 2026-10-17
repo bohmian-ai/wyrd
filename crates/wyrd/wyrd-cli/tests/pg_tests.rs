@@ -127,6 +127,14 @@ impl LocalDev {
         for host in hosts {
             command.args(["--host", host]);
         }
+        self.start_with(command).await;
+    }
+
+    /// Spawn the prepared `server dev` command and wait for readiness.
+    ///
+    /// # Panics
+    /// Panics as [`LocalDev::start`] does.
+    async fn start_with(&mut self, mut command: Command) {
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -175,7 +183,9 @@ impl LocalDev {
             );
         }
         assert!(
-            !printed.contains("wyrd_sk_") && !printed.contains("wyrd_global_"),
+            !printed.contains("wyrd_sk_")
+                && !printed.contains("wyrd_global_")
+                && !printed.contains(self.dsn.expose_secret()),
             "startup stdout carries no secrets"
         );
         self.stdout = Some(tokio::spawn(async move {
@@ -355,9 +365,33 @@ async fn server_dev_first_run_is_client_ready() {
     )
     .expect("non-loopback server file");
     local.start(&[]).await;
-    let saved = GlobalConfig::load_in(&local.environment())
-        .expect("saved config")
-        .client;
+    let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
+    let dev = &global.dev;
+    assert_eq!(dev.tenant.as_deref(), Some("local"));
+    assert_eq!(dev.bind.as_deref(), Some(local.bind.as_str()));
+    assert_eq!(dev.grpc_bind.as_deref(), Some(local.grpc.as_str()));
+    let storage = local.home.path().join("wyrd/server/data/storage");
+    assert_eq!(
+        dev.storage_url.as_deref(),
+        Some(
+            url::Url::from_file_path(&storage)
+                .expect("absolute")
+                .as_str()
+        )
+    );
+    assert!(storage.is_dir() && !local.home.path().join(".wyrd").exists());
+    assert_eq!(
+        dev.bifrost_data_dir.as_deref().map(Path::new),
+        Some(local.home.path().join("wyrd/server/data/bifrost").as_path())
+    );
+    let general = fs::read_to_string(&config).expect("saved config text");
+    assert!(!general.contains(local.dsn.expose_secret()) && !general.contains("wyrd_sk_"));
+    let (database, _) = GlobalConfig::local_databases(&local.environment()).expect("protected");
+    assert_eq!(
+        database.expect("saved database").expose_secret(),
+        local.dsn.expose_secret()
+    );
+    let saved = global.client;
     assert_eq!(saved.grpc_url, Some(format!("http://{}", local.grpc)));
     assert!(
         fs::read_to_string(&config)
@@ -611,26 +645,149 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         String::from_utf8_lossy(&failed.stderr)
     );
     assert!(output.contains("local persistence"), "{output}");
-    assert!(output.contains("recover-admin"));
+    assert!(output.contains("No tenant key has been issued"), "{output}");
     assert!(!output.contains("wyrd_sk_") && !output.contains("wyrd_global_"));
     assert!(!directory.join("credentials.toml").exists());
-    let retried = partial
-        .command()
-        .args(["server", "dev", "--tenant", "local"])
-        .output()
-        .await
-        .expect("safe partial retry");
-    assert!(!retried.status.success());
-    let errors = String::from_utf8_lossy(&retried.stderr);
-    assert!(errors.contains("saved credential"), "{errors}");
-    assert!(
-        !directory.join("credentials.toml").exists(),
-        "an active tenant's key is never reissued"
-    );
     assert!(
         TcpListener::bind(&partial.bind).is_ok(),
         "failure settles the server"
     );
+    let mut partial = partial;
+    partial.start(&[]).await;
+    partial.stop("-INT").await;
+    let credentials = directory.join("credentials.toml");
+    let mut lost = fs::read_to_string(&credentials).expect("saved key");
+    let saved = GlobalConfig::local_api_key(&partial.environment())
+        .expect("protected")
+        .expect("key");
+    lost = lost.replace(saved.expose_secret(), "");
+    fs::write(&credentials, lost.replace("api_key = \"\"\n", "")).expect("key lost");
+    for platform in [None, Some("wyrd_global_unconfirmed")] {
+        let mut command = partial.command();
+        if let Some(platform) = platform {
+            command.env("WYRD_PLATFORM_CREDENTIAL", platform);
+        }
+        let retried = command
+            .args(["server", "dev", "--non-interactive"])
+            .output()
+            .await
+            .expect("lost-key retry");
+        assert!(!retried.status.success());
+        let errors = String::from_utf8_lossy(&retried.stderr);
+        assert!(errors.contains("saved credential"), "{errors}");
+        assert!(errors.contains("recover-admin"), "{errors}");
+        assert!(
+            GlobalConfig::local_api_key(&partial.environment())
+                .expect("protected")
+                .is_none(),
+            "an active tenant's key is never reissued without confirmed recovery"
+        );
+        assert!(
+            TcpListener::bind(&partial.bind).is_ok(),
+            "failure settles the server"
+        );
+    }
+}
+
+/// A bare unattended restart from another working directory, with no
+/// database, listener, storage, or tenant inputs, reuses the saved settings,
+/// key, and data. Unattended runs missing inputs list them all before any
+/// effect, and conflicting or credential-bearing arguments are refused.
+///
+/// # Panics
+/// Panics when the restart changes identity or data, or a refusal has effects.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_dev_saved_settings_survive_working_directory_change() {
+    let mut local = LocalDev::new().await;
+    let fresh = local
+        .command()
+        .env_remove("WYRD_DATABASE_URL")
+        .args(["server", "dev", "--non-interactive"])
+        .output()
+        .await
+        .expect("missing inputs");
+    assert!(!fresh.status.success());
+    let errors = String::from_utf8_lossy(&fresh.stderr);
+    assert!(
+        errors.contains("WYRD_DATABASE_URL") && errors.contains("--tenant"),
+        "{errors}"
+    );
+    for refused in [
+        &[
+            "--tenant",
+            "local",
+            "--storage-url",
+            "s3://user:pw@bucket/x",
+        ][..],
+        &[
+            "--tenant",
+            "local",
+            "--gateway-file",
+            "g.json",
+            "--skip-gateway",
+        ],
+    ] {
+        let output = local
+            .command()
+            .args(["server", "dev", "--non-interactive"])
+            .args(refused)
+            .output()
+            .await
+            .expect("refused input");
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("pw@"));
+    }
+    assert!(!local.home.path().join("wyrd/credentials.toml").exists());
+    assert!(!local.home.path().join("wyrd/server/data").exists());
+
+    local.start(&[]).await;
+    let prompt = local.home.path().join("ask-prompt.yaml");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/cards/gateway_inference/ask-prompt.yaml"),
+        &prompt,
+    )
+    .expect("prompt fixture");
+    let applied = local
+        .command()
+        .args(["apply", prompt.to_str().expect("UTF-8 prompt")])
+        .output()
+        .await
+        .expect("card write");
+    assert!(applied.status.success());
+    local.stop("-INT").await;
+    let key = GlobalConfig::local_api_key(&local.environment())
+        .expect("protected")
+        .expect("key");
+
+    let elsewhere = tempfile::tempdir().expect("another working directory");
+    let mut command = local.command();
+    command
+        .current_dir(elsewhere.path())
+        .env_remove("WYRD_DATABASE_URL")
+        .env_remove("WYRD_SERVER_BIND")
+        .env_remove("WYRD_GRPC_BIND")
+        .env_remove("WYRD_BIFROST_DATA_DIR")
+        .args(["server", "dev", "--non-interactive"]);
+    local.start_with(command).await;
+    let restarted = GlobalConfig::local_api_key(&local.environment())
+        .expect("protected")
+        .expect("key");
+    assert_eq!(restarted.expose_secret(), key.expose_secret());
+    let card = Cards::connect_with(&local.client())
+        .await
+        .expect("handle connects")
+        .get(CardSelector::named(
+            CardKind::Prompt,
+            "default".parse().expect("space"),
+            "ask-prompt".parse().expect("name"),
+        ))
+        .await
+        .expect("data retained across directories");
+    assert_eq!(card.metadata.name.as_str(), "ask-prompt");
+    assert!(!elsewhere.path().join(".wyrd").exists());
+    let output = local.stop("-INT").await;
+    assert!(output.contains("Gateway: skipped"), "{output}");
 }
 
 /// The selected host configuration discovers and calls a read tool using

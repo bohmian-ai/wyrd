@@ -380,7 +380,7 @@ Commits: 2f3c4abef, bb9c7fe68, 7f7c99543, 88c8a07d1, 288bbd536, 6f2b215c6,
 | Saved `[dev]` settings, protected DB URLs, absolute data paths, cwd-independent restart | `wyrd-client/src/global_config.rs` `save_local_dev`/`local_databases`; `DevServer::save_settings` | P2, P8, `global_config` unit test | PASS |
 | Preflight save before key issue; no reissue; explicit recovery | `DevServer::run`/`save_tenant`/`recover` | P9 | PASS |
 | Main example/docs use shared setup and secret-free `local_env` document | `examples/gateway-setup/*`, `docs/...`, architecture notes | P7, `check:examples`, `docs:check` | PASS |
-| Standalone sibling apps use shared setup | — | P12 not authored | BLOCKED |
+| Standalone sibling apps use shared setup | sibling `gateway.json` (`local_env` `OPENAI_API_KEY`), PostgreSQL-only Compose, READMEs; `test_standalone_examples_use_saved_local_setup` | P12 (with `WYRD_EXAMPLES_DIR=<parent of the siblings>`), sibling `uv run pytest` 6 passed, `npm test` 6 passed | PASS |
 
 Checks: `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`,
 `codegen:check`, `docs:check`, `check:examples`, `py:lints`, `py:typecheck`,
@@ -390,10 +390,22 @@ package `README.md` added by a9ed593cd (root cause of the P7 inventory failure).
 Non-goals stayed excluded: no new credential sources, no platform-specific
 mechanism, no generated-artifact hand edits, no secret in argv/config/output.
 
+Sibling diffs (uncommitted; this task implies no sibling commit):
+- `wyrd-example-py`: `docker-compose.yml` → PostgreSQL only, `docker/` removed,
+  `gateway.json` → composite `local_env` document (all three were untracked
+  in-progress files; originals equal `wyrd-example-ts` HEAD), README setup
+  and "Run it with OpenAI" step 1 → `uv run wyrd server dev --gateway-file`,
+  `test/conftest.py` reads `["deployments"]`. Other uncommitted edits in that
+  tree predate this task and were left as found.
+- `wyrd-example-ts`: same Compose/`docker/`/`gateway.json`/README changes with
+  `npx wyrd`; `test/support-desk.test.ts` reads `.deployments`. Its prior
+  `README.md`/`scripts/evidence.ts` edits were left as found.
+- `wyrd-example-rs`: new `gateway.json`; README quickstart uses
+  `--skip-gateway` and live setup uses `--gateway-file` in place of the
+  `managed_secret` pipe. No code changed, so its ignored cargo test was not rerun.
+
 Limits:
-- `../wyrd-example-py` and `../wyrd-example-ts` hold another author's
-  uncommitted work in the same README/test files (staged deletions, README
-  rewrite); `../wyrd-example-rs` is untouched. Editing them now would mix diffs,
-  so the sibling migration and P12 are BLOCKED until those trees are committed.
+- P12 skips when the siblings are not checked out (CI); locally it ran against
+  `/home/thorrester/Documents/GitHub/wyrd-example-*`.
 - Interactive prompting is Unix-only (`cfg(unix)`); other hosts get the
   unattended refusal listing missing inputs.

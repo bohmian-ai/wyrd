@@ -940,3 +940,59 @@ def test_installed_cli_guided_setup() -> None:
         assert database.encode() not in disclosed
         assert database.encode() in protected
         assert not any(value.encode() in protected for value in secrets.values())
+
+
+EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")
+"""Standalone example repositories, checked out beside Wyrd or under ``WYRD_EXAMPLES_DIR``."""
+
+
+@pytest.mark.local_dev
+def test_standalone_examples_use_saved_local_setup() -> None:
+    """Each standalone example starts Wyrd with its own shipped gateway document.
+
+    No example ships a Wyrd bootstrap of its own: no key or tenant script, and
+    a Compose file that runs PostgreSQL only. Starting the installed CLI from
+    each repository's ``gateway.json`` with ``OPENAI_API_KEY`` set converges on
+    one tenant; fresh CLI and Python processes then use the ``openai``
+    deployment the apps call with saved settings alone, and the provider key
+    reaches neither output nor saved files.
+    """
+    root = Path(__file__).resolve().parents[4]
+    examples = Path(os.environ.get("WYRD_EXAMPLES_DIR", root.parent))
+    repos = [examples / name for name in EXAMPLE_REPOS]
+    absent = [str(repo) for repo in repos if not (repo / "gateway.json").is_file()]
+    if absent:
+        raise pytest.skip.Exception(f"standalone examples are not checked out: {absent}")
+    cli_path = str(root / "target/debug/wyrd")
+    provider_key = "sk-example-openai"
+    with local_deployment() as (home, env):
+        caller = dict(env)
+
+        def listed(resource: str) -> list[str]:
+            fresh = subprocess.run(
+                [cli_path, "gateway", resource, "list"],
+                cwd=home,
+                env=caller,
+                capture_output=True,
+                text=True,
+            )
+            assert fresh.returncode == 0, fresh.stderr
+            assert provider_key not in fresh.stdout + fresh.stderr
+            return [item["name"] for item in json.loads(fresh.stdout)]
+
+        for repo in repos:
+            assert not (repo / "docker/keys.sh").exists()
+            assert not (repo / "docker/setup.sh").exists()
+            compose = repo / "docker-compose.yml"
+            assert not compose.exists() or "wyrd:dev" not in compose.read_text(), compose
+            assert provider_key not in (repo / "gateway.json").read_text()
+            gateway_file = ("--gateway-file", str(repo / "gateway.json"))
+            started = {**env, "OPENAI_API_KEY": provider_key}
+            with installed_local_cli(
+                cli_path, home, started, "", tenant="support", extra=gateway_file
+            ):
+                assert listed("deployment") == ["openai"], repo
+                assert listed("credential") == ["openai-key"], repo
+                run_python(caller, "test_cli_bootstrap_saved_config")
+        for saved in (home / "wyrd").rglob("*.toml"):
+            assert provider_key not in saved.read_text(), saved

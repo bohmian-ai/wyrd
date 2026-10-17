@@ -12,12 +12,19 @@ use wyrd_testing::server::TEST_GATEWAY_CREDENTIAL_BINDING;
 /// the installed credential resolver's `WYRD_ACCESS_TOKEN` environment input
 /// with an empty configuration home and no competing credentials.
 fn gateway(endpoint: &str, token: &str, args: &[&str]) -> Output {
+    gateway_env(endpoint, token, args, &[])
+}
+
+/// Runs [`gateway`] with `vars` added to the command's environment, the way
+/// an administrator exports provider keys a document names.
+fn gateway_env(endpoint: &str, token: &str, args: &[&str], vars: &[(&str, &str)]) -> Output {
     let empty_config = tempfile::tempdir().expect("empty config home");
     Command::cargo_bin("wyrd")
         .expect("wyrd binary")
         .arg("gateway")
         .args(args)
         .args(["--server", endpoint])
+        .envs(vars.iter().copied())
         .env("WYRD_CONFIG_HOME", empty_config.path())
         .env("WYRD_ACCESS_TOKEN", token)
         .env_remove("WYRD_WORKLOAD_TOKEN")
@@ -443,5 +450,153 @@ async fn deployment_file_accepts_one_or_many() {
         ["later", "missing", "openai", "piped"],
         "names absent from a file are never deleted"
     );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A composite document naming a local environment variable applies the
+/// credential and its deployments in one request: unresolvable or malformed
+/// documents are refused before any request, a server refusal of a later
+/// deployment commits nothing, a valid document commits together with only
+/// redacted output, and reapplying converges.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed CLI journey lane"]
+async fn deployment_document_applies_local_environment() {
+    const VARIABLE: &str = "WYRD_JOURNEY_OPENAI_KEY";
+    const SECRET: &str = "sk-live-local-env-sentinel";
+    let server = WyrdTestServer::start_bound()
+        .await
+        .expect("test server starts");
+    let endpoint = server.base_url().expect("server is bound").to_owned();
+    let admin = server
+        .bootstrap_user("cli-apply-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let token = admin.jwt().expect("admin jwt").to_owned();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = |name: &str, credential: &str| json!({"name": name, "adapter": "openai", "auth": {"bearer": {"credential": credential}}});
+    let local = |variable: &str| json!({"name": "openai-key", "provider": "openai", "source": {"local_env": variable}});
+    let apply = |file: &str, vars: &[(&str, &str)]| {
+        gateway_env(
+            &endpoint,
+            &token,
+            &["deployment", "put", "--file", file],
+            vars,
+        )
+    };
+    let listed = |resource: &str| {
+        let mut names: Vec<String> = ok_json(&gateway(&endpoint, &token, &[resource, "list"]))
+            .as_array()
+            .expect("list")
+            .iter()
+            .map(|item| item["name"].as_str().expect("name").to_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let quiet = |output: &Output| {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "output discloses the key: {rendered}"
+        );
+    };
+
+    for (file, refused, vars, expected) in [
+        (
+            "unset.json",
+            json!({"credentials": [local(VARIABLE)], "deployments": [entry("openai", "openai-key")]}),
+            &[][..],
+            "unset or empty environment variable",
+        ),
+        (
+            "blank.json",
+            json!({"credentials": [local(VARIABLE)], "deployments": [entry("openai", "openai-key")]}),
+            &[(VARIABLE, "  ")][..],
+            "unset or empty environment variable",
+        ),
+        (
+            "shell.json",
+            json!({"credentials": [local("$(cat key)")], "deployments": [entry("openai", "openai-key")]}),
+            &[(VARIABLE, SECRET)][..],
+            "must be an environment variable name",
+        ),
+        (
+            "unused.json",
+            json!({"credentials": [local(VARIABLE)], "deployments": [entry("openai", "other-key")]}),
+            &[(VARIABLE, SECRET)][..],
+            "not referenced by a submitted deployment",
+        ),
+        (
+            "empty.json",
+            json!({"deployments": []}),
+            &[][..],
+            "must list at least one deployment",
+        ),
+    ] {
+        let output = apply(&document(dir.path(), file, &refused), vars);
+        quiet(&output);
+        let problem = problem(&output);
+        assert_eq!(problem["status"], 400, "{file}: {problem}");
+        assert!(problem.to_string().contains(expected), "{file}: {problem}");
+    }
+    assert!(
+        listed("credential").is_empty() && listed("deployment").is_empty(),
+        "local refusals send nothing"
+    );
+
+    let output = apply(
+        &document(
+            dir.path(),
+            "partial.json",
+            &json!({
+                "credentials": [local(VARIABLE)],
+                "deployments": [entry("openai", "openai-key"), entry("missing", "absent-key")],
+            }),
+        ),
+        &[(VARIABLE, SECRET)],
+    );
+    quiet(&output);
+    assert_eq!(
+        problem(&output)["code"],
+        "WYRD_GATEWAY_400_INVALID_CONFIGURATION"
+    );
+    assert!(
+        listed("credential").is_empty() && listed("deployment").is_empty(),
+        "a refused document commits nothing"
+    );
+
+    let file = document(
+        dir.path(),
+        "gateway.json",
+        &json!({
+            "credentials": [local(VARIABLE)],
+            "deployments": [entry("openai", "openai-key"), entry("openai-backup", "openai-key")],
+        }),
+    );
+    assert!(
+        !std::fs::read_to_string(&file)
+            .expect("document")
+            .contains(SECRET)
+    );
+    for _ in 0..2 {
+        let output = apply(&file, &[(VARIABLE, SECRET)]);
+        quiet(&output);
+        let applied = ok_json(&output);
+        assert_eq!(
+            applied["credentials"][0]["source"], "managed_secret",
+            "{applied}"
+        );
+        assert_eq!(applied["deployments"][1]["name"], "openai-backup");
+        assert_eq!(listed("credential"), ["openai-key"]);
+        assert_eq!(
+            listed("deployment"),
+            ["openai", "openai-backup"],
+            "reapplying converges"
+        );
+    }
     server.shutdown().await.expect("test server shuts down");
 }

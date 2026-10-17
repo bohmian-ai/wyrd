@@ -3,8 +3,11 @@
 //! Each verb reads at most one JSON document, calls the shared
 //! [`wyrd_client::Gateway`] handle, and prints the server's redacted response
 //! as JSON on stdout. `deployment put` also accepts a nonempty list of
-//! deployments, validated whole before it writes each one in order. Authorization, validation, audit, and persistence stay on
-//! the server; failures keep their originating stable problem.
+//! deployments, validated whole before it writes each one in order, and a
+//! composite `{credentials, deployments}` document applied in one server
+//! transaction, whose credentials may name local environment variables.
+//! Authorization, validation, audit, and persistence stay on the server;
+//! failures keep their originating stable problem.
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -12,15 +15,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use serde_json::error::Category;
+use wyrd_client::environment::Environment;
 use wyrd_client::gateway_credential::CredentialWriter;
 use wyrd_client::{Gateway, WyrdClient};
+use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite, ProviderDeployment};
-use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
+use wyrd_spec::gateway::{
+    GatewayContractError, ProviderCredentialView, ProviderCredentialWrite,
+    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentsApplied,
+    ProviderDeploymentsApply,
+};
+use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 
 use crate::error::{CliBoundaryError, WyrdCliError};
 
@@ -75,7 +84,9 @@ pub enum CredentialVerb {
 #[derive(Debug, Subcommand)]
 pub enum DeploymentVerb {
     /// Create or replace the deployment named in the JSON document, or each
-    /// deployment of a nonempty JSON list in order.
+    /// deployment of a nonempty JSON list in order, or apply a
+    /// `{credentials, deployments}` document in one transaction; its
+    /// credentials may use `{"local_env": "VARIABLE"}` sources.
     Put(DocumentArg),
     /// Read one deployment.
     Get(DeploymentNameArg),
@@ -166,6 +177,9 @@ impl GatewayCommand {
                     }
                     DeploymentFile::Many(deployments) => {
                         put_deployments(&gateway, &deployments).await
+                    }
+                    DeploymentFile::Apply(apply) => {
+                        print(&apply_deployments_with(client, &apply).await?)
                     }
                 },
                 DeploymentVerb::Get(arg) => print(&gateway.deployment(&arg.name).await?),
@@ -294,6 +308,19 @@ async fn delete_credential_with(
     CredentialWriter::new(client).delete_credential(name).await
 }
 
+/// Apply credentials and deployments in one server transaction over an
+/// assembled `client`, the path behind `deployment put` and `server dev`.
+///
+/// # Errors
+/// Returns the server's permission, invalid-configuration, conflict, or
+/// availability error; nothing is applied on a refusal.
+pub(crate) async fn apply_deployments_with(
+    client: WyrdClient,
+    apply: &ProviderDeploymentsApply,
+) -> Result<ProviderDeploymentsApplied, WyrdError> {
+    CredentialWriter::new(client).apply_deployments(apply).await
+}
+
 /// Reads and decodes one typed JSON request document from `path`, or from
 /// standard input when `path` is `-`.
 ///
@@ -350,21 +377,136 @@ fn invalid_file(path: &Path, expected: String) -> WyrdCliError {
     }
 }
 
-/// The document of `wyrd gateway deployment put`: one deployment object, or
-/// a JSON list of the same objects.
+/// The document of `wyrd gateway deployment put`: one deployment object, a
+/// JSON list of the same objects, or a composite apply document.
 #[derive(Debug)]
-enum DeploymentFile {
+pub(crate) enum DeploymentFile {
     /// A single deployment; its put prints the server's response unchanged.
     One(ProviderDeployment),
     /// A nonempty, name-unique list of valid deployments, put in order.
     Many(Vec<ProviderDeployment>),
+    /// A validated composite document with local sources already resolved.
+    Apply(ProviderDeploymentsApply),
+}
+
+/// Fields that tell a composite document from a single deployment, which
+/// never carries `deployments`.
+#[derive(Deserialize)]
+struct DocumentShape {
+    /// Present only on a composite document.
+    deployments: Option<IgnoredAny>,
+}
+
+/// A composite authoring document: the wire apply body whose credentials may
+/// also name a local environment variable instead of carrying a value.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthoringApply {
+    /// Credentials to create or rotate.
+    #[serde(default)]
+    pub(crate) credentials: Vec<AuthoringCredential>,
+    /// Deployments to create or replace.
+    pub(crate) deployments: Vec<ProviderDeployment>,
+}
+
+/// One authoring credential: the wire write with an authoring source.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthoringCredential {
+    /// Tenant-unique credential name.
+    pub(crate) name: ProviderCredentialName,
+    /// Provider the credential authenticates to.
+    pub(crate) provider: ProviderId,
+    /// Where the credential value comes from.
+    pub(crate) source: AuthoringSource,
+}
+
+/// A credential source as authored locally.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuthoringSource {
+    /// Name of a local environment variable whose value the CLI submits as a
+    /// managed secret; never sent or persisted as a reference.
+    LocalEnv(String),
+    /// Any existing wire source, sent unchanged.
+    #[serde(untagged)]
+    Wire(ProviderCredentialWriteSource),
+}
+
+impl AuthoringApply {
+    /// Resolve every `local_env` source from `environment` into an in-memory
+    /// managed secret and validate the resulting wire document whole.
+    ///
+    /// A variable name is a literal name (`[A-Za-z_][A-Za-z0-9_]*`), never
+    /// shell syntax; an unset or blank value is refused without naming it.
+    ///
+    /// # Errors
+    /// Returns the [`GatewayContractError`] for the first invalid source or
+    /// document rule; nothing has been sent.
+    pub(crate) fn resolve(
+        self,
+        environment: &Environment,
+    ) -> Result<ProviderDeploymentsApply, GatewayContractError> {
+        let credentials = self
+            .credentials
+            .into_iter()
+            .enumerate()
+            .map(|(index, credential)| {
+                let source = match credential.source {
+                    AuthoringSource::Wire(source) => source,
+                    AuthoringSource::LocalEnv(variable) => {
+                        let field = || format!("credentials[{index}].source.local_env");
+                        if !is_variable_name(&variable) {
+                            return Err(GatewayContractError::new(
+                                field(),
+                                "must be an environment variable name",
+                            ));
+                        }
+                        let value = environment
+                            .var(&variable)
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| {
+                                GatewayContractError::new(
+                                    field(),
+                                    "names an unset or empty environment variable",
+                                )
+                            })?;
+                        ProviderCredentialWriteSource::ManagedSecret {
+                            secret: SecretBearer::new(value),
+                        }
+                    }
+                };
+                Ok(ProviderCredentialWrite {
+                    name: credential.name,
+                    provider: credential.provider,
+                    source,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let apply = ProviderDeploymentsApply {
+            credentials,
+            deployments: self.deployments,
+        };
+        apply.validate()?;
+        Ok(apply)
+    }
+}
+
+/// Whether `name` is a portable environment variable name.
+fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|next| next == '_' || next.is_ascii_alphanumeric())
 }
 
 impl DeploymentFile {
     /// Reads the deployment document at `path` (`-` for standard input).
     ///
-    /// A document whose first token is `[` is a list; anything else is one
-    /// deployment. A list is refused whole, before anything is written, when
+    /// A document whose first token is `[` is a list; an object with
+    /// `deployments` is a composite document, resolved and validated whole;
+    /// anything else is one deployment. A list is refused whole, before anything is written, when
     /// it is empty, repeats a name, or holds an entry that breaks the
     /// deployment contract, so no earlier entry is written for a later
     /// mistake.
@@ -374,9 +516,18 @@ impl DeploymentFile {
     /// Returns [`WyrdCliError::Io`] when the document cannot be read and
     /// [`WyrdCliError::InvalidArgument`] when it does not decode, or a list is
     /// empty, repeats a name, or holds an invalid entry.
-    fn read(path: &Path) -> Result<Self, WyrdCliError> {
+    pub(crate) fn read(path: &Path) -> Result<Self, WyrdCliError> {
         let bytes = read_bytes(path)?;
         if bytes.trim_ascii_start().first() != Some(&b'[') {
+            if decode_document::<DocumentShape>(path, &bytes)?
+                .deployments
+                .is_some()
+            {
+                return decode_document::<AuthoringApply>(path, &bytes)?
+                    .resolve(&Environment::Process)
+                    .map(Self::Apply)
+                    .map_err(|error| invalid_file(path, error.to_string()));
+            }
             return decode_document(path, &bytes).map(Self::One);
         }
         let deployments: Vec<ProviderDeployment> = decode_document(path, &bytes)?;

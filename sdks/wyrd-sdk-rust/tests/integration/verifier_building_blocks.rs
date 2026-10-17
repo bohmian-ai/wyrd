@@ -79,7 +79,7 @@ fn policy() -> PathBuf {
 }
 
 /// A Chat Completions reply whose assistant `message` is the given object.
-fn completion(message: Value) -> ResponseTemplate {
+pub(crate) fn completion(message: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "id": "chatcmpl-blocks",
         "object": "chat.completion",
@@ -107,7 +107,7 @@ async fn fail_reader(upstream: &MockServer, marker: &str, response: ResponseTemp
 /// One assistant tool call of `tool` with JSON `arguments`, as the model
 /// returns it: under the provider-facing name, which spells the dotted wire
 /// name with underscores.
-fn tool_call(id: &str, tool: &str, arguments: &Value) -> Value {
+pub(crate) fn tool_call(id: &str, tool: &str, arguments: &Value) -> Value {
     json!({
         "id": id,
         "type": "function",

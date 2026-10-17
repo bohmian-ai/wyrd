@@ -1,0 +1,28 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: empty-each
+  version: 1.0.0
+  space: default
+spec:
+  description: Every listed item is ok, judged inline and after a code step.
+  inputs:
+    items: {type: json}
+  steps:
+    - id: listed
+      action:
+        kind: code
+        entrypoint: listed
+        inputs: {items: inputs.items}
+        source:
+          inline: |
+            def listed(items):
+                return items
+      requirements:
+        - id: listed-ok
+          statement: Every item the step listed is ok
+          check: {kind: assert, each: "steps.listed.output[*]", operator: equals, expected: ok}
+  requirements:
+    - id: items-ok
+      statement: Every item is ok
+      check: {kind: assert, each: "inputs.items[*]", operator: equals, expected: ok}

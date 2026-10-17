@@ -1,0 +1,24 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: coding-review
+  version: 1.0.0
+  space: default
+spec:
+  description: A whole coding session kept its tests passing and its spans were reviewed live.
+  inputs:
+    calls: verifiers.coding-turn.inputs.call
+    traces: verifiers.coding-turn.inputs.trace
+    tests: verifiers.coding-turn.requirements.tests-pass.outcome
+  requirements:
+    - id: every-call-tested
+      statement: Every call of the session left the tests passing
+      check: {kind: assert, each: "inputs.tests[*]", operator: equals, expected: passed}
+    - id: spans-reviewed
+      statement: The coding session spans were reviewed live
+      check:
+        kind: agent
+        agent: ./coding-judge.yaml
+        inputs:
+          claim: requirement.statement
+          answer: inputs.traces

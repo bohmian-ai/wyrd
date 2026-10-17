@@ -9,16 +9,19 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 use wyrd_ai::bifrost::BifrostOptions;
 
+use opentelemetry::trace::TraceContextExt as _;
 use serde::Deserialize;
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::{CardRef, CardSelector, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Execution, File, Inputs, Submission};
+use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
     SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
@@ -27,8 +30,10 @@ use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
+use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, ancestry, coordinates, fixture, hydrate, register, registered};
+use crate::verifier_building_blocks::{completion, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);
@@ -145,13 +150,14 @@ impl Assistant {
             .expect("bundle loads offline")
     }
 
-    /// The principal id of the assistant Service, the identity every
-    /// [`Self::state`] and [`Self::verify_over_http`] judgment is requested as.
+    /// The principal id of the Service `service`; for the assistant, the
+    /// identity every [`Self::state`] and [`Self::verify_over_http`]
+    /// judgment is requested as.
     ///
     /// # Panics
     /// Panics when the CLI refuses to issue the Service key.
-    async fn principal(&self) -> String {
-        let [kind, name, version, space] = coordinates(&self.service);
+    async fn principal(&self, service: &CardRef) -> String {
+        let [kind, name, version, space] = coordinates(service);
         cli::issue_key(
             &kind,
             &name,
@@ -479,7 +485,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
     state.shutdown().await.expect("Bifrost stops");
 
     let calls = assistant.judge_calls().await;
-    let principal = assistant.principal().await;
+    let principal = assistant.principal(&assistant.service).await;
     let run_id = run.run_id().to_string();
     assert!(
         calls.iter().all(|call| call.act_principal_id != principal),
@@ -530,7 +536,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         .verify_over_http(&format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"))
         .await;
 
-    let principal = assistant.principal().await;
+    let principal = assistant.principal(&assistant.service).await;
     let calls = assistant.judge_calls().await;
     let [call] = &calls[..] else {
         panic!("exactly one judge call: {calls:?}");
@@ -1559,5 +1565,312 @@ async fn grouped_refund_changes_verdict() {
         refused.to_string().contains("verified_by[1].on_failure"),
         "{refused}"
     );
+    assistant.deployment.shutdown().await;
+}
+
+/// The `coding-review` judge's statement, which every request of its
+/// `spans-reviewed` check carries.
+const LIVE_REVIEW: &str = "spans were reviewed live";
+
+/// The coding judge's Verdict once it read the spans: passed, citing the
+/// session's first trace ID in its original `traces` evidence.
+const REVIEWED: &str = r#"{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}"#;
+
+/// What a Chat Completions request carrying tool results contains.
+const TOOL_TURN: &str = r#""role":"tool""#;
+
+impl Assistant {
+    /// Every request body the local judge received for the `coding-review`
+    /// `spans-reviewed` check, in arrival order.
+    ///
+    /// # Panics
+    /// Panics when the judge does not record requests.
+    async fn live_reviews(&self) -> Vec<String> {
+        self.judge
+            .received_requests()
+            .await
+            .expect("the judge records requests")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .filter(|body| body.contains(LIVE_REVIEW))
+            .collect()
+    }
+}
+
+/// Script the `coding-judge` check Agent on the local judge: a request that
+/// already carries tool results passes with [`REVIEWED`]; any other asks for
+/// one `bifrost.query` of the span names stored for `trace`.
+async fn script_coding_judge(judge: &MockServer, trace: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(LIVE_REVIEW))
+        .and(body_string_contains(TOOL_TURN))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": REVIEWED }),
+        ))
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    let query = tool_call(
+        "call-spans",
+        "bifrost.query",
+        &json!({
+            "sql": format!("SELECT name FROM vala.traces.spans WHERE trace_id = decode('{trace}', 'hex') ORDER BY name"),
+            "max_rows": 10,
+        }),
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(LIVE_REVIEW))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": null, "tool_calls": [query] }),
+        ))
+        .with_priority(2)
+        .mount(judge)
+        .await;
+}
+
+/// A coding session's prompt, edit, and test calls are judged per turn, and
+/// once idle the whole session is reviewed from only its declared sources:
+/// each call, its trace ID where one was recorded and null where none was,
+/// and each call's test outcome, failed one included. The trace slot carries
+/// the ID alone: the check Agent's first request names no span, and its
+/// `bifrost.query`, under the owning Service's ordinary tool and query
+/// grants, reads live the spans exported after the turns; once that grant
+/// is revoked, a later session's read is denied with nothing returned. An empty `each` selection is inconclusive `empty_selection`
+/// inline and after a step. A child-field source, a source with no binding
+/// on its site, and a source cycle are refused at registration.
+///
+/// # Panics
+/// Panics when a step fails, the session is not reviewed in time, or a
+/// judgment, a judge request, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_coding_uses_declared_sources() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let coding = assistant
+        .grouped("cards/verify_in_real_time/coding.yaml")
+        .await;
+    deployment
+        .server()
+        .seed_role(
+            "live_reader",
+            &[
+                json!({ "resource": "tool", "action": "invoke", "scope": "all" }),
+                json!({ "resource": "bifrost_query", "action": "read", "scope": "all" }),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("principals connect");
+    let principal = assistant
+        .principal(&coding.receipt.root)
+        .await
+        .parse()
+        .expect("principal id");
+    principals
+        .grant_role(&principal, "live_reader")
+        .await
+        .expect("the Service may read spans live");
+    let group = GroupId::new("session-1").expect("group id");
+    let (dispatch, provider) = service_telemetry(&deployment.client(&coding.key));
+    let session = tracing::dispatcher::with_default(&dispatch, || {
+        let session = tracing::info_span!("session", otel.name = "coding-session");
+        tracing::info_span!(parent: &session, "edit", otel.name = "edit-file").in_scope(|| ());
+        session
+    });
+    let trace = session
+        .context()
+        .span()
+        .span_context()
+        .trace_id()
+        .to_string();
+    script_coding_judge(&assistant.judge, &trace).await;
+    let calls = [
+        json!({"call": "prompt", "tests": "passed"}),
+        json!({"call": "edit", "tests": "failed"}),
+        json!({"call": "test", "tests": "passed"}),
+    ];
+    let run = coding.state.run_for_card("agent").expect("agent run opens");
+    let mut verdicts = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        let mut inputs = vec![("call", Input::from(call.clone()))];
+        if index == 0 {
+            inputs.push(("trace", Input::from(json!(trace))));
+        }
+        let judged = run
+            .observe()
+            .group_id(group.clone())
+            .verify("coding-turn", Inputs::named(inputs))
+            .await
+            .expect("the call is judged");
+        verdicts.push(judged.outcome.verdict);
+    }
+    assert_eq!(
+        verdicts,
+        [
+            VerificationVerdict::Passed,
+            VerificationVerdict::Failed,
+            VerificationVerdict::Passed
+        ]
+    );
+    let empty = run
+        .observe()
+        .verify("empty-each", json!([]))
+        .await
+        .expect("the empty list is judged");
+    assert_eq!(empty.outcome.verdict, VerificationVerdict::Inconclusive);
+    let reasons: Vec<_> = empty
+        .outcome
+        .requirements
+        .iter()
+        .map(|requirement| {
+            (
+                requirement.id.as_str(),
+                requirement.outcome,
+                requirement.reason.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (
+                "listed-ok",
+                RequirementOutcome::Inconclusive,
+                "empty_selection"
+            ),
+            (
+                "items-ok",
+                RequirementOutcome::Inconclusive,
+                "empty_selection"
+            ),
+        ]
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        tracing::info_span!(parent: &session, "late", otel.name = "late-test-run").in_scope(|| ());
+    });
+    drop(session);
+    tokio::task::block_in_place(|| provider.force_flush()).expect("the spans export");
+
+    let judged = deployment
+        .group_execution(&coding.binding, None, WAIT)
+        .await;
+
+    let outcome = judged.result.expect("the result is visible").outcome;
+    let evidence = |slot: &str| {
+        serde_json::to_value(&outcome.evidence[&slot.parse().expect("slot name")])
+            .expect("evidence encodes")
+    };
+    assert_eq!(evidence("calls"), json!({"kind": "json", "value": calls}));
+    assert_eq!(
+        evidence("traces"),
+        json!({"kind": "json", "value": [trace, null, null]})
+    );
+    assert_eq!(
+        evidence("tests"),
+        json!({"kind": "json", "value": ["passed", "failed", "passed"]})
+    );
+    let judged_requirements: Vec<_> = outcome
+        .requirements
+        .iter()
+        .map(|requirement| (requirement.id.as_str(), requirement.outcome))
+        .collect();
+    assert_eq!(
+        judged_requirements,
+        [
+            ("every-call-tested", RequirementOutcome::Failed),
+            ("spans-reviewed", RequirementOutcome::Passed),
+        ],
+        "{:#?}",
+        outcome.requirements
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+    let (reads, asks): (Vec<_>, Vec<_>) = assistant
+        .live_reviews()
+        .await
+        .into_iter()
+        .partition(|body| body.contains(TOOL_TURN));
+    let [ask] = &asks[..] else {
+        panic!("one review request before any tool result: {asks:?}");
+    };
+    assert!(
+        ask.contains(&trace) && !ask.contains("edit-file"),
+        "the trace slot carries its ID only: {ask}"
+    );
+    let [read] = &reads[..] else {
+        panic!("one review request carries the live read: {reads:?}");
+    };
+    assert!(
+        read.contains("edit-file") && read.contains("late-test-run"),
+        "the check reads the spans live: {read}"
+    );
+
+    principals
+        .revoke_role(&principal, "live_reader")
+        .await
+        .expect("the live read is revoked");
+    let later = GroupId::new("session-2").expect("group id");
+    run.observe()
+        .group_id(later.clone())
+        .verify(
+            "coding-turn",
+            Inputs::named([
+                ("call", Input::from(calls[0].clone())),
+                ("trace", Input::from(json!(trace))),
+            ]),
+        )
+        .await
+        .expect("the call is judged");
+    let revoked = deployment
+        .group_execution(&coding.binding, Some(&judged.execution_id), WAIT)
+        .await;
+    assert_eq!(revoked.group_id.as_ref(), Some(&later));
+    let denied: Vec<_> = assistant
+        .live_reviews()
+        .await
+        .into_iter()
+        .filter(|body| body.contains(TOOL_TURN) && body.contains("WYRD_PERMISSION_403_DENIED_RBAC"))
+        .collect();
+    let [denied] = &denied[..] else {
+        panic!("the query read is denied once: {denied:?}");
+    };
+    assert!(
+        !denied.contains("edit-file"),
+        "a denied read returns nothing: {denied}"
+    );
+
+    let cards = deployment.cards().await;
+    for (relative, code, reason) in [
+        (
+            "coding-child.yaml",
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "child fields",
+        ),
+        (
+            "coding-unbound.yaml",
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 0 bindings",
+        ),
+        (
+            "coding-cycle.yaml",
+            "WYRD_SPEC_400_VALIDATION",
+            "forms a source cycle",
+        ),
+    ] {
+        let refused = cards
+            .register_from_path(&fixture(&format!("cards/verify_in_real_time/{relative}")))
+            .await
+            .expect_err(relative);
+        assert_eq!(refused.code(), code, "{relative}: {refused}");
+        assert!(
+            format!("{refused:?}").contains(reason),
+            "{relative}: {refused:?}"
+        );
+    }
+    coding.state.shutdown().await.expect("Bifrost stops");
     assistant.deployment.shutdown().await;
 }

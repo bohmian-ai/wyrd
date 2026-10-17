@@ -1621,17 +1621,18 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueGroupBinding>, SqlxError> {
-        let due: Option<(
-            Uuid,
-            Uuid,
-            Uuid,
-            Uuid,
-            Json<GroupEndSettings>,
-            DateTime<Utc>,
-        )> = sqlx::query_as(DUE_GROUP_SQL)
+        let due: Option<DueGroupRow> = sqlx::query_as(DUE_GROUP_SQL)
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        let Some((binding_id, owner, card, verifier, Json(settings), clock)) = due else {
+        let Some(DueGroupRow {
+            binding_id,
+            owner_card_uid: owner,
+            card_uid: card,
+            verifier_card_uid: verifier,
+            group_end: Json(settings),
+            clock,
+        }) = due
+        else {
             return Ok(None);
         };
         let binding_id = stored(BindingId::new(binding_id))?;
@@ -2497,6 +2498,24 @@ struct DueBindingRow {
     /// tick is made at, so a boundary counts as passed only once its own
     /// occurrence would be claimable.
     schedule_clock: DateTime<Utc>,
+}
+
+/// A locked due `group_end` binding from [`DUE_GROUP_SQL`], carrying the
+/// database instant its poll is decided at.
+#[derive(sqlx::FromRow)]
+struct DueGroupRow {
+    /// Binding identity.
+    binding_id: Uuid,
+    /// The Service whose groups the binding judges.
+    owner_card_uid: Uuid,
+    /// The bound subject Card.
+    card_uid: Uuid,
+    /// The bound Verifier Card.
+    verifier_card_uid: Uuid,
+    /// The binding's pinned `group_end` settings.
+    group_end: Json<GroupEndSettings>,
+    /// PostgreSQL's statement instant for this poll.
+    clock: DateTime<Utc>,
 }
 
 /// An execution status row from [`STATUS_SQL`].

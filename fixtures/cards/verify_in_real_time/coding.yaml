@@ -1,0 +1,16 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: coding
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./coding-turn.yaml
+        - verifier: ./empty-each.yaml
+        - verifier: ./coding-review.yaml
+          runs_on: {kind: group_end, idle: 3s, max_age: 1h, finality: 1d}

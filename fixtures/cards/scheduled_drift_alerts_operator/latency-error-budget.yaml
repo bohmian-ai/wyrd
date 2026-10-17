@@ -1,0 +1,30 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: latency-error-budget
+  version: 1.0.0
+  space: default
+spec:
+  description: Daily check that request latency and error rate stay within budget.
+  inputs:
+    latency: {type: samples, features: [latency]}
+    error_rate: {type: samples, features: [error_rate]}
+  requirements:
+    - id: latency-within-budget
+      statement: Mean request latency stays at or below 100 ms
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 0.0, alert_threshold: 100.0}
+    - id: error-rate-within-budget
+      statement: Mean error rate stays at or below 0.05
+      check:
+        kind: drift
+        on: inputs.error_rate
+        method: Custom
+        signal: {kind: Metric, name: error_rate}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: error_rate, baseline_value: 0.0, alert_threshold: 0.05}

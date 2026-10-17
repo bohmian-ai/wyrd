@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: budget-with-exact-inputs
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: {kind: Verifier, name: latency-error-budget, version: 1.0.0, space: default}
+      runs_on: {kind: schedule, cron: "0 0 * * *"}
+      inputs: {latency: {features: [latency]}, error_rate: {features: [error_rate]}}

@@ -6,10 +6,11 @@ import { trace } from "@opentelemetry/api";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, Cards, type VerifierInputs, WyrdClient, WyrdState, verify } from "wyrd-ai";
+import { Bifrost, Cards, OperatorConnections, type VerifierInputs, WyrdClient, WyrdState, verify } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { type Assistant, assistantAs, assistantTest, judgeCalls, type JudgeCall } from "../support/assistant.js";
+import { Receiver } from "../support/http-receiver.js";
 import { ancestry, binding, fixture, groupExecution, registered, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
@@ -419,27 +420,38 @@ async function enqueueOverHttp(baseUrl: string, key: string, idempotencyKey: str
   return accepted.execution_id;
 }
 
-test("grouped support resumes", async ({ server, assistant }) => {
+/**
+ * Register and hydrate the Service fixture at `path`, start its state with the
+ * Service's own key, and find the one binding whose status pins `group_end`
+ * settings.
+ */
+async function grouped(baseUrl: string, path: string) {
   const cards = await Cards.connect();
-  const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/support.yaml"));
-  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-support-"));
+  const receipt = await cards.registerFromPath(fixture(path));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await cards.hydrate(receipt.root, bundle);
   const key = (await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" })).key;
   const token = await WyrdClient.connect().accessToken();
-  const bindingIds = (await cards.get(receipt.root)).status?.verification?.binding_ids ?? [];
-  const grouped: string[] = [];
-  for (const id of bindingIds) {
-    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, {
+  const bindingIds: string[] = [];
+  for (const id of (await cards.get(receipt.root)).status?.verification?.binding_ids ?? []) {
+    const response = await fetch(`${baseUrl}/v1/verification/bindings/${id}`, {
       headers: { "x-wyrd-access-token": `Bearer ${token}` },
     });
     if (((await response.json()) as { group_end?: unknown }).group_end) {
-      grouped.push(id);
+      bindingIds.push(id);
     }
   }
-  const [bindingId] = grouped;
-  expect(grouped).toHaveLength(1);
+  expect(bindingIds).toHaveLength(1);
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
   await state.startBifrost();
+  return { cards, receipt, bundle, key, state, bindingId: bindingIds[0] };
+}
+
+test("grouped support resumes", async ({ server, assistant }) => {
+  const { cards, receipt, bundle, key, state, bindingId } = await grouped(
+    server.baseUrl,
+    "cards/verify_in_real_time/support.yaml",
+  );
   const group = "conv-1";
   const turns = [1, 2, 3, 4, 5, 6].map((turn) => ({ turn, answer: `answer ${turn}` }));
   const grouping = { positional: true, group_id: group };
@@ -495,3 +507,91 @@ test("grouped support resumes", async ({ server, assistant }) => {
     message: expect.stringContaining("verified_by[0].runs_on"),
   });
 });
+
+test("grouped refund changes verdict", async ({ server }) => {
+  const hooks = await Receiver.start(() => ({ status: 200 }));
+  await (await OperatorConnections.connect()).create({
+    provider: "http",
+    name: "refund-hooks",
+    origin: hooks.url,
+    auth: { scheme: "bearer", token: "refund-hook-token" },
+  });
+  const { cards, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/refund.yaml");
+  const group = "order-1";
+  const opened = Date.now();
+  const turn = (overdue: boolean) =>
+    state.run("agent").observe.verify("refund-turn", { order: "A-1", overdue }, { positional: true, group_id: group });
+
+  await turn(false);
+  await turn(false);
+  const promised = await groupExecution(server, bindingId, WAIT_MS);
+  for (const overdue of [false, true, false]) {
+    await turn(overdue);
+  }
+  const corrected = await groupExecution(server, bindingId, WAIT_MS, promised.execution_id);
+  await turn(false);
+  const unchanged = await groupExecution(server, bindingId, WAIT_MS, corrected.execution_id);
+
+  expect(
+    [promised, corrected, unchanged].map((review) => [
+      review.group?.sources.facts.execution_ids.length,
+      review.result?.outcome.verdict,
+      review.dispatches.length,
+    ]),
+    "only the verdict change dispatches",
+  ).toEqual([
+    [2, "passed", 0],
+    [5, "failed", 1],
+    [6, "failed", 0],
+  ]);
+  const history = await (await Bifrost.connect()).sql(
+    "SELECT execution_id, result_id, verdict FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
+    [bindingId],
+    z.object({ execution_id: z.string(), result_id: z.string(), verdict: z.string() }),
+  );
+  expect(
+    history.map((row) => [row.execution_id, row.verdict]),
+    "every review stays retained",
+  ).toEqual([
+    [promised.execution_id, "passed"],
+    [corrected.execution_id, "failed"],
+    [unchanged.execution_id, "failed"],
+  ]);
+  const [alert] = await hooks.requests(1);
+  expect(alert?.path).toBe("/hooks/refund-review");
+  expect(JSON.parse(alert?.body ?? "null")).toEqual({
+    execution_id: corrected.execution_id,
+    result_id: history[1]?.result_id,
+    verdict: "failed",
+    group_id: group,
+    previous_result_id: history[0]?.result_id,
+    previous_verdict: "passed",
+  });
+
+  // The fixture's 40 s finality, counted from the group's first turn, must
+  // pass before the late turn; waiting for it is the scenario.
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, opened + 41_000 - Date.now())));
+  await turn(true);
+  await state.shutdown();
+  const token = await WyrdClient.connect().accessToken();
+  const quiet = Date.now() + 8_000;
+  while (Date.now() < quiet) {
+    server.flushBifrost();
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${bindingId}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    expect(
+      ((await response.json()) as { last_execution_id: string | null }).last_execution_id,
+      "a turn after finality opens no review",
+    ).toBe(unchanged.execution_id);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  expect(hooks.received).toHaveLength(1);
+  await hooks.close();
+  await expect(
+    cards.registerFromPath(fixture("cards/verify_in_real_time/refund-on-failure.yaml")),
+  ).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+    message: expect.stringContaining("verified_by[1].on_failure"),
+  });
+}, 180_000);

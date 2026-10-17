@@ -381,7 +381,7 @@ def wait_for_local_cli(child: subprocess.Popen[str], master: int, terminal: str,
         assert b"wyrd_global_" in disclosed
 
 
-def stop_local_cli(child: subprocess.Popen[str]) -> None:
+def stop_local_cli(child: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
     """Interrupt and reap the owned CLI, killing its group on deadline failure."""
     if child.poll() is None:
         child.send_signal(signal.SIGINT)
@@ -906,7 +906,8 @@ def test_installed_cli_guided_setup() -> None:
                     (b"Connect which hosts", b""),
                 ],
             )
-            threading.Thread(target=child.stdout.read, daemon=True).start()  # type: ignore[union-attr]
+            assert child.stdout is not None
+            threading.Thread(target=child.stdout.read, daemon=True).start()
             assert b"openai from OPENAI_API_KEY" in shown
             assert b"gemini from GOOGLE_API_KEY" in shown
             assert b"WYRD_STORAGE_URL is unset" in shown
@@ -926,7 +927,7 @@ def test_installed_cli_guided_setup() -> None:
             assert listed("deployment") == ["gemini-local"]
             assert listed("credential") == ["gemini-key"]
         finally:
-            stop_local_cli(child)  # type: ignore[arg-type]
+            stop_local_cli(child)
             os.close(master)
         stderr.seek(0)
         errors = stderr.read()

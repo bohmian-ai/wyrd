@@ -364,3 +364,36 @@ decision are settled; no extra naming/approval rounds are required.
   [spec workflow](../../../../architecture/references/languages/spec-driven-development.md),
   [implementation execution](../../../../architecture/references/languages/implementation-execution.md),
   [testing](../../../../architecture/references/languages/testing-workflows.md).
+
+## Implementation Evidence
+
+Commits: 2f3c4abef, bb9c7fe68, 7f7c99543, 88c8a07d1, 288bbd536, 6f2b215c6,
+3c875c3d6, and the evidence commit. Build:
+`mise exec -- cargo build --locked -p wyrd-cli -p wyrd-server -p wyrd-monty-worker --bins --tests`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Guided/unattended setup converges; missing/invalid inputs refuse safely | `wyrd-cli/src/server/dev.rs` `DevArgs::resolve`, `terminal.rs` | P1, P2, P8 (unattended missing-input, storage-userinfo, gateway-file/skip refusals) | PASS |
+| Gateway optional; only approved providers sent; redacted output | `DevInputs::offer_gateway`/`configure_gateway`, `PROVIDERS` | P1 (gemini only), P3, P7 | PASS |
+| Atomic tenant-scoped apply over HTTP/MCP; no partial commit | server gateway apply, `wyrd-mcp` gateway tool | P4, P10, P11 | PASS |
+| Retained credential/deployment and server-source semantics | unchanged owners | P5a, P5b, P6a, P6b | PASS |
+| Saved `[dev]` settings, protected DB URLs, absolute data paths, cwd-independent restart | `wyrd-client/src/global_config.rs` `save_local_dev`/`local_databases`; `DevServer::save_settings` | P2, P8, `global_config` unit test | PASS |
+| Preflight save before key issue; no reissue; explicit recovery | `DevServer::run`/`save_tenant`/`recover` | P9 | PASS |
+| Main example/docs use shared setup and secret-free `local_env` document | `examples/gateway-setup/*`, `docs/...`, architecture notes | P7, `check:examples`, `docs:check` | PASS |
+| Standalone sibling apps use shared setup | — | P12 not authored | BLOCKED |
+
+Checks: `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`,
+`codegen:check`, `docs:check`, `check:examples`, `py:lints`, `py:typecheck`,
+`git diff --check` — all pass. `scripts/check_ts_package.mjs` now allows the
+package `README.md` added by a9ed593cd (root cause of the P7 inventory failure).
+
+Non-goals stayed excluded: no new credential sources, no platform-specific
+mechanism, no generated-artifact hand edits, no secret in argv/config/output.
+
+Limits:
+- `../wyrd-example-py` and `../wyrd-example-ts` hold another author's
+  uncommitted work in the same README/test files (staged deletions, README
+  rewrite); `../wyrd-example-rs` is untouched. Editing them now would mix diffs,
+  so the sibling migration and P12 are BLOCKED until those trees are committed.
+- Interactive prompting is Unix-only (`cfg(unix)`); other hosts get the
+  unattended refusal listing missing inputs.

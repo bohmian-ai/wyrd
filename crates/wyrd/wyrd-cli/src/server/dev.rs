@@ -97,8 +97,10 @@ struct DevInputs {
     /// Whether to offer detected provider keys: a fresh interactive setup
     /// without `--gateway-file` or `--skip-gateway`.
     offer_gateway: bool,
-    /// Whether an earlier run already completed setup for this endpoint;
-    /// it suppresses the automatic gateway and host offers.
+    /// Whether an earlier run already completed setup for the saved
+    /// deployment: its key and an endpoint are saved. Startup proves the key
+    /// against the selected server first, so a listener override still
+    /// counts; it suppresses the automatic gateway and host offers.
     configured: bool,
 }
 
@@ -187,7 +189,9 @@ impl DevArgs {
     ///
     /// # Errors
     /// Refuses unsafe local files, invalid or missing inputs, a saved key or
-    /// login that belongs to another tenant, and an unreadable gateway file.
+    /// login that belongs to another tenant, a saved key with no saved
+    /// `[dev]` tenant, a remote selection without one, and an unreadable
+    /// gateway file.
     async fn resolve(&self, root: &Path) -> Result<DevInputs, WyrdCliError> {
         // Check local files before any server operation can issue a key.
         let environment = Environment::Process;
@@ -324,6 +328,12 @@ impl DevArgs {
                 "this configuration directory selects another Wyrd server and is preserved; use a separate WYRD_CONFIG_HOME for local setup; nothing has run",
             ));
         }
+        if saved_tenant.is_none() && key.is_some() {
+            return Err(dev_error(
+                "saved credential",
+                "the saved key was not created by local setup, so it is preserved; use a separate WYRD_CONFIG_HOME for local setup; nothing has run",
+            ));
+        }
         validate_saved_login(&endpoint, &tenant, global.client.tenant.as_deref())?;
         let (storage_url, bifrost) = local_data(
             first(
@@ -338,8 +348,10 @@ impl DevArgs {
             ),
             root,
         )?;
-        let configured =
-            key.is_some() && global.client.http_url.as_deref() == Some(endpoint.as_str());
+        // The key proves this is the saved deployment (checked against the
+        // ready server before any write); a saved endpoint proves setup
+        // finished, so a listener override alone is not a first setup.
+        let configured = key.is_some() && global.client.http_url.is_some();
         Ok(DevInputs {
             offer_gateway: interactive && !self.skip_gateway && !configured,
             configured,
@@ -515,9 +527,10 @@ impl DevServer {
     /// Migrate, serve, save settings, provision, persist, authenticate a new
     /// client, apply any requested gateway document, and wait.
     ///
-    /// A saved key must first authenticate against the selected ready server,
-    /// proving it serves the saved deployment, before any saved setting is
-    /// replaced or a tenant is created. Settings are then saved before
+    /// The exact saved key must first authenticate against the selected ready
+    /// server, proving it serves the saved deployment, before any saved
+    /// setting is replaced or a tenant is created; no saved login or ambient
+    /// credential can stand in for it, and the proof writes no file. Settings are then saved before
     /// provisioning so a protected-file failure surfaces before a one-time
     /// key is issued. Only first setup offers the
     /// gateway and detected hosts; `configured` restarts skip both offers
@@ -535,11 +548,10 @@ impl DevServer {
     async fn run(&mut self, hosts: &[McpHost]) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
         let grpc = format!("http://{}", self.inputs.grpc);
-        if GlobalConfig::local_api_key(&Environment::Process)
-            .map_err(map_client_error)?
-            .is_some()
+        if let Some(key) =
+            GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?
         {
-            saved_client(&self.endpoint, &grpc).await.map_err(|_| {
+            proven(saved_key_config(&self.endpoint, &grpc, key)).await.map_err(|_| {
                 dev_error(
                     "saved credential",
                     "the selected server does not accept the saved key, so saved settings are kept and no tenant was created; for another database use a separate WYRD_CONFIG_HOME, or restore the key or use wyrd platform tenant recover-admin",
@@ -1258,10 +1270,10 @@ async fn offer_gateway() -> Result<Option<ProviderDeploymentsApply>, WyrdCliErro
     Ok(None)
 }
 
-/// Assemble a client from the saved key and settings, addressed to the
-/// selected `endpoint` and `grpc` listeners, authenticate it, and perform a
-/// bounded read before returning it. Startup uses it to prove a saved key
-/// belongs to the selected server and, after setup, for gateway setup.
+/// Assemble a client from the saved settings with the ordinary credential
+/// precedence, addressed to the selected `endpoint` and `grpc` listeners,
+/// and return it once [`proven`]. Gateway setup uses it after the tenant is
+/// saved; the startup preflight uses [`saved_key_config`] instead.
 ///
 /// # Errors
 /// Returns redacted guidance for unusable configuration or credentials.
@@ -1277,12 +1289,38 @@ async fn saved_client(endpoint: &str, grpc: &str) -> Result<WyrdClient, WyrdCliE
         directory.to_string_lossy().into_owned(),
     )]));
     let global = GlobalConfig::load_in(&environment).map_err(map_client_error)?;
-    let client = WyrdClient::with_config(ClientConfig::from_environment(
-            environment,
-            &global,
+    proven(ClientConfig::from_environment(
+        environment,
+        &global,
+        Some(endpoint),
+        Some(grpc),
+    ))
+    .await
+}
+
+/// A client configuration presenting exactly the saved `key` to `endpoint`
+/// and `grpc`: no tenant selector, saved login, ambient credential, or disk
+/// token cache can substitute another identity or touch protected files.
+fn saved_key_config(endpoint: &str, grpc: &str, key: SecretString) -> ClientConfig {
+    ClientConfig {
+        credential: Some(key),
+        ..ClientConfig::from_environment(
+            Environment::Fixed(HashMap::new()),
+            &GlobalConfig::default(),
             Some(endpoint),
             Some(grpc),
-        ))
+        )
+    }
+}
+
+/// Build a client from `config` and prove the ready server accepts its
+/// credential with a token exchange and a bounded tenant read.
+///
+/// # Errors
+/// Returns saved-credential guidance when the credential is unusable,
+/// refused at exchange, or refused by the tenant read.
+async fn proven(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
+    let client = WyrdClient::with_config(config)
         .map_err(|_| dev_error("saved credential", "the active tenant has no usable saved credential or its configuration selects another identity; restore its key, correct the selector, or explicitly recover tenant administration through the platform"))?;
     client.access_token().await.map_err(|_| dev_error("saved credential", "the tenant is active but its saved key is missing, invalid, or expired; restore that key or explicitly recover tenant administration through the platform"))?;
     Cards::connect_with(&client).await?.list(ListCardsRequest {

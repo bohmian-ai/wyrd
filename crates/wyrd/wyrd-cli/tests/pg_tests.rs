@@ -17,9 +17,12 @@ use tokio::task::JoinHandle;
 use wyrd_client::bifrost::{Correlation, TableConfig};
 use wyrd_client::cards::{CardSelector, Cards};
 use wyrd_client::environment::Environment;
+use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_dev_fixtures::pg::UnmigratedDatabase;
+use wyrd_spec::auth::{SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::TenantSlug;
 
 use crate::mcp_journey::{list_tables_through_proxy, wyrd};
 
@@ -309,6 +312,29 @@ fn free_bind() -> String {
         .to_string()
 }
 
+/// Every tenant slug in the deployment database at `dsn`, read in an
+/// operator session because tenant rows are hidden from ordinary sessions.
+///
+/// # Panics
+/// Panics when the database cannot be reached or the read fails.
+async fn tenant_slugs(dsn: &SecretString) -> Vec<String> {
+    let pool = sqlx::PgPool::connect(dsn.expose_secret())
+        .await
+        .expect("deployment database connects");
+    let mut operator = pool.begin().await.expect("operator transaction");
+    sqlx::query("SELECT set_config('app.operator', 'on', true)")
+        .execute(&mut *operator)
+        .await
+        .expect("operator session");
+    let slugs = sqlx::query_scalar("SELECT slug FROM platform.tenants ORDER BY slug")
+        .fetch_all(&mut *operator)
+        .await
+        .expect("tenant slugs");
+    drop(operator);
+    pool.close().await;
+    slugs
+}
+
 /// First use migrates an empty database, saves a private key and both
 /// endpoints, and supports fresh CLI writes and client reads outside the
 /// checkout. A stale saved gRPC destination is replaced by the selected
@@ -476,7 +502,11 @@ async fn server_dev_first_run_is_client_ready() {
 /// on a later start is still connected. Another database whose server rejects
 /// the saved key, and a configuration directory selecting a remote server
 /// with or without a key, are refused without changing saved files or
-/// creating a tenant, and the saved deployment then resumes.
+/// creating a tenant, and the saved deployment then resumes. A same-origin
+/// key with no saved `[dev]` tenant is refused before startup even with real
+/// platform authority, and a valid same-origin, same-slug login from another
+/// deployment never stands in for the saved key when its database is
+/// selected.
 ///
 /// # Panics
 /// Panics when a retry changes persisted identity or exposes credentials.
@@ -610,6 +640,145 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         installed
     );
 
+    // A same-origin key with no saved [dev] tenant is not this local
+    // deployment's selection: requesting another tenant, with or without real
+    // platform authority, is refused before startup and changes nothing.
+    let recovered = Command::new(local.home.path().join("wyrd/server/current/wyrd-server"))
+        .arg("recover-root")
+        .env("WYRD_DATABASE_URL", local.dsn.expose_secret())
+        .env_remove("WYRD_PLATFORM_DATABASE_URL")
+        .env("APP_ENV", "development")
+        .output()
+        .await
+        .expect("platform authority");
+    assert!(
+        recovered.status.success(),
+        "platform recovery: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let authority = String::from_utf8(recovered.stdout)
+        .expect("UTF-8 recovery")
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("platform credential")
+        .to_owned();
+    let settings = fs::read_to_string(&config).expect("saved settings");
+    let mut unselected: toml_edit::DocumentMut = settings.parse().expect("saved settings parse");
+    unselected.remove("dev").expect("saved dev section");
+    fs::write(&config, unselected.to_string()).expect("unselected key");
+    let unselected = (
+        fs::read(&credentials).expect("key"),
+        fs::read(&config).expect("config"),
+    );
+    for platform in [None, Some(authority.as_str())] {
+        let mut command = local.command();
+        if let Some(platform) = platform {
+            command.env("WYRD_PLATFORM_CREDENTIAL", platform);
+        }
+        let refused = command
+            .args(["server", "dev", "--tenant", "another", "--non-interactive"])
+            .output()
+            .await
+            .expect("unselected key");
+        let errors = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{errors}");
+        assert!(errors.contains("not created by local setup"), "{errors}");
+        assert!(!errors.contains("wyrd_global_") && !errors.contains("wyrd_sk_"));
+        assert_eq!(
+            (
+                fs::read(&credentials).expect("key"),
+                fs::read(&config).expect("config")
+            ),
+            unselected,
+            "the unselected key and settings are byte-preserved"
+        );
+        assert!(TcpListener::bind(&local.bind).is_ok(), "nothing started");
+    }
+    assert!(
+        !tenant_slugs(&local.dsn)
+            .await
+            .contains(&"another".to_owned()),
+        "no other tenant or key was issued"
+    );
+    fs::write(&config, &settings).expect("restore the dev selection");
+
+    // A valid login for this origin and tenant slug from another deployment
+    // cannot stand in for the saved key when its database is selected: only
+    // the exact saved key is proven, and refusal precedes every write.
+    let signing = wyrd_testing::keys::oracle_peer_signing_key_pem();
+    let mut elsewhere = LocalDev::new().await;
+    elsewhere.bind.clone_from(&local.bind);
+    elsewhere.grpc.clone_from(&local.grpc);
+    elsewhere.peer.clone_from(&local.peer);
+    let mut command = elsewhere.command();
+    command
+        .env("WYRD_SIGNING_KEY_PEM", signing.expose_secret())
+        .args(["server", "dev", "--tenant", "local"]);
+    elsewhere.start_with(command).await;
+    let token = elsewhere
+        .client()
+        .access_token()
+        .await
+        .expect("the other deployment's session");
+    elsewhere.stop("-INT").await;
+    let logins = SavedLogins::at(local.home.path().join("wyrd"));
+    let origin = canonical_origin(&format!("http://{}", local.bind)).expect("origin");
+    let slug: TenantSlug = "local".parse().expect("slug");
+    logins
+        .save(
+            SavedLogin::from_token(
+                origin.clone(),
+                slug.clone(),
+                TokenResponse {
+                    access_token: token,
+                    token_type: TokenType::Bearer,
+                    expires_in: 3600,
+                    refresh_token: Some(SecretBearer::new("unused-refresh".to_owned())),
+                    issued_token_type: None,
+                },
+            )
+            .expect("login record"),
+        )
+        .expect("competing login");
+    let masked_files = (
+        fs::read(&credentials).expect("key"),
+        fs::read(&config).expect("config"),
+    );
+    let data = elsewhere.home.path().join("wyrd/server/data");
+    let masked = local
+        .command()
+        .env("WYRD_DATABASE_URL", elsewhere.dsn.expose_secret())
+        .env("WYRD_SIGNING_KEY_PEM", signing.expose_secret())
+        .env(
+            "WYRD_STORAGE_URL",
+            url::Url::from_file_path(data.join("storage"))
+                .expect("absolute")
+                .as_str(),
+        )
+        .env("WYRD_BIFROST_DATA_DIR", data.join("bifrost"))
+        .args(["server", "dev", "--non-interactive"])
+        .output()
+        .await
+        .expect("login-masked key");
+    let errors = String::from_utf8_lossy(&masked.stderr);
+    assert!(!masked.status.success(), "{errors}");
+    assert!(errors.contains("does not accept the saved key"), "{errors}");
+    assert_eq!(
+        (
+            fs::read(&credentials).expect("key"),
+            fs::read(&config).expect("config")
+        ),
+        masked_files,
+        "a competing login never lets setup replace saved settings"
+    );
+    assert!(
+        TcpListener::bind(&local.bind).is_ok(),
+        "refusal settles the server"
+    );
+    logins
+        .remove(&origin, &slug)
+        .expect("competing login removed");
+
     // Selecting another database with the same tenant slug is refused once
     // its server rejects the saved key: the saved files are untouched, no
     // tenant is created there, and the saved deployment then resumes.
@@ -651,16 +820,8 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         TcpListener::bind(&local.bind).is_ok(),
         "refusal settles the server"
     );
-    let pool = sqlx::PgPool::connect(other_dsn.expose_secret())
-        .await
-        .expect("second database connects");
-    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.tenants")
-        .fetch_one(&pool)
-        .await
-        .expect("tenant count");
-    pool.close().await;
-    assert_eq!(
-        tenants, 0,
+    assert!(
+        !tenant_slugs(&other_dsn).await.contains(&"local".to_owned()),
         "no tenant or key was issued in the other database"
     );
     local.start(&[]).await;

@@ -167,3 +167,77 @@ Do not add tasks to the owner-approved four-task split.
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md); implementation returns evidence, not independent task approval.
+
+## Implementation Evidence
+
+Commits: `a2959a435` (contract/runtime/SQL removal), `727bd1d67` (Rust journeys
+and fixtures), `c4e1eb6a7` (Python), `4a198a9d2` (TypeScript and regenerated
+`card-types.ts`), `48904dd00` (remaining test fixtures, docs, architecture).
+
+Reuse: refusal-by-path is one `serde_path_to_error` decode in
+`wyrd-spec/src/envelope.rs::spec_from_kind_value` (already in the lockfile via
+axum) feeding the existing `deny_unknown_fields` contract; no removed-field
+check, alias or ignored map. Server refusal is the existing
+`WYRD_REGISTRY_400_INVALID_CARD_SPEC`; SDK loader refusal is the existing
+`WYRD_LOADER_400_INVALID_ENVELOPE`, both carrying the authored path.
+`verification_bindings.inputs` is dropped by additive migration
+`20261017000000_drop_verification_binding_inputs.sql`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Binding `inputs` (`{}` or exact selectors) and samples `required: false` refused at their path; nothing persists | `VerificationBinding` has no `inputs`; `InputSlot::Samples` has no `required` (`wyrd-spec/src/card/verifier/mod.rs`); path-prefixed decode (`envelope.rs`); `fixtures/invalid/{scheduled-binding-empty-inputs,scheduled-binding-exact-inputs,optional-samples-slot}.yaml` | `scheduled_binding_rejects_redundant_inputs` in Rust (SDK + raw HTTP 400 + 404 resolve), Python (3 params), TS (3 cases); `card::verifier_card_tests::removed_scheduled_samples_fields_fail_at_their_path` | PASS |
+| Every drift requirement scored from the pinned Verifier; no omission path | `DriftEngine::checks` scores all `spec.drift_checks()` (`wyrd-server/src/verification/drift.rs`); `ExecutionInput::Scheduled { window }` without slots and `schedule_inputs` claim subquery removed (`wyrd-sql/src/queries/verifier_executions.rs`); `check_activation` only requires a samples slot (`components/cards/resolve.rs`) | `scheduled_binding_scores_every_requirement`: 120/0.01 → latency failed, error_rate passed, overall failed; 80/no error_rate → passed/inconclusive, overall inconclusive (Rust, Python 2 params, TS 2 cases) | PASS |
+| Existing scheduled scoring, empty windows, baseline fitting, Operator delivery unchanged | Shared harness helpers keep the fitted path; Custom-only path skips baseline wait | Rust `scheduled_drift_alerts_operator::` 7/7; Python file 10/10; TS file 10/10; `pg_verification_runtime`, `pg_operator_delivery`, `pg_verification_routes`, `pg_card_registration_route` 93/93; `wyrd-testing --test server verification_runtime::` 10/10 | PASS |
+| Schemas/docs/fixtures accept no removed fields | `codegen:regen` output; fixtures stripped; docs/architecture rewritten; `fixtures/README.md` rows added | `codegen:check`, `docs:check`, `wyrd-spec` 760/760, CLI loader/card_lifecycle 21/21, MCP `verification::` 5/5 | PASS |
+| No group lifecycle/outbox changes; no aliases | Diff audit below | `git diff main...HEAD --stat` inspected | PASS |
+
+Commands (all exit 0):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-spec                      # 760 passed
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && \
+  cargo nextest run --locked -p wyrd-sql --test integration --test-threads=1 -E "test(/^pg_verification_bindings::|^pg_verifier_executions::/)" && \
+  cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(/^(pg_card_registration_route|pg_verification_routes|pg_verification_runtime|pg_operator_delivery)::/)" && \
+  cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(/verification_runtime::/)" && \
+  cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(/^verification::/)" && \
+  cargo nextest run --locked -p wyrd-cli --test cli -E "test(/loader::end_to_end|card_lifecycle/)" && \
+  cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(/^scheduled_drift_alerts_operator::/)"'
+  # 32, 93, 10, 5, 21, 7 passed
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && \
+  uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_scheduled_drift_alerts_operator.py && \
+  cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/scheduled-drift-alerts-operator.test.ts'
+  # Python 10 passed; TS 10 passed
+mise run fmt && mise run lints && mise run codegen:check && mise run check:deps && \
+  mise run check:tenant-isolation && mise run ts:napi:check && mise run docs:check && git diff --check
+mise run ts:format && mise run ts:lints && mise run ts:typecheck   # TS sources touched
+```
+
+Exact Scenario selectors run (the Rust and Python selectors in this task are
+correct as written; the TS `-t` selectors are corrected to the repository's
+spaced test names):
+
+```bash
+... cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(=scheduled_drift_alerts_operator::scheduled_binding_rejects_redundant_inputs)"
+... cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(=scheduled_drift_alerts_operator::scheduled_binding_scores_every_requirement)"
+... pnpm exec vitest run tests/integration/scheduled-drift-alerts-operator.test.ts -t "^scheduled binding (rejects redundant inputs|scores every requirement)"   # 5 passed
+```
+
+Material notes:
+
+- RED was not executed as a separate run: both scenarios were implemented with
+  the contract removal. The prior contract accepted binding `inputs` and
+  samples `required: false` (removed `ScheduledInput`, `validate_schedule`,
+  `schedule_inputs` claim column) and filtered drift checks by frozen slots,
+  established by source inspection of the parent commit.
+- Deleted `wyrd-testing/tests/bifrost/server/verification_runtime.rs::omitted_optional_slot_is_not_scored_from_retained_rows`:
+  it asserted the removed omission behavior, which AC-007 forbids.
+- Python stubs are unchanged (no `.pyi` exposed the removed fields), so
+  `py:typecheck` was not required.
+- No unexpected failures occurred; no diagnosis entries.
+
+Non-goal audit: no grouping, group lifecycle, outbox admission, benchmark or
+capacity-case changes; JSON/media/trace `required` optionality, `on_failure`,
+Drift algorithms, baseline ownership and Window submit recording unchanged.
+No compatibility alias or ignored field remains.
+
+Return: `IMPLEMENTED`.

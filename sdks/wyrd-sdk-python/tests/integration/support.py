@@ -28,6 +28,9 @@ BASELINE_TIMEOUT_SECONDS = 90.0
 ON_CALL_TOKEN = "on-call-bearer-token"
 """The bearer secret the ``on-call-hooks`` connection presents to the receiver."""
 
+LIVE_REVIEW = "spans were reviewed live"
+"""The ``coding-review`` statement every request of its ``spans-reviewed`` check carries."""
+
 
 @dataclass
 class Delivery:

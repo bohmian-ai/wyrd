@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -28,6 +29,7 @@ from wyrd.testing import WyrdTestServer, cli
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    LIVE_REVIEW,
     ON_CALL_TOKEN,
     Delivery,
     QueryRow,
@@ -123,6 +125,33 @@ The model names each tool by its provider-facing name, the dotted wire name
 spelled with underscores.
 """
 
+REVIEWED = (
+    '{"outcome":"passed","reason":"the spans were read",'
+    '"citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}'
+)
+"""The coding judge's Verdict once it read the spans: passed, citing the first trace ID."""
+
+
+def live_query(trace_id: str) -> dict:
+    """The coding judge's first turn: read ``trace_id``'s span names live as ``bifrost_query``."""
+    sql = (
+        "SELECT name FROM vala.traces.spans "
+        f"WHERE trace_id = decode('{trace_id}', 'hex') ORDER BY name"
+    )
+    arguments = json.dumps({"sql": sql, "max_rows": 10})
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-spans",
+                "type": "function",
+                "function": {"name": "bifrost_query", "arguments": arguments},
+            }
+        ],
+    }
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -134,7 +163,9 @@ def completion(body: dict) -> tuple[int, dict]:
     schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
     ``SLOW-READER``; otherwise it first calls ``fs.read`` and, once the tool
     result is back, answers a 100-dollar limit. The investigator calls each
-    of its tools once and finishes once the results are back. The policy
+    of its tools once and finishes once the results are back. The coding
+    judge reads the trace's spans live through ``bifrost_query`` and passes,
+    citing the first trace ID, once the read is back. The policy
     judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
     Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
@@ -155,6 +186,9 @@ def completion(body: dict) -> tuple[int, dict]:
             message = {"role": "assistant", "content": '{"max_refund":100}'}
     elif "INVESTIGATE" in text:
         message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
+    elif LIVE_REVIEW in text:
+        [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
+        message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)
     else:
         content = AGREES
         if "Rules:" in text:

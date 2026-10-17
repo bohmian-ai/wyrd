@@ -7,14 +7,17 @@ the named Verifier authorizes a verify; the local model provider stands in
 for the judge and agrees with every answer, citing it.
 """
 
+import json
 import secrets
 import time
 from pathlib import Path
 
 import httpx
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from wyrd import WyrdError, verify
+from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
@@ -25,6 +28,7 @@ from wyrd.testing import WyrdTestServer, cli
 
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    LIVE_REVIEW,
     Receiver,
     ancestry,
     binding_ids,
@@ -55,10 +59,10 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
 
 
-def principal() -> str:
-    """The ``assistant`` Service's principal id, which every judgment here is requested as."""
+def principal(service: str = "assistant") -> str:
+    """The ``service`` principal id; ``assistant``'s is the one most judgments here are requested as."""
     return cli.issue_key(
-        kind="Service", name="assistant", version="1.0.0", space="default"
+        kind="Service", name=service, version="1.0.0", space="default"
     ).principal_id
 
 
@@ -610,3 +614,104 @@ def test_grouped_refund_changes_verdict(
         register(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
     assert "verified_by[1].on_failure" in str(refused.value)
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_coding_uses_declared_sources(
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    receiver: Receiver,
+    tmp_path: Path,
+    fresh_tracer_provider: None,
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/coding.yaml")
+    bundle = download(cards, "coding", tmp_path)
+    [binding_id] = [
+        binding
+        for binding in binding_ids(cards, registered["coding"])
+        if binding_status(wyrd_server, binding).get("group_end") is not None
+    ]
+    wyrd_server.scoped_api_key("py_live_reader", ["tool:invoke", "bifrost_query:read"])
+    principals = Principals(client_of(wyrd_server))
+    coding = principal("coding")
+    principals.grant_role(coding, "py_live_reader")
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("coding")))
+    state.start_bifrost()
+    state.start_telemetry()
+    tracer = trace.get_tracer("journey.coding")
+    session = tracer.start_span("coding-session")
+    with trace.use_span(session), tracer.start_as_current_span("edit-file"):
+        pass
+    trace_id = format(session.get_span_context().trace_id, "032x")
+    group = f"session-{secrets.token_hex(4)}"
+    calls = [
+        {"call": "prompt", "tests": "passed"},
+        {"call": "edit", "tests": "failed"},
+        {"call": "test", "tests": "passed"},
+    ]
+    run = state.run("agent")
+    verdicts = [
+        run.observe.verify(
+            "coding-turn", call=call, group_id=group, **({"trace": trace_id} if index == 0 else {})
+        ).verdict
+        for index, call in enumerate(calls)
+    ]
+    assert verdicts == ["passed", "failed", "passed"]
+    empty = run.observe.verify("empty-each", [])
+    assert empty.verdict == "inconclusive"
+    assert [
+        (requirement["id"], requirement["outcome"], requirement["reason"])
+        for requirement in empty.requirements
+    ] == [
+        ("listed-ok", "inconclusive", "empty_selection"),
+        ("items-ok", "inconclusive", "empty_selection"),
+    ]
+    with trace.use_span(session), tracer.start_as_current_span("late-test-run"):
+        pass
+    session.end()
+    state.flush()
+
+    judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["calls"] == {"kind": "json", "value": calls}
+    assert outcome["evidence"]["traces"] == {"kind": "json", "value": [trace_id, None, None]}
+    assert outcome["evidence"]["tests"] == {
+        "kind": "json",
+        "value": ["passed", "failed", "passed"],
+    }
+    assert [
+        (requirement["id"], requirement["outcome"]) for requirement in outcome["requirements"]
+    ] == [("every-call-tested", "failed"), ("spans-reviewed", "passed")], outcome["requirements"]
+    assert outcome["verdict"] == "failed"
+
+    def reviews() -> list[str]:
+        return [
+            text
+            for delivery in receiver.to(CALLS)
+            if LIVE_REVIEW in (text := json.dumps(delivery.body)) and trace_id in text
+        ]
+
+    [ask] = [text for text in reviews() if '"role": "tool"' not in text]
+    assert "edit-file" not in ask, "the trace slot carries its ID only"
+    [read] = [text for text in reviews() if '"role": "tool"' in text]
+    assert "edit-file" in read and "late-test-run" in read, "the check reads the spans live"
+
+    principals.revoke_role(coding, "py_live_reader")
+    later = f"session-{secrets.token_hex(4)}"
+    run.observe.verify("coding-turn", call=calls[0], trace=trace_id, group_id=later)
+    revoked = group_execution(wyrd_server, binding_id, WAIT_SECONDS, judged["execution_id"])
+    assert revoked["group_id"] == later
+    [denied] = [text for text in reviews() if '"role": "tool"' in text and DENIED in text]
+    assert "edit-file" not in denied, "a denied read returns nothing"
+    state.shutdown()
+
+    for relative, code, reason in [
+        ("coding-child.yaml", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
+        ("coding-unbound.yaml", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"),
+        ("coding-cycle.yaml", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"),
+    ]:
+        with pytest.raises(WyrdError) as refused:
+            register(cards, f"cards/verify_in_real_time/{relative}")
+        assert refused.value.code == code, relative
+        assert reason in f"{refused.value} {refused.value.details}", relative

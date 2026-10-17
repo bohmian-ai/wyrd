@@ -9,6 +9,7 @@ for the judge and agrees with every answer, citing it.
 
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -22,8 +23,10 @@ from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
+from .conftest import registered_assistant, serving
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    Count,
     Receiver,
     ancestry,
     binding_ids,
@@ -433,3 +436,77 @@ def test_another_tenant_cannot_verify_the_assistant(
         with pytest.raises(WyrdError) as raised:
             run.observe.verify(verifier, "yes")
         assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
+
+
+STAGING_CAPACITY = 6
+"""Scribe outbox capacity of the staging-pressure story: its reserved three
+quarters, four writes, is what two direct judgments reserve."""
+
+JUDGE_DELAY_SECONDS = 15.0
+"""How long the staging-pressure story's judge holds each call."""
+
+STAGING_FULL = "WYRD_VERIFICATION_429_STAGING_FULL"
+
+
+def await_judge_calls(judge: Receiver, calls: int) -> None:
+    """Block until ``judge`` has received ``calls`` judge calls."""
+    with judge.delivered:
+        assert judge.delivered.wait_for(lambda: len(judge.to(CALLS)) >= calls, WAIT_SECONDS)
+
+
+def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
+    with (
+        serving(delay=JUDGE_DELAY_SECONDS) as judge,
+        WyrdTestServer(
+            verification_runtime=True,
+            provider_base_url=judge.url,
+            scribe_outbox_capacity=STAGING_CAPACITY,
+        ) as server,
+    ):
+        bundle = registered_assistant(WyrdClient(), tmp_path / "assistant", server)
+        state = hydrated(bundle, WyrdClient(credential=service_key("assistant")))
+        neighbor_admin = server.bootstrap_service_in_tenant(
+            server.seed_tenant("burst-neighbor"), ["admin"], name="burst-admin"
+        )
+        neighbor_client = client_of(server, neighbor_admin)
+        neighbor = hydrated(
+            registered_assistant(neighbor_client, tmp_path / "neighbor"),
+            client_of(server, service_key("assistant", neighbor_client)),
+        )
+        server.flush_bifrost()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            burst = []
+            for in_flight in (1, 2):
+                burst.append(
+                    pool.submit(lambda: state.run("agent").observe.verify("answer-judged", "yes"))
+                )
+                await_judge_calls(judge, in_flight)
+                if in_flight == 1:
+                    accepted = neighbor.run("agent").observe.submit("answer-check", "yes")
+                    assert isinstance(accepted, verify.Execution)
+                    assert accepted.wait(WAIT_SECONDS).verdict == "passed"
+                    assert not burst[0].done(), "the burst's judgment is still in flight"
+                    server.flush_bifrost()
+
+            refused_run = state.run("agent")
+            for call in (refused_run.observe.verify, refused_run.observe.submit):
+                with pytest.raises(WyrdError) as refused:
+                    call("answer-check", "yes")
+                assert refused.value.code == STAGING_FULL
+                assert refused.value.status == 429
+                assert refused.value.details["retry_after_seconds"] == 1
+            assert not any(judging.done() for judging in burst)
+            assert [judging.result().verdict for judging in burst] == ["passed", "passed"]
+
+        server.flush_bifrost()
+        recovered = refused_run.observe.submit("answer-check", "yes")
+        assert isinstance(recovered, verify.Execution)
+        judged = recovered.wait(WAIT_SECONDS)
+        assert (judged.verdict, judged.run_id) == ("passed", refused_run.run_id)
+
+        server.flush_bifrost()
+        rows = Bifrost(client=client_of(server)).sql(
+            "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
+        )
+        assert [row.n for row in rows] == [3]

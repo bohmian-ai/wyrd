@@ -11,7 +11,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::Args;
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 use tokio::process::{Child, Command};
 use wyrd_client::cards::Cards;
 use wyrd_client::config::ClientConfig;
@@ -23,6 +24,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::gateway::ProviderDeploymentsApply;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::registry::ListCardsRequest;
+use wyrd_utils::secret::read_secret_file;
 
 use super::install::compatible;
 use super::{InstalledServer, ServerInstaller};
@@ -110,9 +112,9 @@ struct DevServer {
     endpoint: String,
     /// macOS memory detected once and supplied only to child processes.
     memory: Option<String>,
-    /// Local deployment sealing key supplied as `WYRD_SEALING_KEY_FILE`;
-    /// `None` when the caller already supplies the server's sealing key.
-    sealing_key: Option<PathBuf>,
+    /// Retained local deployment sealing key every child receives as
+    /// `WYRD_SEALING_KEY_FILE`, in place of any caller-supplied source.
+    sealing_key: PathBuf,
     /// Serving child retained across readiness, setup, and foreground waiting.
     child: Option<Child>,
 }
@@ -449,7 +451,7 @@ impl DevServer {
     fn new(
         installed: InstalledServer,
         inputs: DevInputs,
-        sealing_key: Option<PathBuf>,
+        sealing_key: PathBuf,
     ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the CLI package version is semver");
@@ -472,8 +474,8 @@ impl DevServer {
     /// Construct each child with the same resolved inputs as canonical
     /// server environment variables, never arguments, preserving production
     /// hardening. The selected listeners override any server-file setting,
-    /// and the local sealing key, when the caller supplied none, is the
-    /// server's ordinary `WYRD_SEALING_KEY_FILE`.
+    /// and the retained local sealing key, which equals any key the caller
+    /// supplied, is the server's ordinary `WYRD_SEALING_KEY_FILE`.
     fn command(&self) -> Command {
         let inputs = &self.inputs;
         let mut command = Command::new(self.installed.binary());
@@ -491,9 +493,9 @@ impl DevServer {
         if let Some(memory) = &self.memory {
             command.env("WYRD_BIFROST_MEMORY_LIMIT_BYTES", memory);
         }
-        if let Some(sealing_key) = &self.sealing_key {
-            command.env("WYRD_SEALING_KEY_FILE", sealing_key);
-        }
+        command
+            .env("WYRD_SEALING_KEY_FILE", &self.sealing_key)
+            .env_remove("WYRD_SEALING_KEY_BASE64");
         command
     }
 
@@ -936,27 +938,39 @@ const SEALING_KEY_FILE: &str = "sealing.key";
 /// secrets with, such as gateway managed-secret provider keys, before the
 /// first boot, and return the file to supply as `WYRD_SEALING_KEY_FILE`.
 ///
-/// A caller that already supplies `WYRD_SEALING_KEY_FILE` or
-/// `WYRD_SEALING_KEY_BASE64` keeps it and gets `None`. Otherwise the first run
-/// writes 32 random bytes, base64-encoded, to an owner-only `sealing.key`
-/// under the install root and every later run reuses it, so stored secrets
-/// keep opening across restarts and releases. The file is staged beside its
-/// destination and moved into place without replacing an existing key, so an
-/// interrupted or concurrent first run never leaves a partial key. The key is
-/// never printed.
+/// The key is retained in an owner-only `sealing.key` under the install root
+/// and every later run reuses it, so stored secrets keep opening across
+/// restarts, working directories, and releases. A first run retains a key the
+/// caller supplies through `WYRD_SEALING_KEY_FILE` or
+/// `WYRD_SEALING_KEY_BASE64`, else 32 random bytes. A supplied key on a later
+/// run must equal the retained one: a different key is refused, never
+/// written over the key existing secrets are sealed under. The file is staged
+/// beside its destination and moved into place without replacing an existing
+/// key, so an interrupted or concurrent first run never leaves a partial key.
+/// The key is never printed.
 ///
 /// # Errors
-/// Returns a secret-free local-persistence error when the key cannot be
-/// staged or moved into place.
-fn local_sealing_key(root: &Path) -> Result<Option<PathBuf>, WyrdCliError> {
-    if std::env::var_os("WYRD_SEALING_KEY_FILE").is_some()
-        || std::env::var_os("WYRD_SEALING_KEY_BASE64").is_some()
-    {
-        return Ok(None);
-    }
+/// Refuses an invalid supplied key or one that differs from the retained
+/// key, and returns a secret-free local-persistence error when the key cannot
+/// be staged or moved into place.
+fn local_sealing_key(root: &Path) -> Result<PathBuf, WyrdCliError> {
     let path = root.join(SEALING_KEY_FILE);
+    let supplied = supplied_sealing_key()?;
     if path.is_file() {
-        return Ok(Some(path));
+        let retained = read_secret_file(&path)
+            .ok()
+            .and_then(|encoded| sealing_bytes(&encoded));
+        return match (supplied, retained) {
+            (Some(supplied), Some(retained))
+                if supplied.expose_secret() != retained.expose_secret() =>
+            {
+                Err(dev_error(
+                    "sealing key",
+                    "the supplied sealing key differs from the retained local sealing key, which is kept because stored provider keys are sealed under it; unset WYRD_SEALING_KEY_FILE and WYRD_SEALING_KEY_BASE64 or use a separate WYRD_CONFIG_HOME; no migration or setup has run",
+                ))
+            }
+            _ => Ok(path),
+        };
     }
     let failed = || {
         dev_error(
@@ -964,22 +978,57 @@ fn local_sealing_key(root: &Path) -> Result<Option<PathBuf>, WyrdCliError> {
             "the local sealing key could not be written; restore safe permissions on the Wyrd config directory and rerun",
         )
     };
+    let key = supplied.unwrap_or_else(|| SecretBox::new(Box::new(rand::random())));
     // `NamedTempFile` is created owner-only, the mode the server requires of
     // a mounted key file.
     let mut staged = tempfile::NamedTempFile::new_in(root).map_err(|_| failed())?;
     staged
-        .write_all(
-            BASE64_STANDARD
-                .encode(rand::random::<[u8; 32]>())
-                .as_bytes(),
-        )
+        .write_all(BASE64_STANDARD.encode(key.expose_secret()).as_bytes())
         .and_then(|()| staged.as_file().sync_all())
         .map_err(|_| failed())?;
     match staged.persist_noclobber(&path) {
-        Ok(_) => Ok(Some(path)),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(path)),
+        Ok(_) => Ok(path),
+        // A concurrent first run retained its key first; compare against it.
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            local_sealing_key(root)
+        }
         Err(_) => Err(failed()),
     }
+}
+
+/// Read the sealing key the caller supplies, through the server's own
+/// owner-only secret-file rule for `WYRD_SEALING_KEY_FILE`; empty means unset.
+///
+/// # Errors
+/// Refuses both sources at once, an unreadable or permissive file, and a
+/// value that is not base64 of exactly 32 bytes, naming no path or value.
+fn supplied_sealing_key() -> Result<Option<SecretBox<[u8; 32]>>, WyrdCliError> {
+    let refused = || {
+        dev_error(
+            "sealing key",
+            "set only one of WYRD_SEALING_KEY_FILE, an owner-only file, or WYRD_SEALING_KEY_BASE64, holding base64 of exactly 32 bytes; no migration or setup has run",
+        )
+    };
+    let file = std::env::var_os("WYRD_SEALING_KEY_FILE").filter(|file| !file.is_empty());
+    let encoded = match (file, secret_var("WYRD_SEALING_KEY_BASE64")) {
+        (Some(_), Some(_)) => return Err(refused()),
+        (Some(file), None) => {
+            SecretString::from(read_secret_file(Path::new(&file)).map_err(|_| refused())?)
+        }
+        (None, Some(inline)) => inline,
+        (None, None) => return Ok(None),
+    };
+    sealing_bytes(encoded.expose_secret())
+        .map(Some)
+        .ok_or_else(refused)
+}
+
+/// Decode a sealing key as the server does: trimmed standard base64 of
+/// exactly 32 bytes. Returns `None` for any other value.
+fn sealing_bytes(encoded: &str) -> Option<SecretBox<[u8; 32]>> {
+    let bytes = Zeroizing::new(BASE64_STANDARD.decode(encoded.trim()).ok()?);
+    let key: [u8; 32] = bytes.as_slice().try_into().ok()?;
+    Some(SecretBox::new(Box::new(key)))
 }
 
 /// Select one listener from the resolved `value`, else the ordinary

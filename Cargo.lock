@@ -11177,6 +11177,7 @@ dependencies = [
  "wyrd-storage",
  "wyrd-testing",
  "wyrd-tls",
+ "wyrd-utils",
 ]
 
 [[package]]

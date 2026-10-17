@@ -146,7 +146,7 @@ wyrd server dev
 
 The restart reuses the saved database, listeners, tenant, data paths, key, and sealing key, and asks nothing. Migrations are safe to rerun, and an existing tenant keeps its key; the command never issues a replacement just because it restarted. An argument or environment variable overrides only its own saved setting. A different `--tenant` while a key is saved is refused; use a separate `WYRD_CONFIG_HOME` for another tenant.
 
-Your data lives in two places; keep both: the PostgreSQL database and the config directory. Lose `server/sealing.key` and stored provider keys can no longer be decrypted, so you would put them again.
+Your data lives in two places; keep both: the PostgreSQL database and the config directory. Lose `server/sealing.key` and stored provider keys can no longer be decrypted, so you would put them again. A key you supply through `WYRD_SEALING_KEY_FILE` or `WYRD_SEALING_KEY_BASE64` on the first run is kept there, so later runs need no variable; a different key on a later run is refused rather than replacing it.
 
 ## If it fails
 

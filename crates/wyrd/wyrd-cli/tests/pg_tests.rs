@@ -797,14 +797,21 @@ async fn server_dev_selected_mcp_host_reads() {
 /// Provider key the quickstart form stores and the mock provider demands.
 const LOCAL_PROVIDER_KEY: &str = "sk-local-dev-managed-secret";
 
+/// Supplied sealing key, base64 of 32 bytes, that a deployment retains.
+const SUPPLIED_SEALING_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+
 /// A fresh `wyrd server dev` deployment seals a quickstart-form managed
 /// secret on first boot with no extra key step, delivers it to a local
-/// provider through the gateway, and keeps delivering it after a rerun. The
-/// secret never reaches any captured output.
+/// provider through the gateway, and keeps delivering it after a bare rerun
+/// from another working directory. The sealing key is generated, or supplied
+/// through `WYRD_SEALING_KEY_FILE` or `WYRD_SEALING_KEY_BASE64` on the first
+/// run only and retained; a different supplied key is later refused without
+/// replacing it. The tenant key is unchanged and the secret never reaches any
+/// captured output.
 ///
 /// # Panics
 /// Panics when setup, the credential or deployment write, either gateway
-/// call, or a leak check fails.
+/// call, the retained key, the refusal, or a leak check fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn server_dev_keeps_the_gateway_managed_secret_key() {
     use wiremock::matchers::{header, method, path};
@@ -825,69 +832,110 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         })))
-        .expect(2)
+        .expect(6)
         .mount(&provider)
         .await;
 
-    let mut local = LocalDev::new().await;
-    local.start(&[]).await;
-    let mut printed = String::new();
-    for (args, document) in [
-        (
-            ["gateway", "credential", "put", "--file", "-"],
-            format!(
-                r#"{{"name":"local-key","provider":"local-mock","source":{{"managed_secret":{{"secret":"{LOCAL_PROVIDER_KEY}"}}}}}}"#
-            ),
-        ),
-        (
-            ["gateway", "deployment", "put", "--file", "-"],
-            json!({
-                "name": "local-mock",
-                "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
-                "auth": {"bearer": {"credential": "local-key"}},
-                "capabilities": ["chat_completions"],
-            })
-            .to_string(),
-        ),
-    ] {
-        let output = local.stdin_command(&args, &document).await;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.status.success(), "{args:?} failed: {text}");
-        printed.push_str(&text);
-    }
-
-    for run in ["first run", "rerun"] {
-        if run == "rerun" {
-            local.start(&[]).await;
+    for source in ["generated", "file", "inline"] {
+        let mut local = LocalDev::new().await;
+        let mut first = local.command();
+        let supplied = local.home.path().join("supplied.key");
+        fs::write(&supplied, SUPPLIED_SEALING_KEY).expect("supplied key");
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o600)).expect("owner-only");
+        match source {
+            "file" => first.env("WYRD_SEALING_KEY_FILE", &supplied),
+            "inline" => first.env("WYRD_SEALING_KEY_BASE64", SUPPLIED_SEALING_KEY),
+            _ => &mut first,
+        };
+        first.args(["server", "dev", "--tenant", "local"]);
+        local.start_with(first).await;
+        let retained = local.home.path().join("wyrd/server/sealing.key");
+        if source != "generated" {
+            assert_eq!(
+                fs::read_to_string(&retained).expect("retained key").trim(),
+                SUPPLIED_SEALING_KEY,
+                "{source}: the supplied key is retained"
+            );
         }
-        let token = local
-            .client()
-            .access_token()
+        let mut printed = String::new();
+        for (args, document) in [
+            (
+                ["gateway", "credential", "put", "--file", "-"],
+                format!(
+                    r#"{{"name":"local-key","provider":"local-mock","source":{{"managed_secret":{{"secret":"{LOCAL_PROVIDER_KEY}"}}}}}}"#
+                ),
+            ),
+            (
+                ["gateway", "deployment", "put", "--file", "-"],
+                json!({
+                    "name": "local-mock",
+                    "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
+                    "auth": {"bearer": {"credential": "local-key"}},
+                    "capabilities": ["chat_completions"],
+                })
+                .to_string(),
+            ),
+        ] {
+            let output = local.stdin_command(&args, &document).await;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{source} {args:?} failed: {text}");
+            printed.push_str(&text);
+        }
+        let credentials = local.home.path().join("wyrd/credentials.toml");
+        let saved = fs::read(&credentials).expect("saved credentials");
+        let elsewhere = local.home.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("other working directory");
+
+        for run in ["first run", "rerun"] {
+            if run == "rerun" {
+                let mut bare = local.command();
+                bare.current_dir(&elsewhere)
+                    .args(["server", "dev", "--non-interactive"]);
+                local.start_with(bare).await;
+            }
+            let token = local
+                .client()
+                .access_token()
+                .await
+                .expect("saved key exchanges");
+            let answer = reqwest::Client::new()
+                .post(format!("http://{}/v1/chat/completions", local.bind))
+                .bearer_auth(token.expose())
+                .json(&json!({
+                    "model": "local-mock/m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .send()
+                .await
+                .expect("gateway call sends");
+            let status = answer.status();
+            let body = answer.text().await.expect("gateway answer");
+            assert_eq!(status.as_u16(), 200, "{source} {run}: {body}");
+            assert!(body.contains("chatcmpl-local"), "{source} {run}: {body}");
+            printed.push_str(&body);
+            printed.push_str(&local.stop("-INT").await);
+        }
+        assert_eq!(fs::read(&credentials).expect("credentials"), saved);
+
+        let kept = fs::read(&retained).expect("retained key");
+        let other = local
+            .command()
+            .env("WYRD_SEALING_KEY_BASE64", "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=")
+            .args(["server", "dev", "--non-interactive"])
+            .output()
             .await
-            .expect("saved key exchanges");
-        let answer = reqwest::Client::new()
-            .post(format!("http://{}/v1/chat/completions", local.bind))
-            .bearer_auth(token.expose())
-            .json(&json!({
-                "model": "local-mock/m",
-                "messages": [{"role": "user", "content": "hi"}],
-            }))
-            .send()
-            .await
-            .expect("gateway call sends");
-        let status = answer.status();
-        let body = answer.text().await.expect("gateway answer");
-        assert_eq!(status.as_u16(), 200, "{run}: {body}");
-        assert!(body.contains("chatcmpl-local"), "{run}: {body}");
-        printed.push_str(&body);
-        printed.push_str(&local.stop("-INT").await);
+            .expect("different key");
+        let refused = String::from_utf8_lossy(&other.stderr);
+        assert!(!other.status.success(), "{source}: {refused}");
+        assert!(refused.contains("differs from the retained"), "{source}: {refused}");
+        assert_eq!(fs::read(&retained).expect("retained key"), kept);
+        assert!(
+            !printed.contains(LOCAL_PROVIDER_KEY) && !printed.contains(SUPPLIED_SEALING_KEY),
+            "{source}: no provider secret or sealing key reaches CLI, server, or gateway output"
+        );
     }
-    assert!(
-        !printed.contains(LOCAL_PROVIDER_KEY),
-        "the provider secret never reaches CLI, server, or gateway output"
-    );
 }

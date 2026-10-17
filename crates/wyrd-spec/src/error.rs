@@ -2073,7 +2073,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit."
+        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.

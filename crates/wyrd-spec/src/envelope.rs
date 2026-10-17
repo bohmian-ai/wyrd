@@ -752,10 +752,33 @@ impl<'de> Deserialize<'de> for Card {
 /// Decodes one kind's spec body, prefixing any error with the authored field
 /// path (for example `verified_by[0].inputs: unknown field ...`) so a refused
 /// field is named where the author wrote it.
+///
+/// Every Card kind decodes through this one function from
+/// [`spec_from_kind_value`], so loader parsing, inline references, SQL Card
+/// reads and server registration all report the same path-bearing message.
+///
+/// # Errors
+///
+/// Returns the path-prefixed serde message when `value` does not match `T`:
+/// an unknown field (every spec denies unknown fields), a missing required
+/// field, a wrong value type, or a value refused by a field's own decoder.
 fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, String> {
     serde_path_to_error::deserialize(value).map_err(|e| e.to_string())
 }
 
+/// Decodes an untyped spec body into the typed [`Spec`] variant named by
+/// `kind`.
+///
+/// A top-level `type` key, present in older serialized Cards, is removed
+/// before decoding; the remaining body is then decoded through [`decode`] for
+/// the matching native kind. This is the shared dispatcher behind
+/// [`Spec::from_kind_and_value`] and [`Card`] deserialization.
+///
+/// # Errors
+///
+/// Returns the path-prefixed decode message from [`decode`] when the body
+/// does not match the kind's spec, or a fixed message when `kind` is
+/// [`CardKind::External`], which has no spec and cannot be registered.
 fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result<Spec, String> {
     // Strip legacy `type` field — present in older serialized cards.
     if let serde_json::Value::Object(ref mut map) = value {

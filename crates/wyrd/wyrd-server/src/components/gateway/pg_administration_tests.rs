@@ -1668,7 +1668,7 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
     // existing managed secret is rotated first, then moving the referenced
     // `shared` credential to another provider trips the deployments' foreign
     // key, so the whole transaction, rotation included, is discarded.
-    let rotated_row = stored_credential(&fixture, tenant, "managed-key").await;
+    let committed_row = stored_credential(&fixture, tenant, "managed-key").await;
     let referenced = stored_credential(&fixture, tenant, "shared").await;
     let deployments = gateway.deployments(&admin).await.expect("deployments");
     let rotate = |name: &str, provider: &str| {
@@ -1694,7 +1694,7 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
     assert!(!format!("{aborted:?}").contains(ROTATED));
     assert_eq!(
         stored_credential(&fixture, tenant, "managed-key").await,
-        rotated_row,
+        committed_row,
         "the earlier rotation's envelope and metadata rolled back"
     );
     assert_eq!(

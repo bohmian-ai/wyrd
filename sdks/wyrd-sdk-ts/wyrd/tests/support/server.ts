@@ -10,7 +10,9 @@ import {
   type RegistrationReceipt,
   type SpanRecord,
   verify,
+  type VerificationExecutionState,
   type VerificationResult,
+  WyrdClient,
 } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -102,6 +104,39 @@ export async function scheduledResult(
     }
     if (Date.now() >= deadline) {
       throw new Error(`binding ${bindingId} retained no result within ${timeoutMs} ms`);
+    }
+    await sleep(500);
+  }
+}
+
+/**
+ * The newest completed execution of group `bindingId` other than `after`, read
+ * as the administrator: publish captured rows so the group poller discovers
+ * them, then read the binding's `last_execution_id` until that execution
+ * completes with a result.
+ */
+export async function groupExecution(
+  server: { flushBifrost(): void; readonly baseUrl: string },
+  bindingId: string,
+  timeoutMs: number,
+  after?: string,
+): Promise<VerificationExecutionState> {
+  const token = await WyrdClient.connect().accessToken();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    server.flushBifrost();
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${bindingId}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    const { last_execution_id: latest } = (await response.json()) as { last_execution_id: string | null };
+    if (latest !== null && latest !== after) {
+      const state = await (await verify.Execution.connect(latest)).status();
+      if (state.status === "completed" && state.result) {
+        return state;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`group binding ${bindingId} completed no new execution within ${timeoutMs} ms`);
     }
     await sleep(500);
   }

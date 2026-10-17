@@ -656,7 +656,7 @@ export declare class NativeRun {
   forCard(alias: string): NativeRunOpen
   /**
    * Executes a bound Verifier now on slot values and returns its
-   * result.
+   * result, carrying the caller's optional `group_id`.
    *
    * # Errors
    *
@@ -664,19 +664,19 @@ export declare class NativeRun {
    * refusals, a Window Verifier, and the server's refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  verify(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeLifecycleResult>
+  verify(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Submits slot values: Window samples are recorded now on the
    * JavaScript thread, so each queued sample write records its
    * `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
-   * queued for one execution.
+   * queued for one execution carrying the caller's optional `group_id`.
    *
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be projected; input
    * refusals and the server's refusals are returned in [`NativeSubmission`].
    */
-  submit(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeSubmission>
+  submit(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeSubmission>
   /**
    * Invokes this view's tool-free Agent once with the string variables of
    * `variables_json` and returns its final text.

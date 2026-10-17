@@ -1977,6 +1977,49 @@ export interface GatewayPriceRate {
 }
 
 /**
+ * The source evidence one group execution pinned when it was enqueued.
+ *
+ * Every retry of the execution judges exactly this snapshot; later source rows only ever reach a later group execution.
+ */
+export interface GroupCoverage {
+  /**
+   * Distinct eligible source rows, inputs and results counted apart, the snapshot covers; a later-visible row timed earlier raises it.
+   */
+  readonly members: number;
+  /**
+   * The pinned selection of each source slot.
+   */
+  readonly sources: Readonly<Record<string, GroupSourceSnapshot>>;
+  /**
+   * Newest eligible source row time (input `recorded_at` or result `ended_at`) the snapshot covers.
+   */
+  readonly through: string;
+}
+
+/**
+ * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
+ */
+export type GroupId = string;
+
+/**
+ * One source slot's pinned selection within a [`GroupCoverage`].
+ */
+export interface GroupSourceSnapshot {
+  /**
+   * The deployment source-execution ceiling, present only when the eligible executions exceeded it; nothing was read and the group judgment is inconclusive.
+   */
+  readonly exceeded_ceiling?: number | null;
+  /**
+   * The source executions the slot's list holds one value for, in list order: input `recorded_at`, then execution ID.
+   */
+  readonly execution_ids: readonly string[];
+  /**
+   * The authored source declaration.
+   */
+  readonly reference: SourceText;
+}
+
+/**
  * Credential authority of an HTTP action, bound to a tenant `http` connection.
  *
  * The scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.
@@ -2318,7 +2361,7 @@ export interface InputDeclarationTrace {
 /**
  * One named evidence slot. Slots are required unless `required: false`.
  */
-export type InputSlot = InputSlotJson | InputSlotMedia | InputSlotTrace | InputSlotSamples;
+export type InputSlot = InputSlotJson | InputSlotMedia | InputSlotTrace | InputSlotSamples | InputSlotVariant5 | string;
 
 /**
  * A JSON value, optionally constrained by JSON Schema.
@@ -2378,6 +2421,13 @@ export interface InputSlotTrace {
    */
   readonly required?: boolean;
   readonly type: "trace";
+}
+
+/**
+ * A group Verifier's input authored as a source reference string, `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<requirement>.outcome`, resolved at group execution to one ordered value per source execution.
+ */
+export interface InputSlotVariant5 {
+  readonly type: "source";
 }
 
 /**
@@ -5000,6 +5050,11 @@ export interface SourceCompletion {
 export type SourceCompletionOutcome = "complete" | "unavailable";
 
 /**
+ * Group source reference: verifiers.<name>.inputs.<slot> or verifiers.<name>.requirements.<requirement>.outcome, selecting one whole slot or requirement outcome per source execution.
+ */
+export type SourceText = string;
+
+/**
  * Human-visible namespace for Cards and Runs.
  */
 export type SpaceName = string;
@@ -5521,9 +5576,37 @@ export type TorchSaveFormat2 = "Safetensors" | "Pickle";
 export type TraceId = string;
 
 /**
+ * Positive whole duration <n><unit> with unit s, m, h, or d, such as 30m or 24h.
+ */
+export type TriggerDuration = string;
+
+/**
  * Declarative activation for a bound Verifier.
  */
-export type TriggerSpec = TriggerSpecSchedule;
+export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
+
+/**
+ * Activate once per `group_id` group of source executions that has gone quiet or grown old, re-judging it serially as new evidence arrives.
+ */
+export interface TriggerSpecGroupEnd {
+  /**
+   * Optional human-readable purpose.
+   */
+  readonly description?: string | null;
+  /**
+   * Rows timed at or after the group's first source row plus this no longer reopen or expand the group; nothing is deleted.
+   */
+  readonly finality: TriggerDuration;
+  /**
+   * The group ends once its newest source input or result row is older than this.
+   */
+  readonly idle: TriggerDuration;
+  readonly kind: "group_end";
+  /**
+   * The group ends once its first source row is older than this, even while activity continues.
+   */
+  readonly max_age: TriggerDuration;
+}
 
 /**
  * Activate on each due occurrence of a cron schedule.
@@ -5629,9 +5712,15 @@ export interface VerificationBinding {
   /**
    * Operators dispatched independently after a `failed` verdict.
    *
-   * Empty means a failed result stays durable with no reaction.
+   * Empty means a failed result stays durable with no reaction. A `group_end` binding refuses this list; it reacts through [`Self::on_verdict_change`] instead.
    */
   readonly on_failure?: readonly InlineableRef_for_OperatorSpec[];
+  /**
+   * Operators dispatched independently when a settled group judgment's verdict differs from the preceding settled judgment of the same binding and group.
+   *
+   * Valid only on a `group_end` binding. The first judgment of a group is the baseline and dispatches nothing; an unchanged verdict dispatches nothing.
+   */
+  readonly on_verdict_change?: readonly InlineableRef_for_OperatorSpec[];
   /**
    * When the bound Verifier runs, inline or as a referenced Trigger Card.
    *
@@ -5665,7 +5754,7 @@ export interface VerificationError {
  */
 export interface VerificationExecutionState {
   /**
-   * Every Operator dispatch of a failed background binding execution, in identity order; empty otherwise. Delivery completes independently of the execution and never changes its verdict.
+   * Every Operator dispatch of a failed background binding execution or a changed group verdict, in identity order; empty otherwise. Delivery completes independently of the execution and never changes its verdict.
    */
   readonly dispatches: readonly OperatorDispatchState[];
   /**
@@ -5676,6 +5765,18 @@ export interface VerificationExecutionState {
    * The execution.
    */
   readonly execution_id: string;
+  /**
+   * The source snapshot a group execution judges.
+   */
+  readonly group?: GroupCoverage | null;
+  /**
+   * Caller group the execution belongs to, or the group a group execution judges.
+   */
+  readonly group_id?: GroupId | null;
+  /**
+   * Binding owner of a background execution.
+   */
+  readonly owner_card_uid?: CardUid | null;
   /**
    * The result once completed and visible.
    */

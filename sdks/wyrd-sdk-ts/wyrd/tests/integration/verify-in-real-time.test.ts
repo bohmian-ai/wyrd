@@ -10,7 +10,7 @@ import { Bifrost, Cards, type VerifierInputs, WyrdClient, WyrdState, verify } fr
 import { cli } from "@wyrd/testing";
 
 import { type Assistant, assistantAs, assistantTest, judgeCalls, type JudgeCall } from "../support/assistant.js";
-import { ancestry, binding, fixture, timeline } from "../support/server.js";
+import { ancestry, binding, fixture, groupExecution, registered, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -400,4 +400,98 @@ test("another tenant cannot verify the assistant", async ({ server, assistant })
       code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
     });
   }
+});
+
+/** Enqueue `body` over plain HTTP as `key` with `idempotencyKey`, returning the accepted execution. */
+async function enqueueOverHttp(baseUrl: string, key: string, idempotencyKey: string, body: object): Promise<string> {
+  const token = await WyrdClient.connect({ credential: key }).accessToken();
+  const response = await fetch(`${baseUrl}/v1/verification/enqueue`, {
+    method: "POST",
+    headers: {
+      "x-wyrd-access-token": `Bearer ${token}`,
+      "idempotency-key": idempotencyKey,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const accepted = (await response.json()) as { execution_id: string };
+  expect(response.status, JSON.stringify(accepted)).toBe(202);
+  return accepted.execution_id;
+}
+
+test("grouped support resumes", async ({ server, assistant }) => {
+  const cards = await Cards.connect();
+  const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/support.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-support-"));
+  await cards.hydrate(receipt.root, bundle);
+  const key = (await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" })).key;
+  const token = await WyrdClient.connect().accessToken();
+  const bindingIds = (await cards.get(receipt.root)).status?.verification?.binding_ids ?? [];
+  const grouped: string[] = [];
+  for (const id of bindingIds) {
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    if (((await response.json()) as { group_end?: unknown }).group_end) {
+      grouped.push(id);
+    }
+  }
+  const [bindingId] = grouped;
+  expect(grouped).toHaveLength(1);
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await state.startBifrost();
+  const group = "conv-1";
+  const turns = [1, 2, 3, 4, 5, 6].map((turn) => ({ turn, answer: `answer ${turn}` }));
+  const grouping = { positional: true, group_id: group };
+  const first = state.run("agent");
+  for (const turn of turns.slice(0, 3)) {
+    await first.observe.verify("turn-check", turn, grouping);
+  }
+  const resumed = state.run("agent");
+  await resumed.observe.verify("turn-check", turns[3], grouping);
+  const submitted = await resumed.observe.submit("turn-check", turns[4], grouping);
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  await submitted.execution.wait({ timeoutMs: WAIT_MS });
+  const body = (turn: object) => ({
+    verifier_card_uid: registered(receipt, "turn-check").uid,
+    card_uid: registered(receipt, "assistant-agent").uid,
+    group_id: group,
+    inputs: { turn: { kind: "json", value: turn } },
+  });
+  const replayed = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]));
+  expect(await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]))).toBe(replayed);
+  const conflict = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body({ answer: "" }));
+  await expect((await verify.Execution.connect(conflict)).wait({ timeoutMs: WAIT_MS })).rejects.toMatchObject({
+    code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
+  });
+  await (await verify.Execution.connect(replayed)).wait({ timeoutMs: WAIT_MS });
+  await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
+    .run("agent")
+    .observe.verify("turn-check", { answer: "" }, grouping);
+  const other = server.scopedApiKey("other_verifier", [
+    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+  ]);
+  await expect(
+    WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: other }) })
+      .run("agent")
+      .observe.verify("turn-check", { answer: "" }, grouping),
+  ).rejects.toMatchObject(DENIED);
+  await state.shutdown();
+
+  const judged = await groupExecution(server, bindingId, WAIT_MS);
+
+  expect([judged.group_id, judged.owner_card_uid]).toEqual([group, registered(receipt).uid]);
+  expect(judged.group?.members, "six inputs and six results").toBe(12);
+  expect(judged.group?.sources.turns.execution_ids).toHaveLength(6);
+  expect(judged.group?.sources.turns.execution_ids[5]).toBe(replayed);
+  expect(judged.result?.outcome.evidence.turns).toEqual({ kind: "json", value: turns });
+  expect(judged.result?.outcome.verdict).toBe("passed");
+  await expect(
+    cards.registerFromPath(fixture("cards/verify_in_real_time/support-unsourced.yaml")),
+  ).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+    message: expect.stringContaining("verified_by[0].runs_on"),
+  });
 });

@@ -2303,9 +2303,7 @@ export class Observe {
     inputs: VerifierInput | VerifierInputs,
     options?: VerifierInputOptions,
   ): Promise<VerificationResult> {
-    return lifecycleValue(
-      await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id),
-    );
+    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id));
   }
 
   /**

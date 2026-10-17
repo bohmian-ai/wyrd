@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: refund-review
+  version: 1.0.0
+  space: default
+spec:
+  description: No refund promise in the order conversation is overdue.
+  inputs:
+    facts: verifiers.refund-turn.inputs.fact
+  requirements:
+    - id: none-overdue
+      statement: Every promised refund is still within its deadline
+      check: {kind: assert, each: "inputs.facts[*].overdue", operator: equals, expected: false}

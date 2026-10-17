@@ -1182,6 +1182,22 @@ impl Assistant {
 }
 
 impl Grouped {
+    /// Judge `value` with `verifier` in a new Run of the Service's `agent`
+    /// under `group`, as the Service.
+    ///
+    /// # Panics
+    /// Panics when the Run does not open or the verify fails.
+    async fn turn(&self, verifier: &str, group: &GroupId, value: serde_json::Value) {
+        self.state
+            .run_for_card("agent")
+            .expect("agent run opens")
+            .observe()
+            .group_id(group.clone())
+            .verify(verifier, value)
+            .await
+            .expect("the turn is judged");
+    }
+
     /// Enqueue `body` over plain HTTP as the Service with `idempotency_key`,
     /// the way an agent replays a submission, and return the accepted
     /// execution.
@@ -1299,7 +1315,11 @@ async fn grouped_support_resumes() {
         "the same key and body replay one execution"
     );
     let conflict = support
-        .enqueue_over_http(deployment, "support-turn-0006", &body(&json!({"answer": ""})))
+        .enqueue_over_http(
+            deployment,
+            "support-turn-0006",
+            &body(&json!({"answer": ""})),
+        )
         .await;
     let conflicted = Execution::connect_with(conflict, &deployment.admin())
         .await
@@ -1349,7 +1369,10 @@ async fn grouped_support_resumes() {
     assert_eq!(judged.owner_card_uid, support.receipt.root.uid);
     let slot = "turns".parse().expect("slot name");
     let coverage = judged.group.expect("the execution pins its snapshot");
-    assert_eq!(coverage.members, 12, "six inputs and six results: {coverage:?}");
+    assert_eq!(
+        coverage.members, 12,
+        "six inputs and six results: {coverage:?}"
+    );
     assert_eq!(coverage.sources[&slot].execution_ids.len(), 6);
     assert_eq!(coverage.sources[&slot].execution_ids[5], replayed);
     let outcome = judged.result.expect("the result is visible").outcome;
@@ -1373,6 +1396,167 @@ async fn grouped_support_resumes() {
     );
     assert!(
         refused.to_string().contains("verified_by[0].runs_on"),
+        "{refused}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
+/// One retained `vala.verification.results` row of a group binding.
+#[derive(Debug, Deserialize)]
+struct GroupResultRow {
+    /// The execution the result settled.
+    execution_id: String,
+    /// The result's identity, which a verdict-change dispatch names.
+    result_id: String,
+    /// The result's verdict.
+    verdict: String,
+}
+
+/// An order conversation's refund promises are reviewed whole each time it
+/// goes idle, inside its finality window. The first review passes and
+/// dispatches nothing; a burst of turns, one of them overdue, coalesces into
+/// one failed review that dispatches its Operator once with the group and
+/// the passed result it changed from; a further turn keeps the verdict
+/// failed and dispatches nothing. Every review stays retained history. A
+/// turn after finality is still judged on its own but opens no review. A
+/// `group_end` binding declaring `on_failure` is refused at registration,
+/// naming the field.
+///
+/// # Panics
+/// Panics when a step fails, a review is not judged in time, or a review,
+/// dispatch, or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_refund_changes_verdict() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let mut hooks = deployment.hooks("refund-hooks", "refund-hook-token").await;
+    let refund = assistant
+        .grouped("cards/verify_in_real_time/refund.yaml")
+        .await;
+    let group = GroupId::new("order-1").expect("group id");
+    let opened = tokio::time::Instant::now();
+    let turn = |overdue: bool| {
+        refund.turn(
+            "refund-turn",
+            &group,
+            json!({"order": "A-1", "overdue": overdue}),
+        )
+    };
+    let slot = "facts".parse().expect("slot name");
+
+    turn(false).await;
+    turn(false).await;
+    let promised = deployment
+        .group_execution(&refund.binding, None, WAIT)
+        .await;
+    for overdue in [false, true, false] {
+        turn(overdue).await;
+    }
+    let corrected = deployment
+        .group_execution(&refund.binding, Some(&promised.execution_id), WAIT)
+        .await;
+    turn(false).await;
+    let unchanged = deployment
+        .group_execution(&refund.binding, Some(&corrected.execution_id), WAIT)
+        .await;
+
+    let verdicts = [&promised, &corrected, &unchanged].map(|review| {
+        let result = review.result.as_ref().expect("the result is visible");
+        (
+            review.group.as_ref().expect("snapshot").sources[&slot]
+                .execution_ids
+                .len(),
+            result.outcome.verdict,
+            review.dispatches.len(),
+        )
+    });
+    assert_eq!(
+        verdicts,
+        [
+            (2, VerificationVerdict::Passed, 0),
+            (5, VerificationVerdict::Failed, 1),
+            (6, VerificationVerdict::Failed, 0),
+        ],
+        "only the verdict change dispatches"
+    );
+    let history: Vec<GroupResultRow> =
+        Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT execution_id, result_id, verdict FROM vala.verification.results \
+                 WHERE binding_id = $1 ORDER BY ended_at",
+                &[QueryParam::String(refund.binding.to_string())],
+            )
+            .await
+            .expect("the reviews read back");
+    assert_eq!(
+        history
+            .iter()
+            .map(|row| (row.execution_id.clone(), row.verdict.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (promised.execution_id.to_string(), "passed"),
+            (corrected.execution_id.to_string(), "failed"),
+            (unchanged.execution_id.to_string(), "failed"),
+        ],
+        "every review stays retained"
+    );
+    let alert: serde_json::Value = tokio::time::timeout(WAIT, hooks.received.recv())
+        .await
+        .expect("the verdict change is delivered")
+        .expect("the hook is listening")
+        .body_json()
+        .expect("the alert is JSON");
+    assert_eq!(
+        alert,
+        json!({
+            "execution_id": corrected.execution_id.to_string(),
+            "result_id": history[1].result_id,
+            "verdict": "failed",
+            "group_id": "order-1",
+            "previous_result_id": history[0].result_id,
+            "previous_verdict": "passed",
+        })
+    );
+    hooks.assert_quiet(Duration::from_secs(5)).await;
+
+    // The fixture's 40 s finality, counted from the group's first turn,
+    // must pass before the late turn; waiting for it is the scenario.
+    tokio::time::sleep_until(opened + Duration::from_secs(41)).await;
+    turn(true).await;
+    refund.state.shutdown().await.expect("Bifrost stops");
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < quiet {
+        deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        assert_eq!(
+            deployment
+                .binding_status(&refund.binding)
+                .await
+                .last_execution_id,
+            Some(unchanged.execution_id),
+            "a turn after finality opens no review"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let refused = deployment
+        .cards()
+        .await
+        .register_from_path(&fixture("cards/verify_in_real_time/refund-on-failure.yaml"))
+        .await
+        .expect_err("on_failure on a group_end binding is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("verified_by[1].on_failure"),
         "{refused}"
     );
     assistant.deployment.shutdown().await;

@@ -1,7 +1,7 @@
 apiVersion: wyrd/v1
 kind: Service
 metadata:
-  name: support-on-failure
+  name: refund-on-failure
   version: 1.0.0
   space: default
 spec:
@@ -10,8 +10,8 @@ spec:
     - alias: agent
       ref: ./assistant-agent.yaml
       verified_by:
-        - verifier: ./turn-check.yaml
-        - verifier: ./conversation-review.yaml
+        - verifier: ./refund-turn.yaml
+        - verifier: ./refund-review.yaml
           runs_on: {kind: group_end, idle: 3s, max_age: 1h, finality: 1d}
           on_failure:
-            - {kind: Operator, name: alert-on-call, version: 1.0.0, space: default}
+            - ./refund-alert.yaml

@@ -11,13 +11,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use wyrd_ai::cards::RegistrationReceipt;
-use wyrd_ai::operator_connections::{
-    ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
-    OperatorConnections, SecretBearer,
-};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::Submission;
 use wyrd_ai::{
@@ -25,7 +19,7 @@ use wyrd_ai::{
 };
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, fixture, hydrate, register, registered};
+use crate::support::{Deployment, Hooks, fixture, hydrate, register, registered};
 
 /// The bearer token the `on-call-hooks` connection sends to the hook.
 const ON_CALL_TOKEN: &str = "on-call-hook-token";
@@ -37,29 +31,14 @@ const WAIT: Duration = Duration::from_secs(90);
 /// How long the story listens for an alert that must not arrive.
 const QUIET: Duration = Duration::from_secs(5);
 
-/// The local on-call hook: answers 200 and hands every request it receives
-/// to the story.
-struct Hook(UnboundedSender<Request>);
-
-impl Respond for Hook {
-    /// Forward `request` to the story and acknowledge it.
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        // The story may have finished and dropped its receiver.
-        let _ = self.0.send(request.clone());
-        ResponseTemplate::new(200)
-    }
-}
-
 /// The `latency-watch` deployment: the on-call hook, a verification-capable
 /// server whose `on-call-hooks` connection points at the hook, and the
 /// registered Service with its fitted baseline.
 struct Watch {
     /// The deployment.
     deployment: Deployment,
-    /// The local hook; kept so it keeps listening.
-    _hook: MockServer,
-    /// Every request the hook receives.
-    alerts: UnboundedReceiver<Request>,
+    /// The local on-call hook the connection points at.
+    hooks: Hooks,
     /// The Service registration.
     service: RegistrationReceipt,
     /// The scheduled Verifier every sample is submitted to.
@@ -82,27 +61,10 @@ impl Watch {
     /// # Panics
     /// Panics when a setup step fails or the baseline does not fit in time.
     async fn start_with(service: &str, verifier: &'static str) -> Self {
-        let hook = MockServer::start().await;
-        let (sender, alerts) = unbounded_channel();
-        Mock::given(wiremock::matchers::any())
-            .respond_with(Hook(sender))
-            .mount(&hook)
-            .await;
         let deployment =
             Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
                 .await;
-        OperatorConnections::connect_with(&deployment.admin())
-            .await
-            .expect("handle connects")
-            .create(&CreateOperatorConnectionRequest::Http {
-                name: ConnectionName::new("on-call-hooks").expect("connection name"),
-                origin: HttpsOrigin::parse(&hook.uri()).expect("hook origin parses"),
-                auth: HttpConnectionAuth::Bearer {
-                    token: SecretBearer::new(ON_CALL_TOKEN.to_owned()),
-                },
-            })
-            .await
-            .expect("connection creates");
+        let hooks = deployment.hooks("on-call-hooks", ON_CALL_TOKEN).await;
         let cards = deployment.cards().await;
         register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
         let watch = register(
@@ -123,8 +85,7 @@ impl Watch {
             .expect("the latency baseline fits");
         Self {
             deployment,
-            _hook: hook,
-            alerts,
+            hooks,
             service: watch,
             verifier,
         }
@@ -176,16 +137,6 @@ impl Watch {
             .expect("the binding comes due");
         self.deployment.scheduled_result(&binding, WAIT).await
     }
-
-    /// Assert the hook receives nothing for [`QUIET`].
-    ///
-    /// # Panics
-    /// Panics when an alert arrives.
-    async fn assert_quiet(&mut self) {
-        if let Ok(Some(alert)) = tokio::time::timeout(QUIET, self.alerts.recv()).await {
-            panic!("no alert is due: {} {}", alert.method, alert.url);
-        }
-    }
 }
 
 /// A shifted window of submitted latencies is recorded without judging, then
@@ -203,7 +154,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
     let mut watch = Watch::start().await;
     watch.submit(std::iter::repeat_n(99, 100)).await;
     assert!(
-        watch.alerts.try_recv().is_err(),
+        watch.hooks.received.try_recv().is_err(),
         "submitting alone runs no check and alerts no one"
     );
 
@@ -247,7 +198,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         "{latency:?}"
     );
 
-    let alert = tokio::time::timeout(WAIT, watch.alerts.recv())
+    let alert = tokio::time::timeout(WAIT, watch.hooks.received.recv())
         .await
         .expect("an alert arrives in time")
         .expect("the hook is still listening");
@@ -267,7 +218,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         body.to_string().contains(&result.execution_id.to_string()),
         "the alert names the failed execution: {body}"
     );
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 
@@ -285,7 +236,7 @@ async fn passing_window_alerts_no_one() {
     let result = watch.judge().await;
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 
@@ -305,7 +256,7 @@ async fn empty_window_is_inconclusive_and_alerts_no_one() {
     let result = watch.judge().await;
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 

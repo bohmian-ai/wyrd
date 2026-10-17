@@ -54,6 +54,9 @@ use crate::trace_source::TraceSource;
 use crate::trace_source::project_spans;
 use crate::walk::{Prepared, RunLedger, walk};
 
+/// Requirement reason of an `each` assertion whose selector matched nothing.
+const EMPTY_SELECTION: &str = "empty_selection";
+
 /// An execution-wide failure: no verdict was produced.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -429,7 +432,9 @@ impl VerificationEngine {
 
     /// Run one requirement's check over its resolved bindings.
     ///
-    /// A failed Agent or code check is inconclusive.
+    /// A failed Agent or code check is inconclusive, and so is an `each`
+    /// assertion selecting no value, with reason [`EMPTY_SELECTION`], so an
+    /// empty selection never passes vacuously.
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
@@ -450,12 +455,23 @@ impl VerificationEngine {
                 ..
             } => {
                 let observed = inputs.get("value").map_or(Value::Null, json);
-                let compare = if each.is_some() {
-                    evaluate_item_mode
-                } else {
-                    evaluate_single
-                };
-                Judged::compared(compare(&requirement.id, operator, expected, &observed))
+                match (each, &observed) {
+                    (Some(_), Value::Array(items)) if items.is_empty() => {
+                        Judged::inconclusive(EMPTY_SELECTION.to_owned())
+                    }
+                    (Some(_), _) => Judged::compared(evaluate_item_mode(
+                        &requirement.id,
+                        operator,
+                        expected,
+                        &observed,
+                    )),
+                    (None, _) => Judged::compared(evaluate_single(
+                        &requirement.id,
+                        operator,
+                        expected,
+                        &observed,
+                    )),
+                }
             }
             Check::Trace(trace) => self.trace(&requirement.id, trace, &inputs, deadline).await,
             Check::Agent(_) | Check::Code(_) => {

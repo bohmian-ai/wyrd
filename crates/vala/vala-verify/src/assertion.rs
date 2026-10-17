@@ -46,7 +46,8 @@ pub(crate) fn evaluate_single(
 }
 
 /// Compare every element of the `observed` array with `expected`; the
-/// assertion passes only when every element passes, so an empty array passes.
+/// assertion passes only when every element passes. The engine judges an
+/// empty selection inconclusive before comparing, so none reaches here.
 ///
 /// Shared by item-mode Verifier `assert` checks over an `each` selector.
 ///

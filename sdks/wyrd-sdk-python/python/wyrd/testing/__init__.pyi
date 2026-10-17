@@ -34,6 +34,9 @@ class WyrdTestServer:
 
     ``access_ttl_seconds`` mints access tokens of that lifetime, verified with
     no clock-skew allowance, so a journey can outlive its first token.
+
+    ``scribe_outbox_capacity`` replaces the Scribe outbox capacity in items,
+    so a journey can fill verification staging with a few calls.
     """
 
     def __init__(
@@ -43,6 +46,7 @@ class WyrdTestServer:
         provider_base_url: str | None = None,
         live_providers: bool = False,
         access_ttl_seconds: int | None = None,
+        scribe_outbox_capacity: int | None = None,
     ) -> None:
         """Create an unstarted server; entering the ``with`` block boots it.
 
@@ -65,6 +69,8 @@ class WyrdTestServer:
             access_ttl_seconds: the access-token lifetime in seconds, verified
                 with no clock-skew allowance; omitted keeps the production
                 lifetime.
+            scribe_outbox_capacity: the Scribe outbox capacity in items;
+                omitted keeps the production capacity.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when

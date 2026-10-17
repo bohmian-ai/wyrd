@@ -407,6 +407,9 @@ mod error_mapper_tests {
         assert_eq!(problem["details"]["data"]["status"], 503);
     }
 
+    /// Proves every retryable pressure error — auth verify, ingest busy,
+    /// verification staging, and query admission — carries `Retry-After: 1`,
+    /// while non-retryable Bifrost failures carry none.
     #[tokio::test]
     async fn ingest_busy_http_retry_metadata() {
         let retryable = WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
@@ -416,6 +419,18 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let staging_full = WyrdErrorResponse::from(WyrdError::VerificationStagingFull {
+            message: "verification staging is full".to_owned(),
+            details: serde_json::json!({ "retry_after_seconds": 1 }),
+        })
+        .into_response();
+        assert_eq!(
+            staging_full
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),

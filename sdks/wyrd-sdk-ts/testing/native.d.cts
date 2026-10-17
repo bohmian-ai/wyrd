@@ -400,6 +400,11 @@ export interface NativeTestServerOptions {
    * production lifetime.
    */
   accessTtlSeconds?: number
+  /**
+   * Scribe outbox capacity in items, so a journey can fill verification
+   * staging with a few calls; omitted keeps the production capacity.
+   */
+  scribeOutboxCapacity?: number
 }
 
 /**

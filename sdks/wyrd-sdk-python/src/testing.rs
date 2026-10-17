@@ -114,6 +114,9 @@ pub struct WyrdTestServer {
     /// allowance, for a journey that outlives its first token; `None` keeps
     /// the production lifetime.
     access_ttl_seconds: Option<i64>,
+    /// Scribe outbox capacity in items, so a journey can fill verification
+    /// staging with a few calls; `None` keeps the production capacity.
+    scribe_outbox_capacity: Option<usize>,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
     /// Bound gRPC endpoint while entered.
@@ -143,18 +146,20 @@ impl WyrdTestServer {
     /// built-in adapter at its real provider endpoint, which only the opt-in
     /// live smoke lane asks for. `access_ttl_seconds` mints access tokens of that lifetime,
     /// verified with no clock-skew allowance, so a journey can outlive one.
+    /// `scribe_outbox_capacity` replaces the Scribe outbox capacity.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None))]
+    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None, scribe_outbox_capacity = None))]
     fn __new__(
         mutate_env: bool,
         verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
         access_ttl_seconds: Option<i64>,
+        scribe_outbox_capacity: Option<usize>,
     ) -> WyrdPyResult<Self> {
         if live_providers && provider_base_url.is_some() {
             return Err(harness_error(
@@ -173,6 +178,7 @@ impl WyrdTestServer {
             provider_base_url,
             live_providers,
             access_ttl_seconds,
+            scribe_outbox_capacity,
             base_url: None,
             grpc_url: None,
             api_key: None,
@@ -194,11 +200,15 @@ impl WyrdTestServer {
         let live_providers = slf.live_providers;
         let verification_runtime = slf.verification_runtime;
         let access_ttl_seconds = slf.access_ttl_seconds;
+        let scribe_outbox_capacity = slf.scribe_outbox_capacity;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
                 if verification_runtime {
                     builder = builder.with_verification_runtime_for_test();
+                }
+                if let Some(capacity) = scribe_outbox_capacity {
+                    builder = builder.with_scribe_outbox_capacity_for_test(capacity);
                 }
                 if let Some(seconds) = access_ttl_seconds {
                     builder = builder

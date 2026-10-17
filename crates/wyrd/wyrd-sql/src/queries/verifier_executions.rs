@@ -41,8 +41,8 @@ use wyrd_spec::verification::execution::{
     InputDeclaration, VerificationExecutionState, VerificationRequest,
 };
 use wyrd_spec::verification::{
-    DriftWindow, FrozenTarget, OperatorDispatchState, VerificationBindingStatus, VerificationError,
-    VerificationVerdict, VerifierReadiness,
+    DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
+    VerificationError, VerificationVerdict, VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -392,7 +392,8 @@ const BINDING_TARGETS_SQL: &str = r"
            wyrd.verifier_readiness(b.verifier_card_uid) AS readiness,
            (SELECT e.execution_id FROM wyrd.verifier_executions e
              WHERE e.binding_id = b.binding_id
-             ORDER BY e.created_at DESC, e.execution_id DESC LIMIT 1) AS last_execution_id
+             ORDER BY e.created_at DESC, e.execution_id DESC LIMIT 1) AS last_execution_id,
+           b.group_end
       FROM wyrd.verification_bindings b
      WHERE b.binding_id = $1
 ";
@@ -1718,11 +1719,16 @@ impl VerifierExecutionQueue {
         let Some(activity) = binding_activity(conn, binding_id, self.inactivity).await? else {
             return Ok(None);
         };
-        let (subject, verifier, readiness, last_execution): (Uuid, Uuid, String, Option<Uuid>) =
-            sqlx::query_as(BINDING_TARGETS_SQL)
-                .bind(binding_id.as_uuid())
-                .fetch_one(&mut **conn.transaction())
-                .await?;
+        let (subject, verifier, readiness, last_execution, group_end): (
+            Uuid,
+            Uuid,
+            String,
+            Option<Uuid>,
+            Option<Json<GroupEndSettings>>,
+        ) = sqlx::query_as(BINDING_TARGETS_SQL)
+            .bind(binding_id.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await?;
         Ok(Some(VerificationBindingStatus {
             binding_id,
             owner_card_uid: activity.owner_card_uid,
@@ -1735,6 +1741,7 @@ impl VerifierExecutionQueue {
             last_execution_id: last_execution
                 .map(|id| stored(ExecutionId::new(id)))
                 .transpose()?,
+            group_end: group_end.map(|Json(settings)| settings),
         }))
     }
 

@@ -25,8 +25,8 @@ use wyrd_sql::queries::cards::{
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::verification::{
-    BindingActivity, FrozenTarget, InactivityTimeout, NewBinding, binding_activity,
-    owner_binding_ids, project_bindings, record_machine_authentication,
+    BindingActivation, BindingActivity, FrozenTarget, InactivityTimeout, NewBinding,
+    binding_activity, owner_binding_ids, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -78,8 +78,10 @@ fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
         verifier_card_uid: verifier.clone(),
         trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
         operators: vec![FrozenTarget::Uid(uid())],
-        cron: "0 2 * * *".to_owned(),
-        tz: None,
+        activation: BindingActivation::Schedule {
+            cron: "0 2 * * *".to_owned(),
+            tz: None,
+        },
         inputs: BTreeMap::from([(
             SlotName::new("current").expect("valid slot name"),
             ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),

@@ -27,7 +27,7 @@ use wyrd_sql::queries::cards::{
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
-    FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
+    BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_executions::{
     Submission, SubmissionOutcome, VerifierExecutionQueue,
@@ -337,8 +337,10 @@ impl VerificationFixture {
                 verifier_card_uid: verifier.clone(),
                 trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
                 operators,
-                cron: cron.to_owned(),
-                tz: None,
+                activation: BindingActivation::Schedule {
+                    cron: cron.to_owned(),
+                    tz: None,
+                },
                 inputs,
             }],
         )

@@ -102,6 +102,7 @@ async fn journey_author_save_load_run() {
             runs_on: None,
             inputs: std::collections::BTreeMap::new(),
             on_failure: Vec::new(),
+            on_verdict_change: Vec::new(),
         }];
         assert_loaded_export_is_faithful(&authored, &tools, &path);
     }

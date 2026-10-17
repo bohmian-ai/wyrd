@@ -47,9 +47,11 @@ CREATE INDEX auth_service_accounts_by_card_uid
 -- The effective Trigger and every `on_failure` Operator are frozen as either a
 -- referenced Card UID or, for an inline body, its canonical spec digest. The
 -- schedule of a `schedule` Trigger is frozen alongside, so arming the cursor
--- never re-reads a Trigger Card. `next_run_at` stays NULL until the owner's
--- first qualifying machine exchange arms it; an `observations_ready` binding
--- never has a cursor.
+-- never re-reads a Trigger Card. A `group_end` binding freezes its Trigger
+-- durations and pinned source bindings in `group_end`, and its cursor is the
+-- group discovery poll. `next_run_at` stays NULL until the owner's first
+-- qualifying machine exchange arms it; an `observations_ready` binding never
+-- has a cursor.
 CREATE TABLE wyrd.verification_bindings (
     binding_id              UUID        NOT NULL PRIMARY KEY,
     data_tenant_id          UUID        NOT NULL
@@ -64,9 +66,10 @@ CREATE TABLE wyrd.verification_bindings (
     trigger_digest          TEXT,
     operators               JSONB       NOT NULL DEFAULT '[]'::jsonb,
     activation              TEXT        NOT NULL
-        CHECK (activation IN ('schedule','observations_ready')),
+        CHECK (activation IN ('schedule','observations_ready','group_end')),
     schedule_cron           TEXT,
     schedule_tz             TEXT,
+    group_end               JSONB,
     next_run_at             TIMESTAMPTZ,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (data_tenant_id, binding_id),
@@ -77,9 +80,11 @@ CREATE TABLE wyrd.verification_bindings (
     CHECK ((trigger_uid IS NULL) <> (trigger_digest IS NULL)),
     CHECK (jsonb_typeof(operators) = 'array'),
     CHECK (
-        (activation = 'schedule' AND schedule_cron IS NOT NULL)
+        (activation = 'schedule' AND schedule_cron IS NOT NULL AND group_end IS NULL)
         OR (activation = 'observations_ready' AND schedule_cron IS NULL
-            AND schedule_tz IS NULL AND next_run_at IS NULL)
+            AND schedule_tz IS NULL AND next_run_at IS NULL AND group_end IS NULL)
+        OR (activation = 'group_end' AND schedule_cron IS NULL
+            AND schedule_tz IS NULL AND jsonb_typeof(group_end) = 'object')
     ),
     CHECK (owner_card_kind = 'Service' OR subject_occurrence_key = '$owner')
 );

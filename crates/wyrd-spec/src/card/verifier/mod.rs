@@ -676,9 +676,20 @@ pub struct VerificationBinding {
     pub runs_on: Option<InlineableRef<TriggerSpec>>,
     /// Operators dispatched independently after a `failed` verdict.
     ///
-    /// Empty means a failed result stays durable with no reaction.
+    /// Empty means a failed result stays durable with no reaction. A
+    /// `group_end` binding refuses this list; it reacts through
+    /// [`Self::on_verdict_change`] instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_failure: Vec<InlineableRef<OperatorSpec>>,
+    /// Operators dispatched independently when a settled group judgment's
+    /// verdict differs from the preceding settled judgment of the same
+    /// binding and group.
+    ///
+    /// Valid only on a `group_end` binding. The first judgment of a group is
+    /// the baseline and dispatches nothing; an unchanged verdict dispatches
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_verdict_change: Vec<InlineableRef<OperatorSpec>>,
     /// Scheduled evidence: the recorded measurements filling each samples
     /// slot of the Verifier within the subject's schedule window.
     ///
@@ -686,4 +697,27 @@ pub struct VerificationBinding {
     /// names are never inferred.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<SlotName, ScheduledInput>,
+}
+
+impl VerificationBinding {
+    /// Each authored Operator list beside its field name, in declaration
+    /// order, so every validator and reference walker covers both reactions.
+    #[must_use]
+    pub fn operator_lists(&self) -> [(&'static str, &[InlineableRef<OperatorSpec>]); 2] {
+        [
+            ("on_failure", &self.on_failure),
+            ("on_verdict_change", &self.on_verdict_change),
+        ]
+    }
+
+    /// Each authored Operator list beside its field name, mutably, for
+    /// reference pinning.
+    pub fn operator_lists_mut(
+        &mut self,
+    ) -> [(&'static str, &mut Vec<InlineableRef<OperatorSpec>>); 2] {
+        [
+            ("on_failure", &mut self.on_failure),
+            ("on_verdict_change", &mut self.on_verdict_change),
+        ]
+    }
 }

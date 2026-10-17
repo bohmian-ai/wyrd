@@ -39,7 +39,7 @@ use wyrd_sql::queries::cards::{
 };
 use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
-    FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
+    BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
@@ -259,8 +259,10 @@ async fn bind(
             verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators,
-            cron: "0 2 * * *".to_owned(),
-            tz: None,
+            activation: BindingActivation::Schedule {
+                cron: "0 2 * * *".to_owned(),
+                tz: None,
+            },
             inputs: scheduled_inputs(),
         }],
     )

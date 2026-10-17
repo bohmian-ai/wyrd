@@ -860,6 +860,7 @@ mod tests {
             on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
                 "{dir}/operator.yaml"
             )))],
+            on_verdict_change: Vec::new(),
             inputs: BTreeMap::new(),
         }
     }

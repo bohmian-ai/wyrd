@@ -1202,10 +1202,15 @@ struct InputRows {
 
 /// A tenant's slow judgments fill the server's reserved staging share while
 /// another tenant's submission is accepted and judged beside the first of
-/// them; once the share is full, further verify and submit calls are refused
-/// with typed retryable pressure before staging anything. Once the burst
-/// drains, the identical refused call is accepted and judged once, and the
-/// bursting tenant holds exactly one inputs row per accepted call.
+/// them, the bursting tenant offering normal calls one at a time until the
+/// neighbor's execution completes; once the share is full, further verify and
+/// submit calls are refused with typed retryable pressure before staging
+/// anything. Once the burst drains, the identical refused call is accepted and
+/// judged once, and the bursting tenant holds exactly one inputs row per
+/// accepted call.
+///
+/// The normal calls hold at most one reserved slot at a time, so beside the
+/// first judgment's two the neighbor's execution always has its slot.
 ///
 /// # Panics
 /// Panics when a refusal is missing or untyped, the neighbor's execution
@@ -1225,6 +1230,7 @@ async fn verification_staging_refuses_and_recovers() {
     server.flush_bifrost().await.expect("setup settles");
 
     let mut burst = Vec::new();
+    let mut offered = 0;
     for in_flight in 1..=2 {
         let judging = state.clone();
         burst.push(tokio::spawn(async move {
@@ -1247,9 +1253,28 @@ async fn verification_staging_refuses_and_recovers() {
             else {
                 panic!("Run evidence queues an execution");
             };
-            let neighbor_result = accepted
-                .wait(WAIT)
+            let neighbor_waits = tokio::spawn(async move { accepted.wait(WAIT).await });
+            loop {
+                let Submission::Queued(normal) = state
+                    .run_for_card("agent")
+                    .expect("agent run opens")
+                    .observe()
+                    .submit("answer-check", json!("yes"))
+                    .await
+                    .expect("the bursting tenant's normal call is accepted beside the neighbor")
+                else {
+                    panic!("Run evidence queues an execution");
+                };
+                let normal = normal.wait(WAIT).await.expect("the normal call is judged");
+                assert_eq!(normal.outcome.verdict, VerificationVerdict::Passed);
+                offered += 1;
+                if neighbor_waits.is_finished() {
+                    break;
+                }
+            }
+            let neighbor_result = neighbor_waits
                 .await
+                .expect("the neighbor's wait joins")
                 .expect("the neighbor's accepted execution completes during the burst");
             assert_eq!(neighbor_result.outcome.verdict, VerificationVerdict::Passed);
             assert!(
@@ -1320,8 +1345,8 @@ async fn verification_staging_refuses_and_recovers() {
         .expect("the inputs rows count");
     assert_eq!(
         recorded.iter().map(|count| count.rows).collect::<Vec<_>>(),
-        [3],
-        "two burst judgments and the recovered call; nothing of the refused calls"
+        [3 + offered],
+        "the burst judgments, the normal calls, and the recovered call; nothing of the refused calls"
     );
     assistant.deployment.shutdown().await;
 }

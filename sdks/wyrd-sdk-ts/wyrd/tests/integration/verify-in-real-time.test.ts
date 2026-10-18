@@ -446,6 +446,7 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
 
   const burst: Promise<VerificationResult>[] = [];
   const finished: boolean[] = [];
+  let offered = 0;
   for (const inFlight of [1, 2]) {
     const judging = state.run("agent").observe.verify("answer-judged", { answer: "yes" });
     void judging.then(
@@ -459,7 +460,17 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
       if (accepted.kind !== "queued") {
         throw new Error("Run evidence queues an execution");
       }
-      const judged = await accepted.execution.wait({ timeoutMs: WAIT_MS });
+      let neighborDone = false;
+      const neighborWaits = accepted.execution.wait({ timeoutMs: WAIT_MS }).finally(() => (neighborDone = true));
+      do {
+        const normal = await state.run("agent").observe.submit("answer-check", { answer: "yes" });
+        if (normal.kind !== "queued") {
+          throw new Error("Run evidence queues an execution");
+        }
+        expect((await normal.execution.wait({ timeoutMs: WAIT_MS })).outcome.verdict).toBe("passed");
+        offered += 1;
+      } while (!neighborDone);
+      const judged = await neighborWaits;
       expect(judged.outcome.verdict).toBe("passed");
       expect(finished[0], "the burst's judgment is still in flight").toBeUndefined();
       server.flushBifrost();
@@ -494,5 +505,5 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     [],
     z.object({ n: z.coerce.number() }),
   );
-  expect(rows).toEqual([{ n: 3 }]);
+  expect(rows).toEqual([{ n: 3 + offered }]);
 });

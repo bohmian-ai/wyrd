@@ -475,7 +475,8 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
         )
         server.flush_bifrost()
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        offered = 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
             burst = []
             for in_flight in (1, 2):
                 burst.append(
@@ -485,7 +486,15 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
                 if in_flight == 1:
                     accepted = neighbor.run("agent").observe.submit("answer-check", "yes")
                     assert isinstance(accepted, verify.Execution)
-                    assert accepted.wait(WAIT_SECONDS).verdict == "passed"
+                    neighbor_waits = pool.submit(accepted.wait, WAIT_SECONDS)
+                    while True:
+                        normal = state.run("agent").observe.submit("answer-check", "yes")
+                        assert isinstance(normal, verify.Execution)
+                        assert normal.wait(WAIT_SECONDS).verdict == "passed"
+                        offered += 1
+                        if neighbor_waits.done():
+                            break
+                    assert neighbor_waits.result().verdict == "passed"
                     assert not burst[0].done(), "the burst's judgment is still in flight"
                     server.flush_bifrost()
 
@@ -509,4 +518,4 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
         rows = Bifrost(client=client_of(server)).sql(
             "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
         )
-        assert [row.n for row in rows] == [3]
+        assert [row.n for row in rows] == [3 + offered]

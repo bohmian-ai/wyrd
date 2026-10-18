@@ -47,7 +47,7 @@ struct Observed {
 }
 
 impl Observed {
-    /// Boot a server, register and hydrate the fixture Service with
+    /// Boot a server, declare and pull the fixture Service with
     /// `measurements` declared beside `latency`, and start Bifrost on the
     /// bundle with the Service's own key and `queue`.
     ///

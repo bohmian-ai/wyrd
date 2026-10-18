@@ -31,7 +31,7 @@ use utoipa_axum::routes;
 /// Build card routes for the `/v1` group.
 pub fn cards_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list_cards_http, register_card_http))
+        .routes(routes!(list_cards_http, declare_card_http))
         .routes(routes!(get_card_http, delete_card_http))
         .routes(routes!(get_card_by_ref_http, delete_card_by_ref_http))
         .routes(routes!(get_latest_card_http))
@@ -400,7 +400,7 @@ async fn list_artifacts_http(
 )]
 #[tracing::instrument(
     skip(state, caller, headers, body),
-    fields(operation = "card.registration.create")
+    fields(operation = "card.declaration.create")
 )]
 /// Accept a card declaration request and return its durable declaration result.
 ///
@@ -424,7 +424,7 @@ async fn list_artifacts_http(
 /// `operators:invoke` for an Operator-bearing request, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
-pub(crate) async fn register_card_http(
+pub(crate) async fn declare_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
@@ -434,18 +434,18 @@ pub(crate) async fn register_card_http(
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
     // calling?" while this capability check answers "may they declare cards?".
-    authorize_card_write(&state, &caller, "card.registration.create", "cards")?;
+    authorize_card_write(&state, &caller, "card.declaration.create", "cards")?;
     if service::dispatches_operators(&body) {
         audit::authorize(
             &state,
             &caller,
             &Permission::operator_invoke(),
-            "card.registration.create",
+            "card.declaration.create",
             "operators",
         )?;
     }
     let idempotency_key = extract_required_idempotency_key(&headers)?;
-    service::register_card(&state, &caller, idempotency_key.as_str(), body)
+    service::declare_card(&state, &caller, idempotency_key.as_str(), body)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
         .map_err(WyrdErrorResponse::from)
@@ -490,7 +490,7 @@ pub(crate) async fn register_card_http(
 )]
 #[tracing::instrument(
     skip(state, caller, headers),
-    fields(operation = "card.registration.complete")
+    fields(operation = "card.declaration.complete")
 )]
 async fn complete_card_http(
     State(state): State<AppState>,
@@ -503,7 +503,7 @@ async fn complete_card_http(
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.complete",
+        "card.declaration.complete",
         &format!("card:{card_uid}"),
     )?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
@@ -565,7 +565,7 @@ async fn delete_card_http(
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.delete",
+        "card.declaration.delete",
         &format!("card:{card_uid}"),
     )?;
     service::delete_card_with_kind(&state, &caller, &card_uid, kind)
@@ -624,7 +624,7 @@ async fn delete_card_by_ref_http(
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.delete",
+        "card.declaration.delete",
         &card_resource(&card_ref),
     )?;
     service::delete_card_by_ref(&state, &caller, &card_ref)
@@ -834,7 +834,7 @@ mod tests {
 
     /// Reject declaration requests that omit the idempotency key header.
     #[test]
-    fn registration_requires_idempotency_key() {
+    fn declaration_requires_idempotency_key() {
         let error = extract_required_idempotency_key(&HeaderMap::new())
             .expect_err("registration must require an idempotency key");
 
@@ -844,7 +844,7 @@ mod tests {
 
     /// Reject malformed idempotency keys with a dedicated catalog code.
     #[test]
-    fn registration_rejects_malformed_idempotency_key() {
+    fn declaration_rejects_malformed_idempotency_key() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Idempotency-Key",

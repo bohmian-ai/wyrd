@@ -1,4 +1,4 @@
-//! Resolve non-sibling `CardRef` values before registration writes begin.
+//! Resolve non-sibling `CardRef` values before declaration writes begin.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -98,7 +98,7 @@ async fn check_operator(
     })
 }
 
-/// Registration preflight: effective spec bodies for referenced targets,
+/// Declaration preflight: effective spec bodies for referenced targets,
 /// keyed by provenance and identity.
 ///
 /// [`EffectiveSpecs::resolve`] is the preflight entry point. It owns the
@@ -311,7 +311,7 @@ impl EffectiveSpecs {
     /// Check every submitted PSI or SPC drift check against its effective
     /// baseline Data.
     ///
-    /// The fitter reads the Data Card's registered Parquet artifact, so the
+    /// The fitter reads the Data Card's declared Parquet artifact, so the
     /// baseline must use an interface whose artifact is Parquet — Pandas,
     /// Polars, Parquet, or Arrow saved as Parquet — and must declare every
     /// monitored feature as a schema column. Checking here, before the write
@@ -655,7 +655,7 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
 /// Collect exact submitted identities eligible for sibling references.
 ///
 /// Auto-versioned and scoped submissions cannot be sibling targets because a
-/// sibling reference carries an exact version before registration resolves.
+/// sibling reference carries an exact version before declaration resolves.
 fn sibling_identities(
     submissions: &[CardSubmission],
 ) -> Result<BTreeSet<CardRefIdentity>, WyrdError> {

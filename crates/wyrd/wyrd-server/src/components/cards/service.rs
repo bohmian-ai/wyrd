@@ -54,7 +54,7 @@ use wyrd_sql::queries::cards::{
     lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
     mark_card_reconciliation_succeeded, mark_manifest_upload_initialized, mark_manifest_verified,
     persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
-    record_card_blob, record_card_reconciliation_failure, registration_request_hash,
+    record_card_blob, record_card_reconciliation_failure, declaration_request_hash,
     reschedule_card_reconciliation, resolve_version, schedule_card_reconciliation,
     soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
 };
@@ -547,7 +547,7 @@ struct ExistingNode {
 /// Returns the validation, idempotency, dependency, registry, or upload
 /// failure the declaration raised.
 #[tracing::instrument(skip(state, caller), fields(operation = "card.declaration"))]
-pub async fn register_card(
+pub async fn declare_card(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
@@ -565,7 +565,7 @@ pub async fn register_card(
             for table in tables {
                 register_table(state, caller.clone(), table).await?;
             }
-            let plan = plan_registration(request, request_hash, external_refs, order, root);
+            let plan = plan_declaration(request, request_hash, external_refs, order, root);
             DeclarationWriter { state, caller }
                 .write(idempotency_key, plan)
                 .await?
@@ -577,7 +577,7 @@ pub async fn register_card(
 ///
 /// Each declared JSON Schema is parsed into Bifrost user fields here, before
 /// any table or Card is written, so an unsupported schema refuses the whole
-/// registration. [`register_card`] then ensures each table through the
+/// registration. [`declare_card`] then ensures each table through the
 /// catalog owner, which refuses a conflicting existing schema before the
 /// Card transaction opens; tables are never dropped afterwards.
 ///
@@ -718,7 +718,7 @@ async fn wait_for_replay(
 /// Initialize pending artifact uploads after the composite transaction commits.
 #[tracing::instrument(
     skip(state, caller, seed),
-    fields(operation = "card.registration.initialize_uploads")
+    fields(operation = "card.declaration.initialize_uploads")
 )]
 async fn initialize_uploads(
     state: &AppState,
@@ -795,7 +795,7 @@ async fn initialize_uploads(
         }
     }
     if let Some(error) = initialization_error {
-        abort_pending_registration_cards(state, caller, &response.outcomes, idempotency_key).await;
+        abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key).await;
         return Err(error);
     }
     plans.sort_by(|left, right| {
@@ -837,7 +837,7 @@ async fn initialize_uploads(
             match complete_card(state, caller, card_uid, idempotency_key).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    abort_pending_registration_cards(
+                    abort_pending_declaration_cards(
                         state,
                         caller,
                         &response.outcomes,
@@ -887,7 +887,7 @@ async fn initialize_card_uploads(
 }
 
 /// Abort every still-pending Card when post-commit initialization fails.
-async fn abort_pending_registration_cards(
+async fn abort_pending_declaration_cards(
     state: &AppState,
     caller: &Caller,
     outcomes: &[CardDeclarationOutcome],
@@ -1037,7 +1037,7 @@ fn plan_declaration_graph(
 }
 
 /// Assemble the validated graph with resolved external dependencies.
-fn plan_registration(
+fn plan_declaration(
     request: DeclareCardRequest,
     request_hash: String,
     external_refs: ResolvedRefs,
@@ -1527,7 +1527,7 @@ fn hash_request(request: &DeclareCardRequest) -> Result<String, WyrdError> {
         .iter()
         .map(|submission| canonical_artifact_manifest_hash(&submission.artifacts))
         .collect::<Result<Vec<_>, _>>()?;
-    registration_request_hash(&canonical, &hashes)
+    declaration_request_hash(&canonical, &hashes)
 }
 
 /// Strip upload URLs from the durable response and retain only replay inputs.
@@ -1754,7 +1754,7 @@ struct CardCompletionState {
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
-        operation = "card.registration.complete",
+        operation = "card.declaration.complete",
         idempotency_key_present = !idempotency_key.is_empty()
     )
 )]
@@ -2115,7 +2115,7 @@ async fn finish_card_delete(
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
-        operation = "card.registration.cleanup",
+        operation = "card.declaration.cleanup",
         idempotency_key_present = !idempotency_key.is_empty()
     )
 )]
@@ -2708,7 +2708,7 @@ mod tests {
 
     /// Reject a peer-only Verifier Service component before registry access.
     #[test]
-    fn registration_graph_rejects_verifier_service_component() {
+    fn declaration_graph_rejects_verifier_service_component() {
         let request = request(serde_json::json!({
             "submissions": [service("app", serde_json::json!({
                 "components": [{
@@ -2731,7 +2731,7 @@ mod tests {
 
     /// Reject an unbound Verifier submitted beside a Service root before registry access.
     #[test]
-    fn registration_graph_rejects_unbound_verifier_peer() {
+    fn declaration_graph_rejects_unbound_verifier_peer() {
         let request = request(serde_json::json!({
             "submissions": [service("app", serde_json::json!({})), verifier("quality")]
         }));
@@ -2744,7 +2744,7 @@ mod tests {
 
     /// Preserve standalone Verifier declaration at the server boundary.
     #[test]
-    fn registration_graph_accepts_standalone_verifier() {
+    fn declaration_graph_accepts_standalone_verifier() {
         let request = request(serde_json::json!({
             "submissions": [verifier("quality")]
         }));

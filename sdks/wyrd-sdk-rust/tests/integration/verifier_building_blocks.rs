@@ -253,7 +253,7 @@ struct PolicyDesk {
 
 impl PolicyDesk {
     /// Start the upstream and the server, deploy `openai` on the upstream,
-    /// register and hydrate `policy-desk`, and load it as its own key.
+    /// declare and pull `policy-desk`, and load it as its own key.
     ///
     /// # Panics
     /// Panics when a setup step fails.

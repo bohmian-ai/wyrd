@@ -100,7 +100,7 @@ pub struct CardArtifactManifestRow {
 
 /// Card row values needed to construct a declaration response.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RegisteredCardRow {
+pub struct DeclaredCardRow {
     /// Card UID.
     pub card_uid: CardUid,
     /// Card kind.
@@ -126,7 +126,7 @@ pub struct RegisteredCardRow {
 }
 
 /// Compute the canonical request hash from ordered submissions and manifest hashes.
-pub fn registration_request_hash(
+pub fn declaration_request_hash(
     canonical_submissions: &[&CardSubmission],
     artifact_hashes: &[Option<String>],
 ) -> Result<String, WyrdError> {
@@ -269,7 +269,7 @@ pub async fn insert_declaration_operation(
 pub async fn insert_card_row(
     conn: &mut TenantConn<'_>,
     input: NewCardRow<'_>,
-) -> Result<RegisteredCardRow, WyrdError> {
+) -> Result<DeclaredCardRow, WyrdError> {
     let space = input
         .card
         .metadata
@@ -319,7 +319,7 @@ pub async fn insert_card_row(
     .fetch_one(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
-    Ok(RegisteredCardRow {
+    Ok(DeclaredCardRow {
         card_uid: input.card_uid,
         kind: input.card.kind.clone(),
         space: space.clone(),

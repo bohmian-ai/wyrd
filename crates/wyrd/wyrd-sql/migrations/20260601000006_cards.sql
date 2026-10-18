@@ -60,7 +60,7 @@ CREATE TABLE wyrd.cards (
 -- Indexes ---------------------------------------------------------------
 -- cards_identity_unique is partial (WHERE status <> 'deleted') so that
 -- soft-deleted pins do not block re-registration at the same identity.
--- register_card's ON CONFLICT clause targets this index by column list + predicate.
+-- declare_card's ON CONFLICT clause targets this index by column list + predicate.
 
 CREATE UNIQUE INDEX cards_identity_unique
     ON wyrd.cards (data_tenant_id, kind, space, name, version)

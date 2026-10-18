@@ -11,7 +11,7 @@ an agent happened to place them.
 
 ```text
 src/
-  utils.rs       # register_card, stage_audit, flush_observations
+  utils.rs       # declare_card, stage_audit, flush_observations
   helpers.rs     # more steps of the same workflows
 ```
 

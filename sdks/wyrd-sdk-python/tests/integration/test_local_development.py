@@ -1,6 +1,6 @@
 """A developer runs Wyrd locally with only the administrator key ``wyrd setup`` printed.
 
-They declare and hydrate an assistant, invoke a model through the Gateway with
+They declare and pull an assistant, invoke a model through the Gateway with
 the stock OpenAI client, observe and verify a Run, export its spans through
 ``state.start_telemetry``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for

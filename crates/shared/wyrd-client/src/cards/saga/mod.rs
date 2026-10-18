@@ -104,7 +104,7 @@ fn ensure_active(response: &DeclareCardResponse) -> Result<(), RegistryEngineErr
         .find(|outcome| outcome.status != CardLifecycleStatus::Active)
     {
         return Err(WyrdError::RegistryArtifactVerifyFailed {
-            message: "registration did not reach Active state".to_owned(),
+            message: "declaration did not reach Active state".to_owned(),
             details: serde_json::json!({
                 "card_uid": pending.card_ref.uid,
                 "status": pending.status,

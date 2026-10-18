@@ -23,7 +23,7 @@ use crate::load::DeclarationInput;
 ///
 /// # Errors
 /// Returns the declaration error produced by the shared registry saga.
-pub async fn register(
+pub async fn declare(
     cards: &Cards,
     input: &DeclarationInput,
 ) -> Result<DeclarationReceipt, WyrdError> {
@@ -247,12 +247,12 @@ fn handle_phase(state: &mut RendererState, phase: DeclarationPhase) {
 
 fn phase_message(phase: DeclarationPhase) -> &'static str {
     match phase {
-        DeclarationPhase::Preparing => "preparing registration",
-        DeclarationPhase::Submitting => "submitting registration",
+        DeclarationPhase::Preparing => "preparing declaration",
+        DeclarationPhase::Submitting => "submitting declaration",
         DeclarationPhase::Uploading => "uploading artifacts",
-        DeclarationPhase::Completing => "completing registration",
-        DeclarationPhase::Verifying => "verifying registration",
-        DeclarationPhase::CleaningUp => "cleaning up failed registration",
+        DeclarationPhase::Completing => "completing declaration",
+        DeclarationPhase::Verifying => "verifying declaration",
+        DeclarationPhase::CleaningUp => "cleaning up failed declaration",
     }
 }
 
@@ -280,7 +280,7 @@ fn artifact_style(known_total: bool) -> ProgressStyle {
 
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.yellow} {msg}")
-        .expect("invariant: registration spinner template is valid")
+        .expect("invariant: declaration spinner template is valid")
 }
 
 #[cfg(test)]

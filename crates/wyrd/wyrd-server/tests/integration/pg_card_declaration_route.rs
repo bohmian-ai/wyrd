@@ -603,7 +603,7 @@ async fn registration_replays_through_public_authenticated_route() {
         .await_retained_audit_count(
             server.data_tenant_id(),
             &format!(
-                "operation = 'card.registration.create' AND sub_principal_id = '{}'",
+                "operation = 'card.declaration.create' AND sub_principal_id = '{}'",
                 id.as_uuid()
             ),
             2,
@@ -1691,7 +1691,7 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         .await_retained_audit_count(
             server.data_tenant_id(),
             &format!(
-                "operation = 'card.registration.create' AND sub_principal_id = '{}'",
+                "operation = 'card.declaration.create' AND sub_principal_id = '{}'",
                 id.as_uuid()
             ),
             1,
@@ -2088,7 +2088,7 @@ async fn delete_by_ref_not_found_records_one_decision() {
         .retained_audit_records(
             server.data_tenant_id(),
             "outcome",
-            "operation = 'card.registration.delete' AND resource LIKE '%never-registered%'",
+            "operation = 'card.declaration.delete' AND resource LIKE '%never-registered%'",
         )
         .await
         .expect("delete decisions read")
@@ -3094,7 +3094,7 @@ async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(S
         .retained_audit_records(
             server.data_tenant_id(),
             "permission, outcome",
-            &format!("operation = 'card.registration.create' AND sub_principal_id = '{principal}'"),
+            &format!("operation = 'card.declaration.create' AND sub_principal_id = '{principal}'"),
         )
         .await
         .expect("audit rows read")

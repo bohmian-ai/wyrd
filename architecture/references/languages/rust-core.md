@@ -51,18 +51,18 @@ stateless.
 ### Canonical composition
 
 This example deliberately includes both paths. `plan` is the synchronous
-default for deterministic work. `register` earns async because it composes
+default for deterministic work. `declare` earns async because it composes
 storage and network IO. Every item is documented, including private fields,
 private methods, and the free helper.
 
 ```rust
-/// Coordinates deterministic registration planning and remote registration IO.
+/// Coordinates deterministic declaration planning and remote declaration IO.
 pub struct Registry {
     /// Typed client used to commit prepared registrations to the server.
     client: WyrdClient,
-    /// Artifact client used to transfer prepared registration artifacts.
+    /// Artifact client used to transfer prepared declaration artifacts.
     storage: StorageClient,
-    /// Local policy used to validate and normalize registration inputs.
+    /// Local policy used to validate and normalize declaration inputs.
     policy: RegistrationPolicy,
 }
 
@@ -81,15 +81,15 @@ impl Registry {
         }
     }
 
-    /// Produces the deterministic registration plan without performing IO.
+    /// Produces the deterministic declaration plan without performing IO.
     ///
     /// The method validates the authored input against this registry's policy,
     /// constructs its artifact manifest, and returns the prepared request used
-    /// by the asynchronous registration boundary.
+    /// by the asynchronous declaration boundary.
     ///
     /// # Errors
     ///
-    /// Returns `RegistryError` when the input violates registration policy or
+    /// Returns `RegistryError` when the input violates declaration policy or
     /// its artifact manifest cannot be constructed.
     pub fn plan(
         &self,
@@ -100,7 +100,7 @@ impl Registry {
         Ok(PreparedDeclaration::new(input, manifest))
     }
 
-    /// Plans, uploads, and commits one registration through remote IO.
+    /// Plans, uploads, and commits one declaration through remote IO.
     ///
     /// Planning remains synchronous. After planning succeeds, the method
     /// uploads declared artifacts and awaits the server commit.
@@ -108,13 +108,13 @@ impl Registry {
     /// # Errors
     ///
     /// Returns `RegistryError` when local planning fails, an artifact upload
-    /// fails, or the server rejects or cannot commit the registration.
+    /// fails, or the server rejects or cannot commit the declaration.
     ///
     /// # Cancellation
     ///
     /// Cancellation may stop the client after an upload has completed but
     /// before commit returns. The server-side idempotency key makes retry safe.
-    pub async fn register(
+    pub async fn declare(
         &self,
         input: &DeclarationInput,
     ) -> Result<DeclarationReceipt, RegistryError> {
@@ -122,7 +122,7 @@ impl Registry {
         self.upload_and_commit(&prepared).await
     }
 
-    /// Uploads a prepared registration and commits it to the server.
+    /// Uploads a prepared declaration and commits it to the server.
     ///
     /// This method is async because both storage transfer and server commit are
     /// remote IO operations. It does not absorb synchronous planning work.
@@ -134,7 +134,7 @@ impl Registry {
     /// # Cancellation
     ///
     /// Cancellation can occur between upload and commit. Retrying the prepared
-    /// registration is safe because it retains the same idempotency key.
+    /// declaration is safe because it retains the same idempotency key.
     async fn upload_and_commit(
         &self,
         prepared: &PreparedDeclaration,
@@ -144,7 +144,7 @@ impl Registry {
     }
 }
 
-/// Builds the deterministic artifact manifest for one registration input.
+/// Builds the deterministic artifact manifest for one declaration input.
 ///
 /// The helper remains free because its result depends only on `input` and it
 /// has no service state, dependency, identity, or invariant-bearing owner.
@@ -166,12 +166,12 @@ pure validation or transformation.
 Reject functional dependency threading:
 
 ```rust
-/// Registers one input by threading dependencies through a free workflow.
+/// Declares one input by threading dependencies through a free workflow.
 ///
 /// # Errors
 ///
 /// Returns `RegistryError` when upload or commit fails.
-pub async fn register(
+pub async fn declare(
     client: &WyrdClient,
     storage: &StorageClient,
     input: &DeclarationInput,
@@ -212,7 +212,7 @@ Card envelopes and specs own declarative construction, validation, and pure
 transformation. Registry, storage, policy, and lifecycle IO stays on the
 service or handle that owns those dependencies. The canonical reference is
 `crates/shared/wyrd-client/src/cards/handle.rs::Cards`: a public,
-dependency-owning handle with discoverable registration, resolution, listing,
+dependency-owning handle with discoverable declaration, resolution, listing,
 loading, and deletion methods, composed from a focused engine and narrow
 private helpers.
 
@@ -700,7 +700,7 @@ Use `tracing` with structured fields for diagnostics. Instrument write
 handlers with `#[tracing::instrument]` and scrubbed args.
 
 ```rust
-/// Registers one card for the authenticated tenant.
+/// Declares one card for the authenticated tenant.
 ///
 /// The handler delegates durable validation, tenancy enforcement, persistence,
 /// relationship derivation, and audit behavior to the owning application
@@ -716,7 +716,7 @@ handlers with `#[tracing::instrument]` and scrubbed args.
 /// Cancellation may interrupt the response after the server begins durable
 /// processing. Retry behavior follows the route's idempotency contract.
 #[tracing::instrument(skip(state, body), fields(tenant = %tenant.id(), card_kind = %body.kind))]
-pub async fn register_card(
+pub async fn declare_card(
     State(state): State<AppState>,
     tenant: TenantContext,
     Json(body): Json<CardEnvelope>,

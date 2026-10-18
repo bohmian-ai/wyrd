@@ -33,7 +33,7 @@ export interface Worked {
 }
 
 /**
- * Run the whole local workflow as `client`: register and hydrate the
+ * Run the whole local workflow as `client`: declare and pull the
  * assistant, invoke the Gateway, observe and verify a Run, export a span
  * through `state.startTelemetry`, and
  * read the evidence back. No key is issued and nothing is flushed.

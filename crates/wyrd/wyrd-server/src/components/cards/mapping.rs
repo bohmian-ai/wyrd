@@ -2,13 +2,13 @@
 
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{CardLifecycleStatus, CardDeclarationOutcome, DeclarationOutcomeKind};
-use wyrd_sql::queries::cards::RegisteredCardRow;
+use wyrd_sql::queries::cards::DeclaredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
 /// Project one durable card row and write classification onto the wire.
 #[must_use]
 pub fn outcome_row_to_response(
-    row: &RegisteredCardRow,
+    row: &DeclaredCardRow,
     outcome: DeclarationOutcomeKind,
 ) -> CardDeclarationOutcome {
     CardDeclarationOutcome {
@@ -76,7 +76,7 @@ mod tests {
     use wyrd_spec::registry::{
         CardLifecycleStatus, DeclarationOperationId, DeclarationOutcomeKind,
     };
-    use wyrd_sql::queries::cards::RegisteredCardRow;
+    use wyrd_sql::queries::cards::DeclaredCardRow;
     use wyrd_sql::row_types::cards::CardStatus;
 
     use super::outcome_row_to_response;
@@ -117,8 +117,8 @@ mod tests {
     }
 
     /// Build one deterministic durable row for response projection tests.
-    fn row(status: CardStatus) -> RegisteredCardRow {
-        RegisteredCardRow {
+    fn row(status: CardStatus) -> DeclaredCardRow {
+        DeclaredCardRow {
             card_uid: CardUid::from_uuid(Uuid::now_v7())
                 .expect("test_setup: UUIDv7 is a valid card UID"),
             kind: CardKind::Prompt,

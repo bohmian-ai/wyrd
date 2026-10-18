@@ -467,7 +467,7 @@ fn derived(card: &Card) -> (Vec<String>, Option<serde_json::Value>) {
 }
 
 /// Portable and native Prompts, standalone and inline in an Agent, register,
-/// read back, re-register idempotently, and hydrate exactly as authored with
+/// read back, re-declare idempotently, and pull exactly as authored with
 /// the same spec hash, which is the authored spec's canonical hash, and the
 /// same derived variables and response schema; each inline Agent Prompt
 /// registers as the Agent's own `<agent>-prompt` Card the hydrated Agent

@@ -60,7 +60,7 @@ pub(crate) struct Assistant {
 impl Assistant {
     /// Start the judge and the server, deploy the judge model on the gateway,
     /// then register the latency baseline, the latency Model, and the
-    /// assistant, and hydrate the assistant.
+    /// assistant, and pull the assistant.
     ///
     /// # Panics
     /// Panics when a setup step fails.

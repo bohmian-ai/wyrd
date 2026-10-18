@@ -1,5 +1,5 @@
 //! A developer runs Wyrd locally with only the administrator key `wyrd
-//! setup` printed: they register and hydrate an assistant, invoke a model
+//! setup` printed: they declare and pull an assistant, invoke a model
 //! through the Gateway, observe and verify a Run, export its spans through
 //! `start_telemetry`, and query the evidence back. No key is
 //! issued and nothing is flushed on the server's behalf.

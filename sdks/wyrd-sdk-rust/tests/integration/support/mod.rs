@@ -135,22 +135,25 @@ impl Deployment {
         )
     }
 
-    /// Seed role `name` with exactly `permissions`, bootstrap a Service
-    /// principal of the same name holding only it, and return its key.
+    /// Seed role `name` with exactly `permissions`, each a
+    /// `resource:action` string granting every object of that operation,
+    /// through [`Self::granted_key`], and return the key of the Service
+    /// principal of the same name holding only it.
     ///
     /// # Panics
-    /// Panics when a permission does not parse or the role or principal
-    /// cannot be seeded.
+    /// Panics when a permission is not `resource:action` or the role or
+    /// principal cannot be seeded.
     pub async fn scoped_key(&self, name: &str, permissions: &[&str]) -> String {
-        let permissions = permissions
+        let grants = permissions
             .iter()
-            .map(|permission| permission.parse().expect("permission parses"))
+            .map(|permission| {
+                let (resource, action) = permission
+                    .split_once(':')
+                    .expect("permission is resource:action");
+                serde_json::json!({ "resource": resource, "action": action, "scope": "all" })
+            })
             .collect::<Vec<_>>();
-        self.server
-            .seed_role(name, &permissions)
-            .await
-            .expect("role seeds");
-        self.key(name, &[name]).await
+        self.granted_key(name, &grants).await
     }
 
     /// Seed role `name` granting `verifier:run` on exactly `verifier`,
@@ -180,8 +183,7 @@ impl Deployment {
     /// holding only it, and return its key.
     ///
     /// # Panics
-    /// Panics when a grant does not parse or the role or principal cannot be
-    /// seeded.
+    /// Panics when the role or principal cannot be seeded.
     pub async fn granted_key(&self, name: &str, grants: &[serde_json::Value]) -> String {
         api_key(self.granted(name, grants).await)
     }
@@ -190,18 +192,14 @@ impl Deployment {
     /// and return the bootstrapped principal, whose id a story compares with
     /// retained subject and actor attribution.
     ///
+    /// Grants are stored unparsed, so a grant the current schema rejects
+    /// reaches the server and is refused by its own issuance decode.
+    ///
     /// # Panics
-    /// Panics when a grant does not parse or the role or principal cannot be
-    /// seeded.
+    /// Panics when the role or principal cannot be seeded.
     pub async fn granted(&self, name: &str, grants: &[serde_json::Value]) -> Bootstrap {
-        let grants = grants
-            .iter()
-            .map(|grant| {
-                serde_json::from_value(grant.clone()).expect("the scoped permission parses")
-            })
-            .collect::<Vec<_>>();
         self.server
-            .seed_role(name, &grants)
+            .seed_role(name, grants)
             .await
             .expect("role seeds");
         self.server

@@ -299,7 +299,7 @@ def check_sql_source_hygiene(failures: list[str]) -> None:
     combined_sql_paths = [*SQL_CRATES]
     forbidden_patterns = {
         "raw transaction control": r"\bBEGIN;|\bCOMMIT;|\bSAVEPOINT\s+",
-        "bare tenant table reference": r"\bFROM\s+(auth_|registry_|audit_|drift_|eval_)",
+        "bare tenant table reference": r"\bFROM\s+(auth_|registry_|audit_|drift_)",
     }
     for label, pattern in forbidden_patterns.items():
         for path in source_files(combined_sql_paths):

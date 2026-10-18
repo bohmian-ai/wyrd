@@ -959,7 +959,7 @@ mod tests {
         AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
         ClusterRoleLease, NodeId, ScribeCapabilitiesV1,
     };
-    use wyrd_spec::vala::eval::ids::TaskId;
+    use wyrd_spec::verification::TaskId;
     use wyrd_spec::verification::execution::{
         RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
     };
@@ -1579,7 +1579,7 @@ mod tests {
         }
     }
 
-    /// Proves a multi-row Eval detail larger than one frame under a lowered
+    /// Proves a multi-row verification detail larger than one frame under a lowered
     /// Scribe ceiling reaches the local Scribe as bounded frames carrying
     /// every row once, in order, before the summary, and that after a lost
     /// ACK the identical slice resubmits identical frame ids.
@@ -1740,7 +1740,7 @@ mod tests {
     /// Proves a silent peer cannot hold a tenant: the first ready Scribe
     /// accepts every call and never answers, each held frame times out and
     /// its slice is retried under the same batch ids on the next ready
-    /// Scribe, where an oversized Eval detail arrives as bounded frames with
+    /// Scribe, where an oversized verification detail arrives as bounded frames with
     /// every row once and another tenant's capture is written too.
     ///
     /// # Panics

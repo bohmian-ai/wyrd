@@ -123,6 +123,17 @@ pub enum GooglePart {
         /// Call; decodes from `function_call` or `functionCall`.
         #[serde(rename = "function_call", alias = "functionCall")]
         function_call: GoogleFunctionCall,
+        /// Opaque signature the provider attaches to this part; decodes from
+        /// `thought_signature` or `thoughtSignature`. Google requires it
+        /// replayed unchanged on the same part in the next request, so it is
+        /// carried through assistant history and never synthesized.
+        #[serde(
+            rename = "thought_signature",
+            alias = "thoughtSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     /// Function result returned to the model.
     FunctionResponse {
@@ -169,8 +180,9 @@ pub struct GoogleFileData {
 /// Function call the model requested.
 ///
 /// Decoding is deliberately permissive (no `deny_unknown_fields`): Gemini and
-/// Vertex add members such as call identifiers and thought signatures, which are
-/// ignored rather than failing the whole answer.
+/// Vertex add members such as call identifiers, which are ignored rather than
+/// failing the whole answer. The part-level thought signature lives on
+/// [`GooglePart::FunctionCall`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GoogleFunctionCall {

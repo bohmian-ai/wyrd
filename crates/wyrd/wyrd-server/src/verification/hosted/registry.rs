@@ -7,7 +7,7 @@
 //! decision is recorded like any other Card read.
 
 use async_trait::async_trait;
-use vala_eval::blocks::{AgentCardResolver, BlockError, PromptCardResolver};
+use vala_verify::blocks::{AgentCardResolver, BlockError, PromptCardResolver};
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;

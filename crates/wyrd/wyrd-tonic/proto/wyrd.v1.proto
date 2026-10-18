@@ -2,7 +2,7 @@ syntax = "proto3";
 package wyrd.v1;
 
 // One typed service per observation type. Bifrost ingest only in Stage 3;
-// drift / agent-trace / otel / eval get their own typed services later.
+// drift / agent-trace / otel / verification get their own typed services later.
 service BifrostIngestService {
   // One sealed Arrow payload is durably acknowledged as one logical batch.
   rpc InsertBatch(InsertBatchRequest) returns (InsertBatchResponse);

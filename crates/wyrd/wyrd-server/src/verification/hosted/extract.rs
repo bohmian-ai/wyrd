@@ -17,7 +17,7 @@ use calamine::{Data, Reader as _, Xlsx};
 use quick_xml::events::Event;
 use serde_json::{Number, Value};
 use skald_spec::MediaFormat;
-use vala_eval::blocks::BlockError;
+use vala_verify::blocks::BlockError;
 use wyrd_spec::card::verifier::extract::{
     CellValue, DocxBlock, ExtractOutput, PdfPage, PptxSlide, Table, XlsxCell, XlsxSheet,
 };

@@ -138,7 +138,7 @@ fn holds_in_order(names: &[&str], steps: &[fn(&str) -> bool]) -> bool {
 
 /// A Service action that records spans, writes a Run observation and a
 /// table row, calls a model through the Gateway, and verifies its answer
-/// with an Eval LLM judge reads back as one connected, time-ordered tree
+/// with an LLM judge reads back as one connected, time-ordered tree
 /// rooted at the action's span. The queued writes are PRODUCER spans in that
 /// tree, and the same read returns the CONSUMER ingest span linking each
 /// producer as a linked trace. The operator's export holds every server span

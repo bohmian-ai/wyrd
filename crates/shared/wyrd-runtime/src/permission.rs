@@ -78,8 +78,6 @@ pub enum Resource {
     Services,
     /// Operator cards and invocations.
     Operators,
-    /// Eval-backed Verifier Cards and eval runs.
-    Evals,
     /// Explicit invocation of a Verifier Card, optionally scoped to one UID.
     Verifier,
     /// Drift-backed Verifier Cards and drift observations.
@@ -232,7 +230,6 @@ impl Resource {
             Self::Cards => "cards",
             Self::Services => "services",
             Self::Operators => "operators",
-            Self::Evals => "evals",
             Self::Verifier => "verifier",
             Self::Drift => "drift",
             Self::Artifacts => "artifacts",
@@ -476,16 +473,6 @@ impl Permission {
         Self {
             resource: Resource::Operators,
             action: Action::Invoke,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Run evals.
-    #[must_use]
-    pub const fn eval_run() -> Self {
-        Self {
-            resource: Resource::Evals,
-            action: Action::Run,
             scope: PermissionScope::All,
         }
     }
@@ -860,7 +847,6 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "cards" => Resource::Cards,
         "services" => Resource::Services,
         "operators" => Resource::Operators,
-        "evals" => Resource::Evals,
         "verifier" => Resource::Verifier,
         "drift" => Resource::Drift,
         "artifacts" => Resource::Artifacts,
@@ -1095,7 +1081,6 @@ mod tests {
             Resource::Cards,
             Resource::Services,
             Resource::Operators,
-            Resource::Evals,
             Resource::Verifier,
             Resource::Drift,
             Resource::Artifacts,
@@ -1105,7 +1090,7 @@ mod tests {
             Resource::ServiceAccounts,
             Resource::Users,
             Resource::IdentityConnections,
-            Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+            Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
             Resource::Wildcard,
         ];
         for resource in resources {
@@ -1201,14 +1186,14 @@ mod tests {
     #[test]
     fn covers_anyof_resource() {
         let permission = Permission {
-            resource: Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+            resource: Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
             action: Action::Invoke,
             scope: PermissionScope::All,
         };
 
         assert!(permission.covers(&Permission::operator_invoke()));
         assert!(permission.covers(&Permission {
-            resource: Resource::Evals,
+            resource: Resource::Triggers,
             action: Action::Invoke,
             scope: PermissionScope::All,
         }));
@@ -1256,7 +1241,7 @@ mod tests {
             Permission::card_write(),
             Permission::card_read(),
             Permission {
-                resource: Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+                resource: Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
                 action: Action::Invoke,
                 scope: PermissionScope::All,
             },
@@ -1269,7 +1254,7 @@ mod tests {
             json!([
                 {"resource": "cards", "action": "write", "scope": "all"},
                 {"resource": "cards", "action": "read", "scope": "all"},
-                {"resource": {"any_of": ["operators", "evals"]}, "action": "invoke", "scope": "all"},
+                {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
                 {"resource": "wildcard", "action": "wildcard", "scope": "all"}
             ])
         );
@@ -1352,10 +1337,9 @@ mod tests {
     }
 
     /// Proves `verifier:run` parses, covers only its exact Verifier UID or the
-    /// unscoped grant, is never implied by `evals:run`, and refuses a Verifier
-    /// scope on any other operation.
+    /// unscoped grant, and refuses a Verifier scope on any other operation.
     #[test]
-    fn verifier_run_is_uid_scoped_and_distinct_from_eval_run() {
+    fn verifier_run_is_uid_scoped() {
         use wyrd_spec::ids::CardUid;
         let uid = |value: &str| CardUid::new(value).expect("valid uuid7");
         let bound = uid("01927b4c-0000-7000-8000-000000000001");
@@ -1374,15 +1358,11 @@ mod tests {
             !Permission::verifier_run(other).covers(&Permission::verifier_run(bound.clone())),
             "an unrelated UID grant does not cover"
         );
-        assert!(
-            !Permission::eval_run().covers(&Permission::verifier_run(bound.clone())),
-            "evals:run alone does not cover"
-        );
         assert_eq!(
             serde_json::to_value(Permission::verifier_run(bound.clone())).expect("serializes"),
             json!({"resource": "verifier", "action": "run", "scope": {"verifier": bound.as_str()}})
         );
-        for (resource, action) in [("verifier", "read"), ("evals", "run")] {
+        for (resource, action) in [("verifier", "read"), ("cards", "run")] {
             assert!(
                 serde_json::from_value::<Permission>(json!({
                     "resource": resource,
@@ -1875,5 +1855,52 @@ mod tests {
 
         assert_eq!(parsed, Permission::card_write());
         assert_eq!(parsed.to_string(), "cards:write");
+    }
+
+    /// Proves the retired `evals` resource is an ordinary unknown resource in
+    /// every wire form — string grants, structured grants and `any_of`
+    /// members, for `run` and `invoke` — while `verifier:run` and unrelated
+    /// grants keep parsing and covering exactly as before.
+    ///
+    /// # Panics
+    /// Panics when a retired form parses or a retained grant stops parsing or
+    /// covering.
+    #[test]
+    fn retired_permission_is_unknown() {
+        for action in ["run", "invoke"] {
+            assert!(
+                format!("evals:{action}").parse::<Permission>().is_err(),
+                "evals:{action}"
+            );
+            assert!(
+                serde_json::from_value::<Permission>(
+                    json!({"resource": "evals", "action": action, "scope": "all"})
+                )
+                .is_err(),
+                "structured evals:{action}"
+            );
+            assert!(
+                serde_json::from_value::<Permission>(json!({
+                    "resource": {"any_of": ["operators", "evals"]},
+                    "action": action,
+                    "scope": "all"
+                }))
+                .is_err(),
+                "any_of evals:{action}"
+            );
+        }
+        let verifier = "verifier:run"
+            .parse::<Permission>()
+            .expect("verifier:run parses");
+        assert_eq!(verifier, Permission::verifier_run_any());
+        assert!(verifier.covers(&Permission::verifier_run(
+            wyrd_spec::ids::CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid")
+        )));
+        assert_eq!(
+            "operators:invoke"
+                .parse::<Permission>()
+                .expect("unrelated grant parses"),
+            Permission::operator_invoke()
+        );
     }
 }

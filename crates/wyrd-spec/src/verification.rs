@@ -5,9 +5,14 @@
 //! execution-status contracts. HTTP, MCP, and the Rust, Python, and TypeScript
 //! clients share these typed shapes. Durable control state — binding
 //! readiness, execution status, and each Operator dispatch's delivery status —
-//! is owned by Postgres; results stay in Bifrost.
+//! is owned by Postgres; results stay in Bifrost. [`ids`], [`operator`] and
+//! [`plan`] hold the step and requirement identifiers, comparison operators
+//! and step-graph planning that Verifier specs and the engine share.
 
 pub mod execution;
+pub mod ids;
+pub mod operator;
+pub mod plan;
 
 use std::collections::BTreeMap;
 
@@ -16,6 +21,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::drift::DriftMethod;
 use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId};
+
+pub use ids::{JsonPath, TaskId};
+pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
+pub use plan::{DagError, ExecutionPlan, Stage, plan_stages};
+
+/// How a Verifier stores each requirement result's captured `actual` value.
+///
+/// Verdict correctness is unaffected by this setting; only the stored
+/// snapshot of the extracted value changes. Set on the Verifier spec via
+/// `context_capture`; absent means `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCapture {
+    /// Store the raw extracted value.
+    Full,
+    /// Store a SHA-256 hex digest of the extracted value. Allows determinism
+    /// checks without persisting PII.
+    Hash,
+    /// Do not store the value. Use when evidence may contain PII.
+    Redact,
+}
 
 /// A frozen reference to one effective Trigger or Operator.
 ///

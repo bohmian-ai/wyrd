@@ -223,12 +223,12 @@ space = "gov-prod"
     fn e2e_card_space_wins_over_kind_and_defaults() {
         let cfg = load_fixture();
         let mut meta = fresh_meta("churn-classifier");
-        meta.space = Some(SpaceName::new("eval").unwrap());
+        meta.space = Some(SpaceName::new("review").unwrap());
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
         assert_eq!(
             meta.space.as_ref().map(SpaceName::as_str),
-            Some("eval"),
+            Some("review"),
             "card-level space must not be overwritten"
         );
     }

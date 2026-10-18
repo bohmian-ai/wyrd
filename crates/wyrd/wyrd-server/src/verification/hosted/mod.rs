@@ -3,7 +3,7 @@
 //! built-in Agent tools.
 //!
 //! These are the concrete implementations behind the
-//! [`vala_eval::blocks`] executor seams. They hold no request state of their
+//! [`vala_verify::blocks`] executor seams. They hold no request state of their
 //! own: each execution composes them with its accepted authority and pinned
 //! evidence, and every limit comes from [`HostedLimits`].
 

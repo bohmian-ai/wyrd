@@ -1,5 +1,0 @@
-[py:typecheck] $ uv run ty check
-error: Could not acquire lock
-  Caused by: Could not create temporary file
-  Caused by: Read-only file system (os error 30) at path "/home/thorrester/.cache/uv/.tmpLSP1VN"
-[py:typecheck] ERROR task failed

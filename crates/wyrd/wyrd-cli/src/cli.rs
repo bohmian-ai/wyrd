@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 
 use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
-use crate::eval::run::EvalCommand;
 use crate::gateway::GatewayCommand;
 use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
@@ -46,9 +45,6 @@ impl Cli {
             Command::Load(args) => crate::card::dispatch_load(args).await.map_err(Into::into),
             Command::Delete(args) => crate::card::dispatch_delete(args).await.map_err(Into::into),
             Command::Auth(command) => crate::auth::dispatch(command).await.map_err(Into::into),
-            Command::Eval(command) => crate::eval::run::dispatch(command)
-                .await
-                .map_err(Into::into),
             Command::Platform(command) => {
                 crate::platform::dispatch(command).await.map_err(Into::into)
             }
@@ -88,9 +84,6 @@ pub enum Command {
     /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),
-    /// Run, manage, and compare evaluations.
-    #[command(subcommand)]
-    Eval(EvalCommand),
     /// Administer the platform control plane (credentials).
     #[command(subcommand)]
     Platform(PlatformCommand),
@@ -194,7 +187,7 @@ mod tests {
     fn the_root_parser_refuses_every_former_secret_option_without_echo() {
         let secret = "wyrd-cli-sentinel-secret";
         let server = ["--server", "https://wyrd.example"];
-        let cases: [&[&str]; 16] = [
+        let cases: [&[&str]; 15] = [
             &["operator-connection", "create", "--bot-token"],
             &["operator-connection", "create", "--integration-key"],
             &[
@@ -216,7 +209,6 @@ mod tests {
             &["auth", "refresh", "--refresh-token"],
             &["principal", "revoke", "--token"],
             &["query", "--token"],
-            &["eval", "run", "--token"],
         ];
         for case in cases {
             let (option, command) = case.split_last().expect("every case names an option");

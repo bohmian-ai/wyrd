@@ -66,7 +66,7 @@ BIFROST_ONLY = re.compile(
     r"|tests/(oracle_admission|pg_(file_list|forge|maintenance|olap|oracle|stream)))"
     r"|crates/wyrd/wyrd-testing/(src/bifrost/|tests/bifrost/)"
     r"|crates/wyrd/wyrd-server/src/(bifrost/|oracle/|query/|grpc/(query|scribe_tail)\.rs)"
-    r"|crates/wyrd/wyrd-server/tests/(pg_eval_v1_protocol|pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs"
+    r"|crates/wyrd/wyrd-server/tests/(pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs"
     r"|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)"
     r"|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs"
     r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/typecheck/bifrost_contracts\.py|tests/integration/(bifrost/|test_query_bifrost\.py))"

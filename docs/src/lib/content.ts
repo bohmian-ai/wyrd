@@ -67,7 +67,7 @@ export function toSlug(path: string): string {
     .replace(/\/$/, '');
 }
 
-// Validate frontmatter for a single content file. Throws at build/module-eval
+// Validate frontmatter for a single content file. Throws at build/module-evaluation
 // time so a missing or empty title is a hard build failure that names the file.
 // Generated reference pages must emit frontmatter that passes this check.
 export function validateFrontmatter(contentPath: string, raw: unknown): DocMetadata {

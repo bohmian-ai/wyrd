@@ -42,7 +42,7 @@ pub struct MetricEntry {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether this metric came from evaluation.
     #[serde(default)]
-    pub is_eval: bool,
+    pub is_evaluation: bool,
 }
 
 /// Protocol-specific public metadata for an agent or service interface.

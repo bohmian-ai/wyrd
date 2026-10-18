@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
-use vala_eval::{TraceSource, TraceUnavailable};
+use vala_verify::{TraceSource, TraceUnavailable};
 use wyrd_client::bifrost::rows::{SPAN_COLUMNS, span_record};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::TraceId;

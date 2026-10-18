@@ -8,7 +8,7 @@ language, or domain references.
 - `wyrd` is the control plane: registry, storage, lineage, policy,
   install, audit, server, CLI, MCP.
 - `vala` owns observability and analytical storage: observations, traces,
-  drift, eval execution, archival query, background data-plane behavior,
+  drift, Verifier execution, archival query, background data-plane behavior,
   the Bifrost engine (Iceberg + DataFusion).
 - `skald` owns LLM runtime behavior: providers, prompt execution, agents,
   workflows, orchestration, provider-specific wire handling.
@@ -53,6 +53,8 @@ Dependency rules below are enforced by `check:deps`:
 - Bifrost is exposed through `wyrd_client::Bifrost` over the shared client HTTP
   and gRPC transport. Gate, Scribe, Oracle, and Forge remain server-owned and are never
   client types.
+- No current surface uses the retired abbreviated evaluation names;
+  verification vocabulary is the only vocabulary.
 
 ## Service Ownership
 

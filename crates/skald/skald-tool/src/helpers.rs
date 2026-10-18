@@ -69,6 +69,7 @@ pub fn google_function_call_part(name: impl Into<String>, args: serde_json::Valu
             name: name.into(),
             args,
         },
+        thought_signature: None,
     }
 }
 

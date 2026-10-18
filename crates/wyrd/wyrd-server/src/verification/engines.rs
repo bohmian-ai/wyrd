@@ -93,7 +93,7 @@ mod tests {
 
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
-    use wyrd_spec::vala::eval::TaskId;
+    use wyrd_spec::verification::TaskId;
     use wyrd_spec::verification::execution::RequirementResult;
     use wyrd_spec::verification::{DriftReport, VerificationVerdict};
 

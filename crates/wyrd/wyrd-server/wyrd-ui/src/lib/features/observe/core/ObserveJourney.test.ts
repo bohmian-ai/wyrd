@@ -71,10 +71,10 @@ test('overview restores the shared scope and carries it into every signal link',
   const response = await get('/t/acme/observe?service=checkout-api&range=1h');
   expect(response.status).toBe(200);
   const html = await response.text();
-  for (const signal of ['logs', 'metrics', 'traces', 'dashboards', 'evaluations', 'drift'])
+  for (const signal of ['logs', 'metrics', 'traces', 'dashboards', 'drift'])
     expect(html).toContain(`/t/acme/observe/${signal}?service=checkout-api&amp;range=1h`);
   expect(html).toContain('capture 504 from ledger-api');
-  expect(html).toContain('groundedness 0.61');
+  expect(html).not.toContain('/observe/evaluations');
   expect(html).toContain('Absence of a report is not a passing verdict');
 }, 30_000);
 
@@ -231,33 +231,6 @@ test('dashboards stay read-only in inventory and detail, reusing shared chart fr
   expect(detail).toContain('WYRD-PANEL-QUERY-FAILED');
 });
 
-test('evaluation events restore filters from the URL and open the workflow drawer', async () => {
-  const inventory = await (
-    await get('/t/acme/observe/evaluations?service=checkout-agent&status=failed&range=24h')
-  ).text();
-  expect(inventory).toContain('eval_record_01');
-  expect(inventory).not.toContain('eval_record_02');
-  const offline = await (await get('/t/acme/observe/evaluations?origin=offline')).text();
-  expect(offline).toContain('refund-partial-3');
-  expect(offline).not.toContain('eval_record_01');
-  const detail = await (
-    await get('/t/acme/observe/evaluations/eval_record_01?task=groundedness')
-  ).text();
-  expect(detail).toContain('Checkout quality workflow');
-  expect(detail).toContain('scored 0.61 vs');
-  expect(detail).toContain('grounding checks failed');
-  expect(detail).toContain('uncited');
-  // Task selection is URL state; a redacting task states the withholding.
-  const redacted = await (
-    await get('/t/acme/observe/evaluations/eval_record_01?task=pii-leak')
-  ).text();
-  expect(redacted).toContain('Actual values withheld');
-  // Offline events carry scenario identity instead of a registered subject.
-  const scenario = await (await get('/t/acme/observe/evaluations/eval_record_04')).text();
-  expect(scenario).toContain('customer-support-v2');
-  expect(scenario).toContain('no registered Eval card');
-});
-
 test('drift renders the calculated report, feature selection, and honest absence', async () => {
   const html = await (
     await get('/t/acme/observe/drift?driftCard=card_drift_01&service=ranking-api&feature=score&range=30d')
@@ -284,8 +257,6 @@ test('alternate states never imply healthy data', async () => {
   // Unknown drilldowns render safe absence, not a fabricated detail.
   const missingTrace = await (await get('/t/acme/observe/traces/trace_nope')).text();
   expect(missingTrace).toContain('WYRD_SPEC_404_NOT_FOUND');
-  const missingEval = await (await get('/t/acme/observe/evaluations/eval_nope')).text();
-  expect(missingEval).toContain('WYRD_SPEC_404_NOT_FOUND');
   const missingDashboard = await (await get('/t/acme/observe/dashboards/dashboard_nope')).text();
   expect(missingDashboard).toContain('WYRD_SPEC_404_NOT_FOUND');
   // Another tenant never sees acme's signals.

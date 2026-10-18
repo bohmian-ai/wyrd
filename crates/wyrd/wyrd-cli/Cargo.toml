@@ -54,7 +54,6 @@ toml_edit = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-vala-eval = { workspace = true }
 webbrowser = { workspace = true }
 wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-queue = { workspace = true }

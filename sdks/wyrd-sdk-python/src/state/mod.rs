@@ -471,8 +471,9 @@ impl PyWyrdState {
     }
     /// Return the persistent kind-checked Verifier envelope without payload reads.
     ///
-    /// Mirrors `WyrdState::verifier`: one accessor covers every Verifier
-    /// implementation, whose typed body lives under `spec.implementation`.
+    /// Mirrors `WyrdState::verifier` but returns the envelope: one accessor
+    /// covers every Verifier, whose building blocks (`inputs`, `steps`,
+    /// `requirements`, `decide`, `context_capture`) live under `spec`.
     ///
     /// # Errors
     ///

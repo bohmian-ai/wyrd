@@ -155,7 +155,7 @@ test('incomplete draft saves, resumes, and accepts multiple subjects and require
       id: 'claim-1',
       title: 'No ranking regression',
       checks: [
-        { name: 'Eval gate', required: true, mode: 'on-new-evidence', billable: true }
+        { name: 'Verification gate', required: true, mode: 'on-new-evidence', billable: true }
       ]
     }
   ];
@@ -229,7 +229,7 @@ test('verification exposes prerequisites, provenance and confirmed run actions',
       await post(path + '?/run', {
         ...values,
         requestKey: 'missing-evidence',
-        checkId: 'eval-gate',
+        checkId: 'verification-gate',
         confirmed: 'true'
       })
     ).status
@@ -447,7 +447,7 @@ test('equal-number old and new diff rows keep distinct validated discussions', a
     kind: 'source',
     revision: 'rev_07',
     target: 'subject_model',
-    file: 'eval/threshold.yaml',
+    file: 'verification/threshold.yaml',
     line: 1,
     side: 'old'
   };

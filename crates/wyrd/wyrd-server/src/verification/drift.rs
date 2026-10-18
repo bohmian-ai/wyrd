@@ -46,7 +46,7 @@ use vala_drift::{
     DriftReport, DriftScoreError, FITTED_FORMAT, FittedBaseline, PsiBaseline, SpcBaseline,
     SpcScorer, score_custom_mean, score_psi_counts,
 };
-use vala_eval::blocks::DriftChecks;
+use vala_verify::blocks::DriftChecks;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
 use wyrd_spec::card::verifier::{ScheduledInput, VerifierSpec};
@@ -54,7 +54,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, FeatureName, SlotName};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
 use wyrd_sql::queries::verifier_executions::{ClaimedExecution, TerminalStatus};
 

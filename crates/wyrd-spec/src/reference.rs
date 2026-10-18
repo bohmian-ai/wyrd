@@ -956,7 +956,7 @@ mod tests {
     /// Panics when the fixed requirement id stops validating.
     fn nested_judge(agent: InlineableRef<AgentSpec>) -> Spec {
         use crate::card::verifier::{AgentCall, Check, Decide, Requirement, VerifierSpec};
-        use crate::vala::eval::TaskId;
+        use crate::verification::TaskId;
 
         Spec::Verifier(VerifierSpec {
             description: None,

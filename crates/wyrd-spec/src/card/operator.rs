@@ -394,7 +394,7 @@ pub struct OperatorBudget {
 ///
 /// Frozen on the dispatch row when a failed binding-created run settles, so
 /// every retry renders the same payload. It carries identities, the verdict,
-/// completion time, and a bounded summary only: no Eval context, media, Drift
+/// completion time, and a bounded summary only: no verification context, media, Drift
 /// feature rows, result detail, or secret material. Template placeholder names
 /// are exactly [`OperatorFailureContext::FIELDS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -1604,7 +1604,7 @@ mod pg_tests {
             .as_array()
             .expect("bundle metadata lists hydrated cards");
         for (kind, name) in [
-            ("Verifier", "churn-triage-eval"),
+            ("Verifier", "churn-triage-check"),
             ("Verifier", "cohort-check"),
             ("Verifier", "churn-classifier-drift"),
             ("Verifier", "retention-guardrail"),
@@ -2338,8 +2338,8 @@ mod pg_tests {
                 "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    current:\n      type: samples\n      features: [score]\n  requirements:\n    - id: score-stable\n      statement: The score stays near its baseline.\n      check:\n        kind: drift\n        on: inputs.current\n        method: Custom\n        signal:\n          kind: Metric\n          name: score\n        condition:\n          kind: Statistical\n        profile:\n          kind: Custom\n          metric_name: score\n          baseline_value: 1.0\n          alert_threshold: 0.5\n",
             ),
             (
-                "cli-eval-verifier",
-                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    answer:\n      type: json\n  requirements:\n    - id: answered\n      statement: The agent produced an answer.\n      check:\n        kind: assert\n        path: inputs.answer\n        operator: is_not_null\n",
+                "cli-answer-verifier",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-answer-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    answer:\n      type: json\n  requirements:\n    - id: answered\n      statement: The agent produced an answer.\n      check:\n        kind: assert\n        path: inputs.answer\n        operator: is_not_null\n",
             ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);

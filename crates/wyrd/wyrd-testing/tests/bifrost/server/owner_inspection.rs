@@ -121,7 +121,7 @@ async fn readyz(
     Ok((response.status().as_u16(), response.json().await?))
 }
 
-/// Builder for the combined Scribe+Oracle+Forge target with the Eval worker,
+/// Builder for the combined Scribe+Oracle+Forge target with the verification worker,
 /// over one durable data root so a restart replays the same WAL.
 fn combined_target(data_root: &std::path::Path) -> wyrd_testing::WyrdTestServerBuilder {
     wyrd_testing::WyrdTestServer::builder()

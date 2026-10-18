@@ -323,7 +323,7 @@ impl EvidenceInvestigation {
             let response: GetCardResponse = serde_json::from_value(structured(
                 self.agent
                     .call_tool(Self::request(
-                        "cards.get_by_ref",
+                        "cards.get",
                         &json!({ "card_ref": reference }),
                     )?)
                     .await?,

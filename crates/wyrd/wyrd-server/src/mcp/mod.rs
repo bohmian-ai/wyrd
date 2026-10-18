@@ -331,12 +331,6 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            cards::GET_BY_REF => {
-                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                self.mcp_get_card_by_ref(caller, request.arguments)
-                    .await
-                    .map_err(wyrd_error_to_mcp)
-            }
             verification::GET_BINDING => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.mcp_get_binding(caller, request.arguments)

@@ -276,7 +276,7 @@ mod pg_tests {
             let arguments = serde_json::json!({ "card_ref": reference });
             let response = self
                 .agent
-                .call_tool(call("cards.get_by_ref", arguments)?)
+                .call_tool(call(CARDS_GET, arguments)?)
                 .await?;
             Ok(serde_json::from_value(structured(response)?)?)
         }
@@ -341,7 +341,7 @@ mod pg_tests {
             Ok(())
         }
 
-        /// Refuse malformed cursors, incomplete references, and missing Cards.
+        /// Refuse malformed cursors, incomplete, ambiguous, or partial selectors, and missing Cards.
         ///
         /// # Errors
         /// Returns transport failures or an unexpectedly successful call.
@@ -353,12 +353,22 @@ mod pg_tests {
                     "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
                 ),
                 (
-                    "cards.get_by_ref",
+                    CARDS_GET,
                     serde_json::json!({ "card_ref": { "kind": "Service", "name": "support-desk" } }),
                     "WYRD_SPEC_400_VALIDATION",
                 ),
                 (
-                    "cards.get_by_ref",
+                    CARDS_GET,
+                    serde_json::json!({ "card_ref": self.service, "kind": "Service", "card_uid": self.service.uid }),
+                    "WYRD_SPEC_400_VALIDATION",
+                ),
+                (
+                    CARDS_GET,
+                    serde_json::json!({ "kind": "Service" }),
+                    "WYRD_SPEC_400_VALIDATION",
+                ),
+                (
+                    CARDS_GET,
                     serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0", "space": "default" } }),
                     "WYRD_REGISTRY_404_CARD_NOT_FOUND",
                 ),
@@ -384,7 +394,7 @@ mod pg_tests {
             let failure = refusal(
                 foreign
                     .call_tool(call(
-                        "cards.get_by_ref",
+                        CARDS_GET,
                         serde_json::json!({ "card_ref": self.service }),
                     )?)
                     .await,
@@ -422,10 +432,7 @@ mod pg_tests {
 
             for (tool, arguments) in [
                 ("cards.list", serde_json::json!({})),
-                (
-                    "cards.get_by_ref",
-                    serde_json::json!({ "card_ref": self.service }),
-                ),
+                (CARDS_GET, serde_json::json!({ "card_ref": self.service })),
             ] {
                 let failure = refusal(denied.call_tool(call(tool, arguments)?).await)?;
                 assert!(

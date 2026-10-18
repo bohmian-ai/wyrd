@@ -260,7 +260,6 @@ class RequirementResult(TypedDict):
 BuiltinTool: TypeAlias = Literal[
     "cards.list",
     "cards.get",
-    "cards.get_by_ref",
     "bifrost.list_tables",
     "bifrost.describe_table",
     "bifrost.query",

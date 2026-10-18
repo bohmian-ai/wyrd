@@ -64,7 +64,7 @@ CONFORMING = "Refunds follow our policy."
 ANSWER_TEXT = [{"slot": "answer", "locator": {"json_pointer": "/text"}}]
 """The citation of the answer's text, which every cited Verdict of the story names."""
 
-TOOLS = ("cards.get_by_ref", "bifrost.query", "code.run")
+TOOLS = ("cards.get", "bifrost.query", "code.run")
 """The three built-ins the investigator calls, in call order."""
 
 DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"

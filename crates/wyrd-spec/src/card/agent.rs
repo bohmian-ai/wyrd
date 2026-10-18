@@ -62,12 +62,9 @@ pub enum BuiltinTool {
     /// List Cards the caller may read.
     #[serde(rename = "cards.list")]
     CardsList,
-    /// Read one Card by UID.
+    /// Read one Card by exact reference or kind-qualified UID.
     #[serde(rename = "cards.get")]
     CardsGet,
-    /// Read one Card by reference.
-    #[serde(rename = "cards.get_by_ref")]
-    CardsGetByRef,
     /// List Bifrost tables the caller may read.
     #[serde(rename = "bifrost.list_tables")]
     BifrostListTables,
@@ -93,10 +90,9 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in, in catalog order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::CardsList,
         Self::CardsGet,
-        Self::CardsGetByRef,
         Self::BifrostListTables,
         Self::BifrostDescribeTable,
         Self::BifrostQuery,
@@ -112,7 +108,6 @@ impl BuiltinTool {
         match self {
             Self::CardsList => "cards.list",
             Self::CardsGet => "cards.get",
-            Self::CardsGetByRef => "cards.get_by_ref",
             Self::BifrostListTables => "bifrost.list_tables",
             Self::BifrostDescribeTable => "bifrost.describe_table",
             Self::BifrostQuery => "bifrost.query",

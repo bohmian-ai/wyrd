@@ -27,14 +27,13 @@ mod pg_tests {
     /// caller that also holds tenant principal administration, `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 37] = [
+    const ADVERTISED_TOOLS: [&str; 36] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
         "principals.list_credentials",
         "cards.get",
         "cards.list",
-        "cards.get_by_ref",
         "verification.get_binding",
         "verification.get_execution",
         "operator_connections.list",
@@ -156,7 +155,7 @@ mod pg_tests {
                 ADVERTISED_TOOLS.len(),
                 "the checked catalog is the complete every-scope catalog"
             );
-            for name in ["cards.list", "cards.get_by_ref", "wyrd.guide"] {
+            for name in ["cards.list", "cards.get", "wyrd.guide"] {
                 let tool = tools
                     .iter()
                     .find(|tool| tool.name == name)

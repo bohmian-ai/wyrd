@@ -264,7 +264,6 @@ mod pg_tests {
                 "principals.list_credentials",
                 "cards.get",
                 "cards.list",
-                "cards.get_by_ref",
                 "verification.get_binding",
                 "verification.get_execution",
                 "operator_connections.list",

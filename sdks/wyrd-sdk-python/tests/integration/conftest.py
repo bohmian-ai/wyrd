@@ -95,7 +95,7 @@ INVESTIGATE = {
         for id, tool, arguments in (
             (
                 "call-card",
-                "cards.get_by_ref",
+                "cards.get",
                 {
                     "card_ref": {
                         "kind": "Service",

@@ -94,7 +94,7 @@ references, and explain what the retained evidence supports. State missing
 evidence and permission refusals explicitly.
 ```
 
-The agent should discover versions with `cards.list`, read one with `cards.get_by_ref`, and follow the exact references in `card.relationships.outbound_refs` and `inbound_refs`. Each edge stores its identity under `ref`. It should discover and describe Bifrost tables before querying evidence.
+The agent should discover versions with `cards.list`, read one with `cards.get` and its `card_ref`, and follow the exact references in `card.relationships.outbound_refs` and `inbound_refs`. Each edge stores its identity under `ref`. It should discover and describe Bifrost tables before querying evidence.
 
 Read the [MCP tool reference](/reference/mcp-tools/) for every shipped capability and its permissions. For complete procedures, see [Write and query custom data with Bifrost](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/) and [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/).
 

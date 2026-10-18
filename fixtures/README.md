@@ -52,7 +52,7 @@ name.
 | `code` action raise and deadline fail the step and leave its assertion inconclusive | `policy-review.yaml` (`answer-facts`, `timeout_seconds`) | `failed_code_step_leaves_its_assertion_inconclusive` |
 | Malformed judge Verdict and invalid original-evidence citation are inconclusive | `policy-judge.yaml` | `invalid_judge_verdicts_are_inconclusive` |
 | `code` check valid failed cited Verdict; malformed Verdict, foreign citation, forbidden access, and deadline inconclusive | `policy-review.yaml` (`names-the-policy`) | `code_check_fails_with_citations_and_is_inconclusive_otherwise` |
-| Hosted Agent `cards.get_by_ref`, `bifrost.query`, and `code.run` need the tool grant and the domain grant; an exact tool grant covers only its tool; denials return nothing | `tool-review.yaml`, `investigator.yaml` | `hosted_tools_need_the_tool_and_domain_grants` |
+| Hosted Agent `cards.get`, `bifrost.query`, and `code.run` need the tool grant and the domain grant; an exact tool grant covers only its tool; denials return nothing | `tool-review.yaml`, `investigator.yaml` | `hosted_tools_need_the_tool_and_domain_grants` |
 | A delegate narrows the subject's tool authority and the result keeps subject and actor | `tool-review.yaml`, `investigator.yaml` | `delegated_tools_keep_the_narrower_authority` |
 | Missing media input is inconclusive | `policy-review.yaml` (`policy` slot) | `missing_policy_is_inconclusive` |
 | Malformed media never passes | `policy-review.yaml` (`policy` slot) | `malformed_policy_cannot_pass` |

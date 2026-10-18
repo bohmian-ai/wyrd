@@ -40,8 +40,7 @@ Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain do
 | Tool | Effect / permission | Input → output | Purpose |
 | --- | --- | --- | --- |
 | `cards.list` | Read; `cards:read` | List filters and optional cursor → `{items, next_cursor}` | Discover metadata summaries by kind, name, space, version range, lifecycle status, or metadata filter |
-| `cards.get_by_ref` | Read; `cards:read` | `{card_ref}` → `{card, created_at, updated_at}` | Resolve exact kind, name, version, and space |
-| `cards.get` | Read; `cards:read` | `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card when you already have its kind and UID |
+| `cards.get` | Read; `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card by exact kind, name, version, and space, or by kind and UID; pass exactly one form |
 | `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and latest admitted `last_execution_id` |
 | `verification.get_execution` | Read; `cards:read` | `{execution_id}` → execution status | Inspect state, result, error, and Operator dispatches of one execution |
 | `verification.evidence` | Execute; `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan presigned uploads for evidence files the tenant does not already hold |

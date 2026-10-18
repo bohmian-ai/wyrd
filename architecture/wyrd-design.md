@@ -1385,7 +1385,7 @@ tool-less. A step Agent may declare a `workspace` mapping read-only `/inputs`
 paths to evidence; `/work` is bounded scratch for that invocation only.
 
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
-`cards.get`, `cards.get_by_ref`, `bifrost.list_tables`,
+`cards.get`, `bifrost.list_tables`,
 `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
 and `code.run`. The Invoker resolves them before the first model call through
 the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and

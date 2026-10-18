@@ -67,7 +67,7 @@ const READER_FAILURES: ReadonlyArray<readonly [string, Reply]> = [
 ];
 
 /** The three built-ins the investigator calls, in call order. */
-const TOOLS = ["cards.get_by_ref", "bifrost.query", "code.run"] as const;
+const TOOLS = ["cards.get", "bifrost.query", "code.run"] as const;
 
 /** The stable code of a permission denial, carried by every denied tool call's error. */
 const DENIED = "WYRD_PERMISSION_403_DENIED_RBAC";

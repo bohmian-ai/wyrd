@@ -77,8 +77,8 @@ fn response(topic: GuideTopic) -> GuideResponse {
         GuideTopic::Cards => (
             vec![
                 "Call cards.list with kind/name/space or other advertised filters. Read metadata summaries, select an explicit version, and follow next_cursor unchanged to continue the same filtered list. There is no fuzzy search or implicit newest version.",
-                "Call cards.get_by_ref with the selected CardRef, including version; cards.get remains the kind-qualified UID read. Both require cards:read and return the full Card.",
-                "Use Service spec.components and declared tables to establish scope. card.relationships.outbound_refs and inbound_refs contain exact related identities in each edge's ref field; follow them with repeated cards.get_by_ref calls.",
+                "Call cards.get with the selected card_ref, including version and space, or with kind and card_uid; pass exactly one form. It requires cards:read and returns the full Card.",
+                "Use Service spec.components and declared tables to establish scope. card.relationships.outbound_refs and inbound_refs contain exact related identities in each edge's ref field; follow them with repeated cards.get calls by card_ref.",
                 "A principal is an authenticated identity and a Card is a versioned component. Do not substitute principal IDs for Card UIDs. Missing and foreign-tenant Cards are indistinguishable; stop or narrow the question on refusal.",
             ],
             vec![
@@ -88,7 +88,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                     json!({ "kind": "Service", "name": "<service_name>", "limit": 20 }),
                 ),
                 example(
-                    "cards.get_by_ref",
+                    "cards.get",
                     "Read the selected version or relationship",
                     json!({ "card_ref": { "kind": "Service", "name": "<service_name>", "version": "1.0.0", "space": "default" } }),
                 ),

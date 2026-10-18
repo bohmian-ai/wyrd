@@ -280,7 +280,7 @@ requirements:
 
 `agent` is a path such as `./refund-reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference. A placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps file paths under `/inputs/`, such as `/inputs/policy.pdf`, to references, for Agents that read files with the `fs` tools.
 
-A step Agent can use these tools: `cards.list`, `cards.get`, `cards.get_by_ref`, `bifrost.list_tables`, `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`, and `code.run`.
+A step Agent can use these tools: `cards.list`, `cards.get`, `bifrost.list_tables`, `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`, and `code.run`.
 
 #### code
 

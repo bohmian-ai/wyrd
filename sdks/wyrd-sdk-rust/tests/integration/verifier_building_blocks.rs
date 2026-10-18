@@ -61,7 +61,7 @@ const UNCITED: &str = r#"{"outcome":"passed","reason":"trust me","citations":[]}
 const FOREIGN_CITE: &str = r#"{"outcome":"passed","reason":"see the note","citations":[{"slot":"answer","locator":{"json_pointer":"/note"}}]}"#;
 
 /// The three built-ins the investigator calls, in call order.
-const TOOLS: [&str; 3] = ["cards.get_by_ref", "bifrost.query", "code.run"];
+const TOOLS: [&str; 3] = ["cards.get", "bifrost.query", "code.run"];
 
 /// The stable code of a permission denial, carried by every denied tool
 /// call's error.
@@ -1106,7 +1106,7 @@ async fn code_check_fails_with_citations_and_is_inconclusive_otherwise() {
 /// both reads all three; one without the tool grant is denied every call
 /// even with its Card and query reads; one without the query read (it keeps
 /// the Card read that resolving the investigator Agent needs) may read Cards
-/// and run code but is denied the query; and an exact `cards.get_by_ref` tool grant covers no
+/// and run code but is denied the query; and an exact `cards.get` tool grant covers no
 /// other tool. A denied call returns nothing to the model.
 ///
 /// # Panics
@@ -1149,7 +1149,7 @@ async fn hosted_tools_need_the_tool_and_domain_grants() {
 }
 
 /// A principal that may call every tool, acting through a delegate granted
-/// only the exact `cards.get_by_ref` tool, keeps only the narrower
+/// only the exact `cards.get` tool, keeps only the narrower
 /// authority: the Card read succeeds, the query and code calls are denied
 /// with nothing returned, and the retained result names the original
 /// subject and the delegate as actor.

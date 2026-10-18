@@ -35,7 +35,7 @@ use wyrd_spec::registry::{
     CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest,
     CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
     ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed,
-    RelativeArtifactPath, canonical_artifact_manifest_hash,
+    RelativeArtifactPath, canonical_artifact_manifest_hash, validate_artifact_manifest,
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
@@ -1550,15 +1550,17 @@ async fn resolve_existing(
 
 /// Enforce request-wide invariants before database access.
 ///
-/// Each submission must be `wyrd/v1`, decode as its kind, bind validly, match
-/// its declared artifact hash, and, as a Verifier, pass the same
-/// [`VerifierSpec::validate`](wyrd_spec::card::verifier::VerifierSpec::validate)
-/// the loader runs, so a direct request cannot register what an SDK refuses.
+/// The server is the authority for every registration rule; the loader's
+/// checks only report the same refusals earlier. Each submission must be
+/// `wyrd/v1`, decode as its kind, bind validly, publish distinct non-nested
+/// artifact paths, match its declared artifact hash, and, as a Verifier, pass
+/// [`VerifierSpec::validate`](wyrd_spec::card::verifier::VerifierSpec::validate).
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_*` for a multi-card artifact request, a wrong
-/// apiVersion, an undecodable spec or a manifest hash mismatch, and the
-/// binding or Verifier `WYRD_SPEC_400_VALIDATION` refusal otherwise.
+/// apiVersion, an undecodable spec, a repeated or nested artifact path or a
+/// manifest hash mismatch, and the binding or Verifier
+/// `WYRD_SPEC_400_VALIDATION` refusal otherwise.
 fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
     if request.submissions.len() > 1
         && request
@@ -1587,6 +1589,7 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
         if let Spec::Verifier(verifier) = &spec {
             verifier.validate()?;
         }
+        validate_artifact_manifest(&submission.artifacts)?;
         let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()
             && submission.metadata.artifact_hash.is_some()

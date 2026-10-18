@@ -1595,6 +1595,58 @@ async fn composite_with_manifest_rejects_before_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Refuse a manifest that repeats an artifact path or nests one under
+/// another, so a request sent past the loader cannot publish a file `a`
+/// beside `a/b`.
+///
+/// # Panics
+/// Panics when the test server or bootstrap fails, bootstrap returns a non-user principal, or an assertion fails.
+#[tokio::test(flavor = "current_thread")]
+async fn conflicting_artifact_paths_are_refused() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-path-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    for (key, paths) in [
+        ("artifact-paths-repeat", ["prompt.txt", "prompt.txt"]),
+        ("artifact-paths-nested", ["weights", "weights/a.bin"]),
+    ] {
+        let artifacts: Vec<_> = paths
+            .iter()
+            .map(|path| json!({ "relative_path": path, "sha256": "YQ==", "size_bytes": 1 }))
+            .collect();
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                request_with_body(
+                    key,
+                    json!({ "submissions": [{
+                        "apiVersion": "wyrd/v1", "kind": "Prompt",
+                        "metadata": { "name": key, "version": "1.0.0", "space": "default" },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
+                        "artifacts": artifacts
+                    }] }),
+                ),
+            )
+            .await
+            .expect("conflicting manifest responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+        assert_eq!(
+            response_json(response).await["code"],
+            "WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH",
+            "{key}"
+        );
+    }
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Concurrent identical registrations persist one operation and one card.
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_same_key_resolves_to_one_registration() {

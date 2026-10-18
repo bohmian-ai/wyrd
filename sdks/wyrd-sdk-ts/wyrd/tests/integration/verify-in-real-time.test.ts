@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -58,12 +58,32 @@ const TOOL_TURN = /"role"\s*:\s*"tool"/;
 const REVIEWED =
   '{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}';
 
+/** Text every `frame-verifier` judge request carries. */
+const FRAME_CLAIM = "Cite the frame.";
+
+/** The nine-byte label of the one frame whose person wears no badge. */
+const UNBADGED = "no badge!";
+
+/** {@link UNBADGED} in base64, as the judge's image data URL carries it. */
+const UNBADGED_BASE64 = "bm8gYmFkZ2Uh";
+
+/** The frame judge's Verdict for a frame showing a badge: passed, citing the frame as its one page. */
+const BADGED = '{"outcome":"passed","reason":"a badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}';
+
+/** The frame judge's Verdict for the frame showing no badge. */
+const NO_BADGE =
+  '{"outcome":"failed","reason":"no badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}';
+
 /**
- * The local judge of the coding session: the `spans-reviewed` check first
+ * The file's local judge: the frame judge fails the {@link UNBADGED} frame
+ * and passes every other; the coding session's `spans-reviewed` check first
  * reads the span names of the trace its answer names live through
  * `bifrost.query`, then passes with {@link REVIEWED}; every other judge agrees.
  */
-function codingJudge(request: ReceivedRequest): Reply {
+function localJudge(request: ReceivedRequest): Reply {
+  if (request.body.includes(FRAME_CLAIM)) {
+    return judgeReply(request.body.includes(UNBADGED_BASE64) ? NO_BADGE : BADGED);
+  }
   if (!request.body.includes(LIVE_REVIEW)) {
     return judgeReply(AGREES);
   }
@@ -75,8 +95,8 @@ function codingJudge(request: ReceivedRequest): Reply {
   return toolTurn([toolCall("call-spans", "bifrost.query", { sql, max_rows: 10 })]);
 }
 
-/** A fresh deployment per test, as each Rust journey starts its own, judged as {@link codingJudge} answers. */
-const test = assistantTest({ perTest: true, provider: codingJudge });
+/** A fresh deployment per test, as each Rust journey starts its own, judged as {@link localJudge} answers. */
+const test = assistantTest({ perTest: true, provider: localJudge });
 
 /**
  * The process-global tracer provider, installed once by the first traced
@@ -729,4 +749,114 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
     expect(refused?.code, relative).toBe(code);
     expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, relative).toContain(reason);
   }
+}, 180_000);
+
+/**
+ * A PNG frame in a fresh directory carrying the nine-byte `label` after its
+ * signature and a newline, which starts the label on a base64 boundary, so
+ * its base64 appears verbatim in the image data URL the judge receives.
+ */
+function frame(label: string): string {
+  expect(label, "a frame label is nine bytes").toHaveLength(9);
+  const path = join(mkdtempSync(join(tmpdir(), "wyrd-ts-frame-")), `${label}.png`);
+  writeFileSync(path, Buffer.concat([Buffer.from("89504e470d0a1a0a0a", "hex"), Buffer.from(label)]));
+  return path;
+}
+
+/** Submit each frame at `paths` to `frame-verifier` in one Run of `state` under `group`. */
+async function submitFrames(state: WyrdState, group: string, paths: string[]): Promise<verify.Execution[]> {
+  const run = state.run("agent");
+  const executions = [];
+  for (const path of paths) {
+    const submitted = await run.observe.submit("frame-verifier", verify.File.path(path), { group_id: group });
+    if (submitted.kind !== "queued") {
+      throw new Error("a frame submission queues an execution");
+    }
+    executions.push(submitted.execution);
+  }
+  return executions;
+}
+
+test("grouped sampled frames are bounded", async ({ server, provider, assistant }) => {
+  const { cards, bundle, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/frames.yaml");
+  const other = await cards.registerFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
+  const otherBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
+  await cards.hydrate(other.root, otherBundle);
+  const otherKey = await cli.issueKey({ ...other.root, space: other.root.space ?? "default" });
+  const otherState = WyrdState.fromPath(otherBundle, { client: WyrdClient.connect({ credential: otherKey.key }) });
+  await otherState.startBifrost();
+  const reported = (event: string) =>
+    state
+      .run("agent")
+      .observe.verify("event-fact", { event_id: event, detected: true }, { positional: true, group_id: event });
+  const badged = (judged: Awaited<ReturnType<typeof groupExecution>>) => [
+    judged.result?.outcome.verdict,
+    judged.result?.outcome.requirements[0]?.reason,
+  ];
+  const waited = (executions: verify.Execution[]) =>
+    Promise.all(executions.map((execution) => execution.wait({ timeoutMs: WAIT_MS })));
+  const ids = (executions: verify.Execution[]) => executions.map((execution) => execution.id);
+
+  await reported("door-44");
+  let judged = await groupExecution(server, bindingId, WAIT_MS);
+  expect(judged.group_id).toBe("door-44");
+  expect(badged(judged)).toEqual(["inconclusive", "empty_selection"]);
+  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: [] });
+
+  const failing = Array.from({ length: 19 }, (_, index) => frame(`fail-${String(index).padStart(4, "0")}`));
+  failing.splice(7, 0, frame(UNBADGED));
+  const executions = await submitFrames(state, "door-43", failing);
+  await waited(await submitFrames(otherState, "door-43", [frame("other-001")]));
+  const unauthorized = server.scopedApiKey("frames_denied", [
+    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+  ]);
+  await expect(
+    WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: unauthorized }) })
+      .run("agent")
+      .observe.submit("frame-verifier", verify.File.path(frame("denied-01")), { group_id: "door-43" }),
+  ).rejects.toMatchObject(DENIED);
+  await reported("door-43");
+  await waited(executions);
+  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
+  expect(judged.group_id).toBe("door-43");
+  expect(judged.group?.sources.outcomes.execution_ids, "only the Service's own frames, in submission order").toEqual(
+    ids(executions),
+  );
+  expect(judged.group?.sources.event.execution_ids).toHaveLength(1);
+  const expected = Array.from({ length: 20 }, (_, index) => (index === 7 ? "failed" : "passed"));
+  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: expected });
+  expect(judged.result?.outcome.verdict).toBe("failed");
+
+  const over = await submitFrames(
+    state,
+    "door-45",
+    Array.from({ length: 21 }, (_, index) => frame(`over-${String(index).padStart(4, "0")}`)),
+  );
+  await reported("door-45");
+  await waited(over);
+  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
+  expect(judged.group_id).toBe("door-45");
+  expect(badged(judged)).toEqual([
+    "inconclusive",
+    "source_execution_limit_exceeded: verifiers.frame-verifier.requirements.person-wearing-badge.outcome selected more than 20 source executions",
+  ]);
+
+  const door = await submitFrames(
+    state,
+    "door-42",
+    Array.from({ length: 20 }, (_, index) => frame(`door-${String(index).padStart(4, "0")}`)),
+  );
+  await reported("door-42");
+  await waited(door);
+  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
+  expect(judged.group_id).toBe("door-42");
+  expect(judged.group?.sources.outcomes.execution_ids).toEqual(ids(door));
+  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: Array(20).fill("passed") });
+  expect(judged.result?.outcome.verdict).toBe("passed");
+  expect(
+    provider.received.filter((request) => request.body.includes(FRAME_CLAIM)),
+    "every frame is judged once",
+  ).toHaveLength(20 + 1 + 21 + 20);
+  await state.shutdown();
+  await otherState.shutdown();
 }, 180_000);

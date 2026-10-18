@@ -68,28 +68,65 @@ where
     std::process::ExitCode::from(run_cli_code(args).await)
 }
 
+/// Whether `args` request machine output with `--format json`.
+///
+/// Read from the raw arguments, before `--`, so a usage failure that never
+/// parses still learns the requested mode. In JSON mode stdout carries only
+/// the command's one result and stderr only its one error document.
+pub fn json_requested<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<std::ffi::OsStr>,
+{
+    let mut previous_format = false;
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return false;
+        }
+        if (previous_format && arg == "json") || arg == "--format=json" {
+            return true;
+        }
+        previous_format = arg == "--format";
+    }
+    false
+}
+
 /// Parse and run the CLI, returning its numeric process exit code for language
 /// bindings and other embedding surfaces.
+///
+/// With `--format json`, a parse failure is the one
+/// [`error::WyrdCliError::Usage`] document on stderr, like every other
+/// failure; help and version output are unchanged.
 pub async fn run_cli_code<I, T>(args: I) -> u8
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let json = json_requested(&args);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
-            let success = matches!(
+            if matches!(
                 error.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            );
-            let _ = error.print();
-            return if success { 0 } else { 64 };
+            ) {
+                let _ = error.print();
+                return 0;
+            }
+            if json {
+                error::CliBoundaryError::from(error::WyrdCliError::usage(&error)).print(true);
+            } else {
+                let _ = error.print();
+            }
+            return 64;
         }
     };
     match cli.dispatch().await {
         Ok(code) => code_to_u8(code),
         Err(error) => {
-            error.print();
+            error.print(json);
             error.exit_code()
         }
     }
@@ -113,7 +150,17 @@ fn code_to_u8(code: std::process::ExitCode) -> u8 {
 /// Exit-code contract tests for the shared native and Python CLI entrypoint.
 #[cfg(test)]
 mod tests {
-    use super::{code_to_u8, run_cli_code};
+    use super::{code_to_u8, json_requested, run_cli_code};
+
+    /// Only an exact `--format json` before `--` selects machine output.
+    #[test]
+    fn json_mode_is_read_from_raw_arguments() {
+        assert!(json_requested(["wyrd", "get", "--format", "json"]));
+        assert!(json_requested(["wyrd", "get", "--format=json"]));
+        assert!(!json_requested(["wyrd", "query", "--format", "jsonl"]));
+        assert!(!json_requested(["wyrd", "get", "--format", "text"]));
+        assert!(!json_requested(["wyrd", "x", "--", "--format", "json"]));
+    }
 
     /// Preserve the process codes explicitly used by shared CLI dispatch.
     #[test]

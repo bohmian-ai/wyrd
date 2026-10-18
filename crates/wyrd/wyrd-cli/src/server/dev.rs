@@ -28,10 +28,11 @@ use wyrd_utils::secret::read_secret_file;
 
 use super::install::compatible;
 use super::{InstalledServer, ServerInstaller};
+use crate::card::{OutputFormat, print_json};
 use crate::client::map_client_error;
 use crate::error::WyrdCliError;
 use crate::gateway::{AuthoringApply, DeploymentFile, apply_deployments_with};
-use crate::mcp::{self, McpHost};
+use crate::mcp::{self, McpHost, McpInstallReport};
 use crate::platform::credential::PlatformEndpoint;
 #[cfg(unix)]
 use crate::terminal::Terminal;
@@ -71,6 +72,11 @@ pub struct DevArgs {
     /// Skip the gateway offer.
     #[arg(long)]
     skip_gateway: bool,
+    /// Output encoding. `json` never prompts, prints one readiness object on
+    /// stdout once the server is ready and keeps serving, and appends
+    /// progress and server output to the diagnostic log it names.
+    #[arg(long, default_value_t)]
+    format: OutputFormat,
 }
 
 /// Effective local deployment inputs, resolved once before any side effect,
@@ -119,6 +125,172 @@ struct DevServer {
     sealing_key: PathBuf,
     /// Serving child retained across readiness, setup, and foreground waiting.
     child: Option<Child>,
+    /// Destination of progress notices and the serving child's output.
+    diagnostics: Diagnostics,
+}
+
+/// Where `server dev` writes progress, notices, and the serving child's
+/// output: the terminal in text mode, else an append-only diagnostic log, so
+/// JSON mode keeps stdout and stderr for its machine documents.
+enum Diagnostics {
+    /// Progress on stdout, notices on stderr; the child inherits both.
+    Terminal,
+    /// JSON mode's diagnostic log beneath the server directory.
+    Log {
+        /// Log location, reported in the readiness result and stage errors.
+        path: PathBuf,
+        /// Append handle shared by notices and the serving child.
+        file: std::fs::File,
+    },
+}
+
+impl Diagnostics {
+    /// Select the terminal for text, else open `<root>/logs/server-dev.log`.
+    ///
+    /// # Errors
+    /// Returns a local-persistence stage error when the log cannot be opened.
+    fn open(root: &Path, format: OutputFormat) -> Result<Self, WyrdCliError> {
+        if format == OutputFormat::Text {
+            return Ok(Self::Terminal);
+        }
+        let path = root.join("logs").join("server-dev.log");
+        std::fs::create_dir_all(root.join("logs"))
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+            })
+            .map(|file| Self::Log { path, file })
+            .map_err(|_| {
+                dev_error(
+                    "local persistence",
+                    "the diagnostic log could not be opened; restore safe permissions on the Wyrd config directory and rerun; nothing has run",
+                )
+            })
+    }
+
+    /// The diagnostic log, when JSON mode writes one.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Terminal => None,
+            Self::Log { path, .. } => Some(path),
+        }
+    }
+
+    /// Report progress: stdout in text mode, else one log line. A failed log
+    /// write is dropped; it never fails startup.
+    fn progress(&self, text: &str) {
+        match self {
+            Self::Terminal => println!("{text}"),
+            Self::Log { file, .. } => drop(writeln!(&*file, "{text}")),
+        }
+    }
+
+    /// Report a notice: stderr in text mode, else one log line.
+    fn notice(&self, text: &str) {
+        match self {
+            Self::Terminal => eprintln!("{text}"),
+            Self::Log { file, .. } => drop(writeln!(&*file, "{text}")),
+        }
+    }
+
+    /// Point the serving child's stdout and stderr at this destination.
+    ///
+    /// # Errors
+    /// Returns a startup stage error when the log handle cannot be shared.
+    fn attach(&self, command: &mut Command) -> Result<(), WyrdCliError> {
+        if let Self::Log { file, .. } = self {
+            let shared = || {
+                file.try_clone().map_err(|_| {
+                    dev_error(
+                        "startup",
+                        "the diagnostic log could not be shared with the server; rerun",
+                    )
+                })
+            };
+            command.stdout(shared()?).stderr(shared()?);
+        }
+        Ok(())
+    }
+
+    /// Attach the diagnostic log to a local-startup stage error.
+    fn locate(&self, error: WyrdCliError) -> WyrdCliError {
+        match error {
+            WyrdCliError::ServerDev {
+                stage, recovery, ..
+            } => WyrdCliError::ServerDev {
+                stage,
+                recovery,
+                log: self.path().map(Path::to_path_buf),
+            },
+            other => other,
+        }
+    }
+}
+
+/// `server dev`'s readiness: what a fresh client and MCP host use, printed
+/// once while the server keeps running in the foreground.
+#[derive(serde::Serialize)]
+struct DevReady {
+    /// Always `true`; a later failure is a separate error document.
+    ready: bool,
+    /// HTTP endpoint saved for fresh clients.
+    endpoint: String,
+    /// Public gRPC endpoint saved for fresh clients.
+    grpc: String,
+    /// Served tenant.
+    tenant: String,
+    /// Storage URL without userinfo, query, or fragment.
+    storage_url: String,
+    /// Absolute Bifrost data directory.
+    bifrost_data_dir: PathBuf,
+    /// Directory of the saved `config.toml` and protected `credentials.toml`.
+    config_dir: Option<PathBuf>,
+    /// Gateway setup outcome.
+    gateway: String,
+    /// Selected MCP hosts' outcomes; `None` when host setup was skipped.
+    mcp: Option<McpInstallReport>,
+    /// JSON mode's diagnostic log.
+    log: Option<PathBuf>,
+}
+
+impl DevReady {
+    /// Print the readiness message for a person.
+    fn print_text(&self) {
+        let files = self
+            .config_dir
+            .as_deref()
+            .map_or_else(String::new, |dir| dir.display().to_string());
+        match &self.mcp {
+            Some(report) => report.print_text(),
+            None => println!("MCP setup skipped; connect a host later with wyrd mcp install."),
+        }
+        println!(
+            "Local Wyrd ready at {} for tenant {}.\n  gRPC: {}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
+            self.endpoint,
+            self.tenant,
+            self.grpc,
+            self.storage_url,
+            self.bifrost_data_dir.display(),
+            self.gateway,
+        );
+    }
+}
+
+/// `url` without userinfo, query, or fragment, any of which may carry a
+/// storage credential.
+fn redacted(url: &str) -> String {
+    url::Url::parse(url).map_or_else(
+        |_| "(unparseable URL)".to_owned(),
+        |mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        },
+    )
 }
 
 impl DevArgs {
@@ -142,15 +314,18 @@ impl DevArgs {
         let inputs = tokio::select! {
             biased;
             signal = &mut interrupted => {
-                eprintln!("Local setup stopped before installation, migration, or provisioning; rerun the same command.");
+                if self.format == OutputFormat::Text {
+                    eprintln!("Local setup stopped before installation, migration, or provisioning; rerun the same command.");
+                }
                 return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
             }
             inputs = self.resolve(installer.root()) => inputs?,
         };
+        let diagnostics = Diagnostics::open(installer.root(), self.format)?;
         let installed = tokio::select! {
             biased;
             signal = &mut interrupted => {
-                eprintln!("Local installation stopped; rerun the same command.");
+                diagnostics.notice("Local installation stopped; rerun the same command.");
                 return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
             }
             installed = async {
@@ -160,22 +335,24 @@ impl DevArgs {
                 }
             } => installed?,
         };
-        let sealing_key = local_sealing_key(installer.root())?;
-        let mut server = DevServer::new(installed, inputs, sealing_key)?;
+        let sealing_key =
+            local_sealing_key(installer.root()).map_err(|error| diagnostics.locate(error))?;
+        let mut server = DevServer::new(installed, inputs, sealing_key, diagnostics)?;
         let result = tokio::select! {
             biased;
             signal = &mut interrupted => {
-                eprintln!("Local startup stopped. Committed setup steps remain; rerun the same command. An active tenant's key is never reissued.");
+                server.diagnostics.notice("Local startup stopped. Committed setup steps remain; rerun the same command. An active tenant's key is never reissued.");
                 signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source })
             }
-            result = server.run(&self.hosts) => result,
+            result = server.run(&self.hosts, self.format) => result,
         };
         let settled = server.stop().await;
+        let located = |error| server.diagnostics.locate(error);
         match result {
-            Ok(code) => settled.map(|()| code),
+            Ok(code) => settled.map(|()| code).map_err(located),
             Err(error) => {
-                settled?;
-                Err(error)
+                settled.map_err(located)?;
+                Err(located(error))
             }
         }
     }
@@ -254,7 +431,10 @@ impl DevArgs {
             .map(str::parse::<TenantSlug>)
             .transpose()
             .map_err(|_| dev_error("local config", "config.toml [dev] tenant is invalid; correct it or use a separate WYRD_CONFIG_HOME"))?;
-        let interactive = cfg!(unix) && !self.non_interactive && std::io::stdin().is_terminal();
+        let interactive = cfg!(unix)
+            && !self.non_interactive
+            && self.format == OutputFormat::Text
+            && std::io::stdin().is_terminal();
         let database = secret_var("WYRD_DATABASE_URL").or(saved_database);
         let tenant = self.tenant.clone().or_else(|| saved_tenant.clone());
         let (database, tenant) = match (database, tenant) {
@@ -347,6 +527,7 @@ impl DevArgs {
                 saved.bifrost_data_dir.as_deref(),
             ),
             root,
+            self.format == OutputFormat::Text,
         )?;
         // The key proves this is the saved deployment (checked against the
         // ready server before any write); a saved endpoint proves setup
@@ -418,8 +599,9 @@ fn secret_var(variable: &str) -> Option<SecretString> {
 /// Select the storage URL and absolute Bifrost root, defaulting each to a
 /// created directory beneath the server directory `root`.
 ///
-/// A defaulted storage selection is explained once, with its absolute
-/// location; an existing working-directory `.wyrd` is named but not adopted.
+/// A defaulted storage selection is explained once in text mode (`announce`),
+/// with its absolute location; an existing working-directory `.wyrd` is
+/// named but not adopted. JSON mode reports the location in its result.
 ///
 /// # Errors
 /// Refuses an unresolvable Bifrost path and default directories that cannot
@@ -428,6 +610,7 @@ fn local_data(
     storage: Option<String>,
     bifrost: Option<String>,
     root: &Path,
+    announce: bool,
 ) -> Result<(String, PathBuf), WyrdCliError> {
     let created = |path: PathBuf| {
         std::fs::create_dir_all(&path).map(|()| path).map_err(|_| {
@@ -450,11 +633,13 @@ fn local_data(
         return Ok((storage, bifrost));
     }
     let path = created(root.join("data").join("storage"))?;
-    println!(
-        "WYRD_STORAGE_URL is unset; using local storage at {} (saved as [dev] storage_url).",
-        path.display()
-    );
-    if Path::new(".wyrd").is_dir() {
+    if announce {
+        println!(
+            "WYRD_STORAGE_URL is unset; using local storage at {} (saved as [dev] storage_url).",
+            path.display()
+        );
+    }
+    if announce && Path::new(".wyrd").is_dir() {
         println!(
             "The existing ./.wyrd directory is not adopted; pass --storage-url and set WYRD_BIFROST_DATA_DIR to use it."
         );
@@ -477,6 +662,7 @@ impl DevServer {
         installed: InstalledServer,
         inputs: DevInputs,
         sealing_key: PathBuf,
+        diagnostics: Diagnostics,
     ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the CLI package version is semver");
@@ -493,6 +679,7 @@ impl DevServer {
             memory: None,
             sealing_key,
             child: None,
+            diagnostics,
         })
     }
 
@@ -545,7 +732,11 @@ impl DevServer {
     ///
     /// # Panics
     /// Panics if the serving child is not retained after readiness.
-    async fn run(&mut self, hosts: &[McpHost]) -> Result<ExitCode, WyrdCliError> {
+    async fn run(
+        &mut self,
+        hosts: &[McpHost],
+        format: OutputFormat,
+    ) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
         let grpc = format!("http://{}", self.inputs.grpc);
         if let Some(key) =
@@ -567,31 +758,48 @@ impl DevServer {
             child,
             endpoint,
             inputs,
+            diagnostics,
             ..
         } = self;
         let child = child
             .as_mut()
             .expect("the server is retained after readiness");
         let gateway = tokio::select! {
-            configured = inputs.configure_gateway(client) => configured?,
+            configured = inputs.configure_gateway(client, diagnostics) => configured?,
             exited = Self::exited(child) => return exited,
         };
-        if !inputs.configured || !hosts.is_empty() {
+        let mcp = if !inputs.configured || !hosts.is_empty() {
             tokio::select! {
                 offered = mcp::offer_local(hosts, endpoint, inputs.interactive) => offered?,
                 exited = Self::exited(child) => return exited,
             }
+        } else {
+            None
+        };
+        if let Some(report) = &mcp
+            && format == OutputFormat::Text
+            && report.hosts.iter().any(|outcome| outcome.detail.is_some())
+        {
+            report.print_text();
         }
-        let files = Environment::Process
-            .config_dir()
-            .map_or_else(String::new, |dir| dir.display().to_string());
-        println!(
-            "Local Wyrd ready at {endpoint} for tenant {}.\n  gRPC: http://{}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {gateway}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
-            inputs.tenant,
-            inputs.grpc,
-            inputs.storage_url,
-            inputs.bifrost.display(),
-        );
+        let mcp = mcp.map(McpInstallReport::into_result).transpose()?;
+        let ready = DevReady {
+            ready: true,
+            endpoint: endpoint.clone(),
+            grpc: format!("http://{}", inputs.grpc),
+            tenant: inputs.tenant.to_string(),
+            storage_url: redacted(&inputs.storage_url),
+            bifrost_data_dir: inputs.bifrost.clone(),
+            config_dir: Environment::Process.config_dir(),
+            gateway,
+            mcp,
+            log: diagnostics.path().map(Path::to_path_buf),
+        };
+        match format {
+            OutputFormat::Text => ready.print_text(),
+            OutputFormat::Json => print_json(&ready)?,
+        }
+        drop(ready);
         Self::exited(child).await
     }
 
@@ -637,10 +845,10 @@ impl DevServer {
             (saved, _) => saved,
         };
         let candidate = tenant.credential(saved.as_ref())?;
-        println!(
+        self.diagnostics.progress(&format!(
             "Tenant {} ({}) is active; saving local client configuration.",
             self.inputs.tenant, tenant.id
-        );
+        ));
         GlobalConfig::save_local(
             &Environment::Process,
             &self.endpoint,
@@ -696,7 +904,9 @@ impl DevServer {
         self.detect_memory().await?;
         self.migrate().await?;
         drop(reservation);
-        self.child = Some(self.command().spawn().map_err(|_| {
+        let mut command = self.command();
+        self.diagnostics.attach(&mut command)?;
+        self.child = Some(command.spawn().map_err(|_| {
             dev_error(
                 "startup",
                 "check the installed server and listener availability, then rerun",
@@ -742,10 +952,10 @@ impl DevServer {
     /// # Errors
     /// Returns secret-free guidance on failure; committed migrations remain.
     async fn migrate(&self) -> Result<(), WyrdCliError> {
-        println!(
+        self.diagnostics.progress(&format!(
             "Migrating the installed Wyrd server {}.",
             self.installed.version
-        );
+        ));
         let migrated = self.command().arg("migrate").output().await.map_err(|_| {
             dev_error(
                 "migration",
@@ -787,7 +997,7 @@ impl DevServer {
         let setup_succeeded = setup.status.success();
         let printed = SecretString::from(String::from_utf8(setup.stdout)
             .map_err(|_| dev_error("setup response", "the installed server returned invalid output; check its compatible release before rerunning"))?);
-        disclose_root(printed.expose_secret());
+        disclose_root(printed.expose_secret(), &self.diagnostics);
         if !setup_succeeded {
             return Err(dev_error(
                 "setup",
@@ -945,8 +1155,9 @@ impl ProvisionedTenant {
 }
 
 /// Disclose a newly initialized root only to the invoking terminal.
-/// An unavailable terminal prints recovery guidance; tenant persistence continues.
-fn disclose_root(printed: &str) {
+/// An unavailable terminal reports recovery guidance as a notice; tenant
+/// persistence continues.
+fn disclose_root(printed: &str, diagnostics: &Diagnostics) {
     if let Some(root) = printed
         .lines()
         .find(|line| line.starts_with("wyrd_global_"))
@@ -959,13 +1170,13 @@ fn disclose_root(printed: &str) {
             .and_then(|()| terminal.flush())
             .is_err()
             {
-                eprintln!(
-                    "Platform root initialized, but its credential could not be delivered to the terminal; use wyrd-server recover-root when platform administration is needed."
+                diagnostics.notice(
+                    "Platform root initialized, but its credential could not be delivered to the terminal; use wyrd-server recover-root when platform administration is needed.",
                 );
             }
         } else {
-            eprintln!(
-                "Platform root initialized. No invoking terminal was available for disclosure; use wyrd-server recover-root when platform administration is needed."
+            diagnostics.notice(
+                "Platform root initialized. No invoking terminal was available for disclosure; use wyrd-server recover-root when platform administration is needed.",
             );
         }
     }
@@ -1133,7 +1344,11 @@ impl DevInputs {
     /// error, and a failed read-back. A refusal applies nothing, but an error
     /// can also follow a commit whose response was lost, so the failure is
     /// reported as uncertain; reapplying the same named document is safe.
-    async fn configure_gateway(&self, client: WyrdClient) -> Result<String, WyrdCliError> {
+    async fn configure_gateway(
+        &self,
+        client: WyrdClient,
+        diagnostics: &Diagnostics,
+    ) -> Result<String, WyrdCliError> {
         let offered;
         let apply = match &self.gateway {
             Some(apply) => apply,
@@ -1158,8 +1373,8 @@ impl DevInputs {
             .map(|deployment| deployment.name.to_string())
             .collect();
         if let Err(source) = apply_deployments_with(client, apply).await {
-            eprintln!(
-                "Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the gateway changes may have committed. Inspect them with wyrd gateway deployment list once the server is running, then rerun: reapplying the same named document is safe. Or pass --skip-gateway."
+            diagnostics.notice(
+                "Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the gateway changes may have committed. Inspect them with wyrd gateway deployment list once the server is running, then rerun: reapplying the same named document is safe. Or pass --skip-gateway.",
             );
             return Err(WyrdCliError::Server { source });
         }
@@ -1334,7 +1549,11 @@ async fn proven(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
 
 /// Construct a stable local-stage error with static, secret-free recovery.
 fn dev_error(stage: &'static str, recovery: &'static str) -> WyrdCliError {
-    WyrdCliError::ServerDev { stage, recovery }
+    WyrdCliError::ServerDev {
+        stage,
+        recovery,
+        log: None,
+    }
 }
 
 /// Wait for an operating-system interruption without detaching any child.

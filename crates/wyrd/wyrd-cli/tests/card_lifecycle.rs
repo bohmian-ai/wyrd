@@ -36,7 +36,8 @@ fn run_cli_with_token(arguments: &[&str], token: Option<&str>) -> Output {
     command
         .env_remove("WYRD_WORKLOAD_TOKEN")
         .env_remove("WYRD_TENANT")
-        .env_remove("WYRD_API_KEY");
+        .env_remove("WYRD_API_KEY")
+        .env_remove("RUST_LOG");
     command.args(arguments).output().expect("wyrd command runs")
 }
 
@@ -347,9 +348,13 @@ fn invalid_local_reference_returns_card_load_error_without_credentials() {
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
-    assert_eq!(report["ok"], false);
-    assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
+    assert!(output.stdout.is_empty(), "a failed check prints no result");
+    let error: Value = serde_json::from_slice(&output.stderr).expect("stderr is one document");
+    assert_eq!(error["code"], "WYRD_CLI_400_CARD_LOAD");
+    assert!(
+        error["details"]["diagnostics"][0]["code"].is_string(),
+        "{error}"
+    );
 }
 
 /// Reject a peer-only Verifier listed as a Service component during local CLI planning.
@@ -563,17 +568,18 @@ spec:
             "an invalid check contacted the configured server"
         );
         assert_eq!(output.status.code(), Some(64), "{}", invalid.display());
-        let report: Value = serde_json::from_slice(&output.stdout).expect("check failure is JSON");
-        assert_eq!(report["ok"], false);
-        let diagnostic = &report["diagnostics"][0];
+        assert!(output.stdout.is_empty(), "a failed check prints no result");
+        let error: Value =
+            serde_json::from_slice(&output.stderr).expect("stderr is one error document");
+        assert_eq!(error["code"], "WYRD_CLI_400_CARD_LOAD");
+        let diagnostic = &error["details"]["diagnostics"][0];
         assert!(
             diagnostic["code"]
                 .as_str()
                 .is_some_and(|code| code.starts_with("WYRD_")),
-            "{report}"
+            "{error}"
         );
-        assert!(diagnostic["path"].as_str().is_some(), "{report}");
-        assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
+        assert!(diagnostic["path"].as_str().is_some(), "{error}");
     }
 }
 
@@ -2214,6 +2220,168 @@ mod pg_tests {
         assert_eq!(first_stderr_json(&missing)["status"], 404);
         assert!(!missing_dir.exists());
 
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
+    /// Parse one CLI run as a JSON-mode failure: empty stdout, exactly one
+    /// error document as the whole of stderr, and the expected exit code.
+    ///
+    /// # Panics
+    /// Panics when stdout is written, stderr is not one JSON document, or
+    /// the exit code differs.
+    fn json_failure(output: &Output, exit: i32) -> Value {
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "a failure prints no result");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+            panic!(
+                "stderr is not one JSON document ({error}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(error["kind"], "wyrd_cli_error");
+        for field in ["code", "title", "message", "remediation"] {
+            assert!(error[field].is_string(), "{field} missing: {error}");
+        }
+        error
+    }
+
+    /// Every final Card command in JSON mode prints one typed result on
+    /// stdout or one structured error on stderr: usage errors, offline check
+    /// failures, missing credentials, denied reads, and successful declare,
+    /// get, and pull. No run echoes the bearer token.
+    ///
+    /// # Panics
+    /// Panics when a stream holds more or less than its one document, an
+    /// error loses its catalog code, or a credential reaches output.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn json_results_and_errors_are_machine_readable() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let path = path.to_str().expect("prompt path is UTF-8").to_owned();
+        let bundle = temp.path().join("bundle");
+        let bundle = bundle.to_str().expect("bundle path is UTF-8").to_owned();
+
+        let unknown = run_cli_async!("get", "--format", "json", "--bogus");
+        let unknown = json_failure(&unknown, 64);
+        assert_eq!(unknown["code"], "WYRD_CLI_400_USAGE");
+        assert_eq!(unknown["details"]["argument"], "--bogus");
+        let missing = run_cli_async!("pull", "--kind", "Prompt", "--format=json");
+        let missing = json_failure(&missing, 64);
+        assert_eq!(missing["code"], "WYRD_CLI_400_USAGE");
+        assert!(
+            missing["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("--output-dir")),
+            "{missing}"
+        );
+        let human = run_cli_async!("get", "--bogus");
+        assert_eq!(human.status.code(), Some(64));
+        assert!(String::from_utf8_lossy(&human.stderr).contains("Usage:"));
+
+        let absent = temp.path().join("absent.yaml");
+        let check = run_cli_async!(
+            "declare",
+            "--check",
+            absent.to_str().expect("UTF-8"),
+            "--format",
+            "json"
+        );
+        let check = json_failure(&check, 64);
+        assert_eq!(check["code"], "WYRD_CLI_400_CARD_LOAD");
+        assert!(check["details"]["diagnostics"].is_array(), "{check}");
+
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-json-writer", &["editor"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+        let Bootstrap::User {
+            jwt: denied_jwt, ..
+        } = server
+            .bootstrap_user("cli-json-denied", &[])
+            .await
+            .expect("denied user bootstraps")
+        else {
+            panic!("denied bootstrap returned a non-user principal");
+        };
+
+        let anonymous = run_cli_async!("declare", &path, "--server", &base_url, "--format", "json");
+        let anonymous = json_failure(&anonymous, 77);
+        assert_eq!(anonymous["code"], "WYRD_CLI_401_NO_CREDENTIALS");
+
+        let declared = run_cli_async_with_token!(
+            &jwt, "declare", &path, "--server", &base_url, "--format", "json"
+        );
+        assert!(
+            declared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&declared.stderr)
+        );
+        assert!(declared.stderr.is_empty(), "success writes no stderr");
+        let receipt: Value = serde_json::from_slice(&declared.stdout).expect("one receipt");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("receipt has the root UID")
+            .to_owned();
+
+        let denied_run = run_cli_async_with_token!(
+            &denied_jwt,
+            "get",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--server",
+            &base_url,
+            "--format",
+            "json"
+        );
+        let denied = json_failure(&denied_run, 77);
+        assert_eq!(denied["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(denied["status"], 403);
+
+        let got = run_cli_async_with_token!(
+            &jwt, "get", "--kind", "Prompt", "--uid", &uid, "--server", &base_url, "--format",
+            "json"
+        );
+        assert!(got.status.success() && got.stderr.is_empty());
+        let card: Value = serde_json::from_slice(&got.stdout).expect("one envelope");
+        assert_eq!(card["metadata"]["uid"], uid);
+
+        let pulled = run_cli_async_with_token!(
+            &jwt,
+            "pull",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--output-dir",
+            &bundle,
+            "--server",
+            &base_url,
+            "--format",
+            "json"
+        );
+        assert!(pulled.status.success() && pulled.stderr.is_empty());
+        let summary: Value = serde_json::from_slice(&pulled.stdout).expect("one summary");
+        assert_eq!(summary["mode"], "complete");
+
+        for output in [&declared, &denied_run, &got, &pulled] {
+            let streams = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+            let streams = String::from_utf8_lossy(&streams);
+            assert!(
+                !streams.contains(&jwt) && !streams.contains(&denied_jwt),
+                "a credential reached CLI output"
+            );
+        }
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 

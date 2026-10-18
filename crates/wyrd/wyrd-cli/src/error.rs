@@ -19,6 +19,8 @@ pub enum WyrdCliError {
         stage: &'static str,
         /// Static recovery guidance that identifies retained partial state.
         recovery: &'static str,
+        /// Diagnostic log holding progress and server output in JSON mode.
+        log: Option<std::path::PathBuf>,
     },
     /// Required Oracle client configuration was not supplied.
     #[error("query configuration is missing {field}")]
@@ -264,8 +266,9 @@ pub enum WyrdCliError {
 
     /// One or more selected MCP hosts could not be connected.
     ///
-    /// Each host's reason is printed on its own line; the failed hosts' files
-    /// are unchanged and every other selected host was installed.
+    /// Each host's reason is printed on its own line, or carried as
+    /// `details.hosts` in JSON mode; the failed hosts' files are unchanged
+    /// and every other selected host was installed.
     #[error("MCP host installation failed for {hosts}")]
     #[wyrd_error(
         code = "WYRD_CLI_409_MCP_HOST_INSTALL",
@@ -276,6 +279,25 @@ pub enum WyrdCliError {
     McpHostInstall {
         /// Names of the hosts that failed.
         hosts: String,
+        /// Every selected host's outcome, including the successful ones.
+        report: crate::mcp::McpInstallReport,
+    },
+
+    /// The command line did not parse.
+    #[error("{detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_USAGE",
+        status = 400,
+        title = "Invalid command usage",
+        remediation = "Correct the arguments; run the command with --help for its accepted arguments."
+    )]
+    Usage {
+        /// The parser's one-line refusal, without usage text.
+        detail: String,
+        /// Parser failure kind, such as `missing_required_argument`.
+        kind: String,
+        /// Offending argument, when the parser names one.
+        argument: Option<String>,
     },
 
     /// `wyrd mcp proxy` could not establish the host or Wyrd MCP session.
@@ -293,6 +315,57 @@ pub enum WyrdCliError {
 }
 
 impl WyrdCliError {
+    /// Project a command-line parse failure onto [`WyrdCliError::Usage`].
+    ///
+    /// Keeps the parser's message joined onto one line, without the
+    /// `error: ` prefix, usage block, help tip, or terminal styling; the
+    /// parser echoes no value of an unknown argument.
+    #[must_use]
+    pub fn usage(error: &clap::Error) -> Self {
+        let rendered = error.render().to_string();
+        let detail = rendered
+            .lines()
+            .take_while(|line| !line.is_empty() && !line.starts_with("Usage:"))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_start_matches("error: ")
+            .to_owned();
+        let argument = error
+            .get(clap::error::ContextKind::InvalidArg)
+            .map(ToString::to_string);
+        let kind = format!("{:?}", error.kind());
+        Self::Usage {
+            detail,
+            kind,
+            argument,
+        }
+    }
+
+    /// Structured, secret-free diagnostics for the CLI error document.
+    ///
+    /// Carries the loader's diagnostics, the offending field or argument, the
+    /// failed local-startup stage and its diagnostic log, or every selected
+    /// MCP host's outcome; other errors carry none.
+    #[must_use]
+    pub fn details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::CardLoad(error) => Some(serde_json::json!({ "diagnostics": error.diagnostics })),
+            Self::InvalidArgument { field, .. } => Some(serde_json::json!({ "field": field })),
+            Self::QueryConfig { field } => Some(serde_json::json!({ "field": field })),
+            Self::ServerDev { stage, log, .. } => {
+                Some(serde_json::json!({ "stage": stage, "log": log }))
+            }
+            Self::McpHostInstall { report, .. } => {
+                Some(serde_json::json!({ "hosts": report.hosts }))
+            }
+            Self::Usage { kind, argument, .. } => {
+                Some(serde_json::json!({ "kind": kind, "argument": argument }))
+            }
+            _ => None,
+        }
+    }
+
     /// Process exit code for this error.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
@@ -341,6 +414,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
                 details: serde_json::json!({ "field": field }),
             },
             WyrdCliError::QueryConfig { .. }
+            | WyrdCliError::Usage { .. }
             | WyrdCliError::DeleteSelectorRequiresExact
             | WyrdCliError::ServerHostUnsupported { .. }
             | WyrdCliError::ServerVersionIncompatible { .. }
@@ -390,12 +464,14 @@ impl From<wyrd_spec::error::WyrdError> for CliBoundaryError {
 }
 
 impl CliBoundaryError {
-    /// Prints one machine-readable problem followed by one human-readable stderr line.
+    /// Prints one machine-readable problem on stderr, followed in human mode
+    /// by one human-readable line.
     ///
-    /// The method performs exactly two stderr writes and never writes stdout,
-    /// mutates durable state, or changes the originating error metadata.
-    pub fn print(&self) {
-        let json = serde_json::json!({
+    /// With `json`, the problem is the only stderr write, so a caller parses
+    /// stderr whole as one document. The method never writes stdout, mutates
+    /// durable state, or changes the originating error metadata.
+    pub fn print(&self, json: bool) {
+        let document = serde_json::json!({
             "kind": "wyrd_cli_error",
             "code": self.code(),
             "status": self.status(),
@@ -404,8 +480,10 @@ impl CliBoundaryError {
             "remediation": self.remediation(),
             "details": self.details(),
         });
-        eprintln!("{json}");
-        eprintln!("error: {}", self.detail());
+        eprintln!("{document}");
+        if !json {
+            eprintln!("error: {}", self.detail());
+        }
     }
 
     /// Returns the originating stable error code.
@@ -462,7 +540,7 @@ impl CliBoundaryError {
     #[must_use]
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
-            Self::Local(_) => None,
+            Self::Local(error) => error.details(),
             Self::Remote(error) => error.as_problem_json().get("details").cloned(),
         }
     }

@@ -273,8 +273,8 @@ fn check_tree(path: &Path) -> Result<CheckReport, WyrdCliError> {
 
 /// Render `wyrd declare --check` over [`check_tree`].
 ///
-/// A load failure is also printed as an `ok: false` report so a JSON caller
-/// reads the diagnostics from stdout.
+/// A text-mode load failure also prints its diagnostics; in JSON mode they
+/// travel only in the error document, so stdout stays empty.
 ///
 /// # Errors
 /// Returns `WyrdCliError::CardLoad` when loading or local declaration-input
@@ -282,8 +282,8 @@ fn check_tree(path: &Path) -> Result<CheckReport, WyrdCliError> {
 fn dispatch_check(path: &Path, format: OutputFormat) -> Result<ExitCode, WyrdCliError> {
     let report = match check_tree(path) {
         Ok(report) => report,
-        Err(WyrdCliError::CardLoad(error)) => {
-            print_load_failure(&error, format);
+        Err(WyrdCliError::CardLoad(error)) if format == OutputFormat::Text => {
+            print_load_failure(&error);
             return Err(WyrdCliError::CardLoad(error));
         }
         Err(error) => return Err(error),
@@ -783,29 +783,16 @@ fn print_check_text(report: &CheckReport) {
     }
 }
 
-fn print_load_failure(error: &LoadError, format: OutputFormat) {
-    match format {
-        OutputFormat::Text => {
-            for diagnostic in &error.diagnostics {
-                println!(
-                    "{}: {} ({})",
-                    diagnostic.code,
-                    diagnostic.message,
-                    diagnostic.path.display()
-                );
-            }
-        }
-        OutputFormat::Json => {
-            let report = CheckReport {
-                ok: false,
-                cards: Vec::new(),
-                diagnostics: error.diagnostics.clone(),
-            };
-            match serde_json::to_string_pretty(&report) {
-                Ok(output) => println!("{output}"),
-                Err(_) => println!("{{\"ok\":false,\"cards\":[],\"diagnostics\":[]}}"),
-            }
-        }
+/// Print a load failure's diagnostics for a person; JSON callers read the
+/// same diagnostics from the error document's `details.diagnostics`.
+fn print_load_failure(error: &LoadError) {
+    for diagnostic in &error.diagnostics {
+        println!(
+            "{}: {} ({})",
+            diagnostic.code,
+            diagnostic.message,
+            diagnostic.path.display()
+        );
     }
 }
 

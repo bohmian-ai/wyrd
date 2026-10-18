@@ -60,8 +60,8 @@ pub struct ServerInstaller {
     target: &'static str,
 }
 
-/// One verified installation on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One verified installation on disk, and `server install`'s JSON result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InstalledServer {
     /// Release version.
     pub version: Version,

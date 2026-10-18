@@ -115,6 +115,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | MCP host selection required | Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected. |
 | `WYRD_CLI_400_QUERY_CONFIG` | 400 | Query configuration missing | Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain. |
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | 400 | Server host unsupported | Run the server on macOS on aarch64 or Linux (glibc) on x86_64 or aarch64, or use the official container image. |
+| `WYRD_CLI_400_USAGE` | 400 | Invalid command usage | Correct the arguments; run the command with --help for its accepted arguments. |
 | `WYRD_CLI_401_NO_CREDENTIALS` | 401 | No Wyrd credentials | Set WYRD_ACCESS_TOKEN, configure workload identity or WYRD_API_KEY, or add [default].api_key to ~/.config/wyrd/credentials.toml. |
 | `WYRD_CLI_401_NO_PLATFORM_CREDENTIAL` | 401 | No platform credential | Set WYRD_PLATFORM_CREDENTIAL to a platform credential for this deployment. |
 | `WYRD_CLI_401_NO_REFRESH_TOKEN` | 401 | No refresh token | Set WYRD_REFRESH_TOKEN to the refresh token to rotate. |

@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R1
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-long-horizon-verification
 spec_revision: 13
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-009, REQ-011, REQ-013, AC-001, AC-002, AC-003, AC-004, AC-006, AC-008, INV-003, INV-004]
@@ -129,3 +129,33 @@ Build `mise run build:monty-worker` as needed; rebuild changed Python/TS native 
 Run `mise run fmt` and `mise run lints` for changed Rust. For source schema/generated changes, regenerate through the owning pipeline and run `mise run codegen:check`, `mise run ts:typecheck`, and `mise run ts:napi:check` only if N-API declarations change. For Python test/package changes run `mise run py:format` and `mise run py:lints`; add `mise run py:typecheck` for typing/stub/export changes. For TS source/test changes run `mise run ts:format` and `mise run ts:lints`. Run `mise run check:tenant-isolation` for changed SQL/query paths; `mise run check:deps` only if dependency/boundary composition changes; `mise run docs:check` if docs-site files change. These are write-set checks, not a request for a broad aggregate.
 
 Do not require full user-journey suites, `mise run gate`, capacity runs or all language suites for this remediation. Run exact focused closure and only the narrowest lanes covering its actual write set; integrated change review owns broader journey verification. Record diagnosis, RED/GREEN/REFACTOR, exact commands, features, selected counts and finding-to-evidence mapping. Return to cumulative review against the original task after implementation. Completion requires that review's PASS; this task grants no merge or deployment authorization.
+
+## Implementation evidence
+
+Candidate range `e4b1e313a..HEAD` on `change/long-horizon-verification-task-001`. Journey selectors run under `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && …'`; each selected a nonzero count and passed.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1 | `26a3ee94e` `groups.rs` discovery: no completion watermark or `idle+1h` slack; candidates are groups whose first row is within the binding's `finality`, newest activity first; `GroupState::covers` and the outstanding fence are the only coverage authority; one-page ceiling marked `ponytail:` | `wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=verify_in_real_time::grouped_reviews_cover_late_work)'` (late answers recorded during an outstanding group execution and a late null→actual result each reach exactly one next snapshot); `grouped_conversations_recover`, `grouped_support_resumes` | PASS |
+| 2 | `26a3ee94e`, `3662a1d9d` `groups.rs`: per-tuple distinct logical counts before payload reads, over-ceiling tuples take the existing `source_execution_limit_exceeded` reason without payload reads, both payload statements select only the listed membership, incomplete coverage defers (`complete()`) | `wyrd-server --lib -E 'test(/^verification::groups::tests::/)'` 5 passed (`over_ceiling_counts_join_the_group_end`, `reads_select_only_listed_membership`, `groups_end_count_and_order_by_their_rows`, `values_unwrap_inputs_and_outcomes`); `grouped_sampled_frames_are_bounded` (21 frames → limit reason) | PASS |
+| 3 | `26a3ee94e` `groups.rs` timing: elapsed comparisons and checked timestamp arithmetic, no panicking `DateTime ± TimeDelta` | `wyrd-server --lib -E 'test(=verification::groups::tests::largest_accepted_durations_judge_without_overflow)'`; neighbouring progress beside a `999999999d` binding (`forever.yaml`) in `grouped_reviews_cover_late_work` | PASS |
+| 4 | `cd8f0fb8d` `wyrd-spec/src/card/verifier/mod.rs` InputSlot schema = four typed objects or a source string; TS regenerated via codegen; `card-types.test-d.ts` rejects `{type: "source"}` | `wyrd-spec --lib -E 'test(=card::verifier::tests::input_slot_schema_matches_decoding)'`; `wyrd-spec --features server --lib -E 'test(=card::verifier::tests::served_input_slot_schema_matches_decoding)'`; `wyrd-server --features test-support --test integration --run-ignored=all -E 'test(=pg_openapi_contract::grouped_verification_contract_is_served)'`; `mise run codegen:check`; `mise run ts:typecheck` | PASS |
+| 5 | `26a3ee94e` `groups.rs`/`scheduler.rs`: manufactured SystemReadAuthority grants removed; discovery, identities and payloads use `Caller::accepted` + `ScheduledQueryCaller::authenticated` from the recovered owner authority; Drift `Reader::authority` untouched | `grouped_reads_need_the_owner_grant`: without query read → no group execution and a denied `bifrost_query:read` audit row; with query read scoped to `vala.traces` → no group execution; with `workload` restored → the next poll judges all turns; judge receives no request | PASS |
+| 6 | `eef2efb45` rustdoc for duration codec `# Errors`, `SourceText` field, groups test module, Forward sender field; every new remediation item documented | `mise run lints`; source inspection | PASS |
+| 7 | `3d257ee6a` `architecture/wyrd-design.md`, `architecture/references/domain/evaluation.md`: only an explicitly declared `bifrost.query`, ordinary permissions, no workspace or mutation tools, live spans outside the snapshot | Compared with the validator and `grouped_coding_uses_declared_sources` (refuses other tools) | PASS |
+| 8a | Reserved `inputs.group_id` (typed and source) refused, renamed slot succeeds; `7e23a6761` server `validate_request` now runs `VerifierSpec::validate` | Rust `grouped_coding_uses_declared_sources` (SDK refusal `WYRD_LOADER_400_INVALID_ENVELOPE`, `resolve_latest` → `WYRD_REGISTRY_404_CARD_NOT_FOUND`, HTTP `POST /v1/cards` → 400 `WYRD_SPEC_400_VALIDATION`); Python `test_grouped_coding_uses_declared_sources`; TS `grouped coding uses declared sources` | PASS |
+| 8b | Coding: non-trace group execution queries nothing; spans after pinning; tool-invoke and query-read each denied | `grouped_reads_need_the_owner_grant` (judge receives no request); `grouped_reviews_cover_late_work`; `grouped_coding_uses_declared_sources` loop (`lacks Tool/Invoke`, `WYRD_VALA_403_QUERY_FORBIDDEN`) | PASS |
+| 8c | Same-request siblings, registered external reference (`coding-external.yaml`), ambiguity (`support-ambiguous.yaml`), missing declared target (`support-undeclared.yaml`) | Rust/Python/TS coding journeys above; `bda7242d5` Python/TS | PASS |
+| 8d | `c7475a5be` MCP `grouped_frames_over_mcp_are_bounded`: frames planned via `verification.evidence`, PUT over HTTP, enqueued with `group_id`; zero frames → `empty_selection`; failed frame kept; another Service's frame excluded; reader refused RBAC; 21 frames → limit reason | `wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=verification::pg_tests::grouped_frames_over_mcp_are_bounded) \| test(=verification::pg_tests::grouped_verification_discover_act_observe)'` 2 passed | PASS |
+| 8e | Failed discovery enqueues nothing, then a later poll succeeds; incomplete coverage defers | `grouped_reads_need_the_owner_grant`; finding 2 unit tests | PASS |
+
+Python: `pytest -q -m integration test_verify_in_real_time.py::test_grouped_support_resumes …::test_grouped_coding_uses_declared_sources` 2 passed. TS: `vitest run verify-in-real-time.test.ts -t "^grouped (support resumes|coding uses declared sources)$"` 2 passed. Rust journeys: all seven `verify_in_real_time::grouped_*` selected and passed.
+
+Lanes: `fmt`, `lints`, `codegen:check`, `check:tenant-isolation`, `check:deps` (sha2 dev-dependency added to wyrd-mcp), `py:format`, `py:lints`, `ts:format`, `ts:lints`, `ts:typecheck`; `git diff --check` clean.
+
+Diagnoses:
+- **Query-denied variant showed no denial / showed `Tool/Invoke`.** Cause: the default `workload` role grants query read *and* gateway invoke, so revoking it stopped the check Agent before it reached the judge. Fix site: the test grant sets (a verification-schema-scoped query role that keeps gateway invoke); no production change.
+- **HTTP registration accepted a reserved `group_id` slot (201).** Cause: the server did not run `VerifierSpec::validate`; only the loader did. Fix site: `wyrd-server/src/components/cards/service.rs::validate_request`, the single path every registration route goes through.
+- **MCP registration.** MCP has no Card registration tool, so registration is enforced over HTTP; MCP proof covers grouped execution and media.
+
+Non-goals stayed out: no TASK-002/003 work, no new store, queue, transport, harness, budget or limit setting. The only dependency added is the dev-only `sha2`.

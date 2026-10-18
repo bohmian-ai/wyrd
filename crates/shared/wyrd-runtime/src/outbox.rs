@@ -328,9 +328,11 @@ impl<S: OutboxSink> Outbox<S> {
     /// queue. Items still unwritten at the deadline are abandoned with the
     /// writer, which cancels any in-flight write; once the writer is gone
     /// they are counted in `outbox_events_lost_total`, logged, and released
-    /// from `pending()` and `outbox_pending`, which both end at zero. When
-    /// shutdown is called concurrently, exactly one caller reports the loss
-    /// and the others report zero.
+    /// from `pending()` and `outbox_pending`, which both end at zero, and
+    /// released from their admission shares. When shutdown is called
+    /// concurrently, exactly one caller reports the loss and settles both
+    /// shares, and the others report zero. Unspent [`Reservation`] slots stay
+    /// held until their reservation drops.
     pub async fn shutdown(&self, deadline: Instant) -> usize {
         drop(
             self.queue
@@ -345,19 +347,23 @@ impl<S: OutboxSink> Outbox<S> {
             self.abandon.cancel();
             self.writer.wait().await;
         }
+        // With the queue closed and the writer gone nothing else moves these
+        // counts, so the caller that takes a nonzero `pending` also owns its
+        // reserved part and settles both shares alone.
         let lost = self.pending.swap(0, Ordering::AcqRel);
+        if lost == 0 {
+            return 0;
+        }
         let reserved = self.admission.staged_reserved.swap(0, Ordering::AcqRel);
         self.admission.release(lost, reserved);
-        if lost > 0 {
-            count_lost::<S>(lost);
-            metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(lost as f64);
-            tracing::error!(
-                outbox = S::NAME,
-                lost,
-                "outbox shutdown deadline passed with items unwritten"
-            );
-            self.idle.notify_waiters();
-        }
+        count_lost::<S>(lost);
+        metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(lost as f64);
+        tracing::error!(
+            outbox = S::NAME,
+            lost,
+            "outbox shutdown deadline passed with items unwritten"
+        );
+        self.idle.notify_waiters();
         lost
     }
 }
@@ -1222,6 +1228,44 @@ mod tests {
             metrics.gauge("outbox_pending").abs() < f64::EPSILON,
             "the pending gauge returns to zero"
         );
+    }
+
+    /// Concurrent shutdowns over reserved and unreserved items unwritten at
+    /// the deadline report the loss once, settle both shares exactly, and
+    /// leave an unspent reservation holding its slot until it drops.
+    ///
+    /// # Panics
+    /// Panics when a reservation is refused, the loss is reported other than
+    /// once, or a share or count does not settle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_shutdown_releases_reserved_losses_once() {
+        let metrics = TestMetrics::default();
+        let _metrics = metrics::set_default_local_recorder(&metrics);
+        let (outbox, state) = outbox(4);
+        let hanging = DataTenantId::new_v7();
+        state.lock().expect("unpoisoned").hanging.insert(hanging);
+        let held = outbox.reserve(1).expect("an unspent slot is admitted");
+        let spent = outbox.reserve(2).expect("two reserved slots are admitted");
+        spent.stage(hanging, 1_u32);
+        spent.stage(hanging, 2_u32);
+        drop(spent);
+        outbox.stage(hanging, 3_u32);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let (first, second) = tokio::join!(outbox.shutdown(deadline), outbox.shutdown(deadline));
+        assert_eq!(first + second, 3, "the loss is reported by one caller");
+        assert_eq!(first.min(second), 0, "the other caller reports zero");
+        assert_eq!(metrics.counter("outbox_events_lost_total"), 3, "lost once");
+        assert_eq!(outbox.pending(), 0, "abandoned items are not pending");
+        assert_eq!(outbox.admission.staged_reserved.load(Ordering::Acquire), 0);
+        assert_eq!(outbox.admission.unreserved.load(Ordering::Acquire), 0);
+        assert_eq!(
+            outbox.admission.reserved.load(Ordering::Acquire),
+            1,
+            "only the unspent reservation still holds a slot"
+        );
+        drop(held);
+        assert_eq!(outbox.admission.reserved.load(Ordering::Acquire), 0);
     }
 
     /// A sink panic is retried like a failed write: the batch stays pending,

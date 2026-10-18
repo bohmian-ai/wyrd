@@ -32,7 +32,7 @@ A run is one execution of your service, such as answering one customer question.
 
 ```python
 with state.run("agent") as run:
-    answer = run.invoke({"question": question})
+    answer = support_desk.answer(gateway, state, run, question)
     run.observe.record(
         "vala.datasets.tickets",
         {"ticket_id": ticket_id, "question": question, "answer": answer, "refund": "refund" in question},
@@ -44,7 +44,7 @@ with state.run("agent") as run:
 
 ```rust
 let run = state.run_for_card("agent")?;
-let answer = run.invoke(&[("question", question)]).await?;
+let answer = support_desk::answer(&state, &run, question).await?;
 run.observe()
     .record(
         "vala.datasets.tickets",
@@ -58,7 +58,7 @@ run.observe()
 
 ```typescript
 const run = state.run("agent");
-const answer = await run.invoke({ question });
+const answer = await supportDesk.answer(client, state, run, question);
 await run.observe.record("vala.datasets.tickets", {
   ticket_id: ticketId,
   question,
@@ -70,7 +70,7 @@ await run.observe.record("vala.datasets.tickets", {
 </LangTab>
 </LangTabs>
 
-`state.run("agent")` scopes the run to the `agent` component, so the ticket row is about `support-agent@1.0.0`. The ticket row, the Agent's trace spans, and its gateway call all share one `run_id`, so one question reads back as one invocation. When one request touches several components, `run.for_card(alias)` scopes the same run to each in turn. A `session_id` groups the runs of one conversation and must be a UUID.
+`answer` is the support desk's own model call: it renders the Agent's Prompt and sends it to the Wyrd gateway with the run's `wyrd-run-id` and `wyrd-card-uid` headers. `state.run("agent")` scopes the run to the `agent` component, so the ticket row is about `support-agent@1.0.0`. The ticket row, the request's trace spans, and the gateway call all share one `run_id`, so one question reads back as one invocation. When one request touches several components, `run.for_card(alias)` scopes the same run to each in turn. A `session_id` groups the runs of one conversation and must be a UUID.
 
 Opening a run makes no network call and creates nothing on the server. A run exists only as the `run_id` on the rows it produced.
 

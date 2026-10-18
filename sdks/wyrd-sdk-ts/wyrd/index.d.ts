@@ -678,22 +678,6 @@ export declare class NativeRun {
    */
   submit(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeSubmission>
   /**
-   * Invokes this view's tool-free Agent once with the string variables of
-   * `variables_json` and returns its final text.
-   *
-   * `route_json`, when given, is an execution route that replaces the
-   * Agent's declared route whole for this invocation; it is decoded into
-   * the Rust `ExecutionRoute` and passed to `Run::invoke_on`, which owns
-   * every routing decision. Omitted, the declared route is used.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the outcome cannot be projected; a
-   * non-Agent view, an Agent with tools, malformed variables or route, and
-   * the gateway's refusals are returned in [`NativeLifecycleResult`].
-   */
-  invoke(variablesJson?: string | undefined | null, routeJson?: string | undefined | null): Promise<NativeLifecycleResult>
-  /**
    * Emits one row into a registered `vala.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls

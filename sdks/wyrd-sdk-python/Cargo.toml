@@ -20,10 +20,7 @@ doctest = false
 # Python feature activate only when the extension is built.
 python = [
     "dep:pyo3",
-    "skald-agent/python",
-    "skald-tool/python",
     "skald-prompt/python",
-    "skald-runtime/python",
     "wyrd-cards/python",
     "wyrd-config/python",
     "wyrd-utils/python",
@@ -33,10 +30,7 @@ testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url", "dep:chrono",
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311", "chrono"], optional = true }
 wyrd-cli = { workspace = true }
-skald-agent = { workspace = true }
-skald-tool = { workspace = true }
 skald-prompt = { workspace = true }
-skald-runtime = { workspace = true }
 wyrd-cards = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-utils = { workspace = true }

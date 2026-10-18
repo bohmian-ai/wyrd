@@ -19,19 +19,19 @@ package carries the Change Request review workspace behind CR-01.
 | Sheet | Pages | Artboards | Viewport |
 |---|---|---|---|
 | [`home.svg`](./home.svg) | 2 | 4 | 1440 × 1024 |
-| [`cards.svg`](./cards.svg) | 13 | 26 | 1440 × 1024 |
+| [`cards.svg`](./cards.svg) | 12 | 24 | 1440 × 1024 |
 | [`observe.svg`](./observe.svg) | 8 | 16 | 1440 × 1024 |
 | [`changes.svg`](./changes.svg) | 7 | 14 | 1440 × 1024 |
 | [`query.svg`](./query.svg) | 1 | 2 | 1440 × 1024 |
 | [`mobile.svg`](./mobile.svg) | 8 | 16 | 390 × 844 |
-| *existing product set* | *39* | *78* | |
+| *existing product set* | *38* | *76* | |
 | [`cards/experiment/overview.svg`](./cards/experiment/overview.svg) | 2 | 4 | 1440 × 1024 |
 | [`cards/experiment/runs.svg`](./cards/experiment/runs.svg) | 5 | 10 | 1440 × 1024 |
 | [`cards/experiment/compare.svg`](./cards/experiment/compare.svg) | 1 | 2 | 1440 × 1024 |
-| [`cards/experiment/outputs.svg`](./cards/experiment/outputs.svg) | 9 | 18 | 1440 × 1024 |
+| [`cards/experiment/outputs.svg`](./cards/experiment/outputs.svg) | 8 | 16 | 1440 × 1024 |
 | [`cards/experiment/versions.svg`](./cards/experiment/versions.svg) | 1 | 2 | 1440 × 1024 |
 | [`cards/experiment/mobile.svg`](./cards/experiment/mobile.svg) | 3 | 6 | 390 × 844 |
-| *Experiment workspace package* | *21* | *42* | |
+| *Experiment workspace package* | *20* | *40* | |
 | [`cards/service/overview.svg`](./cards/service/overview.svg) | 5 | 10 | 1440 × 1024 |
 | [`cards/service/composition.svg`](./cards/service/composition.svg) | 1 | 2 | 1440 × 1024 |
 | [`cards/service/definition.svg`](./cards/service/definition.svg) | 1 | 2 | 1440 × 1024 |
@@ -46,7 +46,7 @@ package carries the Change Request review workspace behind CR-01.
 | [`changes/subjects.svg`](./changes/subjects.svg) | 1 | 2 | 1440 × 1024 |
 | [`changes/mobile.svg`](./changes/mobile.svg) | 3 | 6 | 390 × 844 |
 | *Change Request workspace package* | *10* | *20* | |
-| **complete set** | **79** | **158** | |
+| **complete set** | **77** | **154** | |
 
 Every artboard is a group whose id is `<PAGE-ID>-<theme>` (for example
 `C-04-dark`), carries a `<title>`/`<desc>` pair, and is labeled in the dashed
@@ -65,8 +65,8 @@ principals, signals, a single Change Request `change_01`, and one query session.
 
 ## Artboard ledger
 
-All 79 pages, in sheet order — the 39 general product pages first, then the
-21-page detailed Experiment workspace package, then the 9-page detailed
+All 77 pages, in sheet order — the 38 general product pages first, then the
+20-page detailed Experiment workspace package, then the 9-page detailed
 Service workspace package, then the 10-page Change Request review workspace
 package.
 
@@ -150,7 +150,7 @@ package.
 - **URL params**: none
 - **Viewport**: 1440 × 1024 (light + dark)
 - **Fixture**: tenant `acme` · `checkout-ranking-study` v4 ACTIVE · uid `card_experiment_01`
-- **Material states**: concise entry/summary, not the workspace — authored summary (spec `summary_metrics` ndcg@10 0.742 plus the author-pinned `best_run_ref` run_07, declaration content, never a derived winner), run counts by lifecycle (7 completed / 1 running / 1 queued / 2 failed / 1 cancelled), running-now and needs-attention links, five URL-restorable workspace destinations, latest-runs excerpt (3 of 12), relationships; earned absent — no attached notebooks. The detailed workspace is the nested [`cards/experiment/`](./cards/experiment/) package (E-01…E-18, EM-01…EM-03); this page only summarizes and routes into it.
+- **Material states**: concise entry/summary, not the workspace — authored summary (spec `summary_metrics` ndcg@10 0.742 plus the author-pinned `best_run_ref` run_07, declaration content, never a derived winner), run counts by lifecycle (7 completed / 1 running / 1 queued / 2 failed / 1 cancelled), running-now and needs-attention links, five URL-restorable workspace destinations, latest-runs excerpt (3 of 12), relationships; earned absent — no attached notebooks. The detailed workspace is the nested [`cards/experiment/`](./cards/experiment/) package (E-01…E-16, E-18, EM-01…EM-03); this page only summarizes and routes into it.
 - **Links**: Open workspace / destinations → `?view={overview,runs,compare,outputs,versions}`; run rows → `?view=runs&run={id}&section=summary`; relationships → /t/acme/cards/{uid}; Observe → /t/acme/observe?experiment=card_experiment_01
 - **Responsive pattern**: R-CARD
 
@@ -162,16 +162,6 @@ package.
 - **Fixture**: tenant `acme`
 - **Material states**: registered Prompt as the primary linked dependency (name, version, provider/model, message and variable counts) with its raised read-only inspection drawer shown open — a CardRef reuse, never a copy; composition strip Prompt → Agent → runtime tools with component-of and publishes-to edges; run limits (max iterations, tool concurrency, recent sessions, timeout); tools remain Skald runtime registrations, never Card kinds; earned absent — no attached artifacts
 - **Links**: Inspect Prompt → the raised drawer; Open Prompt Card → /t/acme/cards/card_prompt_01; publishes to → /t/acme/cards/card_verifier_02; component of → /t/acme/cards/card_service_01; Traces → /t/acme/observe/traces?service=checkout-agent
-- **Responsive pattern**: R-CARD
-
-#### C-08 — Workflow Card
-
-- **Route**: `/t/acme/cards/card_workflow_01`
-- **URL params**: none
-- **Viewport**: 1440 × 1024 (light + dark)
-- **Fixture**: tenant `acme`
-- **Material states**: populated ordered stages, inputs, outputs, owners and governance; earned absent optional section — no execution results are shown on a declaration
-- **Links**: referenced_by/consumes → /t/acme/cards/{uid}; Verifier → /t/acme/cards/card_verifier_02
 - **Responsive pattern**: R-CARD
 
 #### C-09 — Service Card (operational Overview)
@@ -473,7 +463,7 @@ package.
 
 ### `cards/experiment/` — detailed Experiment workspace package
 
-The 21-page realization of the C-06 workspace: one Experiment Card route
+The 20-page realization of the C-06 workspace: one Experiment Card route
 (`/t/acme/cards/card_experiment_01`) whose entire state lives in query
 parameters, so every view is URL-restorable and shareable. Subnavigation is
 exactly Overview · Runs · Compare · Outputs · Versions. All desktop pages are
@@ -524,8 +514,8 @@ never Card declaration fields.
 #### E-07 — Completed agentic/workflow run (`runs.svg`)
 
 - **URL params**: `?view=runs&run=run_11&section=summary`
-- **Material states**: completed design projection of the same run_11 fixture shown running in E-04 (identity unchanged); sessions/tool calls/tokens/cost/p95/errors; labeled per-stage time bars; Verifier quality 0.87 PASS projection; sections gain Traces and Evaluations; tables/visuals/hardware sections are not rendered rather than shown empty
-- **Links**: Traces → `&section=traces`; Evaluations → `&section=evaluations`; Agent/Prompt/Workflow/Service/Verifier Cards → /t/acme/cards/{uid}; canonical exploration → /t/acme/observe
+- **Material states**: completed design projection of the same run_11 fixture shown running in E-04 (identity unchanged); sessions/tool calls/tokens/cost/p95/errors; labeled per-stage time bars; Verifier quality PASS projection; sections gain Traces; tables/visuals/hardware sections are not rendered rather than shown empty
+- **Links**: Traces → `&section=traces`; Agent/Prompt/Workflow/Service/Verifier Cards → /t/acme/cards/{uid}; canonical exploration → /t/acme/observe
 
 #### E-08 — Compatible run comparison (`compare.svg`)
 
@@ -580,12 +570,6 @@ never Card declaration fields.
 - **URL params**: `?view=runs&run=run_11&section=traces&trace=tr_2201&span=sp_09`
 - **Material states**: 6-session inventory with the erroring trace selected; execution tree distinguishes agent/llm/tool/retrieval/error spans by text label + kind bar + waterfall position (never color alone); selected retry span shows latency/attempt, truncated input, error output and progressive disclosure; full payloads remain in Observe
 - **Links**: trace row → `&trace={id}`; span row → `&span={id}`; canonical detail → /t/acme/observe/traces/tr_2201
-
-#### E-17 — Agentic evaluation inspection (`outputs.svg`)
-
-- **URL params**: `?view=runs&run=run_11&section=evaluations&task=groundedness`
-- **Material states**: aggregate 0.87 PASS projection with 6 task verdicts (5 pass / 1 fail); failed groundedness task selected with example input/expected/actual/judge note; the definition stays on the Verifier Card and canonical exploration stays in Observe — both explicitly linked, neither duplicated
-- **Links**: task row → `&task={name}`; quality v2 → /t/acme/cards/card_verifier_02; example span → `&section=traces&trace=tr_2201&span=sp_11`; Observe evaluation run ↗
 
 #### E-18 — Experiment Card versions (`versions.svg`)
 
@@ -838,14 +822,14 @@ Locked interaction rules the package demonstrates:
 
 ## Responsive pattern matrix
 
-Every one of the 63 desktop pages is assigned exactly one pattern.
+Every one of the 61 desktop pages is assigned exactly one pattern.
 
 | Pattern | Narrow behavior | Desktop pages |
 |---|---|---|
 | R-ENTRY | Centered identity/choice, no tenant shell | H-01 |
 | R-HOME | Mobile header/menu; summaries stack | H-02 |
 | R-LIST | Accessible filters; labeled rows or controlled table overflow | C-01, O-06, CR-01, CRW-01 |
-| R-CARD | Primary Card first; metadata/relationships stack | C-02, C-03, C-04, C-05, C-06, C-07, C-08, C-09, C-11, C-12, C-13, C-14 |
+| R-CARD | Primary Card first; metadata/relationships stack | C-02, C-03, C-04, C-05, C-06, C-07, C-09, C-11, C-12, C-13, C-14 |
 | R-SIGNAL | Visible time/filters; trend then records then detail | O-01, O-02, O-03, O-04 |
 | R-DETAIL | Identity/filters first; dense visual scrolls; rail stacks | O-05, O-07 |
 | R-DRIFT | Definition/results stack without merging | O-10 |
@@ -853,7 +837,7 @@ Every one of the 63 desktop pages is assigned exactly one pattern.
 | R-CHANGE | Plain summary first; technical sections stack | CR-03, CR-04, CR-05, CR-06, CRW-03, CRW-04, CRW-05, CRW-06 |
 | R-DIFF | Subject first; commits/files/diff use controlled overflow | CR-07, CRW-07 |
 | R-QUERY | Catalog drawer; results controlled overflow | Q-01 |
-| R-EXP | Card identity + horizontally scrollable subnav persist; the dominant work region stacks above rails; irreducibly wide run/output tables scroll inside their own panel; hidden columns stay reachable through run detail | E-01 … E-18 |
+| R-EXP | Card identity + horizontally scrollable subnav persist; the dominant work region stacks above rails; irreducibly wide run/output tables scroll inside their own panel; hidden columns stay reachable through run detail | E-01 … E-16, E-18 |
 | R-SVC | Card identity, exact version, visible range and the three-item local nav persist; assessment and attention precede compact evidence; tables become labeled rows; composition renders as ordered lanes that scroll; selected-node detail becomes a full-width raised sheet | S-01, S-02, S-03, S-04, S-05, S-06, S-07 |
 
 Mobile artboards realize these patterns at 390 × 844:
@@ -899,7 +883,6 @@ Where each required state is demonstrated.
 | C-05 | ordered prompt definition dominant — system instructions separate from the conversation, explicit roles on every message, labeled text/image/tool-call content treatment (audio and file parts use the same treatment; unsupported provider parts stay discoverable in Raw definition); provider, model, operation, settings and structured response type; variables and media variables with type, required/default state and where each is used; Response schema (open) and Raw definition (closed) disclosures with copy affordance; no secrets and no execution or playground action |
 | C-06 | concise workspace entry — lifecycle run counts, authored summary (summary_metrics · best_run_ref), running + needs-attention links, URL-restorable workspace destinations, latest-runs excerpt; earned absent — no attached notebooks; every detailed state lives in the `cards/experiment/` package ledger below |
 | C-07 | registered Prompt as the primary linked dependency (name, version, provider/model, message and variable counts) with its raised read-only inspection drawer shown open — a CardRef reuse, never a copy; composition strip Prompt → Agent → runtime tools with component-of and publishes-to edges; run limits (max iterations, tool concurrency, recent sessions, timeout); tools remain Skald runtime registrations, never Card kinds; earned absent — no attached artifacts |
-| C-08 | populated ordered stages, inputs, outputs, owners and governance; earned absent optional section — no execution results are shown on a declaration |
 | C-09 | needs-attention operational mini-dashboard — compact assessment strip (four separated state channels, latest change as correlation), dominant six-slot chart grid sharing the exact range (budget/SLO/target as positional lines, dash+marker-distinguished latency percentiles, saved custom chart + restrained Add-chart slot), drift/verification intelligence with score trends vs thresholds and identified subjects, and one supporting context band; healthy/stale/partial/failure/v11 renderings live on S-01/S-04/S-05/S-06/S-07 |
 | C-11 | Definition and Results visibly distinct — Definition (the Card): PSI method with quantile 10-bin profile, Distribution signal, feature `feature`, baseline txns-2026q3 (Data), fixed threshold 0.20, publisher checkout-api/ranker via model_primary, Trigger/Operator chain, no Drift-owned schedule; Results (Vala/Observe projection, never written to the Card): selected feature dominant, current PSI 0.27 breach, 30d series with the plotted 0.20 threshold and positional tick, baseline and sample/missingness context, last calculation, alert history, calculated-vs-raw distinction |
 | C-12 | populated versioned identity, purpose, capabilities, accepted normalized Evidence kinds, result capability, owner/governance and contextual runtime binding; earned absent optional section — no secrets and no closed input world |

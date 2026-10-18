@@ -11,15 +11,17 @@
 //!   returning its execution ID;
 //! - `GET /reviews/{id}` reads that check back by its ID alone.
 //!
-//! Every answer comes from the `support-agent` Card through `Run::invoke`, so
-//! the model call goes through the Wyrd gateway inside a Wyrd Run, and the
-//! Run's ticket, request span, gateway call, and verdicts share its `run_id`.
+//! Every answer renders the `support-agent` Card's Prompt and calls its model
+//! through the Wyrd gateway with the Run's `wyrd-run-id` and `wyrd-card-uid`
+//! headers, so the Run's ticket, request span, gateway call, and verdicts
+//! share its `run_id`.
 //! A Verifier is called on the view of the Card it is bound to: the Run
 //! itself for the Service, and `run.for_card("agent")` for the agent. Both
 //! views share one `run_id`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
@@ -36,8 +38,8 @@ use wyrd_ai::observe::Run;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, ExecutionId, Gateway, RequirementResult, VerificationResult, VerificationVerdict,
-    WyrdClient, WyrdError,
+    Bifrost, ExecutionId, ExecutionRoute, Gateway, RequirementResult, VerificationResult,
+    VerificationVerdict, WyrdClient, WyrdError,
 };
 
 /// The `service/` directory holding this app's Cards.
@@ -105,14 +107,65 @@ impl SupportDesk {
             .with_state(self)
     }
 
-    /// Answer `question` in `run` through the Wyrd gateway and record the
-    /// ticket in `vala.datasets.tickets`.
+    /// Answer `question` as `run`'s Agent through the Wyrd gateway and record
+    /// the ticket in `vala.datasets.tickets`.
+    ///
+    /// Renders the Agent's Prompt, sends it to `<deployment>/<model>` on the
+    /// OpenAI-compatible gateway ingress with a fresh access token, and tags
+    /// the call with the Run and Agent Card. The whole exchange, through
+    /// reading the reply body, is bounded by [`ANSWER_TIMEOUT`].
     ///
     /// # Errors
-    /// Returns the gateway's or the Bifrost writer's error.
-    async fn answer(&self, run: &Run, question: &str) -> Result<String, WyrdError> {
+    /// Returns the gateway's refusal as [`ApiError::refusal`] projects it, the
+    /// state, token, or Bifrost writer's Wyrd error, or a 500 with fixed text
+    /// for a Prompt render, transport, timeout, or reply decoding failure, an
+    /// Agent that does not route through the gateway, or a reply without
+    /// text.
+    ///
+    /// # Cancellation
+    /// The model call and the ticket write are separate steps. A dropped
+    /// future or a transport error after sending leaves the call's outcome
+    /// unknown, and a call that completed may have no ticket. Nothing retries,
+    /// deduplicates, or rolls back either step.
+    async fn answer(&self, run: &Run, question: &str) -> Result<String, ApiError> {
         // ANCHOR: answer
-        let answer = run.invoke(&[("question", question)]).await?;
+        let agent = self.state.agent(run.alias())?;
+        let ExecutionRoute::WyrdGateway { deployment } = &agent.card().spec.execution_route else {
+            return Err(ApiError::internal(
+                "the Agent does not route through the Wyrd gateway",
+            ));
+        };
+        let prompt = &agent.prompt().metadata.prompt;
+        let rendered = prompt
+            .render(&[("question", question)])
+            .map_err(|_| ApiError::internal("the Agent's Prompt does not render"))?;
+        let mut body = serde_json::to_value(rendered)
+            .map_err(|_| ApiError::internal("the rendered Prompt does not serialize"))?["body"]
+            .take();
+        body["model"] = json!(format!("{deployment}/{}", prompt.model));
+        let client = self.state.client()?;
+        // These headers tie the gateway's record of the call to this Run.
+        let reply = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", client.server_url()))
+            .bearer_auth(client.access_token().await?.expose())
+            .header("wyrd-run-id", run.run_id().as_str())
+            .header("wyrd-card-uid", run.subject_uid().as_str())
+            .json(&body)
+            .timeout(ANSWER_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| ApiError::internal("the Wyrd gateway call failed"))?;
+        let status = reply.status();
+        let reply: Option<Value> = reply.json().await.ok();
+        if !status.is_success() {
+            return Err(ApiError::refusal(status, reply.as_ref()));
+        }
+        let reply =
+            reply.ok_or_else(|| ApiError::internal("the gateway reply could not be read"))?;
+        let answer = reply["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("the gateway reply carries no text"))?
+            .to_owned();
         run.observe()
             .record(
                 "vala.datasets.tickets",
@@ -123,6 +176,10 @@ impl SupportDesk {
         Ok(answer)
     }
 }
+
+/// The total budget of one gateway model call, from connecting through the
+/// last byte of the reply.
+const ANSWER_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// The SQL [`evidence`] runs.
 /// Every table it joins carries the Run's `run_id`.
@@ -215,7 +272,12 @@ impl<'a> Breakdown<'a> {
 /// view, which shares the `run_id`.
 ///
 /// # Errors
-/// Returns the Wyrd error of the model call, the ticket write, or a check.
+/// Returns the [`SupportDesk::answer`] error or a check's Wyrd error.
+///
+/// # Cancellation
+/// The steps run in order and nothing is rolled back. A failure or a dropped
+/// request after the model call keeps that call and any ticket or verdict
+/// already recorded, and returns no answer.
 async fn ask(
     State(desk): State<SupportDesk>,
     Json(body): Json<Question>,
@@ -244,7 +306,7 @@ async fn ask(
                 Inputs::named([("ticket", Input::from(ticket))]),
             )
             .await?;
-        Ok::<_, WyrdError>((answer, promise, complete))
+        Ok::<_, ApiError>((answer, promise, complete))
     };
     let (answer, promise, complete) = run
         .scope(work.instrument(tracing::info_span!("support-desk.ask")))
@@ -265,22 +327,30 @@ async fn ask(
 /// without waiting.
 ///
 /// # Errors
-/// Returns the Wyrd error of the model call, the ticket write, or the
-/// submission.
+/// Returns the [`SupportDesk::answer`] error, the submission's Wyrd error, or
+/// a 500 with fixed text when the check is recorded rather than queued.
+///
+/// # Cancellation
+/// The steps run in order and nothing is rolled back. A failure or a dropped
+/// request after the model call keeps that call and its ticket. A submission
+/// whose reply is lost may still be queued, and the caller never learns its
+/// execution ID.
 async fn review(
     State(desk): State<SupportDesk>,
     Json(body): Json<Question>,
 ) -> Result<Json<Value>, ApiError> {
     let run = desk.state.run_for_card("agent")?;
     let work = async {
-        let letter = desk.answer(&run, &format!("{LETTER}{}", body.question)).await?;
+        let letter = desk
+            .answer(&run, &format!("{LETTER}{}", body.question))
+            .await?;
         // ANCHOR: submit
         let submission = run
             .observe()
             .submit("follows-policy", letter_inputs(&letter))
             .await?;
         // ANCHOR_END: submit
-        Ok::<_, WyrdError>((letter, submission))
+        Ok::<_, ApiError>((letter, submission))
     };
     let (letter, submission) = run
         .scope(work.instrument(tracing::info_span!("support-desk.review")))
@@ -288,10 +358,9 @@ async fn review(
     // A Verifier that judges Run evidence is always queued; only a
     // window-scoped one is merely recorded.
     let Submission::Queued(execution) = submission else {
-        return Err(ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({ "message": "follows-policy was recorded, not queued" }),
-        });
+        return Err(ApiError::internal(
+            "follows-policy was recorded, not queued",
+        ));
     };
     Ok(Json(json!({
         "run_id": run.run_id().to_string(),
@@ -326,14 +395,50 @@ async fn review_status(
     })))
 }
 
-/// An HTTP error response carrying the Wyrd error's status, code, and
-/// message.
+/// An HTTP error response carrying a status and, for a catalogued Wyrd
+/// error, its stable code and message.
 #[derive(Debug)]
 pub struct ApiError {
     /// The HTTP status.
     status: StatusCode,
     /// The JSON body.
     body: Value,
+}
+
+impl ApiError {
+    /// A 500 carrying the fixed `message`, for a failure outside the Wyrd
+    /// error catalog. The message is static so no transport, render, or
+    /// decoder detail reaches the response.
+    fn internal(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: json!({ "message": message }),
+        }
+    }
+
+    /// Project a gateway refusal with `status` and decoded `reply` body.
+    ///
+    /// The status is kept. An `error.code` in the Wyrd catalog is kept, with
+    /// the catalog's own title as the message when the code names a variant
+    /// [`WyrdError::from_code`] rebuilds and fixed text naming the status
+    /// otherwise. The reply's own message and every provider field are
+    /// dropped, because the gateway forwards provider error content it did
+    /// not author.
+    fn refusal(status: StatusCode, reply: Option<&Value>) -> Self {
+        let fixed = format!("the Wyrd gateway answered HTTP {}", status.as_u16());
+        let code = reply
+            .and_then(|reply| reply["error"]["code"].as_str())
+            .and_then(|code| WyrdError::codes().into_iter().find(|known| *known == code));
+        let body = match code {
+            Some(code) => json!({
+                "code": code,
+                "message": WyrdError::from_code(code, String::new(), json!({}))
+                    .map_or(fixed, |error| error.title().to_owned()),
+            }),
+            None => json!({ "message": fixed }),
+        };
+        Self { status, body }
+    }
 }
 
 impl From<WyrdError> for ApiError {

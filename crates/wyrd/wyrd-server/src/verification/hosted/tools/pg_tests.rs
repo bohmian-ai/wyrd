@@ -21,7 +21,7 @@ use crate::test_support::{test_caller as caller, test_state as state};
 async fn idle_sandbox(limits: HostedLimits) -> Arc<Sandbox> {
     Arc::new(
         Sandbox::start(
-            PathBuf::from("/nonexistent/wyrd-monty-worker"),
+            PathBuf::from("/nonexistent/wyrd-server"),
             HostedLimits {
                 monty_min_workers: 0,
                 ..limits

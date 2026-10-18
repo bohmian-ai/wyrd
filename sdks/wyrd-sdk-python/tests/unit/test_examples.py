@@ -11,7 +11,6 @@ EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 @pytest.mark.parametrize(
     "example",
     [
-        "structured_pipeline",
         "transport_grpc",
         "transport_http",
         "transport_mock",

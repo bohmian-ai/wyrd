@@ -29,8 +29,10 @@ from wyrd.testing import WyrdTestServer, cli
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    FRAME_CLAIM,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
+    UNBADGED_BASE64,
     Delivery,
     QueryRow,
     Receiver,
@@ -152,6 +154,19 @@ def live_query(trace_id: str) -> dict:
     }
 
 
+BADGED = (
+    '{"outcome":"passed","reason":"a badge is visible",'
+    '"citations":[{"slot":"frame","locator":{"page":1}}]}'
+)
+"""The frame judge's Verdict for a frame showing a badge: passed, citing the frame as its one page."""
+
+NO_BADGE = (
+    '{"outcome":"failed","reason":"no badge is visible",'
+    '"citations":[{"slot":"frame","locator":{"page":1}}]}'
+)
+"""The frame judge's Verdict for the frame showing no badge."""
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -165,7 +180,8 @@ def completion(body: dict) -> tuple[int, dict]:
     result is back, answers a 100-dollar limit. The investigator calls each
     of its tools once and finishes once the results are back. The coding
     judge reads the trace's spans live through ``bifrost_query`` and passes,
-    citing the first trace ID, once the read is back. The policy
+    citing the first trace ID, once the read is back. The frame judge fails
+    the frame carrying ``UNBADGED_BASE64`` and passes every other. The policy
     judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
     Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
@@ -186,6 +202,9 @@ def completion(body: dict) -> tuple[int, dict]:
             message = {"role": "assistant", "content": '{"max_refund":100}'}
     elif "INVESTIGATE" in text:
         message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
+    elif FRAME_CLAIM in text:
+        content = NO_BADGE if UNBADGED_BASE64 in text else BADGED
+        message = {"role": "assistant", "content": content}
     elif LIVE_REVIEW in text:
         [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
         message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)

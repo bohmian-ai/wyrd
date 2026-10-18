@@ -31,6 +31,15 @@ ON_CALL_TOKEN = "on-call-bearer-token"
 LIVE_REVIEW = "spans were reviewed live"
 """The ``coding-review`` statement every request of its ``spans-reviewed`` check carries."""
 
+FRAME_CLAIM = "Cite the frame."
+"""Text every ``frame-verifier`` judge request carries."""
+
+UNBADGED = "no badge!"
+"""The nine-byte label of the one frame whose person wears no badge."""
+
+UNBADGED_BASE64 = "bm8gYmFkZ2Uh"
+"""``UNBADGED`` in base64, as the judge's image data URL carries it."""
+
 
 @dataclass
 class Delivery:
@@ -162,6 +171,16 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
     # Status and its verification block stay empty until the server derives them.
     assert status is not None and status.get("verification") is not None
     return status["verification"]["binding_ids"]
+
+
+def group_binding(server: WyrdTestServer, cards: Cards, ref: CardRef) -> str:
+    """The one ``group_end`` binding the server derived for ``ref``."""
+    [binding_id] = [
+        binding
+        for binding in binding_ids(cards, ref)
+        if binding_status(server, binding).get("group_end") is not None
+    ]
+    return binding_id
 
 
 def binding_status(server: WyrdTestServer, binding_id: str) -> dict[str, Any]:

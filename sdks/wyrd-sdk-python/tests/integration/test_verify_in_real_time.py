@@ -28,13 +28,16 @@ from wyrd.testing import WyrdTestServer, cli
 
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    FRAME_CLAIM,
     LIVE_REVIEW,
+    UNBADGED,
     Receiver,
     ancestry,
     binding_ids,
     binding_status,
     client_of,
     download,
+    group_binding,
     group_execution,
     hydrated,
     register,
@@ -462,11 +465,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     registered = register(cards, "cards/verify_in_real_time/support.yaml")
     bundle = download(cards, "support", tmp_path)
     key = service_key("support")
-    [binding_id] = [
-        binding
-        for binding in binding_ids(cards, registered["support"])
-        if binding_status(wyrd_server, binding).get("group_end") is not None
-    ]
+    binding_id = group_binding(wyrd_server, cards, registered["support"])
     state = WyrdState.from_path(bundle, WyrdClient(credential=key))
     state.start_bifrost()
     group = f"conv-{secrets.token_hex(4)}"
@@ -539,11 +538,7 @@ def test_grouped_refund_changes_verdict(
     )
     registered = register(cards, "cards/verify_in_real_time/refund.yaml")
     bundle = download(cards, "refund", tmp_path)
-    [binding_id] = [
-        binding
-        for binding in binding_ids(cards, registered["refund"])
-        if binding_status(wyrd_server, binding).get("group_end") is not None
-    ]
+    binding_id = group_binding(wyrd_server, cards, registered["refund"])
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("refund")))
     state.start_bifrost()
     group = f"order-{secrets.token_hex(4)}"
@@ -626,11 +621,7 @@ def test_grouped_coding_uses_declared_sources(
 ) -> None:
     registered = register(cards, "cards/verify_in_real_time/coding.yaml")
     bundle = download(cards, "coding", tmp_path)
-    [binding_id] = [
-        binding
-        for binding in binding_ids(cards, registered["coding"])
-        if binding_status(wyrd_server, binding).get("group_end") is not None
-    ]
+    binding_id = group_binding(wyrd_server, cards, registered["coding"])
     wyrd_server.scoped_api_key("py_live_reader", ["tool:invoke", "bifrost_query:read"])
     principals = Principals(client_of(wyrd_server))
     coding = principal("coding")
@@ -715,3 +706,131 @@ def test_grouped_coding_uses_declared_sources(
             register(cards, f"cards/verify_in_real_time/{relative}")
         assert refused.value.code == code, relative
         assert reason in f"{refused.value} {refused.value.details}", relative
+
+
+def frame(directory: Path, label: str) -> Path:
+    """A PNG frame in ``directory`` carrying the nine-byte ``label`` after its signature and a newline.
+
+    Nine bytes start the label on a base64 boundary, so its base64 appears
+    verbatim in the image data URL the judge receives.
+    """
+    assert len(label) == 9, "a frame label is nine bytes"
+    path = directory / f"{label}.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n\n" + label.encode())
+    return path
+
+
+def submit_frames(state: WyrdState, group: str, paths: list[Path]) -> list[verify.Execution]:
+    """Submit each frame at ``paths`` to ``frame-verifier`` in one Run under ``group``."""
+    run = state.run("agent")
+    executions = []
+    for path in paths:
+        queued = run.observe.submit("frame-verifier", verify.File(path), group_id=group)
+        assert isinstance(queued, verify.Execution)
+        executions.append(queued)
+    return executions
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_sampled_frames_are_bounded(
+    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/frames.yaml")
+    register(cards, "cards/verify_in_real_time/frames-other.yaml")
+    binding_id = group_binding(wyrd_server, cards, registered["frames"])
+    bundle = download(cards, "frames", tmp_path / "frames")
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("frames")))
+    state.start_bifrost()
+    other = WyrdState.from_path(
+        download(cards, "frames-other", tmp_path / "other"),
+        WyrdClient(credential=service_key("frames-other")),
+    )
+    other.start_bifrost()
+    events = {
+        name: f"{name}-{secrets.token_hex(4)}" for name in ("empty", "failing", "over", "door")
+    }
+
+    def reported(event: str) -> None:
+        state.run("agent").observe.verify(
+            "event-fact", {"event_id": event, "detected": True}, group_id=event
+        )
+
+    def judged_after(after: str | None) -> verify.ExecutionState:
+        state.flush()
+        return group_execution(wyrd_server, binding_id, WAIT_SECONDS, after)
+
+    def badged(judged: verify.ExecutionState) -> tuple[str, str]:
+        outcome = judged["result"]["outcome"]
+        [requirement] = outcome["requirements"]
+        return outcome["verdict"], requirement["reason"]
+
+    reported(events["empty"])
+    judged = judged_after(None)
+    assert judged["group_id"] == events["empty"]
+    assert badged(judged) == ("inconclusive", "empty_selection")
+    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {"kind": "json", "value": []}
+
+    paths = [frame(tmp_path, f"fail-{index:04}") for index in range(19)]
+    paths.insert(7, frame(tmp_path, UNBADGED))
+    executions = submit_frames(state, events["failing"], paths)
+    for foreign in submit_frames(other, events["failing"], [frame(tmp_path, "other-001")]):
+        foreign.wait(WAIT_SECONDS)
+    unauthorized = wyrd_server.scoped_api_key(
+        "py_frames_denied", [verifier_run(cards, "answer-check")]
+    )
+    with pytest.raises(WyrdError) as denied:
+        WyrdState.from_path(bundle, WyrdClient(credential=unauthorized)).run(
+            "agent"
+        ).observe.submit(
+            "frame-verifier", verify.File(frame(tmp_path, "denied-01")), group_id=events["failing"]
+        )
+    assert denied.value.code == DENIED
+    reported(events["failing"])
+    for execution in executions:
+        execution.wait(WAIT_SECONDS)
+    judged = judged_after(judged["execution_id"])
+    assert judged["group_id"] == events["failing"]
+    coverage = judged["group"]["sources"]
+    assert coverage["outcomes"]["execution_ids"] == [execution.id for execution in executions], (
+        "only the Service's own frames, in submission order"
+    )
+    assert len(coverage["event"]["execution_ids"]) == 1
+    expected = ["passed"] * 20
+    expected[7] = "failed"
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["outcomes"] == {"kind": "json", "value": expected}
+    assert outcome["verdict"] == "failed"
+
+    paths = [frame(tmp_path, f"over-{index:04}") for index in range(21)]
+    executions = submit_frames(state, events["over"], paths)
+    reported(events["over"])
+    for execution in executions:
+        execution.wait(WAIT_SECONDS)
+    judged = judged_after(judged["execution_id"])
+    assert judged["group_id"] == events["over"]
+    assert badged(judged) == (
+        "inconclusive",
+        "source_execution_limit_exceeded: "
+        "verifiers.frame-verifier.requirements.person-wearing-badge.outcome "
+        "selected more than 20 source executions",
+    )
+
+    paths = [frame(tmp_path, f"door-{index:04}") for index in range(20)]
+    executions = submit_frames(state, events["door"], paths)
+    reported(events["door"])
+    for execution in executions:
+        execution.wait(WAIT_SECONDS)
+    judged = judged_after(judged["execution_id"])
+    assert judged["group_id"] == events["door"]
+    assert judged["group"]["sources"]["outcomes"]["execution_ids"] == [
+        execution.id for execution in executions
+    ]
+    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {
+        "kind": "json",
+        "value": ["passed"] * 20,
+    }
+    assert judged["result"]["outcome"]["verdict"] == "passed"
+    frames_judged = [d for d in receiver.to(CALLS) if FRAME_CLAIM in json.dumps(d.body)]
+    assert len(frames_judged) == 20 + 1 + 21 + 20, "every frame is judged once"
+    state.shutdown()
+    other.shutdown()

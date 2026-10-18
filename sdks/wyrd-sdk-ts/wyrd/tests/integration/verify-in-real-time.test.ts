@@ -545,7 +545,10 @@ test("grouped support resumes", async ({ server, assistant }) => {
   });
   const replayed = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]));
   expect(await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]))).toBe(replayed);
-  const conflict = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body({ answer: "" }));
+  // An ungrouped conflicting body: a staged input the queue later refuses
+  // would otherwise join the group.
+  const { group_id: _, ...ungrouped } = body({ answer: "" });
+  const conflict = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", ungrouped);
   await expect((await verify.Execution.connect(conflict)).wait({ timeoutMs: WAIT_MS })).rejects.toMatchObject({
     code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
   });
@@ -566,7 +569,6 @@ test("grouped support resumes", async ({ server, assistant }) => {
   const judged = await groupExecution(server, bindingId, WAIT_MS);
 
   expect([judged.group_id, judged.owner_card_uid]).toEqual([group, registered(receipt).uid]);
-  expect(judged.group?.members, "six inputs and six results").toBe(12);
   expect(judged.group?.sources.turns.execution_ids).toHaveLength(6);
   expect(judged.group?.sources.turns.execution_ids[5]).toBe(replayed);
   expect(judged.result?.outcome.evidence.turns).toEqual({ kind: "json", value: turns });
@@ -589,31 +591,40 @@ test("grouped refund changes verdict", async ({ server }) => {
   });
   const { cards, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/refund.yaml");
   const group = "order-1";
-  const opened = Date.now();
-  const turn = (overdue: boolean) =>
-    state.run("agent").observe.verify("refund-turn", { order: "A-1", overdue }, { positional: true, group_id: group });
+  const turn = (overdue: boolean, paid?: "in_full") =>
+    state
+      .run("agent")
+      .observe.verify(
+        "refund-turn",
+        { order: "A-1", overdue, ...(paid ? { paid } : {}) },
+        { positional: true, group_id: group },
+      );
 
   await turn(false);
   await turn(false);
   const promised = await groupExecution(server, bindingId, WAIT_MS);
-  for (const overdue of [false, true, false]) {
+  for (const overdue of [false, true]) {
     await turn(overdue);
   }
   const corrected = await groupExecution(server, bindingId, WAIT_MS, promised.execution_id);
-  await turn(false);
+  await turn(true);
   const unchanged = await groupExecution(server, bindingId, WAIT_MS, corrected.execution_id);
+  await turn(false, "in_full");
+  const recovered = await groupExecution(server, bindingId, WAIT_MS, unchanged.execution_id);
 
   expect(
-    [promised, corrected, unchanged].map((review) => [
+    [promised, corrected, unchanged, recovered].map((review) => [
       review.group?.sources.facts.execution_ids.length,
       review.result?.outcome.verdict,
+      review.result?.outcome.requirements.map((requirement) => requirement.id),
       review.dispatches.length,
     ]),
-    "only the verdict change dispatches",
+    "only verdict changes dispatch",
   ).toEqual([
-    [2, "passed", 0],
-    [5, "failed", 1],
-    [6, "failed", 0],
+    [2, "passed", ["latest-not-overdue"], 0],
+    [4, "failed", ["latest-not-overdue"], 1],
+    [5, "failed", ["latest-not-overdue"], 0],
+    [6, "passed", ["latest-not-overdue"], 1],
   ]);
   const history = await (await Bifrost.connect()).sql(
     "SELECT execution_id, result_id, verdict FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
@@ -627,37 +638,31 @@ test("grouped refund changes verdict", async ({ server }) => {
     [promised.execution_id, "passed"],
     [corrected.execution_id, "failed"],
     [unchanged.execution_id, "failed"],
+    [recovered.execution_id, "passed"],
   ]);
-  const [alert] = await hooks.requests(1);
-  expect(alert?.path).toBe("/hooks/refund-review");
-  expect(JSON.parse(alert?.body ?? "null")).toEqual({
-    execution_id: corrected.execution_id,
-    result_id: history[1]?.result_id,
-    verdict: "failed",
-    group_id: group,
-    previous_result_id: history[0]?.result_id,
-    previous_verdict: "passed",
-  });
+  const alerts = await hooks.requests(2);
+  expect(alerts.map((alert) => alert.path)).toEqual(["/hooks/refund-review", "/hooks/refund-review"]);
+  expect(alerts.map((alert) => JSON.parse(alert.body))).toEqual([
+    {
+      execution_id: corrected.execution_id,
+      result_id: history[1]?.result_id,
+      verdict: "failed",
+      group_id: group,
+      previous_result_id: history[0]?.result_id,
+      previous_verdict: "passed",
+    },
+    {
+      execution_id: recovered.execution_id,
+      result_id: history[3]?.result_id,
+      verdict: "passed",
+      group_id: group,
+      previous_result_id: history[2]?.result_id,
+      previous_verdict: "failed",
+    },
+  ]);
 
-  // The fixture's 40 s finality, counted from the group's first turn, must
-  // pass before the late turn; waiting for it is the scenario.
-  await new Promise((resolve) => setTimeout(resolve, Math.max(0, opened + 41_000 - Date.now())));
-  await turn(true);
   await state.shutdown();
-  const token = await WyrdClient.connect().accessToken();
-  const quiet = Date.now() + 8_000;
-  while (Date.now() < quiet) {
-    server.flushBifrost();
-    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${bindingId}`, {
-      headers: { "x-wyrd-access-token": `Bearer ${token}` },
-    });
-    expect(
-      ((await response.json()) as { last_execution_id: string | null }).last_execution_id,
-      "a turn after finality opens no review",
-    ).toBe(unchanged.execution_id);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  expect(hooks.received).toHaveLength(1);
+  expect(hooks.received).toHaveLength(2);
   await hooks.close();
   await expect(
     cards.registerFromPath(fixture("cards/verify_in_real_time/refund-on-failure.yaml")),
@@ -787,7 +792,7 @@ async function submitFrames(state: WyrdState, group: string, paths: string[]): P
   return executions;
 }
 
-test("grouped sampled frames are bounded", async ({ server, provider, assistant }) => {
+test("grouped sampled frames use visible outcomes", async ({ server, provider, assistant }) => {
   const { cards, bundle, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/frames.yaml");
   const other = await cards.registerFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
   const otherBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
@@ -825,9 +830,9 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
       .run("agent")
       .observe.submit("frame-verifier", verify.File.path(frame("denied-01")), { group_id: "door-43" }),
   ).rejects.toMatchObject(DENIED);
-  await reported("door-43");
   await waited(executions);
-  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
+  await reported("door-43");
+  judged = await reportedGroup(server, bindingId, judged.execution_id);
   expect(judged.group_id).toBe("door-43");
   // Frames ingested in one batch share its ingest time, so their list
   // order is by execution ID rather than by submission.
@@ -839,32 +844,23 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
   expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: expected });
   expect(judged.result?.outcome.verdict).toBe("failed");
 
-  const over = await submitFrames(
-    state,
-    "door-45",
-    Array.from({ length: 21 }, (_, index) => frame(`over-${String(index).padStart(4, "0")}`)),
-  );
-  await reported("door-45");
-  await waited(over);
-  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
-  expect(judged.group_id).toBe("door-45");
-  expect(badged(judged)).toEqual([
-    "inconclusive",
-    "source_execution_limit_exceeded: verifiers.frame-verifier.requirements.person-wearing-badge.outcome selected more than 20 source executions",
-  ]);
-
-  const door = await submitFrames(
-    state,
-    "door-42",
-    Array.from({ length: 20 }, (_, index) => frame(`door-${String(index).padStart(4, "0")}`)),
-  );
-  await reported("door-42");
-  await waited(door);
-  judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
-  expect(judged.group_id).toBe("door-42");
-  expect([...(judged.group?.sources.outcomes.execution_ids ?? [])].sort()).toEqual(ids(door).sort());
-  expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: Array(20).fill("passed") });
-  expect(judged.result?.outcome.verdict).toBe("passed");
+  for (const [group, count] of [
+    ["door-45", 21],
+    ["door-42", 20],
+  ] as const) {
+    const door = await submitFrames(
+      state,
+      group,
+      Array.from({ length: count }, (_, index) => frame(`${group.slice(5)}-${String(index).padStart(6, "0")}`)),
+    );
+    await waited(door);
+    await reported(group);
+    judged = await reportedGroup(server, bindingId, judged.execution_id);
+    expect(judged.group_id).toBe(group);
+    expect([...(judged.group?.sources.outcomes.execution_ids ?? [])].sort()).toEqual(ids(door).sort());
+    expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: Array(count).fill("passed") });
+    expect(judged.result?.outcome.verdict).toBe("passed");
+  }
   expect(
     provider.received.filter((request) => request.body.includes(FRAME_CLAIM)),
     "every frame is judged once",
@@ -872,6 +868,27 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
   await state.shutdown();
   await otherState.shutdown();
 }, 180_000);
+
+/**
+ * The next completed group execution of `bindingId` after `after` that pins
+ * the reported event and a visible outcome for every listed frame. Frame
+ * results acknowledged before the event may schedule earlier snapshots;
+ * those are skipped.
+ */
+async function reportedGroup(
+  server: { flushBifrost(): void; readonly baseUrl: string },
+  bindingId: string,
+  after: string,
+): Promise<Awaited<ReturnType<typeof groupExecution>>> {
+  for (;;) {
+    const judged = await groupExecution(server, bindingId, WAIT_MS, after);
+    const outcomes = judged.result?.outcome.evidence.outcomes;
+    if (judged.group?.sources.event.execution_ids.length === 1 && !JSON.stringify(outcomes).includes("null")) {
+      return judged;
+    }
+    after = judged.execution_id;
+  }
+}
 
 /** One retained result's execution identity. */
 const Retained = z.object({ execution_id: z.string() });
@@ -887,7 +904,7 @@ async function groupReviews(server: { flushBifrost(): void }, bindingId: string)
   return rows.map((row) => row.execution_id);
 }
 
-test("grouped conversations recover", async ({ server, state: drift }) => {
+test("grouped conversations coexist with drift", async ({ server, state: drift }) => {
   const { receipt, key, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
   const turn = (answer: string) => ({ answer });
   const said = (group: string, answer: string) =>
@@ -958,7 +975,7 @@ test("grouped conversations recover", async ({ server, state: drift }) => {
   expect(ungrouped, "the ungrouped turn joins no group").toHaveLength(1);
   const quiet = Date.now() + 8_000;
   while (Date.now() < quiet) {
-    expect(await groupReviews(server, bindingId), "idle ticks review once").toEqual(reviews);
+    expect(await groupReviews(server, bindingId), "without new activity no group is reviewed again").toEqual(reviews);
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 });
@@ -1035,15 +1052,18 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     status: 429,
     details: { retry_after_seconds: 1 },
   };
+  const grouping = { group_id: "pressured" };
   await expect(refusedRun.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
   await expect(refusedRun.observe.submit("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
+  await expect(refusedRun.observe.verify("answer-check", { answer: "yes" }, grouping)).rejects.toMatchObject(refusal);
+  await expect(refusedRun.observe.submit("answer-check", { answer: "yes" }, grouping)).rejects.toMatchObject(refusal);
   expect(finished, "the burst's judgments are still in flight").toEqual([]);
   for (const judged of await Promise.all(burst)) {
     expect(judged.outcome.verdict).toBe("passed");
   }
 
   server.flushBifrost();
-  const recovered = await refusedRun.observe.submit("answer-check", { answer: "yes" });
+  const recovered = await refusedRun.observe.submit("answer-check", { answer: "yes" }, grouping);
   if (recovered.kind !== "queued") {
     throw new Error("Run evidence queues an execution");
   }
@@ -1058,4 +1078,17 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     z.object({ n: z.coerce.number() }),
   );
   expect(rows).toEqual([{ n: 3 + offered }]);
+
+  const support = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
+  const turn = await support.state
+    .run("agent")
+    .observe.submit("turn-check", { answer: "after drain" }, { positional: true, group_id: "pressured" });
+  if (turn.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  await turn.execution.wait({ timeoutMs: WAIT_MS });
+  await support.state.shutdown();
+  const group = await groupExecution(server, support.bindingId, WAIT_MS);
+  expect([group.group_id, group.group?.sources.turns.execution_ids]).toEqual(["pressured", [turn.execution.id]]);
+  expect(group.result?.outcome.verdict).toBe("passed");
 });

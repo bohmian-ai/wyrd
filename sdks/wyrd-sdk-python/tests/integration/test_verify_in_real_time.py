@@ -496,11 +496,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     idempotency_key = f"support-turn-{group}"
     replayed = enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5]))
     assert enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5])) == replayed
-    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, body({"answer": ""}))
     admin = client_of(wyrd_server)
-    with pytest.raises(WyrdError) as conflicted:
-        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
-    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
     verify.Execution.connect(replayed, admin).wait(WAIT_SECONDS)
     WyrdState.from_path(bundle, admin).run("agent").observe.verify(
         "turn-check", {"answer": ""}, group_id=group
@@ -516,14 +512,22 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
 
     assert (judged["group_id"], judged["owner_card_uid"]) == (group, str(registered["support"].uid))
-    coverage = judged["group"]
-    assert coverage["members"] == 12, "six inputs and six results"
-    assert len(coverage["sources"]["turns"]["execution_ids"]) == 6
-    assert coverage["sources"]["turns"]["execution_ids"][5] == replayed
+    sources = judged["group"]["sources"]
+    listed = sources["turns"]["execution_ids"]
+    assert len(listed) == 6 and listed[5] == replayed, "six turns, the replay once"
+    assert sources["answered"]["execution_ids"] == listed, "each turn's outcome aligns"
     outcome = judged["result"]["outcome"]
     assert outcome["evidence"]["turns"] == {"kind": "json", "value": turns}
+    assert outcome["evidence"]["answered"] == {"kind": "json", "value": ["passed"] * 6}
     assert outcome["verdict"] == "passed"
     assert binding_status(wyrd_server, binding_id)["last_execution_id"] == judged["execution_id"]
+    # A conflicting replay is refused by the queue after staging; it is sent
+    # to its own group so the conversation above keeps its six turns.
+    conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
+    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, conflicting)
+    with pytest.raises(WyrdError) as conflicted:
+        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
+    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
     with pytest.raises(WyrdError) as refused:
         register(cards, "cards/verify_in_real_time/support-unsourced.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
@@ -548,7 +552,6 @@ def test_grouped_refund_changes_verdict(
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("refund")))
     state.start_bifrost()
     group = f"order-{secrets.token_hex(4)}"
-    opened = time.monotonic()
 
     def turn(overdue: bool) -> None:
         state.run("agent").observe.verify(
@@ -558,22 +561,31 @@ def test_grouped_refund_changes_verdict(
     turn(False)
     turn(False)
     promised = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
-    for overdue in [False, True, False]:
-        turn(overdue)
-    corrected = group_execution(wyrd_server, binding_id, WAIT_SECONDS, promised["execution_id"])
     turn(False)
-    unchanged = group_execution(wyrd_server, binding_id, WAIT_SECONDS, corrected["execution_id"])
+    turn(True)
+    overdue = group_execution(wyrd_server, binding_id, WAIT_SECONDS, promised["execution_id"])
+    turn(True)
+    unchanged = group_execution(wyrd_server, binding_id, WAIT_SECONDS, overdue["execution_id"])
+    # A paid-in-full correction is the latest fact, so the order recovers.
+    turn(False)
+    recovered = group_execution(wyrd_server, binding_id, WAIT_SECONDS, unchanged["execution_id"])
+    state.shutdown()
 
+    reviews = [promised, overdue, unchanged, recovered]
     assert [
         (
             len(review["group"]["sources"]["facts"]["execution_ids"]),
             review["result"]["outcome"]["verdict"],
+            [requirement["id"] for requirement in review["result"]["outcome"]["requirements"]],
             len(review["dispatches"]),
         )
-        for review in [promised, corrected, unchanged]
-    ] == [(2, "passed", 0), (5, "failed", 1), (6, "failed", 0)], (
-        "only the verdict change dispatches"
-    )
+        for review in reviews
+    ] == [
+        (2, "passed", ["latest-not-overdue"], 0),
+        (4, "failed", ["latest-not-overdue"], 1),
+        (5, "failed", ["latest-not-overdue"], 0),
+        (6, "passed", ["latest-not-overdue"], 1),
+    ], "only verdict changes dispatch"
     history = (
         Bifrost(client=admin)
         .sql(
@@ -585,32 +597,34 @@ def test_grouped_refund_changes_verdict(
         .to_pylist()
     )
     assert [(row["execution_id"], row["verdict"]) for row in history] == [
-        (promised["execution_id"], "passed"),
-        (corrected["execution_id"], "failed"),
-        (unchanged["execution_id"], "failed"),
+        (review["execution_id"], review["result"]["outcome"]["verdict"]) for review in reviews
     ], "every review stays retained"
-    alert = receiver.wait_for("/hooks/refund-review", WAIT_SECONDS)
-    assert alert.body == {
-        "execution_id": corrected["execution_id"],
-        "result_id": history[1]["result_id"],
-        "verdict": "failed",
-        "group_id": group,
-        "previous_result_id": history[0]["result_id"],
-        "previous_verdict": "passed",
-    }
-
-    # The fixture's 40 s finality, counted from the group's first turn, must
-    # pass before the late turn; waiting for it is the scenario.
-    time.sleep(max(0.0, opened + 41 - time.monotonic()))
-    turn(True)
-    state.shutdown()
-    quiet = time.monotonic() + 8
-    while time.monotonic() < quiet:
-        wyrd_server.flush_bifrost()
-        status = binding_status(wyrd_server, binding_id)
-        assert status["last_execution_id"] == unchanged["execution_id"], "late turns open no review"
-        time.sleep(0.5)
-    assert len(receiver.to("/hooks/refund-review")) == 1
+    with receiver.delivered:
+        assert receiver.delivered.wait_for(
+            lambda: len(receiver.to("/hooks/refund-review")) >= 2, WAIT_SECONDS
+        ), "the failure and the recovery each dispatch"
+    alerts = sorted(
+        (alert.body for alert in receiver.to("/hooks/refund-review")),
+        key=lambda body: body["verdict"] == "passed",
+    )
+    assert alerts == [
+        {
+            "execution_id": overdue["execution_id"],
+            "result_id": history[1]["result_id"],
+            "verdict": "failed",
+            "group_id": group,
+            "previous_result_id": history[0]["result_id"],
+            "previous_verdict": "passed",
+        },
+        {
+            "execution_id": recovered["execution_id"],
+            "result_id": history[3]["result_id"],
+            "verdict": "passed",
+            "group_id": group,
+            "previous_result_id": history[2]["result_id"],
+            "previous_verdict": "failed",
+        },
+    ]
     with pytest.raises(WyrdError) as refused:
         register(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
@@ -746,7 +760,7 @@ def submit_frames(state: WyrdState, group: str, paths: list[Path]) -> list[verif
 
 
 @pytest.mark.usefixtures("assistant_bundle")
-def test_grouped_sampled_frames_are_bounded(
+def test_grouped_sampled_frames_use_visible_outcomes(
     wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
 ) -> None:
     registered = register(cards, "cards/verify_in_real_time/frames.yaml")
@@ -760,9 +774,7 @@ def test_grouped_sampled_frames_are_bounded(
         WyrdClient(credential=service_key("frames-other")),
     )
     other.start_bifrost()
-    events = {
-        name: f"{name}-{secrets.token_hex(4)}" for name in ("empty", "failing", "over", "door")
-    }
+    events = {name: f"{name}-{secrets.token_hex(4)}" for name in ("empty", "failing", "many")}
 
     def reported(event: str) -> None:
         state.run("agent").observe.verify(
@@ -818,37 +830,23 @@ def test_grouped_sampled_frames_are_bounded(
     assert outcome["evidence"]["outcomes"] == {"kind": "json", "value": expected}
     assert outcome["verdict"] == "failed"
 
-    paths = [frame(tmp_path, f"over-{index:04}") for index in range(21)]
-    executions = submit_frames(state, events["over"], paths)
-    reported(events["over"])
+    paths = [frame(tmp_path, f"many-{index:04}") for index in range(21)]
+    executions = submit_frames(state, events["many"], paths)
+    reported(events["many"])
     for execution in executions:
         execution.wait(WAIT_SECONDS)
     judged = judged_after(judged["execution_id"])
-    assert judged["group_id"] == events["over"]
-    assert badged(judged) == (
-        "inconclusive",
-        "source_execution_limit_exceeded: "
-        "verifiers.frame-verifier.requirements.person-wearing-badge.outcome "
-        "selected more than 20 source executions",
-    )
-
-    paths = [frame(tmp_path, f"door-{index:04}") for index in range(20)]
-    executions = submit_frames(state, events["door"], paths)
-    reported(events["door"])
-    for execution in executions:
-        execution.wait(WAIT_SECONDS)
-    judged = judged_after(judged["execution_id"])
-    assert judged["group_id"] == events["door"]
+    assert judged["group_id"] == events["many"]
     assert sorted(judged["group"]["sources"]["outcomes"]["execution_ids"]) == sorted(
         execution.id for execution in executions
-    )
+    ), "twenty-one frames are judged like any other group"
     assert judged["result"]["outcome"]["evidence"]["outcomes"] == {
         "kind": "json",
-        "value": ["passed"] * 20,
+        "value": ["passed"] * 21,
     }
     assert judged["result"]["outcome"]["verdict"] == "passed"
     frames_judged = [d for d in receiver.to(CALLS) if FRAME_CLAIM in json.dumps(d.body)]
-    assert len(frames_judged) == 20 + 1 + 21 + 20, "every frame is judged once"
+    assert len(frames_judged) == 20 + 1 + 21, "every frame is judged once"
     state.shutdown()
     other.shutdown()
 
@@ -866,7 +864,7 @@ def group_reviews(server: WyrdTestServer, binding_id: str, groups: list[str]) ->
 
 
 @pytest.mark.usefixtures("assistant_bundle")
-def test_grouped_conversations_recover(
+def test_grouped_conversations_coexist_with_drift(
     wyrd_server: WyrdTestServer,
     cards: Cards,
     assistant: WyrdState,
@@ -953,7 +951,9 @@ def test_grouped_conversations_recover(
     assert len(ungrouped) == 1, "the ungrouped turn joins no group"
     quiet = time.monotonic() + 8
     while time.monotonic() < quiet:
-        assert group_reviews(wyrd_server, binding_id, [a, b]) == reviews, "idle ticks review once"
+        assert group_reviews(wyrd_server, binding_id, [a, b]) == reviews, (
+            "without new activity a judged group is not read again"
+        )
         time.sleep(0.5)
 
 
@@ -1020,7 +1020,7 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             refused_run = state.run("agent")
             for call in (refused_run.observe.verify, refused_run.observe.submit):
                 with pytest.raises(WyrdError) as refused:
-                    call("answer-check", "yes")
+                    call("answer-check", "yes", group_id="staged")
                 assert refused.value.code == STAGING_FULL
                 assert refused.value.status == 429
                 assert refused.value.details["retry_after_seconds"] == 1
@@ -1028,7 +1028,7 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             assert [judging.result().verdict for judging in burst] == ["passed", "passed"]
 
         server.flush_bifrost()
-        recovered = refused_run.observe.submit("answer-check", "yes")
+        recovered = refused_run.observe.submit("answer-check", "yes", group_id="staged")
         assert isinstance(recovered, verify.Execution)
         judged = recovered.wait(WAIT_SECONDS)
         assert (judged.verdict, judged.run_id) == ("passed", refused_run.run_id)
@@ -1038,3 +1038,18 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
         )
         assert [row.n for row in rows] == [3 + offered]
+
+        cards = Cards(WyrdClient())
+        registered = register(cards, "cards/verify_in_real_time/support.yaml")
+        binding_id = group_binding(server, cards, registered["support"])
+        support = WyrdState.from_path(
+            download(cards, "support", tmp_path / "support"),
+            WyrdClient(credential=service_key("support")),
+        )
+        support.start_bifrost()
+        group = f"staged-{secrets.token_hex(4)}"
+        support.run("agent").observe.verify("turn-check", {"answer": "yes"}, group_id=group)
+        support.shutdown()
+        grouped = group_execution(server, binding_id, WAIT_SECONDS)
+        assert grouped["group_id"] == group
+        assert grouped["result"]["outcome"]["verdict"] == "passed"

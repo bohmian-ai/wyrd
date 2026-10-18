@@ -29,7 +29,7 @@ use crate::cards::engine::{RegistryContext, RegistryEngine};
 use crate::cards::error::RegistryEngineError;
 use crate::cards::progress::DeclarationProgressSink;
 use crate::cards::reads;
-use crate::cards::{CardGraphPuller, BundleMode, PullSummary, DeclarationReceipt};
+use crate::cards::{BundleMode, CardGraphPuller, DeclarationReceipt, PullSummary};
 
 /// A read-time Card lookup request.
 ///
@@ -283,10 +283,7 @@ impl Cards {
     /// # Errors
     /// Returns a Wyrd error when validation, declaration, artifact upload, or
     /// server-owned completion fails.
-    pub async fn declare(
-        &self,
-        input: &DeclarationInput,
-    ) -> Result<DeclarationReceipt, WyrdError> {
+    pub async fn declare(&self, input: &DeclarationInput) -> Result<DeclarationReceipt, WyrdError> {
         crate::cards::saga::declare(&self.engine, input, None)
             .await
             .map_err(Into::into)

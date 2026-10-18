@@ -61,11 +61,11 @@ use wyrd_spec::operator_connection::{
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
-    CardDeclarationOutcome, CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan,
+    ArtifactInventoryResponse, ArtifactManifestEntry, CardDeclarationOutcome, CardLifecycleStatus,
+    CardLocator, CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan,
+    DeclarationOperationId, DeclarationOutcomeKind, DeclarationReceipt, DeclarationReplaySeed,
     DeclareCardRequest, DeclareCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest,
-    ListCardsResponse, ListVersionsResponse, DeclarationOperationId, DeclarationOutcomeKind,
-    DeclarationReceipt, DeclarationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
+    ListCardsResponse, ListVersionsResponse, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};

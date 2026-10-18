@@ -11,7 +11,7 @@ use crate::cards::{
 };
 
 use super::{
-    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
+    BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
     graph::{ResolvedCard, ResolvedGraph, graph_error, validate_alias},
 };
 
@@ -43,11 +43,7 @@ pub(super) struct BundleWriter<'a> {
 
 impl<'a> BundleWriter<'a> {
     /// Creates a writer for one staged graph bundle.
-    pub(super) fn new(
-        context: &'a RegistryContext,
-        staging: &'a Path,
-        mode: BundleMode,
-    ) -> Self {
+    pub(super) fn new(context: &'a RegistryContext, staging: &'a Path, mode: BundleMode) -> Self {
         Self {
             context,
             staging,

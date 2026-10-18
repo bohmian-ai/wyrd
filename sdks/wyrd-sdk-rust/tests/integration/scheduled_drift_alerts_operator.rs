@@ -25,7 +25,7 @@ use wyrd_ai::{
 };
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, fixture, pull, declare, declared};
+use crate::support::{Deployment, declare, declared, fixture, pull};
 
 /// The bearer token the `on-call-hooks` connection sends to the hook.
 const ON_CALL_TOKEN: &str = "on-call-hook-token";

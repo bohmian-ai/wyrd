@@ -27,7 +27,7 @@ use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, pull, declare, declared};
+use crate::support::{Deployment, ancestry, coordinates, declare, declared, pull};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);

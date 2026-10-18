@@ -223,7 +223,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, BundleWorkspace, PUBLISH_FAULTS};
+    use super::{BundleWorkspace, FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, PUBLISH_FAULTS};
 
     /// Serializes tests that mutate the process-wide publication fault flags.
     static PUBLISH_FAULT_LOCK: Mutex<()> = Mutex::new(());

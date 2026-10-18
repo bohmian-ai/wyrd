@@ -23,6 +23,13 @@ mod version_resolve;
 mod version_sql;
 
 pub use auth_projection::upsert_service_account_from_card;
+pub use declare::{
+    CardArtifactManifestRow, CardDeclarationOperationRow, DeclaredCardRow, NewCardRow,
+    NewDeclarationOperation, commit_declaration_operation, declaration_request_hash,
+    insert_artifact_manifest_rows, insert_card_row, insert_declaration_operation,
+    lookup_existing_operation, lookup_expired_operation, manifest_rows_for_init,
+    mark_manifest_upload_initialized, select_card_uids_by_ref_batch,
+};
 pub use delete::{
     CardDeleteState, soft_delete_card, soft_delete_card_by_ref, soft_delete_card_with_kind,
     soft_delete_card_with_state,
@@ -32,8 +39,8 @@ pub use get::{
 };
 pub use lifecycle::{
     CardManifestCompletionRow, CardReconcileClaim, MAX_RECONCILE_ATTEMPTS, RECONCILE_KIND_BLOB,
-    RECONCILE_KIND_CLEANUP, RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_DECLARATION,
-    activate_card, claim_card_reconciliation, fail_card, lock_card_reconciliation_lease,
+    RECONCILE_KIND_CLEANUP, RECONCILE_KIND_DECLARATION, RECONCILE_KIND_FINALIZATION, activate_card,
+    claim_card_reconciliation, fail_card, lock_card_reconciliation_lease,
     lock_pending_card_for_activation, manifest_completion_rows, mark_card_reconciliation_succeeded,
     mark_manifest_verified, record_blob_failure, record_card_blob,
     record_card_reconciliation_failure, reschedule_card_reconciliation,
@@ -42,13 +49,6 @@ pub use lifecycle::{
 pub use list::{
     CardQuery, ListCursor, ListPage, MAX_LIST_LIMIT, check_uid_exists, find_card_by_spec_hash,
     get_unique_spaces, query_cards,
-};
-pub use declare::{
-    CardArtifactManifestRow, CardDeclarationOperationRow, NewCardRow, NewDeclarationOperation,
-    DeclaredCardRow, commit_declaration_operation, insert_artifact_manifest_rows,
-    insert_card_row, insert_declaration_operation, lookup_existing_operation,
-    lookup_expired_operation, manifest_rows_for_init, mark_manifest_upload_initialized,
-    declaration_request_hash, select_card_uids_by_ref_batch,
 };
 pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,

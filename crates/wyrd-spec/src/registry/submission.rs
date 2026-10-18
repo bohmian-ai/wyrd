@@ -181,8 +181,8 @@ pub struct DeclarationReplaySeed {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactManifestEntry, CardSubmission, DeclareCardRequest, DeclareCardResponse,
-        DeclarationReceipt, canonical_artifact_manifest_hash,
+        ArtifactManifestEntry, CardSubmission, DeclarationReceipt, DeclareCardRequest,
+        DeclareCardResponse, canonical_artifact_manifest_hash,
     };
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};

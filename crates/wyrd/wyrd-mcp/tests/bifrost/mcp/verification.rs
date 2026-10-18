@@ -274,10 +274,7 @@ mod pg_tests {
         /// Returns tool, transport, or response decoding failures.
         async fn get(&self, reference: &CardRef) -> Result<GetCardResponse, McpJourneyError> {
             let arguments = serde_json::json!({ "card_ref": reference });
-            let response = self
-                .agent
-                .call_tool(call(CARDS_GET, arguments)?)
-                .await?;
+            let response = self.agent.call_tool(call(CARDS_GET, arguments)?).await?;
             Ok(serde_json::from_value(structured(response)?)?)
         }
 

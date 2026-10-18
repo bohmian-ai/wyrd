@@ -29,10 +29,10 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
-    ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardDeclarationOutcome,
-    CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, DeclareCardRequest,
-    DeclareCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
-    ListVersionsResponse, DeclarationOperationId, DeclarationOutcomeKind, DeclarationReplaySeed,
+    ArtifactInventoryResponse, ArtifactManifestEntry, CardDeclarationOutcome, CardLifecycleStatus,
+    CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, DeclarationOperationId,
+    DeclarationOutcomeKind, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
+    DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
     RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
 use wyrd_spec::request_id::RequestId;
@@ -41,11 +41,11 @@ use wyrd_spec::vala::api::RegisterTableRequest;
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow, CardQuery,
-    CardReconcileClaim, CardDeclarationOperationRow, ListCursor, NewCardRow,
+    CardArtifactManifestRow, CardDeclarationOperationRow, CardDeleteState,
+    CardManifestCompletionRow, CardQuery, CardReconcileClaim, ListCursor, NewCardRow,
     NewDeclarationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
     RECONCILE_KIND_FINALIZATION, Resolution, SubmittedCardIdentity, activate_card,
-    commit_declaration_operation, fail_card, find_card_by_ref,
+    commit_declaration_operation, declaration_request_hash, fail_card, find_card_by_ref,
     get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
     inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
@@ -54,9 +54,9 @@ use wyrd_sql::queries::cards::{
     lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
     mark_card_reconciliation_succeeded, mark_manifest_upload_initialized, mark_manifest_verified,
     persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
-    record_card_blob, record_card_reconciliation_failure, declaration_request_hash,
-    reschedule_card_reconciliation, resolve_version, schedule_card_reconciliation,
-    soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
+    record_card_blob, record_card_reconciliation_failure, reschedule_card_reconciliation,
+    resolve_version, schedule_card_reconciliation, soft_delete_card_by_ref,
+    soft_delete_card_with_kind, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
@@ -833,20 +833,16 @@ async fn initialize_uploads(
         {
             continue;
         }
-        response.outcomes[index] =
-            match complete_card(state, caller, card_uid, idempotency_key).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    abort_pending_declaration_cards(
-                        state,
-                        caller,
-                        &response.outcomes,
-                        idempotency_key,
-                    )
+        response.outcomes[index] = match complete_card(state, caller, card_uid, idempotency_key)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key)
                     .await;
-                    return Err(error);
-                }
-            };
+                return Err(error);
+            }
+        };
     }
     Ok(response)
 }

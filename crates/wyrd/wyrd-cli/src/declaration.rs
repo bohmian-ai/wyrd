@@ -294,9 +294,7 @@ mod tests {
         let renderer = DeclarationProgressRenderer::with_interactive(false);
         let artifact = RelativeArtifactPath::new("weights.bin").expect("test path");
         let sink = renderer.sink();
-        sink(DeclarationProgressEvent::Phase(
-            DeclarationPhase::Uploading,
-        ));
+        sink(DeclarationProgressEvent::Phase(DeclarationPhase::Uploading));
         sink(DeclarationProgressEvent::ArtifactStarted {
             artifact: artifact.clone(),
             total_bytes: Some(10),

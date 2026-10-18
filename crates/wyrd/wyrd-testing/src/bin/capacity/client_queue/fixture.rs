@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
-use wyrd_client::cards::{CardGraphPuller, CardSelector, Cards, BundleMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};

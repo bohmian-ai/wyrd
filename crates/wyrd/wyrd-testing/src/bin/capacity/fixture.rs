@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
-use wyrd_client::cards::{CardGraphPuller, CardSelector, Cards, BundleMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::state::WyrdState;
 use wyrd_client::{GlobalConfig, WyrdClient};

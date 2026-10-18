@@ -168,7 +168,7 @@ mod tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::DeclareCardResponse;
     use wyrd_spec::registry::{
-        CardLifecycleStatus, CardDeclarationOutcome, DeclarationOutcomeKind,
+        CardDeclarationOutcome, CardLifecycleStatus, DeclarationOutcomeKind,
     };
 
     /// Merging keeps the composite root and the server outcome order.

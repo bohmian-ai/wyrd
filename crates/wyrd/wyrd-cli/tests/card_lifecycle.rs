@@ -558,10 +558,12 @@ spec:
 
     for invalid in [&service, &broken_prompt] {
         let (output, contacted) = run_check_against_configured_server(invalid);
-        assert!(!contacted, "an invalid check contacted the configured server");
+        assert!(
+            !contacted,
+            "an invalid check contacted the configured server"
+        );
         assert_eq!(output.status.code(), Some(64), "{}", invalid.display());
-        let report: Value =
-            serde_json::from_slice(&output.stdout).expect("check failure is JSON");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("check failure is JSON");
         assert_eq!(report["ok"], false);
         let diagnostic = &report["diagnostics"][0];
         assert!(
@@ -1615,7 +1617,7 @@ mod pg_tests {
         let model_path = fixture_root.join("model/card.yaml");
         let plan = run_cli_owned(vec![
             "declare".to_owned(),
-                "--check".to_owned(),
+            "--check".to_owned(),
             fixture_root
                 .to_str()
                 .expect("canonical fixture path is UTF-8")

@@ -26,7 +26,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
 
-use crate::support::{Deployment, ancestry, pull, declare, declared};
+use crate::support::{Deployment, ancestry, declare, declared, pull};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";

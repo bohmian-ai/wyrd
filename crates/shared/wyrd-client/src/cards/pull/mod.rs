@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::{error::WyrdError, reference::CardRef};
 
 pub use wyrd_spec::registry::{
-    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
+    BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
 };
 
 use crate::cards::{CardSelector, RegistryContext};

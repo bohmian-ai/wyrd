@@ -13,9 +13,9 @@ use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
-use wyrd_client::cards::{CardSelector, Cards, BundleMode, PullSummary};
+use wyrd_client::cards::{BundleMode, CardSelector, Cards, PullSummary};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
-use wyrd_loader::{LoadError, DeclarationInput};
+use wyrd_loader::{DeclarationInput, LoadError};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata};
@@ -24,8 +24,8 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::MetadataQuery;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    CardLifecycleStatus, CardDeclarationOutcome, CardSummary, ListCardsRequest, ListCardsResponse,
-    DeclarationOutcomeKind, DeclarationReceipt,
+    CardDeclarationOutcome, CardLifecycleStatus, CardSummary, DeclarationOutcomeKind,
+    DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
@@ -2283,11 +2283,7 @@ impl RegistryGetQuery {
                 let key = key.extract::<String>()?;
                 if !matches!(
                     key.as_str(),
-                    "uid"
-                        | "space"
-                        | "name"
-                        | "version"
-                        | "interface"
+                    "uid" | "space" | "name" | "version" | "interface"
                 ) {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                         "get() got an unexpected keyword argument '{key}'"

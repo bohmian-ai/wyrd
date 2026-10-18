@@ -13,17 +13,13 @@ fn main() {
     let renderer = DeclarationProgressRenderer::with_interactive(true);
     let sink = renderer.sink();
 
-    sink(DeclarationProgressEvent::Phase(
-        DeclarationPhase::Preparing,
-    ));
+    sink(DeclarationProgressEvent::Phase(DeclarationPhase::Preparing));
     thread::sleep(Duration::from_millis(500));
     sink(DeclarationProgressEvent::Phase(
         DeclarationPhase::Submitting,
     ));
     thread::sleep(Duration::from_millis(700));
-    sink(DeclarationProgressEvent::Phase(
-        DeclarationPhase::Uploading,
-    ));
+    sink(DeclarationProgressEvent::Phase(DeclarationPhase::Uploading));
 
     let semaphore = Arc::new(DemoSemaphore::new(4));
     let mut workers = Vec::new();
@@ -51,9 +47,7 @@ fn main() {
             DeclarationPhase::Completing,
         ));
         thread::sleep(Duration::from_millis(700));
-        sink(DeclarationProgressEvent::Phase(
-            DeclarationPhase::Verifying,
-        ));
+        sink(DeclarationProgressEvent::Phase(DeclarationPhase::Verifying));
         thread::sleep(Duration::from_millis(500));
     } else {
         sink(DeclarationProgressEvent::Phase(

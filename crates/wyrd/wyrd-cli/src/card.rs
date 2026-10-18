@@ -12,7 +12,7 @@ use wyrd_client::WyrdClient;
 use wyrd_client::cards::DeclarationReceipt;
 use wyrd_client::cards::{BundleMode, CardSelector, Cards, PullSummary};
 use wyrd_loader::{
-    Diagnostic, LoadError, DeclarationInput, build_declaration_input, load as load_tree,
+    DeclarationInput, Diagnostic, LoadError, build_declaration_input, load as load_tree,
 };
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -497,12 +497,9 @@ async fn pull_bundle(
 /// serialization fails.
 pub async fn dispatch_pull(args: PullArgs) -> Result<ExitCode, WyrdCliError> {
     let server = args.connection.server.as_deref();
-    let output = pull_bundle(
-        &args.selector,
-        &args.output_dir,
-        args.metadata_only,
-        || crate::client::from_global(server),
-    )
+    let output = pull_bundle(&args.selector, &args.output_dir, args.metadata_only, || {
+        crate::client::from_global(server)
+    })
     .await?;
     match args.format {
         OutputFormat::Text => print_pull_text(&output),

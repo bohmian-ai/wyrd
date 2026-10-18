@@ -13,7 +13,7 @@ use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, pull, declare};
+use crate::support::{Deployment, declare, pull};
 
 /// One `vala.drift.observations` row, as read back.
 #[derive(Debug, PartialEq, Deserialize)]

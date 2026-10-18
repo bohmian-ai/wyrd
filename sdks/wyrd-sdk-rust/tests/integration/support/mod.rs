@@ -14,7 +14,7 @@ use std::time::Duration;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_ai::cards::{CardRef, CardSelector, Cards, BundleMode, DeclarationReceipt};
+use wyrd_ai::cards::{BundleMode, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};

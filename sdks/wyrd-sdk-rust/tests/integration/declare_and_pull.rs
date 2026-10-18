@@ -8,7 +8,7 @@ use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::{HydratedCard, WyrdState};
 use wyrd_ai::{Card, Spec};
 
-use crate::support::{Deployment, fixture, pull, declare, declared};
+use crate::support::{Deployment, declare, declared, fixture, pull};
 
 /// The support desk Service the stories register.
 const DESK: &str = "cards/declare_and_pull/support-desk.yaml";
@@ -143,8 +143,7 @@ async fn service_graph_declares_and_pulls() {
     assert_eq!(artifacts[0].relative_path(), "support-model.bin");
     assert_eq!(
         std::fs::read(artifacts[0].local_path()).expect("artifact reads"),
-        std::fs::read(fixture("cards/declare_and_pull/support-model.bin"))
-            .expect("fixture reads")
+        std::fs::read(fixture("cards/declare_and_pull/support-model.bin")).expect("fixture reads")
     );
     deployment.shutdown().await;
 }

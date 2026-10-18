@@ -73,10 +73,8 @@ impl EvidenceInvestigation {
             "/../../../fixtures/cards"
         ));
         for component in ["support-model.yaml", "support-agent.yaml"] {
-            Box::pin(
-                cards.declare_from_path(&fixtures.join("declare_and_pull").join(component)),
-            )
-            .await?;
+            Box::pin(cards.declare_from_path(&fixtures.join("declare_and_pull").join(component)))
+                .await?;
         }
         let receipt =
             Box::pin(cards.declare_from_path(&fixtures.join("mcp_investigation/service.yaml")))

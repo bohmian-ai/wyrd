@@ -1,7 +1,7 @@
 //! Projections from registry rows into composite declaration responses.
 
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{CardLifecycleStatus, CardDeclarationOutcome, DeclarationOutcomeKind};
+use wyrd_spec::registry::{CardDeclarationOutcome, CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_sql::queries::cards::DeclaredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
@@ -145,8 +145,7 @@ mod tests {
             (CardStatus::Failed, CardLifecycleStatus::Failed),
             (CardStatus::Expired, CardLifecycleStatus::Expired),
         ] {
-            let outcome =
-                outcome_row_to_response(&row(stored), DeclarationOutcomeKind::Declared);
+            let outcome = outcome_row_to_response(&row(stored), DeclarationOutcomeKind::Declared);
             assert_eq!(outcome.status, expected);
         }
     }

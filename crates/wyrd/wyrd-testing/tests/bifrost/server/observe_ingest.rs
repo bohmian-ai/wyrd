@@ -11,7 +11,7 @@ use std::time::Duration;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use wyrd_client::cards::{CardGraphPuller, CardSelector, Cards, BundleMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::observe::Run;
 use wyrd_client::state::WyrdState;
 use wyrd_client::verify::Submission;

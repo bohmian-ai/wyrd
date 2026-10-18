@@ -31,9 +31,7 @@ use wyrd_spec::reference::{
 use wyrd_spec::registry::{
     ArtifactManifestEntry, RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
-use wyrd_spec::registry::{
-    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
-};
+use wyrd_spec::registry::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
 
 /// One verified artifact payload in a local `WyrdState` bundle.
 #[derive(Debug, Clone)]
@@ -1276,10 +1274,7 @@ impl BundleReader<'_> {
     ///
     /// Returns an invalid-state-bundle or unhydrated-artifact error when any
     /// Card projection, reference, relationship, artifact, or root is invalid.
-    fn load_index(
-        &self,
-        manifest: BundleManifest,
-    ) -> Result<HydratedStateIndex, WyrdError> {
+    fn load_index(&self, manifest: BundleManifest) -> Result<HydratedStateIndex, WyrdError> {
         let mut loaded = Vec::with_capacity(manifest.cards.len());
         let mut known = BTreeSet::new();
         let mut aliases = BTreeMap::new();
@@ -2200,7 +2195,7 @@ pub(crate) mod tests {
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
     use wyrd_spec::registry::{
-        BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
+        BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
     };
 
     use super::{HydratedCard, WyrdState};

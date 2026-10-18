@@ -88,9 +88,7 @@ mod tests {
     };
     use wyrd_semver::VersionBlock;
 
-    use super::{
-        BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
-    };
+    use super::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
 
     /// Build the exact Service identity shared by the manifest root and Card projection.
     ///

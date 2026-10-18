@@ -39,7 +39,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, fixture, pull, declare};
+use crate::support::{Deployment, declare, fixture, pull};
 
 /// How long a test waits for a queued execution.
 const WAIT: Duration = Duration::from_secs(90);

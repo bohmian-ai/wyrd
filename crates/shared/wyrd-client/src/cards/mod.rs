@@ -8,22 +8,22 @@ mod download_progress;
 mod engine;
 mod error;
 mod handle;
-mod pull;
 mod progress;
+mod pull;
 mod reads;
 mod saga;
 
 pub use engine::RegistryContext;
 pub use handle::{CardSelector, Cards};
-pub use pull::{
-    CardGraphPuller, BundleArtifactManifest, BundleManifest, BundleCardManifest,
-    BundleMode, PullSummary,
-};
 pub use progress::{DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink};
+pub use pull::{
+    BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode, CardGraphPuller,
+    PullSummary,
+};
 pub use wyrd_spec::envelope::CardKind;
 pub use wyrd_spec::reference::CardRef;
 pub use wyrd_spec::registry::{
-    CardSummary, ListCardsRequest, ListCardsResponse, DeclarationReceipt,
+    CardSummary, DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
 /// Public surface shape of the `cards` module.

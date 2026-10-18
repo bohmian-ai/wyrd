@@ -7,6 +7,7 @@
 
 /// One Service action read back as one connected trace timeline.
 mod action_timeline;
+mod declare_and_pull;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and through Chat Completions.
@@ -21,7 +22,6 @@ mod principal_roles;
 mod query_bifrost;
 /// Common analytical SQL over part-published, part-live tables.
 mod query_coverage;
-mod declare_and_pull;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
 /// Every handle's `connect` forms against a real server.

@@ -30,7 +30,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
-use crate::support::{Deployment, pull, declare};
+use crate::support::{Deployment, declare, pull};
 
 /// One evidence row: which Card it is attributed to.
 #[derive(Debug, Deserialize)]

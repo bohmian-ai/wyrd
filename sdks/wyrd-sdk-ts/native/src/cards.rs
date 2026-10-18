@@ -11,7 +11,7 @@ use napi::Env;
 use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
-use wyrd_client::cards::{CardKind, CardSelector, Cards, BundleMode, ListCardsRequest};
+use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
 use wyrd_client::verify::Submission;

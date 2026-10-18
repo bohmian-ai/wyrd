@@ -12,6 +12,7 @@ pub mod auth;
 mod card;
 mod cli;
 mod client;
+pub mod declaration;
 pub mod error;
 pub mod gateway;
 pub mod load;
@@ -21,7 +22,6 @@ mod operator_connection;
 mod platform;
 mod principal;
 pub mod query;
-pub mod declaration;
 /// `wyrd server`: verified installation of official server releases.
 pub mod server;
 #[cfg(unix)]
@@ -54,7 +54,7 @@ pub mod commands {
 
 // Re-export the public loader API
 pub use load::{
-    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, DeclarationInput,
+    AuthoredCard, CardSubmission, DeclarationInput, Diagnostic, LoadError, LoadedCard, LoadedTree,
     Severity, SourceSpan, build_declaration_input, build_submissions, emit_json, load,
 };
 

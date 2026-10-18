@@ -11,7 +11,7 @@ use wyrd_ai::cli;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
 
-use crate::support::{Deployment, coordinates, fixture, declare};
+use crate::support::{Deployment, coordinates, declare, fixture};
 
 /// A tenant-wide query over a built-in table, which `workload` permits.
 const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM vala.drift.observations";

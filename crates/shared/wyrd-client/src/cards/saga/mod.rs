@@ -9,13 +9,11 @@ mod upload;
 
 use wyrd_loader::DeclarationInput;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::registry::{CardLifecycleStatus, DeclareCardResponse, DeclarationReceipt};
+use wyrd_spec::registry::{CardLifecycleStatus, DeclarationReceipt, DeclareCardResponse};
 
 use crate::cards::engine::RegistryEngine;
 use crate::cards::error::RegistryEngineError;
-use crate::cards::progress::{
-    DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink,
-};
+use crate::cards::progress::{DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink};
 
 /// Drive one declarative declaration input through the ordered declaration
 /// lifecycle:

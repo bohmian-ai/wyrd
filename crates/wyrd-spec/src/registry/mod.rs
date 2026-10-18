@@ -1,26 +1,24 @@
 //! Card declaration wire contracts.
 
-mod enums;
 /// Offline Card bundle wire projections.
 mod bundle;
+mod enums;
 mod ids;
 mod reads;
 mod submission;
 mod upload;
 
 pub use crate::reference::{InlineableRef, Ref};
+pub use bundle::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
 pub use enums::{CardLifecycleStatus, DeclarationOutcomeKind};
-pub use bundle::{
-    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
-};
-pub use ids::{PathValidationError, DeclarationOperationId, RelativeArtifactPath};
+pub use ids::{DeclarationOperationId, PathValidationError, RelativeArtifactPath};
 pub use reads::{
     ArtifactInventoryResponse, CardLocator, CardSummary, DeleteCardResponse, GetCardResponse,
     ListCardsRequest, ListCardsResponse, ListVersionsResponse, StoredArtifactEntry,
 };
 pub use submission::{
     ArtifactManifestEntry, CardDeclarationOutcome, CardSubmission, CardUploadPlan,
-    DeclareCardRequest, DeclareCardResponse, DeclarationReceipt, DeclarationReplaySeed,
+    DeclarationReceipt, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
     canonical_artifact_manifest_hash,
 };
 pub use upload::CardUploadEntry;

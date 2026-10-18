@@ -15,22 +15,30 @@
 //! of the shared execution capacity, then in one short transaction claims
 //! the pending row with [`VerifierExecutionQueue::claim_due_group`], pins
 //! and enqueues one snapshot, consumes the row, and commits; the permit is
-//! released at handoff, before any Verifier runs. A failure rolls back and
-//! ends that tenant's group pass, leaving the item pending.
+//! released at handoff, before any Verifier runs. An inactive owner or a
+//! rejected owner authority is recorded as one terminal errored group
+//! execution in that same transaction, which also consumes the row. A
+//! retryable failure rolls back and ends that tenant's group pass, leaving
+//! the item pending.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::verification::VerificationError;
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    EnqueueOutcome, QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick,
+    DueGroup, EnqueueOutcome, QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick,
     VerifierExecutionQueue,
 };
-use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
-use super::authority::BackgroundAuthority;
+use super::authority::{AuthorityRefusal, BackgroundAuthority};
 use super::groups::{GroupPollError, GroupPoller};
 
 #[cfg(feature = "test-support")]
@@ -44,6 +52,18 @@ const TENANTS_PER_PASS: i64 = 64;
 /// Occurrences or pending groups one tenant may hand off per pass before the
 /// next tenant runs.
 const TICKS_PER_TENANT: usize = 32;
+
+/// One committed handoff of an expired pending group, which consumed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupHandoff {
+    /// The pinned snapshot was enqueued as this group execution.
+    Enqueued(ExecutionId),
+    /// An identical snapshot's group execution already existed.
+    AlreadyEnqueued(ExecutionId),
+    /// The owner was inactive or refused; this terminal errored group
+    /// execution records why, with nothing evaluated.
+    Errored(ExecutionId),
+}
 
 /// The group loop's snapshot reader and the shared execution capacity each
 /// handoff takes one permit of.
@@ -238,7 +258,7 @@ impl VerificationScheduler {
     pub async fn group_pass(
         &self,
         stop: &CancellationToken,
-    ) -> Result<Vec<EnqueueOutcome>, SqlError> {
+    ) -> Result<Vec<GroupHandoff>, SqlError> {
         let Some(groups) = &self.groups else {
             return Ok(Vec::new());
         };
@@ -293,7 +313,7 @@ impl VerificationScheduler {
                     return Ok::<_, SqlError>(None);
                 };
                 let authority = match due.owner() {
-                    Some(owner) => self.authority.resolve(&mut conn, owner).await?,
+                    Some(owner) => self.authority.resolve(&mut conn, owner).await?.ok(),
                     None => None,
                 };
                 let tick = self.queue.schedule_due(&mut conn, due, authority).await?;
@@ -327,13 +347,11 @@ impl VerificationScheduler {
     ///
     /// Each item first takes one permit of the shared execution capacity; no
     /// permit ends the tenant's pass before any claim or read. The
-    /// transaction claims one pending row, resolves the owner/SYSTEM
-    /// authority, pins and enqueues one snapshot (or finds the execution of
-    /// the same snapshot), consumes the row, and commits; the connection and
-    /// permit are released before any Verifier runs. A group whose owner has
-    /// no authority is consumed without an execution, as a scheduled
-    /// occurrence without authority is skipped. A failed or degraded read
-    /// rolls back, leaving the group pending, and ends the tenant's pass.
+    /// transaction claims one pending row, decides it through
+    /// [`Self::hand_off`], consumes the row, and commits; the connection and
+    /// permit are released before any Verifier runs. An item `hand_off`
+    /// leaves pending rolls back and ends the tenant's pass, so the same
+    /// oldest row is not reclaimed until the next pass.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a tenant transaction fails; earlier handoffs
@@ -347,7 +365,7 @@ impl VerificationScheduler {
         groups: &Groups,
         tenant: DataTenantId,
         stop: &CancellationToken,
-        handed: &mut Vec<EnqueueOutcome>,
+        handed: &mut Vec<GroupHandoff>,
     ) -> Result<(), SqlError> {
         for _ in 0..TICKS_PER_TENANT {
             let Ok(_permit) = groups.capacity.try_acquire() else {
@@ -358,55 +376,125 @@ impl VerificationScheduler {
                 let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
                     return Ok::<_, SqlError>(None);
                 };
-                let authority = match due.owner {
-                    Some(owner) => self.authority.resolve(&mut conn, owner).await?,
-                    None => None,
-                };
-                let outcome = match authority {
-                    None => None,
-                    Some(authority) => {
-                        match groups
-                            .poller
-                            .poll(&mut conn, &self.queue, &due, &authority)
-                            .await
-                        {
-                            Ok(outcome) => Some(outcome),
-                            Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
-                            Err(error) => {
-                                tracing::warn!(
-                                    binding_id = %due.binding_id,
-                                    group_id = %due.group_id,
-                                    %error,
-                                    "group snapshot failed; the group stays pending"
-                                );
-                                return Ok(None);
-                            }
-                        }
-                    }
+                let Some(handoff) = self.hand_off(groups, &mut conn, &due).await? else {
+                    return Ok(None);
                 };
                 self.queue.consume_group(&mut conn, &due).await?;
-                Ok(Some((conn, outcome)))
+                Ok(Some((conn, handoff)))
             };
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied?,
             };
-            let Some((conn, outcome)) = applied else {
+            let Some((conn, handoff)) = applied else {
                 return Ok(());
             };
             conn.commit().await?;
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
-                "outcome" => group_label(outcome.as_ref())
+                "outcome" => group_label(handoff)
             )
             .increment(1);
-            handed.extend(outcome);
+            handed.push(handoff);
             if stop.is_cancelled() {
                 return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Decide the claimed pending group `due` on `conn`, writing its
+    /// execution, or `None` to leave it pending.
+    ///
+    /// An active owner's recovered authority pins and enqueues one snapshot
+    /// (or finds the identical snapshot's execution). An inactive owner, a
+    /// rejected owner authority, or a snapshot read query authorization
+    /// denies is recorded through [`VerifierExecutionQueue::refuse_group`]
+    /// as one terminal errored execution, serving the owner's stored
+    /// principal and recorded by SYSTEM. Everything else is a Wyrd-side
+    /// blockage that is traced and leaves the group pending: an owner with
+    /// no Card-bound principal, unavailable authority, a non-auth enqueue
+    /// refusal, a failed or degraded read, or a tenant without SYSTEM to
+    /// record a refusal.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when a statement fails, including the refusal's
+    /// insert; the caller's transaction is then unusable and rolls back.
+    async fn hand_off(
+        &self,
+        groups: &Groups,
+        conn: &mut TenantConn<'_>,
+        due: &DueGroup,
+    ) -> Result<Option<GroupHandoff>, SqlError> {
+        let pending = |reason: &dyn std::fmt::Display| {
+            tracing::warn!(
+                binding_id = %due.binding_id,
+                group_id = %due.group_id,
+                %reason,
+                "group handoff blocked; the group stays pending"
+            );
+            None
+        };
+        let Some(owner) = due.owner else {
+            return Ok(pending(&"the owner has no Card-bound principal"));
+        };
+        let refusal = 'refusal: {
+            if !due.active {
+                break 'refusal WyrdError::CredentialRevoked {
+                    message: "the binding owner is not runtime-active".to_owned(),
+                    details: serde_json::json!({}),
+                };
+            }
+            let authority = match self.authority.resolve(conn, owner).await? {
+                Ok(authority) => authority,
+                Err(AuthorityRefusal::Rejected(error)) => break 'refusal error,
+                Err(AuthorityRefusal::Unavailable) => {
+                    return Ok(pending(&"the owner authority is unavailable"));
+                }
+            };
+            match groups.poller.poll(conn, &self.queue, due, &authority).await {
+                Ok(EnqueueOutcome::Enqueued(id)) => return Ok(Some(GroupHandoff::Enqueued(id))),
+                Ok(EnqueueOutcome::AlreadyEnqueued(id)) => {
+                    return Ok(Some(GroupHandoff::AlreadyEnqueued(id)));
+                }
+                Ok(EnqueueOutcome::Refused(refusal)) => {
+                    return Ok(pending(&format!("{refusal:?}")));
+                }
+                Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
+                Err(GroupPollError::Denied(error)) => error,
+                Err(error @ GroupPollError::Read(_)) => return Ok(pending(&error)),
+            }
+        };
+        let Some(system) = system_principal_id(conn)
+            .await
+            .map_err(SqlError::Query)?
+            .map(PrincipalId::new)
+        else {
+            return Ok(pending(
+                &"the tenant has no SYSTEM principal to record the refusal",
+            ));
+        };
+        let execution = self
+            .queue
+            .refuse_group(conn, due, owner, system, &VerificationError::from(&refusal))
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    binding_id = %due.binding_id,
+                    group_id = %due.group_id,
+                    %error,
+                    "recording the group refusal failed; the group stays pending"
+                );
+            })?;
+        tracing::info!(
+            binding_id = %due.binding_id,
+            group_id = %due.group_id,
+            %execution,
+            reason = %refusal,
+            "group owner refused; recorded a terminal errored execution"
+        );
+        Ok(Some(GroupHandoff::Errored(execution)))
     }
 
     /// Publish the cross-tenant queue depth gauges.
@@ -439,14 +527,12 @@ fn record_depth(queue: &'static str, counts: QueueCounts) {
     }
 }
 
-/// Stable telemetry label of one group handoff; `None` is a group consumed
-/// because its owner had no authority.
-const fn group_label(outcome: Option<&EnqueueOutcome>) -> &'static str {
-    match outcome {
-        Some(EnqueueOutcome::Enqueued(_)) => "group_enqueued",
-        Some(EnqueueOutcome::AlreadyEnqueued(_)) => "group_already_enqueued",
-        Some(EnqueueOutcome::Refused(_)) => "group_refused",
-        None => "group_authority_unavailable",
+/// Stable telemetry label of one committed group handoff.
+const fn group_label(handoff: GroupHandoff) -> &'static str {
+    match handoff {
+        GroupHandoff::Enqueued(_) => "group_enqueued",
+        GroupHandoff::AlreadyEnqueued(_) => "group_already_enqueued",
+        GroupHandoff::Errored(_) => "group_errored",
     }
 }
 

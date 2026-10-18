@@ -3850,7 +3850,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
             Some(owner) => authority
                 .resolve(&mut conn, owner)
                 .await
-                .expect("owner authority resolves"),
+                .expect("owner authority resolves")
+                .ok(),
             None => None,
         };
         let tick = queue

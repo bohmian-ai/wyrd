@@ -29,6 +29,7 @@ use wyrd_runtime::{
     PermissionScope,
 };
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
@@ -200,6 +201,19 @@ impl SystemReadAuthority {
     }
 }
 
+/// Why [`BackgroundAuthority::resolve`] accepted no authority.
+#[derive(Debug)]
+pub enum AuthorityRefusal {
+    /// Recovery rejected the owner: its principal or tenant is not active, or
+    /// its connection was revoked. The error is the catalog error the
+    /// rejection maps to.
+    Rejected(WyrdError),
+    /// Wyrd could not decide: no tenant issuer is configured, the tenant has
+    /// no SYSTEM principal, or recovery failed on corrupt stored state or
+    /// signing. Not proof the owner was refused; work waiting on it retries.
+    Unavailable,
+}
+
 /// Resolves the authority a background Verifier run is accepted under.
 ///
 /// Scheduled runs serve their binding owner: at acceptance
@@ -223,10 +237,14 @@ impl BackgroundAuthority {
     }
 
     /// The owner/SYSTEM authority a run serving `owner` is accepted under,
-    /// or `None` when either identity cannot be resolved in `conn`'s tenant.
+    /// or why none was accepted in `conn`'s tenant.
     ///
     /// Reads SYSTEM and recovers the owner on `conn` without writing, so the
-    /// resolution commits or rolls back with the run it authorizes.
+    /// resolution commits or rolls back with the run it authorizes. Only an
+    /// inactive principal, tenant, or connection is
+    /// [`AuthorityRefusal::Rejected`]; missing configuration, a missing
+    /// SYSTEM principal, and corrupt or unsignable state are
+    /// [`AuthorityRefusal::Unavailable`] and logged.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a tenant read fails; the caller's
@@ -235,10 +253,10 @@ impl BackgroundAuthority {
         &self,
         conn: &mut TenantConn<'_>,
         owner: PrincipalId,
-    ) -> Result<Option<ExecutionAuthority>, SqlError> {
+    ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
         let Some(issuer) = &self.issuer else {
             tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
-            return Ok(None);
+            return Ok(Err(AuthorityRefusal::Unavailable));
         };
         let Some(system) = system_principal_id(conn)
             .await
@@ -246,18 +264,26 @@ impl BackgroundAuthority {
             .map(PrincipalId::new)
         else {
             tracing::warn!(%owner, "the tenant has no SYSTEM principal; background run not accepted");
-            return Ok(None);
+            return Ok(Err(AuthorityRefusal::Unavailable));
         };
         match issuer.recover(conn, owner.as_uuid()).await {
-            Ok(verified) => Ok(Some(ExecutionAuthority::background(
+            Ok(verified) => Ok(Ok(ExecutionAuthority::background(
                 AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
                 system,
             ))),
             Err(IssuanceError::Store(error)) => Err(error),
             Err(IssuanceError::Database(error)) => Err(SqlError::Query(error)),
+            Err(
+                error @ (IssuanceError::TenantNotAdmitting
+                | IssuanceError::PrincipalInactive
+                | IssuanceError::ConnectionInactive),
+            ) => {
+                tracing::info!(%owner, %error, "binding owner is refused; background run not accepted");
+                Ok(Err(AuthorityRefusal::Rejected(WyrdError::from(error))))
+            }
             Err(error) => {
-                tracing::info!(%owner, %error, "binding owner has no authority; background run not accepted");
-                Ok(None)
+                tracing::warn!(%owner, %error, "binding owner authority is unavailable; background run not accepted");
+                Ok(Err(AuthorityRefusal::Unavailable))
             }
         }
     }

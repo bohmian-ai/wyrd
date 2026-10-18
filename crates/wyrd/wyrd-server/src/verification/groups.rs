@@ -50,6 +50,10 @@ pub enum GroupPollError {
     /// A Postgres statement failed; the caller's transaction is unusable.
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
+    /// Query authorization refused the owner's accepted authority the
+    /// snapshot read; the caller records the refusal as terminal.
+    #[error("group snapshot read denied: {0}")]
+    Denied(WyrdError),
     /// A Bifrost read failed, was degraded, or returned malformed rows; the
     /// caller rolls back so the group stays pending.
     #[error("group snapshot read failed: {0}")]
@@ -57,9 +61,14 @@ pub enum GroupPollError {
 }
 
 impl From<WyrdError> for GroupPollError {
-    /// A failed Bifrost read.
+    /// A permission denial (HTTP 403) is [`Self::Denied`]; every other
+    /// failure is a retryable [`Self::Read`] naming its stable code.
     fn from(error: WyrdError) -> Self {
-        Self::Read(error.to_string())
+        if error.status() == 403 {
+            Self::Denied(error)
+        } else {
+            Self::Read(format!("{}: {error}", error.code()))
+        }
     }
 }
 
@@ -93,9 +102,10 @@ impl GroupPoller {
     ///
     /// # Errors
     /// Returns [`GroupPollError::Sql`] when a Postgres statement fails and
-    /// [`GroupPollError::Read`] when the owner may not query, the read fails,
-    /// is refused or degraded, or a stored declaration or row is malformed;
-    /// the caller rolls back.
+    /// [`GroupPollError::Denied`] when query authorization denies the owner
+    /// the read, and [`GroupPollError::Read`] when the read fails, is refused
+    /// for resources or degraded, or a stored declaration or row is
+    /// malformed.
     pub async fn poll(
         &self,
         conn: &mut TenantConn<'_>,
@@ -153,8 +163,8 @@ impl Reader {
     /// Run `sql` and collect its batches.
     ///
     /// # Errors
-    /// Returns [`GroupPollError::Read`] with the query's error, or when the
-    /// terminal is degraded, since a snapshot missing a live source is not
+    /// Returns the query's error as [`GroupPollError::from`] classifies it,
+    /// or [`GroupPollError::Read`] when the terminal is degraded, since a snapshot missing a live source is not
     /// the visible evidence.
     async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>, GroupPollError> {
         let mut batches = Vec::new();
@@ -172,7 +182,7 @@ impl Reader {
                 },
             )
             .await
-            .map_err(|error| GroupPollError::Read(format!("{}: {error}", error.code())))?;
+            .map_err(GroupPollError::from)?;
         if outcome.terminal.outcome != QueryTerminalOutcome::Success {
             return Err(GroupPollError::Read(format!(
                 "terminal {:?}",
@@ -382,12 +392,22 @@ struct Visible {
 }
 
 impl Visible {
-    /// Record one input row.
+    /// Record one input row of `execution` under `tuple`, keyed by its
+    /// source execution ID.
+    ///
+    /// An execution can appear in several Bifrost rows (replays, later
+    /// files); only the payload with the earliest `wyrd_ingested_at` is kept,
+    /// so the pinned input and the list order are stable across re-reads.
     fn input(&mut self, tuple: usize, execution: ExecutionId, at: DateTime<Utc>, value: Value) {
         Earliest::keep(&mut self.inputs, execution, tuple, at, value);
     }
 
-    /// Record one result row.
+    /// Record one result row of `execution` under `tuple`, keyed by its
+    /// `result` ID rather than the execution.
+    ///
+    /// An execution may own several results (later revisions); each result
+    /// is kept separately so [`Self::executions`] can select the greatest,
+    /// and each keeps only its earliest-ingested row like [`Self::input`].
     fn result(
         &mut self,
         result: VerificationResultId,
@@ -403,7 +423,9 @@ impl Visible {
     /// by earliest input time, else earliest result time, then execution ID.
     /// The selected result is the greatest `(at, result_id)`.
     fn executions(&self, tuple: usize) -> Vec<(ExecutionId, Option<VerificationResultId>)> {
-        // Each execution's earliest input time and earliest result time.
+        /// An execution's two optional ordering anchors: the ingest time of
+        /// its earliest input, then of its earliest result. Either is absent
+        /// when the snapshot holds no such row; the input anchor wins.
         type Firsts = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
         let mut order: BTreeMap<ExecutionId, Firsts> = BTreeMap::new();
         let mut selected: BTreeMap<ExecutionId, (DateTime<Utc>, VerificationResultId)> =

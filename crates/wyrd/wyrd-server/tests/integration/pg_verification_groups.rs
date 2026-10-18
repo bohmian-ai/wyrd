@@ -30,7 +30,7 @@ use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
-use wyrd_server::verification::scheduler::VerificationScheduler;
+use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
@@ -249,6 +249,13 @@ impl Support {
 
     /// The acknowledged activity of one `turn-check` source item in `group`,
     /// as the Scribe writer records it.
+    ///
+    /// C13 uses it to drive the pending-row upsert directly beside a held
+    /// handoff, with the support fixture's owner, agent and `turn-check`
+    /// identities.
+    ///
+    /// # Panics
+    /// Panics when `group` is not a valid [`GroupId`].
     fn activity(&self, group: &str) -> GroupActivity {
         GroupActivity {
             owner_card_uid: self.owner.clone(),
@@ -289,8 +296,8 @@ impl Support {
     ///
     /// # Panics
     /// Panics when `outcome` created nothing or the queue runs out first.
-    async fn claim_group(&self, outcome: &EnqueueOutcome) -> ClaimedExecution {
-        let EnqueueOutcome::Enqueued(execution) = outcome else {
+    async fn claim_group(&self, outcome: &GroupHandoff) -> ClaimedExecution {
+        let GroupHandoff::Enqueued(execution) = outcome else {
             panic!("the pass did not create a group execution: {outcome:?}");
         };
         loop {
@@ -331,8 +338,8 @@ impl Support {
     ///
     /// # Panics
     /// Panics when `outcome` created nothing or the execution has no group.
-    async fn snapshot(&self, outcome: &EnqueueOutcome) -> Value {
-        let EnqueueOutcome::Enqueued(execution) = outcome else {
+    async fn snapshot(&self, outcome: &GroupHandoff) -> Value {
+        let GroupHandoff::Enqueued(execution) = outcome else {
             panic!("the poll did not create a group execution: {outcome:?}");
         };
         let execution = self.execution(*execution).await;
@@ -501,8 +508,8 @@ async fn available_rows_form_expiring_group_snapshots() {
     support.make_due().await;
     let replayed = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert!(
-        matches!(replayed.as_slice(), [EnqueueOutcome::AlreadyEnqueued(execution)]
-            if EnqueueOutcome::Enqueued(*execution) == handed[0]),
+        matches!(replayed.as_slice(), [GroupHandoff::AlreadyEnqueued(execution)]
+            if GroupHandoff::Enqueued(*execution) == handed[0]),
         "a replayed row pins the same snapshot: {replayed:?}"
     );
 

@@ -182,7 +182,11 @@ impl Reference {
 /// [`SourceReference`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SourceText(String);
+pub struct SourceText(
+    /// The authored `verifiers.<name>...` text, kept verbatim so coverage
+    /// pins exactly what the author wrote.
+    String,
+);
 
 impl SourceText {
     /// The authored text.

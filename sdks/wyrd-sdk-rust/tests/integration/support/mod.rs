@@ -496,7 +496,11 @@ impl Hooks {
 }
 
 /// The hook's responder: answers 200 and hands every request to the story.
-struct Forward(UnboundedSender<Request>);
+struct Forward(
+    /// The story's delivery channel; a send after the story dropped its
+    /// receiver is ignored.
+    UnboundedSender<Request>,
+);
 
 impl Respond for Forward {
     /// Forward `request` to the story and acknowledge it.

@@ -136,6 +136,9 @@ impl TriggerDuration {
 
 impl fmt::Display for TriggerDuration {
     /// Writes the authored text.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] when the formatter's writer fails.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text)
     }
@@ -150,6 +153,11 @@ impl From<TriggerDuration> for String {
 
 impl<'de> Deserialize<'de> for TriggerDuration {
     /// Decodes and validates authored `<n><unit>` text.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the value is not a string, and
+    /// a custom error carrying the [`TriggerDuration::parse`] refusal when
+    /// the text is not a valid duration.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         Self::parse(&text).map_err(serde::de::Error::custom)

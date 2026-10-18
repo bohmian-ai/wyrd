@@ -202,7 +202,7 @@ fn answer_text() -> [Citation; 1] {
 ///
 /// # Panics
 /// Panics when the result has no such requirement.
-fn requirement<'a>(result: &'a VerificationResult, id: &str) -> &'a RequirementResult {
+pub(crate) fn requirement<'a>(result: &'a VerificationResult, id: &str) -> &'a RequirementResult {
     result
         .outcome
         .requirements

@@ -445,6 +445,24 @@ impl Deployment {
         }
     }
 
+    /// Shut the server down and boot `builder` over the same Postgres and
+    /// artifact storage, as a process restart does. Durable rows, the
+    /// administrator key among them, survive; the address changes, so
+    /// clients are built again from the returned deployment.
+    ///
+    /// # Panics
+    /// Panics when the server does not shut down or the replacement does
+    /// not start.
+    pub async fn restart(self, builder: WyrdTestServerBuilder) -> Self {
+        let server = Box::pin(self.server.restart_bound(builder))
+            .await
+            .expect("test server restarts");
+        Self {
+            server,
+            admin_key: self.admin_key,
+        }
+    }
+
     /// Stop the server.
     ///
     /// # Panics

@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: frame-verifier
+  version: 1.0.0
+  space: default
+spec:
+  description: One application-sampled frame shows a person wearing a badge.
+  inputs:
+    frame: {type: media, formats: [jpeg, png], max_bytes: 65536}
+  requirements:
+    - id: person-wearing-badge
+      statement: The person in the frame wears a badge
+      check:
+        kind: agent
+        agent: ./frame-judge.yaml
+        inputs: {claim: requirement.statement, frame: inputs.frame}

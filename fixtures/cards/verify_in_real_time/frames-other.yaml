@@ -1,0 +1,15 @@
+# Another person-detection Service judging frames with the same frame
+# Verifier, whose rows never enter the frames Service's groups.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: frames-other
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./frame-verifier.yaml

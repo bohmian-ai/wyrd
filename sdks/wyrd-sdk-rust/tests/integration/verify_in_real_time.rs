@@ -28,12 +28,12 @@ use wyrd_ai::{
 };
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::VerifierReadiness;
-use wyrd_testing::server::WyrdTestServer;
+use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, ancestry, coordinates, fixture, hydrate, register, registered};
-use crate::verifier_building_blocks::{completion, tool_call};
+use crate::verifier_building_blocks::{completion, requirement, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);
@@ -63,6 +63,17 @@ pub(crate) struct Assistant {
     agent: CardRef,
 }
 
+/// `builder` running the verification runtime, its gateway provider root
+/// at the local `judge`.
+///
+/// # Panics
+/// Panics when the judge URL does not parse.
+fn on_judge(builder: WyrdTestServerBuilder, judge: &MockServer) -> WyrdTestServerBuilder {
+    builder
+        .with_verification_runtime_for_test()
+        .with_gateway_provider_root_for_test(judge.uri().parse().expect("judge URL parses"))
+}
+
 impl Assistant {
     /// Start the judge and the server, deploy the judge model on the gateway,
     /// then register the latency baseline, the latency Model, and the
@@ -71,6 +82,15 @@ impl Assistant {
     /// # Panics
     /// Panics when a setup step fails.
     pub(crate) async fn start() -> Self {
+        Box::pin(Self::start_with(WyrdTestServer::builder())).await
+    }
+
+    /// [`Self::start`] on a server `builder` configures, which also runs
+    /// the verification runtime on the local judge.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start_with(builder: WyrdTestServerBuilder) -> Self {
         let judge = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -88,14 +108,7 @@ impl Assistant {
             })))
             .mount(&judge)
             .await;
-        let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
-                .with_verification_runtime_for_test()
-                .with_gateway_provider_root_for_test(
-                    judge.uri().parse().expect("judge URL parses"),
-                ),
-        )
-        .await;
+        let deployment = Deployment::start_with(on_judge(builder, &judge)).await;
         configure_gateway(&deployment.admin()).await;
         Gateway::connect_with(&deployment.admin())
             .await
@@ -1579,22 +1592,20 @@ const REVIEWED: &str = r#"{"outcome":"passed","reason":"the spans were read","ci
 /// What a Chat Completions request carrying tool results contains.
 const TOOL_TURN: &str = r#""role":"tool""#;
 
-impl Assistant {
-    /// Every request body the local judge received for the `coding-review`
-    /// `spans-reviewed` check, in arrival order.
-    ///
-    /// # Panics
-    /// Panics when the judge does not record requests.
-    async fn live_reviews(&self) -> Vec<String> {
-        self.judge
-            .received_requests()
-            .await
-            .expect("the judge records requests")
-            .iter()
-            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
-            .filter(|body| body.contains(LIVE_REVIEW))
-            .collect()
-    }
+/// Every request body the local `judge` received that contains `marker`,
+/// in arrival order.
+///
+/// # Panics
+/// Panics when the judge does not record requests.
+async fn judged_bodies(judge: &MockServer, marker: &str) -> Vec<String> {
+    judge
+        .received_requests()
+        .await
+        .expect("the judge records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains(marker))
+        .collect()
 }
 
 /// Script the `coding-judge` check Agent on the local judge: a request that
@@ -1789,8 +1800,7 @@ async fn grouped_coding_uses_declared_sources() {
         outcome.requirements
     );
     assert_eq!(outcome.verdict, VerificationVerdict::Failed);
-    let (reads, asks): (Vec<_>, Vec<_>) = assistant
-        .live_reviews()
+    let (reads, asks): (Vec<_>, Vec<_>) = judged_bodies(&assistant.judge, LIVE_REVIEW)
         .await
         .into_iter()
         .partition(|body| body.contains(TOOL_TURN));
@@ -1829,8 +1839,7 @@ async fn grouped_coding_uses_declared_sources() {
         .group_execution(&coding.binding, Some(&judged.execution_id), WAIT)
         .await;
     assert_eq!(revoked.group_id.as_ref(), Some(&later));
-    let denied: Vec<_> = assistant
-        .live_reviews()
+    let denied: Vec<_> = judged_bodies(&assistant.judge, LIVE_REVIEW)
         .await
         .into_iter()
         .filter(|body| body.contains(TOOL_TURN) && body.contains("WYRD_PERMISSION_403_DENIED_RBAC"))
@@ -1873,4 +1882,324 @@ async fn grouped_coding_uses_declared_sources() {
     }
     coding.state.shutdown().await.expect("Bifrost stops");
     assistant.deployment.shutdown().await;
+}
+
+/// The frame judge's Verdict for a frame showing a badge: passed, citing the
+/// frame, an image, as its one page.
+const BADGED: &str = r#"{"outcome":"passed","reason":"a badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+/// The frame judge's Verdict for the frame showing no badge.
+const NO_BADGE: &str = r#"{"outcome":"failed","reason":"no badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+/// Text every `frame-verifier` judge request carries.
+const FRAME_CLAIM: &str = "Cite the frame.";
+
+/// The label of the one frame whose person wears no badge.
+const UNBADGED: &str = "no badge!";
+
+/// [`UNBADGED`] in base64, as the judge's image data URL carries it.
+const UNBADGED_BASE64: &str = "bm8gYmFkZ2Uh";
+
+/// The label of the frame running when the server dies.
+const SLOW: &str = "slow lens";
+
+/// [`SLOW`] in base64, as the judge's image data URL carries it.
+const SLOW_BASE64: &str = "c2xvdyBsZW5z";
+
+/// Write a PNG frame into `dir` carrying the nine-byte `label` right after
+/// the signature and a newline. Those nine bytes start the label on a base64
+/// boundary, so its base64 appears verbatim in the image data URL the judge
+/// receives.
+///
+/// # Panics
+/// Panics when `label` is not nine bytes or the file cannot be written.
+fn frame(dir: &TempDir, label: &str) -> std::path::PathBuf {
+    assert_eq!(label.len(), 9, "a frame label is nine bytes");
+    let path = dir.path().join(format!("{label}.png"));
+    std::fs::write(
+        &path,
+        [b"\x89PNG\r\n\x1a\n\n".as_slice(), label.as_bytes()].concat(),
+    )
+    .expect("the frame writes");
+    path
+}
+
+/// Script the `frame-judge` on the local judge: the [`UNBADGED`] frame fails,
+/// the first [`SLOW`] request answers only after the server has died, and
+/// every other frame passes with [`BADGED`].
+async fn script_frame_judge(judge: &MockServer) {
+    let verdict = |content: &str| completion(json!({ "role": "assistant", "content": content }));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(UNBADGED_BASE64))
+        .respond_with(verdict(NO_BADGE))
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(SLOW_BASE64))
+        .respond_with(verdict(BADGED).set_delay(Duration::from_secs(60)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(FRAME_CLAIM))
+        .respond_with(verdict(BADGED))
+        .with_priority(2)
+        .mount(judge)
+        .await;
+}
+
+/// Submit each frame at `paths` to `frame-verifier` in one Run of `state`'s
+/// `agent` under `group`, returning the queued executions in submission order.
+///
+/// # Panics
+/// Panics when the Run does not open or a submission is not queued.
+async fn submit_frames(
+    state: &WyrdState,
+    group: &GroupId,
+    paths: &[std::path::PathBuf],
+) -> Vec<Execution> {
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let mut executions = Vec::new();
+    for path in paths {
+        let Submission::Queued(queued) = run
+            .observe()
+            .group_id(group.clone())
+            .submit("frame-verifier", File::path(path))
+            .await
+            .expect("the frame is submitted")
+        else {
+            panic!("a frame submission queues an execution");
+        };
+        executions.push(queued);
+    }
+    executions
+}
+
+/// An application samples door events into PNG frames, submits each frame
+/// under the event id as `group_id`, and reports the event fact; once the
+/// event goes idle `event-review` judges the whole frame list. Zero frames
+/// are inconclusive `empty_selection`; one unbadged frame of twenty fails
+/// the event, and frames another Service or an unauthorized caller submits
+/// never join it; twenty-one frames exceed the ceiling of twenty and are
+/// inconclusive `source_execution_limit_exceeded` with nothing judged; and
+/// exactly twenty frames pass even when the server dies while one is
+/// running: only that frame is judged again, and it counts once.
+///
+/// # Panics
+/// Panics when a step fails, an event is not judged in time, or a judgment
+/// or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_sampled_frames_are_bounded() {
+    let assistant = Box::pin(Assistant::start_with(
+        WyrdTestServer::builder().with_shutdown_drain_for_test(Duration::from_secs(2)),
+    ))
+    .await;
+    script_frame_judge(&assistant.judge).await;
+    let deployment = &assistant.deployment;
+    let frames = assistant
+        .grouped("cards/verify_in_real_time/frames.yaml")
+        .await;
+    let cards = deployment.cards().await;
+    let other = register(&cards, "cards/verify_in_real_time/frames-other.yaml").await;
+    let other_bundle = hydrate(&cards, &other.root).await;
+    let other_state = WyrdState::from_path_with(
+        other_bundle.path().join("bundle"),
+        deployment.client(&deployment.service_key(&other.root).await),
+    )
+    .expect("bundle loads");
+    other_state.start_bifrost().await.expect("Bifrost starts");
+    let dir = TempDir::new().expect("frame directory");
+    let outcomes = "outcomes".parse().expect("slot name");
+    let event = "event".parse().expect("slot name");
+    let fact = |id: &str| json!({ "event_id": id, "detected": true });
+    let reason = |judged: &wyrd_spec::verification::execution::VerificationExecutionState| {
+        let result = judged.result.as_ref().expect("the result is visible");
+        (
+            result.outcome.verdict,
+            requirement(result, "every-frame-badged").reason.clone(),
+        )
+    };
+
+    let empty = GroupId::new("door-44").expect("group id");
+    frames.turn("event-fact", &empty, fact("door-44")).await;
+    let judged = deployment
+        .group_execution(&frames.binding, None, WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&empty));
+    assert_eq!(
+        reason(&judged),
+        (
+            VerificationVerdict::Inconclusive,
+            "empty_selection".to_owned()
+        )
+    );
+    let evidence = &judged
+        .result
+        .as_ref()
+        .expect("the result is visible")
+        .outcome
+        .evidence;
+    assert_eq!(
+        serde_json::to_value(&evidence[&outcomes]).expect("evidence encodes"),
+        json!({ "kind": "json", "value": [] }),
+    );
+
+    let failing = GroupId::new("door-43").expect("group id");
+    let mut paths: Vec<_> = (1..=19)
+        .map(|index| frame(&dir, &format!("door43-{index:02}")))
+        .collect();
+    paths.insert(7, frame(&dir, UNBADGED));
+    let executions = submit_frames(&frames.state, &failing, &paths).await;
+    for foreign in submit_frames(&other_state, &failing, &[frame(&dir, "other-001")]).await {
+        foreign
+            .wait(WAIT)
+            .await
+            .expect("the other Service's frame is judged");
+    }
+    let unauthorized = deployment
+        .verifier_key("frames_denied", &assistant.answer_check)
+        .await;
+    let denied = WyrdState::from_path_with(
+        frames.bundle.path().join("bundle"),
+        deployment.client(&unauthorized),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(failing.clone())
+    .submit("frame-verifier", File::path(frame(&dir, "denied-01")))
+    .await
+    .expect_err("verifier:run on another Verifier is no grant");
+    assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC", "{denied}");
+    frames.turn("event-fact", &failing, fact("door-43")).await;
+    for execution in &executions {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let judged = deployment
+        .group_execution(&frames.binding, Some(&judged.execution_id), WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&failing));
+    let coverage = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    assert_eq!(
+        coverage.sources[&outcomes].execution_ids,
+        executions
+            .iter()
+            .map(|execution| *execution.id())
+            .collect::<Vec<_>>(),
+        "only the Service's own frames, in submission order"
+    );
+    assert_eq!(coverage.sources[&event].execution_ids.len(), 1);
+    let mut expected = vec!["passed"; 20];
+    expected[7] = "failed";
+    let outcome = &judged
+        .result
+        .as_ref()
+        .expect("the result is visible")
+        .outcome;
+    assert_eq!(
+        serde_json::to_value(&outcome.evidence[&outcomes]).expect("evidence encodes"),
+        json!({ "kind": "json", "value": expected }),
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+
+    let over = GroupId::new("door-45").expect("group id");
+    let paths: Vec<_> = (1..=21)
+        .map(|index| frame(&dir, &format!("door45-{index:02}")))
+        .collect();
+    let executions = submit_frames(&frames.state, &over, &paths).await;
+    frames.turn("event-fact", &over, fact("door-45")).await;
+    for execution in &executions {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let judged = deployment
+        .group_execution(&frames.binding, Some(&judged.execution_id), WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&over));
+    assert_eq!(
+        reason(&judged),
+        (
+            VerificationVerdict::Inconclusive,
+            "source_execution_limit_exceeded: verifiers.frame-verifier.requirements.person-wearing-badge.outcome selected more than 20 source executions".to_owned()
+        )
+    );
+
+    let door = GroupId::new("door-42").expect("group id");
+    let mut paths: Vec<_> = (1..=19)
+        .map(|index| frame(&dir, &format!("door42-{index:02}")))
+        .collect();
+    paths.push(frame(&dir, SLOW));
+    let executions = submit_frames(&frames.state, &door, &paths).await;
+    frames.turn("event-fact", &door, fact("door-42")).await;
+    for execution in &executions[..19] {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let ids: Vec<_> = executions.iter().map(|execution| *execution.id()).collect();
+    let mut after = judged.execution_id;
+    frames.state.shutdown().await.expect("Bifrost stops");
+    other_state.shutdown().await.expect("Bifrost stops");
+    // Rows the dying process has not published are outbox loss; the
+    // positive variant publishes the 19 judged frames first.
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let Assistant {
+        deployment, judge, ..
+    } = assistant;
+    let deployment = deployment
+        .restart(on_judge(WyrdTestServer::builder(), &judge))
+        .await;
+    Execution::connect_with(ids[19], &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the running frame recovers and is judged");
+    let judged = loop {
+        let judged = deployment
+            .group_execution(&frames.binding, Some(&after), WAIT)
+            .await;
+        assert_eq!(judged.group_id.as_ref(), Some(&door));
+        if reason(&judged).0 == VerificationVerdict::Passed {
+            break judged;
+        }
+        // An idle review before the recovered result saw a null outcome;
+        // the visible result makes the next serial review due.
+        after = judged.execution_id;
+    };
+    let coverage = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    assert_eq!(coverage.sources[&outcomes].execution_ids, ids);
+    assert_eq!(
+        serde_json::to_value(
+            &judged
+                .result
+                .as_ref()
+                .expect("the result is visible")
+                .outcome
+                .evidence[&outcomes]
+        )
+        .expect("evidence encodes"),
+        json!({ "kind": "json", "value": vec!["passed"; 20] }),
+    );
+    assert_eq!(judged_bodies(&judge, SLOW_BASE64).await.len(), 2);
+    assert_eq!(
+        judged_bodies(&judge, FRAME_CLAIM).await.len(),
+        20 + 1 + 21 + 20 + 1,
+        "every frame is judged once, and only the running one again"
+    );
+    deployment.shutdown().await;
 }

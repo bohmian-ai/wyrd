@@ -1197,7 +1197,7 @@ never a refusal: checks that need it are inconclusive.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | A tool-less Agent returning the closed Verdict schema `{outcome, reason, citations}` |
+| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` |
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
@@ -1403,7 +1403,10 @@ is charged to the subject.
 Agent owns Prompt, tools, run configuration, and `execution_route`;
 server-hosted calls require `wyrd_gateway`. Overrides are keyed by step or
 requirement ID and replace that call's route whole. A check-position Agent is
-tool-less. A step Agent may declare a `workspace` mapping read-only `/inputs`
+tool-less unless it explicitly declares `bifrost.query`, its only permitted
+tool: each call needs the ordinary tool-invoke, query and payload permissions,
+there is no workspace and no mutating tool, and span data it reads live stays
+outside the pinned snapshot. A step Agent may declare a `workspace` mapping read-only `/inputs`
 paths to evidence; `/work` is bounded scratch for that invocation only.
 
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,

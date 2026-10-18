@@ -270,10 +270,7 @@ impl VerificationScheduler {
                     None => None,
                 };
                 if let Some(authority) = authority {
-                    match groups
-                        .poll(&mut conn, &self.queue, tenant, &due, &authority)
-                        .await
-                    {
+                    match groups.poll(&mut conn, &self.queue, &due, &authority).await {
                         Ok(enqueued) => {
                             for outcome in enqueued {
                                 metrics::counter!(

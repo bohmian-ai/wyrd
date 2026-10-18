@@ -2,14 +2,15 @@
 //!
 //! [`GroupPoller`] serves one binding claimed by
 //! [`VerifierExecutionQueue::claim_due_group`]. It discovers, in Bifrost, the
-//! groups whose newest source input or result row is newer than the
-//! binding's own latest visible group result, reads each candidate's source
-//! row identities, and decides in Rust whether the group ended (idle or
-//! max_age) within its finality bound. A due group whose newest row no
-//! queued group execution covers gets one pinned snapshot: per source slot
-//! one ordered, deduplicated list read from the source executions' inputs
-//! or authoritative results, or, past the deployment ceiling, no read at all.
-//! Every read runs as the tenant SYSTEM principal serving the binding owner.
+//! groups whose first source row is still within the binding's finality,
+//! newest activity first. Per candidate it counts each source binding's
+//! distinct executions, reads the row identities of the bindings within the
+//! deployment ceiling, and decides in Rust whether the group ended (idle or
+//! max_age) within its finality bound. A due group whose rows no queued group
+//! execution covers gets one pinned snapshot: per source slot one ordered,
+//! deduplicated list read from exactly those executions' inputs or
+//! authoritative results, or, past the ceiling, no read at all. Every read
+//! runs under the binding owner's accepted authority, executed by SYSTEM.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -19,11 +20,8 @@ use arrow::util::display::array_value_to_string;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::verification::{ExecutionInputsTable, ResultsTable};
-use wyrd_spec::DataTenantId;
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
@@ -36,29 +34,19 @@ use wyrd_sql::queries::verifier_executions::{
     DueGroupBinding, EnqueueOutcome, ExecutionAuthority, GroupSnapshot, VerifierExecutionQueue,
 };
 
-use super::authority::SystemReadAuthority;
 use super::drift::ObservationWindow;
+use crate::components::auth::Caller;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
 /// Error code of a read of a Bifrost table the tenant never created.
 const TABLE_NOT_FOUND: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
-/// Candidate groups one poll of one binding examines, least recently active
-/// first.
-// ponytail: a binding with more ended, unjudged groups than this drains them
-// over successive polls; page by newest row time if one poll must take more.
+/// Candidate groups one poll of one binding examines, newest activity first.
+// ponytail: a binding with more open in-finality groups than this examines
+// only the newest-active page each poll; add a continuing discovery cursor if
+// older open groups must be judged while newer ones stay active.
 const GROUPS_PER_POLL: usize = 64;
-
-/// How far past `idle` discovery still looks for a group's newest row.
-// ponytail: a group that ended more than this before any poll ran (a
-// scheduler outage) is not rediscovered; widen it or persist a watermark if
-// outages that long must still be judged.
-const DISCOVERY_SLACK: TimeDelta = TimeDelta::hours(1);
-
-/// Source row identities one group may hold; a larger group is skipped,
-/// never judged truncated.
-const ROWS_PER_GROUP: usize = 100_000;
 
 /// Why one poll did not finish.
 #[derive(Debug, thiserror::Error)]
@@ -104,67 +92,60 @@ impl GroupPoller {
     }
 
     /// Enqueue one group execution for every ended, uncovered group of the
-    /// claimed binding `due` in `tenant`, under `authority`.
+    /// claimed binding `due`, under the owner's accepted `authority`.
     ///
-    /// Discovery reads at most [`GROUPS_PER_POLL`] candidates; each candidate
-    /// is skipped when it is not yet due, has an outstanding group execution,
-    /// or is already covered by the latest one. Rows of a submission the
-    /// queue refused, such as an idempotency conflict, are not source rows
-    /// and are dropped before the end is judged. A candidate whose rows exceed
-    /// [`ROWS_PER_GROUP`] is logged and skipped. The caller commits the
-    /// returned enqueues together with the binding's advanced cursor.
+    /// Every statement runs as `authority` executed by its SYSTEM actor, so
+    /// ordinary query admission, table authorization and denial audit decide
+    /// what the owner may read. Discovery reads at most [`GROUPS_PER_POLL`]
+    /// candidates; each candidate is skipped when it is not yet due, has an
+    /// outstanding group execution, is already covered by the latest one, or
+    /// its selected payloads are not all visible yet (the next poll retries
+    /// it). Rows of a submission the queue refused, such as an idempotency
+    /// conflict, are not source rows and are dropped before the end is
+    /// judged. The caller commits the returned enqueues together with the
+    /// binding's advanced cursor.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Sql`] when a Postgres statement fails and
-    /// [`GroupPollError::Read`] when a Bifrost read fails or a stored
-    /// source declaration or row is malformed; enqueues made before the
-    /// failure stay in the caller's transaction.
+    /// [`GroupPollError::Read`] when the owner may not query, a Bifrost read
+    /// fails or is refused, or a stored source declaration or row is
+    /// malformed; enqueues of whole snapshots made before the failure stay in
+    /// the caller's transaction.
     pub async fn poll(
         &self,
         conn: &mut TenantConn<'_>,
         queue: &VerifierExecutionQueue,
-        tenant: DataTenantId,
         due: &DueGroupBinding,
         authority: &ExecutionAuthority,
     ) -> Result<Vec<EnqueueOutcome>, GroupPollError> {
-        let read = SystemReadAuthority::resolve(
-            &self.state,
-            tenant,
-            Some(authority.attribution().act_principal_id),
-            &[
-                TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME),
-                TableRef::new(BifrostNamespace::Verification, ResultsTable::NAME),
-            ],
-        )
-        .await
-        .map_err(|error| GroupPollError::Read(error.to_string()))?
-        .serving(authority.authority());
-        if read.context().principal.effective_permissions.is_empty() {
-            return Ok(Vec::new());
-        }
+        let caller = Caller::accepted(
+            authority.authority(),
+            authority.attribution().act_principal_id,
+        );
         let mut poll = BindingPoll {
-            query: ScheduledQueryCaller::new(
+            query: ScheduledQueryCaller::authenticated(
                 self.state.clone(),
-                read.into_context(),
+                caller,
                 CancellationToken::new(),
-            ),
+            )?,
             deadline_ms: i64::try_from(self.query_timeout.as_millis()).unwrap_or(i64::MAX),
             sources: Sources::new(&due.settings, &due.owner_card_uid.to_string())?,
-            ceiling: self.ceiling as usize,
+            ceiling: u64::from(self.ceiling),
             due,
             results: true,
         };
         let mut enqueued = Vec::new();
         for group in poll.candidates().await? {
-            let mut rows = poll.identities(&group).await?;
-            if rows.len() > ROWS_PER_GROUP {
-                tracing::warn!(binding_id = %due.binding_id, group_id = %group, "group exceeds its source row bound; not judged");
-                continue;
-            }
+            let counts = poll.counts(&group).await?;
+            let over: BTreeMap<usize, TupleCount> = counts
+                .into_iter()
+                .filter(|(_, count)| count.executions > poll.ceiling)
+                .collect();
+            let mut rows = poll.identities(&group, &over).await?;
             let ids: Vec<ExecutionId> = rows.iter().map(|row| row.execution_id).collect();
             let refused = queue.refused_submissions(conn, &ids).await?;
             rows.retain(|row| !refused.contains(&row.execution_id));
-            let Some(ended) = Ended::judge(&rows, &due.settings, due.clock) else {
+            let Some(ended) = Ended::judge(&rows, over.values(), &due.settings, due.clock) else {
                 continue;
             };
             let states = queue
@@ -175,7 +156,12 @@ impl GroupPoller {
             }) {
                 continue;
             }
-            let snapshot = poll.snapshot(conn, queue, group, &rows, &ended).await?;
+            let Some(snapshot) = poll
+                .snapshot(conn, queue, group, &rows, &over, &ended)
+                .await?
+            else {
+                continue;
+            };
             enqueued.push(
                 queue
                     .enqueue_group(conn, due.binding_id, &snapshot, authority)
@@ -186,60 +172,57 @@ impl GroupPoller {
     }
 }
 
-/// One claimed binding's poll: its SYSTEM reader, sources and filters.
+/// One claimed binding's poll: its owner-authorized reader, sources and
+/// filters.
 struct BindingPoll<'a> {
-    /// The authorized caller every statement runs through.
+    /// The owner's accepted caller every statement runs through.
     query: ScheduledQueryCaller,
     /// Deadline of one statement, in milliseconds.
     deadline_ms: i64,
     /// The binding's parsed source slots.
     sources: Sources,
     /// The deployment source-execution ceiling of one source reference.
-    ceiling: usize,
+    ceiling: u64,
     /// The claimed binding.
     due: &'a DueGroupBinding,
     /// Whether the tenant's results table exists; until it does, sources
-    /// have inputs only and the binding has no group result.
+    /// have inputs only.
     results: bool,
 }
 
 impl BindingPoll<'_> {
-    /// Groups with a source row in the discovery window newer than the
-    /// binding's latest visible result for them, least recently active
-    /// first, at most [`GROUPS_PER_POLL`].
+    /// Groups whose first visible source row is within the binding's
+    /// finality of the tick clock, newest activity first, at most
+    /// [`GROUPS_PER_POLL`].
     ///
-    /// A tenant without a results table is discovered from inputs alone,
-    /// and the poll remembers that for its later reads.
+    /// Nothing past finality can open a group execution, so finality is the
+    /// only discovery bound; the queue's coverage decides what is new. A
+    /// finality reaching before the earliest representable instant bounds
+    /// nothing. A tenant without a results table is discovered from inputs
+    /// alone, and the poll remembers that for its later reads.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Read`] when a read fails or a group ID is
     /// malformed.
     async fn candidates(&mut self) -> Result<Vec<GroupId>, GroupPollError> {
-        let since = ObservationWindow::instant(
-            self.due.clock - span(&self.due.settings.idle) - DISCOVERY_SLACK,
-        );
-        let window = |column: &str| format!("{column} >= {since}");
-        let judged = format!(
-            "SELECT s.group_id, MAX(s.at) AS newest FROM ({rows}) s \
-             LEFT JOIN (SELECT group_id, MAX(ended_at) AS judged FROM vala.verification.results \
-             WHERE binding_id = {binding} AND verifier_card_uid = {verifier} \
-             AND group_id IS NOT NULL AND ended_at >= {since} GROUP BY group_id) j \
-             ON s.group_id = j.group_id \
-             GROUP BY s.group_id, j.judged HAVING j.judged IS NULL OR MAX(s.at) > j.judged \
-             ORDER BY newest, s.group_id LIMIT {GROUPS_PER_POLL}",
-            rows = self.surfaces(window),
-            binding = ObservationWindow::text(&self.due.binding_id.to_string()),
-            verifier = ObservationWindow::text(&self.due.verifier_card_uid.to_string()),
-        );
-        let batches = match self.run(&judged).await {
+        let open = self
+            .due
+            .clock
+            .checked_sub_signed(span(&self.due.settings.finality))
+            .map(|since| format!(" HAVING MIN(at) >= {}", ObservationWindow::instant(since)))
+            .unwrap_or_default();
+        // ponytail: scans the binding's whole retained source history each
+        // poll; prune by a time-partitioned semi-join if that outgrows a poll.
+        let sql = |rows: String| {
+            format!(
+                "SELECT group_id, MAX(at) AS newest FROM ({rows}) s GROUP BY group_id{open} \
+                 ORDER BY newest DESC, group_id LIMIT {GROUPS_PER_POLL}"
+            )
+        };
+        let batches = match self.run(&sql(self.surfaces("true"))).await {
             Err(error) if error.code() == TABLE_NOT_FOUND => {
                 self.results = false;
-                self.query(&format!(
-                    "SELECT group_id, MAX(at) AS newest FROM ({}) s GROUP BY group_id \
-                     ORDER BY newest, group_id LIMIT {GROUPS_PER_POLL}",
-                    self.surfaces(window)
-                ))
-                .await?
+                self.query(&sql(self.surfaces("true"))).await?
             }
             batches => batches?,
         };
@@ -254,19 +237,63 @@ impl BindingPoll<'_> {
         Ok(groups)
     }
 
-    /// Every visible source row identity of `group`, one more than
-    /// [`ROWS_PER_GROUP`] at most.
+    /// Per source tuple of `group`, its distinct executions and rows, read
+    /// before any identity so a tuple over the ceiling is never listed.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Read`] when the read fails or a row is
     /// malformed.
-    async fn identities(&self, group: &GroupId) -> Result<Vec<SourceRow>, GroupPollError> {
-        let group = ObservationWindow::text(group.as_str());
+    async fn counts(&self, group: &GroupId) -> Result<BTreeMap<usize, TupleCount>, GroupPollError> {
+        let sql = format!(
+            "SELECT card_uid, verifier_card_uid, COUNT(DISTINCT execution_id) AS executions, \
+             COUNT(*) AS members, MIN(at) AS first, MAX(at) AS newest FROM \
+             (SELECT DISTINCT surface, card_uid, verifier_card_uid, execution_id, at FROM ({}) s) d \
+             GROUP BY card_uid, verifier_card_uid",
+            self.surfaces(&self.group(group))
+        );
+        let mut counts = BTreeMap::new();
+        for batch in self.query(&sql).await? {
+            let (first, newest) = (times(&batch, "first")?, times(&batch, "newest")?);
+            for row in 0..batch.num_rows() {
+                let Some(tuple) = self.sources.tuple(&batch, row)? else {
+                    continue;
+                };
+                counts.insert(
+                    tuple,
+                    TupleCount {
+                        executions: number(&batch, "executions", row)?,
+                        members: number(&batch, "members", row)?,
+                        first: instant(first, row)?,
+                        newest: instant(newest, row)?,
+                    },
+                );
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Every distinct visible source row identity of `group` outside the
+    /// `over`-ceiling tuples, so at most the ceiling's executions per tuple.
+    ///
+    /// # Errors
+    /// Returns [`GroupPollError::Read`] when the read fails or a row is
+    /// malformed.
+    async fn identities(
+        &self,
+        group: &GroupId,
+        over: &BTreeMap<usize, TupleCount>,
+    ) -> Result<Vec<SourceRow>, GroupPollError> {
+        let within: Vec<usize> = (0..self.sources.tuples.len())
+            .filter(|tuple| !over.contains_key(tuple))
+            .collect();
+        if within.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = format!("{} AND ({})", self.group(group), self.sources.any(&within));
         let batches = self
             .query(&format!(
-                "{} LIMIT {}",
-                self.surfaces(|_| format!("group_id = {group}")),
-                ROWS_PER_GROUP + 1
+                "SELECT DISTINCT surface, card_uid, verifier_card_uid, execution_id, at FROM ({}) s",
+                self.surfaces(&filter)
             ))
             .await?;
         self.sources.rows(&batches)
@@ -275,10 +302,12 @@ impl BindingPoll<'_> {
     /// Pin the snapshot of one ended `group`: per source binding its
     /// eligible executions in list order, then per slot one aligned list.
     ///
-    /// A source binding over the ceiling reads nothing: each of its slots
-    /// pins an empty list marked with the ceiling. Otherwise its inputs
-    /// and authoritative results are read once and every slot takes its
-    /// value per execution, null when absent.
+    /// A source binding `over` the ceiling reads nothing: each of its slots
+    /// pins an empty list marked with the ceiling. Otherwise the inputs and
+    /// authoritative results of exactly its listed executions are read once
+    /// and every slot takes its value per execution, null when absent.
+    /// Returns `None`, deferring the group to the next poll, when a listed
+    /// row's payload is not yet visible.
     ///
     /// # Errors
     /// Returns [`GroupPollError`] when a read fails or a row is malformed.
@@ -288,40 +317,36 @@ impl BindingPoll<'_> {
         queue: &VerifierExecutionQueue,
         group: GroupId,
         rows: &[SourceRow],
+        over: &BTreeMap<usize, TupleCount>,
         ended: &Ended,
-    ) -> Result<GroupSnapshot, GroupPollError> {
-        let lists: Vec<Vec<ExecutionId>> = (0..self.sources.tuples.len())
-            .map(|tuple| ended.executions(rows, tuple))
+    ) -> Result<Option<GroupSnapshot>, GroupPollError> {
+        let lists: Vec<Option<Vec<ExecutionId>>> = (0..self.sources.tuples.len())
+            .map(|tuple| (!over.contains_key(&tuple)).then(|| ended.executions(rows, tuple)))
             .collect();
-        let readable: BTreeSet<ExecutionId> = lists
-            .iter()
-            .filter(|list| list.len() <= self.ceiling)
-            .flatten()
-            .copied()
-            .collect();
+        let readable: BTreeSet<ExecutionId> = lists.iter().flatten().flatten().copied().collect();
         let payloads = if readable.is_empty() {
             Payloads::default()
         } else {
             let ids: Vec<ExecutionId> = readable.iter().copied().collect();
             let selected = queue.selected_results(conn, &ids).await?;
-            self.payloads(&group, ended.cutoff, &readable, &selected)
-                .await?
+            let payloads = self
+                .payloads(&group, ended.cutoff, &readable, &selected)
+                .await?;
+            if !self.complete(&payloads, rows, ended, &selected) {
+                tracing::warn!(binding_id = %self.due.binding_id, group_id = %group, "group payloads not yet visible; deferred");
+                return Ok(None);
+            }
+            payloads
         };
+        let ceiling = u32::try_from(self.ceiling).unwrap_or(u32::MAX);
         let mut inputs = BTreeMap::new();
         let mut sources = BTreeMap::new();
         for slot in &self.sources.slots {
-            let list = &lists[slot.tuple];
-            let over = list.len() > self.ceiling;
-            let (values, execution_ids) = if over {
-                (Vec::new(), Vec::new())
-            } else {
-                (
-                    list.iter()
-                        .map(|execution| payloads.value(*execution, &slot.field))
-                        .collect(),
-                    list.clone(),
-                )
-            };
+            let list = lists[slot.tuple].clone().unwrap_or_default();
+            let values = list
+                .iter()
+                .map(|execution| payloads.value(*execution, &slot.field))
+                .collect();
             inputs.insert(
                 slot.name.clone(),
                 InputDeclaration::Json {
@@ -332,12 +357,12 @@ impl BindingPoll<'_> {
                 slot.name.clone(),
                 GroupSourceSnapshot {
                     reference: slot.reference.clone(),
-                    execution_ids,
-                    exceeded_ceiling: over.then(|| u32::try_from(self.ceiling).unwrap_or(u32::MAX)),
+                    execution_ids: list,
+                    exceeded_ceiling: lists[slot.tuple].is_none().then_some(ceiling),
                 },
             );
         }
-        Ok(GroupSnapshot {
+        Ok(Some(GroupSnapshot {
             group_id: group,
             inputs,
             coverage: GroupCoverage {
@@ -345,11 +370,35 @@ impl BindingPoll<'_> {
                 members: ended.members,
                 sources,
             },
+        }))
+    }
+
+    /// Whether `payloads` holds every listed eligible row's value a slot
+    /// reads: an input for each input row, and an outcome for each result
+    /// row of a direct execution. A queued execution's outcome is its
+    /// `selected` result's, which may genuinely be not yet published.
+    fn complete(
+        &self,
+        payloads: &Payloads,
+        rows: &[SourceRow],
+        ended: &Ended,
+        selected: &BTreeMap<ExecutionId, Option<VerificationResultId>>,
+    ) -> bool {
+        let (inputs, outcomes) = self.sources.reads();
+        rows.iter().filter(|row| ended.eligible(row)).all(|row| {
+            if row.result {
+                !outcomes
+                    || !self.results
+                    || selected.contains_key(&row.execution_id)
+                    || payloads.outcomes.contains_key(&row.execution_id)
+            } else {
+                !inputs || payloads.inputs.contains_key(&row.execution_id)
+            }
         })
     }
 
-    /// Read the inputs and results of `readable` executions of `group`
-    /// timed before `cutoff`.
+    /// Read the inputs and results of exactly the `readable` executions of
+    /// `group` timed before `cutoff`.
     ///
     /// Each execution takes its earliest visible input row. A queued
     /// execution takes only the result its settlement `selected`; a direct
@@ -362,28 +411,29 @@ impl BindingPoll<'_> {
     async fn payloads(
         &self,
         group: &GroupId,
-        cutoff: DateTime<Utc>,
+        cutoff: Option<DateTime<Utc>>,
         readable: &BTreeSet<ExecutionId>,
         selected: &BTreeMap<ExecutionId, Option<VerificationResultId>>,
     ) -> Result<Payloads, GroupPollError> {
         let mut payloads = Payloads::default();
-        let needs = |input: bool| {
-            self.sources
-                .slots
-                .iter()
-                .any(|slot| matches!(slot.field, SourceField::Input(_)) == input)
-        };
+        let (inputs, outcomes) = self.sources.reads();
+        let members = readable
+            .iter()
+            .map(|execution| ObservationWindow::text(&execution.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let select = |columns: &str, table: &str, at: &str| {
+            let before = cutoff
+                .map(|cutoff| format!(" AND {at} < {}", ObservationWindow::instant(cutoff)))
+                .unwrap_or_default();
             format!(
                 "SELECT {columns}, {at} FROM vala.verification.{table} WHERE {} \
-                 AND group_id = {} AND {at} < {} LIMIT {}",
+                 AND {} AND execution_id IN ({members}){before}",
                 self.sources.eligible,
-                ObservationWindow::text(group.as_str()),
-                ObservationWindow::instant(cutoff),
-                ROWS_PER_GROUP + 1
+                self.group(group),
             )
         };
-        if needs(true) {
+        if inputs {
             let sql = select(
                 "execution_id, inputs",
                 ExecutionInputsTable::NAME,
@@ -395,9 +445,7 @@ impl BindingPoll<'_> {
                 for row in 0..batch.num_rows() {
                     let execution = id(&batch, row)?;
                     let at = instant(times, row)?;
-                    if readable.contains(&execution)
-                        && earliest.get(&execution).is_none_or(|known| at < *known)
-                    {
+                    if earliest.get(&execution).is_none_or(|known| at < *known) {
                         earliest.insert(execution, at);
                         payloads
                             .inputs
@@ -406,7 +454,7 @@ impl BindingPoll<'_> {
                 }
             }
         }
-        if needs(false) && self.results {
+        if outcomes && self.results {
             let sql = select(
                 "execution_id, result_id, outcome",
                 ResultsTable::NAME,
@@ -425,7 +473,7 @@ impl BindingPoll<'_> {
                         }
                         None => earliest.get(&execution).is_none_or(|known| at < *known),
                     };
-                    if readable.contains(&execution) && authoritative {
+                    if authoritative {
                         earliest.insert(execution, at);
                         payloads
                             .outcomes
@@ -437,24 +485,27 @@ impl BindingPoll<'_> {
         Ok(payloads)
     }
 
+    /// The `group_id = <group>` predicate.
+    fn group(&self, group: &GroupId) -> String {
+        format!("group_id = {}", ObservationWindow::text(group.as_str()))
+    }
+
     /// Both source surfaces as one `(surface, group_id, card_uid,
-    /// verifier_card_uid, execution_id, at)` row set, each restricted by
-    /// `filter` of its time column; inputs alone without a results table.
-    fn surfaces(&self, filter: impl Fn(&str) -> String) -> String {
+    /// verifier_card_uid, execution_id, at)` row set restricted by `filter`;
+    /// inputs alone without a results table.
+    fn surfaces(&self, filter: &str) -> String {
         let inputs = format!(
             "SELECT 'i' AS surface, group_id, card_uid, verifier_card_uid, execution_id, \
-             recorded_at AS at FROM vala.verification.execution_inputs WHERE {} AND {}",
+             recorded_at AS at FROM vala.verification.execution_inputs WHERE {} AND {filter}",
             self.sources.eligible,
-            filter("recorded_at"),
         );
         if !self.results {
             return inputs;
         }
         format!(
             "{inputs} UNION ALL SELECT 'r' AS surface, group_id, card_uid, verifier_card_uid, \
-             execution_id, ended_at AS at FROM vala.verification.results WHERE {} AND {}",
+             execution_id, ended_at AS at FROM vala.verification.results WHERE {} AND {filter}",
             self.sources.eligible,
-            filter("ended_at"),
         )
     }
 
@@ -490,6 +541,19 @@ impl BindingPoll<'_> {
             .await?;
         Ok(batches)
     }
+}
+
+/// One source tuple's distinct visible executions and rows in one group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TupleCount {
+    /// Distinct source executions.
+    executions: u64,
+    /// Distinct `(surface, execution, time)` rows.
+    members: u64,
+    /// Earliest row time.
+    first: DateTime<Utc>,
+    /// Newest row time.
+    newest: DateTime<Utc>,
 }
 
 /// One binding's source slots and the distinct source tuples they read.
@@ -547,9 +611,26 @@ impl Sources {
                 tuple,
             });
         }
-        let any = tuples
+        let mut sources = Self {
+            slots,
+            tuples,
+            eligible: String::new(),
+        };
+        let all: Vec<usize> = (0..sources.tuples.len()).collect();
+        sources.eligible = format!(
+            "owner_card_uid = {} AND group_id IS NOT NULL AND ({})",
+            ObservationWindow::text(owner),
+            sources.any(&all)
+        );
+        Ok(sources)
+    }
+
+    /// The predicate matching a row of any of `tuples`.
+    fn any(&self, tuples: &[usize]) -> String {
+        tuples
             .iter()
-            .map(|(card, verifier)| {
+            .map(|tuple| {
+                let (card, verifier) = &self.tuples[*tuple];
                 format!(
                     "(card_uid = {} AND verifier_card_uid = {})",
                     ObservationWindow::text(card),
@@ -557,16 +638,29 @@ impl Sources {
                 )
             })
             .collect::<Vec<_>>()
-            .join(" OR ");
-        let eligible = format!(
-            "owner_card_uid = {} AND group_id IS NOT NULL AND ({any})",
-            ObservationWindow::text(owner)
-        );
-        Ok(Self {
-            slots,
-            tuples,
-            eligible,
-        })
+            .join(" OR ")
+    }
+
+    /// Whether some slot reads an input, and whether some reads an outcome.
+    fn reads(&self) -> (bool, bool) {
+        let input = |slot: &SourceSlot| matches!(slot.field, SourceField::Input(_));
+        (
+            self.slots.iter().any(input),
+            self.slots.iter().any(|slot| !input(slot)),
+        )
+    }
+
+    /// The source tuple of `row` in `batch`, `None` for a row of no tuple.
+    ///
+    /// # Errors
+    /// Returns [`GroupPollError::Read`] when a tuple column is missing or
+    /// malformed.
+    fn tuple(&self, batch: &RecordBatch, row: usize) -> Result<Option<usize>, GroupPollError> {
+        let card = text(batch, "card_uid", row)?;
+        let verifier = text(batch, "verifier_card_uid", row)?;
+        Ok(self.tuples.iter().position(|(c, v)| {
+            card.as_deref() == Some(c.as_str()) && verifier.as_deref() == Some(v.as_str())
+        }))
     }
 
     /// Decode identity rows, dropping rows of no source tuple.
@@ -579,11 +673,7 @@ impl Sources {
         for batch in batches {
             let times = times(batch, "at")?;
             for row in 0..batch.num_rows() {
-                let card = text(batch, "card_uid", row)?;
-                let verifier = text(batch, "verifier_card_uid", row)?;
-                let Some(tuple) = self.tuples.iter().position(|(c, v)| {
-                    card.as_deref() == Some(c.as_str()) && verifier.as_deref() == Some(v.as_str())
-                }) else {
+                let Some(tuple) = self.tuple(batch, row)? else {
                     continue;
                 };
                 rows.push(SourceRow {
@@ -614,39 +704,69 @@ struct SourceRow {
 /// A group that ended: its finality cutoff and the coverage it is judged at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ended {
-    /// Rows at or after this instant are past finality and never count.
-    cutoff: DateTime<Utc>,
+    /// Rows at or after this instant are past finality and never count;
+    /// `None` when first + finality is past the latest representable
+    /// instant, so every row counts.
+    cutoff: Option<DateTime<Utc>>,
     /// Newest eligible row time.
     through: DateTime<Utc>,
-    /// Distinct eligible `(surface, execution)` rows.
+    /// Distinct eligible `(surface, execution, time)` rows.
     members: u64,
 }
 
 impl Ended {
-    /// Whether the group of `rows` ended at `clock` under `settings`.
+    /// Whether the group of `rows` and of the `over`-ceiling tuple counts
+    /// ended at `clock` under `settings`.
     ///
     /// The first row anchors max_age and finality; rows at or after first +
     /// finality are dropped; the group ended when its newest eligible row is
-    /// at least `idle` old or its first is at least `max_age` old.
-    fn judge(
+    /// at least `idle` old or its first is at least `max_age` old. Ages are
+    /// compared as elapsed spans, so no accepted duration overflows.
+    // ponytail: an over-ceiling tuple contributes its whole count, refused
+    // submissions and rows past finality included; list it too if that
+    // precision ever matters for a group already judged inconclusive.
+    fn judge<'a>(
         rows: &[SourceRow],
+        over: impl Iterator<Item = &'a TupleCount> + Clone,
         settings: &GroupEndSettings,
         clock: DateTime<Utc>,
     ) -> Option<Self> {
-        let first = rows.iter().map(|row| row.at).min()?;
-        let cutoff = first + span(&settings.finality);
-        let eligible = rows.iter().filter(|row| row.at < cutoff);
-        let through = eligible.clone().map(|row| row.at).max()?;
+        let first = rows
+            .iter()
+            .map(|row| row.at)
+            .chain(over.clone().map(|count| count.first))
+            .min()?;
+        let cutoff = first.checked_add_signed(span(&settings.finality));
+        let ended = Self {
+            cutoff,
+            through: first,
+            members: 0,
+        };
+        let eligible = rows.iter().filter(|row| ended.eligible(row));
+        let through = eligible
+            .clone()
+            .map(|row| row.at)
+            .chain(over.clone().map(|count| count.newest))
+            .max()?;
         let members = eligible
-            .map(|row| (row.result, row.execution_id))
+            .map(|row| (row.result, row.execution_id, row.at))
             .collect::<BTreeSet<_>>()
             .len();
-        (through + span(&settings.idle) <= clock || first + span(&settings.max_age) <= clock)
-            .then_some(Self {
-                cutoff,
-                through,
-                members: u64::try_from(members).unwrap_or(u64::MAX),
-            })
+        let members = u64::try_from(members)
+            .unwrap_or(u64::MAX)
+            .saturating_add(over.map(|count| count.members).sum());
+        (clock.signed_duration_since(through) >= span(&settings.idle)
+            || clock.signed_duration_since(first) >= span(&settings.max_age))
+        .then_some(Self {
+            cutoff,
+            through,
+            members,
+        })
+    }
+
+    /// Whether `row` is timed before the finality cutoff.
+    fn eligible(&self, row: &SourceRow) -> bool {
+        self.cutoff.is_none_or(|cutoff| row.at < cutoff)
     }
 
     /// The eligible executions of `tuple` in list order: by earliest input
@@ -656,7 +776,7 @@ impl Ended {
         let mut order: BTreeMap<ExecutionId, (bool, DateTime<Utc>)> = BTreeMap::new();
         for row in rows
             .iter()
-            .filter(|row| row.tuple == tuple && row.at < self.cutoff)
+            .filter(|row| row.tuple == tuple && self.eligible(row))
         {
             let key = (row.result, row.at);
             order
@@ -717,9 +837,25 @@ impl Payloads {
     }
 }
 
-/// `duration` as a chrono span.
+/// `duration` as a chrono span, saturating at [`TimeDelta::MAX`], which no
+/// difference of two instants reaches.
 fn span(duration: &TriggerDuration) -> TimeDelta {
-    TimeDelta::seconds(i64::try_from(duration.seconds()).unwrap_or(i64::MAX))
+    i64::try_from(duration.seconds())
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+        .unwrap_or(TimeDelta::MAX)
+}
+
+/// Cell `row` of integer column `name`.
+///
+/// # Errors
+/// Returns [`GroupPollError::Read`] when the cell is absent, null, or not a
+/// non-negative integer.
+fn number(batch: &RecordBatch, name: &str, row: usize) -> Result<u64, GroupPollError> {
+    text(batch, name, row)?
+        .ok_or_else(|| GroupPollError::Read(format!("null {name}")))?
+        .parse()
+        .map_err(malformed)
 }
 
 /// A malformed stored value as a read failure.
@@ -801,6 +937,8 @@ fn variant(batch: &RecordBatch, name: &str, row: usize) -> Result<Value, GroupPo
         .map_err(|error| GroupPollError::Read(format!("{name}: {error:?}")))
 }
 
+/// Pure end, ordering, timing-boundary and value-mapping checks of the
+/// poller; its Bifrost reads are proved by the grouped user journeys.
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
@@ -832,6 +970,11 @@ mod tests {
             finality: duration("60s"),
             sources: BTreeMap::new(),
         }
+    }
+
+    /// No over-ceiling tuple counts.
+    fn none() -> std::iter::Empty<&'static TupleCount> {
+        std::iter::empty()
     }
 
     /// One input (`result` false) or result row of tuple 0.
@@ -866,8 +1009,8 @@ mod tests {
             row(true, d, 11),
             row(false, late, 65),
         ];
-        assert_eq!(Ended::judge(&rows, &settings(), at(41)), None);
-        let ended = Ended::judge(&rows, &settings(), at(42)).expect("idle reached");
+        assert_eq!(Ended::judge(&rows, none(), &settings(), at(41)), None);
+        let ended = Ended::judge(&rows, none(), &settings(), at(42)).expect("idle reached");
         assert_eq!(
             ended.through,
             at(12),
@@ -878,15 +1021,87 @@ mod tests {
         assert!(ended.executions(&rows, 1).is_empty());
 
         let active = [row(false, a, 0), row(false, b, 50)];
-        assert!(Ended::judge(&active, &settings(), at(79)).is_none());
-        assert!(Ended::judge(&active, &settings(), at(80)).is_some());
+        assert!(Ended::judge(&active, none(), &settings(), at(79)).is_none());
+        assert!(Ended::judge(&active, none(), &settings(), at(80)).is_some());
         let busy = [row(false, a, 0), row(false, b, 55), row(false, c, 59)];
-        assert!(Ended::judge(&busy, &settings(), at(88)).is_none());
+        assert!(Ended::judge(&busy, none(), &settings(), at(88)).is_none());
         let aged = [row(false, a, 0), row(false, b, 59), row(false, c, 99)];
         assert!(
-            Ended::judge(&aged, &settings(), at(89)).is_some(),
+            Ended::judge(&aged, none(), &settings(), at(89)).is_some(),
             "a row past finality does not postpone idle"
         );
+    }
+
+    /// An over-ceiling tuple's count anchors the group's first row, extends
+    /// its newest activity and adds its rows to the coverage.
+    ///
+    /// # Panics
+    /// Panics when the count is judged otherwise.
+    #[test]
+    fn over_ceiling_counts_join_the_group_end() {
+        let execution = ExecutionId::new_v7();
+        let rows = [row(false, execution, 20)];
+        let count = TupleCount {
+            executions: 21,
+            members: 40,
+            first: at(0),
+            newest: at(25),
+        };
+        let judge = |clock| Ended::judge(&rows, std::iter::once(&count), &settings(), at(clock));
+        assert!(judge(54).is_none(), "the count's newest row postpones idle");
+        let ended = judge(55).expect("idle reached from the count's newest row");
+        assert_eq!((ended.through, ended.members), (at(25), 41));
+        assert_eq!(
+            ended.cutoff,
+            Some(at(60)),
+            "the count's first row anchors finality"
+        );
+        assert!(Ended::judge(&[], std::iter::once(&count), &settings(), at(55)).is_some());
+    }
+
+    /// Every accepted duration, up to the largest of each unit, judges
+    /// without overflow and with the mathematically correct eligibility.
+    ///
+    /// # Panics
+    /// Panics when a duration overflows or judges otherwise.
+    #[test]
+    fn largest_accepted_durations_judge_without_overflow() {
+        let duration = |text| TriggerDuration::parse(text).expect("invariant: valid duration");
+        let execution = ExecutionId::new_v7();
+        let rows = [row(false, execution, 0)];
+        for largest in ["999999999s", "999999999m", "999999999h", "999999999d"] {
+            let never = GroupEndSettings {
+                idle: duration(largest),
+                max_age: duration(largest),
+                finality: duration(largest),
+                sources: BTreeMap::new(),
+            };
+            assert_eq!(
+                Ended::judge(&rows, none(), &never, at(1_000)),
+                None,
+                "{largest}"
+            );
+            assert_eq!(
+                Ended::judge(&rows, none(), &never, DateTime::<Utc>::MAX_UTC),
+                (largest != "999999999d").then_some(Ended {
+                    cutoff: at(0).checked_add_signed(span(&duration(largest))),
+                    through: at(0),
+                    members: 1,
+                }),
+                "{largest} ends exactly when its span has elapsed"
+            );
+            let quick = GroupEndSettings {
+                idle: duration("1s"),
+                ..never
+            };
+            let ended = Ended::judge(&rows, none(), &quick, at(1)).expect("idle reached");
+            assert!(ended.eligible(&row(false, execution, 1_000_000)));
+        }
+        let mut exact = settings();
+        exact.finality = duration("1s");
+        let late = row(false, ExecutionId::new_v7(), 1);
+        let ended = Ended::judge(&[rows[0], late], none(), &exact, at(30)).expect("idle reached");
+        assert!(!ended.eligible(&late), "first + finality is past finality");
     }
 
     /// Values unwrap JSON and trace inputs, keep other declarations, read

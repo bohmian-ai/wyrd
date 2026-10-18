@@ -246,8 +246,12 @@ def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextmanager
-def serving() -> Iterator[Receiver]:
-    """Serve the local model provider and Operator hook endpoint until exit."""
+def serving(delay: float = 0.0) -> Iterator[Receiver]:
+    """Serve the local model provider and Operator hook endpoint until exit.
+
+    With a ``delay``, each judge call is recorded on arrival and answered
+    ``delay`` seconds later, so a test can hold judgments in flight.
+    """
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
 
@@ -255,12 +259,16 @@ def serving() -> Iterator[Receiver]:
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)) or b"{}")
             headers = {name.lower(): value for name, value in self.headers.items()}
+            if delay:
+                received.record(Delivery(self.path, headers, body))
+                time.sleep(delay)
             status, reply = completion(body) if self.path == "/v1/chat/completions" else (200, {})
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
-            received.record(Delivery(self.path, headers, body))
+            if not delay:
+                received.record(Delivery(self.path, headers, body))
 
         def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""
@@ -312,19 +320,28 @@ def viewer_key(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture(scope="session")
-def assistant_bundle(
-    wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
+def assistant_bundle(wyrd_server: WyrdTestServer, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded."""
+    return registered_assistant(WyrdClient(), tmp_path_factory.mktemp("assistant"), wyrd_server)
+
+
+def registered_assistant(
+    client: WyrdClient, destination: Path, fitted_by: WyrdTestServer | None = None
 ) -> Path:
-    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded.
+    """Register the ``assistant`` Service as ``client`` and download it.
 
     Its agent checks call the gateway, so their model is deployed there first.
+    With ``fitted_by``, the download waits for the latency baseline, which that
+    server can only observe in its fixture tenant.
     """
-    configure_gateway(WyrdClient())
+    cards = Cards(client)
+    configure_gateway(client)
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
-    wyrd_server.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
-    return download(cards, "assistant", tmp_path_factory.mktemp("assistant"))
+    if fitted_by is not None:
+        fitted_by.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
+    return download(cards, "assistant", destination)
 
 
 @pytest.fixture(scope="session")

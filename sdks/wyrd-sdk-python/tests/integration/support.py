@@ -153,9 +153,11 @@ def download(cards: Cards, service: str, destination: Path) -> Path:
     return cards.hydrate(ref, destination).destination
 
 
-def service_key(service: str) -> str:
-    """Issue the registered ``service``'s own key; it holds only the default Card Role."""
-    return cli.issue_key(kind="Service", name=service, version="1.0.0", space="default").key
+def service_key(service: str, client: WyrdClient | None = None) -> str:
+    """Issue the registered ``service``'s own key as ``client``; it holds only the default Card Role."""
+    return cli.issue_key(
+        kind="Service", name=service, version="1.0.0", space="default", client=client
+    ).key
 
 
 def hydrated(bundle: Path, client: WyrdClient | None = None) -> WyrdState:

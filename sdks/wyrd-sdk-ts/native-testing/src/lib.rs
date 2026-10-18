@@ -548,6 +548,9 @@ pub struct NativeTestServerOptions {
     /// allowance, so a journey can outlive one token; omitted keeps the
     /// production lifetime.
     pub access_ttl_seconds: Option<u32>,
+    /// Scribe outbox capacity in items, so a journey can fill verification
+    /// staging with a few calls; omitted keeps the production capacity.
+    pub scribe_outbox_capacity: Option<u32>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -566,6 +569,7 @@ pub fn start_test_server(
         provider_base_url: None,
         verification_runtime: None,
         access_ttl_seconds: None,
+        scribe_outbox_capacity: None,
     });
     let provider_root = options
         .provider_base_url
@@ -580,10 +584,13 @@ pub fn start_test_server(
         provider_root,
         options.verification_runtime.unwrap_or(false),
         options.access_ttl_seconds,
+        options.scribe_outbox_capacity,
     )))
 }
 
 /// Starts the bound harness with the requested test-only capabilities.
+///
+/// `scribe_outbox_capacity` replaces the Scribe outbox capacity when set.
 ///
 /// # Errors
 ///
@@ -592,8 +599,12 @@ async fn start_test_server_async(
     provider_root: Option<url::Url>,
     verification_runtime: bool,
     access_ttl_seconds: Option<u32>,
+    scribe_outbox_capacity: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    if let Some(capacity) = scribe_outbox_capacity {
+        builder = builder.with_scribe_outbox_capacity_for_test(capacity as usize);
+    }
     if let Some(seconds) = access_ttl_seconds {
         builder = builder
             .with_access_ttl(chrono::Duration::seconds(i64::from(seconds)))

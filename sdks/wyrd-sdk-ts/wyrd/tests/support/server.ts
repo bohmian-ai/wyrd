@@ -150,6 +150,8 @@ export interface ServerOptions {
   readonly verificationRuntime?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
   readonly accessTtlSeconds?: number;
+  /** Scribe outbox capacity in items; the production capacity by default. */
+  readonly scribeOutboxCapacity?: number;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -173,7 +175,8 @@ function deploy(server: NativeWyrdTestServer): void {
  * `test` with one real Wyrd server per story file, started with `options`.
  *
  * `provider` is the local upstream the server calls, started before the
- * server; with `options.provider` set, its address is the server's provider
+ * server and scoped like it, since Vitest shares a file-scoped fixture by
+ * name across every `serverTest` in the file; with `options.provider` set, its address is the server's provider
  * base URL, and without it the server keeps its default upstreams. Each test starts
  * from the deployment environment, so a test that removes the ambient
  * credential with `vi.stubEnv` leaves the next test unaffected.
@@ -186,7 +189,7 @@ export function serverTest(options: ServerOptions = {}) {
         await use(provider);
         await provider.close();
       },
-      { scope: "file" },
+      { scope: options.perTest ? "test" : "file" },
     ],
     server: [
       async ({ provider }, use) => {
@@ -194,6 +197,7 @@ export function serverTest(options: ServerOptions = {}) {
           providerBaseUrl: options.provider && provider.url,
           verificationRuntime: options.verificationRuntime,
           accessTtlSeconds: options.accessTtlSeconds,
+          scribeOutboxCapacity: options.scribeOutboxCapacity,
         });
         deploy(server);
         await use(server);

@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -132,7 +132,8 @@ const READ_DECISION: &str = "bifrost.query.read_decision";
 /// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
-/// Renders one retained audit cell as text: a text column as its value and the
+/// Renders one retained audit cell as text: a text column (`Utf8`, or the
+/// `Utf8View` a SQL `CAST(... AS VARCHAR)` plans as) as its value and the
 /// Variant `detail` column as its JSON text, so assertions parse it like any
 /// other JSON. A null cell is `None`.
 ///
@@ -144,6 +145,9 @@ fn audit_cell_text(column: &dyn Array, row: usize) -> Result<Option<String>, Wyr
         return Ok(None);
     }
     if let Some(text) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(text.value(row).to_owned()));
+    }
+    if let Some(text) = column.as_any().downcast_ref::<StringViewArray>() {
         return Ok(Some(text.value(row).to_owned()));
     }
     if column.data_type() != &variant_storage_type() {
@@ -482,6 +486,8 @@ pub struct WyrdTestServerBuilder {
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
     scribe_ingest_limits: IngestLimits,
+    /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
+    scribe_outbox_capacity: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -653,6 +659,7 @@ impl Default for WyrdTestServerBuilder {
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
+            scribe_outbox_capacity: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -1996,10 +2003,14 @@ impl WyrdTestServer {
     /// Runs `sql` against the tenant's retained data under the inspection
     /// context, every selected column decoded as text or Variant JSON.
     ///
+    /// A journey reads retained tables that have no dedicated reader here,
+    /// such as `vala.verification.execution_inputs`, through this one query
+    /// path; the audit and span readers frame their SQL around it.
+    ///
     /// # Errors
     /// Returns the authorization, query, decode, or stream failure. A table
     /// the tenant has never published reads as no rows.
-    async fn retained_records(
+    pub async fn retained_records(
         &self,
         tenant: DataTenantId,
         sql: String,
@@ -4470,6 +4481,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Lowers `scribe.outbox_capacity` so a journey can fill the production
+    /// Scribe outbox bound with a handful of calls.
+    #[must_use]
+    pub const fn with_scribe_outbox_capacity_for_test(mut self, capacity: usize) -> Self {
+        self.scribe_outbox_capacity = Some(capacity);
+        self
+    }
+
     /// Select a scaled Scribe geometry for a real-server journey.
     ///
     /// This installs no second lifecycle policy: the value is the same
@@ -4980,6 +4999,9 @@ impl WyrdTestServerBuilder {
             .transpose()?;
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        if let Some(capacity) = self.scribe_outbox_capacity {
+            bifrost_config.scribe.outbox_capacity = capacity;
+        }
         bifrost_config.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {
             bifrost_config.oracle = oracle;
@@ -5886,6 +5908,36 @@ mod teardown_tests {
             aborted.load(Ordering::SeqCst),
             "the stalled serve task must be aborted and joined before shutdown returns"
         );
+    }
+}
+
+/// Proves the retained-record cell decoder reads every text layout a query
+/// plans.
+#[cfg(test)]
+mod cell_tests {
+    use arrow::array::{StringArray, StringViewArray};
+
+    use super::audit_cell_text;
+
+    /// A `Utf8` column and the `Utf8View` column a SQL `CAST(... AS VARCHAR)`
+    /// plans as both decode to their text, and a null cell to `None`.
+    ///
+    /// # Panics
+    /// Panics when either layout is rejected or decodes to other text.
+    #[test]
+    fn text_cells_decode_from_both_string_layouts() {
+        let plain = StringArray::from(vec![Some("plain"), None]);
+        let view = StringViewArray::from(vec![Some("view"), None]);
+        for (column, text) in [
+            (&plain as &dyn arrow::array::Array, "plain"),
+            (&view, "view"),
+        ] {
+            assert_eq!(
+                audit_cell_text(column, 0).expect("text decodes"),
+                Some(text.to_owned())
+            );
+            assert_eq!(audit_cell_text(column, 1).expect("null decodes"), None);
+        }
     }
 }
 

@@ -12,6 +12,7 @@ import {
   Cards,
   OperatorConnections,
   Principals,
+  type VerificationResult,
   type VerifierInputs,
   WyrdClient,
   type WyrdError,
@@ -29,6 +30,7 @@ import {
   judgeCalls,
   judgeReply,
   type JudgeCall,
+  registerAssistant,
   toolCall,
   toolTurn,
 } from "../support/assistant.js";
@@ -96,7 +98,7 @@ function localJudge(request: ReceivedRequest): Reply {
 }
 
 /** A fresh deployment per test, as each Rust journey starts its own, judged as {@link localJudge} answers. */
-const test = assistantTest({ perTest: true, provider: localJudge });
+const test = assistantTest({ perTest: true, judge: localJudge });
 
 /**
  * The process-global tracer provider, installed once by the first traced
@@ -959,4 +961,101 @@ test("grouped conversations recover", async ({ server, state: drift }) => {
     expect(await groupReviews(server, bindingId), "idle ticks review once").toEqual(reviews);
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
+});
+
+/** Scribe outbox capacity of the staging-pressure story: its reserved three quarters, four writes, is what two direct judgments reserve. */
+const STAGING_CAPACITY = 6;
+
+/** How long the staging-pressure story's judge holds each call. */
+const JUDGE_DELAY_MS = 15_000;
+
+/** Judge calls the staging-pressure story's judge has received, counted on arrival. */
+let judgeArrivals = 0;
+
+/** A fresh deployment whose judge holds every call and whose staging is small. */
+const stagingTest = assistantTest({
+  perTest: true,
+  scribeOutboxCapacity: STAGING_CAPACITY,
+  judge: () => {
+    judgeArrivals += 1;
+    return { ...judgeReply(AGREES), delayMs: JUDGE_DELAY_MS };
+  },
+});
+
+/** Resolve once the judge has received `calls` calls. */
+async function awaitJudgeCalls(calls: number): Promise<void> {
+  await vi.waitFor(() => expect(judgeArrivals).toBeGreaterThanOrEqual(calls), { timeout: WAIT_MS, interval: 20 });
+}
+
+stagingTest("verification_staging_refuses_and_recovers", async ({ server, state }) => {
+  judgeArrivals = 0;
+  const neighborClient = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant("burst-neighbor"), ["admin"], "burst-admin"),
+  });
+  const registeredNeighbor = await registerAssistant(neighborClient);
+  const neighbor = assistantAs(registeredNeighbor, WyrdClient.connect({ credential: registeredNeighbor.key }));
+  server.flushBifrost();
+
+  const burst: Promise<VerificationResult>[] = [];
+  const finished: boolean[] = [];
+  let offered = 0;
+  for (const inFlight of [1, 2]) {
+    const judging = state.run("agent").observe.verify("answer-judged", { answer: "yes" });
+    void judging.then(
+      () => (finished[inFlight - 1] = true),
+      () => (finished[inFlight - 1] = true),
+    );
+    burst.push(judging);
+    await awaitJudgeCalls(inFlight);
+    if (inFlight === 1) {
+      const accepted = await neighbor.run("agent").observe.submit("answer-check", { answer: "yes" });
+      if (accepted.kind !== "queued") {
+        throw new Error("Run evidence queues an execution");
+      }
+      let neighborDone = false;
+      const neighborWaits = accepted.execution.wait({ timeoutMs: WAIT_MS }).finally(() => (neighborDone = true));
+      do {
+        const normal = await state.run("agent").observe.submit("answer-check", { answer: "yes" });
+        if (normal.kind !== "queued") {
+          throw new Error("Run evidence queues an execution");
+        }
+        expect((await normal.execution.wait({ timeoutMs: WAIT_MS })).outcome.verdict).toBe("passed");
+        offered += 1;
+      } while (!neighborDone);
+      const judged = await neighborWaits;
+      expect(judged.outcome.verdict).toBe("passed");
+      expect(finished[0], "the burst's judgment is still in flight").toBeUndefined();
+      server.flushBifrost();
+    }
+  }
+
+  const refusedRun = state.run("agent");
+  const refusal = {
+    code: "WYRD_VERIFICATION_429_STAGING_FULL",
+    status: 429,
+    details: { retry_after_seconds: 1 },
+  };
+  await expect(refusedRun.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
+  await expect(refusedRun.observe.submit("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
+  expect(finished, "the burst's judgments are still in flight").toEqual([]);
+  for (const judged of await Promise.all(burst)) {
+    expect(judged.outcome.verdict).toBe("passed");
+  }
+
+  server.flushBifrost();
+  const recovered = await refusedRun.observe.submit("answer-check", { answer: "yes" });
+  if (recovered.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  const judged = await recovered.execution.wait({ timeoutMs: WAIT_MS });
+  expect(judged.outcome.verdict).toBe("passed");
+  expect(judged.run_id).toBe(refusedRun.runId);
+
+  server.flushBifrost();
+  const rows = await (await Bifrost.connect()).sql(
+    "SELECT count(*) AS n FROM vala.verification.execution_inputs",
+    [],
+    z.object({ n: z.coerce.number() }),
+  );
+  expect(rows).toEqual([{ n: 3 + offered }]);
 });

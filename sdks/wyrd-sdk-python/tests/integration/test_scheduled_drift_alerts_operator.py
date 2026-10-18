@@ -171,7 +171,7 @@ def test_scheduled_binding_rejects_redundant_inputs(
     ],
 )
 def test_scheduled_binding_scores_every_requirement(
-    latency_budget: Watch, sample: dict[str, float], verdict: str, outcomes: dict[str, str]
+    latency_budget: Watch, sample: dict[str, Any], verdict: str, outcomes: dict[str, str]
 ) -> None:
     observe = latency_budget.state.run().observe
     for _ in range(10):
@@ -188,5 +188,6 @@ def test_scheduled_binding_scores_every_requirement(
         requirement["id"]: requirement["outcome"] for requirement in result.requirements
     } == outcomes
     for requirement in result.requirements:
+        assert requirement["provenance"]["kind"] == "drift"
         window = requirement["provenance"]["window"]
         assert window["start"] < window["end"], window

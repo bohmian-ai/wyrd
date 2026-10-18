@@ -515,5 +515,6 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |
 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | 422 | Verification input incompatible | Supply every feature the Verifier scores, with the value type its baseline or profile expects. |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | 422 | Verification input unsupported | Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule. |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | 429 | Verification staging is full | Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate. |
 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | 502 | Verification dependency failed | The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers. |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | 504 | Verification execution timed out | Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds. |

@@ -329,6 +329,12 @@ pub struct ScribeRuntimeConfig {
     /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
+    /// Most writes this process's Scribe outbox admits at once: queued,
+    /// retrying, and in flight. Verifier calls that would take reservations
+    /// past three quarters of it are refused with retryable pressure; past
+    /// all of it, unreserved writes such as audit decisions are counted lost.
+    #[serde(default = "default_outbox_capacity")]
+    pub outbox_capacity: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
     /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
@@ -1452,6 +1458,11 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
 }
 
+/// Returns the default for [`ScribeRuntimeConfig::outbox_capacity`].
+fn default_outbox_capacity() -> usize {
+    crate::scribe_outbox::SCRIBE_CAPACITY
+}
+
 /// Bytes in one megabyte of the megabyte-valued Scribe size settings.
 const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
 
@@ -1493,6 +1504,7 @@ impl Default for ScribeRuntimeConfig {
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
             ingest_request_bytes: default_ingest_request_bytes(),
+            outbox_capacity: default_outbox_capacity(),
             mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
             max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
@@ -1510,8 +1522,8 @@ impl ScribeRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns a field-specific boot error when a thread or ingest bound is
-    /// zero, a frozen cardinality bound exceeds its immutable V1 maximum, the
+    /// Returns a field-specific boot error when a thread, ingest, or outbox
+    /// bound is zero, a frozen cardinality bound exceeds its immutable V1 maximum, the
     /// configured request cannot be represented by tonic/WAL v4 framing, a
     /// shard count, file size, or retention time is zero or a size overflows
     /// bytes, or the derived Scribe geometry is incoherent.
@@ -1550,6 +1562,9 @@ impl ScribeRuntimeConfig {
         }
         if self.ingest_request_bytes == 0 {
             return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
+        }
+        if self.outbox_capacity == 0 {
+            return Err("scribe.outbox_capacity must be at least 1".to_owned());
         }
         if self
             .ingest_request_bytes

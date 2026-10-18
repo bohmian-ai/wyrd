@@ -1820,4 +1820,74 @@ mod pg_tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// A bound Service is refused execute and enqueue over MCP with the
+    /// retryable staging-pressure problem when the Scribe outbox has no
+    /// reservable room, and nothing of either call is staged.
+    ///
+    /// A one-item outbox reserves nothing, so every reserved verification
+    /// write is refused deterministically; recovery after pressure clears is
+    /// proven by the SDK journeys.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, flush,
+    /// or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a write tool is not offered, a refusal is not the stable
+    /// staging-pressure code with its retry hint, or an input row was staged.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn staging_pressure_is_retryable() -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_scribe_outbox_capacity_for_test(1)
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-pressure-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let fixture = register_fixture(&cards).await?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let agent_client = connect(&server, &agent).await?;
+        let offered = agent_client.list_all_tools().await?;
+        for tool in [EXECUTE, ENQUEUE] {
+            assert!(
+                offered.iter().any(|offered| offered.name == tool),
+                "the editor is offered {tool}"
+            );
+            let refused = refusal(
+                agent_client
+                    .call_tool(call(tool, fixture.assert_request(PASSING_ANSWER))?)
+                    .await,
+            )?;
+            assert!(
+                refused.contains("WYRD_VERIFICATION_429_STAGING_FULL")
+                    && refused.contains("retry_after_seconds"),
+                "{tool} is refused as retryable staging pressure: {refused}"
+            );
+        }
+
+        server.flush_bifrost().await?;
+        let staged = rows(
+            &agent_client,
+            "SELECT count(*) FROM vala.verification.execution_inputs".to_owned(),
+        )
+        .await?;
+        assert_eq!(
+            staged,
+            serde_json::json!([[0]]),
+            "a refused call stages nothing"
+        );
+        agent_client.cancel().await?;
+        Ok(())
+    }
 }

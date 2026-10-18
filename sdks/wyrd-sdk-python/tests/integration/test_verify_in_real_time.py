@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -28,11 +29,13 @@ from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
+from .conftest import registered_assistant, serving
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
     FRAME_CLAIM,
     LIVE_REVIEW,
     UNBADGED,
+    Count,
     Receiver,
     Retained,
     ancestry,
@@ -952,3 +955,86 @@ def test_grouped_conversations_recover(
     while time.monotonic() < quiet:
         assert group_reviews(wyrd_server, binding_id, [a, b]) == reviews, "idle ticks review once"
         time.sleep(0.5)
+
+
+STAGING_CAPACITY = 6
+"""Scribe outbox capacity of the staging-pressure story: its reserved three
+quarters, four writes, is what two direct judgments reserve."""
+
+JUDGE_DELAY_SECONDS = 15.0
+"""How long the staging-pressure story's judge holds each call."""
+
+STAGING_FULL = "WYRD_VERIFICATION_429_STAGING_FULL"
+
+
+def await_judge_calls(judge: Receiver, calls: int) -> None:
+    """Block until ``judge`` has received ``calls`` judge calls."""
+    with judge.delivered:
+        assert judge.delivered.wait_for(lambda: len(judge.to(CALLS)) >= calls, WAIT_SECONDS)
+
+
+def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
+    with (
+        serving(delay=JUDGE_DELAY_SECONDS) as judge,
+        WyrdTestServer(
+            verification_runtime=True,
+            provider_base_url=judge.url,
+            scribe_outbox_capacity=STAGING_CAPACITY,
+        ) as server,
+    ):
+        bundle = registered_assistant(WyrdClient(), tmp_path / "assistant", server)
+        state = hydrated(bundle, WyrdClient(credential=service_key("assistant")))
+        neighbor_admin = server.bootstrap_service_in_tenant(
+            server.seed_tenant("burst-neighbor"), ["admin"], name="burst-admin"
+        )
+        neighbor_client = client_of(server, neighbor_admin)
+        neighbor = hydrated(
+            registered_assistant(neighbor_client, tmp_path / "neighbor"),
+            client_of(server, service_key("assistant", neighbor_client)),
+        )
+        server.flush_bifrost()
+
+        offered = 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            burst = []
+            for in_flight in (1, 2):
+                burst.append(
+                    pool.submit(lambda: state.run("agent").observe.verify("answer-judged", "yes"))
+                )
+                await_judge_calls(judge, in_flight)
+                if in_flight == 1:
+                    accepted = neighbor.run("agent").observe.submit("answer-check", "yes")
+                    assert isinstance(accepted, verify.Execution)
+                    neighbor_waits = pool.submit(accepted.wait, WAIT_SECONDS)
+                    while True:
+                        normal = state.run("agent").observe.submit("answer-check", "yes")
+                        assert isinstance(normal, verify.Execution)
+                        assert normal.wait(WAIT_SECONDS).verdict == "passed"
+                        offered += 1
+                        if neighbor_waits.done():
+                            break
+                    assert neighbor_waits.result().verdict == "passed"
+                    assert not burst[0].done(), "the burst's judgment is still in flight"
+                    server.flush_bifrost()
+
+            refused_run = state.run("agent")
+            for call in (refused_run.observe.verify, refused_run.observe.submit):
+                with pytest.raises(WyrdError) as refused:
+                    call("answer-check", "yes")
+                assert refused.value.code == STAGING_FULL
+                assert refused.value.status == 429
+                assert refused.value.details["retry_after_seconds"] == 1
+            assert not any(judging.done() for judging in burst)
+            assert [judging.result().verdict for judging in burst] == ["passed", "passed"]
+
+        server.flush_bifrost()
+        recovered = refused_run.observe.submit("answer-check", "yes")
+        assert isinstance(recovered, verify.Execution)
+        judged = recovered.wait(WAIT_SECONDS)
+        assert (judged.verdict, judged.run_id) == ("passed", refused_run.run_id)
+
+        server.flush_bifrost()
+        rows = Bifrost(client=client_of(server)).sql(
+            "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
+        )
+        assert [row.n for row in rows] == [3 + offered]

@@ -135,6 +135,33 @@ impl Fixture {
     async fn queued(&self) -> usize {
         self.seed.executions().await.expect("executions read").len()
     }
+
+    /// Count the tenant's queued executions once every earlier request has
+    /// been processed, excluding a sentinel enqueued as `jwt` to order the
+    /// read.
+    ///
+    /// Enqueue answers before Scribe acknowledges the inputs and the
+    /// submission writer commits the execution, so a plain count can run
+    /// ahead of an earlier request's processing. The tenant's writes are
+    /// processed in arrival order on both outboxes, so once the later
+    /// sentinel is visible every earlier staged submission has been
+    /// processed too.
+    ///
+    /// # Panics
+    /// Panics when the sentinel is not accepted or never becomes visible, or
+    /// the queue cannot be read.
+    async fn queued_before_sentinel(&self, server: &WyrdTestServer, jwt: &str) -> usize {
+        let (status, sentinel) = enqueue(
+            server,
+            jwt,
+            &self.request(&self.assertion, json!("sentinel")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{sentinel}");
+        visible_execution(server, jwt, execution_id(&sentinel)).await;
+        self.queued().await - 1
+    }
 }
 
 /// POST one raw body to `uri` as `jwt`, optionally keyed.
@@ -443,6 +470,94 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Count the tenant's retained `vala.verification.execution_inputs` rows,
+/// in total and for `execution`, after the Scribe outbox settles.
+///
+/// # Panics
+/// Panics when staged writes do not publish or the rows cannot be read.
+async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, usize) {
+    server.flush_bifrost().await.expect("inputs publish");
+    let rows = server
+        .retained_records(
+            server.data_tenant_id(),
+            "SELECT execution_id FROM vala.verification.execution_inputs".to_owned(),
+        )
+        .await
+        .expect("inputs rows read");
+    let mine = rows
+        .iter()
+        .filter(|row| row.first().cloned().flatten() == Some(execution.to_string()))
+        .count();
+    (rows.len(), mine)
+}
+
+/// A keyed enqueue refused for a full Scribe staging share is refused with
+/// typed retryable pressure before anything is staged; once the share drains,
+/// the identical keyed request is accepted, its replay returns the same
+/// execution, and the tenant holds one execution and one inputs row per
+/// accepted request, none for the refused attempt.
+///
+/// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
+/// unwritten and hold the whole reserved share (two of three slots)
+/// deterministically.
+///
+/// Both counts are ordered after the requests before them through
+/// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
+/// queued execution with one inputs row.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, replay, queue, or inputs expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn staging_refusal_recovers_the_same_enqueue_identity() {
+    let server = WyrdTestServer::builder()
+        .with_scribe_outbox_capacity_for_test(3)
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vr-pressure", &["editor"]).await;
+    server.flush_bifrost().await.expect("setup settles");
+
+    let stall = server.stall_next_bifrost_write().expect("Scribe stalls");
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let (status, ahead) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ahead}");
+    stall.wait_entered().await;
+    let (status, behind) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{behind}");
+    let (status, refused) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
+    assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
+    assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
+
+    stall.release();
+    stall.wait_completed().await;
+    server.flush_bifrost().await.expect("the share drains");
+    assert_eq!(
+        fixture.queued_before_sentinel(&server, &jwt).await,
+        2,
+        "the refusal queued nothing"
+    );
+    let (status, accepted) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let recovered = execution_id(&accepted);
+    assert_eq!(
+        input_rows(&server, recovered).await,
+        (4, 1),
+        "one inputs row per accepted request and the sentinel, none for the refused attempt"
+    );
+    let (status, replay) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(execution_id(&replay), recovered, "the retry replays");
+    assert_eq!(
+        fixture.queued_before_sentinel(&server, &jwt).await,
+        4,
+        "the two fills, the first sentinel, and the recovered call; the replay added none"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Malformed and oversized bodies, an invalid Idempotency-Key, a caller
 /// without `verifier:run`, and a caller holding only an unrelated `operators:invoke` are refused
 /// with stable codes before anything is staged, each authorization refusal
@@ -524,7 +639,11 @@ async fn enqueue_refusals_fail_before_staging() {
     assert_eq!(problem["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
     let (status, problem) = get(&server, &jwt, "/v1/verification/executions/not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
-    assert_eq!(fixture.queued().await, 0, "no refusal staged a submission");
+    assert_eq!(
+        fixture.queued_before_sentinel(&server, &jwt).await,
+        0,
+        "no refusal staged a submission"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -937,7 +1056,7 @@ async fn direct_execution_judges_inline_without_enqueueing() {
         vec![run_decision("allowed"); 2],
         "one decision per request"
     );
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1054,7 +1173,7 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", machine.id().as_uuid()).await,
         vec![run_decision("allowed")]
     );
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1158,7 +1277,7 @@ async fn direct_execution_refuses_nonconforming_evidence() {
     let (status, missing) = execute(&server, &jwt, body(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["outcome"]["verdict"], "inconclusive", "{missing}");
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 

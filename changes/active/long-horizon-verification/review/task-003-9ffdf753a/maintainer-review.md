@@ -1,0 +1,55 @@
+# Maintainer review — TASK-003
+
+Overall: **FAIL**
+
+Subject: complete cumulative `ef3a57b0776dd7bc451273b9176498fcca700550...9ffdf753ab11ce9b638c906388d3690a6aede249`. HEAD was checked and remains the candidate. This is an independent source review; no other discovery report was read. Only this report was written.
+
+The subject records that the requested approved spec is revision 13 while the available file identifies revision 14 as draft. This review uses the unchanged TASK-003 bounded-admission and preserved-lifecycle obligations; it does not approve revision 14 or resolve that authority discrepancy.
+
+## Changed-surface coverage
+
+| Changed surface | Symbols, surrounding owners, callers and tests reviewed | Assessment |
+|---|---|---|
+| `wyrd-runtime/src/outbox.rs` | `Outbox::{new,stage,reserve,reservable,send,shutdown}`, `Reservation::{stage,drop,fmt}`, `Admission::release`, `admit`, queue/backlog/written types, `OutboxWriter::{run,dispatch,is_ready,finish,release}`; sink trait, pending/idle/retry ownership, memory-sink fixtures, new bounded tests and existing retry/tenant/drain/panic/late-stage tests | Extension stays with the existing lifecycle owner. Concurrent final accounting has MAINT-001 below. |
+| Verification control service | `staging_full`, `execute`, `enqueue`, `stage_direct`; HTTP routes and MCP call paths; authorization ordering, input/result payload construction, submission ownership | Reservation precedes source staging; direct inputs and result share one two-slot reservation; failed preparation drops unused capacity. New behavior remains discoverable on the existing control owner. |
+| Server Scribe outbox | `SCRIBE_CAPACITY`, `ScribeWrite::ExecutionInputs`, `ScribeSink::{outbox,bounded_outbox,write}`, span-permit documentation and affected test constructors; audit, capture, result and span sibling producers | Reservation travels with the existing inputs item to the existing ACK handoff. No replacement writer or transport. Frame retry identities and terminal-loss handling stay with Scribe. |
+| Verification runtime | `RuntimeLimits::{execution_slots,default}`, `ClaimLoop::{new,run,claim_round}`, `VerifierRunner::{new,attempt,settle}` and `StagedResult`; Operator worker constructor, shared `LeasedWork` lifecycle, deferral and lease settlement | Shared claim loop bounds the retained task set. Runner reserves result capacity before engine work and preserves its existing settlement owner. Operator path retains its existing permit gate. |
+| Config and boot | `ScribeRuntimeConfig::{outbox_capacity,default,validate}`, default helper, `compose_bifrost` wiring | One process setting reaches the existing Scribe owner. No client-owned admission policy. |
+| Stable errors and projections | `WyrdError::VerificationStagingFull`, details projection, HTTP retry-header mapper and extended mapper test; generated error documentation and TypeScript error-code union | Derive-backed error follows the existing error catalog and response mapper. No second metadata list was introduced. |
+| Rust harness and runtime integration tests | `WyrdTestServerBuilder` field/default/test setter/start wiring; `claim_first_round`, old first-round/200-run tests and new slot-cap test | Harness lowers the actual production configuration. Old tests explicitly provide the slots required by their original pool/tenant-round scenarios; the separate new test checks the cap. |
+| Rust SDK journey | `Assistant::{start,start_on,in_tenant,await_judge_calls}`, pressure constants and `InputRows`, `verification_staging_refuses_and_recovers` | Reuses deployment, public SDK, registration, hydration and local judge. Assertions cover caller errors, neighbor completion, drain and retained source-row count. |
+| Python boundary and journeys | Native `WyrdTestServer` field, constructor and enter wiring; authored testing stub; `serving`, `registered_assistant`, assistant fixture, `service_key`, judge wait and pressure journey | Constructor/stub names and defaults agree. Tenant-specific setup reuses the existing public helpers; delayed provider mode exposes an actual arrival condition. |
+| TypeScript boundary and journeys | `NativeTestServerOptions`, native start functions and declaration; support `ServerOptions/serverTest`, `registerAssistant/AssistantOptions/assistantTest`; pressure journey and judge wait | Test-only capacity reaches the same Rust builder. Provider lifetime now matches server lifetime. Shared assistant setup is reused by both ordinary and tenant-specific stories. |
+| MCP pressure journey | `staging_pressure_is_retryable`, existing fixture registration, tool discovery/call/refusal and Bifrost row-read helpers | Uses real tools and server. One-item capacity makes refusal deterministic; recovery is exercised in the SDK stories. |
+| Architecture, user docs and task evidence | Changed queued-submission design paragraph; generated error row; real-time error table; runtime-limit row; complete original-task evidence additions | Documents the selected admission outcome and existing loss boundary. Evidence claims were distinguished from independently run checks. |
+
+Applicable maintainer authority: AGENTS.md §§5, 6, 8, 11, 12, 15–16; `architecture/agent-rules.md`; `architecture/references/languages/{spec-driven-development,maintainer-style,rust-core,errors,testing-workflows}.md`; reference router and ownership patterns; Wyrd doctrine; verification/queued submission and audit design, and applicable Bifrost ACK/retry/admission boundaries. Source navigation began with CodeGraph and expanded through the cumulative diff and local callers/tests.
+
+## Existing-owner comparison
+
+| Workflow | Existing alternative | What it lacked | Why extension suffices |
+|---|---|---|---|
+| Staging admission and retry/drain | Generic `Outbox` and its `OutboxWriter`; existing span-only semaphore | Whole pending-work admission and an atomic producer refusal before source staging | Accounting belongs at this owner because it sees queued, waiting, failed and in-flight work. A bounded channel alone would release on receive and miss writer backlogs. The reservation carries retained capacity through existing work ownership. |
+| Non-blocking audit/capture/span staging | Existing `Outbox::stage` / audit staging adapter and span permits | Finite total staging under sink outage | Keeping the existing fire-and-forget entry point and counting/logging overflow preserves authorization behavior. Separate reserved/unreserved admission prevents the operation's authorization audit from consuming that operation's reservable capacity. No new audit queue is needed. |
+| Scribe ACK → submission queue | Existing `ScribeWrite::ExecutionInputs` handoff and `SubmissionSink` over the same generic outbox | Guaranteed room at the downstream handoff | Carrying a downstream reservation on the existing item is sufficient. A second durable receipt/broker or producer-side SQL insertion would duplicate the existing queue owner and change the contract. |
+| Queued execution count and result availability | Shared `ClaimLoop`, existing hosted-resource permits and runner settlement | Hosted step permits did not bound the number of retained execution tasks; result staging could be full after engine work | Bound the existing `JoinSet` in `ClaimLoop`, retain Operator permits, and reserve result capacity in the runner's existing attempt. Another worker scheduler is unnecessary. |
+| Language pressure proof | Existing real-time assistant journeys, local provider and test-server configuration | A deterministic small capacity and held in-flight judgments | Lowering the same production configuration and extending existing fixtures is sufficient; no replacement engine or language-specific limiter was added. |
+
+## Material finding
+
+### MAINT-001 — REGRESSION: shutdown splits one loss settlement across concurrent callers
+
+- **Changed location:** `crates/shared/wyrd-runtime/src/outbox.rs:348–350`; related `Admission::release` at lines 438–441.
+- **Governing obligation:** TASK-003 preserves existing shutdown/loss accounting; `Outbox::shutdown` explicitly promises at lines 331–333 that concurrent callers have exactly one loss reporter. Maintainer-style requires one clear owner for retained invariants; independently atomic fields do not make their joint settlement atomic.
+- **Evidence and reachable state:** reserve and stage one item against a hanging or retrying sink. After the deadline the writer exits with `pending = 1` and `staged_reserved = 1`. Two callers may concurrently await and finish `shutdown` on the shared `Arc<Outbox<_>>`. Caller A executes `pending.swap(0)` and obtains 1. Caller B then obtains 0 from `pending.swap(0)`, but obtains 1 from `staged_reserved.swap(0)`. Caller B calls `release(0, 1)`, whose `count - reserved` underflows; caller A later releases `(1, 0)`. There is no lock or winning-caller condition around these paired swaps. The already-existing public concurrent-shutdown contract is the consumer; production Scribe and submission outboxes both use this shared implementation.
+- **Concrete consequence / maintenance cost:** shutdown can panic in checked arithmetic and partially mutate admission state, or wrap accounting with overflow checks disabled. The exact loss total and reserved-share release no longer have one settlement owner. Future maintainers cannot safely reason about final accounting by inspecting either counter separately.
+- **Smallest testable correction:** keep shutdown finalization in the existing outbox lifecycle and make the pending-loss and reserved-loss capture/release one winner's operation. Preserve unspent reservations and late-stage release; do not add another lifecycle owner or suppress underflow. Add a focused concurrent shutdown test with reserved unwritten work that proves no panic, one total loss report/count, pending/gauge zero, and no double release. Existing shutdown tests only stage unreserved work and do not exercise this interleaving.
+
+## Non-blocking calibration notes
+
+- `VerificationControl::{execute,enqueue}` retain substantive rustdoc but their `# Errors` lists do not mention the newly returned `VerificationStagingFull`. The public error documentation is updated, so this is a local discoverability note rather than an independent behavioral blocker.
+- The fixed reserved/unreserved ratio and tiny capacities have deliberate consequences: capacity 1 reserves zero slots, which the MCP test uses. This report does not demand borrowing, tuning, strict fairness, or a second admission layer; those would broaden the selected scope.
+
+## Verification limits
+
+Read the complete cumulative diff and traced the materially changed owners and supporting consumers/tests. No build, test, or external service was run in this review; recorded green evidence in the task is a claim, not independently reproduced output. The MAINT-001 interleaving follows directly from the changed atomic operations. Grouped J-005 evidence remains recorded as open in the task. Production, tests, config and HEAD were not modified.

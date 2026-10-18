@@ -1639,9 +1639,12 @@ Queued-execution creation follows Scribe's acknowledgement and never delays
 it. After the ack, the server puts one request per submission into an
 in-process outbox. One writer drains it, one multi-row insert per tenant,
 deciding idempotent replay and conflict in that transaction, so a repeated
-request inserts nothing. The outbox has no count limit and never drops a
-request because PostgreSQL is slow or down: a failed write keeps its batch and
-retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
+request inserts nothing. The outbox is bounded, but each submission reserves
+its slot before its inputs are staged, so the hand-off is never refused; a
+`submit` that finds no room is refused with
+`WYRD_VERIFICATION_429_STAGING_FULL` before anything is staged. The outbox
+never drops a request because PostgreSQL is slow or down: a failed write
+keeps its batch and retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 

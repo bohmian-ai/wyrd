@@ -34,6 +34,7 @@ from .support import (
     LIVE_REVIEW,
     UNBADGED,
     Receiver,
+    Retained,
     ancestry,
     binding_ids,
     binding_status,
@@ -836,3 +837,107 @@ def test_grouped_sampled_frames_are_bounded(
     assert len(frames_judged) == 20 + 1 + 21 + 20, "every frame is judged once"
     state.shutdown()
     other.shutdown()
+
+
+def group_reviews(server: WyrdTestServer, binding_id: str, groups: list[str]) -> list[str]:
+    """The executions of ``binding_id``'s retained reviews of ``groups``, oldest first."""
+    server.flush_bifrost()
+    rows = Bifrost(client=client_of(server)).sql(
+        "SELECT execution_id FROM vala.verification.results "
+        "WHERE binding_id = $1 AND group_id IN ($2, $3) ORDER BY ended_at",
+        [binding_id, *groups],
+        model=Retained,
+    )
+    return [row.execution_id for row in rows]
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_conversations_recover(
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    assistant: WyrdState,
+    other_tenant: str,
+    tmp_path: Path,
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/support.yaml")
+    key = service_key("support")
+    binding_id = group_binding(wyrd_server, cards, registered["support"])
+    state = WyrdState.from_path(
+        download(cards, "support", tmp_path / "a"), WyrdClient(credential=key)
+    )
+    state.start_bifrost()
+    assistant.start_bifrost()
+    suffix = secrets.token_hex(4)
+    a, b = f"conv-a-{suffix}", f"conv-b-{suffix}"
+
+    def turn(answer: str) -> dict:
+        return {"answer": answer}
+
+    sampled = assistant.run("model").observe.submit("latency-drift", {"latency": 12.5})
+    assert isinstance(sampled, verify.Recorded)
+    state.run("agent").observe.verify("turn-check", turn("a1"), group_id=a)
+    state.run("agent").observe.verify("turn-check", turn("b1"), group_id=b)
+    queued = state.run("agent").observe.submit("turn-check", turn("a2"), group_id=a)
+    assert isinstance(queued, verify.Execution)
+    state.run("agent").observe.verify("turn-check", turn(""), group_id=b)
+    solo = state.run("agent").observe.verify("turn-check", turn("solo"))
+    queued.wait(WAIT_SECONDS)
+    newer = register(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
+    late = enqueue_over_http(
+        wyrd_server,
+        key,
+        f"support-newer-{suffix}",
+        {
+            "verifier_card_uid": str(newer["turn-check"].uid),
+            "card_uid": str(registered["assistant-agent"].uid),
+            "group_id": a,
+            "inputs": {"turn": {"kind": "json", "value": turn("newer")}},
+        },
+    )
+    admin = client_of(wyrd_server)
+    verify.Execution.connect(late, admin).wait(WAIT_SECONDS)
+    tenant_b = client_of(
+        wyrd_server,
+        wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name=f"b-admin-{suffix}"),
+    )
+    b_cards = Cards(tenant_b)
+    register(b_cards, "cards/verify_in_real_time/support.yaml")
+    b_key = cli.issue_key(
+        kind="Service", name="support", version="1.0.0", space="default", client=tenant_b
+    ).key
+    b_state = WyrdState.from_path(
+        download(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
+    )
+    b_state.start_bifrost()
+    b_state.run("agent").observe.verify("turn-check", turn("tenant b"), group_id=a)
+    for each in (state, assistant, b_state):
+        each.shutdown()
+
+    deadline = time.monotonic() + WAIT_SECONDS
+    while len(reviews := group_reviews(wyrd_server, binding_id, [a, b])) < 2:
+        assert time.monotonic() < deadline, "both conversations are reviewed"
+        time.sleep(0.5)
+    judged = {}
+    for execution_id in reviews:
+        review = verify.Execution.connect(execution_id, admin).status()
+        outcome = review["result"]["outcome"]
+        judged[review["group_id"]] = (
+            len(review["group"]["sources"]["turns"]["execution_ids"]),
+            outcome["evidence"]["turns"],
+            outcome["verdict"],
+        )
+    assert judged == {
+        a: (2, {"kind": "json", "value": [turn("a1"), turn("a2")]}, "passed"),
+        b: (2, {"kind": "json", "value": [turn("b1"), turn("")]}, "failed"),
+    }, "each conversation judges only its own pinned turns"
+    ungrouped = Bifrost(client=admin).sql(
+        "SELECT execution_id FROM vala.verification.results "
+        "WHERE execution_id = $1 AND group_id IS NULL",
+        [solo.execution_id],
+        model=Retained,
+    )
+    assert len(ungrouped) == 1, "the ungrouped turn joins no group"
+    quiet = time.monotonic() + 8
+    while time.monotonic() < quiet:
+        assert group_reviews(wyrd_server, binding_id, [a, b]) == reviews, "idle ticks review once"
+        time.sleep(0.5)

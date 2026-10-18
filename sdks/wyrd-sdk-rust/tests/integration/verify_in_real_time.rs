@@ -2210,6 +2210,7 @@ struct Grouping {
     /// The group the result belongs to, absent for an ungrouped turn.
     group_id: Option<String>,
 }
+
 /// The executions of `binding`'s retained group reviews, oldest first, read
 /// as the administrator after publishing every captured row of `servers`.
 ///

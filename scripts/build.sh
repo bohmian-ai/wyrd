@@ -4,8 +4,8 @@
 # versions come from mise.toml.
 #
 #   scripts/build.sh bundle
-#       Builds this host's bundle into release/: the wyrd-server binary and,
-#       beside it, the wyrd-monty-worker it spawns for Verifier code.
+#       Builds this host's bundle into release/: the wyrd-server binary,
+#       which also runs as the Monty worker it spawns for Verifier code.
 #       WYRD_PROFILE names the Cargo profile (default release; published
 #       bundles use dist).
 #
@@ -31,11 +31,10 @@ bundle() {
   [[ $profile == dev ]] && profile_dir=debug
 
   cargo build --locked -p wyrd-server --profile "$profile" --features cloud
-  cargo build --locked -p wyrd-monty-worker --profile "$profile"
 
   rm -rf "$out"
   mkdir -p "$out"
-  cp "$target/$profile_dir/wyrd-server" "$target/$profile_dir/wyrd-monty-worker" "$out/"
+  cp "$target/$profile_dir/wyrd-server" "$out/"
   "$out/wyrd-server" --version
 }
 

@@ -14,7 +14,7 @@ These limits protect a server that runs Verifiers for many tenants. They are env
 | Environment variable | Default | Bounds |
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers. `1` or `0`; also `[verification] enabled` in TOML |
-| `WYRD_VERIFICATION_MONTY_WORKER` | `wyrd-monty-worker` beside the running `wyrd-server` | Path of the Python worker binary |
+| `WYRD_VERIFICATION_MONTY_WORKER` | the running `wyrd-server` | Executable the pool starts as `<path> subprocess` for each Python worker |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
 | `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
 | `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |
@@ -59,7 +59,7 @@ A process hosts the runtime when `WYRD_VERIFICATION_ENABLED` is `1` and its role
 
 ## Python workers
 
-`code` actions and checks, and an Agent's `code.run` calls, run in a pool of `wyrd-monty-worker` processes. There is one pool per server process, shared by every tenant; no interpreter state is shared. Agent checks, model calls, and other tools never hold a worker.
+`code` actions and checks, and an Agent's `code.run` calls, run in a pool of `wyrd-server subprocess` worker processes. There is one pool per server process, shared by every tenant; no interpreter state is shared. Agent checks, model calls, and other tools never hold a worker.
 
 - Each Python operation gets a fresh worker, which is killed when the operation ends. Files in `/work` persist across the `code.run` calls of one step attempt; nothing persists across attempts, steps, or executions.
 - At most `MONTY_MAX_WORKERS` operations run, after the memory cap below, and `MONTY_MAX_WAITERS` more wait. An operation beyond that is refused at once; nothing queues in memory.

@@ -7,19 +7,13 @@ order: 4
 status: runnable
 ---
 
-The verification runtime runs Verifier steps and checks inside `wyrd-server`: file extraction, scratch workspaces, Agent tools, and Python code in a pool of `wyrd-monty-worker` processes. Every setting, default, and startup rule is in [Verification runtime limits](/reference/verification-runtime-limits/); this page covers the decisions an operator makes. For database and server setup, see [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
+The verification runtime runs Verifier steps and checks inside `wyrd-server`: file extraction, scratch workspaces, Agent tools, and Python code in a pool of worker processes. Every setting, default, and startup rule is in [Verification runtime limits](/reference/verification-runtime-limits/); this page covers the decisions an operator makes. For database and server setup, see [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
 
-## Install the worker
+## Python workers
 
-`wyrd-server` runs Python in a separate `wyrd-monty-worker` binary. Release bundles ship it beside `wyrd-server`, and the official images install both in `/usr/local/bin`, so the default needs no setting.
+`wyrd-server` runs Python in worker processes it starts from its own binary as `wyrd-server subprocess`. Release bundles and the official images ship only `wyrd-server`, and the default needs no setting. A worker that crashes or exceeds its memory budget ends only its own process; the server keeps serving and starts a replacement.
 
-If you install the binaries yourself, keep the two side by side, or point the server at the worker:
-
-```bash
-export WYRD_VERIFICATION_MONTY_WORKER=/opt/wyrd/bin/wyrd-monty-worker
-```
-
-Use the worker from the same release as the server. A server that runs Verifiers refuses to start when the worker is missing or cannot start:
+A server that runs Verifiers refuses to start when its worker cannot start:
 
 ```text
 hosted Verifier blocks could not start: ...

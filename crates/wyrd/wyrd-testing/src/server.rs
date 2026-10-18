@@ -6060,17 +6060,14 @@ mod tests {
 
 /// Hosted Verifier blocks for a test server: the default Deployment limits
 /// with no prewarmed worker, so only a Verifier that runs Python spawns the
-/// Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else the
-/// `build:monty-worker` output.
+/// Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else the `build:server`
+/// `wyrd-server`, which serves as its own worker.
 ///
 /// # Errors
 /// Returns [`WyrdTestServerError::Start`] when the sandbox pool cannot start.
 async fn test_verification_blocks() -> Result<HostedBlocks, WyrdTestServerError> {
     let worker = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../target/release/wyrd-monty-worker")
-        },
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/release/wyrd-server"),
         PathBuf::from,
     );
     let limits = HostedLimits {

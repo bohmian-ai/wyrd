@@ -446,7 +446,6 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
         config.mkdir(mode=0o700)
         release.mkdir(parents=True)
         shutil.copy2(root / "target/debug/wyrd-server", release / "wyrd-server")
-        shutil.copy2(root / "target/debug/wyrd-monty-worker", release / "wyrd-monty-worker")
         (config / "server/current").symlink_to(Path("versions") / version)
         env = dict(os.environ)
         for name in (

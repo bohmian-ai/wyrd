@@ -246,21 +246,14 @@ const OUTSTANDING_GROUP_SQL: &str = r"
        AND status IN ('pending', 'running', 'retrying')
 ";
 
-/// The settled result, if any, of each queued execution among `$1`.
-const SELECTED_RESULTS_SQL: &str = r"
-    SELECT execution_id, result_id
+/// Every queued execution submitted to group `$1`: the result its
+/// settlement selected, and whether the queue writer refused the submission
+/// (settled `errored` on acceptance, never claimed).
+const GROUP_SUBMISSIONS_SQL: &str = r"
+    SELECT execution_id, result_id,
+           origin = 'manual' AND status = 'errored' AND attempts = 0 AS refused
       FROM wyrd.verifier_executions
-     WHERE execution_id = ANY($1)
-";
-
-/// The submissions among `$1` the queue writer settled `errored` without
-/// accepting them: an idempotency conflict or a refused target, never
-/// claimed.
-const REFUSED_SUBMISSIONS_SQL: &str = r"
-    SELECT execution_id
-      FROM wyrd.verifier_executions
-     WHERE execution_id = ANY($1) AND origin = 'manual'
-       AND status = 'errored' AND attempts = 0
+     WHERE group_id = $1
 ";
 
 /// The settled group result admitted immediately before execution `$1` for
@@ -969,6 +962,17 @@ pub struct DueGroupBinding {
     /// The owner's Card-bound principal when it is runtime-active; `None`
     /// means no group execution may be accepted this tick.
     pub owner: Option<PrincipalId>,
+}
+
+/// The queue's settlement of the executions queued to one group, which
+/// decides the group's eligible source rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupSubmissions {
+    /// Submissions the queue writer refused; their rows are no source rows.
+    pub refused: BTreeSet<ExecutionId>,
+    /// Each accepted queued execution's selected result, `None` while its
+    /// settlement selected none.
+    pub selected: BTreeMap<ExecutionId, Option<VerificationResultId>>,
 }
 
 /// The latest group execution of one binding and group.
@@ -1686,60 +1690,41 @@ impl VerifierExecutionQueue {
             .collect()
     }
 
-    /// The authoritative result of each queued execution among `executions`.
+    /// The queue's settlement of every execution queued with `group_id`.
     ///
-    /// A queued execution maps to the result its settlement selected, or
-    /// `None` while it has none, so a result row an abandoned attempt
-    /// published is never authoritative. A direct execution was never queued
-    /// and is absent: its one published result is its own.
-    ///
-    /// # Errors
-    /// Returns the database error when the read fails, or a decode error when
-    /// a stored identity is malformed.
-    pub async fn selected_results(
-        &self,
-        conn: &mut TenantConn<'_>,
-        executions: &[ExecutionId],
-    ) -> Result<BTreeMap<ExecutionId, Option<VerificationResultId>>, SqlxError> {
-        let ids: Vec<Uuid> = executions.iter().map(ExecutionId::as_uuid).collect();
-        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(SELECTED_RESULTS_SQL)
-            .bind(ids)
-            .fetch_all(&mut **conn.transaction())
-            .await?;
-        rows.into_iter()
-            .map(|(execution, result)| {
-                Ok((
-                    stored(ExecutionId::new(execution))?,
-                    result
-                        .map(|result| stored(VerificationResultId::new(result)))
-                        .transpose()?,
-                ))
-            })
-            .collect()
-    }
-
-    /// The executions among `executions` whose staged submission the queue
-    /// writer refused: settled `errored` on acceptance for an idempotency
-    /// conflict or an unavailable target, so they never ran and their staged
-    /// inputs are no execution's evidence. Accepted, direct, and not yet
-    /// accepted executions are absent.
+    /// A refused submission (an idempotency conflict or an unavailable
+    /// target) never ran, so its staged inputs are no execution's evidence.
+    /// Every other queued execution maps to the result its settlement
+    /// selected, or `None` while it has none, so a result row an abandoned
+    /// attempt published is never authoritative. A direct execution was
+    /// never queued and appears in neither: its one published result is its
+    /// own.
     ///
     /// # Errors
     /// Returns the database error when the read fails, or a decode error when
     /// a stored identity is malformed.
-    pub async fn refused_submissions(
+    pub async fn group_submissions(
         &self,
         conn: &mut TenantConn<'_>,
-        executions: &[ExecutionId],
-    ) -> Result<BTreeSet<ExecutionId>, SqlxError> {
-        let ids: Vec<Uuid> = executions.iter().map(ExecutionId::as_uuid).collect();
-        let rows: Vec<Uuid> = sqlx::query_scalar(REFUSED_SUBMISSIONS_SQL)
-            .bind(ids)
+        group_id: &GroupId,
+    ) -> Result<GroupSubmissions, SqlxError> {
+        let rows: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(GROUP_SUBMISSIONS_SQL)
+            .bind(group_id.as_str())
             .fetch_all(&mut **conn.transaction())
             .await?;
-        rows.into_iter()
-            .map(|execution| stored(ExecutionId::new(execution)))
-            .collect()
+        let mut submissions = GroupSubmissions::default();
+        for (execution, result, refused) in rows {
+            let execution = stored(ExecutionId::new(execution))?;
+            if refused {
+                submissions.refused.insert(execution);
+            } else {
+                let result = result
+                    .map(|result| stored(VerificationResultId::new(result)))
+                    .transpose()?;
+                submissions.selected.insert(execution, result);
+            }
+        }
+        Ok(submissions)
     }
 
     /// Enqueue one group execution of `binding_id` judging `snapshot`.

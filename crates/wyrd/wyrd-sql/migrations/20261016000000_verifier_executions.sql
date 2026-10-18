@@ -83,6 +83,11 @@ CREATE UNIQUE INDEX verifier_executions_group_outstanding
     ON wyrd.verifier_executions (data_tenant_id, binding_id, group_id)
     WHERE origin = 'group' AND status IN ('pending', 'running', 'retrying');
 
+-- A group poll reads the settlement of every execution queued to its group.
+CREATE INDEX verifier_executions_group
+    ON wyrd.verifier_executions (data_tenant_id, group_id)
+    WHERE group_id IS NOT NULL;
+
 ALTER TABLE wyrd.operator_dispatches RENAME COLUMN run_id TO execution_id;
 
 -- Live dispatches render their frozen context on a later delivery attempt,

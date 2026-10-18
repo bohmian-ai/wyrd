@@ -1304,8 +1304,9 @@ mod pg_tests {
 
     /// A group review, read over MCP once its group goes idle: poll
     /// `verification.get_binding` until it names a completed execution other
-    /// than `after`, publishing captured rows each round so the group poller
-    /// discovers them.
+    /// than `after` whose result is visible, publishing captured rows each
+    /// round so the group poller discovers them and a completed review's
+    /// staged result becomes readable.
     ///
     /// # Errors
     ///
@@ -1332,7 +1333,7 @@ mod pg_tests {
                 && Some(id) != after
             {
                 let state = settle(client, id).await?;
-                if state["status"] == "completed" {
+                if state["status"] == "completed" && !state["result"].is_null() {
                     return Ok(state);
                 }
             }
@@ -1457,6 +1458,7 @@ mod pg_tests {
         assert_eq!(
             review["result"]["outcome"]["evidence"]["turns"],
             serde_json::json!({ "kind": "json", "value": [{ "answer": "first" }, { "answer": "second" }] }),
+            "{review}"
         );
         assert_eq!(review["result"]["outcome"]["verdict"], "passed", "{review}");
         let review_id = text(&review, "/execution_id")?.to_owned();

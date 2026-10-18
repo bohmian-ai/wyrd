@@ -273,8 +273,8 @@ pub struct GroupSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct GroupCoverage {
-    /// Newest eligible source row time (input `recorded_at` or result
-    /// `ended_at`) the snapshot covers.
+    /// Newest eligible source row time (the row's PostgreSQL-anchored
+    /// `wyrd_ingested_at`) the snapshot covers.
     pub through: DateTime<Utc>,
     /// Distinct eligible source rows, inputs and results counted apart, the
     /// snapshot covers; a later-visible row timed earlier raises it.
@@ -290,7 +290,8 @@ pub struct GroupSourceSnapshot {
     /// The authored source declaration.
     pub reference: SourceText,
     /// The source executions the slot's list holds one value for, in list
-    /// order: input `recorded_at`, then execution ID.
+    /// order: earliest input ingest time (earliest result ingest time for a
+    /// result-only execution), then execution ID.
     pub execution_ids: Vec<ExecutionId>,
     /// The deployment source-execution ceiling, present only when the
     /// eligible executions exceeded it; nothing was read and the group

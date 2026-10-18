@@ -96,3 +96,41 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
 Server seams use `-p wyrd-server --features test-support --test integration --run-ignored=all`. Rust SDK stories use `-p wyrd-ai --test integration -P journey --run-ignored=all`. For every specifically named new/changed test, record and run its exact module-qualified `mise exec -- cargo nextest run --locked ... -E 'test(=...)'` command. Confirm selection counts. Re-run any failure with WYRD_LOG before diagnosis; document the trace-supported cause and correction. No synthetic host load.
 
 Run applicable Rust format/lints and targeted tenancy/dependency checks if their owned boundary changes. Regenerate/check contracts only if changed. Build `mise run build:monty-worker` as needed. This task does not require complete SDK journey suites or broad aggregates; change review owns those once. Append focused execution evidence and source closure for every retained ID. The later task review assesses the full cumulative candidate against the original task and all prior findings.
+
+## Implementation evidence
+
+Existing owners reused: `GroupPoller`/`BindingPoll`, `VerifierExecutionQueue`, the `GroupSnapshot`/`GroupState` coverage owners, `ResultPayloadBuilder` and the one `ScribeOutbox`, the bound-server `pg_verification_groups` seam, and the Rust journey's local judge.
+
+**One read.** Bifrost states that even a successful later cut "can omit or duplicate rows" (bifrost-design, Durability and visibility), so membership and values must share one statement; refusing Degraded terminals would not close a two-read gap. Per group the queue first names the group's refused submissions and selected results (`VerifierExecutionQueue::group_submissions`, one `WHERE group_id = $1` statement replacing the two by-ID lookups, with a `(data_tenant_id, group_id)` partial index). One Bifrost statement then reads every eligible row with `COUNT(DISTINCT execution_id) OVER (PARTITION BY card_uid, verifier_card_uid)` and `CASE WHEN executions <= ceiling … THEN payload END`, a window over the same scan, so the count, the over decision and the values agree with the rows. Deleted: `selection`'s Rust filtering, both payload statements, `Sources::complete`, the deferral, `Ended::over`/`eligible`, the `cutoff` field and `incomplete_selections_defer`. The snapshot is now synchronous.
+
+**PostgreSQL time.** Every row time is `wyrd_ingested_at`. Finality needs no row filter: rows and the tick clock are both PostgreSQL time, so `Ended::judge` refuses a group once the clock or any row reaches first + finality. Tests elapse time only on PostgreSQL (`pg_sleep`) under binding durations set on the claimed `due.settings`; `due.clock` is never shifted.
+
+**Consequence of spec revision 15.** One Scribe batch shares one ingest time, so rows ingested together tie and list by `execution_id`, not by submission order. The Rust, Python and TypeScript sampled-frames journeys asserted submission order; each now asserts the exact member set and derives each value's position from its listed ID. The unit test pins the (time, `execution_id`) order.
+
+| Finding | Implementation | Verification | Result |
+|---|---|---|---|
+| FIND-1 | Unselected queued results are excluded in the one read (`NOT queued OR result_id IN selected`); a later selection raises members | `pg_verification_groups::a_visible_result_counts_once_its_settlement_selects_it`: visible result before selection → review pins `[null]`, members 1; settle review; select that exact result without republishing → one new review, members 2, `["passed"]`; next tick enqueues nothing. Negative control (authority filter neutralised): fails at members 2 ≠ 1 | PASS |
+| FIND-2 eligibility | Refused submissions excluded in the one read; `judge` anchors on the first eligible row; discovery bounds `MAX(at)` | `pg_verification_groups::finality_anchors_on_the_first_eligible_row`: refused-first group judged from its later accepted turn (lists only it); old accepted group past 10s finality enqueues nothing. Negative control (refused filter neutralised): fails at 0 ≠ 1 enqueues | PASS |
+| FIND-2 timing | Uncapped identity read; no rank, limit or re-run | `verification::groups::tests::one_read_selects_eligible_rows_and_gates_payloads` asserts no `LIMIT`/`RANK`, the group, owner/tuple, refused and authority filters, the ceiling gate and no `recorded_at`/`ended_at` | PASS |
+| FIND-2 proof | Deleted as inexpressible: one statement carries membership and values | `verification::groups::tests::decoding_marks_tuples_over_the_ceiling`; `pg_verification_groups::refused_submissions_do_not_count_toward_the_ceiling`; `pg_verification_groups::partial_group_reads_enqueue_nothing_until_a_complete_poll` | PASS |
+| FIND-6 | `Support::tick` documents `# Errors` (returned poll errors; the tick still commits its cursor and whole snapshots) | Source inspection | PASS |
+| FIND-8 | The coding judge holds its first review answer (`HeldReview`) until the test has read the pinned trace ID, published and flushed the late span, and released it | `verify_in_real_time::grouped_coding_uses_declared_sources`: pinned ask carries the trace ID; live read contains `late-test-run`; evidence traces `[trace, null, null]` | PASS |
+| Ordering regression | Journeys assert the members and ID-aligned values | Rust/Python/TS `grouped_sampled_frames_are_bounded` | PASS |
+
+**Diagnosis (MCP, intermittent).** Symptom: `verification::pg_tests::grouped_verification_discover_act_observe` failed once at `verification.rs:1457`, where review `result.outcome.evidence.turns` was `Null`; the same run's `execution_ids` assertion passed and the re-run passed. Evidence, from a fresh read-only diagnostician: `get_execution` fills `result` from a Bifrost read and leaves it absent until the row is visible (`components/verification/service.rs:221–280`). The contract says "`completed` may briefly lack a visible result" (`wyrd-spec/src/verification/execution.rs:150–153`). Settlement stages the result on the outbox in the completing transaction (`runner.rs:510–563`). Cause: the test helper `group_review` returned on `completed` without waiting for `result`. Fix site: that helper now requires a visible result, the same rule as the Rust journey helper `support::group_execution`. 11/11 MCP grouped and `query::` tests pass after the fix.
+
+Commands (Postgres-backed ones under `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && …'`):
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/^verification::groups::tests::/)'   # 5 passed
+cargo nextest run --locked -p wyrd-server --features test-support --test integration --run-ignored=all -E 'test(/^pg_verification_groups::/)'   # 4 passed
+cargo nextest run --locked -p wyrd-server --features test-support --test integration --run-ignored=all -E 'test(=pg_verification_groups::a_visible_result_counts_once_its_settlement_selects_it) | test(=pg_verification_groups::finality_anchors_on_the_first_eligible_row)'   # both fail under each neutralised filter; source restored
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^verify_in_real_time::grouped_/)'   # 7 passed
+cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(/grouped_/) | test(/^query::/)'   # 11 passed
+cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(/^query_lifecycle::/)'   # 2 passed
+cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/test_verify_in_real_time.py -k grouped   # 5 passed (after mise run py:setup)
+cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/verify-in-real-time.test.ts -t grouped   # 5 passed (after ts:build, ts:build:testing)
+mise run fmt && mise run lints && mise run check:tenant-isolation && mise run codegen:regen && mise run codegen:check && mise run py:format && mise run py:lints && mise run ts:format:check && mise run ts:lints && git diff --check   # all pass
+```
+
+Non-goals held: no continuing cursor, TASK-002/003 work, new queue, readiness tracker, receipt, configuration or dependency. `card-types.ts` changed only through `codegen:regen`, from the `GroupCoverage` rustdoc.

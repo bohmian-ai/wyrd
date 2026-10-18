@@ -2,8 +2,11 @@
 //! [`GroupPoller`], queue and cursor owner on a bound server.
 //!
 //! The verification runtime stays off, so no background poll consumes an
-//! armed query fault or claims the binding; each test claims the binding,
-//! polls and commits exactly as one scheduler tick does.
+//! armed query fault or claims the binding and no runner claims a source
+//! execution; each test claims the binding, polls and commits exactly as one
+//! scheduler tick does. Time elapses only on PostgreSQL's clock: rows carry
+//! Bifrost's PostgreSQL-anchored ingest time, and each tick lets one second
+//! pass there before judging under a one-second idle.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +23,25 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
+use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::groups::{GroupPollError, GroupPoller};
-use wyrd_spec::ids::{CardUid, ExecutionId};
-use wyrd_sql::queries::verifier_executions::{EnqueueOutcome, VerifierExecutionQueue};
+use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_spec::card::trigger::TriggerDuration;
+use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::verification::VerificationVerdict;
+use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
+use wyrd_sql::TenantConn;
+use wyrd_sql::queries::verifier_executions::{
+    ClaimedExecution, EnqueueOutcome, ExecutionInput, VerifierExecutionQueue,
+};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// How long an accepted enqueue may take to become readable.
 const VISIBLE: Duration = Duration::from_secs(30);
+
+/// How long a test claim leases an execution; no runner competes for it.
+const LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// One bound server with the support Service registered and credentialed.
 struct Support {
@@ -186,20 +200,29 @@ impl Support {
     }
 
     /// Run one scheduler tick of the tenant's `group_end` binding through
-    /// `poller`: bring its cursor due, claim it, judge its groups a minute
-    /// past PostgreSQL's clock so every idle window has elapsed, and commit
-    /// whatever the poll enqueued with the advanced cursor.
+    /// `poller` under a one-second idle and `finality`: let one second pass
+    /// on PostgreSQL's clock, bring the cursor due, claim it, poll, and
+    /// commit whatever the poll enqueued with the advanced cursor.
+    ///
+    /// # Errors
+    /// Returns the poll's [`GroupPollError`]: a failed or refused Bifrost
+    /// read, or a failed Postgres statement. The tick still commits, so the
+    /// claimed cursor and every whole snapshot enqueued before the failure
+    /// persist.
     ///
     /// # Panics
-    /// Panics when a Postgres statement fails, nothing is due, or the
-    /// Service is not active.
-    async fn tick(&self, poller: &GroupPoller) -> Result<Vec<EnqueueOutcome>, GroupPollError> {
-        let tenant = self.server.data_tenant_id();
-        let mut conn = self
-            .server
-            .tenant_conn_for(tenant)
+    /// Panics when a Postgres statement outside the poll fails, nothing is
+    /// due, or the Service is not active.
+    async fn tick(
+        &self,
+        poller: &GroupPoller,
+        finality: &str,
+    ) -> Result<Vec<EnqueueOutcome>, GroupPollError> {
+        let mut conn = self.conn().await;
+        sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut **conn.transaction())
             .await
-            .expect("tenant connection opens");
+            .expect("PostgreSQL time passes");
         sqlx::query(
             "UPDATE wyrd.verification_bindings SET next_run_at = statement_timestamp() \
               WHERE activation = 'group_end'",
@@ -213,7 +236,9 @@ impl Support {
             .await
             .expect("claim runs")
             .expect("the group binding is due");
-        due.clock += chrono::TimeDelta::minutes(1);
+        let duration = |text| TriggerDuration::parse(text).expect("a valid duration");
+        due.settings.idle = duration("1s");
+        due.settings.finality = duration(finality);
         let state = self.server.state();
         let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox))
             .resolve(&mut conn, due.owner.expect("the Service is active"))
@@ -223,6 +248,79 @@ impl Support {
         let polled = poller.poll(&mut conn, &queue, &due, &authority).await;
         conn.commit().await.expect("the tick commits");
         polled
+    }
+
+    /// A transaction on the tenant's Postgres schema.
+    ///
+    /// # Panics
+    /// Panics when the connection does not open.
+    async fn conn(&self) -> TenantConn<'_> {
+        self.server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens")
+    }
+
+    /// Claim the one claimable execution, committed so it stays leased.
+    ///
+    /// # Panics
+    /// Panics when the claim fails or nothing is claimable.
+    async fn claim(&self) -> ClaimedExecution {
+        let mut conn = self.conn().await;
+        let claimed = VerifierExecutionQueue::default()
+            .claim(&mut conn, LEASE)
+            .await
+            .expect("claim runs")
+            .expect("an execution is claimable");
+        conn.commit().await.expect("the claim commits");
+        claimed
+    }
+
+    /// Settle `claimed` completed with `result_id`, which becomes its
+    /// selected result.
+    ///
+    /// # Panics
+    /// Panics when the settlement fails or does not apply.
+    async fn complete(&self, claimed: &ClaimedExecution, result_id: VerificationResultId) {
+        let mut conn = self.conn().await;
+        VerifierExecutionQueue::default()
+            .complete(
+                &mut conn,
+                claimed.lease,
+                result_id,
+                VerificationVerdict::Passed,
+                "",
+                None,
+            )
+            .await
+            .expect("the settlement applies");
+        conn.commit().await.expect("the settlement commits");
+    }
+
+    /// Judge one ungrouped turn answering `answer` directly and return its
+    /// result.
+    ///
+    /// # Panics
+    /// Panics when the execution is not answered OK.
+    async fn execute(&self, answer: &str) -> VerificationResult {
+        let body = json!({
+            "verifier_card_uid": self.turn_check,
+            "card_uid": self.agent,
+            "inputs": {"turn": {"kind": "json", "value": {"answer": answer}}},
+        });
+        let (status, result) = self
+            .send(
+                &self.service,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/verification/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("builds"),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        serde_json::from_value(result).expect("a verification result")
     }
 
     /// The group snapshot of the group execution `outcome` created.
@@ -259,6 +357,22 @@ fn client(base_url: &str, jwt: &str) -> WyrdClient {
     WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
+/// The value list `claimed` group execution pins for `slot`.
+///
+/// # Panics
+/// Panics when `claimed` is no group execution or lacks the slot.
+fn values(claimed: &ClaimedExecution, slot: &str) -> Value {
+    let ExecutionInput::Grouped { inputs, .. } = &claimed.input else {
+        panic!("not a group execution: {:?}", claimed.input);
+    };
+    let Some(InputDeclaration::Json { value }) =
+        inputs.get(&SlotName::new(slot).expect("a valid slot"))
+    else {
+        panic!("no {slot} list: {inputs:?}");
+    };
+    value.clone()
+}
+
 /// The execution IDs a snapshot's `slot` lists.
 fn listed(snapshot: &Value, slot: &str) -> Value {
     snapshot["sources"][slot]["execution_ids"].clone()
@@ -286,13 +400,16 @@ async fn partial_group_reads_enqueue_nothing_until_a_complete_poll() {
     let poller = GroupPoller::new(support.server.state().clone(), 20, Duration::from_secs(30));
 
     support.server.fail_next_query_after_batch();
-    let refused = support.tick(&poller).await;
+    let refused = support.tick(&poller, "1d").await;
     assert!(
         matches!(refused, Err(GroupPollError::Read(_))),
         "{refused:?}"
     );
 
-    let enqueued = support.tick(&poller).await.expect("the next tick reads");
+    let enqueued = support
+        .tick(&poller, "1d")
+        .await
+        .expect("the next tick reads");
     assert_eq!(enqueued.len(), 1, "{enqueued:?}");
     let snapshot = support.snapshot(&enqueued[0]).await;
     let ids = json!(turns);
@@ -303,7 +420,10 @@ async fn partial_group_reads_enqueue_nothing_until_a_complete_poll() {
         "two inputs, no results yet: {snapshot}"
     );
 
-    let again = support.tick(&poller).await.expect("a covered tick reads");
+    let again = support
+        .tick(&poller, "1d")
+        .await
+        .expect("a covered tick reads");
     assert!(
         again.is_empty(),
         "covered activity is not re-enqueued: {again:?}"
@@ -336,7 +456,7 @@ async fn refused_submissions_do_not_count_toward_the_ceiling() {
         .expect("Bifrost flushes");
     let poller = GroupPoller::new(support.server.state().clone(), 2, Duration::from_secs(30));
 
-    let enqueued = support.tick(&poller).await.expect("the tick reads");
+    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
     assert_eq!(enqueued.len(), 2, "{enqueued:?}");
     let mut snapshots = Vec::new();
     for outcome in &enqueued {
@@ -353,4 +473,117 @@ async fn refused_submissions_do_not_count_toward_the_ceiling() {
         .expect("the over group is marked");
     assert_eq!(listed(over, "turns"), json!([]), "{over}");
     assert_eq!(over["sources"]["answered"]["exceeded_ceiling"], 2, "{over}");
+}
+
+/// A queued turn's result visible before its settlement selects it is no
+/// source row: the review pins its outcome null and counts only its input.
+/// Selecting that exact visible result, without republishing it, yields one
+/// next whole review with the actual outcome, and an unchanged poll none.
+///
+/// # Panics
+/// Panics when setup fails or a review pins or counts otherwise.
+#[tokio::test]
+async fn a_visible_result_counts_once_its_settlement_selects_it() {
+    let support = Support::start().await;
+    let turn = support.turn("selected", "yes", None).await;
+    let outcome = support.execute("yes").await.outcome;
+    let source = support.claim().await;
+    assert_eq!(source.lease.execution_id, turn);
+    let group = GroupId::new("selected").expect("a valid group");
+    let payload = ResultPayloadBuilder::new(
+        ResultRun {
+            execution_id: turn,
+            run_id: None,
+            verifier_version: &source.verifier_version,
+            card_uid: &source.card_uid,
+            owner_card_uid: source.authority.principal.owner_service_uid(),
+            group_id: Some(&group),
+            binding_id: None,
+            trigger: None,
+            window: None,
+        },
+        &source.verifier_card_uid,
+        chrono::DateTime::UNIX_EPOCH,
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .build(&outcome)
+    .expect("the result builds");
+    let result_id = payload.result_id();
+    let state = support.server.state();
+    state.scribe_outbox.stage(
+        support.server.data_tenant_id(),
+        ScribeWrite::Result {
+            payload,
+            attribution: source.attribution,
+        },
+    );
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let poller = GroupPoller::new(state.clone(), 20, Duration::from_secs(30));
+
+    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
+    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
+    let first = support.snapshot(&enqueued[0]).await;
+    assert_eq!(first["members"], 1, "only the input counts: {first}");
+    let review = support.claim().await;
+    assert_eq!(values(&review, "answered"), json!([null]));
+    support
+        .complete(&review, VerificationResultId::new_v7())
+        .await;
+
+    support.complete(&source, result_id).await;
+    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
+    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
+    let second = support.snapshot(&enqueued[0]).await;
+    assert_eq!(second["members"], 2, "{second}");
+    assert_eq!(listed(&second, "answered"), json!([turn]), "{second}");
+    let review = support.claim().await;
+    assert_eq!(values(&review, "answered"), json!(["passed"]));
+    assert_eq!(values(&review, "turns"), json!([{"answer": "yes"}]));
+
+    let again = support.tick(&poller, "1d").await.expect("the tick reads");
+    assert!(again.is_empty(), "unchanged activity: {again:?}");
+}
+
+/// Finality anchors on a group's first eligible row: a group whose first
+/// row is an old refused submission is judged from its recent accepted
+/// turn, while a group whose old first row is accepted stays past finality.
+///
+/// # Panics
+/// Panics when setup fails or the tick judges other groups.
+#[tokio::test]
+async fn finality_anchors_on_the_first_eligible_row() {
+    let support = Support::start().await;
+    support
+        .turn("old-accepted", "one", Some("finality-0001"))
+        .await;
+    support
+        .turn("refused-first", "conflict", Some("finality-0001"))
+        .await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let mut conn = support.conn().await;
+    sqlx::query("SELECT pg_sleep(10)")
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("PostgreSQL time passes");
+    conn.commit().await.expect("the wait commits");
+    let accepted = support.turn("refused-first", "two", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let poller = GroupPoller::new(support.server.state().clone(), 20, Duration::from_secs(30));
+
+    let enqueued = support.tick(&poller, "10s").await.expect("the tick reads");
+    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
+    let snapshot = support.snapshot(&enqueued[0]).await;
+    assert_eq!(listed(&snapshot, "turns"), json!([accepted]), "{snapshot}");
 }

@@ -802,12 +802,15 @@ def test_grouped_sampled_frames_are_bounded(
     judged = judged_after(judged["execution_id"])
     assert judged["group_id"] == events["failing"]
     coverage = judged["group"]["sources"]
-    assert coverage["outcomes"]["execution_ids"] == [execution.id for execution in executions], (
-        "only the Service's own frames, in submission order"
+    # Frames ingested in one batch share its ingest time, so their list
+    # order is by execution ID rather than by submission.
+    listed = coverage["outcomes"]["execution_ids"]
+    assert len(listed) == 20
+    assert set(listed) == {execution.id for execution in executions}, (
+        "only the Service's own frames"
     )
     assert len(coverage["event"]["execution_ids"]) == 1
-    expected = ["passed"] * 20
-    expected[7] = "failed"
+    expected = ["failed" if id == executions[7].id else "passed" for id in listed]
     outcome = judged["result"]["outcome"]
     assert outcome["evidence"]["outcomes"] == {"kind": "json", "value": expected}
     assert outcome["verdict"] == "failed"
@@ -833,9 +836,9 @@ def test_grouped_sampled_frames_are_bounded(
         execution.wait(WAIT_SECONDS)
     judged = judged_after(judged["execution_id"])
     assert judged["group_id"] == events["door"]
-    assert judged["group"]["sources"]["outcomes"]["execution_ids"] == [
+    assert sorted(judged["group"]["sources"]["outcomes"]["execution_ids"]) == sorted(
         execution.id for execution in executions
-    ]
+    )
     assert judged["result"]["outcome"]["evidence"]["outcomes"] == {
         "kind": "json",
         "value": ["passed"] * 20,

@@ -827,11 +827,13 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
   await waited(executions);
   judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
   expect(judged.group_id).toBe("door-43");
-  expect(judged.group?.sources.outcomes.execution_ids, "only the Service's own frames, in submission order").toEqual(
-    ids(executions),
-  );
+  // Frames ingested in one batch share its ingest time, so their list
+  // order is by execution ID rather than by submission.
+  const listed = judged.group?.sources.outcomes.execution_ids ?? [];
+  expect([...listed].sort(), "only the Service's own frames").toEqual(ids(executions).sort());
   expect(judged.group?.sources.event.execution_ids).toHaveLength(1);
-  const expected = Array.from({ length: 20 }, (_, index) => (index === 7 ? "failed" : "passed"));
+  const unbadged = ids(executions)[7];
+  const expected = listed.map((id) => (id === unbadged ? "failed" : "passed"));
   expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: expected });
   expect(judged.result?.outcome.verdict).toBe("failed");
 
@@ -858,7 +860,7 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
   await waited(door);
   judged = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
   expect(judged.group_id).toBe("door-42");
-  expect(judged.group?.sources.outcomes.execution_ids).toEqual(ids(door));
+  expect([...(judged.group?.sources.outcomes.execution_ids ?? [])].sort()).toEqual(ids(door).sort());
   expect(judged.result?.outcome.evidence.outcomes).toEqual({ kind: "json", value: Array(20).fill("passed") });
   expect(judged.result?.outcome.verdict).toBe("passed");
   expect(

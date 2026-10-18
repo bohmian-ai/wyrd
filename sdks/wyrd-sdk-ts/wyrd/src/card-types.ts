@@ -1991,7 +1991,7 @@ export interface GroupCoverage {
    */
   readonly sources: Readonly<Record<string, GroupSourceSnapshot>>;
   /**
-   * Newest eligible source row time (input `recorded_at` or result `ended_at`) the snapshot covers.
+   * Newest eligible source row time (the row's PostgreSQL-anchored `wyrd_ingested_at`) the snapshot covers.
    */
   readonly through: string;
 }
@@ -2010,7 +2010,7 @@ export interface GroupSourceSnapshot {
    */
   readonly exceeded_ceiling?: number | null;
   /**
-   * The source executions the slot's list holds one value for, in list order: input `recorded_at`, then execution ID.
+   * The source executions the slot's list holds one value for, in list order: earliest input ingest time (earliest result ingest time for a result-only execution), then execution ID.
    */
   readonly execution_ids: readonly string[];
   /**

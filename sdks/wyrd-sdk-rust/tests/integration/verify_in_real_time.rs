@@ -1609,10 +1609,57 @@ async fn judged_bodies(judge: &MockServer, marker: &str) -> Vec<String> {
         .collect()
 }
 
+/// The coding review's tool-call answer, held on its first request until
+/// the test releases it.
+///
+/// The first request is reported on `asked` with its body, the evidence the
+/// group execution pinned, and is answered only once `release` fires; so the
+/// test observes the pinned trace IDs, publishes later spans, and only then
+/// lets the check run its live read. Every later request is answered at
+/// once. Holding blocks one judge server thread for that first request.
+struct HeldReview {
+    /// The answer every request receives.
+    response: ResponseTemplate,
+    /// Where the first request's body is reported.
+    asked: std::sync::mpsc::Sender<String>,
+    /// The signal the first answer waits for; taken by that request.
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl wiremock::Respond for HeldReview {
+    /// Report and hold the first request, then answer it and every later
+    /// one with `response`.
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let first = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(release) = first {
+            drop(
+                self.asked
+                    .send(String::from_utf8_lossy(&request.body).into_owned()),
+            );
+            release.recv().unwrap_or_default();
+        }
+        self.response.clone()
+    }
+}
+
 /// Script the `coding-judge` check Agent on the local judge: a request that
 /// already carries tool results passes with [`REVIEWED`]; any other asks for
-/// one `bifrost.query` of the span names stored for `trace`.
-async fn script_coding_judge(judge: &MockServer, trace: &str) {
+/// one `bifrost.query` of the span names stored for `trace`, the first such
+/// answer held as [`HeldReview`] describes.
+///
+/// Returns where the first review request's body arrives and the sender
+/// that releases its answer.
+async fn script_coding_judge(
+    judge: &MockServer,
+    trace: &str,
+) -> (
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Sender<()>,
+) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains(LIVE_REVIEW))
@@ -1631,15 +1678,22 @@ async fn script_coding_judge(judge: &MockServer, trace: &str) {
             "max_rows": 10,
         }),
     );
+    let (asked, first) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains(LIVE_REVIEW))
-        .respond_with(completion(
-            json!({ "role": "assistant", "content": null, "tool_calls": [query] }),
-        ))
+        .respond_with(HeldReview {
+            response: completion(
+                json!({ "role": "assistant", "content": null, "tool_calls": [query] }),
+            ),
+            asked,
+            release: std::sync::Mutex::new(Some(held)),
+        })
         .with_priority(2)
         .mount(judge)
         .await;
+    (first, release)
 }
 
 /// A coding session's prompt, edit, and test calls are judged per turn, and
@@ -1648,7 +1702,8 @@ async fn script_coding_judge(judge: &MockServer, trace: &str) {
 /// and each call's test outcome, failed one included. The trace slot carries
 /// the ID alone: the check Agent's first request names no span, and its
 /// `bifrost.query`, under the owning Service's ordinary tool and query
-/// grants, reads live the spans exported after the turns; once that grant
+/// grants, reads live a span exported only after the review pinned and sent
+/// its trace IDs, which stay unchanged; once that grant
 /// is revoked, a later session's read is denied with nothing returned. An empty `each` selection is inconclusive `empty_selection`
 /// inline and after a step. Holding only one of the tool-invoke and query
 /// grants, a session's read is denied on the missing one. A child-field
@@ -1705,7 +1760,7 @@ async fn grouped_coding_uses_declared_sources() {
         .span_context()
         .trace_id()
         .to_string();
-    script_coding_judge(&assistant.judge, &trace).await;
+    let (asked, release) = script_coding_judge(&assistant.judge, &trace).await;
     let calls = [
         json!({"call": "prompt", "tests": "passed"}),
         json!({"call": "edit", "tests": "failed"}),
@@ -1767,11 +1822,15 @@ async fn grouped_coding_uses_declared_sources() {
             ),
         ]
     );
+    let pinned = tokio::task::block_in_place(|| asked.recv_timeout(WAIT))
+        .expect("the review asks before any later span exists");
+    assert!(pinned.contains(&trace), "the pinned trace ID: {pinned}");
     tracing::dispatcher::with_default(&dispatch, || {
         tracing::info_span!(parent: &session, "late", otel.name = "late-test-run").in_scope(|| ());
     });
     drop(session);
     tokio::task::block_in_place(|| provider.force_flush()).expect("the spans export");
+    release.send(()).expect("the held review waits");
 
     let judged = deployment
         .group_execution(&coding.binding, None, WAIT)
@@ -2222,17 +2281,24 @@ async fn grouped_sampled_frames_are_bounded() {
         .group
         .as_ref()
         .expect("the execution pins its snapshot");
+    // Frames ingested in one batch share its ingest time, so their list
+    // order is by execution ID rather than by submission.
+    let listed = &coverage.sources[&outcomes].execution_ids;
+    assert_eq!(listed.len(), 20);
     assert_eq!(
-        coverage.sources[&outcomes].execution_ids,
+        listed.iter().collect::<BTreeSet<_>>(),
         executions
             .iter()
-            .map(|execution| *execution.id())
-            .collect::<Vec<_>>(),
-        "only the Service's own frames, in submission order"
+            .map(Execution::id)
+            .collect::<BTreeSet<_>>(),
+        "only the Service's own frames"
     );
     assert_eq!(coverage.sources[&event].execution_ids.len(), 1);
-    let mut expected = vec!["passed"; 20];
-    expected[7] = "failed";
+    let unbadged = executions[7].id();
+    let expected: Vec<_> = listed
+        .iter()
+        .map(|id| if id == unbadged { "failed" } else { "passed" })
+        .collect();
     let outcome = &judged
         .result
         .as_ref()
@@ -2314,7 +2380,13 @@ async fn grouped_sampled_frames_are_bounded() {
         .group
         .as_ref()
         .expect("the execution pins its snapshot");
-    assert_eq!(coverage.sources[&outcomes].execution_ids, ids);
+    assert_eq!(
+        coverage.sources[&outcomes]
+            .execution_ids
+            .iter()
+            .collect::<BTreeSet<_>>(),
+        ids.iter().collect::<BTreeSet<_>>()
+    );
     assert_eq!(
         serde_json::to_value(
             &judged

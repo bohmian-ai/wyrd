@@ -28,7 +28,7 @@ use wyrd_utils::secret::read_secret_file;
 
 use super::install::compatible;
 use super::{InstalledServer, ServerInstaller};
-use crate::card::{OutputFormat, print_json};
+use crate::card::OutputFormat;
 use crate::client::map_client_error;
 use crate::error::WyrdCliError;
 use crate::gateway::{AuthoringApply, DeploymentFile, apply_deployments_with};
@@ -72,8 +72,8 @@ pub struct DevArgs {
     /// Skip the gateway offer.
     #[arg(long)]
     skip_gateway: bool,
-    /// Output encoding. `json` never prompts, prints one readiness object on
-    /// stdout once the server is ready and keeps serving, and appends
+    /// Output encoding. `json` never prompts, prints one single-line readiness
+    /// object on stdout once the server is ready and keeps serving, and appends
     /// progress and server output to the diagnostic log it names.
     #[arg(long, default_value_t)]
     format: OutputFormat,
@@ -797,7 +797,13 @@ impl DevServer {
         };
         match format {
             OutputFormat::Text => ready.print_text(),
-            OutputFormat::Json => print_json(&ready)?,
+            // One line, so a caller reads readiness while the server serves.
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string(&ready).map_err(|error| WyrdCliError::Output {
+                    detail: error.to_string(),
+                })?
+            ),
         }
         drop(ready);
         Self::exited(child).await

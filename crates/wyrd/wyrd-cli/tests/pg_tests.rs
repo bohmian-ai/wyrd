@@ -46,6 +46,8 @@ struct LocalDev {
     grpc: String,
     /// Isolated Bifrost peer listener used by the normal server.
     peer: String,
+    /// The JSON readiness result of the current start, when JSON was used.
+    ready: Option<serde_json::Value>,
 }
 
 impl LocalDev {
@@ -90,6 +92,7 @@ impl LocalDev {
             bind: free_bind(),
             grpc: free_bind(),
             peer: free_bind(),
+            ready: None,
         }
     }
 
@@ -108,7 +111,8 @@ impl LocalDev {
             .env("WYRD_SERVER_BIND", &self.bind)
             .env("WYRD_GRPC_BIND", &self.grpc)
             .env("WYRD_BIFROST_PEER_BIND_ADDR", &self.peer)
-            .env("WYRD_METRICS_BIND", "127.0.0.1:0");
+            .env("WYRD_METRICS_BIND", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
         command
     }
 
@@ -124,6 +128,27 @@ impl LocalDev {
             command.args(["--host", host]);
         }
         self.start_with(command).await;
+    }
+
+    /// Start unattended JSON-mode setup and wait for its readiness result.
+    ///
+    /// # Panics
+    /// Panics as [`LocalDev::start`] does, or when anything but the one
+    /// readiness line reaches stdout before readiness.
+    async fn start_json(&mut self) {
+        let mut command = self.command();
+        command.args([
+            "server",
+            "dev",
+            "--tenant",
+            "local",
+            "--non-interactive",
+            "--format",
+            "json",
+        ]);
+        self.start_with(command).await;
+        let ready = self.ready.as_ref().expect("a JSON readiness result");
+        assert_eq!(ready["ready"], true);
     }
 
     /// Spawn the prepared `server dev` command and wait for readiness.
@@ -155,9 +180,16 @@ impl LocalDev {
                 if stdout.read_line(&mut line).await.expect("startup output") == 0 {
                     return false;
                 }
-                let ready = line.starts_with("Local Wyrd ready at ");
+                let json = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .filter(|value| value["ready"] == true);
+                let ready = line.starts_with("Local Wyrd ready at ") || json.is_some();
                 printed.push_str(&line);
                 if ready {
+                    if let Some(json) = json {
+                        assert_eq!(printed, line, "JSON mode prints only its readiness result");
+                        self.ready = Some(json);
+                    }
                     return true;
                 }
             }
@@ -331,7 +363,10 @@ async fn tenant_slugs(dsn: &SecretString) -> Vec<String> {
 
 /// First use migrates an empty database, saves a private key and both
 /// endpoints, and supports fresh CLI writes and client reads outside the
-/// checkout. A stale saved gRPC destination is replaced by the selected
+/// checkout. Unattended JSON mode refuses missing input before any side
+/// effect and an occupied listener by stage, each as one stderr document,
+/// then prints one readiness line and keeps serving while the client works;
+/// its progress and server output reach only the named diagnostic log. A stale saved gRPC destination is replaced by the selected
 /// custom loopback listener, which also governs a non-loopback server-file
 /// setting, and a fresh saved client writes Bifrost rows over it.
 ///
@@ -364,7 +399,48 @@ async fn server_dev_first_run_is_client_ready() {
         ),
     )
     .expect("non-loopback server file");
-    local.start(&[]).await;
+    let json_args = [
+        "server",
+        "dev",
+        "--tenant",
+        "local",
+        "--non-interactive",
+        "--format",
+        "json",
+    ];
+    let missing = local
+        .command()
+        .env_remove("WYRD_DATABASE_URL")
+        .args(json_args)
+        .output()
+        .await
+        .expect("missing-input run");
+    let refused = json_failure(&missing);
+    assert_eq!(refused["details"]["stage"], "input");
+    assert!(
+        refused["details"]["log"].is_null(),
+        "nothing has run: {refused}"
+    );
+    assert!(!local.home.path().join("wyrd/server/logs").exists());
+    let occupied = TcpListener::bind(&local.bind).expect("occupy the HTTP listener");
+    let busy = local
+        .command()
+        .args(json_args)
+        .output()
+        .await
+        .expect("occupied-listener run");
+    drop(occupied);
+    let refused = json_failure(&busy);
+    assert_eq!(refused["details"]["stage"], "listener");
+    let log = local.home.path().join("wyrd/server/logs/server-dev.log");
+    assert_eq!(refused["details"]["log"], log.to_str().expect("UTF-8 log"));
+    local.start_json().await;
+    let ready = local.ready.clone().expect("readiness result");
+    assert_eq!(ready["endpoint"], format!("http://{}", local.bind));
+    assert_eq!(ready["grpc"], format!("http://{}", local.grpc));
+    assert_eq!(ready["tenant"], "local");
+    assert_eq!(ready["log"], log.to_str().expect("UTF-8 log"));
+    assert_eq!(ready["mcp"], serde_json::Value::Null);
     let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
     let dev = &global.dev;
     assert_eq!(dev.tenant.as_deref(), Some("local"));
@@ -487,7 +563,35 @@ async fn server_dev_first_run_is_client_ready() {
             & 0o777,
         0o600
     );
-    local.stop("-INT").await;
+    let output = local.stop("-INT").await;
+    assert_eq!(
+        output.trim(),
+        serde_json::to_string(&ready).expect("readiness serializes"),
+        "JSON mode writes only its readiness line to stdout and nothing to stderr"
+    );
+    let diagnostics = fs::read_to_string(&log).expect("diagnostic log");
+    assert!(diagnostics.contains("Migrating the installed Wyrd server"));
+    assert!(diagnostics.contains("Local startup stopped"));
+    assert!(!diagnostics.contains("wyrd_sk_") && !diagnostics.contains(local.dsn.expose_secret()));
+}
+
+/// Decode a JSON-mode `server dev` refusal: nonzero exit, empty stdout, and
+/// one `WYRD_CLI_503_SERVER_DEV` document as the whole of stderr.
+///
+/// # Panics
+/// Panics when the run succeeded, wrote stdout, or stderr is not that one
+/// document.
+fn json_failure(output: &std::process::Output) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(69));
+    assert!(output.stdout.is_empty(), "a refusal prints no result");
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|_| {
+        panic!(
+            "stderr is one error document: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(error["code"], "WYRD_CLI_503_SERVER_DEV");
+    error
 }
 
 /// Reruns retain the active release and key; a failed one-time save does not

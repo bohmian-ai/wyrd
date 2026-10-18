@@ -391,9 +391,9 @@ spec:
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
+    let error: Value = serde_json::from_slice(&output.stderr).expect("check error is JSON");
     assert_eq!(
-        report["diagnostics"][0]["code"],
+        error["details"]["diagnostics"][0]["code"],
         "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND"
     );
 }
@@ -446,9 +446,9 @@ spec:
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
+    let error: Value = serde_json::from_slice(&output.stderr).expect("check error is JSON");
     assert_eq!(
-        report["diagnostics"][0]["code"],
+        error["details"]["diagnostics"][0]["code"],
         "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER"
     );
 }
@@ -2556,10 +2556,10 @@ mod pg_tests {
             ])
             .await;
             assert_eq!(plan.status.code(), Some(64), "{kind}");
-            let report: Value = serde_json::from_slice(&plan.stdout).expect("check error is JSON");
+            let error: Value = serde_json::from_slice(&plan.stderr).expect("check error is JSON");
             assert_eq!(
-                report["diagnostics"][0]["code"], "WYRD_LOADER_400_INVALID_ENVELOPE",
-                "{kind}: {report}"
+                error["details"]["diagnostics"][0]["code"], "WYRD_LOADER_400_INVALID_ENVELOPE",
+                "{kind}: {error}"
             );
             let refused = run_cli_owned_with_token(declare(&path), Some(jwt.clone())).await;
             assert_eq!(refused.status.code(), Some(64), "{kind}");

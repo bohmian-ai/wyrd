@@ -402,8 +402,9 @@ build: `mise run build:monty-worker`, `mise run py:setup` (Python wheel) and
 - Failed or truncated discovery and snapshot reads defer without a partial
   judgment (a poll error is logged, and the next tick retries). No
   fault-injection control exists, so there is no journey for it; the
-  shutdown-race trace shows `group poll failed … query execution failed`
-  followed by no review.
+  teardown trace of the recover journey logs `group poll failed … query
+  execution failed` while the journey's review count stays unchanged. This
+  is incidental evidence, not a dedicated assertion.
 - Reversed completion order: ordering by recorded input is proven by 20
   concurrently completing frames whose coverage matches submission order. A
   dedicated reversed pair was not added.

@@ -202,3 +202,69 @@ do not weaken the supported-platform or installed-process proof.
   [execution](../../../../architecture/references/languages/implementation-execution.md), [testing](../../../../architecture/references/languages/testing-workflows.md).
 - [Agent harness](../../../../architecture/references/languages/agent-harness.md), [errors](../../../../architecture/references/languages/errors.md),
   [security](../../../../architecture/wyrd-security-posture.md), [deployment operations](../../../../architecture/operations/deployment-and-release.md).
+
+## Implementation Evidence
+
+Executed on Linux x86_64 only. Linux arm64 and macOS arm64 were not executed
+here; their agreement rests on source review: the installer's `host_target`
+lists exactly the three targets, and the release matrix runs macos-15 (arm64)
+and ubuntu.
+
+### Reuse and gap record
+
+| Owner reused | Gap closed | Extension |
+|---|---|---|
+| `lib.rs::run_cli_code`, `CliBoundaryError::print` | Error printed JSON plus prose; Clap bypassed the catalog | `json_requested` scans raw argv once; JSON mode prints one stderr document; Clap failures become `WYRD_CLI_400_USAGE` (exit 64) |
+| `WyrdCliError` derive catalog | Local errors carried no details | `WyrdCliError::details`: loader diagnostics, field, startup stage plus log, MCP host outcomes, usage kind/argument |
+| `card.rs::OutputFormat`, `print_json` | Setup commands lacked `--format`; a failed check wrote `ok:false` to stdout | Reused on `server install`, `server dev`, `mcp install`; JSON check failures leave stdout empty |
+| `DevServer` ready boundary | No machine readiness | One single-line `DevReady` after readiness and the fresh-client proof; the existing foreground wait, interrupt, and stop are unchanged |
+| `DevServer` output | Progress and the child's output shared the machine streams | `Diagnostics` appends to `<server root>/logs/server-dev.log` in JSON mode; stage errors and readiness name it |
+| `McpInstallReport` | Prose only | JSON report; failures carry it as `details.hosts`; JSON never prompts |
+| `main.rs` tracing | Logs on stderr | Default filter is `off` in JSON mode unless `RUST_LOG` is set |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Required final commands project success, usage and domain errors in JSON | `lib.rs::{json_requested,run_cli_code}`, `error.rs::{WyrdCliError::{usage,details},CliBoundaryError::print}`, `card.rs::dispatch_check` | P1 (usage, offline check, no credentials, 403, declare/get/pull, token sentinel), P2, lib `tests::json_mode_is_read_from_raw_arguments` | PASS |
+| One ready result precedes the foreground wait; refusal and recovery retained | `server/dev.rs::{DevReady,Diagnostics,DevServer::run,DevArgs::run}` | P3 (missing input with no side effect, occupied listener `stage`+`log`, single readiness line, served fresh-client writes/reads, stdout/stderr hold only that line, log content without secrets), P4 | PASS |
+| Installer and host reports are typed, explicit, repeatable, credential-safe | `server/mod.rs::InstallArgs`, `install.rs::InstalledServer: Serialize`, `mcp/mod.rs::{InstallArgs::run,McpInstallReport::{failed,print_text,into_result},offer_local}` | P5 (result shape; real binary JSON 503 refusal through an unreachable proxy), P6 (JSON conflict details, no-prompt refusal, repeat `unchanged`, sentinel), P7 | PASS |
+| Normative targets are Linux x86_64, Linux arm64 and macOS arm64, with portability bans intact | `AGENTS.md` §2; installer `host_target` unchanged (already three) | Static review: `git grep` finds no other current four-target claim | PASS (Linux x86_64 executed only) |
+| No new lifetime, auth or error ownership boundary | Same catalog derive; no detach/stop API; credential resolution untouched | `mise run codegen:check`, `mise run check:deps`, diff review | PASS |
+
+### Commands
+
+- P1: `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::json_results_and_errors_are_machine_readable)'` — 1 passed
+- P2: `… -E 'test(=card_lifecycle::pg_tests::card_lifecycle_cli_journey)'` — 1 passed
+- P3: `… -E 'test(=pg_tests::server_dev_first_run_is_client_ready)'` — 1 passed
+- P4: `… -E 'test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state)'` — 1 passed
+- P5: `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_selects_latest_stable) or test(=server_install::server_install_preserves_previous_on_failure)'` — 2 passed
+- P6: `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=mcp_install_changes_only_selected_hosts)'` — 1 passed
+- P7: `… -E 'test(=pg_tests::server_dev_selected_mcp_host_reads)'` — 1 passed
+- Retained TASK-001 checks rewritten to read diagnostics from the error document; all passed:
+  - `card_lifecycle::invalid_local_reference_returns_card_load_error_without_credentials`
+  - `declare_check_validates_disk_references_without_contacting_a_configured_server`
+  - `declare_check_rejects_verifier_service_component_with_stable_diagnostic`
+  - `declare_check_rejects_unbound_verifier_peer_with_stable_diagnostic`
+  - `pg_tests::cli_enforces_the_verifier_card_contract`
+- Supporting lanes:
+  - `mise exec -- cargo nextest run --locked -p wyrd-cli --lib` — 71 passed
+  - `mise run fmt` and `mise run lints` — clean
+  - `mise run docs:generate` (adds `WYRD_CLI_400_USAGE` to `errors.md`) — done
+  - `mise run codegen:check`, `mise run docs:check` and `mise run check:deps` — passed
+  - `git diff --check` — clean
+- No Python or TypeScript binding changed. Both embed `run_cli_code`, so they inherit the contract; no SDK test depends on stream shape.
+
+### Non-goals
+
+- Excluded:
+  - detached mode or a stop/lifecycle API;
+  - process-manager state;
+  - a server-aware check;
+  - credentials in argv or host config;
+  - MCP declaration, upload or check;
+  - UI;
+  - sibling repositories;
+  - edits to other change packets.
+- Text mode keeps its existing JSON-line-plus-prose stderr.
+- Limit: an interrupt (exit 130) emits no error document; it is caller-initiated termination, recorded in the diagnostic log.

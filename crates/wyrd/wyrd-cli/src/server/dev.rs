@@ -262,10 +262,6 @@ impl DevReady {
             .config_dir
             .as_deref()
             .map_or_else(String::new, |dir| dir.display().to_string());
-        match &self.mcp {
-            Some(report) => report.print_text(),
-            None => println!("MCP setup skipped; connect a host later with wyrd mcp install."),
-        }
         println!(
             "Local Wyrd ready at {} for tenant {}.\n  gRPC: {}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
             self.endpoint,
@@ -768,7 +764,8 @@ impl DevServer {
             configured = inputs.configure_gateway(client, diagnostics) => configured?,
             exited = Self::exited(child) => return exited,
         };
-        let mcp = if !inputs.configured || !hosts.is_empty() {
+        let offer = !inputs.configured || !hosts.is_empty();
+        let mcp = if offer {
             tokio::select! {
                 offered = mcp::offer_local(hosts, endpoint, inputs.interactive) => offered?,
                 exited = Self::exited(child) => return exited,
@@ -776,11 +773,14 @@ impl DevServer {
         } else {
             None
         };
-        if let Some(report) = &mcp
-            && format == OutputFormat::Text
-            && report.hosts.iter().any(|outcome| outcome.detail.is_some())
-        {
-            report.print_text();
+        if format == OutputFormat::Text {
+            match &mcp {
+                Some(report) => report.print_text(),
+                None if offer => {
+                    println!("MCP setup skipped; connect a host later with wyrd mcp install.");
+                }
+                None => {}
+            }
         }
         let mcp = mcp.map(McpInstallReport::into_result).transpose()?;
         let ready = DevReady {

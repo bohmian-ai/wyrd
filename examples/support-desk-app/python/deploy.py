@@ -1,4 +1,4 @@
-"""Register the Cards in ``service/`` and download them into ``.wyrd-bundle``.
+"""Declare the Cards in ``service/`` and download them into ``.wyrd-bundle``.
 
 Registering the Service creates its ``vala.datasets.tickets`` table. The
 script also turns on gateway call metadata capture, so every model call is
@@ -25,7 +25,7 @@ def deploy(client: WyrdClient | None = None) -> None:
     shutil.rmtree(BUNDLE, ignore_errors=True)
     cards.pull(receipt.root, BUNDLE)
     Gateway(client).put_capture_policy({"mode": "metadata", "payload_fields": []})
-    print(f"registered {receipt.root} into {BUNDLE.name}")
+    print(f"declared {receipt.root} into {BUNDLE.name}")
     # ANCHOR_END: deploy
 
 

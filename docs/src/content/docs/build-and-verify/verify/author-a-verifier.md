@@ -90,19 +90,19 @@ The policy lives in the judge, not in the request. Your app sends only the lette
 
 A model call takes seconds, so the app [submits this Verifier](/build-and-verify/observe/record-a-run-and-observations/) in the background instead of waiting on it in the request.
 
-## 4. Check it before you register
+## 4. Check it before you declare
 
-`wyrd plan` loads every Card a Service references, follows the `./` paths, and validates each one without writing anything:
+`wyrd declare --check` loads every Card a Service references, follows the `./` paths, and validates each one without writing anything:
 
 ```bash
-wyrd plan service/support-desk.yaml
+wyrd declare --check service/support-desk.yaml
 ```
 
 ```text
 plan valid: 7 card(s)
 ```
 
-The CLI then lists each Card it would register. A broken Verifier fails here with the field that is wrong:
+The CLI then lists each Card it would declare. A broken Verifier fails here with the field that is wrong:
 
 | You see | Cause | Fix |
 | --- | --- | --- |

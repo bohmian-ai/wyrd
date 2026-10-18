@@ -86,7 +86,7 @@ The URL is stored in that agent's entry; open the file from the table above to s
 
 Ask the agent to list its MCP tools, then call `wyrd.guide` with `{"topic":"overview"}`. The guide returns `topic`, ordered `steps`, and `examples` containing tool names and argument objects. Its other topics are `cards`, `verification`, and `bifrost_sql`.
 
-Try a question about a Service you registered:
+Try a question about a Service you declared:
 
 ```text
 Analyze service support-desk in space default. Discover its exact version, follow its component

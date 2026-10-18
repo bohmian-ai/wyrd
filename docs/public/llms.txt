@@ -16,7 +16,7 @@
 
 - [Define a Service](https://bohmian-ai.github.io/wyrd/build-and-verify/declare/define-a-service/): Declare a Service as a folder of Card files, with exact component versions and a table for the rows it records, then validate it locally.
 - [Bind a Verifier](https://bohmian-ai.github.io/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
-- [Register and inspect a Service](https://bohmian-ai.github.io/wyrd/build-and-verify/declare/register-and-inspect/): Register a Service and every Card it references in one call, then read back its exact versions and the relationships the server derived.
+- [Declare and inspect a Service](https://bohmian-ai.github.io/wyrd/build-and-verify/declare/declare-and-inspect/): Declare a Service and every Card it references in one call, then read back its exact versions and the relationships the server derived.
 - [Record a run and observations](https://bohmian-ai.github.io/wyrd/build-and-verify/observe/record-a-run-and-observations/): Load your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
 - [Write and query custom data with Bifrost](https://bohmian-ai.github.io/wyrd/build-and-verify/observe/write-and-query-custom-data-with-bifrost/): Connect to Bifrost directly to register a table, load rows, and query any table you can read with SQL.
 - [Author a Verifier](https://bohmian-ai.github.io/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier Card from its inputs and requirements, starting with a one-line assertion and working up to a model judge that cites a document.

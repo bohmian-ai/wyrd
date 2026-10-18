@@ -20,7 +20,7 @@ Good: modules follow the capability; the public handle exposes its operations.
 ```text
 src/
   cards/
-    handle.rs    # Cards::register, Cards::get
+    handle.rs    # Cards::declare, Cards::get
   outbox/
     writer.rs    # Outbox::stage
 ```
@@ -141,7 +141,7 @@ the right Card.
 
 ```python
 def test_register(client, card):
-    assert client.cards.register(card) is not None
+    assert client.cards.declare(card) is not None
 ```
 
 Good: assert the durable result through the public client and name the
@@ -149,7 +149,7 @@ scenario. The exact API and fixture names below are illustrative.
 
 ```python
 def test_registered_card_can_be_loaded(client, card):
-    receipt = client.cards.register(card)
+    receipt = client.cards.declare(card)
     loaded = client.cards.get(receipt.card_ref)
     assert loaded.metadata.uid == receipt.card_ref.uid
     assert loaded.metadata.version == receipt.card_ref.version

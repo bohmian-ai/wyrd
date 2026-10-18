@@ -7,7 +7,7 @@ order: 1
 status: runnable
 ---
 
-A Verifier takes evidence from your app and decides whether it meets your requirements. Every object on this page rejects keys it does not define, so a typo fails at `wyrd plan` instead of being ignored. For a walkthrough, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
+A Verifier takes evidence from your app and decides whether it meets your requirements. Every object on this page rejects keys it does not define, so a typo fails at `wyrd declare --check` instead of being ignored. For a walkthrough, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
 
 ## How a Verifier works
 
@@ -259,7 +259,7 @@ To give the whole file to an Agent, pass the output to a placeholder: `inputs: {
 - Read legacy Office files. `doc`, `xls`, and `ppt` are separate formats; convert them to `docx`, `xlsx`, or `pptx`.
 - Open archives. `zip` and `tar_gz` go to a step Agent's `workspace` instead.
 
-A slot that accepts a format `extract` can't read fails `wyrd plan` with rule `extract_format`. At run time the step fails, and the requirements that need it are `inconclusive`, when the file doesn't parse as its format, a PDF is encrypted, a text file isn't UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/reference/verification-runtime-limits/)). Each result records the extractor version, `wyrd-extract/1`, so a verdict shows which extractor read the file.
+A slot that accepts a format `extract` can't read fails `wyrd declare --check` with rule `extract_format`. At run time the step fails, and the requirements that need it are `inconclusive`, when the file doesn't parse as its format, a PDF is encrypted, a text file isn't UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/reference/verification-runtime-limits/)). Each result records the extractor version, `wyrd-extract/1`, so a verdict shows which extractor read the file.
 
 #### agent
 

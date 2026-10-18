@@ -14,7 +14,7 @@ Load the exact Service version you deployed, wrap each request in a run, record 
 
 ## Prerequisites
 
-- A registered Service, such as `support-desk` from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
+- A declared Service, such as `support-desk` from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
 - A credential bound to that Service version, so the server can attribute what it records. A tenant administrator issues one:
 
   ```bash

@@ -3,7 +3,7 @@
  * records each ticket, and checks every answer against its refund policy
  * with the `support/policy-check` Verifier.
  *
- * {@link deploy} registers the checked-in Cards under `service/`, which
+ * {@link deploy} declares the checked-in Cards under `service/`, which
  * ensures the declared `vala.datasets.tickets` table, turns on metadata
  * capture, and checks the Agent's model is deployed. {@link serve} answers
  * every question in its own Agent Run with {@link answer}, which calls the
@@ -41,7 +41,7 @@ export const SERVICE = resolve(import.meta.dirname, "../service");
 /** The MCP protocol revision Wyrd serves. */
 const MCP_VERSION = "2026-07-28";
 
-/** The deployed support desk: its registration and loaded Card graph. */
+/** The deployed support desk: its declaration and loaded Card graph. */
 export interface Desk {
   readonly receipt: DeclarationReceipt;
   readonly state: WyrdState;
@@ -61,20 +61,20 @@ function policyCheck(answer: string): VerifierInputs {
   return { answer, policy: verify.File.path(join(SERVICE, "refund-policy.pdf")) };
 }
 
-/** The registered UID of the Card named `name`. */
+/** The declared UID of the Card named `name`. */
 export function uid(desk: Desk, name: string): string {
   const ref = desk.receipt.outcomes.find((outcome) => outcome.card_ref.name === name)?.card_ref;
   if (!ref?.uid) {
-    throw new Error(`${name} is not registered`);
+    throw new Error(`${name} is not declared`);
   }
   return ref.uid;
 }
 
 /**
- * Register and hydrate the Service into `bundle`, capture gateway call
+ * Declare and pull the Service into `bundle`, capture gateway call
  * metadata, and check the Agent's model is deployed.
  *
- * @throws WyrdError - the registration refusal, including
+ * @throws WyrdError - the declaration refusal, including
  *   `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` for an incompatible existing
  *   `tickets` table.
  * @throws Error - naming the exact gateway deployment to configure when the

@@ -1,6 +1,6 @@
 //! A customer-support API whose answers are checked by Wyrd.
 //!
-//! [`SupportDesk::deploy`] registers the Cards in `service/` and loads them
+//! [`SupportDesk::deploy`] declares the Cards in `service/` and loads them
 //! back as a [`WyrdState`]. [`SupportDesk::router`] serves three requests:
 //!
 //! - `POST /ask` answers a question and runs the two model-free Verifiers
@@ -56,15 +56,15 @@ pub struct SupportDesk {
 }
 
 impl SupportDesk {
-    /// Register `service/support-desk.yaml` and every Card it references,
-    /// hydrate them into `bundle`, turn on gateway call metadata capture so
+    /// Declare `service/support-desk.yaml` and every Card it references,
+    /// pull them into `bundle`, turn on gateway call metadata capture so
     /// each model call is retained as evidence, and start the Bifrost writer
     /// the ticket rows go through.
     ///
-    /// Registering is idempotent, so restarting the app re-registers nothing.
+    /// Declaring is idempotent, so restarting the app re-declares nothing.
     ///
     /// # Errors
-    /// Returns the server's refusal of the registration, hydration, or
+    /// Returns the server's refusal of the declaration, pull, or
     /// capture policy, or the local error loading the bundle.
     pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Self, WyrdError> {
         // ANCHOR: deploy

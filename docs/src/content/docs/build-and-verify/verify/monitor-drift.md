@@ -8,17 +8,17 @@ order: 3
 status: runnable
 ---
 
-A drift Verifier compares what a component sees in production with a baseline you register once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
+A drift Verifier compares what a component sees in production with a baseline you declare once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
 
 ## Prerequisites
 
-- A registered Model Card, here `churn-classifier@1.4.2` ([register one from code](/understand/cards-versions-and-relationships/#register-cards-from-code)), and `editor` to register Cards.
+- A declared Model Card, here `churn-classifier@1.4.2` ([declare one from code](/understand/cards-versions-and-relationships/#declare-cards-from-code)), and `editor` to declare Cards.
 - A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
 - A sample of healthy inputs, with the same column names your service will record.
 
-## 1. Register the baseline
+## 1. Declare the baseline
 
-The baseline is a Data Card. From Python, register a DataFrame of healthy inputs:
+The baseline is a Data Card. From Python, declare a DataFrame of healthy inputs:
 
 ```python
 import pandas as pd
@@ -80,9 +80,9 @@ Pick the method by what you are watching:
 
 `condition` must be `Statistical`. A feature is drifted when its score exceeds the threshold, and the requirement fails if any feature drifted. For PSI, 0.1 is a small shift and 0.25 a large one; start at 0.25 and tighten once you know how noisy your inputs are.
 
-Registration refuses a Verifier that mixes `samples` slots or `drift` checks with any other slot or check type: a window Verifier and a per-run Verifier are judged on different evidence.
+Declaration refuses a Verifier that mixes `samples` slots or `drift` checks with any other slot or check type: a window Verifier and a per-run Verifier are judged on different evidence.
 
-## 3. Bind it to a schedule and register
+## 3. Bind it to a schedule and declare
 
 List the model as a component of a Service and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
 
@@ -105,14 +105,14 @@ spec:
 A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ```bash
-wyrd apply service/churn-service.yaml
+wyrd declare service/churn-service.yaml
 ```
 
 `schedule` is the only Trigger that runs a Verifier on its own. `cron` is evaluated in UTC unless you set `tz`, such as `tz: America/Chicago`. Each due time judges the samples recorded since the previous one, so the hourly schedule above judges `[00:00, 01:00)` at 01:00.
 
 ## 4. Wait for the baseline to fit
 
-After registration the server fits the baseline in the background. A PSI or SPC Verifier cannot score anything until that finishes. Check its state:
+After declaration the server fits the baseline in the background. A PSI or SPC Verifier cannot score anything until that finishes. Check its state:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -155,7 +155,7 @@ console.log(verifier.status?.verification?.baseline?.state); // pending, buildin
 </LangTab>
 </LangTabs>
 
-`failed` comes with `baseline.error` explaining why, usually a feature missing from the baseline or a text column under `Spc`, which only charts numbers. Fix the Card and register a new version. A window judged before the baseline is `ready` is `inconclusive` and runs no Operator.
+`failed` comes with `baseline.error` explaining why, usually a feature missing from the baseline or a text column under `Spc`, which only charts numbers. Fix the Card and declare a new version. A window judged before the baseline is `ready` is `inconclusive` and runs no Operator.
 
 ## 5. Record samples
 
@@ -272,9 +272,9 @@ const rows = await bifrost.sql(
 
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
-| Registration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
-| Registration refuses the binding | A window Verifier without a `schedule` Trigger, or an `inputs` entry missing or naming other measurements than its slot | Bind with `runs_on: { kind: schedule, ... }` and one `inputs` entry per `samples` slot |
+| Declaration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
+| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or an `inputs` entry missing or naming other measurements than its slot | Bind with `runs_on: { kind: schedule, ... }` and one `inputs` entry per `samples` slot |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | `verify` on a window Verifier | Use `submit` |
-| Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and register a new version |
+| Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and declare a new version |
 | No results on schedule | The Service has not authenticated in 24 hours, or no samples landed in the window | Deploy the Service; submit on the bound component's alias |
 | Every window `inconclusive` | The baseline was not ready, or the window had too few samples to score | Wait for `ready`; read the requirement `reason` |

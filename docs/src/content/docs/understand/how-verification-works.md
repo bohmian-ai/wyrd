@@ -62,20 +62,20 @@ In `follows-policy`, the caller uploads one file: the refund decision letter the
 | `requirements` | Each has a unique `id`, a `statement`, and one `check`, and produces one verdict. Attach them to a step or to the whole Verifier |
 | `decide` | How requirement verdicts combine: `all` (the default) or `{ pass_rate: { threshold } }` |
 
-A Verifier may have no steps. With no requirements, every result is `inconclusive`, never a pass. Every step and requirement ID is unique across the whole Verifier; registration refuses duplicates.
+A Verifier may have no steps. With no requirements, every result is `inconclusive`, never a pass. Every step and requirement ID is unique across the whole Verifier; declaration refuses duplicates.
 
 ### Input slots
 
 | `type` | Evidence | Caller supplies |
 | --- | --- | --- |
 | `json` | JSON, optionally constrained by `schema` (JSON Schema) | An ordinary value |
-| `media` | A pinned file in one of `formats`, with an optional lower `max_bytes` | A `File` (local path or bytes) or an `ArtifactRef` to a registered Artifact |
+| `media` | A pinned file in one of `formats`, with an optional lower `max_bytes` | A `File` (local path or bytes) or an `ArtifactRef` to a declared Artifact |
 | `trace` | A trace, read through tenant-scoped trace reads | A 32-hex-digit trace ID |
 | `samples` | Feature measurements or metric samples for a scheduled window | A flat object of the declared `features`, or one value when the slot declares one |
 
 Unknown slot names, wrong value types, invalid trace IDs, and values outside a declared schema or size are refused before anything runs. A missing required slot is not refused: it is missing evidence, and every check that needs it is `inconclusive`. An omitted optional slot is `null`.
 
-Files are evidence, not Cards. Constructing a `File` reads nothing. During `verify` or `submit`, the SDK hashes the file, asks the server which digests it lacks, and uploads only those, straight to tenant object storage. Files are pinned by SHA-256 and never pass through the verification request. The server checks length, digest, and format when it reads them; a mismatch cannot produce a pass. An `ArtifactRef` selects a file of an existing registered Artifact, with that Artifact's normal authorization.
+Files are evidence, not Cards. Constructing a `File` reads nothing. During `verify` or `submit`, the SDK hashes the file, asks the server which digests it lacks, and uploads only those, straight to tenant object storage. Files are pinned by SHA-256 and never pass through the verification request. The server checks length, digest, and format when it reads them; a mismatch cannot produce a pass. An `ArtifactRef` selects a file of an existing declared Artifact, with that Artifact's normal authorization.
 
 ### Steps and actions
 
@@ -85,7 +85,7 @@ Files are evidence, not Cards. Constructing a `File` reads nothing. During `veri
 | `agent` | Invokes an inline, file-authored, or registered Agent. Output follows its Prompt's response schema, or is text |
 | `code` | Runs immutable Python (`runtime: python`) from `source.inline` or an exact Artifact, calling `entrypoint` with explicitly bound `inputs`. Returns JSON |
 
-Actions read and compute. They never write to external systems, register Cards, or dispatch Operators. A step can set `timeout_seconds` and `retries`; every attempt stays visible, and retries never hide the final failure.
+Actions read and compute. They never write to external systems, declare Cards, or dispatch Operators. A step can set `timeout_seconds` and `retries`; every attempt stays visible, and retries never hide the final failure.
 
 An Agent step has two input channels. `inputs` values are injected into the model request through the Prompt's placeholders, and the keys must match those placeholders exactly. `workspace` maps virtual `/inputs/...` paths to media, JSON, or step outputs; the Agent reads them with the built-in tools named on its Agent Card. `/inputs` is read-only, `/work` is empty scratch for that call, and both are removed when the call ends. [Agent tools and authorization](/reference/agent-tools-and-authorization/) lists the tools.
 
@@ -115,7 +115,7 @@ A citation names an original input `slot` and a locator: `page`, `slide`, `lines
 
 Child fields use dots; array indexes are zero-based (`slides[0]`). Wildcards (`[*]`) work only in an assertion's `each`. There is no `$.` prefix.
 
-A step's optional `when` is a condition with the same shape as an assertion, `{path, operator, expected}`, not an expression language; when it is false, the step is skipped. A reference in an action or `when` makes a dependency; `depends_on` adds order without data. Independent steps run concurrently. A step runs its action, then its own requirements, before anything that depends on it starts. Whole-Verifier requirements run after every step. Requirements never feed each other, and each verdict reaches `decide` exactly once. Registration refuses cycles, unknown references, and references a position cannot read.
+A step's optional `when` is a condition with the same shape as an assertion, `{path, operator, expected}`, not an expression language; when it is false, the step is skipped. A reference in an action or `when` makes a dependency; `depends_on` adds order without data. Independent steps run concurrently. A step runs its action, then its own requirements, before anything that depends on it starts. Whole-Verifier requirements run after every step. Requirements never feed each other, and each verdict reaches `decide` exactly once. Declaration refuses cycles, unknown references, and references a position cannot read.
 
 ### Skips, missing evidence, and decide
 
@@ -168,7 +168,7 @@ The subject is the component the binding sits under; you can also bind on the Se
 
 ## Run evidence and window evidence
 
-The check kinds decide how evidence arrives. Registration refuses a Verifier that mixes the two, or mixes `samples` with other slot types.
+The check kinds decide how evidence arrives. Declaration refuses a Verifier that mixes the two, or mixes `samples` with other slot types.
 
 | Evidence | `verify` | `submit` |
 | --- | --- | --- |
@@ -254,7 +254,7 @@ spec:
 
 Secrets never go on the Card. An Operator names an operator connection, which a tenant administrator creates once. Each Operator is delivered on its own, at least once: up to 3 attempts within 5 minutes. A replayed queue request never causes a second logical dispatch, and one failing Operator does not stop the others or change the verdict.
 
-## What can go wrong at registration
+## What can go wrong at declaration
 
 | Error code | Cause |
 | --- | --- |

@@ -8,7 +8,7 @@ order: 1
 status: runnable
 ---
 
-A Service Card is the root of your declaration. It names the components your service is built from, each pinned to an exact Card version, and the tables it records rows into. You write it in YAML whatever language the service is written in, and `wyrd plan` checks it without a server.
+A Service Card is the root of your declaration. It names the components your service is built from, each pinned to an exact Card version, and the tables it records rows into. You write it in YAML whatever language the service is written in, and `wyrd declare --check` checks it without a server.
 
 This page builds the `support-desk` Service from the [quickstart](/get-started/quickstart/). The finished files are in `examples/support-desk-app/service/`.
 
@@ -62,22 +62,22 @@ spec:
 | Field | Holds |
 | --- | --- |
 | `components[].alias` | The runtime name of the component, unique within the Service |
-| `components[].ref` | A path to the component's Card file, or a registered Card such as `{kind: Model, name: churn-classifier, version: 1.4.2}` |
+| `components[].ref` | A path to the component's Card file, or a declared Card such as `{kind: Model, name: churn-classifier, version: 1.4.2}` |
 | `tables[].name` | A table to create as `vala.datasets.<name>` when the Service registers |
 | `tables[].schema` | A JSON Schema object; the order of `properties` is the column order |
 | `service_type` | A free-form label, such as `agent` or `api` |
 
-A path is relative to the file that contains it. Every reference names one exact version: Wyrd has no version ranges, so a registered Service always records exactly what it was built from.
+A path is relative to the file that contains it. Every reference names one exact version: Wyrd has no version ranges, so a declared Service always records exactly what it was built from.
 
 Verifiers attach through `verified_by`, which [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/) adds next.
 
 ## 3. Check it locally
 
 ```bash
-wyrd plan support-desk.yaml
+wyrd declare --check support-desk.yaml
 ```
 
-`plan` loads the Service and every Card it references, validates them, and contacts no server. It prints `plan valid: 3 card(s)`, then one line per Card, such as `Service default/support-desk@1.0.0`. Fix anything it reports before you register.
+`wyrd declare --check` loads the Service and every Card it references, validates them, and contacts no server. It prints `check valid: 3 card(s)`, then one line per Card, such as `Service default/support-desk@1.0.0`. Fix anything it reports before you declare.
 
 ## Set the space once
 
@@ -98,7 +98,7 @@ A Card's own `metadata.space` wins, then the `[kind.<Kind>]` value, then `[defau
 | You see | Cause | Fix |
 | --- | --- | --- |
 | `WYRD_LOADER_400_INVALID_ENVELOPE` | A file is missing `apiVersion` or `kind`, a path points at no Card, a referenced Card has no exact `version`, or two Cards reference each other. `details.diagnostics` names each file | Fix the file it names |
-| `WYRD_LOADER_400_PATH_ESCAPE` | A `ref` path leaves the declaration's directory tree | Move the Card inside it, or reference the registered Card instead |
+| `WYRD_LOADER_400_PATH_ESCAPE` | A `ref` path leaves the declaration's directory tree | Move the Card inside it, or reference the declared Card instead |
 
 ## Next
 

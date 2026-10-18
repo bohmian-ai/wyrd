@@ -1,6 +1,6 @@
 ---
-title: Register and inspect a Service
-description: Register a Service and every Card it references in one call, then read back its exact versions and the relationships the server derived.
+title: Declare and inspect a Service
+description: Declare a Service and every Card it references in one call, then read back its exact versions and the relationships the server derived.
 pillar: wyrd
 section: Build and verify
 topic: Declare
@@ -10,25 +10,25 @@ status: runnable
 
 Registering the Service registers every Card it references, dependencies first, and creates its tables. The server then records which Card references which, so you can read the graph back from any Card.
 
-## Register
+## Declare
 
 From the CLI:
 
 ```bash
-wyrd apply examples/support-desk-app/service/support-desk.yaml
+wyrd declare examples/support-desk-app/service/support-desk.yaml
 ```
 
-It prints `registered:` and the Service's reference, then one line per Card with its outcome and status:
+It prints `declared:` and the Service's reference, then one line per Card with its outcome and status:
 
 ```text
-registered: default/Service/support-desk@1.0.0#<uid>
-  default/Prompt/support-prompt@1.0.0#<uid>: registered (active)
+declared: default/Service/support-desk@1.0.0#<uid>
+  default/Prompt/support-prompt@1.0.0#<uid>: declared (active)
   ...
 ```
 
 <Aside type="caution" title="Unverified">The line format is derived from the CLI source. A captured run replaces it on the first verified run.</Aside>
 
-From code, `declare_from_path` does the same and returns the receipt. The example's deploy step then downloads what it registered:
+From code, `declare_from_path` does the same and returns the receipt. The example's deploy step then downloads what it declared:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -52,15 +52,15 @@ From code, `declare_from_path` does the same and returns the receipt. The exampl
 
 | Outcome | Means |
 | --- | --- |
-| `registered` | A new version was stored |
-| `idempotent_noop` | That exact version is already registered with the same content |
+| `declared` | A new version was stored |
+| `idempotent_noop` | That exact version is already declared with the same content |
 | `deduplicated` | The Card has no exact version, and the latest one in its line has the same content |
 
-Registering is safe to rerun: unchanged Cards come back `idempotent_noop`. If the loader finds any error, nothing is sent.
+Declaring is safe to rerun: unchanged Cards come back `idempotent_noop`. If the loader finds any error, nothing is sent.
 
 ## Inspect
 
-List what is registered:
+List what is declared:
 
 ```bash
 wyrd list --kind Service
@@ -110,7 +110,7 @@ for (const edge of card.relationships.outbound_refs) console.log(edge.alias, edg
 To download the Service and everything it references into a directory, as the app does at deploy time:
 
 ```bash
-wyrd get --kind Service --space default --name support-desk --version 1.0.0 --output-dir .wyrd-bundle
+wyrd pull --kind Service --space default --name support-desk --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## Change a Card
@@ -123,12 +123,12 @@ Leave `version` out of a Card instead, and the server picks one: `0.1.0` first, 
 
 | You see | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_REGISTRY_409_SPEC_DRIFT` | An exact version is already registered with different content | Bump the Card's `version` |
-| `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | A `ref` names a registered Card that doesn't exist | Register that Card first, or fix the reference |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | An exact version is already declared with different content | Bump the Card's `version` |
+| `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | A `ref` names a declared Card that doesn't exist | Declare that Card first, or fix the reference |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | A table in `spec.tables` already exists with different columns | Keep the existing schema, or use a new table name |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | Your credential lacks `cards:write` | Use a credential that can register Cards |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | A file failed local validation; nothing was sent | Run `wyrd plan` and fix the file it names |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | Your credential lacks `cards:write` | Use a credential that can declare Cards |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | A file failed local validation; nothing was sent | Run `wyrd declare --check` and fix the file it names |
 
 ## Next
 
-[Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/) against the registered Service.
+[Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/) against the declared Service.

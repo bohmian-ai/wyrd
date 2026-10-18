@@ -131,7 +131,7 @@ export function supportApi(support: Support) {
 if (import.meta.main) {
   // WYRD_SERVER_URL and WYRD_API_KEY say which server to use and who the app is.
   const client = WyrdClient.connect();
-  // The registered Service, hydrated by `npm run deploy`.
+  // The declared Service, pulled by `npm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
   await state.startBifrost(); // writes tickets to Bifrost
   await state.startTelemetry(); // exports spans to Wyrd

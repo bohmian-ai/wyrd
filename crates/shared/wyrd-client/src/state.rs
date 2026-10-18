@@ -535,7 +535,7 @@ impl WyrdState {
     /// it, so later environment changes do not change its principal.
     ///
     /// # Arguments
-    /// * `path` - The Card bundle directory, as [`crate::cards::Cards::hydrate`]
+    /// * `path` - The Card bundle directory, as [`crate::cards::Cards::pull`]
     ///   publishes it.
     ///
     /// # Errors

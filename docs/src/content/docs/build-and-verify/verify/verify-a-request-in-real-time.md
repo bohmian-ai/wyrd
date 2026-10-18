@@ -116,7 +116,7 @@ const reply = result.outcome.verdict === "passed" ? answer : "Let me pass this t
 | Rust | `wyrd_ai::verify::File::path("report.pdf")` | `wyrd_ai::verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
 | TypeScript | `verify.File.path("report.pdf")` | `verify.File.bytes(data, { format: "pdf" })` |
 
-To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="report.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "report.pdf")`. It is read with the Artifact's own authorization.
+To use a file already declared as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="report.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "report.pdf")`. It is read with the Artifact's own authorization.
 
 ## 3. Read the breakdown
 

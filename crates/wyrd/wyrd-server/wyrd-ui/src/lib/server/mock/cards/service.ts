@@ -448,7 +448,7 @@ spec:
 /** S-03 — the declaration-first Definition presentation for v12. */
 const definition: ServiceDefinition = {
   declaration: {
-    note: 'immutable · registered 2026-09-01 by j.reyes',
+    note: 'immutable · declared 2026-09-01 by j.reyes',
     summary: 'Customer-facing checkout: capture, hold and decline decisions for every cart.',
     entries: [
       { k: 'entry_point', v: 'acme.checkout.app:app — imported by the deploy image, never by Wyrd' },
@@ -520,7 +520,7 @@ const v11Overview: ServiceOverviewState = {
     { label: 'OPERATIONAL', value: '◔ NO DATA' },
     { label: 'FRESHNESS', value: '— NONE IN RANGE' }
   ],
-  channelNote: 'v11 registered 2026-08-02 · superseded by v12 on 09-01',
+  channelNote: 'v11 declared 2026-08-02 · superseded by v12 on 09-01',
   charts: currentCharts('', 0.19).map((chart) => ({
     ...chart,
     latest: undefined,
@@ -555,7 +555,7 @@ const v11Overview: ServiceOverviewState = {
   },
   context: {
     components: { text: 'v11 declares its own refs — see Definition', href: 'definition' },
-    activity: 'no v11 events in range · v11 registered 2026-08-02',
+    activity: 'no v11 events in range · v11 declared 2026-08-02',
     investigations: investigations(),
     foot: 'scope preserved'
   }
@@ -596,7 +596,7 @@ const v11Presentation: ServicePresentation = {
   definition: {
     ...definition,
     declaration: {
-      note: 'immutable · registered 2026-08-02 by j.reyes · superseded by v12',
+      note: 'immutable · declared 2026-08-02 by j.reyes · superseded by v12',
       summary: definition.declaration.summary,
       entries: definition.declaration.entries
     },

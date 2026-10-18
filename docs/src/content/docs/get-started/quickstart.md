@@ -104,7 +104,7 @@ The example is seven Cards in `service/`. The Service names the others by relati
 | `follows-policy.yaml` | Bound to the agent. Extracts the text of the agent's letter, then asks `policy-judge` |
 | `policy-judge.yaml` | A tool-less Agent with the refund policy in its prompt. Returns a verdict citing lines of the letter |
 
-`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. Registering the Service registers every Card it references, so the next step registers all seven.
+`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. Declaring the Service declares every Card it references, so the next step declares all seven.
 
 ## 4. Deploy the Cards
 
@@ -132,7 +132,7 @@ This registers all seven Cards, which creates the `vala.datasets.tickets` table.
 </LangTab>
 </LangTabs>
 
-It ends with `registered <card-uid> into .wyrd-bundle`.
+It ends with `declared <card-uid> into .wyrd-bundle`.
 
 ## 5. Ask a question
 

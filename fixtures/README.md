@@ -1,21 +1,21 @@
 # Shared SDK fixtures
 
 Checked-in Cards that the Rust, Python, and TypeScript journeys all load
-(`TESTING.md`, client-facing checklist). Register a file through the public
+(`TESTING.md`, client-facing checklist). Declare a file through the public
 SDK or CLI; never write or edit YAML in a test. A Card with an artifact is
-registered alone, before the graph that references it.
+declared alone, before the graph that references it.
 
 A story uses the same file and test names in every SDK: `<story>.rs`,
 `test_<story>.py`, `<story-with-dashes>.test.ts`; test `outcome_name` is
 `test_outcome_name` in Python and `it("outcome name")` in TypeScript.
 
-| Story | Register, in order | Tests |
+| Story | Declare, in order | Tests |
 |---|---|---|
 | `declare_and_pull` | `declare_and_pull/support-model.yaml`, `declare_and_pull/support-desk.yaml` (`cards_get_returns_every_kind_typed` also registers `latency_baseline/latency-baseline.yaml` for its Data); `declare_and_pull/authored-prompts.yaml` holds the portable, native, and inline-Agent Prompt forms | `prompt_forms_round_trip_as_authored`, `agent_prompt_registration_identity`, `hydrated_agent_prompt_card_navigation`, `service_graph_registers_and_hydrates`, `latest_version_resolves_to_the_registered_card`, `registering_the_graph_again_is_idempotent`, `cards_get_returns_every_kind_typed`, `artifact_without_digest_registers`, `wrong_artifact_digest_is_refused`, `retired_card_kind_is_refused`, `reader_cannot_register_cards`, `cli_apply_and_get_round_trip_the_graph`, `refused_cli_command_raises_its_catalog_code` |
 | `workflow_loading` | `workflow_loading/team/security.yaml`, `workflow_loading/team/correctness.yaml`; see the table below | `local_workflow_runs_without_credentials`, `gateway_workflow_without_credentials_is_refused_before_any_step`, `registry_refs_resolve_through_the_registry`, `registry_refs_without_read_access_are_refused`, `local_sibling_never_satisfies_a_registry_ref`, `deleted_registry_card_is_refused`, `applied_workflow_stays_pinned_to_its_registered_cards`, `loaded_workflow_runs_its_pinned_cards`, `loading_a_bad_selector_is_refused`, `text_input_needs_a_declared_input_named_input`, `yaml_workflow_loads_without_resolving_file_targets` |
 | `observe_a_run` | `observe_a_run/observed-model.yaml`, `observe_a_run/observed-service.yaml`; the Service binds the Custom drift Verifier `observed-drift.yaml` on a schedule | `run_observations_read_back_by_run_id`, `custom_drift_judges_the_submitted_window_on_schedule`, `run_view_exposes_its_alias`, `card_scoped_key_cannot_write_another_cards_observations`, `unsealable_byte_budget_is_refused_at_connect` |
 | `verify_in_real_time` | `latency_baseline/latency-baseline.yaml`, `verify_in_real_time/latency-model.yaml`, `verify_in_real_time/assistant.yaml`; `verify_in_real_time/unfitted-assistant.yaml` binds `tier-drift`, whose baseline never fits | `agent_answer_passes_its_verifier`, `agent_answer_fails_its_verifier`, `judged_answer_passes_the_agent_check`, `judge_call_is_attributed_to_the_run_and_card`, `judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card`, `traced_sdk_verify_joins_the_callers_trace`, `malformed_traceparent_is_ignored_by_the_judge_call`, `submitted_answer_is_judged_in_the_background_and_resumes_by_id`, `another_tenant_cannot_resume_an_execution`, `window_verifier_records_samples_and_refuses_verify`, `unfitted_baseline_is_judged_inconclusive_on_schedule`, `unbound_verifier_fails_locally`, `input_that_does_not_fit_its_slot_fails_locally`, `caller_without_the_verifier_grant_is_refused`, `exact_verifier_grant_verifies_only_that_verifier`, `another_tenant_cannot_verify_the_assistant` |
-| `scheduled_drift_alerts_operator` | create http connection `on-call-hooks` on the local receiver's origin, then `latency_baseline/latency-baseline.yaml`, `scheduled_drift_alerts_operator/latency-watch.yaml` | `failed_schedule_alerts_its_operator_on_the_connection_origin`, `passing_window_alerts_no_one`, `empty_window_is_inconclusive_and_alerts_no_one`, `path_only_operator_without_connection_is_refused`; `ready_spc_baseline_charts_a_scheduled_window` registers `scheduled_drift_alerts_operator/latency-steady.yaml` instead |
+| `scheduled_drift_alerts_operator` | create http connection `on-call-hooks` on the local receiver's origin, then `latency_baseline/latency-baseline.yaml`, `scheduled_drift_alerts_operator/latency-watch.yaml` | `failed_schedule_alerts_its_operator_on_the_connection_origin`, `passing_window_alerts_no_one`, `empty_window_is_inconclusive_and_alerts_no_one`, `path_only_operator_without_connection_is_refused`; `ready_spc_baseline_charts_a_scheduled_window` declares `scheduled_drift_alerts_operator/latency-steady.yaml` instead |
 | `query_bifrost` | no Cards | `parameterized_sql_returns_the_callers_rows`, `bound_sql_text_is_treated_as_data`, `unwritten_builtin_table_reads_as_empty`, `stream_yields_arrow_batches_and_a_terminal`, `caller_without_bifrost_read_is_refused` |
 | `gateway_inference` | `gateway_inference/ask-agent.yaml` with its `ask-prompt.yaml`; `ask-service.yaml` composes that Agent | `openai_client_calls_the_gateway_with_an_access_token`, `caller_without_gateway_invoke_is_refused`, `cli_issues_a_card_scoped_key_and_writes_a_provider_credential` |
 | `gateway_jev` | `gateway_jev/reviewer.yaml`, after the `jev/jev-latest` deployment | `native_systemone_answers_relay_intact`, `invalid_jev_questions_are_refused_before_jev`, `chat_completions_pass_typed_jev_requests_through`, `jev_refusals_relay_like_other_providers` |
@@ -93,10 +93,10 @@ Refusals load one deliberately broken Card from `invalid/`:
 |---|---|
 | `invalid/wrong-artifact-digest/support-model.yaml` | `WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH` |
 | `invalid/operator-path-without-connection.yaml` | `WYRD_SPEC_400_INVALID_OPERATOR` |
-| `invalid/retired-drift-kind.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` (registration and `wyrd apply` alike) |
+| `invalid/retired-drift-kind.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` (declaration and `wyrd declare` alike) |
 | `invalid/prompt-with-removed-fields.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` |
 
-Names are fixed, so registering a fixture again is idempotent. Add a story
+Names are fixed, so declaring a fixture again is idempotent. Add a story
 only when a journey needs Cards none of these provide.
 
 Offline inputs that only Python unit tests load live with them in
@@ -116,7 +116,7 @@ and assertion Verifier Cards. Its additional fixtures live in `cards/mcp_investi
 | `drift-verifier.yaml` | Agent-readable Custom Drift Verifier matching the seeded feature report |
 | `drift-report.json` | Native retained Drift report with a failed latency feature |
 
-The journey registers Cards through the shared client, writes custom rows
+The journey declares Cards through the shared client, writes custom rows
 through Bifrost, and publishes fixture reports through the existing native
 result mapper and Scribe outbox. It reads the evidence through the real MCP
 endpoint; it does not execute a live model.

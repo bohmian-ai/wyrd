@@ -82,12 +82,12 @@ Every day at midnight UTC, the server compares the day's `latency` samples with 
 
 | Field | Required | Holds |
 | --- | --- | --- |
-| `verifier` | Yes | A path to the Verifier's Card file, or a registered Verifier |
-| `runs_on` | No | A Trigger, as a path, a registered Card, or inline. Absent, only your code runs the Verifier |
+| `verifier` | Yes | A path to the Verifier's Card file, or a declared Verifier |
+| `runs_on` | No | A Trigger, as a path, a declared Card, or inline. Absent, only your code runs the Verifier |
 | `inputs` | No | For a scheduled Verifier, each `samples` slot's recorded `features` |
-| `on_failure` | No | Operators to run after a `failed` verdict, as paths, registered Cards, or inline |
+| `on_failure` | No | Operators to run after a `failed` verdict, as paths, declared Cards, or inline |
 
-A Trigger is `{kind: schedule, cron: "<cron>", tz: <zone>}`, with `tz` defaulting to UTC. Schedules only judge recorded samples: binding `runs_on` to a Verifier with other inputs fails registration. A binding has no other fields, and an unknown field such as `when` is rejected.
+A Trigger is `{kind: schedule, cron: "<cron>", tz: <zone>}`, with `tz` defaulting to UTC. Schedules only judge recorded samples: binding `runs_on` to a Verifier with other inputs fails declaration. A binding has no other fields, and an unknown field such as `when` is rejected.
 
 ## If it fails
 
@@ -96,8 +96,8 @@ A Trigger is `{kind: schedule, cron: "<cron>", tz: <zone>}`, with `tz` defaultin
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` from `verify` or `submit` | The Verifier isn't bound to the view you called it on | Call it on the view whose Card binds it, or add the binding |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | The same Verifier is bound twice on one subject | Remove one |
 | `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | `runs_on` is set on a Verifier that doesn't judge `samples` | Remove `runs_on` and call the Verifier from code |
-| `WYRD_PERMISSION_403_DENIED_RBAC` at registration | A binding has `on_failure`, and your credential lacks `operators:invoke` | Register with a credential that has it |
+| `WYRD_PERMISSION_403_DENIED_RBAC` at declaration | A binding has `on_failure`, and your credential lacks `operators:invoke` | Declare with a credential that has it |
 
 ## Next
 
-[Register and inspect the Service](/build-and-verify/declare/register-and-inspect/). To write your own Verifier, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
+[Declare and inspect the Service](/build-and-verify/declare/declare-and-inspect/). To write your own Verifier, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).

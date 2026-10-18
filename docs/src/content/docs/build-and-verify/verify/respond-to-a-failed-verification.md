@@ -61,7 +61,7 @@ When `latency-shift` fails, the server posts the `body` to `https://hooks.exampl
 | `verdict`, `completed_at`, `summary` | What happened and when |
 | `drift.drifted_features`, `drift.total_features` | For drift checks, how many features drifted |
 
-The Operator's `auth.scheme` must match the connection's, and `url` is a path on the connection's origin, or a full URL with that same origin. Register the Service as usual with `wyrd apply latency-watch.yaml`; registration refuses an Operator whose connection is missing, disabled, or does not match. Registering a binding with `on_failure` needs the `operators:invoke` scope.
+The Operator's `auth.scheme` must match the connection's, and `url` is a path on the connection's origin, or a full URL with that same origin. Declare the Service as usual with `wyrd declare latency-watch.yaml`; declaration refuses an Operator whose connection is missing, disabled, or does not match. Declaring a binding with `on_failure` needs the `operators:invoke` scope.
 
 Slack and PagerDuty use `kind: notify` with a `channel` of `{kind: slack, connection, channel_id, text}` or `{kind: pager_duty, connection, ...}`, against a `slack` or `pager_duty` connection.
 
@@ -120,7 +120,7 @@ A dispatch is `pending`, `running`, `retrying`, `delivered`, or `failed`. Each o
 
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` at registration | No active connection has that name, or its auth scheme or origin differs from the Operator's | Create the connection first, and match `auth.scheme` and the origin |
+| `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` at declaration | No active connection has that name, or its auth scheme or origin differs from the Operator's | Create the connection first, and match `auth.scheme` and the origin |
 | The check failed but `dispatches` is empty | The verdict came from `verify`, or it was `inconclusive` | Only a `failed` verdict from `submit` or a schedule runs Operators |
 | A dispatch is `failed` | The webhook refused the request or was unreachable after retries | Read the dispatch's `error`, fix the receiver, and check the connection's token |
 | Nothing ran at all | The binding is inactive or its baseline is not ready | [Check the binding](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/#4-check-a-binding) |

@@ -72,7 +72,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_REFRESH_REVOKED` | 401 | Refresh token revoked | Re-authenticate to obtain a new refresh token. |
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
 | `WYRD_AUTH_401_UNAUTHENTICATED` | 401 | Not authenticated | Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer &lt;token&gt;`. |
-| `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-register the card or use a different principal to obtain a token. |
+| `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
 | `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | 404 | Requested principal not found in tenant | The principal named by the `subject_token` or `actor_token` no longer exists in the current tenant. Re-authenticate both parties and retry the exchange. |
@@ -182,7 +182,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED` | 400 | Could not normalize signature dtype | Provide a FieldSpec with a canonical Arrow logical dtype string. |
 | `WYRD_MODEL_400_HF_REVISION_INVALID` | 400 | Invalid HuggingFace revision | Pass a 7-40 character lowercase hex revision from the HuggingFace repo. |
 | `WYRD_MODEL_400_HF_TASK_MISSING` | 400 | Missing HuggingFace task | Set HuggingfaceMeta.hf_task before saving. |
-| `WYRD_MODEL_400_MISSING_SIGNATURE` | 400 | Missing model signature | Pass signature fields explicitly or build a ModelSignature before registration. |
+| `WYRD_MODEL_400_MISSING_SIGNATURE` | 400 | Missing model signature | Pass signature fields explicitly or build a ModelSignature before declaration. |
 | `WYRD_MODEL_400_SHAPE_INVALID` | 400 | Invalid model signature shape | Use Dim::Fixed(n) with n &gt; 0 or Dim::Dynamic(name) for unknown dimensions. |
 | `WYRD_MODEL_400_UNKNOWN_MODEL_TYPE` | 400 | Unknown ModelCard model type | Pass a supported model object or an explicit ModelInterface. |
 | `WYRD_MODEL_400_VALIDATION` | 400 | ModelCard validation failed | Fix the ModelCard signature, framework version, or interface configuration. |
@@ -268,7 +268,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_DEPENDENCY_CYCLE` | 400 | Card dependency cycle | Remove the cyclic CardRef dependency and submit an acyclic card graph. |
 | `WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION` | 400 | Heavy artifact submission must be standalone | Register the artifact-bearing card alone, then reference it from a later composite request. |
 | `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID` | 400 | Invalid idempotency key | Provide an 8-256 character Idempotency-Key without whitespace. |
-| `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED` | 400 | Idempotency key required | Provide a stable Idempotency-Key header and retry the registration. |
+| `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED` | 400 | Idempotency key required | Provide a stable Idempotency-Key header and retry the declaration. |
 | `WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH` | 400 | Invalid artifact path | Use a relative forward-slash path without empty or parent-traversal segments. |
 | `WYRD_REGISTRY_400_INVALID_CARD_SPEC` | 400 | Card spec failed type-driven deserialization | Verify the kind/spec field combination matches the documented Wyrd v1 schema for that kind. |
 | `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` | 400 | The version block is invalid for this operation | Check the error message for the specific constraint: Service and Agent cards require an exact semver pin; version components must fit i64; a scoped bump must stay within the authored range. |
@@ -278,12 +278,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_SPEC_TOO_LARGE` | 400 | Card spec exceeds MAX_SPEC_BYTES (256 KiB) | Reduce the spec size or split into multiple cards. If artifacts are inlined, move them to an Artifact card with object_store backing. |
 | `WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE` | 400 | Unresolved inline CardRef | Resolve nested inline file references in the loader before submitting the card. |
 | `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` | 400 | Unresolved path CardRef | Expand path references in the loader before submitting the card. |
-| `WYRD_REGISTRY_400_UPLOAD_INTERRUPTED` | 400 | Upload interrupted | Retry the upload while the registration operation remains pending. |
+| `WYRD_REGISTRY_400_UPLOAD_INTERRUPTED` | 400 | Upload interrupted | Retry the upload while the declaration operation remains pending. |
 | `WYRD_REGISTRY_400_VERSION_REQUIRED` | 400 | `metadata.version` is present but empty | Provide a valid semver string (e.g. `"1.0.0"`) or omit `metadata.version` entirely to let the server auto-assign the next version. |
-| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (space, kind, name, version) or the `card_uid` is correct and the card is registered in the current tenant. |
+| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key conflict | Use the original request with this key or choose a new key for different content. |
-| `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the registered version. |
-| `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Registration operation expired | Start a new registration with a new idempotency key. |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-declare with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version. |
+| `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Declaration operation expired | Start a new declaration with a new idempotency key. |
 | `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | 422 | Card reference could not be resolved | Register the referenced card in the current tenant before submitting this card. |
 | `WYRD_REGISTRY_500_VERSION_CONFLICT` | 500 | Card uid mismatch for same identity | Internal invariant violation; report with the request id and audit_id. |
 | `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` | 503 | Transient Postgres or RLS misconfiguration; retry with backoff | Retry with exponential backoff (60s cap). If persistent, check Postgres connectivity, the tenant row, and the RLS role bindings. |
@@ -349,7 +349,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | 400 | Invalid Verifier reference kind | Set verified_by[..].verifier to a Verifier CardRef. |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | 400 | Operator connection unavailable | Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator. |
 | `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit. |
-| `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or register the shared Verifier separately. |
+| `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or declare the shared Verifier separately. |
 | `WYRD_SPEC_400_VALIDATION` | 400 | Validation failed | Check the submitted Wyrd request fields against the published schema and retry. |
 | `WYRD_SPEC_404_NOT_FOUND` | 404 | Resource not found | Check that the referenced Wyrd resource exists. |
 | `WYRD_SPEC_409_CONFLICT` | 409 | Conflict | Refresh the resource and retry with the current version or idempotency key. |
@@ -448,7 +448,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_403_BIFROST_CARD_SCOPE` | 403 | Card outside principal card scope | Attribute the write or call to a Card the authenticated principal is authorized to tag, or add the target Card to the Service card's components. |
 | `WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE` | 403 | Reserved built-in write denied | Write through the supported observation or audit API instead of directly targeting a reserved built-in table. |
 | `WYRD_VALA_403_BIFROST_TENANT_BINDING_MISSING` | 403 | No tenant binding for OLAP operation | Acquire a TenantConn for a valid tenant before writing or querying Bifrost tables. |
-| `WYRD_VALA_403_CARD_UNRESOLVED` | 403 | Card reference unresolved | Use a card_ref that resolves to a registered card in the current tenant. |
+| `WYRD_VALA_403_CARD_UNRESOLVED` | 403 | Card reference unresolved | Use a card_ref that resolves to a declared card in the current tenant. |
 | `WYRD_VALA_403_QUERY_FORBIDDEN` | 403 | Query forbidden | The principal lacks bifrost_query:read for this table. |
 | `WYRD_VALA_403_QUERY_PEER_SECURITY` | 403 | Query peer security validation failed | Reject the peer attempt and investigate credential/fence/replay state. |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | 404 | Bifrost table not found | Create the table via the catalog API before writing or querying. |
@@ -508,7 +508,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_400_INVALID_WINDOW` | 400 | Invalid Drift window | Send a UTC half-open drift_window with start before end spanning at most 31 days. |
 | `WYRD_VERIFICATION_404_BINDING_NOT_FOUND` | 404 | Verification binding not found | Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs. |
 | `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | 404 | Verification execution not found | Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible. |
-| `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID registered in the caller's tenant. |
+| `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |

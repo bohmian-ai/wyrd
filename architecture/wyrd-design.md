@@ -29,9 +29,9 @@ drift, not permission for code and documentation to diverge.
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
   - [Verifier](#verifier) · [Source](#source) · [Bifrost](#bifrost)
   - [Trigger](#trigger) · [Operator](#operator)
-- [Registry lifecycle](#registry-lifecycle) — composite registration, card blob, idempotency
+- [Registry lifecycle](#registry-lifecycle) — composite declaration, card blob, idempotency
 - [Bifrost design](./bifrost-design.md) — OLAP warehouse: tables, Scribe ingest, Oracle admission, Forge, public surface
-- [Spec-file authoring](#spec-file-authoring) — `ref` / `path` / `inline`, pre-registration matrix
+- [Spec-file authoring](#spec-file-authoring) — `ref` / `path` / `inline`, pre-declaration matrix
 - [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
 - [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
 - [Worked directory layout](#worked-directory-layout) — example deployment tree
@@ -67,7 +67,7 @@ not a passive integration or inventory product.
    composes Policy for runtime gates.
 7. **Native observation first; external data by reading only.** AI services
    record runtime behavior through Wyrd's native observation system
-   (`wyrd.observe` → `vala`, linked to registered cards) — this is the
+   (`wyrd.observe` → `vala`, linked to declared cards) — this is the
    primary path. When data already lives in an external system (Prometheus,
    Snowflake, object storage), `Source` cards let Wyrd query it. Wyrd never
    writes to external data stores and never requires external systems to push
@@ -95,18 +95,18 @@ not a passive integration or inventory product.
     `Trigger.schedule`. Dispatch lives on `Operator`. There is no `Alert`
     kind — alerting is an Operator with a notification adapter.
 16. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
-    Experiment carry durable artifact bytes and MUST be pre-registered before
+    Experiment carry durable artifact bytes and MUST be pre-declared before
     anything else can point at them — they're the lineage anchors. Every other
     kind (Prompt, Agent, Verifier, Policy, Trigger, Operator, Source, Mcp,
-    Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
-    and registers in one move. No separate storage step, no programmatic
-    registration prerequisite.
+    Audit, Service) is spec-only: `wyrd declare file.yaml` reads
+    and declares in one move. No separate storage step, no programmatic
+    declaration prerequisite.
 17. **Light cards may inline in place of a `CardRef`.** Wherever a spec slot
     permits an embedded child, it uses `InlineableRef<T>`. Inline definitions
-    have no card identity, are not registered standalone, and cannot be
-    referenced from outside their parent. To reuse a child, register it as a
+    have no card identity, are not declared standalone, and cannot be
+    referenced from outside their parent. To reuse a child, declare it as a
     card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
-    `Ref`. One exception: registration materializes a registered Agent's
+    `Ref`. One exception: declaration materializes a declared Agent's
     inline Prompt as its own Prompt Card named `<agent-name>-prompt` in the
     Agent's space, versioned on its own registry line, and persists the Agent
     with that Card's exact UID-bearing reference. Identical inline content in
@@ -131,7 +131,7 @@ not a passive integration or inventory product.
     — resolves those bounded scope identities to Card UIDs and signs that
     mapping. A principal bound to no Card — a User, a tenant administrator, or
     an unbound Service — has no bounded scope: it may attribute to any
-    registered observation-target Card in its tenant, which ingest resolves
+    declared observation-target Card in its tenant, which ingest resolves
     against the tenant registry.
     An observation may carry its subject `card_uid`; when present, the
     server authorizes it against that scope's mapped UIDs and stores it.
@@ -149,7 +149,7 @@ not a passive integration or inventory product.
       a free-form OAuth-style `Scope` *string*; a typed closed object scope
       inside `Permission` is the sanctioned model — see
       `v1/00-foundations/permission-model.md`.
-    - **Policy** gates card states (`classify` at register-time, `gate` at
+    - **Policy** gates card states (`classify` at declare-time, `gate` at
       deploy-time). There is no runtime cross-service invoke gate: the
       `PolicyAction::Invoke` enum member and the `POST /v1/authz/check`
       runtime evaluation surface it referenced were removed and have no
@@ -200,7 +200,7 @@ not a passive integration or inventory product.
     any principal resolves (no credential, a malformed bearer token, or one
     failing signature or claim verification) records no audit decision; the
     credential-exchange refusals audit records keep the sentinel pair when no
-    identity is verified. `wyrd apply -f service.yaml` (or an Agent card) creates
+    identity is verified. `wyrd declare service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -231,8 +231,8 @@ not a passive integration or inventory product.
 19. **Reference slots use exactly `Ref` or `InlineableRef<T>`.** `Ref` carries
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
     permits an inline child body. `Path` is loader-only. During composite
-    registration, the loader may rewrite an authored path to the
-    registration-only `Sibling { sibling: CardRef }` form so the server can
+    declaration, the loader may rewrite an authored path to the
+    declaration-only `Sibling { sibling: CardRef }` form so the server can
     distinguish a target submitted in the same request from an external Card
     referenced with `Ref(CardRef)`. The server validates both forms and
     rewrites them to UID-bearing `Ref(CardRef)` before hashing, relationship
@@ -241,8 +241,8 @@ not a passive integration or inventory product.
     The server, registry, and evaluator reject unresolved paths at their
     boundaries.
 
-    `path` resolves to a typed registration reference before send; only `ref`,
-    registration-only `sibling`, and `inline` cross a composite registration
+    `path` resolves to a typed declaration reference before send; only `ref`,
+    declaration-only `sibling`, and `inline` cross a composite declaration
     wire. Heavy cards (Model, Data, Experiment, Artifact) accept `ref` only —
     `inline` is rejected because identity anchors lineage. Environment/stage is
     target-card metadata (`labels` /
@@ -258,7 +258,7 @@ not a passive integration or inventory product.
     discover → act → observe. Unit and integration tests support journeys by
     isolating a seam or a branch that is awkward to drive end-to-end; they never
     substitute for the journey. Each journey covers the happy path **and** the
-    edge/negative flows a real caller actually hits — re-register with a
+    edge/negative flows a real caller actually hits — re-declare with a
     conflicting schema, an under-privileged token, a rejected query, a replayed
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
@@ -341,7 +341,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 Wyrd registers 14 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
-`ExternalSpec` and no External Card registration path.
+`ExternalSpec` and no External Card declaration path.
 
 | Domain        | Kinds |
 |---------------|-------|
@@ -437,7 +437,7 @@ spec:
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
 deployment: the Agent's `execution_route` chooses where the call executes.
-An Agent's inline Prompt takes the same two forms and registers as the
+An Agent's inline Prompt takes the same two forms and declares as the
 Agent's own `<agent-name>-prompt` Prompt Card (doctrine 17).
 
 ### Agent
@@ -452,16 +452,16 @@ spec:
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
-Every registered Agent persists `prompt` as an exact Prompt Card reference:
+Every declared Agent persists `prompt` as an exact Prompt Card reference:
 Path and Sibling forms resolve to the authored Prompt Card, and an inline body
-registers as `<agent-name>-prompt` (doctrine 17). Hydrated state therefore
+declares as `<agent-name>-prompt` (doctrine 17). Hydrated state therefore
 always contains the Agent's Prompt Card without a separate Service component;
 a hydrated Agent's `prompt()` returns that Prompt Card, whose `ref` is its
 exact identity, and `prompt_ref` / `promptRef` is the stored reference.
 Generic state lookup (`state[alias]` / `get` in Python, `get` in Rust and
 TypeScript) returns the kind-appropriate hydrated Card. A bundle whose Agent
-Prompt has no registered identity is `WYRD_SDK_400_INVALID_STATE_BUNDLE`;
-re-register and rehydrate it.
+Prompt has no declared identity is `WYRD_SDK_400_INVALID_STATE_BUNDLE`;
+re-declare and pull it again.
 
 `native` calls the Prompt's provider with the executing host's own provider
 configuration; server-controlled execution refuses it. `wyrd_gateway` sends
@@ -504,7 +504,7 @@ contact — no `service_account` field on the spec. See "Runtime identity".
 Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
 rule shape; the `action` field on each rule says when it fires:
 
-  - `classify` (register-time): rule derives attrs onto the card (e.g.
+  - `classify` (declare-time): rule derives attrs onto the card (e.g.
                                 `risk.tier = "high"`). Never blocks.
   - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
                                 credential issuance (`wyrd auth issue-key`),
@@ -584,7 +584,7 @@ own batch id until Scribe acknowledges it. Gate refuses every public write to
 Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a
 mint-time `card_ref_scope` derived from the transitive card-ref graph rooted at
 that card — but a `Service` binding is optional, and the administrative and
-automation principals a tenant creates for itself hold no Card at all. `wyrd apply` for a Service or Agent card creates or updates the
+automation principals a tenant creates for itself hold no Card at all. `wyrd declare` for a Service or Agent card creates or updates the
 principal row idempotently (keyed on `(tenant_id, card_kind, card_uid)`);
 re-apply preserves the same
 `principal_id`. No secret is returned. The declarative and credential
@@ -593,7 +593,7 @@ operations are separated, matching the kubectl pattern (`apply` then
 
 | Operation | Wyrd command | What it does |
 |---|---|---|
-| Register card + create principal | `wyrd apply -f service.yaml` | Idempotent. Writes card, upserts the Service/Agent principal keyed on `(tenant_id, card_kind, card_uid)`. Re-apply preserves `principal_id`. No secret. |
+| Declare card + create principal | `wyrd declare service.yaml` | Idempotent. Writes card, upserts the Service/Agent principal keyed on `(tenant_id, card_kind, card_uid)`. Re-declaring preserves `principal_id`. No secret. |
 | Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Requires an applied principal. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
 
 #### API key → JWT flow
@@ -899,11 +899,11 @@ Consequences, stated so they stop drifting:
   signs its authoritative UID with the identity. Ingest uses that verified
   in-memory mapping and performs no Card-registry Postgres or cache lookup.
   A principal bound to no Card (User, tenant administrator, unbound Service)
-  carries no bounded scope; its scope is every registered observation-target
+  carries no bounded scope; its scope is every declared observation-target
   Card in its tenant. Gate looks the distinct `card_uid` values of each
   frame (at most 32) up in the tenant registry before dispatch and hands
-  Scribe the registered observation-target UIDs as that frame's scope, so an
-  unregistered or non-observation Card is refused exactly like a UID outside
+  Scribe the declared observation-target UIDs as that frame's scope, so an
+  undeclared or non-observation Card is refused exactly like a UID outside
   a signed scope.
 - **This is not the governance token.** `card_uid` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
@@ -1190,7 +1190,7 @@ never a refusal: checks that need it are inconclusive.
 | Action | Does |
 |---|---|
 | `extract` | Reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML). Text and structure only; no OCR or rendering |
-| `agent` | Calls an inline, file-authored, or registered Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
+| `agent` | Calls an inline, file-authored, or declared Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
 | `code` | Runs sandboxed Python (`runtime: python`) from inline source or an exact Artifact, with a named `entrypoint` and bound `inputs`; returns JSON |
 
 | Check | Judges |
@@ -1201,13 +1201,13 @@ never a refusal: checks that need it are inconclusive.
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
-Actions read and compute; they never mutate external systems, register Cards,
+Actions read and compute; they never mutate external systems, declare Cards,
 or dispatch Operators. References use `inputs.<slot>`, `steps.<id>.output`,
 `steps.<id>.status`, `steps.<id>.requirements.<rid>.outcome|reason`, and
 `requirement.id|statement`, with dotted fields and zero-based indexes; `[*]`
 appears only in `each`. Step and requirement IDs are unique across the whole
 Verifier and key results, route overrides, and fitted drift state. References
-in actions and `when` create dependencies; registration rejects cycles,
+in actions and `when` create dependencies; declaration rejects cycles,
 unknown references, checks that read another requirement's verdict, and
 fields absent from a known output schema. Independent steps run concurrently;
 a step's requirements run before its dependents start.
@@ -1227,7 +1227,7 @@ A citation names an original input slot and a typed locator (`page`, `slide`,
 slots. The server validates every citation against the pinned evidence, and a
 passed Agent check without a valid citation becomes inconclusive.
 
-Verifiers judge one of two evidence modes, fixed at registration; mixing them
+Verifiers judge one of two evidence modes, fixed at declaration; mixing them
 is refused.
 
 | Mode | Evidence | `verify` | `submit` |
@@ -1235,7 +1235,7 @@ is refused.
 | Run | `json`, `media`, `trace` | Executes now; returns `VerificationResult` within 60 s | Stages inputs and queues one execution; returns `VerificationExecution` |
 | Window | `samples` with `drift` checks | Refused (`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`) | Records samples through the drift observation path; returns `Recorded` |
 
-A Window Verifier requires a `schedule` binding. Registration and binding do
+A Window Verifier requires a `schedule` binding. Declaration and binding do
 not grant invocation authority.
 
 A Verifier runs through a `verified_by` binding on a Service component,
@@ -1251,7 +1251,7 @@ verified_by:
 
 One binding is one subscription. Its subject is the containing Service,
 standalone Agent, or Service component occurrence; the same Verifier, Trigger,
-and Operator Cards may be reused by any number of bindings. Registration
+and Operator Cards may be reused by any number of bindings. Declaration
 UID-pins every referenced Verifier, Trigger, and Operator, and rejects
 unresolved, wrong-kind, unauthorized, and cross-tenant references, duplicate
 bindings to the same Verifier version for one subject, `workflow` in
@@ -1291,7 +1291,7 @@ from the authenticated caller, never the path; refuses a body over
 `WYRD_VERIFICATION_FILE_MAX_MIB` or one that hashes to another digest before
 the object becomes readable; and writes the same tenant-qualified
 `evidence/sha256/<digest>` key with no metadata row. A repeated upload of one
-digest is idempotent. `ArtifactRef` selects a registered Artifact under its
+digest is idempotent. `ArtifactRef` selects a declared Artifact under its
 own authorization.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
@@ -1599,7 +1599,7 @@ spec:
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling `samples` slots from the binding's
 `inputs` map. Missed occurrences are skipped, not backfilled. A Trigger never
-fires on its own: nothing runs merely because a Trigger Card is registered,
+fires on its own: nothing runs merely because a Trigger Card is declared,
 and one schedule occurrence shared by two subjects creates two subject-scoped
 executions, never one mixed-subject execution.
 
@@ -1679,7 +1679,7 @@ pinned `wyrd-vault` KV v2 reader that Gateway also uses for provider
 credentials; only the Operator owner interprets and validates the KEK, and no
 general secret resolver backs Operator keys. Rewrap onto a new active version
 runs beside delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
-logs, and audit carry only redacted metadata, never key locations. Registration
+logs, and audit carry only redacted metadata, never key locations. Declaration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —
 match; a mismatch fails closed with one indistinguishable error. Rotation
@@ -1706,7 +1706,7 @@ exact Verifier and subject Card identities; the `failed` verdict; completion
 time; a bounded result summary; and one count block for the failed execution's
 Verifier's drift checks when it has any. It never
 carries raw input context, media, feature rows, feature names, step output,
-or secret material, and registration rejects unknown template fields.
+or secret material, and declaration rejects unknown template fields.
 Exact field schema lives in OpenAPI.
 
 | Applies to | Template fields |
@@ -1744,14 +1744,14 @@ channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
 ## Registry lifecycle
 
 How authored specs become durable cards. This section pins the wire
-shape of composite registration, the card blob state machine, and the
+shape of composite declaration, the card blob state machine, and the
 idempotency contract. Implementation lives in `wyrd_client::cards`; active change
 specifications and task packets follow the repository specification-first
 workflow and do not override this contract.
 
-### Composite registration
+### Composite declaration
 
-`POST /v1/cards` is a **composite** endpoint. One request may register
+`POST /v1/cards` is a **composite** endpoint. One request may declare
 one card or many, and the server derives the root from the DAG of
 submissions.
 
@@ -1851,7 +1851,7 @@ Idempotency state lives in `wyrd.card_declaration_operations` with a
 
 ### Error catalog
 
-The public error catalog covering registration is fixed and versioned.
+The public error catalog covering declaration is fixed and versioned.
 Codes and semantics live in `crates/wyrd-spec/src/error.rs` behind the
 `WyrdError` derive. Codes referenced above:
 `WYRD_REGISTRY_400_DEPENDENCY_CYCLE`,
@@ -1874,25 +1874,25 @@ serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 
 ## Spec-file authoring
 
-Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
+Two complementary mechanisms — `wyrd declare file.yaml` reads + declares in
 one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string is
 loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
 
-### Pre-registration matrix (Rule 16)
+### Pre-declaration matrix (Rule 16)
 
-| Kind | Must pre-register? | Why |
+| Kind | Must pre-declare? | Why |
 |------|---------------------|-----|
 | `Model`        | **Yes** | Carries weight artifacts; lineage anchor. |
 | `Data`         | **Yes** | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; registration materializes it as `<agent-name>-prompt`. |
-| `Agent`        | Optional | Light. Spec-only; `apply` registers it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
-| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
+| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; declaration materializes it as `<agent-name>-prompt`. |
+| `Agent`        | Optional | Light. Spec-only; `wyrd declare` declares it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
+| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
-apply -f verification-suite.yaml` registers all of them in dependency order. The Agent
+declare verification-suite.yaml` declares all of them in dependency order. The Agent
 under test, its judge Agent, and the Verifier that judges it can all
 ship in one file.
 
@@ -1932,13 +1932,13 @@ components:
 
 `CardRef` carries `kind`, `name`, one `version`, optional `space`, and optional
 `uid`; never labels, annotations, or a version requirement. An omitted space
-inherits the containing authored context. Local loading never registers. Apply
-registers path-loaded Cards in the same composite request, projects paths to
+inherits the containing authored context. Local loading never declares. Declare
+declares path-loaded Cards in the same composite request, projects paths to
 Sibling references, and preserves external refs even at matching identities.
-Inline bodies remain embedded, except a registered Agent's inline Prompt,
-which registration materializes as its own Prompt Card and replaces with that
+Inline bodies remain embedded, except a declared Agent's inline Prompt,
+which declaration materializes as its own Prompt Card and replaces with that
 Card's exact reference (doctrine 17). Only resolved Ref/Sibling and inline
-bodies cross registration; durable persistence contains no Path or Sibling.
+bodies cross declaration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 
@@ -1962,10 +1962,10 @@ relationship tests all project from it:
 ### Path resolution rules (loader contract)
 
 A path string is **client-side authoring sugar**, not a durable wire variant.
-It targets a full Card envelope on disk; the loader reads it without registering.
+It targets a full Card envelope on disk; the loader reads it without declaring.
 Apply submits it as an independent Card and rewrites the referring slot to an explicit
-registration reference. When the target is part of the same composite
-submission, the registration reference is `Sibling { sibling: CardRef }`;
+declaration reference. When the target is part of the same composite
+submission, the declaration reference is `Sibling { sibling: CardRef }`;
 an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves
 binding intent instead of inferring it from identity. The server validates
 both forms and rewrites them to UID-bearing `Ref(CardRef)` before hashing,
@@ -1978,15 +1978,15 @@ relationship derivation, or durable persistence. The server, registry, and
   machines and CI).
 - The referenced file is a **full card envelope** — `kind` + `metadata`
   (`space`, `name`, `version`) + `spec`, plus `apiVersion`, which authored
-  files may omit and which then defaults to `wyrd/v1`; the registration wire
-  always carries it explicitly. Registration derives the
+  files may omit and which then defaults to `wyrd/v1`; the declaration wire
+  always carries it explicitly. Declaration derives the
   child's identity from that `metadata`, and the parent slot becomes a `ref:`
   to it. This is what makes a `path:` target reusable and lineage-anchoring,
   unlike `inline:`.
-- Path imports **are registered as independent cards**, in dependency order,
+- Path imports **are declared as independent cards**, in dependency order,
   ahead of the parent that references them. A heavy-card envelope reached by
-  `path:` still follows the normal pre-registration + blob-upload flow before
-  the parent registers.
+  `path:` still follows the normal pre-declaration + blob-upload flow before
+  the parent declares.
 - Transitive: a `path:`-loaded envelope may itself contain `ref`/`path`/`inline`
   slots. The loader resolves transitively with a hard depth
   limit (≤8) to catch cycles.
@@ -1994,7 +1994,7 @@ relationship derivation, or durable persistence. The server, registry, and
   combination is a validation error.
 
 This keeps the wire contract typed (`ref | inline`, with an explicit
-registration-only sibling projection where a composite write needs it), keeps
+declaration-only sibling projection where a composite write needs it), keeps
 `path` resolution client-side, prevents filesystem-on-server, and gives authors
 the file-splitting ergonomic they expect from JSON-Schema `$ref` / OpenAPI
 external-file imports. Durable and read contracts remain the simpler direct
@@ -2135,7 +2135,7 @@ other kinds are runtime-aliased into a Service.
 
 ## Worked directory layout
 
-A deployment is a folder. `wyrd apply -f <dir>` registers every card.
+A deployment is a folder. `wyrd declare <dir>` declares every card.
 
 ```
 services/ops-copilot/

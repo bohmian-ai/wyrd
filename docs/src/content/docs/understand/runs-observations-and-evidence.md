@@ -129,7 +129,7 @@ Bifrost keeps every observation and verdict, so a question like "which model ver
 
 ## Read data where it already lives
 
-<Aside type="caution" title="Not read yet">You can register Source Cards today, but the server does not read from them. The shape below is the registered contract, not a working ingest path.</Aside>
+<Aside type="caution" title="Not read yet">You can declare Source Cards today, but the server does not read from them. The shape below is the declared contract, not a working ingest path.</Aside>
 
 If the data is already in another system, describe it with a Source Card instead of copying it into Bifrost. A Source names the kind of data and how to reach it; it never holds a secret, only the name of the server environment variable that does.
 

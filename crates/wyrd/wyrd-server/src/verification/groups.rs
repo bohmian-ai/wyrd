@@ -246,10 +246,11 @@ impl BindingPoll<'_> {
     async fn counts(&self, group: &GroupId) -> Result<BTreeMap<usize, TupleCount>, GroupPollError> {
         let sql = format!(
             "SELECT card_uid, verifier_card_uid, COUNT(DISTINCT execution_id) AS executions, \
-             COUNT(*) AS members, MIN(at) AS first, MAX(at) AS newest FROM \
-             (SELECT DISTINCT surface, card_uid, verifier_card_uid, execution_id, at FROM ({}) s) d \
-             GROUP BY card_uid, verifier_card_uid",
-            self.surfaces(&self.group(group))
+             COUNT(*) AS members, MIN(first) AS first, MAX(newest) AS newest FROM \
+             (SELECT surface, card_uid, verifier_card_uid, execution_id, MIN(at) AS first, \
+             MAX(at) AS newest FROM ({}) s GROUP BY surface, card_uid, verifier_card_uid, \
+             execution_id) d GROUP BY card_uid, verifier_card_uid",
+            self.surfaces(&same_group(group))
         );
         let mut counts = BTreeMap::new();
         for batch in self.query(&sql).await? {
@@ -289,12 +290,8 @@ impl BindingPoll<'_> {
         if within.is_empty() {
             return Ok(Vec::new());
         }
-        let filter = format!("{} AND ({})", self.group(group), self.sources.any(&within));
         let batches = self
-            .query(&format!(
-                "SELECT DISTINCT surface, card_uid, verifier_card_uid, execution_id, at FROM ({}) s",
-                self.surfaces(&filter)
-            ))
+            .query(&self.sources.identities(group, &within, self.results))
             .await?;
         self.sources.rows(&batches)
     }
@@ -417,21 +414,9 @@ impl BindingPoll<'_> {
     ) -> Result<Payloads, GroupPollError> {
         let mut payloads = Payloads::default();
         let (inputs, outcomes) = self.sources.reads();
-        let members = readable
-            .iter()
-            .map(|execution| ObservationWindow::text(&execution.to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let select = |columns: &str, table: &str, at: &str| {
-            let before = cutoff
-                .map(|cutoff| format!(" AND {at} < {}", ObservationWindow::instant(cutoff)))
-                .unwrap_or_default();
-            format!(
-                "SELECT {columns}, {at} FROM vala.verification.{table} WHERE {} \
-                 AND {} AND execution_id IN ({members}){before}",
-                self.sources.eligible,
-                self.group(group),
-            )
+        let select = |columns, table, at| {
+            self.sources
+                .payloads(columns, table, at, group, readable, cutoff)
         };
         if inputs {
             let sql = select(
@@ -485,28 +470,10 @@ impl BindingPoll<'_> {
         Ok(payloads)
     }
 
-    /// The `group_id = <group>` predicate.
-    fn group(&self, group: &GroupId) -> String {
-        format!("group_id = {}", ObservationWindow::text(group.as_str()))
-    }
-
-    /// Both source surfaces as one `(surface, group_id, card_uid,
-    /// verifier_card_uid, execution_id, at)` row set restricted by `filter`;
-    /// inputs alone without a results table.
+    /// Both source surfaces restricted by `filter`, as
+    /// [`Sources::surfaces`] reads them for this poll.
     fn surfaces(&self, filter: &str) -> String {
-        let inputs = format!(
-            "SELECT 'i' AS surface, group_id, card_uid, verifier_card_uid, execution_id, \
-             recorded_at AS at FROM vala.verification.execution_inputs WHERE {} AND {filter}",
-            self.sources.eligible,
-        );
-        if !self.results {
-            return inputs;
-        }
-        format!(
-            "{inputs} UNION ALL SELECT 'r' AS surface, group_id, card_uid, verifier_card_uid, \
-             execution_id, ended_at AS at FROM vala.verification.results WHERE {} AND {filter}",
-            self.sources.eligible,
-        )
+        self.sources.surfaces(filter, self.results)
     }
 
     /// Run `sql` and collect its batches; a missing table reads as empty.
@@ -548,7 +515,7 @@ impl BindingPoll<'_> {
 struct TupleCount {
     /// Distinct source executions.
     executions: u64,
-    /// Distinct `(surface, execution, time)` rows.
+    /// Distinct `(surface, execution)` rows; a replayed row counts once.
     members: u64,
     /// Earliest row time.
     first: DateTime<Utc>,
@@ -641,6 +608,62 @@ impl Sources {
             .join(" OR ")
     }
 
+    /// Both source surfaces as one `(surface, group_id, card_uid,
+    /// verifier_card_uid, execution_id, at)` row set restricted by `filter`;
+    /// inputs alone without a `results` table.
+    fn surfaces(&self, filter: &str, results: bool) -> String {
+        let inputs = format!(
+            "SELECT 'i' AS surface, group_id, card_uid, verifier_card_uid, execution_id, \
+             recorded_at AS at FROM vala.verification.execution_inputs WHERE {} AND {filter}",
+            self.eligible,
+        );
+        if !results {
+            return inputs;
+        }
+        format!(
+            "{inputs} UNION ALL SELECT 'r' AS surface, group_id, card_uid, verifier_card_uid, \
+             execution_id, ended_at AS at FROM vala.verification.results WHERE {} AND {filter}",
+            self.eligible,
+        )
+    }
+
+    /// The distinct row identities of `group` in the `within`-ceiling
+    /// tuples only; physically replayed rows read once.
+    fn identities(&self, group: &GroupId, within: &[usize], results: bool) -> String {
+        let filter = format!("{} AND ({})", same_group(group), self.any(within));
+        format!(
+            "SELECT DISTINCT surface, card_uid, verifier_card_uid, execution_id, at FROM ({}) s",
+            self.surfaces(&filter, results)
+        )
+    }
+
+    /// The `columns` and `at` time of exactly the `readable` executions'
+    /// rows of `table` in `group`, timed before `cutoff` when there is one.
+    fn payloads(
+        &self,
+        columns: &str,
+        table: &str,
+        at: &str,
+        group: &GroupId,
+        readable: &BTreeSet<ExecutionId>,
+        cutoff: Option<DateTime<Utc>>,
+    ) -> String {
+        let members = readable
+            .iter()
+            .map(|execution| ObservationWindow::text(&execution.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let before = cutoff
+            .map(|cutoff| format!(" AND {at} < {}", ObservationWindow::instant(cutoff)))
+            .unwrap_or_default();
+        format!(
+            "SELECT {columns}, {at} FROM vala.verification.{table} WHERE {} \
+             AND {} AND execution_id IN ({members}){before}",
+            self.eligible,
+            same_group(group),
+        )
+    }
+
     /// Whether some slot reads an input, and whether some reads an outcome.
     fn reads(&self) -> (bool, bool) {
         let input = |slot: &SourceSlot| matches!(slot.field, SourceField::Input(_));
@@ -710,7 +733,8 @@ struct Ended {
     cutoff: Option<DateTime<Utc>>,
     /// Newest eligible row time.
     through: DateTime<Utc>,
-    /// Distinct eligible `(surface, execution, time)` rows.
+    /// Distinct eligible `(surface, execution)` rows; a replayed row counts
+    /// once.
     members: u64,
 }
 
@@ -749,7 +773,7 @@ impl Ended {
             .chain(over.clone().map(|count| count.newest))
             .max()?;
         let members = eligible
-            .map(|row| (row.result, row.execution_id, row.at))
+            .map(|row| (row.result, row.execution_id))
             .collect::<BTreeSet<_>>()
             .len();
         let members = u64::try_from(members)
@@ -858,6 +882,11 @@ fn number(batch: &RecordBatch, name: &str, row: usize) -> Result<u64, GroupPollE
         .map_err(malformed)
 }
 
+/// The `group_id = <group>` predicate.
+fn same_group(group: &GroupId) -> String {
+    format!("group_id = {}", ObservationWindow::text(group.as_str()))
+}
+
 /// A malformed stored value as a read failure.
 fn malformed(error: impl std::fmt::Display) -> GroupPollError {
     GroupPollError::Read(error.to_string())
@@ -943,7 +972,8 @@ fn variant(batch: &RecordBatch, name: &str, row: usize) -> Result<Value, GroupPo
 mod tests {
     use chrono::TimeZone as _;
     use serde_json::json;
-    use wyrd_spec::verification::TaskId;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::verification::{GroupSource, TaskId};
 
     use super::*;
 
@@ -1102,6 +1132,82 @@ mod tests {
         let late = row(false, ExecutionId::new_v7(), 1);
         let ended = Ended::judge(&[rows[0], late], none(), &exact, at(30)).expect("idle reached");
         assert!(!ended.eligible(&late), "first + finality is past finality");
+    }
+
+    /// Identities read only the within-ceiling tuples and payloads only the
+    /// listed executions, under the owner, every source tuple, the group and
+    /// the finality cutoff.
+    ///
+    /// # Panics
+    /// Panics when a statement selects other rows.
+    #[test]
+    fn reads_select_only_listed_membership() {
+        let uid = || CardUid::from_uuid(uuid::Uuid::now_v7()).expect("invariant: a v7 card uid");
+        let (owner, frames, fact) = (uid(), uid(), uid());
+        let source = |verifier: &CardUid, text: &str| GroupSource {
+            reference: serde_json::from_value(json!(text)).expect("invariant: source text"),
+            subject_occurrence_key: "agent".to_owned(),
+            card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
+        };
+        let mut settings = settings();
+        settings.sources = BTreeMap::from([
+            (
+                SlotName::new("frames").expect("invariant: slot"),
+                source(&frames, "verifiers.frame.inputs.frame"),
+            ),
+            (
+                SlotName::new("fact").expect("invariant: slot"),
+                source(&fact, "verifiers.fact.inputs.fact"),
+            ),
+        ]);
+        let sources = Sources::new(&settings, owner.as_str()).expect("sources parse");
+        let within = sources
+            .tuples
+            .iter()
+            .position(|(_, verifier)| verifier == fact.as_str())
+            .expect("the fact tuple");
+        let group = GroupId::new("event-1").expect("invariant: group");
+        let identities = sources.identities(&group, &[within], true);
+        assert!(
+            identities.starts_with("SELECT DISTINCT surface"),
+            "{identities}"
+        );
+        let only_fact = format!(
+            "AND group_id = 'event-1' AND ((card_uid = '{owner}' AND verifier_card_uid = '{fact}'))"
+        );
+        assert_eq!(identities.matches(&only_fact).count(), 2, "{identities}");
+
+        let (listed, unlisted) = (ExecutionId::new_v7(), ExecutionId::new_v7());
+        let payloads = sources.payloads(
+            "execution_id, inputs",
+            "execution_inputs",
+            "recorded_at",
+            &group,
+            &BTreeSet::from([listed]),
+            Some(at(60)),
+        );
+        assert!(
+            payloads.ends_with(&format!(
+                "AND group_id = 'event-1' AND execution_id IN ('{listed}') \
+                 AND recorded_at < '2026-10-01T00:01:00.000000Z'"
+            )),
+            "{payloads}"
+        );
+        assert!(payloads.contains(&sources.eligible), "{payloads}");
+        assert!(!payloads.contains(&unlisted.to_string()));
+        assert!(
+            !sources
+                .payloads(
+                    "outcome",
+                    "results",
+                    "ended_at",
+                    &group,
+                    &BTreeSet::from([listed]),
+                    None
+                )
+                .contains(" < ")
+        );
     }
 
     /// Values unwrap JSON and trace inputs, keep other declarations, read

@@ -5243,15 +5243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "monty-alloc"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ab6540f9aabb557f25a7b71d571ae55ecf9ba2c9f2e6c7dbe329e422faf1195"
-dependencies = [
- "monty-types",
-]
-
-[[package]]
 name = "monty-fs"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10791,6 +10782,8 @@ name = "workspace-hack"
 version = "0.2.0"
 dependencies = [
  "ahash",
+ "aho-corasick",
+ "arrayvec",
  "arrow",
  "arrow-array",
  "arrow-cast",
@@ -10801,6 +10794,7 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "base64 0.23.1",
+ "base64ct",
  "bigdecimal",
  "bit-set",
  "bit-vec 0.8.0",
@@ -10812,6 +10806,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_builder",
+ "compact_str",
  "compression-codecs",
  "console",
  "crossbeam-epoch",
@@ -10833,6 +10828,7 @@ dependencies = [
  "futures-task",
  "futures-util",
  "generic-array",
+ "get-size2",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -10845,10 +10841,14 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "icu_properties",
  "idna",
  "indexmap 2.14.2",
  "itertools 0.13.0",
  "lazy_static",
+ "lexical-parse-float",
+ "lexical-parse-integer",
+ "lexical-util",
  "libc",
  "liblzma",
  "liblzma-sys",
@@ -10859,6 +10859,7 @@ dependencies = [
  "moka",
  "nom 7.1.3",
  "num-bigint 0.4.8",
+ "num-integer",
  "num-traits",
  "objc2",
  "objc2-core-foundation",
@@ -10867,13 +10868,16 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "ordermap",
  "percent-encoding",
  "petgraph 0.8.3",
+ "phf_shared 0.11.3",
  "ppv-lite86",
  "proc-macro2",
  "prost",
  "quick-xml",
  "rand 0.10.2",
+ "rand 0.8.7",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "rand_core 0.6.4",
@@ -10883,6 +10887,8 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rmcp",
+ "ruff_source_file",
+ "ruff_text_size",
  "rustix",
  "rustls",
  "secrecy",
@@ -10899,12 +10905,14 @@ dependencies = [
  "simdutf8",
  "slab",
  "smallvec",
+ "spin 0.9.8",
  "sqlx-core 0.9.0",
  "subtle",
  "syn 2.0.118",
  "syn 3.0.5",
  "sync_wrapper",
  "temp-env",
+ "thin-vec",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -10926,9 +10934,10 @@ dependencies = [
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",
+ "zip 0.6.6",
+ "zip 8.6.0",
  "zstd 0.13.3",
  "zstd-safe 7.2.4",
- "zstd-sys",
 ]
 
 [[package]]
@@ -11227,12 +11236,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
- "wyrd-skald-agent",
- "wyrd-skald-prompt",
- "wyrd-skald-providers",
- "wyrd-skald-runtime",
  "wyrd-skald-spec",
- "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tls",
@@ -11400,15 +11404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-monty-worker"
-version = "0.2.0"
-dependencies = [
- "monty-alloc",
- "monty-proto",
- "monty-types",
-]
-
-[[package]]
 name = "wyrd-queue"
 version = "0.2.0"
 dependencies = [
@@ -11453,23 +11448,14 @@ name = "wyrd-rust-examples"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "reqwest 0.13.4",
- "schemars 0.8.22",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",
- "wyrd",
  "wyrd-ai",
- "wyrd-skald-agent",
- "wyrd-skald-prompt",
- "wyrd-skald-runtime",
- "wyrd-skald-spec",
- "wyrd-skald-tool",
- "wyrd-spec",
 ]
 
 [[package]]
@@ -11498,10 +11484,7 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
- "wyrd-skald-agent",
  "wyrd-skald-prompt",
- "wyrd-skald-runtime",
- "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-types",
@@ -11597,6 +11580,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mimalloc",
  "monty-pool",
+ "monty-proto",
  "monty-types",
  "num-traits",
  "oauth2",
@@ -11677,7 +11661,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "pyo3",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11687,7 +11670,6 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
  "wyrd-skald-runtime",
@@ -11695,7 +11677,6 @@ dependencies = [
  "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-telemetry",
- "wyrd-utils",
 ]
 
 [[package]]
@@ -11761,7 +11742,6 @@ name = "wyrd-skald-runtime"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "pyo3",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -11793,17 +11773,14 @@ name = "wyrd-skald-tool"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "pyo3",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-skald-spec",
  "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]

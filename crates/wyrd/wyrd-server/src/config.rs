@@ -1707,8 +1707,9 @@ pub struct VerificationConfig {
     /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
     #[serde(skip)]
     pub limits: HostedLimits,
-    /// The hardened Monty worker binary: `WYRD_VERIFICATION_MONTY_WORKER`,
-    /// else `wyrd-monty-worker` beside the running server binary.
+    /// The executable the Monty pool spawns as `<path> subprocess`:
+    /// `WYRD_VERIFICATION_MONTY_WORKER`, else the running `wyrd-server`
+    /// itself.
     #[serde(skip)]
     pub monty_worker: Option<PathBuf>,
 }
@@ -1882,11 +1883,7 @@ impl VerificationConfig {
         }
         self.monty_worker = env_opt("WYRD_VERIFICATION_MONTY_WORKER")?
             .map(PathBuf::from)
-            .or_else(|| {
-                env::current_exe()
-                    .ok()
-                    .map(|server| server.with_file_name("wyrd-monty-worker"))
-            });
+            .or_else(|| env::current_exe().ok());
         Ok(())
     }
 }
@@ -4267,7 +4264,7 @@ maintenance_interval_secs = 45
         assert_eq!(config.limits, HostedLimits::default());
         assert!(
             config.monty_worker.is_some(),
-            "worker defaults beside the server"
+            "the worker defaults to the running server"
         );
         temp_env::with_vars(
             [

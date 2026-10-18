@@ -29,17 +29,6 @@ impl SessionId {
 }
 
 /// Role of one session turn.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "wyrd.session", name = "Role", eq, eq_int, from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    expect(
-        clippy::unsafe_derive_deserialize,
-        reason = "the only unsafe is PyO3's generated glue, which deserialization never reaches"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -54,17 +43,6 @@ pub enum Role {
 }
 
 /// Persistable text-oriented session turn.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "wyrd.session", name = "SessionTurn", skip_from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    expect(
-        clippy::unsafe_derive_deserialize,
-        reason = "the only unsafe is PyO3's generated glue, which deserialization never reaches"
-    )
-)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionTurn {
     /// Role for this turn.

@@ -1,7 +1,7 @@
-//! The Python sandbox against the real hardened `wyrd-monty-worker`.
+//! The Python sandbox against real `wyrd-server subprocess` Monty workers.
 //!
-//! Ignored in the fast lane because they need the worker binary; `mise run
-//! test:verification:sandbox` builds it and runs them.
+//! Ignored in the fast lane because they need the release `wyrd-server`
+//! binary; `mise run test:verification:sandbox` builds it and runs them.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,16 +18,13 @@ use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
 const NEEDS_WORKER: &str = "needs the Monty worker; run `mise run test:verification:sandbox`";
 
 /// The worker binary: `WYRD_VERIFICATION_MONTY_WORKER`, else the
-/// `build:monty-worker` output.
+/// `build:server` `wyrd-server`, which serves as its own worker.
 ///
 /// # Panics
 /// Panics when the binary is missing.
 pub(crate) fn worker() -> PathBuf {
     let path = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../target/release/wyrd-monty-worker")
-        },
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/release/wyrd-server"),
         PathBuf::from,
     );
     assert!(path.is_file(), "{}: {NEEDS_WORKER}", path.display());
@@ -348,6 +345,18 @@ async fn sandbox_contains_runaway_code() {
         run(
             &sandbox,
             "def f():\n    return len('x' * (512 * 1024 * 1024))",
+            "f",
+            json!({}),
+        )
+        .await,
+    );
+    assert!(reason.contains("MemoryError"), "{reason}");
+    // Small allocations pass every size precheck, so only the worker
+    // allocator's live-byte count can stop this growth.
+    let reason = terminal(
+        run(
+            &sandbox,
+            "def f():\n    xs = []\n    while True:\n        xs.append('x' * 4096)",
             "f",
             json!({}),
         )

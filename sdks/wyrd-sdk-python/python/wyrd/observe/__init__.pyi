@@ -47,36 +47,6 @@ class Run:
         """
         ...
 
-    def invoke(
-        self, variables: dict[str, str] | None = None, *, route: dict[str, str] | None = None
-    ) -> str:
-        """Invoke this view's tool-free Agent once on its execution route.
-
-        A ``{"kind": "wyrd_gateway", "deployment": <name>}`` route sends each
-        model call to ``<deployment>/<Prompt model>`` through the gateway as
-        the state's client, carrying this run and the Agent Card as
-        correlation. A ``{"kind": "native"}`` route calls the Prompt's
-        provider with this host's configuration.
-
-        Args:
-            variables: the Agent Prompt's string variables.
-            route: replaces the Agent's declared ``execution_route`` whole for
-                this invocation only; the Card is unchanged. Omitted, the
-                declared route is used.
-
-        Returns:
-            The Agent's final text.
-
-        Raises:
-            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed ``route``;
-                ``WYRD_SDK_400_CARD_KIND_MISMATCH`` for a view that is not an
-                Agent; ``WYRD_AGENT_422_VALIDATION`` for an Agent with tools,
-                a non-gateway Prompt model, or a gateway route to a Vertex
-                Prompt, all before any IO; otherwise the gateway's own
-                refusal, such as ``WYRD_PERMISSION_403_DENIED_RBAC``.
-        """
-        ...
-
     def __enter__(self) -> Run:
         """Enter this view's ambient OpenTelemetry span correlation.
 

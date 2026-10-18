@@ -146,6 +146,7 @@ lopdf = { version = "0.45", default-features = false }
 quick-xml = "0.41"
 # Sandboxed Verifier Python pool and the hardened worker binary it spawns.
 monty-pool = "1.1"
+monty-proto = "1.1"
 monty-types = "1.1"
 tar = { version = "0.4", default-features = false }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }

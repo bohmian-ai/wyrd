@@ -10,14 +10,6 @@ publish = false
 description = "Runnable Wyrd Rust examples."
 
 [[bin]]
-name = "agent_openai"
-path = "agent_openai.rs"
-
-[[bin]]
-name = "agent_smoke"
-path = "agent_smoke.rs"
-
-[[bin]]
 name = "transport_grpc"
 path = "transport_grpc.rs"
 
@@ -36,21 +28,12 @@ path = "../support-desk/rust/main.rs"
 [dependencies]
 anyhow = "1"
 reqwest = { workspace = true }
-async-trait = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-skald-agent = { workspace = true }
-skald-prompt = { workspace = true }
-skald-runtime = { workspace = true }
-skald-spec = { workspace = true }
-skald-tool = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
-wyrd = { path = "../../crates/wyrd/wyrd" }
 wyrd-ai = { path = "../../sdks/wyrd-sdk-rust", features = ["otel"] }
-wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

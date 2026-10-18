@@ -3079,48 +3079,6 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Prove `Run::invoke` refuses an Agent that declares tools with the stable
-    /// Agent validation code before resolving a client or doing any IO.
-    ///
-    /// # Panics
-    /// Panics if the fixture cannot load or the refusal carries another code.
-    #[tokio::test]
-    async fn invoke_refuses_an_agent_with_tools_before_io() {
-        let mut bundle = TestBundle::with_typed_cards();
-        let agent_ref = test_ref(CardKind::Agent, "tooled", 11);
-        bundle.add_card(
-            "agent_tooled",
-            canonical_card(
-                &agent_ref,
-                CardKind::Agent,
-                Spec::Agent(AgentSpec {
-                    prompt: InlineableRef::Ref(test_ref(CardKind::Prompt, "triage", 4)),
-                    execution_route: wyrd_spec::ExecutionRoute::Native {},
-                    tool_names: vec!["search".to_owned()],
-                    run_config: AgentRunConfigSpec::default(),
-                    verified_by: Vec::new(),
-                }),
-            ),
-            &[],
-        );
-        bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
-            let Spec::Service(spec) = &mut card.spec else {
-                panic!("fixture root is a Service");
-            };
-            spec.components
-                .push(service_component("agent_tooled", &agent_ref));
-        });
-        bundle.write();
-        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
-        let refused = state
-            .run_for_card("agent_tooled")
-            .expect("agent view resolves")
-            .invoke(&[])
-            .await
-            .expect_err("an Agent with tools is refused");
-        assert_eq!(refused.code(), "WYRD_AGENT_422_VALIDATION", "{refused}");
-    }
-
     /// Prove an old bundle whose Agent Prompt is still inline, and so has no
     /// registered Prompt Card identity, is refused as an invalid bundle rather
     /// than given a fabricated identity.

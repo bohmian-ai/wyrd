@@ -2,8 +2,7 @@
 
 This lane is the only place a gateway call reaches a real upstream. Each
 provider's own client calls its deployment on the session's one live server, so
-a failure here is a gateway relay defect or a provider refusal, never a Wyrd
-Prompt lowering defect (``test_prompt_live_providers`` isolates those). Nothing
+a failure here is a gateway relay defect or a provider refusal. Nothing
 here asserts token counts or deterministic failures: the proof is connectivity
 and a parseable response shape.
 

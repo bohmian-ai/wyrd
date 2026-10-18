@@ -1,8 +1,0 @@
-[check:deps] $ bash scripts/checks/deps.sh
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
-────────────
- Nextest run ID 516b7a17-8536-4aba-b47d-2356891b1890 with nextest profile: default
-    Starting 1 test across 1 binary
-        PASS [   0.002s] (1/1) wyrd-spec::security_inline_gate inline_source_rejected_when_test_utils_off
-────────────
-     Summary [   0.002s] 1 test run: 1 passed, 0 skipped

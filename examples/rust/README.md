@@ -3,22 +3,12 @@
 Run these examples from the repository root:
 
 ```bash
-cargo run -p wyrd-rust-examples --bin workflow_parallel
+cargo run -p wyrd-rust-examples --bin client_request
 ```
 
-Mock-provider examples run without credentials:
-
-- `agent_smoke.rs` builds an Agent card and saves local YAML.
-- `workflow_from_builder.rs` builds and runs a two-step workflow.
-- `workflow_from_yaml.rs` loads `workflows/research.yaml`.
-- `workflow_parallel.rs` runs two researchers in parallel, then fans into one
-  synthesizer step.
-
-Provider examples require the matching provider credentials:
-
-- `agent_openai.rs`
-- `workflow_openai.rs`
-- `workflow_anthropic.rs`
-- `workflow_gemini.rs`
-- `workflow_gateway.rs`
-- `workflow_structured_output.rs`
+- `client_request.rs` makes one authenticated request through a `WyrdClient`
+  built from the ambient configuration.
+- `transport_http.rs` and `transport_grpc.rs` point a client's HTTP and gRPC
+  planes at explicit endpoints without any network call.
+- `support_desk` runs the [support desk](../support-desk/README.md) against
+  `WYRD_SERVER_URL`.

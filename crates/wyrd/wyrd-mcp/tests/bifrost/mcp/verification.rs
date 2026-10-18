@@ -608,10 +608,13 @@ mod pg_tests {
         Ok(())
     }
 
-    /// Poll `execution_id` over MCP until it reaches a terminal status.
+    /// Poll `execution_id` over MCP until it reaches a terminal status, and
+    /// a `completed` one until its result is visible.
     ///
     /// An enqueued execution becomes visible only once the queue accepts its
-    /// submission, so a not-found read is retried until the deadline.
+    /// submission, so a not-found read is retried until the deadline; a
+    /// `completed` execution may briefly lack its result, so that is retried
+    /// too.
     ///
     /// # Errors
     ///
@@ -644,6 +647,7 @@ mod pg_tests {
                     state["status"].as_str(),
                     Some("pending" | "running" | "retrying")
                 )
+                && (state["status"] != "completed" || state.get("result").is_some())
             {
                 return Ok(state);
             }

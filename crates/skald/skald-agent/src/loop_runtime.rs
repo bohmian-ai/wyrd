@@ -125,8 +125,6 @@ impl Agent {
                             error: Some(error),
                             errors: Vec::new(),
                             structured_output: None,
-                            #[cfg(feature = "python")]
-                            parsed: None,
                         });
                     }
                     ChainResult::Replaced(input) => {
@@ -332,8 +330,6 @@ impl Agent {
             error: None,
             errors: Vec::new(),
             structured_output: None,
-            #[cfg(feature = "python")]
-            parsed: None,
         })
     }
 
@@ -409,8 +405,6 @@ impl Agent {
                         error: Some(error),
                         errors: Vec::new(),
                         structured_output: None,
-                        #[cfg(feature = "python")]
-                        parsed: None,
                     });
                 }
                 ChainResult::Replaced(replacement) => replacement,
@@ -455,8 +449,6 @@ impl Agent {
                         error: Some(error),
                         errors: Vec::new(),
                         structured_output: None,
-                        #[cfg(feature = "python")]
-                        parsed: None,
                     });
                 }
                 ChainResult::Replaced(replacement) => replacement,
@@ -494,8 +486,6 @@ impl Agent {
                     error: None,
                     errors: Vec::new(),
                     structured_output,
-                    #[cfg(feature = "python")]
-                    parsed: None,
                 };
                 return match apply_chain_with_panic_catch(
                     &self.callbacks.after_agent,
@@ -509,8 +499,6 @@ impl Agent {
                         finish_reason: FinishReason::CallbackAborted,
                         error: Some(error),
                         structured_output: None,
-                        #[cfg(feature = "python")]
-                        parsed: None,
                         ..held
                     }),
                     ChainResult::Replaced(replacement) => Ok(replacement),

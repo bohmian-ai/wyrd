@@ -17,7 +17,6 @@ import type {
   CredentialListResponse as CredentialList,
   CredentialMetadata,
   DataTypeSpec,
-  ExecutionRoute,
   FallbackRule,
   FallbackScope,
   FieldSpec2 as FieldDescription,
@@ -2379,37 +2378,6 @@ export class Run {
    */
   forCard(alias: string): Run {
     return Run.fromOpen(this.#native.forCard(alias));
-  }
-
-  /**
-   * Invoke this view's tool-free Agent once on its execution route and return
-   * its final text. A `{ kind: "wyrd_gateway", deployment }` route sends each
-   * model call to `<deployment>/<Prompt model>` through the gateway as the
-   * state's client, carrying this run and the Agent Card as correlation; a
-   * `{ kind: "native" }` route calls the Prompt's provider with this host's
-   * configuration.
-   *
-   * @param variables - The Agent Prompt's string variables.
-   * @param options - `route` replaces the Agent's declared `execution_route`
-   * whole for this invocation only; the Card is unchanged.
-   * @returns The Agent's final text.
-   * @throws a {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` for a malformed
-   * route; `WYRD_SDK_400_CARD_KIND_MISMATCH` for a view that is not an Agent;
-   * `WYRD_AGENT_422_VALIDATION` for an Agent with tools, a non-gateway Prompt
-   * model, or a gateway route to a Vertex Prompt, all before any IO;
-   * otherwise the gateway's own refusal, such as
-   * `WYRD_PERMISSION_403_DENIED_RBAC`.
-   */
-  async invoke(
-    variables: Readonly<Record<string, string>> = {},
-    options: { readonly route?: ExecutionRoute } = {},
-  ): Promise<string> {
-    return lifecycleValue<string>(
-      await this.#native.invoke(
-        strictJson("variables", variables),
-        options.route === undefined ? undefined : strictJson("route", options.route),
-      ),
-    );
   }
 
   /**

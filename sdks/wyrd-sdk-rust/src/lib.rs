@@ -24,11 +24,11 @@
 //! behind the `testing` feature and is absent from production builds.
 //!
 //! The list also holds the projection to the surface every SDK shares
-//! (REQ-210): the `wyrd_client::gateway_caller` module is left off, so the
-//! Agent gateway caller is not reachable here. The `wyrd_client::auth` and
-//! `storage` modules are left off too (this package's [`auth`] is the principal
-//! handle, `wyrd_client::principals`): the authentication middleware and the artifact-transfer
-//! client are mechanics behind [`WyrdClient`] and [`cards::Cards`]. [`transport`]
+//! (REQ-210): the `wyrd_client::auth` and `storage` modules are left off
+//! (this package's [`auth`] is the principal handle,
+//! `wyrd_client::principals`): the authentication middleware and the
+//! artifact-transfer client are mechanics behind [`WyrdClient`] and
+//! [`cards::Cards`]. [`transport`]
 //! carries only the endpoint and credential types [`config::ClientConfig`]
 //! names. Raw requests, writer internals, and
 //! bundle introspection on the re-exported types exist only under
@@ -161,8 +161,7 @@ pub use wyrd_spec::error::WyrdError;
 /// typed spec.
 pub use wyrd_spec::envelope::{Card, Spec};
 
-/// Where an Agent's model calls go: declared on every Agent Card and
-/// replaceable whole for one invocation with `Run::invoke_on`.
+/// Where an Agent's model calls go, as declared on every Agent Card.
 pub use wyrd_spec::ExecutionRoute;
 
 /// The result `observe().verify` and `Execution::wait` return:

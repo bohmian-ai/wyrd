@@ -1257,10 +1257,55 @@ mod pg_tests {
         Ok(())
     }
 
-    /// The support conversation's group review, read over MCP once the
-    /// group goes idle: poll `verification.get_binding` until it names a
-    /// completed execution, publishing captured rows each round so the group
-    /// poller discovers them.
+    /// The one `group_end` binding of the Service `service_uid`, discovered
+    /// over MCP: its Card names its bindings and each binding's status says
+    /// whether it pins `group_end` settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool-call failure or an error when the Card names no
+    /// bindings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Service does not bind exactly one `group_end`
+    /// Verifier.
+    async fn group_binding(
+        client: &RunningService<RoleClient, ()>,
+        service_uid: &str,
+    ) -> Result<String, McpJourneyError> {
+        let card = structured(
+            client
+                .call_tool(call(
+                    CARDS_GET,
+                    serde_json::json!({ "kind": "Service", "card_uid": service_uid }),
+                )?)
+                .await?,
+        )?;
+        let mut grouped = Vec::new();
+        for id in card["card"]["status"]["verification"]["binding_ids"]
+            .as_array()
+            .ok_or("the Service names its bindings")?
+        {
+            let binding = structured(
+                client
+                    .call_tool(call(GET_BINDING, serde_json::json!({ "binding_id": id }))?)
+                    .await?,
+            )?;
+            if !binding["group_end"].is_null() {
+                grouped.push(text(&binding, "/binding_id")?.to_owned());
+            }
+        }
+        let [binding_id] = <[String; 1]>::try_from(grouped).unwrap_or_else(|grouped| {
+            panic!("the Service binds exactly one group_end Verifier: {grouped:?}")
+        });
+        Ok(binding_id)
+    }
+
+    /// A group review, read over MCP once its group goes idle: poll
+    /// `verification.get_binding` until it names a completed execution other
+    /// than `after`, publishing captured rows each round so the group poller
+    /// discovers them.
     ///
     /// # Errors
     ///
@@ -1270,6 +1315,7 @@ mod pg_tests {
         server: &WyrdTestServer,
         client: &RunningService<RoleClient, ()>,
         binding_id: &str,
+        after: Option<&str>,
     ) -> Result<JsonValue, McpJourneyError> {
         let deadline = tokio::time::Instant::now() + SETTLE;
         loop {
@@ -1282,7 +1328,9 @@ mod pg_tests {
                     )?)
                     .await?,
             )?;
-            if let Some(id) = binding["last_execution_id"].as_str() {
+            if let Some(id) = binding["last_execution_id"].as_str()
+                && Some(id) != after
+            {
                 let state = settle(client, id).await?;
                 if state["status"] == "completed" {
                     return Ok(state);
@@ -1356,31 +1404,7 @@ mod pg_tests {
         let agent_client = connect(&server, &agent).await?;
 
         // Discover: the Service's Card names the binding whose status pins group_end.
-        let card = structured(
-            agent_client
-                .call_tool(call(
-                    CARDS_GET,
-                    serde_json::json!({ "kind": "Service", "card_uid": service_uid }),
-                )?)
-                .await?,
-        )?;
-        let mut grouped = Vec::new();
-        for id in card["card"]["status"]["verification"]["binding_ids"]
-            .as_array()
-            .ok_or("the Service names its bindings")?
-        {
-            let binding = structured(
-                agent_client
-                    .call_tool(call(GET_BINDING, serde_json::json!({ "binding_id": id }))?)
-                    .await?,
-            )?;
-            if !binding["group_end"].is_null() {
-                grouped.push(text(&binding, "/binding_id")?.to_owned());
-            }
-        }
-        let [binding_id] = grouped.as_slice() else {
-            panic!("the Service binds exactly one group_end Verifier: {grouped:?}");
-        };
+        let binding_id = &group_binding(&agent_client, &service_uid).await?;
 
         // Act: one grouped execute, one keyed grouped enqueue, one ungrouped execute.
         let turn = |answer: &str, group: Option<&str>| {
@@ -1422,7 +1446,7 @@ mod pg_tests {
         let solo = text(&ungrouped, "/execution_id")?.to_owned();
 
         // Observe: one review over exactly the two grouped turns, in call order.
-        let review = group_review(&server, &agent_client, binding_id).await?;
+        let review = group_review(&server, &agent_client, binding_id, None).await?;
         assert_eq!(review["group_id"], "conv-mcp", "{review}");
         assert_eq!(review["owner_card_uid"], service_uid.as_str(), "{review}");
         assert_eq!(
@@ -1484,6 +1508,309 @@ mod pg_tests {
             "another tenant cannot read the group review: {foreign_read}"
         );
         foreign_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The frame judge's Verdict for a frame showing a badge: passed, citing
+    /// the frame as its one page.
+    const BADGED: &str = r#"{"outcome":"passed","reason":"a badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+    /// The frame judge's Verdict for the [`UNBADGED`] frame.
+    const NO_BADGE: &str = r#"{"outcome":"failed","reason":"no badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+    /// Text every `frame-verifier` judge request carries.
+    const FRAME_CLAIM: &str = "Cite the frame.";
+
+    /// The label of the one frame that shows no badge.
+    const UNBADGED: &str = "no badge!";
+
+    /// [`UNBADGED`] in base64, as the judge's image data URL carries it.
+    const UNBADGED_BASE64: &str = "bm8gYmFkZ2Uh";
+
+    /// One agent's MCP session for the frames Service and the HTTP access
+    /// it uploads frame bytes with.
+    struct FrameAgent {
+        /// The agent's MCP connection.
+        client: RunningService<RoleClient, ()>,
+        /// The agent's HTTP client, minting the bearer for planned uploads.
+        http: wyrd_client::WyrdClient,
+        /// The server's base URL.
+        base_url: String,
+        /// The frame Verifier the agent submits to.
+        frame_verifier: String,
+        /// The Card the frames are judged for.
+        subject: String,
+    }
+
+    impl FrameAgent {
+        /// Upload the PNG frame carrying the nine-byte `label` after its
+        /// signature and a newline, planning through `verification.evidence`
+        /// and PUTting the bytes where the plan says, and enqueue it to the
+        /// frame Verifier under `group`, returning its execution.
+        ///
+        /// # Errors
+        ///
+        /// Returns a tool-call, plan-shape, or upload failure.
+        async fn submit(&self, group: &str, label: &str) -> Result<String, McpJourneyError> {
+            use sha2::Digest as _;
+            let bytes = [b"\x89PNG\r\n\x1a\n\n".as_slice(), label.as_bytes()].concat();
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let planned = structured(
+                self.client
+                    .call_tool(call(
+                        EVIDENCE,
+                        serde_json::json!({ "files": [{ "sha256": sha256, "size_bytes": bytes.len() }] }),
+                    )?)
+                    .await?,
+            )?;
+            for upload in planned["uploads"].as_array().ok_or("uploads is a list")? {
+                let url = text(upload, "/plan/data/put_url")?;
+                let url = if url.starts_with('/') {
+                    format!("{}{url}", self.base_url)
+                } else {
+                    url.to_owned()
+                };
+                let status = reqwest::Client::new()
+                    .put(url)
+                    .header(
+                        "x-wyrd-access-token",
+                        format!("Bearer {}", self.http.access_token().await?.expose()),
+                    )
+                    .header("content-type", "application/octet-stream")
+                    .body(bytes.clone())
+                    .send()
+                    .await?
+                    .status();
+                assert!(
+                    status.is_success(),
+                    "the planned upload is accepted: {status}"
+                );
+            }
+            let queued = structured(
+                self.client
+                    .call_tool(call(
+                        ENQUEUE,
+                        serde_json::json!({
+                            "verifier_card_uid": self.frame_verifier,
+                            "card_uid": self.subject,
+                            "group_id": group,
+                            "idempotency_key": format!("frame-{group}-{sha256}"),
+                            "inputs": { "frame": {
+                                "kind": "file", "sha256": sha256,
+                                "size_bytes": bytes.len(), "format": "png",
+                            } },
+                        }),
+                    )?)
+                    .await?,
+            )?;
+            Ok(text(&queued, "/execution_id")?.to_owned())
+        }
+    }
+
+    /// An HTTP/MCP review agent submits an event's sampled frames as
+    /// uploaded files under the event id as `group_id`, reports the event
+    /// fact, and reads the event review over MCP.
+    ///
+    /// The event fact alone yields a review over `[]` frame outcomes,
+    /// inconclusive `empty_selection`. Two frames, one unbadged, fail the
+    /// event with the failed frame kept in place, while a frame another
+    /// Service submits under the same `group_id` never joins it and a
+    /// reader's grouped enqueue is refused. Twenty-one frames exceed the
+    /// deployment ceiling of twenty and are inconclusive
+    /// `source_execution_limit_exceeded`.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, bootstrap, registration, MCP transport,
+    /// upload, or tool-call failures, or an error when a review never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an upload is refused or a review, coverage, or refusal
+    /// expectation fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn grouped_frames_over_mcp_are_bounded() -> Result<(), McpJourneyError> {
+        let judge = wiremock::MockServer::start().await;
+        for (marker, verdict, priority) in
+            [(UNBADGED_BASE64, NO_BADGE, 1), (FRAME_CLAIM, BADGED, 2)]
+        {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/chat/completions"))
+                .and(wiremock::matchers::body_string_contains(marker))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-frame", "object": "chat.completion", "created": 1,
+                        "model": "gpt-4o",
+                        "choices": [{ "index": 0, "finish_reason": "stop",
+                            "message": { "role": "assistant", "content": verdict } }],
+                        "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+                    }),
+                ))
+                .with_priority(priority)
+                .mount(&judge)
+                .await;
+        }
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(judge.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        server
+            .deploy_gateway_model_for_test("gpt-4o", "mcp_frame_invoker")
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-frames-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let fixture = |name: &str| {
+            format!(
+                "{}/../../../fixtures/cards/verify_in_real_time/{name}.yaml",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        };
+        let mut agents = Vec::new();
+        for name in ["frames", "frames-other"] {
+            let receipt = Box::pin(cards.register_from_path(Path::new(&fixture(name)))).await?;
+            let uid = |name: &str| -> Result<String, McpJourneyError> {
+                Ok(receipt
+                    .outcomes
+                    .iter()
+                    .find(|outcome| outcome.card_ref.name.as_str() == name)
+                    .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                    .ok_or("the fixture registers the named Card")?
+                    .to_string())
+            };
+            let principal = server
+                .credential_registered_service(&receipt.root, &["editor", "mcp_frame_invoker"])
+                .await?;
+            agents.push((
+                FrameAgent {
+                    client: connect(&server, &principal).await?,
+                    http: client(&server, api_key(&principal)?)?,
+                    base_url: server
+                        .base_url()
+                        .ok_or("a bound server has a URL")?
+                        .to_owned(),
+                    frame_verifier: uid("frame-verifier")?,
+                    subject: uid("assistant-agent")?,
+                },
+                uid(name)?,
+                uid("event-fact").ok(),
+            ));
+        }
+        let [(agent, service_uid, event_fact), (other, _, _)] =
+            <[_; 2]>::try_from(agents).map_err(|_| "two agents connect")?;
+        let event_fact = event_fact.ok_or("the frames Service binds event-fact")?;
+        let binding_id = group_binding(&agent.client, &service_uid).await?;
+        let fact = |group: &str| -> Result<CallToolRequestParams, McpJourneyError> {
+            call(
+                EXECUTE,
+                serde_json::json!({
+                    "verifier_card_uid": event_fact,
+                    "card_uid": agent.subject,
+                    "group_id": group,
+                    "inputs": { "event": { "kind": "json",
+                        "value": { "event_id": group, "detected": true } } },
+                }),
+            )
+        };
+        let outcomes = "/result/outcome/evidence/outcomes";
+        let reason = "/result/outcome/requirements/0/reason";
+
+        structured(agent.client.call_tool(fact("door-44")?).await?)?;
+        let empty = group_review(&server, &agent.client, &binding_id, None).await?;
+        assert_eq!(empty["group_id"], "door-44", "{empty}");
+        assert_eq!(
+            empty.pointer(outcomes),
+            Some(&serde_json::json!({ "kind": "json", "value": [] }))
+        );
+        assert_eq!(text(&empty, reason)?, "empty_selection", "{empty}");
+        assert_eq!(
+            empty["result"]["outcome"]["verdict"], "inconclusive",
+            "{empty}"
+        );
+
+        let mut frames = vec![agent.submit("door-43", "door43-01").await?];
+        frames.push(agent.submit("door-43", UNBADGED).await?);
+        let foreign = other.submit("door-43", "other-001").await?;
+        let reader = server
+            .bootstrap_service("mcp-frames-reader", &["viewer"])
+            .await?;
+        let reader_client = connect(&server, &reader).await?;
+        let denied = refusal(reader_client.call_tool(fact("door-43")?).await)?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "a reader adds no frame: {denied}"
+        );
+        reader_client.cancel().await?;
+        for execution in &frames {
+            assert_eq!(
+                settle(&agent.client, execution).await?["status"],
+                "completed"
+            );
+        }
+        assert_eq!(
+            settle(&other.client, &foreign).await?["status"],
+            "completed"
+        );
+        structured(agent.client.call_tool(fact("door-43")?).await?)?;
+        let failing = group_review(
+            &server,
+            &agent.client,
+            &binding_id,
+            Some(text(&empty, "/execution_id")?),
+        )
+        .await?;
+        assert_eq!(failing["group_id"], "door-43", "{failing}");
+        assert_eq!(
+            failing["group"]["sources"]["outcomes"]["execution_ids"],
+            serde_json::json!(frames),
+            "only this Service's frames, in submission order: {failing}"
+        );
+        assert_eq!(
+            failing.pointer(outcomes),
+            Some(&serde_json::json!({ "kind": "json", "value": ["passed", "failed"] }))
+        );
+        assert_eq!(
+            failing["result"]["outcome"]["verdict"], "failed",
+            "{failing}"
+        );
+
+        let mut over = Vec::new();
+        for index in 1..=21 {
+            over.push(
+                agent
+                    .submit("door-45", &format!("door45-{index:02}"))
+                    .await?,
+            );
+        }
+        for execution in &over {
+            settle(&agent.client, execution).await?;
+        }
+        structured(agent.client.call_tool(fact("door-45")?).await?)?;
+        let bounded = group_review(
+            &server,
+            &agent.client,
+            &binding_id,
+            Some(text(&failing, "/execution_id")?),
+        )
+        .await?;
+        assert_eq!(bounded["group_id"], "door-45", "{bounded}");
+        assert!(
+            text(&bounded, reason)?.starts_with("source_execution_limit_exceeded"),
+            "{bounded}"
+        );
+        assert_eq!(
+            bounded["result"]["outcome"]["verdict"], "inconclusive",
+            "{bounded}"
+        );
+        agent.client.cancel().await?;
+        other.client.cancel().await?;
         server.shutdown().await?;
         Ok(())
     }

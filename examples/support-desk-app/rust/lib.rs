@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
-use wyrd_ai::cards::{CardSelector, Cards, BundleMode};
+use wyrd_ai::cards::{BundleMode, CardSelector, Cards};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::observe::Run;
 use wyrd_ai::state::WyrdState;

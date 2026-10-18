@@ -334,7 +334,7 @@ def test_published_quickstart_declares_observes_and_verifies(
             assert incomplete["verdict"] == "failed"
             assert incomplete["requirements"][0]["reason"] == "missing order_id"
 
-            desk = http.app.state.desk
+            desk = modules["app"].app.state.desk
             for verifier, inputs, code in (
                 ("not-bound", {"answer": "x"}, "WYRD_SDK_404_UNKNOWN_VERIFIER"),
                 ("no-refund-promise", {"letter": "x"}, "WYRD_VERIFICATION_400_INPUT_INVALID"),

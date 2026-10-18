@@ -69,7 +69,7 @@ If only the test is changed (bigger capacity, flushing), it stays racy, because 
     test verify_in_real_time::verification_staging_refuses_and_recovers has been running for over 60 seconds
     2026-10-17T21:05:06.023112Z  INFO bifrost.forge.maintenance.pass{role="server"}: vala_bifrost_redux::forge::gc: Forge leader maintenance pass started manifest_rewrite_tables=0 snapshot_expiration_
     2026-10-17T21:05:06.023164Z  INFO bifrost.forge.maintenance.pass{role="server"}: vala_bifrost_redux::forge::gc: Forge leader maintenance pass completed
-    2026-10-17T21:05:37.918758Z  WARN wyrd_testing::server: WyrdTestServer dropped on an active Tokio runtime without explicit shutdown(); aborting its lifecycle owners. Prefer `srv.shutdown().await` 
+    2026-10-17T21:05:37.918758Z  WARN wyrd_testing::server: WyrdTestServer dropped on an active Tokio runtime without explicit shutdown(); aborting its lifecycle owners. Prefer `srv.shutdown().await`
     2026-10-17T21:05:37.919041Z  INFO vala_bifrost_redux::gate: bifrost gate closed
     2026-10-17T21:05:37.919104Z  INFO wyrd_storage::sweeper: storage sweeper shutting down
     2026-10-17T21:05:37.919180Z  INFO vala_bifrost_redux::forge::leadership: Forge leader term revoked fencing_token=1 reason="shutdown"
@@ -206,7 +206,7 @@ Retrospective findings, from source only. They can't show what the implementer k
 ### Report D evidence (recovered failing output)
 
 --- transcript line 1268 (2026-10-17T21:31:45.565Z) ---
-52:tests/integration/test_verify_in_real_time.py:473: 
+52:tests/integration/test_verify_in_real_time.py:473:
 70:E       wyrd._wyrd.WyrdError: baseline of verifier 01a14bc5-a91a-7802-98b4-2bca164502fa was not ready within 90s; last observed: None
 72:tests/integration/conftest.py:285: WyrdError
 Shell cwd was reset to /home/thorrester/Documents/GitHub/wyrd-worktrees/long-horizon-verification-task-003

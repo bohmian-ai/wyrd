@@ -13,4 +13,4 @@ spec:
         - verifier: ./coding-turn.yaml
         - verifier: ./empty-each.yaml
         - verifier: ./coding-review.yaml
-          runs_on: {kind: group_end, idle: 3s, max_age: 1h, finality: 1d}
+          runs_on: {kind: group_end, after: 3s}

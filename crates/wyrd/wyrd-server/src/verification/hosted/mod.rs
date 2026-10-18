@@ -83,9 +83,6 @@ pub struct HostedLimits {
     pub agent_code_budget: Duration,
     /// Overall deadline of one immediate `verify` request.
     pub verify_timeout: Duration,
-    /// Most distinct source executions one group source reference may read
-    /// per snapshot; one more judges the group inconclusive unread.
-    pub source_executions_max: u32,
 }
 
 impl HostedLimits {
@@ -136,7 +133,6 @@ impl Default for HostedLimits {
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
-            source_executions_max: 1000,
         }
     }
 }

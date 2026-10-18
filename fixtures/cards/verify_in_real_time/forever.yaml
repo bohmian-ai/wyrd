@@ -1,5 +1,5 @@
-# The support conversation under the largest durations a Trigger accepts:
-# its groups never end, and polling them must not stop the scheduler.
+# The support conversation under the largest `after` a Trigger accepts:
+# its groups never come due, and scheduling them must not stop the scheduler.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -14,4 +14,4 @@ spec:
       verified_by:
         - verifier: ./turn-check.yaml
         - verifier: ./conversation-review.yaml
-          runs_on: {kind: group_end, idle: 999999999d, max_age: 999999999d, finality: 999999999d}
+          runs_on: {kind: group_end, after: 999999999d}

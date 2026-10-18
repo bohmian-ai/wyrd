@@ -885,6 +885,7 @@ pub async fn compose_bifrost(
         ),
         scribe_config.ingest_request_bytes,
         scribe_config.outbox_capacity,
+        Some(postgres.wyrd().clone()),
     );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(

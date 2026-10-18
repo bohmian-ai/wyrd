@@ -1306,7 +1306,7 @@ mod pg_tests {
         Ok(binding_id)
     }
 
-    /// A group review, read over MCP once its group goes idle: poll
+    /// A group review, read over MCP once its group comes due: poll
     /// `verification.get_binding` until it names a completed execution other
     /// than `after` whose result is visible, publishing captured rows each
     /// round so the group poller discovers them and a completed review's
@@ -1356,7 +1356,7 @@ mod pg_tests {
     /// The Service reads its Card and finds the binding whose status pins
     /// `group_end` settings. Each grouped tool result and execution read
     /// echoes the same `group_id`, and an ungrouped `execute` leaves its
-    /// result without one. Once the group goes idle the binding names one
+    /// result without one. Once its `after` period expires the binding names one
     /// review whose snapshot holds exactly the two grouped turns in call
     /// order, and `bifrost.query` reads the same `group_id` on its persisted
     /// result row. A reader is refused a grouped enqueue, and another
@@ -1626,9 +1626,8 @@ mod pg_tests {
     /// inconclusive `empty_selection`. Two frames, one unbadged, fail the
     /// event with the failed frame kept in place, while a frame another
     /// Service submits under the same `group_id` never joins it and a
-    /// reader's grouped enqueue is refused. Twenty-one frames exceed the
-    /// deployment ceiling of twenty and are inconclusive
-    /// `source_execution_limit_exceeded`.
+    /// reader's grouped enqueue is refused. Twenty-one badged frames are
+    /// judged like any other group, passing with every visible outcome.
     ///
     /// # Errors
     ///
@@ -1642,7 +1641,7 @@ mod pg_tests {
     /// expectation fails.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn grouped_frames_over_mcp_are_bounded() -> Result<(), McpJourneyError> {
+    async fn grouped_frames_use_visible_outcomes() -> Result<(), McpJourneyError> {
         let judge = wiremock::MockServer::start().await;
         for (marker, verdict, priority) in
             [(UNBADGED_BASE64, NO_BADGE, 1), (FRAME_CLAIM, BADGED, 2)]
@@ -1791,33 +1790,38 @@ mod pg_tests {
             "{failing}"
         );
 
-        let mut over = Vec::new();
+        let mut many = Vec::new();
         for index in 1..=21 {
-            over.push(
+            many.push(
                 agent
                     .submit("door-45", &format!("door45-{index:02}"))
                     .await?,
             );
         }
-        for execution in &over {
+        for execution in &many {
             settle(&agent.client, execution).await?;
         }
         structured(agent.client.call_tool(fact("door-45")?).await?)?;
-        let bounded = group_review(
+        let passing = group_review(
             &server,
             &agent.client,
             &binding_id,
             Some(text(&failing, "/execution_id")?),
         )
         .await?;
-        assert_eq!(bounded["group_id"], "door-45", "{bounded}");
-        assert!(
-            text(&bounded, reason)?.starts_with("source_execution_limit_exceeded"),
-            "{bounded}"
+        assert_eq!(passing["group_id"], "door-45", "{passing}");
+        assert_eq!(
+            passing["group"]["sources"]["outcomes"]["execution_ids"],
+            serde_json::json!(many),
+            "{passing}"
         );
         assert_eq!(
-            bounded["result"]["outcome"]["verdict"], "inconclusive",
-            "{bounded}"
+            passing.pointer(outcomes),
+            Some(&serde_json::json!({ "kind": "json", "value": vec!["passed"; 21] }))
+        );
+        assert_eq!(
+            passing["result"]["outcome"]["verdict"], "passed",
+            "{passing}"
         );
         agent.client.cancel().await?;
         other.client.cancel().await?;

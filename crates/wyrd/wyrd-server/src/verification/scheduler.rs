@@ -10,15 +10,18 @@
 //! many processes, duplicate ticks, and a restart mid-pass never create a
 //! second run for one occurrence.
 //!
-//! In a process hosting Verifier blocks the same pass also polls each
-//! tenant's due `group_end` bindings through [`GroupPoller`]: one binding
-//! per short transaction, its cursor advanced by
-//! [`VerifierExecutionQueue::claim_due_group`] and committed with the group
-//! executions the poll enqueued.
+//! In a process hosting Verifier blocks a separate group loop hands expired
+//! pending groups off through [`GroupPoller`]: per item it takes one permit
+//! of the shared execution capacity, then in one short transaction claims
+//! the pending row with [`VerifierExecutionQueue::claim_due_group`], pins
+//! and enqueues one snapshot, consumes the row, and commits; the permit is
+//! released at handoff, before any Verifier runs. A failure rolls back and
+//! ends that tenant's group pass, leaving the item pending.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
@@ -38,8 +41,18 @@ use super::health::RuntimeCapability;
 /// Tenants examined per scheduler pass, most overdue first.
 const TENANTS_PER_PASS: i64 = 64;
 
-/// Occurrences one tenant may schedule per pass before the next tenant runs.
+/// Occurrences or pending groups one tenant may hand off per pass before the
+/// next tenant runs.
 const TICKS_PER_TENANT: usize = 32;
+
+/// The group loop's snapshot reader and the shared execution capacity each
+/// handoff takes one permit of.
+struct Groups {
+    /// Pins and enqueues one pending group's snapshot.
+    poller: GroupPoller,
+    /// Execution capacity shared with the runner's claim loop.
+    capacity: Arc<Semaphore>,
+}
 
 /// Owner of the binding-schedule loop.
 pub struct VerificationScheduler {
@@ -53,8 +66,8 @@ pub struct VerificationScheduler {
     authority: BackgroundAuthority,
     /// Idle wait between passes.
     poll_interval: Duration,
-    /// Group discovery, present only where Verifier blocks are hosted.
-    groups: Option<GroupPoller>,
+    /// Pending group handoff, present only where Verifier blocks are hosted.
+    groups: Option<Groups>,
     /// Test-only crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
@@ -86,10 +99,12 @@ impl VerificationScheduler {
         }
     }
 
-    /// Also poll due `group_end` bindings through `groups`.
+    /// Also hand off expired pending groups through `poller`, taking one
+    /// permit of `capacity`, the execution capacity the runner's claim loop
+    /// shares, per handoff.
     #[must_use]
-    pub fn with_groups(mut self, groups: GroupPoller) -> Self {
-        self.groups = Some(groups);
+    pub fn with_groups(mut self, poller: GroupPoller, capacity: Arc<Semaphore>) -> Self {
+        self.groups = Some(Groups { poller, capacity });
         self
     }
 
@@ -101,10 +116,13 @@ impl VerificationScheduler {
         self
     }
 
-    /// Run passes every poll interval until `stop` is cancelled.
+    /// Run the cron loop and, where groups are hosted, the separate group
+    /// loop until `stop` is cancelled.
     ///
-    /// A failed pass is logged and retried on the next interval; the loop
-    /// only returns on `stop`.
+    /// Each loop finishes its pass before sleeping the poll interval, so slow
+    /// group snapshot reads never delay cron occurrences. A failed pass is
+    /// logged and retried on the next interval; the loops only return on
+    /// `stop`.
     ///
     /// The depth report and the idle wait race `stop` directly. A pass
     /// observes `stop` only at its occurrence linearization point (see
@@ -118,6 +136,17 @@ impl VerificationScheduler {
     /// Cancellation before an occurrence's commit is selected rolls it back;
     /// a selected commit is awaited to its result before the loop returns.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
+        tokio::join!(self.cron_loop(&stop), self.group_loop(&stop));
+    }
+
+    /// Run cron passes every poll interval until `stop` is cancelled.
+    ///
+    /// # Panics
+    /// Panics under `test-support` when a test armed a scheduler crash.
+    ///
+    /// # Cancellation
+    /// As [`Self::run`].
+    async fn cron_loop(&self, stop: &CancellationToken) {
         loop {
             #[cfg(feature = "test-support")]
             if let Some(crash) = &self.crash {
@@ -130,8 +159,28 @@ impl VerificationScheduler {
                     tracing::warn!(%error, "verification queue depth read failed");
                 }
             }
-            if let Err(error) = self.pass(&stop).await {
+            if let Err(error) = self.pass(stop).await {
                 tracing::warn!(%error, "verification scheduler pass failed");
+            }
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(self.poll_interval) => {}
+            }
+        }
+    }
+
+    /// Run group passes every poll interval until `stop` is cancelled; a
+    /// process hosting no groups returns at once.
+    ///
+    /// # Cancellation
+    /// As [`Self::run`].
+    async fn group_loop(&self, stop: &CancellationToken) {
+        if self.groups.is_none() {
+            return;
+        }
+        loop {
+            if let Err(error) = self.group_pass(stop).await {
+                tracing::warn!(%error, "verification group pass failed");
             }
             tokio::select! {
                 () = stop.cancelled() => return,
@@ -169,13 +218,48 @@ impl VerificationScheduler {
             if let Err(error) = self.schedule_tenant(tenant, stop, &mut ticks).await {
                 tracing::warn!(%tenant, %error, "tenant verification schedule failed");
             }
-            if let Some(groups) = &self.groups
-                && let Err(error) = self.poll_groups(groups, tenant, stop).await
-            {
-                tracing::warn!(%tenant, %error, "tenant group poll failed");
-            }
         }
         Ok(ticks)
+    }
+
+    /// Hand off every expired pending group PostgreSQL considers due until
+    /// `stop` is cancelled, returning each committed handoff's outcome.
+    ///
+    /// Visits at most [`TENANTS_PER_PASS`] most-overdue tenants and hands off
+    /// at most [`TICKS_PER_TENANT`] groups per tenant, sequentially. A tenant
+    /// whose handoff fails is logged and skipped without stopping the pass. A
+    /// process hosting no groups hands off nothing.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the cross-tenant due list cannot be read.
+    ///
+    /// # Cancellation
+    /// As [`Self::pass`].
+    pub async fn group_pass(
+        &self,
+        stop: &CancellationToken,
+    ) -> Result<Vec<EnqueueOutcome>, SqlError> {
+        let Some(groups) = &self.groups else {
+            return Ok(Vec::new());
+        };
+        let tenants = tokio::select! {
+            biased;
+            () = stop.cancelled() => return Ok(Vec::new()),
+            tenants = self.queue.tenants_with_due_groups(&self.operator, TENANTS_PER_PASS) => tenants?,
+        };
+        let mut handed = Vec::new();
+        for tenant in tenants {
+            if stop.is_cancelled() {
+                break;
+            }
+            if let Err(error) = self
+                .hand_off_groups(groups, tenant, stop, &mut handed)
+                .await
+            {
+                tracing::warn!(%tenant, %error, "tenant group handoff failed");
+            }
+        }
+        Ok(handed)
     }
 
     /// Commit up to [`TICKS_PER_TENANT`] due occurrences of `tenant`, one
@@ -237,29 +321,38 @@ impl VerificationScheduler {
         Ok(())
     }
 
-    /// Poll up to [`TICKS_PER_TENANT`] due `group_end` bindings of `tenant`,
-    /// one transaction each.
+    /// Hand off up to [`TICKS_PER_TENANT`] expired pending groups of
+    /// `tenant`, one transaction each, appending every committed outcome to
+    /// `handed`.
     ///
-    /// Each transaction claims one binding (advancing its cursor), resolves
-    /// the owner/SYSTEM authority, enqueues the groups `groups` finds ended,
-    /// and commits. A binding without authority only advances its cursor. A
-    /// failed Bifrost read is logged and the advanced cursor still commits,
-    /// so the next poll retries discovery rather than this pass spinning.
+    /// Each item first takes one permit of the shared execution capacity; no
+    /// permit ends the tenant's pass before any claim or read. The
+    /// transaction claims one pending row, resolves the owner/SYSTEM
+    /// authority, pins and enqueues one snapshot (or finds the execution of
+    /// the same snapshot), consumes the row, and commits; the connection and
+    /// permit are released before any Verifier runs. A group whose owner has
+    /// no authority is consumed without an execution, as a scheduled
+    /// occurrence without authority is skipped. A failed or degraded read
+    /// rolls back, leaving the group pending, and ends the tenant's pass.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when a tenant transaction fails; earlier polls
+    /// Returns [`SqlError`] when a tenant transaction fails; earlier handoffs
     /// stay committed.
     ///
     /// # Cancellation
     /// As [`Self::schedule_tenant`]: cancellation before commit selection
-    /// rolls back the in-progress poll.
-    async fn poll_groups(
+    /// rolls back the in-progress handoff.
+    async fn hand_off_groups(
         &self,
-        groups: &GroupPoller,
+        groups: &Groups,
         tenant: DataTenantId,
         stop: &CancellationToken,
+        handed: &mut Vec<EnqueueOutcome>,
     ) -> Result<(), SqlError> {
         for _ in 0..TICKS_PER_TENANT {
+            let Ok(_permit) = groups.capacity.try_acquire() else {
+                return Ok(());
+            };
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
                 let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
@@ -269,34 +362,46 @@ impl VerificationScheduler {
                     Some(owner) => self.authority.resolve(&mut conn, owner).await?,
                     None => None,
                 };
-                if let Some(authority) = authority {
-                    match groups.poll(&mut conn, &self.queue, &due, &authority).await {
-                        Ok(enqueued) => {
-                            for outcome in enqueued {
-                                metrics::counter!(
-                                    crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
-                                    "outcome" => group_label(&outcome)
-                                )
-                                .increment(1);
+                let outcome = match authority {
+                    None => None,
+                    Some(authority) => {
+                        match groups
+                            .poller
+                            .poll(&mut conn, &self.queue, &due, &authority)
+                            .await
+                        {
+                            Ok(outcome) => Some(outcome),
+                            Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
+                            Err(error) => {
+                                tracing::warn!(
+                                    binding_id = %due.binding_id,
+                                    group_id = %due.group_id,
+                                    %error,
+                                    "group snapshot failed; the group stays pending"
+                                );
+                                return Ok(None);
                             }
                         }
-                        Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
-                        Err(error) => {
-                            tracing::warn!(binding_id = %due.binding_id, %error, "group poll failed");
-                        }
                     }
-                }
-                Ok(Some(conn))
+                };
+                self.queue.consume_group(&mut conn, &due).await?;
+                Ok(Some((conn, outcome)))
             };
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied?,
             };
-            let Some(conn) = applied else {
+            let Some((conn, outcome)) = applied else {
                 return Ok(());
             };
             conn.commit().await?;
+            metrics::counter!(
+                crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
+                "outcome" => group_label(outcome.as_ref())
+            )
+            .increment(1);
+            handed.extend(outcome);
             if stop.is_cancelled() {
                 return Ok(());
             }
@@ -334,12 +439,14 @@ fn record_depth(queue: &'static str, counts: QueueCounts) {
     }
 }
 
-/// Stable telemetry label of one group enqueue outcome.
-const fn group_label(outcome: &EnqueueOutcome) -> &'static str {
+/// Stable telemetry label of one group handoff; `None` is a group consumed
+/// because its owner had no authority.
+const fn group_label(outcome: Option<&EnqueueOutcome>) -> &'static str {
     match outcome {
-        EnqueueOutcome::Enqueued(_) => "group_enqueued",
-        EnqueueOutcome::AlreadyEnqueued(_) => "group_already_enqueued",
-        EnqueueOutcome::Refused(_) => "group_refused",
+        Some(EnqueueOutcome::Enqueued(_)) => "group_enqueued",
+        Some(EnqueueOutcome::AlreadyEnqueued(_)) => "group_already_enqueued",
+        Some(EnqueueOutcome::Refused(_)) => "group_refused",
+        None => "group_authority_unavailable",
     }
 }
 

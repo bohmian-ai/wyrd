@@ -12,6 +12,6 @@ spec:
       verified_by:
         - verifier: ./refund-turn.yaml
         - verifier: ./refund-review.yaml
-          runs_on: {kind: group_end, idle: 3s, max_age: 1h, finality: 40s}
+          runs_on: {kind: group_end, after: 3s}
           on_verdict_change:
             - ./refund-alert.yaml

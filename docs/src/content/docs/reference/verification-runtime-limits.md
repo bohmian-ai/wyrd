@@ -35,7 +35,6 @@ These limits protect a server that runs Verifiers for many tenants. They are env
 | `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` | 2048 | All worker processes together, idle ones included |
 | `WYRD_VERIFICATION_CODE_TIMEOUT_MS` | 10000 | One Python operation, from waiting for a worker through compiling, running, and its file calls |
 | `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | All `code.run` calls of one Agent step together, across its retries |
-| `WYRD_VERIFICATION_SOURCE_EXECUTIONS_MAX` | 1000 | Distinct source executions one `verifiers.<name>...` group input reads per group snapshot. Exactly this many are judged; one more makes the group result `inconclusive` with reason `source_execution_limit_exceeded`, naming the reference and the limit, without reading the payloads |
 
 ## Startup rules
 

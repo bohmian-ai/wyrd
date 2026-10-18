@@ -6111,8 +6111,7 @@ mod tests {
 }
 
 /// Hosted Verifier blocks for a test server: the default Deployment limits
-/// with no prewarmed worker and a source-execution ceiling of 20, which the
-/// grouped journeys meet exactly and exceed by one. Only a Verifier that runs
+/// with no prewarmed worker. Only a Verifier that runs
 /// Python spawns the Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else
 /// the `build:server` `wyrd-server`, which serves as its own worker.
 ///
@@ -6125,7 +6124,6 @@ async fn test_verification_blocks() -> Result<HostedBlocks, WyrdTestServerError>
     );
     let limits = HostedLimits {
         monty_min_workers: 0,
-        source_executions_max: 20,
         ..HostedLimits::default()
     };
     HostedBlocks::start(worker, limits)

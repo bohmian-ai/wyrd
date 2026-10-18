@@ -888,10 +888,13 @@ impl<'a> ResultLayoutJourney<'a> {
             .server
             .bifrost_scribe()
             .ok_or("the mixed node owns no Scribe")?;
-        let outbox = ScribeSink::local_outbox(Arc::new(StraddleScribe {
-            inner: Arc::clone(&scribe),
-            straddle,
-        }));
+        let outbox = ScribeSink::local_outbox(
+            Arc::new(StraddleScribe {
+                inner: Arc::clone(&scribe),
+                straddle,
+            }),
+            None,
+        );
         outbox.stage(
             self.tenant,
             ScribeWrite::Result {

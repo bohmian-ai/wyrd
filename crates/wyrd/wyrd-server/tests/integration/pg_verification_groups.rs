@@ -1,12 +1,13 @@
-//! Group polls of a registered `group_end` binding driven through the real
-//! [`GroupPoller`], queue and cursor owner on a bound server.
+//! Pending `group_end` groups of a registered binding, scheduled by
+//! Scribe-acknowledged source activity and handed off through the real
+//! [`VerificationScheduler`] group pass, [`GroupPoller`] and queue on a bound
+//! server.
 //!
-//! The verification runtime stays off, so no background poll consumes an
-//! armed query fault or claims the binding and no runner claims a source
-//! execution; each test claims the binding, polls and commits exactly as one
-//! scheduler tick does. Time elapses only on PostgreSQL's clock: rows carry
-//! Bifrost's PostgreSQL-anchored ingest time, and each tick lets one second
-//! pass there before judging under a one-second idle.
+//! The verification runtime stays off, so no background pass consumes an
+//! armed query fault or a pending group and no runner claims an execution;
+//! each test runs passes itself. Time elapses only on PostgreSQL's clock: a
+//! test brings pending groups due by moving their due time to PostgreSQL's
+//! statement time instead of waiting out the binding's `after`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::cards::Cards;
@@ -25,15 +28,14 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
 use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
-use wyrd_server::verification::groups::{GroupPollError, GroupPoller};
-use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
-use wyrd_spec::card::trigger::TriggerDuration;
-use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
-use wyrd_spec::verification::VerificationVerdict;
+use wyrd_server::verification::groups::GroupPoller;
+use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
+use wyrd_server::verification::scheduler::VerificationScheduler;
+use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, EnqueueOutcome, ExecutionInput, VerifierExecutionQueue,
+    ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, VerifierExecutionQueue,
 };
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -51,6 +53,8 @@ struct Support {
     admin: String,
     /// The Service's access token, which also records its activity.
     service: String,
+    /// The support Service, owner of every turn.
+    owner: CardUid,
     /// The Agent each turn judges.
     agent: CardUid,
     /// The per-turn source Verifier.
@@ -107,6 +111,7 @@ impl Support {
             .await
             .expect("API key exchanges");
         Self {
+            owner: uid("support"),
             agent: uid("assistant-agent"),
             turn_check: uid("turn-check"),
             server,
@@ -199,55 +204,58 @@ impl Support {
         )
     }
 
-    /// Run one scheduler tick of the tenant's `group_end` binding through
-    /// `poller` under a one-second idle and `finality`: let one second pass
-    /// on PostgreSQL's clock, bring the cursor due, claim it, poll, and
-    /// commit whatever the poll enqueued with the advanced cursor.
-    ///
-    /// # Errors
-    /// Returns the poll's [`GroupPollError`]: a failed or refused Bifrost
-    /// read, or a failed Postgres statement. The tick still commits, so the
-    /// claimed cursor and every whole snapshot enqueued before the failure
-    /// persist.
+    /// A scheduler over the server's Postgres and the real [`GroupPoller`],
+    /// sharing `capacity` as the runtime's execution capacity.
+    fn scheduler(&self, capacity: &Arc<Semaphore>) -> VerificationScheduler {
+        let state = self.server.state();
+        VerificationScheduler::new(
+            state.postgres.wyrd().clone(),
+            self.server.operator_pool(),
+            VerifierExecutionQueue::default(),
+            BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox)),
+            Duration::from_secs(1),
+        )
+        .with_groups(
+            GroupPoller::new(state.clone(), Duration::from_secs(30)),
+            Arc::clone(capacity),
+        )
+    }
+
+    /// The due time of `group`'s pending row, if one exists.
     ///
     /// # Panics
-    /// Panics when a Postgres statement outside the poll fails, nothing is
-    /// due, or the Service is not active.
-    async fn tick(
-        &self,
-        poller: &GroupPoller,
-        finality: &str,
-    ) -> Result<Vec<EnqueueOutcome>, GroupPollError> {
+    /// Panics when the read fails.
+    async fn pending(&self, group: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         let mut conn = self.conn().await;
-        sqlx::query("SELECT pg_sleep(1)")
+        sqlx::query_scalar("SELECT due_at FROM wyrd.verification_group_pending WHERE group_id = $1")
+            .bind(group)
+            .fetch_optional(&mut **conn.transaction())
+            .await
+            .expect("the pending row reads")
+    }
+
+    /// Bring every pending group due on PostgreSQL's clock.
+    ///
+    /// # Panics
+    /// Panics when the update fails.
+    async fn make_due(&self) {
+        let mut conn = self.conn().await;
+        sqlx::query("UPDATE wyrd.verification_group_pending SET due_at = statement_timestamp()")
             .execute(&mut **conn.transaction())
             .await
-            .expect("PostgreSQL time passes");
-        sqlx::query(
-            "UPDATE wyrd.verification_bindings SET next_run_at = statement_timestamp() \
-              WHERE activation = 'group_end'",
-        )
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("the binding is due");
-        let queue = VerifierExecutionQueue::default();
-        let mut due = queue
-            .claim_due_group(&mut conn)
-            .await
-            .expect("claim runs")
-            .expect("the group binding is due");
-        let duration = |text| TriggerDuration::parse(text).expect("a valid duration");
-        due.settings.idle = duration("1s");
-        due.settings.finality = duration(finality);
-        let state = self.server.state();
-        let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox))
-            .resolve(&mut conn, due.owner.expect("the Service is active"))
-            .await
-            .expect("authority resolves")
-            .expect("the owner is accepted");
-        let polled = poller.poll(&mut conn, &queue, &due, &authority).await;
-        conn.commit().await.expect("the tick commits");
-        polled
+            .expect("pending groups come due");
+        conn.commit().await.expect("the due times commit");
+    }
+
+    /// The acknowledged activity of one `turn-check` source item in `group`,
+    /// as the Scribe writer records it.
+    fn activity(&self, group: &str) -> GroupActivity {
+        GroupActivity {
+            owner_card_uid: self.owner.clone(),
+            card_uid: self.agent.clone(),
+            verifier_card_uid: self.turn_check.clone(),
+            group_id: GroupId::new(group).expect("a valid group"),
+        }
     }
 
     /// A transaction on the tenant's Postgres schema.
@@ -261,7 +269,7 @@ impl Support {
             .expect("tenant connection opens")
     }
 
-    /// Claim the one claimable execution, committed so it stays leased.
+    /// Claim the earliest claimable execution, committed so it stays leased.
     ///
     /// # Panics
     /// Panics when the claim fails or nothing is claimable.
@@ -276,25 +284,21 @@ impl Support {
         claimed
     }
 
-    /// Settle `claimed` completed with `result_id`, which becomes its
-    /// selected result.
+    /// Claim executions until the group execution `outcome` created is
+    /// leased, leaving the source executions claimed before it leased too.
     ///
     /// # Panics
-    /// Panics when the settlement fails or does not apply.
-    async fn complete(&self, claimed: &ClaimedExecution, result_id: VerificationResultId) {
-        let mut conn = self.conn().await;
-        VerifierExecutionQueue::default()
-            .complete(
-                &mut conn,
-                claimed.lease,
-                result_id,
-                VerificationVerdict::Passed,
-                "",
-                None,
-            )
-            .await
-            .expect("the settlement applies");
-        conn.commit().await.expect("the settlement commits");
+    /// Panics when `outcome` created nothing or the queue runs out first.
+    async fn claim_group(&self, outcome: &EnqueueOutcome) -> ClaimedExecution {
+        let EnqueueOutcome::Enqueued(execution) = outcome else {
+            panic!("the pass did not create a group execution: {outcome:?}");
+        };
+        loop {
+            let claimed = self.claim().await;
+            if claimed.lease.execution_id == *execution {
+                return claimed;
+            }
+        }
     }
 
     /// Judge one ungrouped turn answering `answer` directly and return its
@@ -378,126 +382,34 @@ fn listed(snapshot: &Value, slot: &str) -> Value {
     snapshot["sources"][slot]["execution_ids"].clone()
 }
 
-/// A group read cut short after its first batch enqueues nothing; the next
-/// tick creates one snapshot listing every turn, and a third tick creates no
-/// second one for the same activity.
-///
-/// # Panics
-/// Panics when setup fails, the truncated tick enqueues, or the recovered
-/// snapshot is not the one complete selection.
-#[tokio::test]
-async fn partial_group_reads_enqueue_nothing_until_a_complete_poll() {
-    let support = Support::start().await;
-    let turns = [
-        support.turn("partial", "one", None).await,
-        support.turn("partial", "two", None).await,
-    ];
-    support
-        .server
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
-    let poller = GroupPoller::new(support.server.state().clone(), 20, Duration::from_secs(30));
-
-    support.server.fail_next_query_after_batch();
-    let refused = support.tick(&poller, "1d").await;
-    assert!(
-        matches!(refused, Err(GroupPollError::Read(_))),
-        "{refused:?}"
-    );
-
-    let enqueued = support
-        .tick(&poller, "1d")
-        .await
-        .expect("the next tick reads");
-    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
-    let snapshot = support.snapshot(&enqueued[0]).await;
-    let ids = json!(turns);
-    assert_eq!(listed(&snapshot, "turns"), ids, "{snapshot}");
-    assert_eq!(listed(&snapshot, "answered"), ids, "{snapshot}");
-    assert_eq!(
-        snapshot["members"], 2,
-        "two inputs, no results yet: {snapshot}"
-    );
-
-    let again = support
-        .tick(&poller, "1d")
-        .await
-        .expect("a covered tick reads");
-    assert!(
-        again.is_empty(),
-        "covered activity is not re-enqueued: {again:?}"
-    );
+/// The Scribe write of `payload`, the result rows of the claimed source
+/// execution `source`; staging it leaves `source` unsettled, and staging an
+/// equal `payload` again replays the identical rows.
+fn result(source: &ClaimedExecution, payload: ResultPayload) -> ScribeWrite {
+    ScribeWrite::Result {
+        payload,
+        attribution: source.attribution.clone(),
+    }
 }
 
-/// Under a ceiling of two, a group of two accepted turns and a refused
-/// idempotency conflict is judged normally over the two, while a group of
-/// three accepted turns is marked over the ceiling and lists nothing.
+/// The `turn-check` result rows of the claimed source execution `source`
+/// in `group`, judging `outcome`.
 ///
 /// # Panics
-/// Panics when setup fails or either snapshot differs.
-#[tokio::test]
-async fn refused_submissions_do_not_count_toward_the_ceiling() {
-    let support = Support::start().await;
-    let first = support
-        .turn("at-ceiling", "one", Some("at-ceiling-0001"))
-        .await;
-    support
-        .turn("at-ceiling", "conflict", Some("at-ceiling-0001"))
-        .await;
-    let second = support.turn("at-ceiling", "two", None).await;
-    for answer in ["one", "two", "three"] {
-        support.turn("over", answer, None).await;
-    }
-    support
-        .server
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
-    let poller = GroupPoller::new(support.server.state().clone(), 2, Duration::from_secs(30));
-
-    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
-    assert_eq!(enqueued.len(), 2, "{enqueued:?}");
-    let mut snapshots = Vec::new();
-    for outcome in &enqueued {
-        snapshots.push(support.snapshot(outcome).await);
-    }
-    let normal = snapshots
-        .iter()
-        .find(|snapshot| snapshot["sources"]["turns"]["exceeded_ceiling"].is_null())
-        .expect("the at-ceiling group is judged normally");
-    assert_eq!(listed(normal, "turns"), json!([first, second]), "{normal}");
-    let over = snapshots
-        .iter()
-        .find(|snapshot| snapshot["sources"]["turns"]["exceeded_ceiling"] == 2)
-        .expect("the over group is marked");
-    assert_eq!(listed(over, "turns"), json!([]), "{over}");
-    assert_eq!(over["sources"]["answered"]["exceeded_ceiling"], 2, "{over}");
-}
-
-/// A queued turn's result visible before its settlement selects it is no
-/// source row: the review pins its outcome null and counts only its input.
-/// Selecting that exact visible result, without republishing it, yields one
-/// next whole review with the actual outcome, and an unchanged poll none.
-///
-/// # Panics
-/// Panics when setup fails or a review pins or counts otherwise.
-#[tokio::test]
-async fn a_visible_result_counts_once_its_settlement_selects_it() {
-    let support = Support::start().await;
-    let turn = support.turn("selected", "yes", None).await;
-    let outcome = support.execute("yes").await.outcome;
-    let source = support.claim().await;
-    assert_eq!(source.lease.execution_id, turn);
-    let group = GroupId::new("selected").expect("a valid group");
-    let payload = ResultPayloadBuilder::new(
+/// Panics when the rows do not build.
+fn payload(
+    source: &ClaimedExecution,
+    group: &GroupId,
+    outcome: &VerificationResult,
+) -> ResultPayload {
+    ResultPayloadBuilder::new(
         ResultRun {
-            execution_id: turn,
+            execution_id: source.lease.execution_id,
             run_id: None,
             verifier_version: &source.verifier_version,
             card_uid: &source.card_uid,
             owner_card_uid: source.authority.principal.owner_service_uid(),
-            group_id: Some(&group),
+            group_id: Some(group),
             binding_id: None,
             trigger: None,
             window: None,
@@ -506,84 +418,292 @@ async fn a_visible_result_counts_once_its_settlement_selects_it() {
         chrono::DateTime::UNIX_EPOCH,
         chrono::DateTime::UNIX_EPOCH,
     )
-    .build(&outcome)
-    .expect("the result builds");
-    let result_id = payload.result_id();
+    .build(&outcome.outcome)
+    .expect("the result builds")
+}
+
+/// Acknowledged evidence, not historical metadata, makes a group due: a
+/// visible but unsettled result and an input-only turn form one snapshot
+/// after expiration, a physically replayed result pins the same snapshot, a
+/// refused read leaves the group pending with no partial snapshot, and the
+/// next acknowledged turn reaches a later snapshot while the earlier one
+/// stays immutable.
+///
+/// # Panics
+/// Panics when setup fails or a pass hands off other snapshots.
+#[tokio::test]
+async fn available_rows_form_expiring_group_snapshots() {
+    let support = Support::start().await;
+    let group = GroupId::new("visible").expect("a valid group");
+    let first = support.turn("visible", "yes", None).await;
+    let source = support.claim().await;
+    assert_eq!(source.lease.execution_id, first);
+    let judged = support.execute("yes").await;
+    let staged = payload(&source, &group, &judged);
     let state = support.server.state();
     state.scribe_outbox.stage(
         support.server.data_tenant_id(),
-        ScribeWrite::Result {
-            payload,
-            attribution: source.attribution,
-        },
+        result(&source, staged.clone()),
     );
+    let second = support.turn("visible", "later", None).await;
     support
         .server
         .flush_bifrost()
         .await
         .expect("Bifrost flushes");
-    let poller = GroupPoller::new(state.clone(), 20, Duration::from_secs(30));
+    let capacity = Arc::new(Semaphore::new(4));
+    let scheduler = support.scheduler(&capacity);
+    let stop = CancellationToken::new();
 
-    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
-    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
-    let first = support.snapshot(&enqueued[0]).await;
-    assert_eq!(first["members"], 1, "only the input counts: {first}");
-    let review = support.claim().await;
-    assert_eq!(values(&review, "answered"), json!([null]));
+    assert!(
+        support.pending("visible").await.is_some(),
+        "ACKs schedule the group"
+    );
+    let early = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        early.is_empty(),
+        "nothing hands off before expiration: {early:?}"
+    );
+
+    support.make_due().await;
+    let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert_eq!(handed.len(), 1, "{handed:?}");
+    assert!(
+        support.pending("visible").await.is_none(),
+        "the handoff consumes it"
+    );
+    let snapshot = support.snapshot(&handed[0]).await;
+    assert_eq!(
+        listed(&snapshot, "turns"),
+        json!([first, second]),
+        "{snapshot}"
+    );
+    assert_eq!(
+        listed(&snapshot, "answered"),
+        json!([first, second]),
+        "{snapshot}"
+    );
+    let judging = support.claim_group(&handed[0]).await;
+    assert_eq!(values(&judging, "answered"), json!(["passed", null]));
+    assert_eq!(
+        values(&judging, "turns"),
+        json!([{"answer": "yes"}, {"answer": "later"}])
+    );
+
+    state
+        .scribe_outbox
+        .stage(support.server.data_tenant_id(), result(&source, staged));
     support
-        .complete(&review, VerificationResultId::new_v7())
-        .await;
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    support.make_due().await;
+    let replayed = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        matches!(replayed.as_slice(), [EnqueueOutcome::AlreadyEnqueued(execution)]
+            if EnqueueOutcome::Enqueued(*execution) == handed[0]),
+        "a replayed row pins the same snapshot: {replayed:?}"
+    );
 
-    support.complete(&source, result_id).await;
-    let enqueued = support.tick(&poller, "1d").await.expect("the tick reads");
-    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
-    let second = support.snapshot(&enqueued[0]).await;
-    assert_eq!(second["members"], 2, "{second}");
-    assert_eq!(listed(&second, "answered"), json!([turn]), "{second}");
-    let review = support.claim().await;
-    assert_eq!(values(&review, "answered"), json!(["passed"]));
-    assert_eq!(values(&review, "turns"), json!([{"answer": "yes"}]));
+    let third = support.turn("visible", "last", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    support.make_due().await;
+    support.server.fail_next_query_after_batch();
+    let refused = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        refused.is_empty(),
+        "a refused read hands off nothing: {refused:?}"
+    );
+    assert!(
+        support.pending("visible").await.is_some(),
+        "the group stays pending"
+    );
 
-    let again = support.tick(&poller, "1d").await.expect("the tick reads");
-    assert!(again.is_empty(), "unchanged activity: {again:?}");
+    let later = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert_eq!(later.len(), 1, "{later:?}");
+    let next = support.snapshot(&later[0]).await;
+    assert_eq!(
+        listed(&next, "turns"),
+        json!([first, second, third]),
+        "{next}"
+    );
+    assert_eq!(
+        support.snapshot(&handed[0]).await,
+        snapshot,
+        "snapshots are immutable"
+    );
 }
 
-/// Finality anchors on a group's first eligible row: a group whose first
-/// row is an old refused submission is judged from its recent accepted
-/// turn, while a group whose old first row is accepted stays past finality.
+/// Pending groups debounce on acknowledged activity and stop after handoff:
+/// a later ACK moves the one due time, a full capacity pool claims nothing,
+/// a handoff consumes the row and repeated passes hand off nothing, two
+/// claimers never take one group, activity arriving during a handoff stays
+/// pending, a pass hands off at most 32 groups of a tenant, and a blocked
+/// group read does not hold up the cron pass.
 ///
 /// # Panics
-/// Panics when setup fails or the tick judges other groups.
+/// Panics when setup fails or the pending state differs.
 #[tokio::test]
-async fn finality_anchors_on_the_first_eligible_row() {
+async fn pending_groups_debounce_and_stop_after_handoff() {
     let support = Support::start().await;
-    support
-        .turn("old-accepted", "one", Some("finality-0001"))
-        .await;
-    support
-        .turn("refused-first", "conflict", Some("finality-0001"))
-        .await;
+    support.turn("debounce", "one", None).await;
     support
         .server
         .flush_bifrost()
         .await
         .expect("Bifrost flushes");
+    let first_due = support
+        .pending("debounce")
+        .await
+        .expect("the ACK schedules it");
+    support.execute("ungrouped").await;
+    support.turn("debounce", "two", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let moved = support
+        .pending("debounce")
+        .await
+        .expect("still one pending row");
+    assert!(moved > first_due, "{moved} moves past {first_due}");
     let mut conn = support.conn().await;
-    sqlx::query("SELECT pg_sleep(10)")
-        .execute(&mut **conn.transaction())
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.verification_group_pending")
+        .fetch_one(&mut **conn.transaction())
         .await
-        .expect("PostgreSQL time passes");
-    conn.commit().await.expect("the wait commits");
-    let accepted = support.turn("refused-first", "two", None).await;
+        .expect("pending rows count");
+    assert_eq!(rows, 1, "ungrouped work schedules nothing");
+    drop(conn);
+
+    let capacity = Arc::new(Semaphore::new(1));
+    let scheduler = support.scheduler(&capacity);
+    let stop = CancellationToken::new();
+    support.make_due().await;
+    let held = capacity.try_acquire().expect("the one permit");
+    let starved = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(starved.is_empty(), "no permit, no claim: {starved:?}");
+    assert!(support.pending("debounce").await.is_some());
+    drop(held);
+    let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert_eq!(handed.len(), 1, "{handed:?}");
+    assert!(
+        support.pending("debounce").await.is_none(),
+        "the handoff consumes it"
+    );
+    let idle = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(idle.is_empty(), "no activity, no read: {idle:?}");
+
+    support.turn("debounce", "three", None).await;
     support
         .server
         .flush_bifrost()
         .await
         .expect("Bifrost flushes");
-    let poller = GroupPoller::new(support.server.state().clone(), 20, Duration::from_secs(30));
+    assert!(
+        support.pending("debounce").await.is_some(),
+        "new activity reschedules"
+    );
+    support.make_due().await;
+    let queue = VerifierExecutionQueue::default();
+    let mut claimer = support.conn().await;
+    let due = queue
+        .claim_due_group(&mut claimer)
+        .await
+        .expect("claim runs")
+        .expect("the group is due");
+    let mut rival = support.conn().await;
+    assert!(
+        queue
+            .claim_due_group(&mut rival)
+            .await
+            .expect("claim runs")
+            .is_none(),
+        "a claimed group is skipped"
+    );
+    drop(rival);
+    let mut arrival = support.conn().await;
+    let activity = [support.activity("debounce")];
+    let state = support.server.state();
+    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox))
+        .resolve(&mut claimer, due.owner.expect("the Service is active"))
+        .await
+        .expect("authority resolves")
+        .expect("the owner is accepted");
+    let poller = GroupPoller::new(state.clone(), Duration::from_secs(30));
+    let ((), ()) = tokio::join!(
+        async {
+            queue
+                .record_group_activity(&mut arrival, &activity)
+                .await
+                .expect("the arrival records");
+        },
+        async {
+            let outcome = poller
+                .poll(&mut claimer, &queue, &due, &authority)
+                .await
+                .expect("the snapshot pins");
+            assert!(
+                matches!(outcome, EnqueueOutcome::Enqueued(_)),
+                "{outcome:?}"
+            );
+            queue
+                .consume_group(&mut claimer, &due)
+                .await
+                .expect("consumes");
+            claimer.commit().await.expect("the handoff commits");
+        },
+    );
+    arrival.commit().await.expect("the arrival commits");
+    assert!(
+        support.pending("debounce").await.is_some(),
+        "activity during a handoff stays pending"
+    );
 
-    let enqueued = support.tick(&poller, "10s").await.expect("the tick reads");
-    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
-    let snapshot = support.snapshot(&enqueued[0]).await;
-    assert_eq!(listed(&snapshot, "turns"), json!([accepted]), "{snapshot}");
+    let mut conn = support.conn().await;
+    let many: Vec<GroupActivity> = (0..33)
+        .map(|index| support.activity(&format!("many-{index:02}")))
+        .collect();
+    queue
+        .record_group_activity(&mut conn, &many)
+        .await
+        .expect("activity records");
+    conn.commit().await.expect("activity commits");
+    support.make_due().await;
+    let wide = Arc::new(Semaphore::new(64));
+    let batched = support.scheduler(&wide);
+    let first_pass = batched.group_pass(&stop).await.expect("the pass runs");
+    assert_eq!(first_pass.len(), 32, "one tenant pass hands off at most 32");
+    let second_pass = batched.group_pass(&stop).await.expect("the pass runs");
+    assert_eq!(second_pass.len(), 2, "the remainder: {second_pass:?}");
+
+    support.turn("blocked", "one", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    support.make_due().await;
+    support.server.stall_next_query_after_schema();
+    let (blocked, cron) = tokio::join!(batched.group_pass(&stop), async {
+        support
+            .server
+            .wait_query_schema_stall()
+            .await
+            .expect("the group read stalls");
+        let cron = batched.pass(&stop).await;
+        stop.cancel();
+        cron
+    });
+    cron.expect("the cron pass runs while a group read is blocked");
+    assert!(blocked.expect("the pass stops").is_empty());
+    assert!(
+        support.pending("blocked").await.is_some(),
+        "the group stays pending"
+    );
 }

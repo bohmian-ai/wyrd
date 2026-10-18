@@ -13,6 +13,7 @@ use vala_bifrost_redux::contracts::{
     FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
 };
 use wyrd_spec::DataTenantId;
+use wyrd_sql::WyrdPostgres;
 
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
 
@@ -70,17 +71,18 @@ impl PublicationFault {
         self.sent.lock().expect("fault lock").clone()
     }
 
-    /// The result outbox writing through these faults to `inner`, created on
-    /// first use and shared by every later caller.
+    /// The result outbox writing through these faults to `inner` and
+    /// recording grouped activity through `groups`, created on first use and
+    /// shared by every later caller.
     ///
     /// The outbox's writer starts on the shared Wyrd runtime, like every
     /// server owner, so a test server's teardown can still drive and cancel
     /// its in-flight writes after the test's own runtime stops polling.
-    pub(crate) fn outbox(&self, inner: Arc<dyn Scribe>) -> Arc<ScribeOutbox> {
+    pub(crate) fn outbox(&self, inner: Arc<dyn Scribe>, groups: WyrdPostgres) -> Arc<ScribeOutbox> {
         let fault = self.clone();
         Arc::clone(self.outbox.get_or_init(move || {
             let _shared = wyrd_runtime::runtime().enter();
-            ScribeSink::local_outbox(Arc::new(FaultScribe { inner, fault }))
+            ScribeSink::local_outbox(Arc::new(FaultScribe { inner, fault }), Some(groups))
         }))
     }
 }

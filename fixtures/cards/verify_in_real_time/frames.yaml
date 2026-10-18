@@ -1,6 +1,6 @@
 # A person-detection application: its sampled frames and the event fact it
 # reports share the event id as group id, and event-review judges the event
-# once the group goes idle.
+# once the group comes due.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -16,4 +16,4 @@ spec:
         - verifier: ./frame-verifier.yaml
         - verifier: ./event-fact.yaml
         - verifier: ./event-review.yaml
-          runs_on: {kind: group_end, idle: 3s, max_age: 30m, finality: 30d}
+          runs_on: {kind: group_end, after: 3s}

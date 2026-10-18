@@ -1529,23 +1529,23 @@ async fn grouped_verification_contract_is_served() {
         assert!(properties(state).contains(field), "{field}: {state}");
         assert!(!required("VerificationExecutionState").contains(field));
     }
-    let coverage = &state["properties"]["group"];
+    let group = &state["properties"]["group"];
     assert_eq!(
-        properties(coverage),
-        BTreeSet::from(["through", "members", "sources"].map(str::to_owned))
+        properties(group),
+        BTreeSet::from(["sources"].map(str::to_owned))
     );
     let snapshot =
-        &resolve_schema(&document, coverage)["properties"]["sources"]["additionalProperties"];
+        &resolve_schema(&document, group)["properties"]["sources"]["additionalProperties"];
     assert_eq!(
         properties(snapshot),
-        BTreeSet::from(["reference", "execution_ids", "exceeded_ceiling"].map(str::to_owned))
+        BTreeSet::from(["reference", "execution_ids"].map(str::to_owned))
     );
     let status = &schemas["VerificationBindingStatus"];
     assert!(!required("VerificationBindingStatus").contains("group_end"));
     let settings = &status["properties"]["group_end"];
     assert_eq!(
         properties(settings),
-        BTreeSet::from(["idle", "max_age", "finality", "sources"].map(str::to_owned))
+        BTreeSet::from(["after", "sources"].map(str::to_owned))
     );
     let source =
         &resolve_schema(&document, settings)["properties"]["sources"]["additionalProperties"];

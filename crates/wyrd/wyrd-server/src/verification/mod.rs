@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
@@ -366,8 +367,9 @@ impl VerificationRuntimeBuilder<'_> {
     /// reads its inputs through the ordinary query service, local or
     /// peer-forwarded; without both it is not composed and therefore not required, so
     /// health is not degraded by an intentionally absent capability. The
-    /// scheduler polls `group_end` bindings only where hosted blocks supply
-    /// the deployment source-execution ceiling. Every
+    /// scheduler hands off pending `group_end` groups only where Verifier
+    /// blocks are hosted, sharing the runner's `execution_slots` capacity.
+    /// Every
     /// composed capability is marked required on the shared health.
     #[must_use]
     pub fn build(self) -> Option<VerificationRuntime> {
@@ -377,6 +379,7 @@ impl VerificationRuntimeBuilder<'_> {
         };
         let postgres = self.state.postgres.wyrd();
         let queue = VerifierExecutionQueue::default();
+        let capacity = Arc::new(Semaphore::new(self.limits.execution_slots.max(1)));
         let scheduler = VerificationScheduler::new(
             postgres.clone(),
             operator.clone(),
@@ -385,11 +388,10 @@ impl VerificationRuntimeBuilder<'_> {
             self.limits.poll_interval,
         );
         let scheduler = match &self.state.verification_blocks {
-            Some(blocks) => scheduler.with_groups(GroupPoller::new(
-                self.state.clone(),
-                blocks.limits().source_executions_max,
-                self.limits.execution_timeout,
-            )),
+            Some(_) => scheduler.with_groups(
+                GroupPoller::new(self.state.clone(), self.limits.execution_timeout),
+                Arc::clone(&capacity),
+            ),
             None => scheduler,
         };
         #[cfg(feature = "test-support")]
@@ -431,7 +433,9 @@ impl VerificationRuntimeBuilder<'_> {
         let outbox = Arc::clone(&self.state.scribe_outbox);
         #[cfg(feature = "test-support")]
         let outbox = match (self.publication_fault, self.state.bifrost.scribe()) {
-            (Some(fault), Some(scribe)) => fault.outbox(Arc::clone(scribe.scribe()) as _),
+            (Some(fault), Some(scribe)) => {
+                fault.outbox(Arc::clone(scribe.scribe()) as _, postgres.clone())
+            }
             _ => outbox,
         };
         if let Some(blocks) = &self.state.verification_blocks
@@ -443,6 +447,7 @@ impl VerificationRuntimeBuilder<'_> {
                 operator,
                 queue,
                 outbox,
+                capacity,
                 self.limits,
             );
             #[cfg(feature = "test-support")]

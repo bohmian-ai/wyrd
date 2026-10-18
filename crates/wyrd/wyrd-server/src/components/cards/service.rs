@@ -1353,18 +1353,14 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     TriggerActivation::Schedule { cron, tz } => {
                         BindingActivation::Schedule { cron, tz }
                     }
-                    TriggerActivation::GroupEnd {
-                        idle,
-                        max_age,
-                        finality,
-                    } => BindingActivation::GroupEnd(GroupEndSettings {
-                        idle,
-                        max_age,
-                        finality,
-                        sources: self
-                            .group_sources(occurrence, &subject, site, &verifier_card_uid)
-                            .await?,
-                    }),
+                    TriggerActivation::GroupEnd { after } => {
+                        BindingActivation::GroupEnd(GroupEndSettings {
+                            after,
+                            sources: self
+                                .group_sources(occurrence, &subject, site, &verifier_card_uid)
+                                .await?,
+                        })
+                    }
                 };
                 // Registration admits only the list its activation reacts
                 // through, so chaining both freezes exactly that one.

@@ -343,13 +343,10 @@ class GroupSourceSnapshot(TypedDict):
 
     reference: str
     execution_ids: list[str]
-    exceeded_ceiling: NotRequired[int]
 
-class GroupCoverage(TypedDict):
+class GroupSnapshot(TypedDict):
     """The source snapshot a group execution judges."""
 
-    through: str
-    members: int
     sources: dict[str, GroupSourceSnapshot]
 
 class ExecutionState(TypedDict):
@@ -362,7 +359,7 @@ class ExecutionState(TypedDict):
     dispatches: list[OperatorDispatchState]
     group_id: NotRequired[str]
     owner_card_uid: NotRequired[str]
-    group: NotRequired[GroupCoverage]
+    group: NotRequired[GroupSnapshot]
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.

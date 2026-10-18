@@ -1842,11 +1842,6 @@ impl VerificationConfig {
             &mut limits.max_workspaces,
         )?;
         set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
-        set_scaled(
-            "WYRD_VERIFICATION_SOURCE_EXECUTIONS_MAX",
-            1,
-            &mut limits.source_executions_max,
-        )?;
         let inconsistent = [
             (
                 limits.monty_min_workers > limits.monty_max_workers,
@@ -4271,7 +4266,6 @@ maintenance_interval_secs = 45
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
-                ("WYRD_VERIFICATION_SOURCE_EXECUTIONS_MAX", Some("20")),
                 ("WYRD_VERIFICATION_MONTY_WORKER", Some("/opt/worker")),
             ],
             || {
@@ -4280,7 +4274,6 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
-                assert_eq!(config.limits.source_executions_max, 20);
                 assert_eq!(config.monty_worker, Some(PathBuf::from("/opt/worker")));
             },
         );

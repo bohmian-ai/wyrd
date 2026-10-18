@@ -1667,7 +1667,7 @@ spec:
   kind: schedule | group_end              # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
-  after: duration                         # group_end only — elapsed since newest visible source evidence
+  after: duration                         # group_end only — elapsed since the newest acknowledged source evidence
 ```
 
 `group_end` binds only a Verifier with source inputs and judges each caller

@@ -25,6 +25,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Error as ReqwestError};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use wyrd_auth_oidc::{ScreenError, ScreenedHttp};
@@ -185,7 +186,7 @@ impl OperatorWorker {
                     limits.operator_global_permits,
                     limits.operator_tenant_permits,
                 )),
-                limits.operator_global_permits,
+                Arc::new(Semaphore::new(limits.operator_global_permits.max(1))),
                 &limits,
             ),
             postgres,

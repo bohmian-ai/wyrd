@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "test-support")]
+use tokio::sync::Semaphore;
 use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -213,7 +214,8 @@ impl VerifierRunner {
     }
 
     /// Build a runner over `state`'s Wyrd Postgres owner, the operator pool,
-    /// and the hosted `blocks`.
+    /// and the hosted `blocks`, each running execution holding one permit of
+    /// `capacity`, the execution capacity group snapshot handoff shares.
     ///
     /// The runner carries no coordination clock: queue availability, claims,
     /// leases, renewals, retries, and settlements are decided and stamped by
@@ -227,11 +229,12 @@ impl VerifierRunner {
         operator: OperatorPool,
         queue: VerifierExecutionQueue,
         outbox: Arc<ScribeOutbox>,
+        capacity: Arc<Semaphore>,
         limits: RuntimeLimits,
     ) -> Self {
         let postgres = state.postgres.wyrd().clone();
         Self {
-            claims: ClaimLoop::new(postgres.clone(), None, limits.execution_slots, &limits),
+            claims: ClaimLoop::new(postgres.clone(), None, capacity, &limits),
             renewal: Arc::new(LeaseRenewal::new(postgres.clone(), queue, limits.lease)),
             drift: DriftEngine::new(state.clone(), limits.execution_timeout),
             state,
@@ -439,23 +442,12 @@ impl VerifierRunner {
                 route_overrides,
                 run_id.clone(),
             ),
-            ExecutionInput::Grouped { inputs, coverage } => {
-                if let Some((reference, ceiling)) = coverage.sources.values().find_map(|source| {
-                    source
-                        .exceeded_ceiling
-                        .map(|ceiling| (&source.reference, ceiling))
-                }) {
-                    return EngineOutcome::Completed(engines::source_limit_exceeded(
-                        spec, reference, ceiling,
-                    ));
-                }
-                (
-                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                    inputs,
-                    &no_routes,
-                    None,
-                )
-            }
+            ExecutionInput::Grouped { inputs, .. } => (
+                DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                inputs,
+                &no_routes,
+                None,
+            ),
         };
         let caller = Caller::accepted(&run.authority, system);
         let accepted_at = Utc::now()

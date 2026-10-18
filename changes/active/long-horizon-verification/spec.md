@@ -1,7 +1,7 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 14
-status: draft
+revision: 15
+status: approved
 ---
 
 # Long-horizon and heavy verification
@@ -234,9 +234,9 @@ spec:
 
 At group execution, each reference returns an ordered list with one element
 per execution of the resolved source binding in that group revision. Order
-is ascending input `recorded_at`, then `execution_id` to break ties, using
-server-recorded row times rather than a Postgres acceptance counter. A result-only
-execution uses its earliest visible result time for this ordering. References
+is ascending input row time, then `execution_id` to break ties, using
+the row times REQ-004 defines rather than a Postgres acceptance counter. A
+result-only execution uses its earliest visible result row time for this ordering. References
 to the same binding use the same source execution order. A group snapshot containing no executions of that binding yields an empty list, not invented evidence or a vacuous pass.
 
 For an input reference, each element is that execution's whole supplied slot
@@ -337,8 +337,11 @@ against existing group results; the group's own rows are not source activity.
 A group is due when its newest source row (input or result) is older than
 `idle`, or its first source row is older than `max_age`, and no group result
 covers its newest eligible source row. Apply REQ-003 finality. Row times are
-server input `recorded_at` and result `ended_at`; first/newest include both
-surfaces. A result is new activity: it postpones idle and, if not already
+each input and result row's managed `wyrd_ingested_at`, which Bifrost stamps
+from its PostgreSQL-anchored clock; first/newest include both surfaces. No
+group decision reads a server process clock: PostgreSQL is the only time
+source, and the producer-owned `recorded_at` and `ended_at` remain result
+facts, never group timing. A result is new activity: it postpones idle and, if not already
 covered, can create another revision. There is no terminal-source readiness
 barrier, pending-turn tracking or additional max_age wait after discovery.
 At the cap, use whatever rows are visible, with missing values as REQ-002 says.
@@ -687,8 +690,8 @@ are eligible for group lookup.
 Journeys pass `group_id=` on verify/submit and configure `kind: group_end`
 on group bindings. Fixtures identify the common owner Service/component and
 flush source rows before discovery in basic flows, and use the visibility/cap
-variants below for absent results. Server-recorded evidence times and binding
-cursors simulate elapsed days; tests do not sleep for days or use producer
+variants below for absent results. Binding durations and cursors, never a process
+clock, simulate elapsed days; tests do not sleep for days or use producer
 timestamps to advance server time.
 
 ### AC-001 / J-001 — Resumable e-commerce conversation
@@ -1217,6 +1220,7 @@ Revision 14 is a **draft** awaiting owner approval.
 | 12 | draft | Owner added REQ-015/AC-009: extend existing opt-in bench:capacity and wyrd_verification_engine_overhead_seconds for assertion-only direct p99 <1 ms while preserving p95 <10 ms and existing normal-load SLOs. Require baseline/grouped noise comparison, grouped-submit throughput/drain, group-end read/latency/ceiling and bounded-overload/tenant-progress evidence. Baseline misses remain work in scope; expected overload refusals are isolated from normal zero-error judgment. No gate/verify lane or separate benchmark added; approval outstanding. |
 | 13 | approved | Owner reserved group_id as a Verifier input slot name to avoid the new Python keyword argument collision. Updated REQ-001 and AC-001 registration negatives across SDK/HTTP/MCP, including typed/source declarations and renamed-slot success. Rechecked existing SDK signatures: no other equivalent argument-name collision or reserved-slot blacklist; reuse validate_slot/invalid and WyrdError::Validation rule/path shape. No other reserved names added. Owner explicitly approved revision 13; this entry records that approval without changing the revision or requirements. |
 | 14 | draft | Plan-readiness PR-001 found no transition for existing managed verification tables. Owner confirmed nothing has ever shipped: added the pre-release schema constraint (in-place definition change, reset not upgrade, checks unchanged, no upgrade journey). Requirements and ACs otherwise unchanged; approval outstanding. |
+| 15 | approved | TASK-001 review found group timing compared PostgreSQL's clock with server-process row times (`recorded_at` stamped at enqueue, `ended_at` by the runner), which drift across replicas; AGENTS §15 makes PostgreSQL the only time source, client-produced timings excepted. Owner approved REQ-004 row times as the managed `wyrd_ingested_at` from Bifrost's PostgreSQL-anchored clock for source order, first/newest, idle/max_age, finality and coverage, and journeys advance time through binding durations and cursors only. Carries revision 14 unchanged. Owner explicitly approved this revision. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

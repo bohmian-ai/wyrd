@@ -48,8 +48,35 @@ const CALLER_SPAN = "b7ad6b7169203331";
 /** The stable refusal for a caller no grant authorizes. */
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
-/** A fresh deployment per test, as each Rust journey starts its own. */
-const test = assistantTest({ perTest: true });
+/** The `coding-review` statement every request of its `spans-reviewed` check carries. */
+const LIVE_REVIEW = "spans were reviewed live";
+
+/** What a Chat Completions request carrying tool results contains. */
+const TOOL_TURN = /"role"\s*:\s*"tool"/;
+
+/** The coding judge's Verdict once it read the spans: passed, citing the first trace ID. */
+const REVIEWED =
+  '{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}';
+
+/**
+ * The local judge of the coding session: the `spans-reviewed` check first
+ * reads the span names of the trace its answer names live through
+ * `bifrost.query`, then passes with {@link REVIEWED}; every other judge agrees.
+ */
+function codingJudge(request: ReceivedRequest): Reply {
+  if (!request.body.includes(LIVE_REVIEW)) {
+    return judgeReply(AGREES);
+  }
+  if (TOOL_TURN.test(request.body)) {
+    return judgeReply(REVIEWED);
+  }
+  const [traceId] = request.body.match(/[0-9a-f]{32}/) ?? [];
+  const sql = `SELECT name FROM vala.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`;
+  return toolTurn([toolCall("call-spans", "bifrost.query", { sql, max_rows: 10 })]);
+}
+
+/** A fresh deployment per test, as each Rust journey starts its own, judged as {@link codingJudge} answers. */
+const test = assistantTest({ perTest: true, provider: codingJudge });
 
 /**
  * The process-global tracer provider, installed once by the first traced
@@ -618,121 +645,88 @@ test("grouped refund changes verdict", async ({ server }) => {
   });
 }, 180_000);
 
-/** The `coding-review` statement every request of its `spans-reviewed` check carries. */
-const LIVE_REVIEW = "spans were reviewed live";
-
-/** What a Chat Completions request carrying tool results contains. */
-const TOOL_TURN = /"role"\s*:\s*"tool"/;
-
-/** The coding judge's Verdict once it read the spans: passed, citing the first trace ID. */
-const REVIEWED =
-  '{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}';
-
-/**
- * The local judge of the coding session: the `spans-reviewed` check first
- * reads the span names of the trace its answer names live through
- * `bifrost.query`, then passes with {@link REVIEWED}; every other judge agrees.
- */
-function codingJudge(request: ReceivedRequest): Reply {
-  if (!request.body.includes(LIVE_REVIEW)) {
-    return judgeReply(AGREES);
+test("grouped coding uses declared sources", async ({ server, provider, assistant: _ }) => {
+  const { cards, principal, state, bindingId, key } = await grouped(
+    server.baseUrl,
+    "cards/verify_in_real_time/coding.yaml",
+  );
+  server.scopedApiKey("ts_live_reader", ["tool:invoke", "bifrost_query:read"]);
+  const principals = await Principals.connect();
+  await principals.grantRole(principal, "ts_live_reader");
+  const spans = new BasicTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(spanExporter(WyrdClient.connect({ credential: key })))],
+  });
+  const tracer = spans.getTracer("journey.coding");
+  const session = tracer.startSpan("coding-session");
+  tracer.startSpan("edit-file", {}, trace.setSpan(context.active(), session)).end();
+  const traceId = session.spanContext().traceId;
+  const calls = [
+    { call: "prompt", tests: "passed" },
+    { call: "edit", tests: "failed" },
+    { call: "test", tests: "passed" },
+  ];
+  const run = state.run("agent");
+  const verdicts = [];
+  for (const [index, call] of calls.entries()) {
+    const inputs: VerifierInputs = index === 0 ? { call, trace: traceId } : { call };
+    verdicts.push((await run.observe.verify("coding-turn", inputs, { group_id: "session-1" })).outcome.verdict);
   }
-  if (TOOL_TURN.test(request.body)) {
-    return judgeReply(REVIEWED);
-  }
-  const [traceId] = request.body.match(/[0-9a-f]{32}/) ?? [];
-  const sql = `SELECT name FROM vala.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`;
-  return toolTurn([toolCall("call-spans", "bifrost.query", { sql, max_rows: 10 })]);
-}
+  expect(verdicts).toEqual(["passed", "failed", "passed"]);
+  const empty = await run.observe.verify("empty-each", [], { positional: true });
+  expect(empty.outcome.verdict).toBe("inconclusive");
+  expect(
+    empty.outcome.requirements.map((requirement) => [requirement.id, requirement.outcome, requirement.reason]),
+  ).toEqual([
+    ["listed-ok", "inconclusive", "empty_selection"],
+    ["items-ok", "inconclusive", "empty_selection"],
+  ]);
+  tracer.startSpan("late-test-run", {}, trace.setSpan(context.active(), session)).end();
+  session.end();
+  await spans.shutdown();
 
-const codingTest = assistantTest({ perTest: true, provider: codingJudge });
+  const judged = await groupExecution(server, bindingId, WAIT_MS);
 
-codingTest(
-  "grouped coding uses declared sources",
-  async ({ server, provider, assistant: _ }) => {
-    const { cards, principal, state, bindingId, key } = await grouped(
-      server.baseUrl,
-      "cards/verify_in_real_time/coding.yaml",
+  const outcome = judged.result?.outcome;
+  expect(outcome?.evidence.calls).toEqual({ kind: "json", value: calls });
+  expect(outcome?.evidence.traces).toEqual({ kind: "json", value: [traceId, null, null] });
+  expect(outcome?.evidence.tests).toEqual({ kind: "json", value: ["passed", "failed", "passed"] });
+  expect(
+    outcome?.requirements.map((requirement) => [requirement.id, requirement.outcome]),
+    JSON.stringify(outcome?.requirements),
+  ).toEqual([
+    ["every-call-tested", "failed"],
+    ["spans-reviewed", "passed"],
+  ]);
+  expect(outcome?.verdict).toBe("failed");
+  const reviews = () => provider.received.map((request) => request.body).filter((body) => body.includes(LIVE_REVIEW));
+  const [ask, ...moreAsks] = reviews().filter((body) => !TOOL_TURN.test(body));
+  expect(moreAsks).toEqual([]);
+  expect(ask, "the trace slot carries its ID only").toContain(traceId);
+  expect(ask).not.toContain("edit-file");
+  const [read, ...moreReads] = reviews().filter((body) => TOOL_TURN.test(body));
+  expect(moreReads).toEqual([]);
+  expect(read, "the check reads the spans live").toContain("edit-file");
+  expect(read).toContain("late-test-run");
+
+  await principals.revokeRole(principal, "ts_live_reader");
+  await run.observe.verify("coding-turn", { call: calls[0], trace: traceId }, { group_id: "session-2" });
+  const revoked = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
+  expect(revoked.group_id).toBe("session-2");
+  const denied = reviews().filter((body) => TOOL_TURN.test(body) && body.includes("WYRD_PERMISSION_403_DENIED_RBAC"));
+  expect(denied).toHaveLength(1);
+  expect(denied[0], "a denied read returns nothing").not.toContain("edit-file");
+  await state.shutdown();
+
+  for (const [relative, code, reason] of [
+    ["coding-child.yaml", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
+    ["coding-unbound.yaml", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
+    ["coding-cycle.yaml", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
+  ] as const) {
+    const refused = await cards.registerFromPath(fixture(`cards/verify_in_real_time/${relative}`)).then(
+      () => undefined,
+      (error: unknown) => error as WyrdError,
     );
-    server.scopedApiKey("ts_live_reader", ["tool:invoke", "bifrost_query:read"]);
-    const principals = await Principals.connect();
-    await principals.grantRole(principal, "ts_live_reader");
-    const spans = new BasicTracerProvider({
-      spanProcessors: [new SimpleSpanProcessor(spanExporter(WyrdClient.connect({ credential: key })))],
-    });
-    const tracer = spans.getTracer("journey.coding");
-    const session = tracer.startSpan("coding-session");
-    tracer.startSpan("edit-file", {}, trace.setSpan(context.active(), session)).end();
-    const traceId = session.spanContext().traceId;
-    const calls = [
-      { call: "prompt", tests: "passed" },
-      { call: "edit", tests: "failed" },
-      { call: "test", tests: "passed" },
-    ];
-    const run = state.run("agent");
-    const verdicts = [];
-    for (const [index, call] of calls.entries()) {
-      const inputs: VerifierInputs = index === 0 ? { call, trace: traceId } : { call };
-      verdicts.push((await run.observe.verify("coding-turn", inputs, { group_id: "session-1" })).outcome.verdict);
-    }
-    expect(verdicts).toEqual(["passed", "failed", "passed"]);
-    const empty = await run.observe.verify("empty-each", [], { positional: true });
-    expect(empty.outcome.verdict).toBe("inconclusive");
-    expect(
-      empty.outcome.requirements.map((requirement) => [requirement.id, requirement.outcome, requirement.reason]),
-    ).toEqual([
-      ["listed-ok", "inconclusive", "empty_selection"],
-      ["items-ok", "inconclusive", "empty_selection"],
-    ]);
-    tracer.startSpan("late-test-run", {}, trace.setSpan(context.active(), session)).end();
-    session.end();
-    await spans.shutdown();
-
-    const judged = await groupExecution(server, bindingId, WAIT_MS);
-
-    const outcome = judged.result?.outcome;
-    expect(outcome?.evidence.calls).toEqual({ kind: "json", value: calls });
-    expect(outcome?.evidence.traces).toEqual({ kind: "json", value: [traceId, null, null] });
-    expect(outcome?.evidence.tests).toEqual({ kind: "json", value: ["passed", "failed", "passed"] });
-    expect(
-      outcome?.requirements.map((requirement) => [requirement.id, requirement.outcome]),
-      JSON.stringify(outcome?.requirements),
-    ).toEqual([
-      ["every-call-tested", "failed"],
-      ["spans-reviewed", "passed"],
-    ]);
-    expect(outcome?.verdict).toBe("failed");
-    const reviews = () => provider.received.map((request) => request.body).filter((body) => body.includes(LIVE_REVIEW));
-    const [ask, ...moreAsks] = reviews().filter((body) => !TOOL_TURN.test(body));
-    expect(moreAsks).toEqual([]);
-    expect(ask, "the trace slot carries its ID only").toContain(traceId);
-    expect(ask).not.toContain("edit-file");
-    const [read, ...moreReads] = reviews().filter((body) => TOOL_TURN.test(body));
-    expect(moreReads).toEqual([]);
-    expect(read, "the check reads the spans live").toContain("edit-file");
-    expect(read).toContain("late-test-run");
-
-    await principals.revokeRole(principal, "ts_live_reader");
-    await run.observe.verify("coding-turn", { call: calls[0], trace: traceId }, { group_id: "session-2" });
-    const revoked = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
-    expect(revoked.group_id).toBe("session-2");
-    const denied = reviews().filter((body) => TOOL_TURN.test(body) && body.includes("WYRD_PERMISSION_403_DENIED_RBAC"));
-    expect(denied).toHaveLength(1);
-    expect(denied[0], "a denied read returns nothing").not.toContain("edit-file");
-    await state.shutdown();
-
-    for (const [relative, code, reason] of [
-      ["coding-child.yaml", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
-      ["coding-unbound.yaml", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
-      ["coding-cycle.yaml", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
-    ] as const) {
-      const refused = await cards.registerFromPath(fixture(`cards/verify_in_real_time/${relative}`)).then(
-        () => undefined,
-        (error: unknown) => error as WyrdError,
-      );
-      expect(refused?.code, relative).toBe(code);
-      expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, relative).toContain(reason);
-    }
-  },
-  180_000,
-);
+    expect(refused?.code, relative).toBe(code);
+    expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, relative).toContain(reason);
+  }
+}, 180_000);

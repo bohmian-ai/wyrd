@@ -56,6 +56,8 @@ pub struct VerifierSpec {
     pub description: Option<String>,
     /// Named evidence slots, addressed as `inputs.<slot>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(with = "BTreeMap<SlotName, InputSlotSchema>")]
+    #[cfg_attr(feature = "server", schema(value_type = BTreeMap<String, InputSlotSchema>))]
     pub inputs: BTreeMap<SlotName, InputSlot>,
     /// Preparation steps; independent steps may run concurrently.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -128,10 +130,90 @@ impl VerifierSpec {
     }
 }
 
+/// The JSON Schema of an authored [`InputSlot`]: one typed slot object or a
+/// source reference string, exactly the forms [`InputSlot`] decodes.
+///
+/// schemars projects a per-variant `#[serde(untagged)]` as one more tagged
+/// object, so the derived schema of [`InputSlot`] omits its source variant
+/// and this uninhabited type unions it back in for [`VerifierSpec::inputs`].
+enum InputSlotSchema {}
+
+impl JsonSchema for InputSlotSchema {
+    /// Names the authored slot schema in generated definitions.
+    fn schema_name() -> String {
+        "InputSlot".to_owned()
+    }
+
+    /// One of the typed slot objects or the source reference string.
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{Metadata, SchemaObject, SubschemaValidation};
+
+        SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "One named evidence slot. Slots are required unless `required: false`."
+                        .to_owned(),
+                ),
+                ..Metadata::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    generator.subschema_for::<InputSlot>(),
+                    generator.subschema_for::<SourceText>(),
+                ]),
+                ..SubschemaValidation::default()
+            })),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for InputSlotSchema {
+    /// The derived typed slot objects with the source variant, which utoipa
+    /// projects as an unsatisfiable tagged string, replaced by the source
+    /// reference string.
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::Schema;
+
+        let mut slot = <InputSlot as utoipa::PartialSchema>::schema();
+        if let RefOr::T(Schema::OneOf(one_of)) = &mut slot {
+            one_of
+                .items
+                .retain(|item| !matches!(item, RefOr::T(Schema::AllOf(_))));
+            one_of
+                .items
+                .push(<SourceText as utoipa::PartialSchema>::schema());
+        }
+        slot
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for InputSlotSchema {
+    /// Names the authored slot schema as the served contract's `InputSlot`.
+    fn name() -> std::borrow::Cow<'static, str> {
+        "InputSlot".into()
+    }
+
+    /// Registers the schemas the typed slot objects reference.
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        <InputSlot as utoipa::ToSchema>::schemas(schemas);
+    }
+}
+
 /// One named evidence slot. Slots are required unless `required: false`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(rename = "TypedInputSlot")]
 pub enum InputSlot {
     /// A JSON value, optionally constrained by JSON Schema.
     Json {
@@ -173,6 +255,7 @@ pub enum InputSlot {
     /// `verifiers.<name>.requirements.<requirement>.outcome`, resolved at
     /// group execution to one ordered value per source execution.
     #[serde(untagged)]
+    #[schemars(skip)]
     Source(SourceText),
 }
 
@@ -719,5 +802,87 @@ impl VerificationBinding {
             ("on_failure", &mut self.on_failure),
             ("on_verdict_change", &mut self.on_verdict_change),
         ]
+    }
+}
+
+/// Schema projection parity of authored Verifier input slots.
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{InputSlot, VerifierSpec};
+
+    /// The generated schema offers exactly the four typed slot objects and
+    /// the source string, the forms decoding accepts; a `{type: "source"}`
+    /// object is neither generated nor decoded.
+    ///
+    /// # Panics
+    /// Panics when the schema or decoding admits another form.
+    #[test]
+    fn input_slot_schema_matches_decoding() {
+        let schema = serde_json::to_value(schemars::schema_for!(VerifierSpec))
+            .expect("invariant: a schema serializes");
+        let definitions = &schema["definitions"];
+        assert_eq!(
+            definitions["InputSlot"]["oneOf"],
+            json!([
+                {"$ref": "#/definitions/TypedInputSlot"},
+                {"$ref": "#/definitions/SourceText"}
+            ])
+        );
+        let tags: Vec<&Value> = definitions["TypedInputSlot"]["oneOf"]
+            .as_array()
+            .expect("invariant: typed slots are a oneOf")
+            .iter()
+            .map(|variant| &variant["properties"]["type"]["enum"][0])
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                &json!("json"),
+                &json!("media"),
+                &json!("trace"),
+                &json!("samples")
+            ]
+        );
+        assert_eq!(definitions["SourceText"]["type"], json!("string"));
+
+        let decode = |value| serde_json::from_value::<InputSlot>(value);
+        assert!(matches!(
+            decode(json!("verifiers.turn.inputs.message")),
+            Ok(InputSlot::Source(_))
+        ));
+        assert!(decode(json!({"type": "trace"})).is_ok());
+        assert!(decode(json!({"type": "source"})).is_err());
+    }
+
+    /// The served projection offers the same forms: the four typed slot
+    /// objects and the source string, never a tagged source object.
+    ///
+    /// # Panics
+    /// Panics when the served schema admits another form.
+    #[cfg(feature = "server")]
+    #[test]
+    fn served_input_slot_schema_matches_decoding() {
+        let schema =
+            serde_json::to_value(<super::InputSlotSchema as utoipa::PartialSchema>::schema())
+                .expect("invariant: a schema serializes");
+        let forms: Vec<Value> = schema["oneOf"]
+            .as_array()
+            .expect("invariant: slots are a oneOf")
+            .iter()
+            .map(|form| form["properties"]["type"]["enum"][0].clone())
+            .collect();
+        assert_eq!(
+            forms,
+            [
+                json!("json"),
+                json!("media"),
+                json!("trace"),
+                json!("samples"),
+                Value::Null
+            ]
+        );
+        assert_eq!(schema["oneOf"][4]["type"], json!("string"));
     }
 }

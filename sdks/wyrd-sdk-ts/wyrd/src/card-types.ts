@@ -2361,74 +2361,7 @@ export interface InputDeclarationTrace {
 /**
  * One named evidence slot. Slots are required unless `required: false`.
  */
-export type InputSlot = InputSlotJson | InputSlotMedia | InputSlotTrace | InputSlotSamples | InputSlotVariant5 | string;
-
-/**
- * A JSON value, optionally constrained by JSON Schema.
- */
-export interface InputSlotJson {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  /**
-   * JSON Schema the value must satisfy.
-   */
-  readonly schema?: JsonValue;
-  readonly type: "json";
-}
-
-/**
- * A pinned file in one of the accepted formats.
- */
-export interface InputSlotMedia {
-  /**
-   * Accepted formats.
-   */
-  readonly formats: readonly MediaFormat[];
-  /**
-   * Lower size bound than the deployment limit.
-   */
-  readonly max_bytes?: number | null;
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "media";
-}
-
-/**
- * Feature measurements or metric samples recorded for a scheduled window.
- */
-export interface InputSlotSamples {
-  /**
-   * Measurement names, including metric names.
-   */
-  readonly features: readonly FeatureName[];
-  /**
-   * Whether the schedule binding must fill the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "samples";
-}
-
-/**
- * A trace resolved through tenant-scoped trace reads.
- */
-export interface InputSlotTrace {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "trace";
-}
-
-/**
- * A group Verifier's input authored as a source reference string, `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<requirement>.outcome`, resolved at group execution to one ordered value per source execution.
- */
-export interface InputSlotVariant5 {
-  readonly type: "source";
-}
+export type InputSlot = TypedInputSlot | SourceText;
 
 /**
  * OTel-canonical instrumentation scope.
@@ -5631,6 +5564,71 @@ export interface TriggerSpecSchedule {
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
 export type TypedCardKind = "Data" | "Model" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
+
+/**
+ * One named evidence slot. Slots are required unless `required: false`.
+ */
+export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
+
+/**
+ * A JSON value, optionally constrained by JSON Schema.
+ */
+export interface TypedInputSlotJson {
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  /**
+   * JSON Schema the value must satisfy.
+   */
+  readonly schema?: JsonValue;
+  readonly type: "json";
+}
+
+/**
+ * A pinned file in one of the accepted formats.
+ */
+export interface TypedInputSlotMedia {
+  /**
+   * Accepted formats.
+   */
+  readonly formats: readonly MediaFormat[];
+  /**
+   * Lower size bound than the deployment limit.
+   */
+  readonly max_bytes?: number | null;
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  readonly type: "media";
+}
+
+/**
+ * Feature measurements or metric samples recorded for a scheduled window.
+ */
+export interface TypedInputSlotSamples {
+  /**
+   * Measurement names, including metric names.
+   */
+  readonly features: readonly FeatureName[];
+  /**
+   * Whether the schedule binding must fill the slot.
+   */
+  readonly required?: boolean;
+  readonly type: "samples";
+}
+
+/**
+ * A trace resolved through tenant-scoped trace reads.
+ */
+export interface TypedInputSlotTrace {
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  readonly type: "trace";
+}
 
 /**
  * Admission of a call whose cost cannot be bounded.

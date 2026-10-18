@@ -746,3 +746,80 @@ collisions stay reversible implementation choices within the declared owners.
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md).
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED`. Commits `ab6fd7295`, `02da06e1c`, `8b77c4672`,
+`f5c5554ca`, `e08cbcde4` on `change/long-horizon-verification-task-001`.
+Feature sets: `wyrd-server --features test-support` for C7/C8/C13 and lib tests;
+journey profile (`-P journey --run-ignored=all`) for `wyrd-ai`/`wyrd-mcp`;
+default features elsewhere. REQ-015/AC-009 remain **pending subsequent
+benchmarking**; no capacity claim or benchmark machinery was added.
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A1 simple Trigger, expiry refresh, six-fact support, boundaries | `wyrd-spec/src/card/trigger.rs` (`group_end { after }`), `20261018000000_verification_group_pending.sql`, `scribe_outbox.rs` post-ACK upsert, `verification/scheduler.rs::group_pass`, `components/cards/service.rs` | C1 Rust/Py/TS, C7, C8, C13 | PASS |
+| A2 visible rows, null alignment, ordering, late/equal-time rows, immutable prior inputs | `verification/groups.rs` (`Visible`, `Earliest`, `executions`, `pin`) | C3, C6, C8, C4/C10 equal-ingest-time ordering | PASS |
+| A3 same snapshot idempotent, overlapping snapshots, no coverage/finality machinery | `group_snapshot_sha256` + unique index in `20261016000000_verifier_executions.sql`; `verifier_executions.rs` | C2, C6, C8, C9, removed-term search | PASS |
+| A4 refund baseline/changed/unchanged/recovery, settled-order dispatch | `verifier_executions.rs::complete` settled-order comparison; `refund-review.yaml` latest-fact step | C2 Rust/Py/TS, C9 | PASS |
+| A5 coding without tracing, optional live trace | coding fixtures, `verification/hosted/mod.rs` | C3 Rust/Py/TS | PASS |
+| A6 20-frame, failed/empty, 21-frame normal, per-item queue | source ceiling removed (`config.rs`, `engines.rs`, wire/stub/docs); `frames.yaml` | C4 Rust/Py/TS, C10 | PASS |
+| A7 many groups/tenants, exact versions, no-IO owner attribution, ungrouped behavior | `scheduler.rs` tenant/item bounds, `groups.rs` owner authority | C1, C5, C8 | PASS |
+| A8 TASK-002 scheduled checks, TASK-003 pressure/drain/audit/tenant progress | `query/scheduled.rs` stall seam honored; claims/outbox unchanged in semantics | C5, C11, C12; wyrd-server lib tests (groups, scribe_outbox, scheduler, claims: 13 passed) | PASS |
+| A9 SDKs, stubs, generated declarations, OpenAPI/MCP, docs agree; tradeoffs documented | `__init__.pyi`, regenerated `card-types.ts`/`errors.md`, `how-verification-works.md`, `verification-runtime-limits.md`, `wyrd-design.md` | C7, C10, codegen/docs/py/ts static checks | PASS |
+| A10 all original scenarios evidenced, no new benchmark claims | this section; REQ-015/AC-009 pending | all C1–C13 below | PASS |
+| A11 post-ACK updates, consumption, concurrent arrival, bounded batches, capacity/cron isolation | `scribe_outbox.rs`, `CLAIM_DUE_GROUP` SKIP LOCKED, `group_pass` 64 tenants × 32 items, shared `Arc<Semaphore>` `try_acquire` | C13, C11 | PASS |
+
+### Commands and selected counts
+
+All Postgres-backed commands ran under
+`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && …'`.
+
+- C1–C6, C11 (Rust), C12 (Rust): `cargo nextest run --locked --no-fail-fast -p wyrd-ai --test integration -P journey --run-ignored=all -E` with the union of the exact `test(=…)` selectors for `verify_in_real_time::{grouped_support_resumes, grouped_refund_changes_verdict, grouped_coding_uses_declared_sources, grouped_sampled_frames_use_visible_outcomes, grouped_conversations_coexist_with_drift, grouped_executions_include_late_evidence, verification_staging_refuses_and_recovers}` and `scheduled_drift_alerts_operator::{scheduled_binding_scores_every_requirement, scheduled_binding_rejects_redundant_inputs}`. Result: 9 run, 9 passed.
+- C1–C5, C11, C12 (Python): `uv run python -m pytest -q -m integration` with the eight node IDs from C1–C5/C11/C12. Result: 11 passed (parametrized).
+- C1–C5, C11 (TS): `pnpm exec vitest run tests/integration/verify-in-real-time.test.ts -t "^(grouped support resumes|grouped refund changes verdict|grouped coding uses declared sources|grouped sampled frames use visible outcomes|grouped conversations coexist with drift|verification_staging_refuses_and_recovers)$"`. Result: 6 passed.
+- C12 (TS): `pnpm exec vitest run tests/integration/scheduled-drift-alerts-operator.test.ts -t "^scheduled binding (scores every requirement|rejects redundant inputs) \("`. Result: 5 passed (parametrized).
+- C7: `cargo nextest run --locked -p wyrd-server --features test-support --test integration -E "test(=pg_openapi_contract::grouped_verification_contract_is_served)"`. Result: 1 passed.
+- C8 and C13: `… -E "test(=pg_verification_groups::available_rows_form_expiring_group_snapshots) | test(=pg_verification_groups::pending_groups_debounce_and_stop_after_handoff)"`. Result: 2 passed.
+- C9: `cargo nextest run --locked -p wyrd-sql --test integration --run-ignored=all -E "test(=pg_verifier_executions::group_snapshots_are_idempotent_and_react_in_settlement_order)"`. Result: 1 passed. This was rerun after the `SettledRow` alias.
+- C10: `cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(=verification::pg_tests::grouped_verification_discover_act_observe) | test(=verification::pg_tests::grouped_frames_use_visible_outcomes)"`. Result: 2 passed after the diagnosis below.
+- Static and owner checks, all exit 0: `fmt`, `lints`, `codegen:regen`, `codegen:check`, `check:deps`, `check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`, `py:test:unit` (595 passed), `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `docs:check`, `git diff --check`.
+
+### RED / GREEN / REFACTOR
+
+- **RED.** C8, C9 and C13 are new tests against APIs and tables the pre-change tree lacked: the pending table, `group_pass`, the snapshot digest and settled-order comparison. They could not compile or pass there, so no separate synthetic red run was recorded. The renamed journeys and the C10/C11 extensions failed against the old idle/ceiling model until the after-only scheduling landed.
+- **GREEN.** SQL scheduling and snapshot identity landed in `ab6fd7295`, the bounded scheduler loop and server tests in `02da06e1c`, contracts and docs in `8b77c4672`, and SDK journeys in `f5c5554ca`.
+- **REFACTOR.** Clippy `type_complexity` was resolved with the local aliases `Firsts` and `SettledRow`. The runner `Semaphore` import was moved out from under a `test-support` cfg.
+
+### Diagnoses
+
+1. **C13 stall never engaged.**
+   - **Symptom.** `pending_groups_debounce_and_stop_after_handoff` failed with "query schema stall deadline elapsed".
+   - **Evidence.** The scheduled/group query path in `crates/wyrd/wyrd-server/src/query/scheduled.rs` called `drop(fault.apply(&mut stream))`, so no waiter was ever marked entered.
+   - **Cause.** The test-support fault seam ignored schema stalls on the scheduled path, unlike `collect.rs`.
+   - **Fix site.** `query/scheduled.rs`: `mark_entered()`, then await cancellation, mirroring `collect.rs`. That is the only other caller of `fault.apply` and it already behaves this way.
+2. **C10 `grouped_frames_use_visible_outcomes` order mismatch.**
+   - **Symptom.** `wyrd-mcp/tests/bifrost/mcp/verification.rs:1813`: two adjacent IDs in the 21-frame snapshot were swapped relative to submission order.
+   - **Evidence.** The INFO trace shows two tie groups that are lexically ordered by execution ID.
+   - **Cause.** Frames staged back-to-back share one Scribe batch and its `wyrd_ingested_at`. Ties break by `ExecutionId`, a hash-shaped UUID, as the spec and step 4 require. Production is correct; the test assumed submission order.
+   - **Fix site.** The test only. Membership is compared as a set, and expected outcomes are derived from the listed order, which matches the Rust, Python and TS SDK journeys.
+   - **Diagnostician.** A fresh read-only diagnostician confirmed the cause and fix site independently. It also found that the order-sensitive assertions elsewhere (MCP `conv-mcp`, SDK support turns, `pg_verification_groups`) stage each row after the previous one was acknowledged, so they are safe.
+
+### Decisions (reversible, recorded)
+
+- Rows whose owner has no authority, and enqueues that are Refused, are consumed rather than retried.
+- A staged input whose submission the queue later refuses still joins its group, as the visibility tradeoff allows. Key-conflict checks therefore use an ungrouped or separate group.
+- `refund-review.yaml` judges the latest fact through a code step, so correction recovery is expressible.
+- Fixture file renames ("review" → group Verifier terminology) were skipped as naming churn.
+
+### Non-goal and diff audit
+
+- **Diff scope.** `git diff --stat 22335c2c4..HEAD` lists 53 files. All are within the declared write set: wyrd-spec trigger/verification, wyrd-server verification/scheduler/outbox/query/config, wyrd-sql migrations and queries, wyrd-testing, MCP/server/SQL tests, fixtures, SDK journeys, the stub, generated `card-types.ts`/`errors.md`, docs and `wyrd-design.md`.
+- **Nothing reintroduced.** A tracked-tree search for `group_through`, `group_members`, `GroupCoverage`, `GroupState`, `exceeded_ceiling` and `SOURCE_EXECUTIONS_MAX` returns no current consumers. None of the following was added:
+  - an outstanding gate, coalescing or latest-result adoption;
+  - a visibility barrier or publication checkpoint;
+  - a source-count ceiling, platform-specific mechanism or new dependency;
+  - a gate bypass, `#[allow]` or ignored test.
+- **Working tree.** Clean apart from this evidence append.

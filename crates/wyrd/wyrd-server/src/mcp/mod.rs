@@ -178,7 +178,7 @@ impl ServerHandler for WyrdMcpHandler {
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.protocol_version = WYRD_MCP_PROTOCOL_VERSION;
-        info.instructions = Some("Use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries.".to_owned());
+        info.instructions = Some(r#"New to Wyrd? Call wyrd.guide {"topic":"start"} for the Declare -> Observe -> Verify workflow on an application you own, then use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries."#.to_owned());
         info
     }
 

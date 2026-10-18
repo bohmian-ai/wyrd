@@ -151,7 +151,10 @@ pub(crate) async fn list_tables_through_proxy(
     let info = host.peer_info().expect("proxy initialization metadata");
     let instructions = info.instructions.as_deref().expect("server instructions");
     assert!(instructions.contains("tools/list"));
-    assert!(instructions.contains("wyrd.guide"));
+    assert!(
+        instructions.contains(r#"wyrd.guide {"topic":"start"}"#),
+        "the proxy forwards the server's onboarding instructions: {instructions}"
+    );
     let tools = host
         .list_all_tools()
         .await

@@ -1,4 +1,5 @@
-//! Static investigation guidance; all authorized evidence remains in the owning tools.
+//! Static onboarding and investigation guidance; all authorized evidence
+//! remains in the owning tools.
 
 use rmcp::model::{CallToolResult, Tool};
 use serde_json::{Map, Value, json};
@@ -15,9 +16,9 @@ pub(super) const GUIDE: &str = "wyrd.guide";
 pub(super) fn descriptor() -> Tool {
     tool::<GuideRequest, GuideResponse>(
         GUIDE,
-        "Guide a Wyrd investigation",
-        "Explain overview, cards, verification, or bifrost_sql workflows with bounded tool \
-         examples. Contains no tenant data and grants no permissions. Replace example \
+        "Guide Wyrd onboarding or an investigation",
+        "Explain the start onboarding workflow, or the overview, cards, verification, or \
+         bifrost_sql investigation workflows, with bounded tool examples. Contains no tenant data and grants no permissions. Replace example \
          placeholders with exact discovered identifiers; consult tools/list for current schemas.",
         true,
     )
@@ -59,13 +60,46 @@ fn sql_example(purpose: &str, sql: &str) -> GuideExample {
 }
 
 /// Explain a closed workflow using exact tool and schema names.
+///
+/// `start` names CLI commands and SDK operations as text, because MCP neither
+/// declares Cards, pulls bundles, uploads files, nor ingests application data;
+/// its examples call only shipped read tools.
 fn response(topic: GuideTopic) -> GuideResponse {
     let (steps, examples) = match topic {
+        GuideTopic::Start => (
+            vec![
+                "Wyrd verifies an application you own in three steps: Declare its components and Verifiers with the wyrd CLI, Observe it with a Wyrd SDK inside the application, and Verify its behavior through the SDK or this MCP server. MCP teaches, reads Cards and evidence, and runs verification. It does not declare Cards, pull bundles, upload files, or ingest application telemetry or rows; use a shell for those.",
+                "Read the docs before writing code. llms.txt is the page index and llms-full.txt the full text, including every embedded YAML and code example, both under the docs base /wyrd/ (published at https://bohmian-ai.github.io/wyrd/; a locally served docs build uses the same paths). Follow get-started/setup/, then get-started/quickstart/, then the build-and-verify Declare, Observe, and Verify pages. Stable error codes and remediation are listed at api/errors/.",
+                "Setup: the person installs the wyrd CLI, supplies PostgreSQL, and runs wyrd server dev in a terminal or background job they own, waiting for readiness; wyrd server dev --format json prints one readiness line and keeps serving. Do not start, stop, or restart that server yourself. It saves the endpoint and an administrator credential that the CLI and SDKs resolve with no arguments. wyrd mcp install --host <host> --format json connects a host without writing a credential into its configuration; the host must reload or reconnect afterwards.",
+                "Declare: map the application to one Service Card YAML file with components (an alias and a ref) for its Agent, Prompt, and Model Cards, tables with a JSON schema for each kind of custom row, and verified_by bindings to Verifier Cards. A gateway deployment and model string such as openai/gpt-4o is a route, not a Model Card; declare a Model Card only for model artifacts you own, through its existing artifact workflow, before referring to it. Run wyrd declare <dir> --check --format json, which validates the local files and never contacts the server, then wyrd declare <dir> --format json. Repeating an unchanged declaration is idempotent. The receipt's root is the Service's exact identity; declaring returns no secret and grants no authority.",
+                "Read and pull: wyrd get --kind Service --space <space> --name <name> --version <version>, or cards.get here, reads one Card envelope. wyrd pull --kind Service --uid <root_uid> --output-dir .wyrd-bundle, or the SDK's Cards.pull, writes the complete bundle the application loads. A --metadata-only bundle is inspectable but not runnable.",
+                "Observe: install the Python SDK (pip install \"wyrd-ai[otel]\", plus agents or gateway for those integrations), the Rust wyrd-ai crate, or the TypeScript wyrd-ai package. Load the bundle with WyrdState.from_path, call start_bifrost and start_telemetry, open state.run() for each unit of work, write rows with run.observe.record(<table>, row) matching the declared schema, use run.for_card(<alias>) for a component's view, and call state.shutdown() before exit to flush buffered rows and spans. Recording buffers rows; a row becomes queryable only after the server publishes it.",
+                "Verify: run.observe.verify(<verifier>, <slot>=value) returns a judgment within the server deadline; a failed verdict is a result, not an error, and dispatches no Operator. run.observe.submit(...) queues the work and returns an execution; poll it from any process with verify.Execution.connect(execution_id).status() or verification.get_execution until it is completed, errored, or timed_out. Here, verification.execute and verification.enqueue take the same inline inputs and require verifier:run on the Verifier. A path on your machine is not server-readable; send file evidence from the SDK, such as verify.File. Drift Verifiers run only on their binding schedule.",
+                "Done means server evidence, not your own output: read the Service and its Verifier bindings with cards.get, query your custom table and vala.traces.spans by run_id with bifrost.query, and read each judgment from vala.verification.results. Use the cards, verification, and bifrost_sql topics for those reads. Report refusals, empty results, and failed queries as they are.",
+            ],
+            vec![
+                example(
+                    "cards.list",
+                    "Find the declared Service's exact versions",
+                    json!({ "kind": "Service", "name": "<service_name>", "limit": 20 }),
+                ),
+                example(
+                    "verification.get_execution",
+                    "Poll a submitted verification to a terminal status",
+                    json!({ "execution_id": "<execution_id>" }),
+                ),
+                example(
+                    GUIDE,
+                    "Learn evidence queries",
+                    json!({ "topic": "bifrost_sql" }),
+                ),
+            ],
+        ),
         GuideTopic::Overview => (
             vec![
                 "Use tools/list to inspect the current caller-dependent catalog and each tool's input/output schema. Discovery does not grant permission; a named call can still be refused.",
                 "For a Service name, start with cards.list. For a request or trace, discover and describe Bifrost tables. For a Verifier execution, read verification.get_execution. Choose the investigation path from the evidence.",
-                "Use wyrd.guide topics cards, verification, and bifrost_sql for those workflows. Consult tool descriptors for principal credentials, Operator connections, and gateway administration.",
+                "Use wyrd.guide topic start to declare, observe, and verify an application, and topics cards, verification, and bifrost_sql for those investigations. Consult tool descriptors for principal credentials, Operator connections, and gateway administration.",
                 "Cite exact Card UIDs and versions, result IDs, table names, and returned rows. State empty evidence, uncertainty, refusals, and failed queries explicitly.",
             ],
             vec![example(
@@ -100,7 +134,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 "Call verification.get_execution for execution status, its result, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out executions do not establish a completed judgment. A just-enqueued execution may read as not found until the queue accepts it.",
                 "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features by matching result_id.",
                 "card_uid identifies the Card verified and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
-                "verification.execute and verification.enqueue require verifier:run on the Verifier and take the same inline inputs. verification.execute returns the judgment directly and dispatches no Operator. verification.enqueue accepts the work with 202 and an execution_id; poll verification.get_execution. Upload large files first with verification.evidence. Drift Verifiers judge windows and run only on their binding schedule.",
+                "verification.execute and verification.enqueue require verifier:run on the Verifier and take the same inline inputs. verification.execute returns the judgment directly and dispatches no Operator. verification.enqueue accepts the work with 202 and an execution_id; poll verification.get_execution. File inputs are referenced by digest: verification.evidence plans their upload, and the SDK or HTTP client sends the bytes; a local path is not server-readable. Drift Verifiers judge windows and run only on their binding schedule.",
             ],
             vec![
                 example(

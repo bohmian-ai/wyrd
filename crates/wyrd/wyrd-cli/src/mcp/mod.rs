@@ -48,7 +48,7 @@ pub struct InstallArgs {
     /// command. Omitted, the host follows the global client endpoint.
     #[arg(long)]
     server: Option<String>,
-    /// Output encoding; `json` prints the [`McpInstallReport`] and never
+    /// Output encoding; `json` prints one per-host installation report and never
     /// prompts, so it requires `--host`.
     #[arg(long, default_value_t)]
     format: OutputFormat,

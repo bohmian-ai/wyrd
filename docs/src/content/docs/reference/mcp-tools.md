@@ -33,7 +33,7 @@ Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain do
 | --- | --- | --- | --- |
 | `wyrd.guide` | Read; authenticated | `{topic}` → `{topic, steps, examples}` | Static guidance; reads no tenant data and grants no permission |
 
-`topic` is one of `overview`, `cards`, `verification`, `bifrost_sql`. Each example contains `tool`, `purpose`, and an `arguments` object. Replace angle-bracket placeholders with discovered identities and adjust example time windows. The guide is a workflow aid; `tools/list` remains the current schema authority.
+`topic` is one of `start`, `overview`, `cards`, `verification`, `bifrost_sql`. `start` teaches an unfamiliar coding agent the Declare → Observe → Verify workflow on its own application: the CLI commands and SDK operations it runs from a shell, the docs to read, and the server evidence that shows it is done. The server's initialization `instructions` point new agents to it. Each example contains `tool`, `purpose`, and an `arguments` object. Replace angle-bracket placeholders with discovered identities and adjust example time windows. The guide is a workflow aid; `tools/list` remains the current schema authority.
 
 ## Cards and verification
 

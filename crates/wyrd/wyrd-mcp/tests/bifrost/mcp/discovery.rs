@@ -126,7 +126,10 @@ mod pg_tests {
             let info = self.agent.peer_info().ok_or("server discovery info")?;
             let instructions = info.instructions.as_deref().ok_or("server instructions")?;
             assert!(instructions.contains("tools/list"));
-            assert!(instructions.contains("wyrd.guide"));
+            assert!(
+                instructions.contains(r#"wyrd.guide {"topic":"start"}"#),
+                "first contact leads to onboarding: {instructions}"
+            );
             // Protocol 2026-07-28 requires cache metadata; strict clients
             // reject a list result without it.
             let page = self.agent.list_tools(None).await?;
@@ -155,6 +158,17 @@ mod pg_tests {
                 ADVERTISED_TOOLS.len(),
                 "the checked catalog is the complete every-scope catalog"
             );
+            // Declaration, bundle pull, local check, and file upload stay CLI
+            // and SDK operations; onboarding adds no MCP write capability.
+            for tool in &tools {
+                for owned_elsewhere in ["declare", "pull", "check", "upload", "get_by_ref"] {
+                    assert!(
+                        !tool.name.contains(owned_elsewhere),
+                        "{} is not an MCP capability",
+                        tool.name
+                    );
+                }
+            }
             for name in ["cards.list", "cards.get", "wyrd.guide"] {
                 let tool = tools
                     .iter()
@@ -178,7 +192,7 @@ mod pg_tests {
         /// # Errors
         /// Returns a malformed guide, missing tool, or failed query example.
         async fn topics(&self, tools: &[Tool]) -> Result<(), McpJourneyError> {
-            for topic in ["overview", "cards", "verification", "bifrost_sql"] {
+            for topic in ["start", "overview", "cards", "verification", "bifrost_sql"] {
                 let guide = self.read("wyrd.guide", json!({ "topic": topic })).await?;
                 assert_eq!(guide["topic"], topic);
                 let steps = guide["steps"].as_array().ok_or("guide has steps")?;
@@ -196,6 +210,40 @@ mod pg_tests {
                         self.execute_sql_example(example).await?;
                     }
                 }
+            }
+            self.onboarding().await
+        }
+
+        /// The onboarding topic names the final CLI and SDK workflow and its docs.
+        ///
+        /// # Errors
+        /// Returns a transport failure or a guide without onboarding steps.
+        async fn onboarding(&self) -> Result<(), McpJourneyError> {
+            let guide = self.read("wyrd.guide", json!({ "topic": "start" })).await?;
+            let steps = guide["steps"]
+                .as_array()
+                .ok_or("start has steps")?
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for taught in [
+                "llms-full.txt",
+                "wyrd server dev",
+                "wyrd mcp install --host",
+                "wyrd declare",
+                "--check",
+                "wyrd get",
+                "wyrd pull",
+                "WyrdState",
+                "shutdown",
+                "verify",
+                "submit",
+                "verification.get_execution",
+                "vala.verification.results",
+                "Model Card",
+            ] {
+                assert!(steps.contains(taught), "start teaches {taught}: {steps}");
             }
             Ok(())
         }

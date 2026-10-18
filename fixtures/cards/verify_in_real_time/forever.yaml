@@ -1,0 +1,17 @@
+# The support conversation under the largest durations a Trigger accepts:
+# its groups never end, and polling them must not stop the scheduler.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: forever
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./turn-check.yaml
+        - verifier: ./conversation-review.yaml
+          runs_on: {kind: group_end, idle: 999999999d, max_age: 999999999d, finality: 999999999d}

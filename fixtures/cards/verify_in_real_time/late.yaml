@@ -1,0 +1,18 @@
+# A judged conversation whose whole-conversation review is slow, so turns
+# can arrive while it runs and a turn's own judgment can land after the next
+# review pinned it.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: late
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./answer-judged.yaml
+        - verifier: ./late-review.yaml
+          runs_on: {kind: group_end, idle: 3s, max_age: 1h, finality: 1d}

@@ -27,7 +27,8 @@ use wyrd_ai::{
     SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
 };
 use wyrd_spec::ids::BindingId;
-use wyrd_spec::verification::VerifierReadiness;
+use wyrd_spec::verification::execution::VerificationExecutionState;
+use wyrd_spec::verification::{VerificationExecutionStatus, VerifierReadiness};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::action_timeline::service_telemetry;
@@ -2474,4 +2475,149 @@ async fn grouped_conversations_recover() {
     )
     .await;
     deployment.shutdown().await;
+}
+
+/// One evidence slot of `review`'s result as JSON.
+///
+/// # Panics
+/// Panics when the review has no result or no such slot.
+fn evidence(review: &VerificationExecutionState, slot: &str) -> serde_json::Value {
+    let result = review.result.as_ref().expect("the result is visible");
+    serde_json::to_value(&result.outcome.evidence[&slot.parse().expect("slot name")])
+        .expect("evidence encodes")
+}
+
+/// A judged conversation's review is slow. Answers recorded while it runs
+/// reach exactly one next review, which pins a still-running answer's
+/// judgment as null; once that judgment lands, exactly one more review
+/// judges it, every review stays retained, and nothing is reviewed again.
+/// Throughout, a neighbouring conversation bound under the largest
+/// durations a Trigger accepts never ends and never stops the scheduler.
+///
+/// # Panics
+/// Panics when a step fails, a review is not judged in time, or a review
+/// differs or repeats.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_reviews_cover_late_work() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    for (marker, delay, priority) in [("LATE-REVIEW", 6, 1), ("late answer", 15, 2)] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(
+                completion(json!({ "role": "assistant", "content": AGREES }))
+                    .set_delay(Duration::from_secs(delay)),
+            )
+            .with_priority(priority)
+            .mount(&assistant.judge)
+            .await;
+    }
+    let forever = assistant
+        .grouped("cards/verify_in_real_time/forever.yaml")
+        .await;
+    forever
+        .turn(
+            "turn-check",
+            &GroupId::new("endless").expect("group id"),
+            json!({ "answer": "still here" }),
+        )
+        .await;
+    let late = assistant
+        .grouped("cards/verify_in_real_time/late.yaml")
+        .await;
+    let group = GroupId::new("slow-1").expect("group id");
+    late.turn("answer-judged", &group, json!("first answer"))
+        .await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let outstanding = loop {
+        deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        if let Some(id) = deployment
+            .binding_status(&late.binding)
+            .await
+            .last_execution_id
+        {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first review is enqueued"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    late.turn("answer-judged", &group, json!("second answer"))
+        .await;
+    let Submission::Queued(pending) = late
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(group.clone())
+        .submit("answer-judged", json!("late answer"))
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("an answer-judged submission queues an execution");
+    };
+    let review = Execution::connect_with(outstanding, &deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    assert_ne!(
+        review.status().await.expect("the review reads").status,
+        VerificationExecutionStatus::Completed,
+        "both answers were recorded while the first review ran"
+    );
+    review.wait(WAIT).await.expect("the first review completes");
+    let first = review.status().await.expect("the review reads");
+    assert_eq!(
+        evidence(&first, "answer"),
+        json!({"kind": "json", "value": ["first answer"]})
+    );
+
+    let next = deployment
+        .group_execution(&late.binding, Some(&outstanding), WAIT)
+        .await;
+    assert_eq!(
+        evidence(&next, "answer"),
+        json!({"kind": "json", "value": ["first answer", "second answer", "late answer"]}),
+        "one next review covers every answer recorded during the first"
+    );
+    assert_eq!(
+        evidence(&next, "agreed"),
+        json!({"kind": "json", "value": ["passed", "passed", null]}),
+        "the still-running judgment is pinned null"
+    );
+    pending.wait(WAIT).await.expect("the late answer is judged");
+    let settled = deployment
+        .group_execution(&late.binding, Some(&next.execution_id), WAIT)
+        .await;
+    assert_eq!(
+        evidence(&settled, "agreed"),
+        json!({"kind": "json", "value": ["passed", "passed", "passed"]}),
+        "the late judgment is judged by exactly one more review"
+    );
+    late.state.shutdown().await.expect("Bifrost stops");
+    assert_no_new_review(
+        deployment,
+        &[deployment.server()],
+        &late.binding,
+        &[outstanding, next.execution_id, settled.execution_id],
+    )
+    .await;
+    assert_eq!(
+        deployment
+            .binding_status(&forever.binding)
+            .await
+            .last_execution_id,
+        None,
+        "a conversation under the largest durations never ends"
+    );
+    forever.state.shutdown().await.expect("Bifrost stops");
+    assistant.deployment.shutdown().await;
 }

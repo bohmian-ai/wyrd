@@ -18,7 +18,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::{CardRef, CardSelector, RegistrationReceipt};
+use wyrd_ai::cards::{CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
@@ -2201,5 +2201,276 @@ async fn grouped_sampled_frames_are_bounded() {
         20 + 1 + 21 + 20 + 1,
         "every frame is judged once, and only the running one again"
     );
+    deployment.shutdown().await;
+}
+
+/// The executions of `binding`'s retained group reviews, oldest first, read
+/// as the administrator after publishing every captured row of `servers`.
+///
+/// # Panics
+/// Panics when a flush or the read fails.
+async fn group_reviews(
+    deployment: &Deployment,
+    servers: &[&WyrdTestServer],
+    binding: &BindingId,
+) -> Vec<ExecutionId> {
+    /// One `vala.verification.results` row's execution identity.
+    #[derive(Deserialize)]
+    struct Review {
+        /// The group execution the result settled.
+        execution_id: String,
+    }
+    for server in servers {
+        server.flush_bifrost().await.expect("rows publish");
+    }
+    let rows: Vec<Review> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT execution_id FROM vala.verification.results \
+             WHERE binding_id = $1 ORDER BY ended_at",
+            &[QueryParam::String(binding.to_string())],
+        )
+        .await
+        .expect("the reviews read back");
+    rows.into_iter()
+        .map(|row| {
+            row.execution_id
+                .parse()
+                .expect("the row names an execution")
+        })
+        .collect()
+}
+
+/// Assert `binding` retains exactly `expected` group reviews for `quiet`
+/// while every one of `servers` keeps polling: idle ticks on a primary, a
+/// replica, or a restarted process judge no group a second time.
+///
+/// # Panics
+/// Panics when a further review is retained.
+async fn assert_no_new_review(
+    deployment: &Deployment,
+    servers: &[&WyrdTestServer],
+    binding: &BindingId,
+    expected: &[ExecutionId],
+) {
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < quiet {
+        assert_eq!(
+            group_reviews(deployment, servers, binding).await,
+            expected,
+            "no group is reviewed twice"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Two support conversations run at once beside a drift sample, an
+/// ungrouped turn, the same `group_id` in another tenant, and a turn judged
+/// by a newer `turn-check` registered after the binding pinned its source.
+/// Each conversation is reviewed once with only its own pinned turns, in
+/// call order, and the ungrouped turn reads back with no group. A replica
+/// and then a restarted primary keep polling, and neither reviews a group
+/// a second time.
+///
+/// # Panics
+/// Panics when a step fails, a review is not judged in time, or a review
+/// differs or repeats.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_conversations_recover() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let (a, b) = (
+        GroupId::new("conv-a").expect("group id"),
+        GroupId::new("conv-b").expect("group id"),
+    );
+    let turn = |answer: &str| json!({ "answer": answer });
+    let slot = "turns".parse().expect("slot name");
+
+    let drift = assistant.state().await;
+    let sampled = drift
+        .run_for_card("model")
+        .expect("model run opens")
+        .observe()
+        .submit("latency-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the drift sample is recorded");
+    assert!(matches!(sampled, Submission::Recorded), "{sampled:?}");
+    support.turn("turn-check", &a, turn("a1")).await;
+    support.turn("turn-check", &b, turn("b1")).await;
+    let Submission::Queued(queued) = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(a.clone())
+        .submit("turn-check", turn("a2"))
+        .await
+        .expect("the turn is submitted")
+    else {
+        panic!("a turn-check submission queues an execution");
+    };
+    support.turn("turn-check", &b, turn("")).await;
+    let ungrouped = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("turn-check", turn("solo"))
+        .await
+        .expect("an ungrouped turn is judged");
+    queued.wait(WAIT).await.expect("the queued turn is judged");
+
+    let cards = deployment.cards().await;
+    let newer = register(&cards, "cards/verify_in_real_time/turn-check-newer.yaml").await;
+    let late = support
+        .enqueue_over_http(
+            deployment,
+            "support-newer-turn",
+            &json!({
+                "verifier_card_uid": newer.root.uid,
+                "card_uid": registered(&support.receipt, "assistant-agent").uid,
+                "group_id": a,
+                "inputs": {"turn": {"kind": "json", "value": turn("newer")}},
+            }),
+        )
+        .await;
+    Execution::connect_with(late, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the newer Verifier judges the turn");
+
+    let tenant_b = deployment.client(&deployment.other_tenant_admin("tenant-b").await);
+    let b_cards = Cards::connect_with(&tenant_b)
+        .await
+        .expect("handle connects");
+    let b_support = register(&b_cards, "cards/verify_in_real_time/support.yaml").await;
+    let b_bundle = hydrate(&b_cards, &b_support.root).await;
+    let [kind, name, version, space] = coordinates(&b_support.root);
+    let b_key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(tenant_b))
+        .await
+        .expect("the CLI issues tenant B's Service key")
+        .key;
+    let b_state = WyrdState::from_path_with(
+        b_bundle.path().join("bundle"),
+        deployment.client(b_key.expose()),
+    )
+    .expect("bundle loads");
+    b_state.start_bifrost().await.expect("Bifrost starts");
+    b_state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(a.clone())
+        .verify("turn-check", turn("tenant b"))
+        .await
+        .expect("tenant B's turn is judged");
+    for state in [&support.state, &drift, &b_state] {
+        state.shutdown().await.expect("Bifrost stops");
+    }
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let reviews = loop {
+        let reviews = group_reviews(deployment, &[deployment.server()], &support.binding).await;
+        if reviews.len() >= 2 {
+            break reviews;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both conversations are reviewed within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let admin = deployment.admin();
+    let mut judged = Vec::new();
+    for id in &reviews {
+        let state = Execution::connect_with(*id, &admin)
+            .await
+            .expect("the execution handle connects")
+            .status()
+            .await
+            .expect("the review reads");
+        let result = state.result.expect("the result is visible");
+        judged.push((
+            state.group_id.expect("a group review names its group"),
+            state.group.expect("the review pins its snapshot").sources[&slot]
+                .execution_ids
+                .len(),
+            serde_json::to_value(&result.outcome.evidence[&slot]).expect("evidence encodes"),
+            result.outcome.verdict,
+        ));
+    }
+    judged.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    assert_eq!(
+        judged,
+        [
+            (
+                a,
+                2,
+                json!({"kind": "json", "value": [turn("a1"), turn("a2")]}),
+                VerificationVerdict::Passed,
+            ),
+            (
+                b,
+                2,
+                json!({"kind": "json", "value": [turn("b1"), turn("")]}),
+                VerificationVerdict::Failed,
+            ),
+        ],
+        "each conversation judges only its own pinned turns"
+    );
+    /// One retained result's persisted `group_id` column.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Grouping {
+        /// The group the result belongs to, absent for an ungrouped turn.
+        group_id: Option<String>,
+    }
+    let solo: Vec<Grouping> = Bifrost::connect_with(&admin, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT group_id FROM vala.verification.results WHERE execution_id = $1",
+            &[QueryParam::String(ungrouped.execution_id.to_string())],
+        )
+        .await
+        .expect("the ungrouped result reads back");
+    assert_eq!(
+        solo,
+        [Grouping { group_id: None }],
+        "the turn joins no group"
+    );
+
+    let replica = deployment
+        .server()
+        .start_bound_replica(on_judge(WyrdTestServer::builder(), &assistant.judge))
+        .await
+        .expect("the replica starts");
+    assert_no_new_review(
+        deployment,
+        &[deployment.server(), &replica],
+        &support.binding,
+        &reviews,
+    )
+    .await;
+    replica.shutdown().await.expect("the replica stops");
+    let Assistant {
+        deployment, judge, ..
+    } = assistant;
+    let deployment = deployment
+        .restart(on_judge(WyrdTestServer::builder(), &judge))
+        .await;
+    assert_no_new_review(
+        &deployment,
+        &[deployment.server()],
+        &support.binding,
+        &reviews,
+    )
+    .await;
     deployment.shutdown().await;
 }

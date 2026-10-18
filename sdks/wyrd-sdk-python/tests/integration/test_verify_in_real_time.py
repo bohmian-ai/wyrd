@@ -7,6 +7,8 @@ the named Verifier authorizes a verify; the local model provider stands in
 for the judge and agrees with every answer, citing it.
 """
 
+from __future__ import annotations
+
 import json
 import secrets
 import time

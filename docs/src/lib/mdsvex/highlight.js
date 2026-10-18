@@ -100,11 +100,14 @@ function parseLines(spec) {
  * Anchor comment lines never appear in the output. Throws, failing the build,
  * for a missing file, a missing region, a range past the end of the file, or a
  * non-literal attribute. Returns the embedded files so Vite rebuilds the page
- * when one changes.
+ * when one changes. `render` turns each resolved body into its replacement:
+ * the highlighted `<CodeBlock>` for the site, or a Markdown fence for the
+ * plain-text agent reference.
  * @param {string} content
+ * @param {(code: string, lang: string, title: string, marked?: string) => string} [render]
  * @returns {{ code: string, dependencies: string[] }}
  */
-export function embedCodeFromFile(content) {
+export function embedCodeFromFile(content, render = codeBlock) {
   /** @type {string[]} */
   const dependencies = [];
   const code = content.replace(/<CodeFromFile\b([^>]*?)\/>/g, (tag, attrs) => {
@@ -123,7 +126,7 @@ export function embedCodeFromFile(content) {
     dependencies.push(abs);
     if (props.region && props.range) throw new Error(`CodeFromFile: use "region" or "range", not both: ${tag}`);
     const body = props.region ? sliceRegion(src, props.region, tail) : props.range ? sliceRange(src, props.range) : src;
-    return codeBlock(stripAnchors(body), props.lang, props.title ?? path.basename(tail), props.highlight);
+    return render(stripAnchors(body), props.lang, props.title ?? path.basename(tail), props.highlight);
   });
   return { code, dependencies };
 }

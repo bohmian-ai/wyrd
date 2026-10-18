@@ -265,7 +265,7 @@ export type BlockSource = string | MediaSource;
  *
  * The closed catalog a Verifier step Agent may name in [`AgentSpec::tool_names`] and the exact object a `tool:invoke` permission may be scoped to. Registration and authorization share this one vocabulary, so a name is either a built-in everywhere or nowhere.
  */
-export type BuiltinTool = "cards.list" | "cards.get" | "cards.get_by_ref" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "code.run";
+export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "code.run";
 
 /**
  * What executed one Agent, code, extract, or drift block.
@@ -343,6 +343,36 @@ export interface CancelRunningQueryResponse {
 }
 
 /**
+ * Outcome for one submission in a composite declaration.
+ */
+export interface CardDeclarationOutcome {
+  /**
+   * BLAKE3 hex hash of the sorted artifact manifest, when present.
+   */
+  readonly artifact_hash: string | null;
+  /**
+   * URI of the durable card blob once written.
+   */
+  readonly card_blob_uri: string | null;
+  /**
+   * Server-resolved card identity.
+   */
+  readonly card_ref: CardRef;
+  /**
+   * Declaration result for this submission.
+   */
+  readonly outcome: DeclarationOutcomeKind;
+  /**
+   * BLAKE3 hex hash of the JCS-canonical resolved spec.
+   */
+  readonly spec_hash: string;
+  /**
+   * Server-managed lifecycle state.
+   */
+  readonly status: CardLifecycleStatus;
+}
+
+/**
  * Wyrd Card kind.
  */
 export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source";
@@ -385,36 +415,6 @@ export interface CardRef {
    * Exact referenced Card version.
    */
   readonly version: VersionBlock;
-}
-
-/**
- * Outcome for one submission in a composite registration.
- */
-export interface CardDeclarationOutcome {
-  /**
-   * BLAKE3 hex hash of the sorted artifact manifest, when present.
-   */
-  readonly artifact_hash: string | null;
-  /**
-   * URI of the durable card blob once written.
-   */
-  readonly card_blob_uri: string | null;
-  /**
-   * Server-resolved card identity.
-   */
-  readonly card_ref: CardRef;
-  /**
-   * Registration result for this submission.
-   */
-  readonly outcome: DeclarationOutcomeKind;
-  /**
-   * BLAKE3 hex hash of the JCS-canonical resolved spec.
-   */
-  readonly spec_hash: string;
-  /**
-   * Server-managed lifecycle state.
-   */
-  readonly status: CardLifecycleStatus;
 }
 
 /**
@@ -1291,6 +1291,27 @@ export interface DecidePassRatePassRate {
    * Minimum passed share.
    */
   readonly threshold: number;
+}
+
+/**
+ * Result of a declaration write.
+ */
+export type DeclarationOutcomeKind = "declared" | "idempotent_noop" | "deduplicated";
+
+/**
+ * Public SDK receipt after the engine completes all required side effects.
+ *
+ * Upload plans and operation identifiers remain internal to the declaration engine and are intentionally absent from this projection.
+ */
+export interface DeclarationReceipt {
+  /**
+   * Dependency-first server outcomes with final lifecycle state.
+   */
+  readonly outcomes: readonly CardDeclarationOutcome[];
+  /**
+   * Server-derived graph root.
+   */
+  readonly root: CardRef;
 }
 
 /**
@@ -4450,27 +4471,6 @@ export interface RegisteredVerifierCard {
 }
 
 /**
- * Result of a registration write.
- */
-export type DeclarationOutcomeKind = "registered" | "idempotent_noop" | "deduplicated";
-
-/**
- * Public SDK receipt after the engine completes all required side effects.
- *
- * Upload plans and operation identifiers remain internal to the registration engine and are intentionally absent from this projection.
- */
-export interface DeclarationReceipt {
-  /**
-   * Dependency-first server outcomes with final lifecycle state.
-   */
-  readonly outcomes: readonly CardDeclarationOutcome[];
-  /**
-   * Server-derived graph root.
-   */
-  readonly root: CardRef;
-}
-
-/**
  * Server-derived relationship summary for graph, UI, policy, imports, and diff.
  */
 export interface Relationships {
@@ -5855,7 +5855,7 @@ export interface VersionBumpPrePre {
 }
 
 /**
- * Authored version on the card-registration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.
+ * Authored version on the card-declaration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.
  */
 export type VersionSpec = string;
 

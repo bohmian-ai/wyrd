@@ -1256,4 +1256,235 @@ mod pg_tests {
         );
         Ok(())
     }
+
+    /// The support conversation's group review, read over MCP once the
+    /// group goes idle: poll `verification.get_binding` until it names a
+    /// completed execution, publishing captured rows each round so the group
+    /// poller discovers them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool-call or flush failure, or an error when no review
+    /// completes within [`SETTLE`].
+    async fn group_review(
+        server: &WyrdTestServer,
+        client: &RunningService<RoleClient, ()>,
+        binding_id: &str,
+    ) -> Result<JsonValue, McpJourneyError> {
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        loop {
+            server.flush_bifrost().await?;
+            let binding = structured(
+                client
+                    .call_tool(call(
+                        GET_BINDING,
+                        serde_json::json!({ "binding_id": binding_id }),
+                    )?)
+                    .await?,
+            )?;
+            if let Some(id) = binding["last_execution_id"].as_str() {
+                let state = settle(client, id).await?;
+                if state["status"] == "completed" {
+                    return Ok(state);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("binding {binding_id} completed no group review").into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// An agent discovers its `group_end` binding, judges a conversation's
+    /// turns through `verification.execute` and a keyed
+    /// `verification.enqueue` that both carry `group_id`, and inspects the
+    /// group review over MCP.
+    ///
+    /// The Service reads its Card and finds the binding whose status pins
+    /// `group_end` settings. Each grouped tool result and execution read
+    /// echoes the same `group_id`, and an ungrouped `execute` leaves its
+    /// result without one. Once the group goes idle the binding names one
+    /// review whose snapshot holds exactly the two grouped turns in call
+    /// order, and `bifrost.query` reads the same `group_id` on its persisted
+    /// result row. A reader is refused a grouped enqueue, and another
+    /// tenant's administrator cannot read the review.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures, or an error when an execution or the review never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the administrator's Cards handle cannot connect, or when
+    /// any binding, group, snapshot, row, or refusal expectation fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn grouped_verification_discover_act_observe() -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-group-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let receipt = Box::pin(cards.register_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verify_in_real_time/support.yaml"
+        ))))
+        .await?;
+        let uid = |name: &str| -> Result<String, McpJourneyError> {
+            Ok(receipt
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.name.as_str() == name)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .ok_or("the fixture registers the named Card")?
+                .to_string())
+        };
+        let (service_uid, turn_check, agent_uid) =
+            (uid("support")?, uid("turn-check")?, uid("assistant-agent")?);
+        let agent = server
+            .credential_registered_service(&receipt.root, &["editor"])
+            .await?;
+        let agent_client = connect(&server, &agent).await?;
+
+        // Discover: the Service's Card names the binding whose status pins group_end.
+        let card = structured(
+            agent_client
+                .call_tool(call(
+                    CARDS_GET,
+                    serde_json::json!({ "kind": "Service", "card_uid": service_uid }),
+                )?)
+                .await?,
+        )?;
+        let mut grouped = Vec::new();
+        for id in card["card"]["status"]["verification"]["binding_ids"]
+            .as_array()
+            .ok_or("the Service names its bindings")?
+        {
+            let binding = structured(
+                agent_client
+                    .call_tool(call(GET_BINDING, serde_json::json!({ "binding_id": id }))?)
+                    .await?,
+            )?;
+            if !binding["group_end"].is_null() {
+                grouped.push(text(&binding, "/binding_id")?.to_owned());
+            }
+        }
+        let [binding_id] = grouped.as_slice() else {
+            panic!("the Service binds exactly one group_end Verifier: {grouped:?}");
+        };
+
+        // Act: one grouped execute, one keyed grouped enqueue, one ungrouped execute.
+        let turn = |answer: &str, group: Option<&str>| {
+            let mut body = serde_json::json!({
+                "verifier_card_uid": turn_check,
+                "card_uid": agent_uid,
+                "inputs": { "turn": { "kind": "json", "value": { "answer": answer } } },
+            });
+            if let Some(group) = group {
+                body["group_id"] = group.into();
+            }
+            body
+        };
+        let executed = structured(
+            agent_client
+                .call_tool(call(EXECUTE, turn("first", Some("conv-mcp")))?)
+                .await?,
+        )?;
+        let first = text(&executed, "/execution_id")?.to_owned();
+        let mut enqueue = turn("second", Some("conv-mcp"));
+        enqueue["idempotency_key"] = "mcp-group-0002".into();
+        let second = text(
+            &structured(
+                agent_client
+                    .call_tool(call(ENQUEUE, enqueue.clone())?)
+                    .await?,
+            )?,
+            "/execution_id",
+        )?
+        .to_owned();
+        let state = settle(&agent_client, &second).await?;
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(state["group_id"], "conv-mcp", "{state}");
+        let ungrouped = structured(
+            agent_client
+                .call_tool(call(EXECUTE, turn("solo", None))?)
+                .await?,
+        )?;
+        let solo = text(&ungrouped, "/execution_id")?.to_owned();
+
+        // Observe: one review over exactly the two grouped turns, in call order.
+        let review = group_review(&server, &agent_client, binding_id).await?;
+        assert_eq!(review["group_id"], "conv-mcp", "{review}");
+        assert_eq!(review["owner_card_uid"], service_uid.as_str(), "{review}");
+        assert_eq!(
+            review["group"]["sources"]["turns"]["execution_ids"],
+            serde_json::json!([first, second]),
+            "{review}"
+        );
+        assert_eq!(
+            review["result"]["outcome"]["evidence"]["turns"],
+            serde_json::json!({ "kind": "json", "value": [{ "answer": "first" }, { "answer": "second" }] }),
+        );
+        assert_eq!(review["result"]["outcome"]["verdict"], "passed", "{review}");
+        let review_id = text(&review, "/execution_id")?.to_owned();
+        server.flush_bifrost().await?;
+        let persisted = rows(
+            &agent_client,
+            format!(
+                "SELECT execution_id, group_id FROM vala.verification.results \
+                 WHERE execution_id IN ('{first}', '{solo}', '{review_id}') ORDER BY ended_at"
+            ),
+        )
+        .await?;
+        assert_eq!(
+            persisted,
+            serde_json::json!([
+                [first, "conv-mcp"],
+                [solo, JsonValue::Null],
+                [review_id, "conv-mcp"]
+            ]),
+            "the persisted group_id column matches each call"
+        );
+        agent_client.cancel().await?;
+
+        let reader = server
+            .bootstrap_service("mcp-group-reader", &["viewer"])
+            .await?;
+        let reader_client = connect(&server, &reader).await?;
+        let denied = refusal(reader_client.call_tool(call(ENQUEUE, enqueue)?).await)?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "an unscoped grouped enqueue is refused: {denied}"
+        );
+        reader_client.cancel().await?;
+        let other_tenant = server.seed_tenant("mcp-group-other").await?;
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "mcp-group-foreign", &["admin"])
+            .await?;
+        let foreign_client = connect(&server, &foreign).await?;
+        let foreign_read = refusal(
+            foreign_client
+                .call_tool(call(
+                    GET_EXECUTION,
+                    serde_json::json!({ "execution_id": review_id }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            foreign_read.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+            "another tenant cannot read the group review: {foreign_read}"
+        );
+        foreign_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }

@@ -1,8 +1,8 @@
 //! Trigger Card spec: the closed activation that creates a Verifier execution.
 //!
 //! `schedule` runs a bound Verifier on cron boundaries; `group_end` runs a
-//! group Verifier once a `group_id` group of source executions goes idle or
-//! reaches its maximum age, under the Trigger's own [`TriggerDuration`]s.
+//! group Verifier once no new source evidence of a `group_id` group has been
+//! acknowledged for the Trigger's one [`TriggerDuration`], `after`.
 //!
 //! A Trigger declares *when* a bound Verifier runs. It never names the
 //! Verifier, an Operator, or a verdict threshold: the verification binding
@@ -46,18 +46,12 @@ pub enum TriggerActivation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
-    /// Activate once per `group_id` group of source executions that has gone
-    /// quiet or grown old, re-judging it serially as new evidence arrives.
+    /// Activate once per `group_id` group of source executions this long
+    /// after its latest acknowledged source evidence; new evidence postpones
+    /// it and, once judged, schedules a later group execution.
     GroupEnd {
-        /// The group ends once its newest source input or result row is
-        /// older than this.
-        idle: TriggerDuration,
-        /// The group ends once its first source row is older than this, even
-        /// while activity continues.
-        max_age: TriggerDuration,
-        /// Rows timed at or after the group's first source row plus this no
-        /// longer reopen or expand the group; nothing is deleted.
-        finality: TriggerDuration,
+        /// Quiet period after the latest acknowledged source input or result.
+        after: TriggerDuration,
     },
 }
 
@@ -286,41 +280,34 @@ mod tests {
         assert!(error.to_string().contains("api_token"), "{error}");
     }
 
-    /// Decode a group-end activation with its three durations, read back
-    /// verbatim, and refuse a missing finality or a malformed duration.
+    /// Decode a group-end activation with its one duration, read back
+    /// verbatim, and refuse a missing `after`, the removed multi-clock fields,
+    /// or a malformed duration.
     ///
     /// # Panics
     /// Panics when the authored form fails to decode, reads back differently,
-    /// or a malformed form decodes.
+    /// or a refused form decodes.
     #[test]
-    fn group_end_decodes_its_durations() {
-        let authored = serde_json::json!({
-            "kind": "group_end",
-            "idle": "30m",
-            "max_age": "24h",
-            "finality": "30d",
-        });
+    fn group_end_decodes_its_duration() {
+        let authored = serde_json::json!({"kind": "group_end", "after": "30m"});
         let spec: TriggerSpec =
             serde_json::from_value(authored.clone()).expect("group_end decodes");
-        let TriggerActivation::GroupEnd {
-            idle,
-            max_age,
-            finality,
-        } = &spec.activation
-        else {
+        let TriggerActivation::GroupEnd { after } = &spec.activation else {
             panic!("decoded {:?}", spec.activation);
         };
-        assert_eq!(
-            (idle.seconds(), max_age.seconds(), finality.seconds()),
-            (1_800, 86_400, 2_592_000)
-        );
+        assert_eq!(after.seconds(), 1_800);
         assert_eq!(serde_json::to_value(&spec).expect("encodes"), authored);
-        assert!(
-            serde_json::from_value::<TriggerSpec>(
-                serde_json::json!({"kind": "group_end", "idle": "30m", "max_age": "24h"})
-            )
-            .is_err()
-        );
+        for refused in [
+            serde_json::json!({"kind": "group_end"}),
+            serde_json::json!({"kind": "group_end", "after": "30m", "idle": "30m"}),
+            serde_json::json!({"kind": "group_end", "after": "30m", "max_age": "24h"}),
+            serde_json::json!({"kind": "group_end", "after": "30m", "finality": "30d"}),
+        ] {
+            assert!(
+                serde_json::from_value::<TriggerSpec>(refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
         for text in [
             "",
             "m",

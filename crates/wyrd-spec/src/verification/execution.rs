@@ -16,7 +16,7 @@ use serde_json::Value;
 use skald_spec::MediaFormat;
 
 use super::{
-    DriftReport, DriftWindow, GroupCoverage, OperatorDispatchState, VerificationError,
+    DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
     VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
@@ -179,7 +179,7 @@ pub struct VerificationExecutionState {
     pub owner_card_uid: Option<CardUid>,
     /// The source snapshot a group execution judges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<GroupCoverage>,
+    pub group: Option<GroupSnapshot>,
 }
 
 /// The attributable result of one Verifier execution.

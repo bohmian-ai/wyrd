@@ -240,13 +240,9 @@ pub struct VerificationBindingStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct GroupEndSettings {
-    /// The group ends once its newest source row is older than this.
-    pub idle: TriggerDuration,
-    /// The group ends once its first source row is older than this.
-    pub max_age: TriggerDuration,
-    /// Rows timed this long after the group's first source row no longer
-    /// reopen or expand it.
-    pub finality: TriggerDuration,
+    /// Quiet period after a group's latest acknowledged source input or
+    /// result before it is judged.
+    pub after: TriggerDuration,
     /// The exact source binding each source slot of the group Verifier reads.
     pub sources: BTreeMap<SlotName, GroupSource>,
 }
@@ -269,21 +265,15 @@ pub struct GroupSource {
 /// The source evidence one group execution pinned when it was enqueued.
 ///
 /// Every retry of the execution judges exactly this snapshot; later source
-/// rows only ever reach a later group execution.
+/// evidence only ever reaches a later group execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct GroupCoverage {
-    /// Newest eligible source row time (the row's PostgreSQL-anchored
-    /// `wyrd_ingested_at`) the snapshot covers.
-    pub through: DateTime<Utc>,
-    /// Distinct eligible source rows, inputs and results counted apart, the
-    /// snapshot covers; a later-visible row timed earlier raises it.
-    pub members: u64,
+pub struct GroupSnapshot {
     /// The pinned selection of each source slot.
     pub sources: BTreeMap<SlotName, GroupSourceSnapshot>,
 }
 
-/// One source slot's pinned selection within a [`GroupCoverage`].
+/// One source slot's pinned selection within a [`GroupSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct GroupSourceSnapshot {
@@ -293,11 +283,6 @@ pub struct GroupSourceSnapshot {
     /// order: earliest input ingest time (earliest result ingest time for a
     /// result-only execution), then execution ID.
     pub execution_ids: Vec<ExecutionId>,
-    /// The deployment source-execution ceiling, present only when the
-    /// eligible executions exceeded it; nothing was read and the group
-    /// judgment is inconclusive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exceeded_ceiling: Option<u32>,
 }
 
 /// Current state of one Operator dispatch in an execution status response.

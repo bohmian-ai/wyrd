@@ -33,8 +33,7 @@ ALTER TABLE wyrd.verifier_executions
     ADD COLUMN route_overrides JSONB,
     ADD COLUMN group_id        TEXT
         CHECK (group_id IS NULL OR octet_length(group_id) BETWEEN 1 AND 256),
-    ADD COLUMN group_through   TIMESTAMPTZ,
-    ADD COLUMN group_members   BIGINT CHECK (group_members IS NULL OR group_members > 0),
+    ADD COLUMN group_snapshot_sha256 BYTEA,
     ADD COLUMN group_sources   JSONB,
     ADD COLUMN group_verdict   TEXT
         CHECK (group_verdict IS NULL OR group_verdict IN ('passed', 'failed', 'inconclusive'));
@@ -43,10 +42,9 @@ ALTER TABLE wyrd.verifier_executions
 -- caller submission's or group snapshot's input declarations and route
 -- overrides. A submitted execution keeps its opaque caller `group_id`; a
 -- `group` execution judges one pinned snapshot of its binding's group, where
--- `group_through` and `group_members` are the newest eligible source row time
--- and distinct source input/result rows it covers, `group_sources` names each
--- source slot's selected identities or the read ceiling it exceeded, and
--- `group_verdict` is the settled verdict the next group result is compared
+-- `group_snapshot_sha256` is the content identity of that snapshot,
+-- `group_sources` names each source slot's selected executions, and
+-- `group_verdict` is the settled verdict later group results are compared
 -- with for `on_verdict_change`.
 ALTER TABLE wyrd.verifier_executions DROP CONSTRAINT verifier_runs_check4;
 ALTER TABLE wyrd.verifier_executions
@@ -67,8 +65,7 @@ ALTER TABLE wyrd.verifier_executions
         run_id IS NULL OR (origin = 'manual' AND inputs IS NOT NULL)
     ),
     ADD CONSTRAINT verifier_executions_group_shape CHECK (
-        (origin = 'group') = (group_through IS NOT NULL)
-        AND (origin = 'group') = (group_members IS NOT NULL)
+        (origin = 'group') = (octet_length(group_snapshot_sha256) IS NOT DISTINCT FROM 32)
         AND (origin = 'group') = (jsonb_typeof(group_sources) IS NOT DISTINCT FROM 'object')
         AND (origin <> 'group' OR group_id IS NOT NULL)
         AND (group_verdict IS NULL OR (origin = 'group' AND status = 'completed'))
@@ -77,16 +74,12 @@ ALTER TABLE wyrd.verifier_executions
         origin IN ('schedule', 'manual', 'group')
     ) NOT VALID;
 
--- At most one group execution is outstanding per binding and group, so
--- arrivals during it coalesce into the next snapshot.
-CREATE UNIQUE INDEX verifier_executions_group_outstanding
-    ON wyrd.verifier_executions (data_tenant_id, binding_id, group_id)
-    WHERE origin = 'group' AND status IN ('pending', 'running', 'retrying');
-
--- A group poll reads the settlement of every execution queued to its group.
-CREATE INDEX verifier_executions_group
-    ON wyrd.verifier_executions (data_tenant_id, group_id)
-    WHERE group_id IS NOT NULL;
+-- One group execution per binding, group, and snapshot content, whatever its
+-- status, so re-reading unchanged evidence enqueues nothing while distinct
+-- snapshots may overlap.
+CREATE UNIQUE INDEX verifier_executions_group_snapshot
+    ON wyrd.verifier_executions (data_tenant_id, binding_id, group_id, group_snapshot_sha256)
+    WHERE origin = 'group';
 
 ALTER TABLE wyrd.operator_dispatches RENAME COLUMN run_id TO execution_id;
 

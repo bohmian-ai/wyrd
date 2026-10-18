@@ -74,14 +74,12 @@ const RECORD_AUTHENTICATION_SQL: &str = r"
     RETURNING card_uid, statement_timestamp()
 ";
 
-/// Lock and list one owner's cursor bindings whose cursor is still null.
-///
-/// A `group_end` binding has no cron, so its row reads a null `schedule_cron`.
+/// Lock and list one owner's schedule bindings whose cursor is still null.
 const UNARMED_SCHEDULES_SQL: &str = r"
     SELECT binding_id, schedule_cron, schedule_tz
       FROM wyrd.verification_bindings
      WHERE owner_card_uid = $1
-       AND activation IN ('schedule', 'group_end')
+       AND activation = 'schedule'
        AND next_run_at IS NULL
      ORDER BY binding_id
        FOR UPDATE
@@ -311,7 +309,7 @@ pub enum BindingActivation {
         /// Authored IANA timezone; absent means UTC.
         tz: Option<String>,
     },
-    /// A `group_end` Trigger's pinned durations and exact source bindings.
+    /// A `group_end` Trigger's pinned duration and exact source bindings.
     GroupEnd(GroupEndSettings),
 }
 
@@ -403,8 +401,7 @@ pub async fn owner_binding_ids(
 /// principal's `last_authenticated_at` to PostgreSQL's statement time — never
 /// backward — when the principal is an active Card-bound Service or Agent,
 /// then sets every still-null `schedule` cursor of that exact owner Card
-/// version to its first boundary after that same database instant, and every
-/// still-null `group_end` cursor to that instant itself. Arming and
+/// version to its first boundary after that same database instant. Arming and
 /// the later due predicate therefore share one clock, and the caller's wall
 /// clock decides nothing. An already armed cursor is never moved, so a later
 /// exchange renews activity without resetting or postponing the schedule. A
@@ -429,21 +426,11 @@ pub async fn record_machine_authentication(
     let Some((owner, at)) = stamped else {
         return Ok(());
     };
-    let unarmed: Vec<(Uuid, Option<String>, Option<String>)> =
-        sqlx::query_as(UNARMED_SCHEDULES_SQL)
-            .bind(owner)
-            .fetch_all(&mut **conn.transaction())
-            .await?;
+    let unarmed: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(UNARMED_SCHEDULES_SQL)
+        .bind(owner)
+        .fetch_all(&mut **conn.transaction())
+        .await?;
     for (binding_id, cron, tz) in unarmed {
-        // A group_end cursor polls group discovery from the activation onward.
-        let Some(cron) = cron else {
-            sqlx::query(ARM_SCHEDULE_SQL)
-                .bind(binding_id)
-                .bind(at)
-                .execute(&mut **conn.transaction())
-                .await?;
-            continue;
-        };
         let next = match BindingSchedule::parse(&cron, tz.as_deref())
             .and_then(|schedule| schedule.next_after(at))
         {

@@ -3382,6 +3382,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    /// Rejects the retired `wyrd/hydrated-bundle/v1` header: no compatibility reader exists.
+    ///
+    /// # Panics
+    /// Panics if fixture rewriting fails or the retired header is accepted.
+    fn rejects_retired_bundle_api_version() {
+        let mut bundle = TestBundle::complete_service();
+        bundle.rewrite_manifest(|manifest| {
+            manifest.api_version = "wyrd/hydrated-bundle/v1".to_owned();
+        });
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "api_version",
+        );
+    }
+
+    #[test]
     /// Rejects manifests whose declared Card count disagrees with their contents.
     ///
     /// # Panics

@@ -255,3 +255,59 @@ ordinary cross-surface renames do not require renewed naming decisions.
   [execution](../../../../architecture/references/languages/implementation-execution.md), [testing](../../../../architecture/references/languages/testing-workflows.md).
 - [Agent harness](../../../../architecture/references/languages/agent-harness.md), [errors](../../../../architecture/references/languages/errors.md),
   [security](../../../../architecture/wyrd-security-posture.md), [Bifrost](../../../../architecture/bifrost-design.md).
+
+## Implementation Evidence
+
+Status: IMPLEMENTED on `change/local-dev-setup` (commits `21ebaf94a`..HEAD).
+
+### Acceptance matrix
+
+| Criterion | Evidence | Result |
+|---|---|---|
+| Local check validates disk references with no server contact; real declare authoritative (REQ-002, AC-002) | P1/P2; `card_lifecycle::removed_card_verbs_are_usage_errors`; real declaration in P6 | PASS |
+| Public declaration names and in-place SQL/replay/audit agree; no aliases (REQ-003, AC-003) | P3–P6, P9–P12; audit operations `card.declaration.*`; `codegen:check`; served OpenAPI P5 | PASS |
+| Get is one envelope without artifacts; merged MCP `cards.get` keeps selectors and refusals (REQ-004, AC-004) | P6–P9; MCP ambiguous/partial-selector cases; per-kind Python get refuses `eager_load`/`load_kwargs`; CLI get round trips in P10–P12 | PASS |
+| Pull yields complete loadable bundles; metadata-only and failures safe; public CLI load removed (REQ-004, AC-005) | P6/P8/P10–P12; `state::tests::rejects_retired_bundle_api_version`; `rejects_metadata_only_bundle_as_unhydrated`; `failed_replacement_restores_the_previous_bundle` | PASS |
+| Ownership, auth/tenancy, runtime loading, durability unchanged (INV-001–005) | `check:deps`, `check:tenant-isolation`, P4 cross-tenant/non-active, py:test:unit 598 passed | PASS |
+
+### Renamed exact selectors
+
+- P1 `card_lifecycle::declare_check_is_local_and_returns_machine_readable_card_projection`
+- P2 `card_lifecycle::invalid_local_reference_returns_card_load_error_without_credentials`, `card_lifecycle::declare_rejects_an_unreadable_artifact_manifest_before_authentication`
+- P3 `pg_cards_declare::consolidated_declaration_migration_has_locked_shape`, `pg_cards_declare::subject_actor_creation_and_replay`
+- P4 `pg_card_declaration_route::declaration_replays_through_public_authenticated_route`, `pg_card_declaration_route::non_active_and_cross_tenant_dependencies_leave_no_writes`
+- P5 unchanged; P6 unchanged; P7 unchanged
+- P8 `card_lifecycle::pg_tests::multi_card_service_pull_publishes_complete_and_metadata_bundles`
+- P9 `test_cards_crud.py::test_prompt_cards_declare_get_list_resolve_latest_and_delete`, `::test_data_card_custom_interface_get_requires_interface_and_downloads_no_artifacts`, `::test_model_card_custom_interface_get_requires_interface_and_downloads_no_artifacts`
+- P10 `declare_and_pull::service_graph_declares_and_pulls`, `declare_and_pull::cards_get_returns_every_kind_typed` (+ `cli_declare_get_and_pull_round_trip_the_graph`, `refused_cli_command_raises_its_catalog_code`)
+- P11 `tests/integration/test_declare_and_pull.py::test_service_graph_declares_and_pulls`, `::test_cards_get_returns_every_kind_as_envelope` (+ CLI round-trip and refused tests)
+- P12 `tests/integration/declare-and-pull.test.ts -t '^(service graph declares and pulls|cards get returns every kind typed|cli declare get and pull round trip the graph|refused cli command raises its catalog code)$'`
+
+### Commands and results
+
+| Command | Result |
+|---|---|
+| P1/P2 nextest (`wyrd-cli --test cli`) | 3 passed |
+| P3 (with-test-postgres, `wyrd-sql --test integration`) | 2 passed |
+| P4 (`wyrd-server --test integration`) | 2 passed |
+| P5 `pg_openapi_contract::card_contract_publishes_typed_lifecycle_and_problem_shapes` | 1 passed |
+| P6 + P8 (`wyrd-cli --test cli`) | 2 passed |
+| P7 (`wyrd-mcp --test mcp -P journey`) | 1 passed |
+| P9 pytest | 3 passed |
+| P10 (`wyrd-ai --test integration -P journey`) | 4 passed |
+| P11 pytest | 4 passed |
+| P12 vitest | 4 passed |
+| `wyrd-client --lib state::tests::rejects_retired_bundle_api_version` | 1 passed |
+| `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:regen`, `codegen:check` | pass |
+| `mise run py:format`, `py:lints`, `py:typecheck`, `py:test:unit` | pass (598 passed) |
+| `mise run ts:napi:check`, `ts:format:check`, `ts:lints`, `ts:typecheck` | pass |
+| `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` / `build` / vitest | 0 errors / built / 178 passed |
+| `mise run docs:check` | pass |
+| `git diff --check` | clean |
+
+### Non-goal closure and diff audit
+
+- Not done (TASK-002/003): guide `start` topic, MCP declaration/check tools, common CLI JSON/error stream, onboarding prose rewrite. Docs received only mechanical verb, vocabulary, and page-slug updates (`declare/declare-and-inspect`).
+- No compatibility readers, aliases, or old-name gates. The retired `wyrd/hydrated-bundle/v1` header and the `plan`/`apply`/`load` verbs are refused.
+- Runtime hydration names (`HydratedCard`, `PythonStateHydrator`, `hydrate_interface`, `HydratedStateIndex`, `runtime_hydration_error`) and unrelated registrations (Bifrost tables, tools, providers, roles, compaction, UI workspace and component registries) are unchanged.
+- Migrations were edited in place as approved (pre-release schema).

@@ -69,6 +69,7 @@ async fn consolidated_declaration_migration_has_locked_shape() {
         vec![
             "blob_failed_at",
             "card_blob_uri",
+            "declaration_operation_id",
             "finalized_at",
             "pending_since",
             "reconcile_attempts",
@@ -80,7 +81,6 @@ async fn consolidated_declaration_migration_has_locked_shape() {
             "reconcile_lease_owner",
             "reconcile_next_attempt_at",
             "reconcile_status",
-            "declaration_operation_id",
         ]
     );
     let tables: Vec<String> = sqlx::query_scalar(

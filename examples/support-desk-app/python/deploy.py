@@ -23,7 +23,7 @@ def deploy(client: WyrdClient | None = None) -> None:
     cards = Cards(client)
     receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
     shutil.rmtree(BUNDLE, ignore_errors=True)
-    cards.hydrate(receipt.root, BUNDLE)
+    cards.pull(receipt.root, BUNDLE)
     Gateway(client).put_capture_policy({"mode": "metadata", "payload_fields": []})
     print(f"registered {receipt.root} into {BUNDLE.name}")
     # ANCHOR_END: deploy

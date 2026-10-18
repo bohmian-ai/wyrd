@@ -1,4 +1,4 @@
-"""A Service graph registers from checked-in YAML, reads back typed, and hydrates (AC-047, AC-049, AC-051)."""
+"""A Service graph declares from checked-in YAML, reads back typed, and pulls (AC-047, AC-049, AC-051)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from wyrd.prompt import PromptCard
 from wyrd.state import CardEnvelope, WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import FIXTURES, download, hydrated, register
+from .support import FIXTURES, declare, hydrated, pull
 
 pytestmark = pytest.mark.integration
 
@@ -24,13 +24,13 @@ SUPPORT_DESK = "cards/declare_and_pull/support-desk.yaml"
 @pytest.fixture(scope="module")
 def support_desk(cards: Cards) -> dict[str, CardRef]:
     """The ``support-desk`` graph, registered after its artifact-bearing Model; every Card by name."""
-    return {**register(cards, SUPPORT_MODEL), **register(cards, SUPPORT_DESK)}
+    return {**declare(cards, SUPPORT_MODEL), **declare(cards, SUPPORT_DESK)}
 
 
-def test_service_graph_registers_and_hydrates(
+def test_service_graph_declares_and_pulls(
     cards: Cards, support_desk: dict[str, CardRef], tmp_path: Path
 ) -> None:
-    bundle = download(cards, "support-desk", tmp_path)
+    bundle = pull(cards, "support-desk", tmp_path)
 
     state = hydrated(bundle)
 
@@ -65,8 +65,8 @@ def test_registering_the_graph_again_is_idempotent(
 def test_cards_get_returns_every_kind_as_envelope(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
-    baseline = register(cards, "cards/latency_baseline/latency-baseline.yaml")["latency-baseline"]
-    daily = register(cards, "cards/scheduled_drift_alerts_operator/daily.yaml")["daily"]
+    baseline = declare(cards, "cards/latency_baseline/latency-baseline.yaml")["latency-baseline"]
+    daily = declare(cards, "cards/scheduled_drift_alerts_operator/daily.yaml")["daily"]
     refs = [
         (CardKind.Data, baseline),
         (CardKind.Model, support_desk["support-model"]),
@@ -81,7 +81,7 @@ def test_cards_get_returns_every_kind_as_envelope(
     envelopes = [cards.get(ref) for _, ref in refs]
 
     # Every kind reads back as the native envelope with its exact identity,
-    # mapping-valued content, and no graph aliases (registry reads hydrate nothing).
+    # mapping-valued content, and no graph aliases (registry reads pull nothing).
     for (kind, ref), envelope in zip(refs, envelopes, strict=True):
         assert isinstance(envelope, CardEnvelope)
         assert envelope.card_ref == ref
@@ -106,7 +106,7 @@ def test_cards_get_returns_every_kind_as_envelope(
     assert operator.spec["kind"] == "http"
 
 
-def test_artifact_without_digest_registers(cards: Cards, support_desk: dict[str, CardRef]) -> None:
+def test_artifact_without_digest_declares(cards: Cards, support_desk: dict[str, CardRef]) -> None:
     """The fixture Model lists its artifact without a digest; the client computes it."""
     model = cards.get(support_desk["support-model"])
 
@@ -125,7 +125,7 @@ def test_retired_card_kind_is_refused(cards: Cards) -> None:
     assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
-def test_viewer_cannot_register_cards(viewer_key: str) -> None:
+def test_viewer_cannot_declare_cards(viewer_key: str) -> None:
     reader = Cards(WyrdClient(credential=viewer_key))
 
     with pytest.raises(WyrdError) as refused:
@@ -133,13 +133,17 @@ def test_viewer_cannot_register_cards(viewer_key: str) -> None:
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
 
-def test_cli_apply_and_get_round_trip_the_graph(
+def test_cli_declare_get_and_pull_round_trip_the_graph(
     wyrd_server: WyrdTestServer, support_desk: dict[str, CardRef], tmp_path: Path
 ) -> None:
     client = WyrdClient(credential=wyrd_server.api_key)
-    applied = cli.apply(FIXTURES / SUPPORT_DESK, client=client)
+    declared = cli.declare(FIXTURES / SUPPORT_DESK, client=client)
 
-    summary = cli.get(
+    envelope = cli.get(
+        kind="Service", space="default", name="support-desk", version="1.0.0", client=client
+    )
+    assert not any(tmp_path.iterdir())
+    summary = cli.pull(
         output_dir=tmp_path,
         kind="Service",
         space="default",
@@ -148,30 +152,36 @@ def test_cli_apply_and_get_round_trip_the_graph(
         client=client,
     )
 
-    assert applied.root == support_desk["support-desk"]
+    assert declared.root == support_desk["support-desk"]
+    assert isinstance(envelope, CardEnvelope)
+    assert envelope.card_ref == support_desk["support-desk"]
+    assert envelope.kind == CardKind.Service
     assert (summary.mode, summary.root) == ("complete", support_desk["support-desk"])
     assert hydrated(tmp_path).service.card_ref == support_desk["support-desk"]
 
 
 def test_refused_cli_command_raises_its_catalog_code(tmp_path: Path) -> None:
     with pytest.raises(WyrdError) as refused:
-        cli.get(
+        cli.get(kind="Service", space="default", name="no-such-service", version="1.0.0")
+    assert refused.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+    with pytest.raises(WyrdError) as refused_pull:
+        cli.pull(
             output_dir=tmp_path,
             kind="Service",
             space="default",
             name="no-such-service",
             version="1.0.0",
         )
-    assert refused.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+    assert refused_pull.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
 
 
-def test_hydrated_agent_prompt_card_navigation(
+def test_pulled_agent_prompt_card_navigation(
     cards: Cards, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Inline, path and CardRef Agents navigate offline to their registered Prompt Cards."""
-    register(cards, "cards/agent_prompt/desk-prompt.yaml")
-    desk = register(cards, "cards/agent_prompt/prompt-desk.yaml")
-    bundle = download(cards, "prompt-desk", tmp_path)
+    declare(cards, "cards/agent_prompt/desk-prompt.yaml")
+    desk = declare(cards, "cards/agent_prompt/prompt-desk.yaml")
+    bundle = pull(cards, "prompt-desk", tmp_path)
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
 
     state = WyrdState.from_path(bundle)
@@ -239,8 +249,8 @@ NATIVE_SPEC = {
 
 def test_prompt_forms_round_trip_as_authored(cards: Cards, tmp_path: Path) -> None:
     """Portable and native Prompts, standalone and inline, read and hydrate as authored with one hash."""
-    registered = register(cards, "cards/declare_and_pull/authored-prompts.yaml")
-    state = WyrdState.from_path(download(cards, "authored-prompts", tmp_path))
+    registered = declare(cards, "cards/declare_and_pull/authored-prompts.yaml")
+    state = WyrdState.from_path(pull(cards, "authored-prompts", tmp_path))
     answer = PORTABLE_SPEC["response_format"]
 
     for name, prompt, authored, variables, schema in (

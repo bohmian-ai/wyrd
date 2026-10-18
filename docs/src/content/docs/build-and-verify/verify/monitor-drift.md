@@ -32,7 +32,7 @@ baseline = DataCard(
     name="churn-baseline",
     version="1.0.0",
 )
-Cards().data.register(baseline)
+Cards().data.declare(baseline)
 ```
 
 Registration uploads the data and records its schema and statistics. Keep the columns to the features you will score: every feature the Verifier names must be a column here.

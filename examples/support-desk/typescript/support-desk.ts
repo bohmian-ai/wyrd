@@ -83,7 +83,7 @@ export function uid(desk: Desk, name: string): string {
 export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> {
   const cards = await Cards.connect({ client });
   const receipt = await cards.declareFromPath(join(SERVICE, "support-desk.yaml"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle, { client });
   const gateway = await Gateway.connect({ client });
   await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });

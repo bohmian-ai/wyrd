@@ -51,7 +51,7 @@ def models(cards: Cards) -> dict[str, CardRef]:
         ),
     )
     return {
-        alias: cards.model.register(
+        alias: cards.model.declare(
             ModelCard(
                 SklearnInterface(model=model),
                 space="default",
@@ -67,7 +67,7 @@ def models(cards: Cards) -> dict[str, CardRef]:
 @pytest.fixture(scope="module")
 def service(cards: Cards, models: dict[str, CardRef]) -> CardRef:
     """The registered ``typed_state`` Service, after its Models and training Data."""
-    cards.data.register(
+    cards.data.declare(
         DataCard(
             PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
         )
@@ -88,15 +88,15 @@ def trusted(cards: Cards, models: dict[str, CardRef]) -> dict[str, str]:
 
 @pytest.fixture
 def bundle(service: CardRef, tmp_path: Path) -> Path:
-    """The Service's complete graph, downloaded with ``wyrd get``."""
-    cli.get(output_dir=tmp_path, kind="Service", uid=str(service.uid))
+    """The Service's complete graph, downloaded with ``wyrd pull``."""
+    cli.pull(output_dir=tmp_path, kind="Service", uid=str(service.uid))
     return tmp_path
 
 
 @pytest.fixture
 def metadata_bundle(service: CardRef, tmp_path: Path) -> Path:
     """The Service's graph downloaded metadata-only, without artifact bytes."""
-    cli.get(output_dir=tmp_path, kind="Service", uid=str(service.uid), metadata_only=True)
+    cli.pull(output_dir=tmp_path, kind="Service", uid=str(service.uid), metadata_only=True)
     return tmp_path
 
 

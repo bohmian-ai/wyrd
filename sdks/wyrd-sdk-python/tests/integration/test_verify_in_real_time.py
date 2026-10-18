@@ -29,8 +29,8 @@ from .support import (
     binding_ids,
     binding_status,
     client_of,
+    declare,
     hydrated,
-    register,
     service_key,
     timeline,
 )
@@ -48,7 +48,7 @@ CALLS = "/v1/chat/completions"
 
 def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     """The ``verifier:run`` grant on exactly the registered ``verifier``."""
-    uid = register(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
+    uid = declare(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
     return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
 
 
@@ -101,7 +101,7 @@ def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> 
 
     Returns the result's ``execution_id``.
     """
-    registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
+    registered = declare(cards, "cards/verify_in_real_time/assistant.yaml")
     token = WyrdClient(credential=service_key("assistant")).access_token()
     response = httpx.post(
         f"{server.base_url}/v1/verification/execute",
@@ -204,7 +204,7 @@ def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         .to_pylist()
     )
     caller = principal()
-    agent = register(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
+    agent = declare(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
     assert (call["sub_principal_id"], call["run_id"], call["card_uid"]) == (
         caller,
         None,

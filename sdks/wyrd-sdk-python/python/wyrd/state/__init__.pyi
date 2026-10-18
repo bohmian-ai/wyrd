@@ -12,7 +12,7 @@ from ..prompt import PromptCard
 from ._hydrated import HydratedCard
 
 class CardEnvelope:
-    """Complete read-only projection of one registered Card.
+    """Complete read-only projection of one declared Card.
 
     The envelope is retained in native typed form by ``WyrdState``. Mapping
     properties are converted to ordinary JSON-compatible Python values when
@@ -112,7 +112,7 @@ class HydratedArtifact:
 class WyrdState:
     """Offline runtime view of one complete Service Card graph.
 
-    ``WyrdState`` validates a bundle produced by ``wyrd get``, eagerly creates
+    ``WyrdState`` validates a bundle produced by ``wyrd pull``, eagerly creates
     Python Agent/Prompt/Model/Data holders, and shares one holder across every
     alias for the same exact Card. Construction uses local files only.
 
@@ -143,7 +143,7 @@ class WyrdState:
 
         Args:
             path: Directory produced by complete hydration, such as
-                ``Cards.hydrate``.
+                ``Cards.pull``.
             client: the ``WyrdClient`` this state acts as. Omitted, the
                 ambient client resolves when the state first needs one.
             interfaces: Custom Model/Data interface classes or instances keyed
@@ -227,7 +227,7 @@ class WyrdState:
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when ``alias`` is not
-                registered in this bundle. No network IO occurs.
+                declared in this bundle. No network IO occurs.
         """
         ...
 

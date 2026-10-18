@@ -25,8 +25,8 @@ from .support import (
     Receiver,
     ancestry,
     client_of,
-    download,
-    register,
+    declare,
+    pull,
     timeline,
 )
 
@@ -135,9 +135,7 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
-    card_uid = str(
-        register(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid
-    )
+    card_uid = str(declare(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid)
     issued = cli.issue_key(
         kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
     )
@@ -205,8 +203,8 @@ def test_agent_prompt_routes(
 ) -> None:
     deploy(server, "openai", name="openai-backup")
     deploy(server, "openai", name="openai-granted", access="granted")
-    register(Cards(admin), "cards/gateway_inference/ask-service.yaml")
-    bundle = download(Cards(admin), "ask-service", tmp_path)
+    declare(Cards(admin), "cards/gateway_inference/ask-service.yaml")
+    bundle = pull(Cards(admin), "ask-service", tmp_path)
     key = cli.issue_key(
         kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
     )

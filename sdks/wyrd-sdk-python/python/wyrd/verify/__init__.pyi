@@ -34,7 +34,7 @@ class FileInput(TypedDict):
     filename: NotRequired[str]
 
 class ArtifactInput(TypedDict):
-    """A registered Artifact Card's file."""
+    """A declared Artifact Card's file."""
 
     kind: Literal["artifact"]
     artifact: CardRefWire
@@ -166,7 +166,7 @@ class SiblingRefWire(TypedDict):
     sibling: CardRefWire
 
 CardRefTarget: TypeAlias = CardRefWire | SiblingRefWire | str
-"""A registered, sibling, or authored-path (``str``) Card reference."""
+"""A declared, sibling, or authored-path (``str``) Card reference."""
 
 ComparisonOperatorWire: TypeAlias = str | dict[str, JsonValue]
 """A scalar operator discriminator, or a parameterized operator object."""
@@ -331,7 +331,7 @@ class ExecutionState(TypedDict):
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.
 
-    Constructing a ``File`` performs no IO and registers nothing. During the
+    Constructing a ``File`` performs no IO and declares nothing. During the
     call the client hashes it with SHA-256, asks the server which digests it
     lacks, and uploads only those straight to tenant storage. An uploaded file
     is evidence pinned by its digest, never an Artifact Card.
@@ -360,7 +360,7 @@ class File:
         ...
 
 class ArtifactRef:
-    """A registered Artifact's file, verified with its normal authorization."""
+    """A declared Artifact's file, verified with its normal authorization."""
 
     def __init__(self, artifact: CardRef, path: str | None = None) -> None:
         """Select ``artifact``'s only file, or ``path`` within it.

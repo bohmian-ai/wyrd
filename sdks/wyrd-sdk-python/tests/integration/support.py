@@ -95,7 +95,7 @@ class StandInModel(ModelInterface):
         self.model: object = None
 
     def save(self, path: Path, save_kwargs: dict[str, object] | None = None) -> None:
-        """Never called: the journeys register checked-in Cards, they do not save one."""
+        """Never called: the journeys declare checked-in Cards, they do not save one."""
         raise NotImplementedError
 
     def load(self, path: Path, load_kwargs: dict[str, object] | None = None) -> None:
@@ -129,16 +129,16 @@ def ancestry(spans: Sequence[SpanRecord], span: SpanRecord) -> list[SpanRecord]:
     return chain
 
 
-def register(cards: Cards, path: str) -> dict[str, CardRef]:
+def declare(cards: Cards, path: str) -> dict[str, CardRef]:
     """Register one checked-in fixture file and return every Card it registered, by name."""
     receipt = cards.declare_from_path(FIXTURES / path)
     return {outcome.card_ref.name: outcome.card_ref for outcome in receipt.outcomes}
 
 
-def download(cards: Cards, service: str, destination: Path) -> Path:
+def pull(cards: Cards, service: str, destination: Path) -> Path:
     """Hydrate the registered ``service`` graph into ``destination``."""
     ref = CardRef("Service", service, "1.0.0", space="default")
-    return cards.hydrate(ref, destination).destination
+    return cards.pull(ref, destination).destination
 
 
 def service_key(service: str) -> str:

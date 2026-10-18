@@ -1,6 +1,6 @@
 """A developer runs Wyrd locally with only the administrator key ``wyrd setup`` printed.
 
-They register and hydrate an assistant, invoke a model through the Gateway with
+They declare and hydrate an assistant, invoke a model through the Gateway with
 the stock OpenAI client, observe and verify a Run, export its spans through
 ``state.start_telemetry``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for
@@ -47,7 +47,7 @@ from wyrd.state import WyrdState
 from wyrd.testing import UnmigratedDatabase, WyrdTestServer, cli
 
 from .gateway.support import Upstream
-from .support import Receiver, download, hydrated, register
+from .support import Receiver, declare, hydrated, pull
 
 pytestmark = pytest.mark.integration
 
@@ -88,10 +88,10 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     """Run the whole local workflow as ``client`` and assert each step."""
     configure_gateway(client)
     cards = Cards(client)
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    register(cards, "cards/verify_in_real_time/assistant.yaml")
-    state = hydrated(download(cards, "assistant", bundle_home), client)
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    declare(cards, "cards/verify_in_real_time/assistant.yaml")
+    state = hydrated(pull(cards, "assistant", bundle_home), client)
     state.start_bifrost()
 
     assert invoke(client) == "hi"
@@ -181,10 +181,10 @@ def test_start_telemetry_refuses_the_applications_own_provider(
         server_url=server.base_url, credential=server.tenant_admin_key(), grpc_url=server.grpc_url
     )
     cards = Cards(client)
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    register(cards, "cards/verify_in_real_time/assistant.yaml")
-    state = hydrated(download(cards, "assistant", tmp_path), client)
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    declare(cards, "cards/verify_in_real_time/assistant.yaml")
+    state = hydrated(pull(cards, "assistant", tmp_path), client)
     own = TracerProvider()
     trace.set_tracer_provider(own)
 
@@ -219,7 +219,7 @@ def cli_bootstrap_client(monkeypatch: pytest.MonkeyPatch) -> WyrdClient:
 def test_cli_bootstrap_saved_config(cli_bootstrap_client: WyrdClient) -> None:
     """A fresh Python runtime writes and reads using only the CLI's saved files."""
     cards = Cards(cli_bootstrap_client)
-    refs = register(cards, "cards/gateway_inference/ask-prompt.yaml")
+    refs = declare(cards, "cards/gateway_inference/ask-prompt.yaml")
     assert cards.get(refs["ask-prompt"]).metadata["name"] == "ask-prompt"
 
 

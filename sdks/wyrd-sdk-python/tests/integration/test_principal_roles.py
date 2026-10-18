@@ -15,7 +15,7 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import FIXTURES, Count, client_of, register
+from .support import FIXTURES, Count, client_of, declare
 
 pytestmark = pytest.mark.integration
 
@@ -23,7 +23,7 @@ TENANT_WIDE = "SELECT COUNT(*) AS n FROM vala.drift.observations"
 """A tenant-wide query over a built-in table, which ``workload`` permits."""
 
 AUTHORED = FIXTURES / "cards/gateway_inference/ask-prompt.yaml"
-"""A Card only an author can register."""
+"""A Card only an author can declare."""
 
 DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 
@@ -39,8 +39,8 @@ def server(wyrd_server: WyrdTestServer) -> Iterator[WyrdTestServer]:
 def service(server: WyrdTestServer) -> CardRef:
     """The observed Service, registered with its Model through the SDK."""
     cards = Cards(client_of(server))
-    register(cards, "cards/observe_a_run/observed-model.yaml")
-    return register(cards, "cards/observe_a_run/observed-service.yaml")["observed-service"]
+    declare(cards, "cards/observe_a_run/observed-model.yaml")
+    return declare(cards, "cards/observe_a_run/observed-service.yaml")["observed-service"]
 
 
 def issue(server: WyrdTestServer, service: CardRef) -> tuple[str, str]:

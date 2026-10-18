@@ -13,7 +13,7 @@ def offline_cards() -> Cards:
     return Cards(WyrdClient(server_url="http://127.0.0.1:1", credential="unit-test-key"))
 
 
-def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
+def test_agent_cards_are_not_declarable(offline_cards: Cards) -> None:
     """The unscoped registry rejects envelope-only Agent holders locally."""
     card = AgentCard(
         PromptReference.inline(Prompt.openai_chat("gpt-4o", messages="hello")),
@@ -23,7 +23,7 @@ def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
         version="0.1.0",
     )
     with pytest.raises(wyrd.WyrdError) as captured:
-        offline_cards.register(card)  # ty: ignore[invalid-argument-type]
+        offline_cards.declare(card)  # ty: ignore[invalid-argument-type]
     assert captured.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
@@ -36,8 +36,18 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: 
         version="1.2.3",
     )
     with pytest.raises(wyrd.WyrdError) as captured:
-        offline_cards.prompt.register(card, version_bump=VersionBump.Minor)
+        offline_cards.prompt.declare(card, version_bump=VersionBump.Minor)
     assert captured.value.code == "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK"
+
+
+@pytest.mark.parametrize("kind", ["data", "model"])
+@pytest.mark.parametrize("option", ["eager_load", "load_kwargs"])
+def test_registry_get_rejects_artifact_download_options(
+    offline_cards: Cards, kind: str, option: str
+) -> None:
+    """Typed get reads one envelope; artifact-loading options are refused before any IO."""
+    with pytest.raises(TypeError, match=option):
+        getattr(offline_cards, kind).get(uid="not-a-uid", **{option: True})
 
 
 @pytest.mark.usefixtures("no_credentials")

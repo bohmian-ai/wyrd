@@ -128,7 +128,7 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
     """
     cards = Cards(client)
     receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
-    state = WyrdState.from_path(cards.hydrate(receipt.root, bundle).destination, client)
+    state = WyrdState.from_path(cards.pull(receipt.root, bundle).destination, client)
     gateway = Gateway(client)
     gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
     name = state.card("agent").spec["execution_route"].get("deployment")

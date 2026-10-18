@@ -18,7 +18,7 @@ export async function deploy(client: WyrdClient, bundle: string = BUNDLE_DIR) {
   const cards = await Cards.connect({ client });
   const receipt = await cards.declareFromPath(join(SERVICE_DIR, "support-desk.yaml"));
   rmSync(bundle, { recursive: true, force: true });
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   // Record each gateway call's metadata, never its content, in vala.gateway.calls.
   await (await Gateway.connect({ client })).putCapturePolicy({ mode: "metadata", payload_fields: [] });
   // ANCHOR_END: deploy

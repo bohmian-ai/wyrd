@@ -757,45 +757,6 @@ pub(crate) fn invalid_argument(field: &str, value: &str, expected: &str) -> Wyrd
     }
 }
 
-/// Pin a server-returned card to the exact version it resolved to.
-///
-/// Output and follow-up commands quote the resolved version rather than the
-/// requirement the caller typed, so a later run cannot silently address a
-/// different card.
-///
-/// # Errors
-/// Returns [`WyrdCliError::Server`] when the response carries no resolved
-/// version, which means the server did not answer with an exact card.
-pub(crate) fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
-    let version = card
-        .metadata
-        .resolved_pin()
-        .cloned()
-        .ok_or_else(|| WyrdCliError::Server {
-            source: WyrdError::RegistryInvalidCardSpec {
-                message: "server response did not contain an exact card version".to_owned(),
-                details: serde_json::json!({}),
-            },
-        })?;
-    let space = card
-        .metadata
-        .space
-        .clone()
-        .ok_or_else(|| WyrdCliError::Server {
-            source: WyrdError::RegistryInvalidCardSpec {
-                message: "server response did not contain a card space".to_owned(),
-                details: serde_json::json!({}),
-            },
-        })?;
-    Ok(CardRef {
-        kind: card.kind.clone(),
-        name: card.metadata.name.clone(),
-        version,
-        space: Some(space),
-        uid: card.metadata.uid.clone(),
-    })
-}
-
 fn check_cards(input: &DeclarationInput) -> Vec<CheckCard> {
     input
         .submissions

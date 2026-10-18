@@ -117,7 +117,7 @@ cards = Cards()  # server URL and credential come from your Wyrd config
 
 train = pd.read_parquet("churn-training.parquet")
 data = DataCard(PandasInterface(data=train), space="default", name="churn-training", version="1.4.2")
-cards.data.register(data)
+cards.data.declare(data)
 
 features = train[["tenure_months", "monthly_spend"]]
 model = LogisticRegression().fit(features, train["churned"])
@@ -129,7 +129,7 @@ card = ModelCard(
     version="1.4.2",
     metadata=ModelCardMetadata(task_type="binary_classification", signature=signature),
 )
-cards.model.register(card)
+cards.model.declare(card)
 ```
 
 A `ModelCard` needs a signature, the names and types of the model's inputs and outputs; without one, construction fails with `WYRD_MODEL_400_MISSING_SIGNATURE`. Code-built Cards default to version `0.1.0`, so set `version` yourself. `register` updates the card object in place with its server-assigned `uid`. The Service can now list it as a component with `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }`.

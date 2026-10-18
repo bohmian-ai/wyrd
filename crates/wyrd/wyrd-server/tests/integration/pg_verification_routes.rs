@@ -489,6 +489,11 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 /// unwritten and hold the whole reserved share (two of three slots)
 /// deterministically.
 ///
+/// The replay's submission is processed after Scribe acknowledges its inputs,
+/// in the tenant's arrival order, so a distinct sentinel enqueued after it is
+/// visible only once the replay has been processed; the execution count is
+/// read after the sentinel appears.
+///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, replay, queue, or inputs expectation fails.
@@ -533,10 +538,16 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
     let (status, replay) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
     assert_eq!(execution_id(&replay), recovered, "the retry replays");
+    let later = fixture.request(&fixture.assertion, json!(2));
+    let (status, sentinel) = enqueue(&server, &jwt, &later, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{sentinel}");
+    let sentinel = execution_id(&sentinel);
+    assert_ne!(sentinel, recovered, "the sentinel is its own execution");
+    visible_execution(&server, &jwt, sentinel).await;
     assert_eq!(
         fixture.queued().await,
-        3,
-        "one execution per accepted request"
+        4,
+        "the replay added no execution beside the sentinel written after it"
     );
     server.shutdown().await.expect("test server shuts down");
 }

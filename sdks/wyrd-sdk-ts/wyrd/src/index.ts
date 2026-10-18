@@ -8,7 +8,7 @@ import type {
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
-  CardRegistrationOutcome,
+  CardDeclarationOutcome,
   CardSummary,
   CompactionTypeWire as CompactionType,
   CreateOperatorConnectionRequest,
@@ -63,7 +63,7 @@ import type {
   RegisteredPromptCard,
   RegisteredServiceCard,
   RegisteredVerifierCard,
-  RegistrationReceipt,
+  DeclarationReceipt,
   RevokePrincipalRequest,
   RoleAssignment,
   RoleAssignmentChange,
@@ -138,7 +138,7 @@ export interface CancelRunningQueryResult {
 export type { WyrdErrorCode } from "./error-codes.js";
 /** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
 export type {
-  CardRegistrationOutcome,
+  CardDeclarationOutcome,
   CardSummary,
   CompactionType,
   CreateOperatorConnectionRequest,
@@ -185,7 +185,7 @@ export type {
   ProviderDeployment,
   QueryParam,
   QueryTerminal,
-  RegistrationReceipt,
+  DeclarationReceipt,
   RevokePrincipalRequest,
   RoleAssignment,
   RoleAssignmentChange,
@@ -1376,7 +1376,7 @@ export class Bifrost {
 }
 
 /** Machine-readable result of a published hydration. */
-export interface HydrationSummary {
+export interface PullSummary {
   readonly root: CardRef;
   readonly destination: string;
   readonly mode: "complete" | "metadata";
@@ -1619,8 +1619,8 @@ export class Cards {
    * @throws {@link WyrdError} for a file that does not load or validate, or
    * the registry's refusal.
    */
-  async registerFromPath(path: string): Promise<RegistrationReceipt> {
-    return lifecycleValue<RegistrationReceipt>(await this.#native.registerFromPath(path));
+  async declareFromPath(path: string): Promise<DeclarationReceipt> {
+    return lifecycleValue<DeclarationReceipt>(await this.#native.declareFromPath(path));
   }
 
   /**
@@ -1685,8 +1685,8 @@ export class Cards {
     ref: CardRef | string,
     destination: string,
     options: { readonly metadataOnly?: boolean } = {},
-  ): Promise<HydrationSummary> {
-    return lifecycleValue<HydrationSummary>(
+  ): Promise<PullSummary> {
+    return lifecycleValue<PullSummary>(
       await this.#native.hydrate(cardRefText(ref), destination, options.metadataOnly ?? false),
     );
   }
@@ -2702,7 +2702,7 @@ export class WyrdState {
   }
 
   /**
-   * Load and validate one hydrated bundle.
+   * Load and validate one Card bundle.
    *
    * @param path - The bundle directory {@link Cards.hydrate} published.
    * @param options - `client`, whose principal every server call of this

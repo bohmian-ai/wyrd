@@ -9,8 +9,8 @@ use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 
 use crate::cards::error::RegistryEngineError;
 
-/// Validate source bytes before any registration network call and stamp the
-/// manifest hash that the server validates at the registration boundary.
+/// Validate source bytes before any declaration network call and stamp the
+/// manifest hash that the server validates at the declaration boundary.
 ///
 /// Entries are sorted in place. An entry authored without `size_bytes` or
 /// `sha256` takes the value computed from its source; a declared value must

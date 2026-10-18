@@ -1140,7 +1140,7 @@ pub enum WyrdError {
     #[wyrd_error(
         code = "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
         status = 400,
-        title = "Hydrated bundle is missing artifact payloads",
+        title = "Card bundle is missing artifact payloads",
         remediation = "Run wyrd get without --metadata-only and load the complete bundle."
     )]
     SdkUnhydratedArtifact {

@@ -139,7 +139,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
         "apiVersion: wyrd/v1
 kind: Service
 metadata:
-  name: hydrated-service
+  name: pulled-service
   version: 1.0.0
   space: default
 spec:
@@ -178,7 +178,7 @@ spec:
 /// Owns the committed typed-state Card tree and its temporary test workspace.
 ///
 /// The fixture copies stable Card documents and artifact bytes into an isolated
-/// directory so public registration and CLI apply consume the same tree a
+/// directory so public declaration and CLI declare consume the same tree a
 /// maintainer can inspect under `tests/fixtures`, while each journey gets a
 /// fresh bundle destination.
 struct RuntimeServiceFixture {
@@ -186,9 +186,9 @@ struct RuntimeServiceFixture {
     workspace: TempDir,
     /// Directory containing the copied fixture documents and payloads.
     source_root: PathBuf,
-    /// Copied Service document consumed by the CLI apply dispatcher.
+    /// Copied Service document consumed by the CLI declare dispatcher.
     service_path: PathBuf,
-    /// Destination used by the complete CLI hydration command.
+    /// Destination used by the complete CLI pull command.
     bundle_dir: PathBuf,
 }
 
@@ -264,37 +264,37 @@ impl RuntimeServiceFixture {
         path
     }
 
-    /// Return the Service document consumed by the CLI apply dispatcher.
+    /// Return the Service document consumed by the CLI declare dispatcher.
     #[must_use]
     fn service_path(&self) -> &Path {
         &self.service_path
     }
 
-    /// Return the complete-hydration destination used by the CLI get command.
+    /// Return the complete-pull destination used by the CLI pull command.
     #[must_use]
     fn bundle_dir(&self) -> &Path {
         debug_assert!(self.bundle_dir.starts_with(self.workspace.path()));
         &self.bundle_dir
     }
 
-    /// Register the heavy lineage anchors through the public Cards API.
+    /// Declare the heavy lineage anchors through the public Cards API.
     ///
     /// Models and Data carry the three artifact payloads whose bytes the
-    /// offline state later verifies. The Service apply resolves and registers
+    /// offline state later verifies. The Service declare resolves and declares
     /// every light dependency from its authored path tree.
     ///
     /// # Errors
     /// Returns the first registry or fixture-loading error encountered while
-    /// registering a dependency through [`wyrd_client::cards::Cards`].
-    async fn register_dependencies(&self, cards: &Cards) -> Result<(), WyrdError> {
+    /// declaring a dependency through [`wyrd_client::cards::Cards`].
+    async fn declare_dependencies(&self, cards: &Cards) -> Result<(), WyrdError> {
         for relative in ["training.yaml", "model-primary.yaml", "model-shadow.yaml"] {
-            cards.register_from_path(&self.path(relative)).await?;
+            cards.declare_from_path(&self.path(relative)).await?;
         }
         Ok(())
     }
 
     /// Return the exact aliases expected from the Service graph and generated
-    /// canonical aliases emitted by hydration.
+    /// canonical aliases emitted by pull.
     #[must_use]
     fn expected_aliases() -> &'static [&'static str] {
         Self::EXPECTED_ALIASES
@@ -311,11 +311,12 @@ fn first_stderr_json(output: &Output) -> Value {
 }
 
 #[test]
-fn plan_is_local_and_returns_machine_readable_card_projection() {
+fn declare_check_is_local_and_returns_machine_readable_card_projection() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     let path = write_prompt(&temp);
     let output = run_cli(&[
-        "plan",
+        "declare",
+        "--check",
         path.to_str().expect("prompt path is UTF-8"),
         "--format",
         "json",
@@ -326,7 +327,7 @@ fn plan_is_local_and_returns_machine_readable_card_projection() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report: Value = serde_json::from_slice(&output.stdout).expect("plan output is JSON");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("check output is JSON");
     assert_eq!(report["ok"], true);
     assert_eq!(report["cards"][0]["kind"], "Prompt");
     assert_eq!(report["cards"][0]["name"], "cli-prompt");
@@ -338,21 +339,22 @@ fn invalid_local_reference_returns_card_load_error_without_credentials() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     let path = temp.path().join("missing.yaml");
     let output = run_cli(&[
-        "plan",
+        "declare",
+        "--check",
         path.to_str().expect("prompt path is UTF-8"),
         "--format",
         "json",
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
     assert_eq!(report["ok"], false);
     assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
 }
 
 /// Reject a peer-only Verifier listed as a Service component during local CLI planning.
 #[test]
-fn plan_rejects_verifier_service_component_with_stable_diagnostic() {
+fn declare_check_rejects_verifier_service_component_with_stable_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     let path = temp.path().join("service.yaml");
     std::fs::write(
@@ -376,14 +378,15 @@ spec:
     .expect("invalid Service fixture writes");
 
     let output = run_cli(&[
-        "plan",
+        "declare",
+        "--check",
         path.to_str().expect("Service path is UTF-8"),
         "--format",
         "json",
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
     assert_eq!(
         report["diagnostics"][0]["code"],
         "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND"
@@ -392,7 +395,7 @@ spec:
 
 /// Reject an unbound Verifier in a Service-root directory during local CLI planning.
 #[test]
-fn plan_rejects_unbound_verifier_peer_with_stable_diagnostic() {
+fn declare_check_rejects_unbound_verifier_peer_with_stable_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     std::fs::write(
         temp.path().join("service.yaml"),
@@ -430,14 +433,15 @@ spec:
     .expect("Verifier fixture writes");
 
     let output = run_cli(&[
-        "plan",
+        "declare",
+        "--check",
         temp.path().to_str().expect("fixture path is UTF-8"),
         "--format",
         "json",
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("check error is JSON");
     assert_eq!(
         report["diagnostics"][0]["code"],
         "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER"
@@ -445,7 +449,7 @@ spec:
 }
 
 #[test]
-fn apply_rejects_an_unreadable_artifact_manifest_before_authentication() {
+fn declare_rejects_an_unreadable_artifact_manifest_before_authentication() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     let path = write_prompt(&temp);
     let contents = std::fs::read_to_string(&path).expect("prompt reads");
@@ -456,7 +460,7 @@ fn apply_rejects_an_unreadable_artifact_manifest_before_authentication() {
     .expect("invalid prompt writes");
 
     let output = run_cli(&[
-        "apply",
+        "declare",
         path.to_str().expect("prompt path is UTF-8"),
         "--format",
         "json",
@@ -464,6 +468,120 @@ fn apply_rejects_an_unreadable_artifact_manifest_before_authentication() {
 
     assert_eq!(output.status.code(), Some(64));
     assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
+}
+
+/// Run the CLI with a reachable server and a bearer configured, returning
+/// its output and whether the configured listener received any connection.
+///
+/// # Panics
+/// Panics when the local listener cannot be bound or inspected.
+fn run_check_against_configured_server(path: &Path) -> (Output, bool) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener binds");
+    listener
+        .set_nonblocking(true)
+        .expect("listener becomes nonblocking");
+    let server = format!(
+        "http://{}",
+        listener.local_addr().expect("listener has an address")
+    );
+    let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
+    let empty_config =
+        std::env::temp_dir().join(format!("wyrd-cli-empty-config-{}", std::process::id()));
+    let output = command
+        .env("WYRD_CONFIG_HOME", empty_config)
+        .env("WYRD_SERVER_URL", &server)
+        .env("WYRD_ACCESS_TOKEN", "configured-but-unused")
+        .args([
+            "declare",
+            "--check",
+            path.to_str().expect("Card path is UTF-8"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("wyrd command runs");
+    let contacted = match listener.accept() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("listener accept failed: {error}"),
+    };
+    (output, contacted)
+}
+
+/// `declare --check` validates the referenced disk files without contacting
+/// a configured server: valid input returns the candidates, while a missing
+/// transitive Card file and a missing artifact source fail with located
+/// loader diagnostics.
+///
+/// # Panics
+/// Panics when the check contacts the server or reports the wrong outcome.
+#[test]
+fn declare_check_validates_disk_references_without_contacting_a_configured_server() {
+    let temp = tempfile::tempdir().expect("tempdir creates");
+    let prompt = write_prompt(&temp);
+    let (valid, contacted) = run_check_against_configured_server(&prompt);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(!contacted, "a valid check contacted the configured server");
+    let report: Value = serde_json::from_slice(&valid.stdout).expect("check output is JSON");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["cards"][0]["name"], "cli-prompt");
+
+    let service = temp.path().join("service.yaml");
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: missing-component
+  version: 1.0.0
+  space: default
+spec:
+  components:
+    - alias: agent
+      ref: ./missing-agent.yaml
+",
+    )
+    .expect("Service fixture writes");
+    let missing_artifact = temp.path().join("missing-artifact");
+    std::fs::create_dir(&missing_artifact).expect("artifact case directory creates");
+    let contents = std::fs::read_to_string(&prompt).expect("prompt reads");
+    let broken_prompt = missing_artifact.join("prompt.yaml");
+    std::fs::write(
+        &broken_prompt,
+        contents.replace("relative_path: prompt.txt", "relative_path: missing.txt"),
+    )
+    .expect("missing-artifact prompt writes");
+
+    for invalid in [&service, &broken_prompt] {
+        let (output, contacted) = run_check_against_configured_server(invalid);
+        assert!(!contacted, "an invalid check contacted the configured server");
+        assert_eq!(output.status.code(), Some(64), "{}", invalid.display());
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("check failure is JSON");
+        assert_eq!(report["ok"], false);
+        let diagnostic = &report["diagnostics"][0];
+        assert!(
+            diagnostic["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("WYRD_")),
+            "{report}"
+        );
+        assert!(diagnostic["path"].as_str().is_some(), "{report}");
+        assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
+    }
+}
+
+/// The removed `plan`, `apply`, and `load` verbs are usage errors, not aliases.
+#[test]
+fn removed_card_verbs_are_usage_errors() {
+    for verb in ["plan", "apply", "load"] {
+        let output = run_cli(&[verb, "--help"]);
+        assert_eq!(output.status.code(), Some(64), "{verb} is still accepted");
+    }
 }
 
 #[test]
@@ -488,9 +606,9 @@ fn delete_rejects_ambiguous_named_selector_before_client_construction() {
 }
 
 #[test]
-fn get_requires_an_output_directory_before_client_construction() {
+fn pull_requires_an_output_directory_before_client_construction() {
     let output = run_cli(&[
-        "get",
+        "pull",
         "--kind",
         "Prompt",
         "--space",
@@ -502,16 +620,13 @@ fn get_requires_an_output_directory_before_client_construction() {
     ]);
 
     assert_eq!(output.status.code(), Some(64));
-    assert_eq!(
-        first_stderr_json(&output)["code"],
-        "WYRD_CLI_400_INVALID_ARGUMENT"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--output-dir"));
 }
 
-/// Keep `get` help successful, hydration-specific, and free of argv credentials.
+/// Keep `pull` help successful, bundle-specific, and free of argv credentials.
 #[test]
-fn get_help_describes_hydration_and_does_not_advertise_argv_credentials() {
-    let output = run_cli(&["get", "--help"]);
+fn pull_help_describes_the_bundle_and_does_not_advertise_argv_credentials() {
+    let output = run_cli(&["pull", "--help"]);
     let help = String::from_utf8_lossy(&output.stdout);
 
     assert_eq!(output.status.code(), Some(0));
@@ -521,6 +636,30 @@ fn get_help_describes_hydration_and_does_not_advertise_argv_credentials() {
     assert!(help.contains("--metadata-only"));
     assert!(help.contains("not runnable"));
     assert!(!help.contains("--token"));
+}
+
+/// `get` reads one envelope: it takes no output directory or bundle mode.
+#[test]
+fn get_help_describes_one_envelope_without_bundle_options() {
+    let output = run_cli(&["get", "--help"]);
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(help.contains("envelope"));
+    assert!(!help.contains("--output-dir"));
+    assert!(!help.contains("--metadata-only"));
+    let refused = run_cli(&[
+        "get",
+        "--kind",
+        "Prompt",
+        "--space",
+        "default",
+        "--name",
+        "cli-prompt",
+        "--output-dir",
+        "bundle",
+    ]);
+    assert_eq!(refused.status.code(), Some(64));
 }
 
 #[test]
@@ -668,7 +807,7 @@ mod pg_tests {
     }
 
     /// Build the public registry handle used by the CLI journey's dependency
-    /// registration calls.
+    /// declaration calls.
     ///
     /// The handle exercises the same authenticated HTTP client boundary as a
     /// caller; it does not access the registry engine or database directly.
@@ -709,7 +848,7 @@ mod pg_tests {
             .map_err(|error| format!("CLI stdout is not JSON: {error}"))
     }
 
-    /// Decode the exact Service root reference from an apply receipt.
+    /// Decode the exact Service root reference from an declare receipt.
     ///
     /// # Errors
     /// Returns a JSON decoding error when the receipt has no valid `root`
@@ -732,7 +871,7 @@ mod pg_tests {
             .to_str()
             .ok_or_else(|| "bundle path is not UTF-8".to_owned())?;
         Ok(vec![
-            "get".to_owned(),
+            "pull".to_owned(),
             "--kind".to_owned(),
             root.kind.wire_name().to_owned(),
             "--uid".to_owned(),
@@ -746,7 +885,7 @@ mod pg_tests {
         ])
     }
 
-    /// Assert that every hydrated model and data artifact has the expected
+    /// Assert that every pulled model and data artifact has the expected
     /// bytes, digest, and verified local path.
     ///
     /// The assertions prove artifact payloads remain external to typed holder
@@ -780,7 +919,7 @@ mod pg_tests {
     }
 
     /// Assert exact version and UID identity for every Card represented by an
-    /// alias in the hydrated graph.
+    /// alias in the pulled graph.
     ///
     /// # Panics
     /// Panics when an alias is unresolved, a CardRef is not versioned, a UID is
@@ -841,15 +980,15 @@ mod pg_tests {
         };
 
         let path_string = path.to_str().expect("prompt path is UTF-8");
-        let apply_arguments = vec![
-            "apply".to_owned(),
+        let declare_arguments = vec![
+            "declare".to_owned(),
             path_string.to_owned(),
             "--server".to_owned(),
             base_url.clone(),
             "--format".to_owned(),
             "json".to_owned(),
         ];
-        let plan = run_cli_async!("plan", path_string, "--format", "json");
+        let plan = run_cli_async!("declare", "--check", path_string, "--format", "json");
         assert!(
             plan.status.success(),
             "{}",
@@ -858,7 +997,7 @@ mod pg_tests {
 
         let denied = run_cli_async_with_token!(
             &denied_jwt,
-            "apply",
+            "declare",
             path_string,
             "--server",
             &base_url,
@@ -868,13 +1007,14 @@ mod pg_tests {
         assert_eq!(denied.status.code(), Some(77));
         assert_eq!(first_stderr_json(&denied)["status"], 403);
 
-        let applied = run_cli_owned_with_token(apply_arguments, Some(jwt.clone())).await;
+        let declared = run_cli_owned_with_token(declare_arguments, Some(jwt.clone())).await;
         assert!(
-            applied.status.success(),
+            declared.status.success(),
             "{}",
-            String::from_utf8_lossy(&applied.stderr)
+            String::from_utf8_lossy(&declared.stderr)
         );
-        let receipt: Value = serde_json::from_slice(&applied.stdout).expect("receipt is JSON");
+        let receipt: Value = serde_json::from_slice(&declared.stdout).expect("receipt is JSON");
+        assert_eq!(receipt["outcomes"][0]["outcome"], "declared");
         let uid = receipt["root"]["uid"]
             .as_str()
             .expect("receipt contains a root UID")
@@ -882,7 +1022,7 @@ mod pg_tests {
 
         let replay = run_cli_async_with_token!(
             &jwt,
-            "apply",
+            "declare",
             path_string,
             "--server",
             &base_url,
@@ -900,16 +1040,16 @@ mod pg_tests {
 
         let denied_get = run_cli_async_with_token!(
             &denied_jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
             &uid,
             "--output-dir",
             temp.path()
-                .join("denied-hydration")
+                .join("denied-pull")
                 .to_str()
-                .expect("denied hydration path is UTF-8"),
+                .expect("denied pull path is UTF-8"),
             "--server",
             &base_url,
             "--format",
@@ -924,20 +1064,20 @@ mod pg_tests {
             denied_error["remediation"],
             "Request the required role from a workspace admin."
         );
-        assert!(!temp.path().join("denied-hydration").exists());
+        assert!(!temp.path().join("denied-pull").exists());
 
         let get = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
             &uid,
             "--output-dir",
             temp.path()
-                .join("hydrated")
+                .join("pulled")
                 .to_str()
-                .expect("hydration path is UTF-8"),
+                .expect("pull path is UTF-8"),
             "--server",
             &base_url,
             "--format",
@@ -948,24 +1088,24 @@ mod pg_tests {
             "{}",
             String::from_utf8_lossy(&get.stderr)
         );
-        let hydrated: Value = serde_json::from_slice(&get.stdout).expect("get output is JSON");
-        assert_eq!(hydrated["root"]["uid"], uid);
-        assert_eq!(hydrated["mode"], "complete");
-        assert_eq!(hydrated["card_count"], 1);
+        let pulled: Value = serde_json::from_slice(&get.stdout).expect("get output is JSON");
+        assert_eq!(pulled["root"]["uid"], uid);
+        assert_eq!(pulled["mode"], "complete");
+        assert_eq!(pulled["card_count"], 1);
         assert!(
-            !std::fs::read(temp.path().join("hydrated/metadata.yaml"))
-                .expect("hydrated metadata reads")
+            !std::fs::read(temp.path().join("pulled/metadata.yaml"))
+                .expect("pulled metadata reads")
                 .is_empty()
         );
         assert_eq!(
-            std::fs::read(temp.path().join("hydrated/cards/root/artifacts/prompt.txt"))
-                .expect("hydrated artifact reads"),
+            std::fs::read(temp.path().join("pulled/cards/root/artifacts/prompt.txt"))
+                .expect("pulled artifact reads"),
             b"cli-card-artifact"
         );
 
         let metadata_only = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
@@ -998,7 +1138,7 @@ mod pg_tests {
 
         let rerun = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
@@ -1072,10 +1212,10 @@ mod pg_tests {
             serde_json::from_slice(&latest.stdout).expect("latest output is JSON");
         assert_eq!(resolved["card_ref"]["uid"], uid);
 
-        let latest_dir = temp.path().join("latest-hydrated");
+        let latest_dir = temp.path().join("latest-pulled");
         let latest_get = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--space",
@@ -1095,7 +1235,7 @@ mod pg_tests {
             String::from_utf8_lossy(&latest_get.stderr)
         );
         let latest_summary: Value =
-            serde_json::from_slice(&latest_get.stdout).expect("latest hydration JSON");
+            serde_json::from_slice(&latest_get.stdout).expect("latest pull JSON");
         assert_eq!(latest_summary["root"]["uid"], uid);
         let latest_manifest: Value = serde_yaml::from_reader(
             std::fs::File::open(latest_dir.join("metadata.yaml")).expect("latest manifest opens"),
@@ -1103,33 +1243,46 @@ mod pg_tests {
         .expect("latest manifest reads");
         assert_eq!(latest_manifest["root"]["version"], "1.0.0");
 
-        let destination = temp.path().join("loaded");
-        let destination_string = destination.to_str().expect("destination path is UTF-8");
-        let loaded = run_cli_async_with_token!(
-            &jwt,
-            "load",
-            "--kind",
-            "Prompt",
-            "--uid",
-            &uid,
-            "--path",
-            destination_string,
-            "--server",
-            &base_url,
-            "--format",
-            "json",
-        );
+        let get_cwd = temp.path().join("get-cwd");
+        std::fs::create_dir(&get_cwd).expect("get working directory creates");
+        let envelope = tokio::task::spawn_blocking({
+            let get_cwd = get_cwd.clone();
+            let arguments = [
+                "get", "--kind", "Prompt", "--uid", &uid, "--server", &base_url, "--format", "json",
+            ]
+            .map(str::to_owned);
+            let jwt = jwt.clone();
+            move || {
+                Command::cargo_bin("wyrd")
+                    .expect("wyrd binary builds")
+                    .current_dir(get_cwd)
+                    .env("WYRD_ACCESS_TOKEN", jwt)
+                    .env_remove("WYRD_WORKLOAD_TOKEN")
+                    .env_remove("WYRD_TENANT")
+                    .env_remove("WYRD_API_KEY")
+                    .args(arguments)
+                    .output()
+                    .expect("wyrd command runs")
+            }
+        })
+        .await
+        .expect("CLI subprocess joins");
         assert!(
-            loaded.status.success(),
+            envelope.status.success(),
             "{}",
-            String::from_utf8_lossy(&loaded.stderr)
+            String::from_utf8_lossy(&envelope.stderr)
         );
-        let loaded_json: Value =
-            serde_json::from_slice(&loaded.stdout).expect("load output is JSON");
-        assert_eq!(loaded_json["materialized"], true);
-        assert_eq!(
-            std::fs::read(destination.join("prompt.txt")).expect("artifact reads"),
-            b"cli-card-artifact"
+        let card: Value = serde_json::from_slice(&envelope.stdout).expect("get output is JSON");
+        assert_eq!(card["apiVersion"], "wyrd/v1");
+        assert_eq!(card["kind"], "Prompt");
+        assert_eq!(card["metadata"]["uid"], uid);
+        assert_eq!(card["metadata"]["name"], "cli-prompt");
+        assert!(
+            std::fs::read_dir(&get_cwd)
+                .expect("get working directory lists")
+                .next()
+                .is_none(),
+            "get wrote local files"
         );
 
         let superuser = server
@@ -1155,7 +1308,7 @@ mod pg_tests {
             .expect("artifact bytes corrupt with the same length");
         let digest_mismatch = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
@@ -1183,7 +1336,7 @@ mod pg_tests {
             .expect("artifact bytes corrupt with a different length");
         let size_mismatch = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
@@ -1217,7 +1370,7 @@ mod pg_tests {
         .expect("artifact path corrupts");
         let unsafe_path = run_cli_async_with_token!(
             &jwt,
-            "get",
+            "pull",
             "--kind",
             "Prompt",
             "--uid",
@@ -1266,15 +1419,15 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
-    /// Prove the public CLI apply/get path publishes a complete bundle that
+    /// Prove the public CLI declare/get path publishes a complete bundle that
     /// remains usable through native typed WyrdState after server shutdown.
     ///
-    /// The journey exercises public registration, CLI subprocesses, complete
-    /// artifact hydration, exact alias projection, and offline typed access
+    /// The journey exercises public declaration, CLI subprocesses, complete
+    /// artifact pull, exact alias projection, and offline typed access
     /// after the originating server and connection endpoint are gone.
     ///
     /// # Panics
-    /// Panics when fixture creation, public registration, CLI apply/get,
+    /// Panics when fixture creation, public declaration, CLI declare/get,
     /// server shutdown, offline loading, or any typed-state invariant fails.
     ///
     /// # Cancellation
@@ -1303,12 +1456,12 @@ mod pg_tests {
 
         let cards = public_cards_client(&base_url, &jwt).await;
         fixture
-            .register_dependencies(&cards)
+            .declare_dependencies(&cards)
             .await
-            .expect("journey dependencies register through public Cards API");
-        let apply = run_cli_json(
+            .expect("journey dependencies declare through public Cards API");
+        let declare = run_cli_json(
             vec![
-                "apply".to_owned(),
+                "declare".to_owned(),
                 fixture
                     .service_path()
                     .to_str()
@@ -1322,13 +1475,13 @@ mod pg_tests {
             &jwt,
         )
         .await;
-        let receipt = apply.expect("CLI apply succeeds");
+        let receipt = declare.expect("CLI declare succeeds");
         wait_baseline_ready(
             &cards,
             json!({"kind": "Verifier", "name": "model-drift", "version": "1.0.0", "space": "default"}),
         )
         .await;
-        let service_ref = exact_root_ref(&receipt).expect("apply root is an exact CardRef");
+        let service_ref = exact_root_ref(&receipt).expect("declare root is an exact CardRef");
         assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(service_ref.name.as_str(), "typed-service");
         assert_eq!(service_ref.version.as_str(), "1.0.0");
@@ -1437,19 +1590,19 @@ mod pg_tests {
 
     /// Exercise the canonical authored-directory fixture through real CLI and server boundaries.
     ///
-    /// The journey first plans the complete directory, registers the external
+    /// The journey first checks the complete directory, declares the external
     /// Data and Model prerequisites exactly as separate user workflows would,
-    /// applies every canonical submission, and hydrates the reachable
+    /// applies every canonical submission, and pulls the reachable
     /// Service graph through CLI `get`.
     ///
     /// # Panics
     /// Panics when the committed fixture drifts, any CLI operation fails, the
-    /// server returns an incomplete receipt, or complete hydration omits an
+    /// server returns an incomplete receipt, or complete pull omits an
     /// observability peer.
     ///
     /// # Cancellation
     /// Cancellation may leave the in-process server awaiting harness cleanup;
-    /// all registered state belongs to the journey's isolated tenant.
+    /// all declared state belongs to the journey's isolated tenant.
     #[tokio::test]
     async fn canonical_authored_directory_runs_real_cli_journey() {
         let fixture_root =
@@ -1461,7 +1614,8 @@ mod pg_tests {
         let operator_path = prerequisites.join("retention-pager-operator.yaml");
         let model_path = fixture_root.join("model/card.yaml");
         let plan = run_cli_owned(vec![
-            "plan".to_owned(),
+            "declare".to_owned(),
+                "--check".to_owned(),
             fixture_root
                 .to_str()
                 .expect("canonical fixture path is UTF-8")
@@ -1475,7 +1629,7 @@ mod pg_tests {
             "{}",
             String::from_utf8_lossy(&plan.stderr)
         );
-        let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
+        let plan: Value = serde_json::from_slice(&plan.stdout).expect("check output is JSON");
         assert_eq!(plan["cards"].as_array().map(Vec::len), Some(10));
 
         let server = WyrdTestServer::builder()
@@ -1538,7 +1692,7 @@ mod pg_tests {
         for path in [&data_path, &verifier_path, &operator_path, &model_path] {
             run_cli_json(
                 vec![
-                    "apply".to_owned(),
+                    "declare".to_owned(),
                     path.to_str()
                         .expect("prerequisite path is UTF-8")
                         .to_owned(),
@@ -1555,7 +1709,7 @@ mod pg_tests {
 
         let receipt = run_cli_json(
             vec![
-                "apply".to_owned(),
+                "declare".to_owned(),
                 fixture_root
                     .to_str()
                     .expect("canonical fixture path is UTF-8")
@@ -1591,7 +1745,7 @@ mod pg_tests {
             &jwt,
         )
         .await
-        .expect("canonical Service graph hydrates");
+        .expect("canonical Service graph pulls");
         assert_eq!(summary["mode"], "complete");
         assert_eq!(summary["card_count"], 14);
 
@@ -1602,7 +1756,7 @@ mod pg_tests {
         .expect("canonical bundle metadata is YAML");
         let cards = metadata["cards"]
             .as_array()
-            .expect("bundle metadata lists hydrated cards");
+            .expect("bundle metadata lists pulled cards");
         for (kind, name) in [
             ("Verifier", "churn-triage-check"),
             ("Verifier", "cohort-check"),
@@ -1615,7 +1769,7 @@ mod pg_tests {
                 cards.iter().any(|card| {
                     card["card_ref"]["kind"] == kind && card["card_ref"]["name"] == name
                 }),
-                "hydrated graph reaches {kind} {name}: {cards:?}"
+                "pulled graph reaches {kind} {name}: {cards:?}"
             );
         }
 
@@ -1626,7 +1780,7 @@ mod pg_tests {
             let card = cards
                 .iter()
                 .find(|card| card["card_ref"]["name"] == name)
-                .unwrap_or_else(|| panic!("bundle hydrates the {binding_owner} {name}"));
+                .unwrap_or_else(|| panic!("bundle pulls the {binding_owner} {name}"));
             let card_path = bundle.path().join(
                 card["card_path"]
                     .as_str()
@@ -1669,9 +1823,9 @@ mod pg_tests {
         server.shutdown().await.expect("test server shuts down");
     }
 
-    /// Prove real registry output hydrates into runtime state and rejects metadata-only output.
+    /// Prove real registry output pulls into runtime state and rejects metadata-only output.
     #[tokio::test]
-    async fn multi_card_service_get_hydrates_complete_and_metadata_bundles() {
+    async fn multi_card_service_pull_publishes_complete_and_metadata_bundles() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let service_path = write_multi_card_service(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
@@ -1700,15 +1854,15 @@ mod pg_tests {
             temp.path().join("agent-two.yaml"),
         ] {
             cards
-                .register_from_path(&path)
+                .declare_from_path(&path)
                 .await
-                .expect("related Card registers through shared path API");
+                .expect("related Card declares through shared path API");
         }
-        let registration = cards
-            .register_from_path(&service_path)
+        let declaration = cards
+            .declare_from_path(&service_path)
             .await
-            .expect("root Service registers through shared path API");
-        let service_uid = registration
+            .expect("root Service declares through shared path API");
+        let service_uid = declaration
             .root
             .uid
             .as_ref()
@@ -1734,14 +1888,14 @@ mod pg_tests {
         let original_blob = std::fs::read(&blob_path).expect("service blob reads");
         let service_ref = json!({
             "kind": "Service",
-            "name": "hydrated-service",
+            "name": "pulled-service",
             "version": "1.0.0",
             "space": "default",
             "uid": service_uid_string,
         });
         let service_ref_string = format!(
-            "default/Service/hydrated-service@1.0.0#{}",
-            registration.root.uid.as_ref().expect("service UID exists")
+            "default/Service/pulled-service@1.0.0#{}",
+            declaration.root.uid.as_ref().expect("service UID exists")
         );
 
         let mut cycle_blob: Value =
@@ -1762,7 +1916,7 @@ mod pg_tests {
         let cycle_dir = temp.path().join("cycle-service");
         let cycle = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -1821,7 +1975,7 @@ mod pg_tests {
         .expect("alias blob writes");
         let alias_conflict = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -1848,10 +2002,10 @@ mod pg_tests {
         assert!(!alias_dir.exists());
         std::fs::write(&blob_path, &original_blob).expect("service blob restores");
 
-        let denied_dir = temp.path().join("denied-service-hydration");
+        let denied_dir = temp.path().join("denied-service-pull");
         let denied = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -1876,7 +2030,7 @@ mod pg_tests {
         let full_dir = temp.path().join("full-service");
         let full = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -1934,7 +2088,7 @@ mod pg_tests {
 
         let state = WyrdState::from_path(&full_dir)
             .expect("registry-produced complete bundle loads as WyrdState");
-        assert_eq!(state.root_ref(), &registration.root);
+        assert_eq!(state.root_ref(), &declaration.root);
         assert_eq!(state.service().kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(
             state
@@ -1985,7 +2139,7 @@ mod pg_tests {
         let metadata_dir = temp.path().join("metadata-service");
         let metadata = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -2035,7 +2189,7 @@ mod pg_tests {
         let missing_dir = temp.path().join("missing-related");
         let missing = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Service".to_owned(),
                 "--uid".to_owned(),
@@ -2061,94 +2215,21 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
-    /// Prove a real `wyrd load` transfer clears stdout progress before its final JSON receipt.
+    /// Prove complete `wyrd pull` clears stdout progress before its final JSON summary.
     ///
     /// # Panics
-    /// Panics when the embedded server, public CLI registration/load workflow,
-    /// JSON receipt, or verified artifact bytes fail their expected contract.
-    ///
-    /// # Cancellation
-    /// Cancellation can leave the isolated test server awaiting shutdown, but
-    /// the registry materializer keeps an incomplete destination unpublished.
-    #[tokio::test]
-    async fn cli_load_renders_download_progress() {
-        let temp = tempfile::tempdir().expect("tempdir creates");
-        let path = write_prompt(&temp);
-        let destination = temp.path().join("loaded");
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
-        let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-load-progress", &["editor"])
-            .await
-            .expect("writer bootstraps")
-        else {
-            panic!("writer bootstrap returned a non-user principal");
-        };
-        let receipt = run_cli_json(
-            vec![
-                "apply".to_owned(),
-                path.to_str().expect("prompt path is UTF-8").to_owned(),
-                "--server".to_owned(),
-                base_url.clone(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            &jwt,
-        )
-        .await
-        .expect("CLI apply succeeds");
-        let uid = receipt["root"]["uid"]
-            .as_str()
-            .expect("apply receipt has Card UID");
-        let loaded = run_cli_owned_with_token(
-            vec![
-                "load".to_owned(),
-                "--kind".to_owned(),
-                "Prompt".to_owned(),
-                "--uid".to_owned(),
-                uid.to_owned(),
-                "--path".to_owned(),
-                destination
-                    .to_str()
-                    .expect("load destination is UTF-8")
-                    .to_owned(),
-                "--server".to_owned(),
-                base_url,
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            Some(jwt),
-        )
-        .await;
-        assert!(
-            loaded.status.success(),
-            "{}",
-            String::from_utf8_lossy(&loaded.stderr)
-        );
-        let summary: Value = serde_json::from_slice(&loaded.stdout)
-            .expect("load stdout remains JSON after progress clears");
-        assert_eq!(summary["materialized"], true);
-        assert_eq!(
-            std::fs::read(destination.join("prompt.txt")).expect("loaded artifact reads"),
-            b"cli-card-artifact"
-        );
-        stop_cli_server(server, shutdown, serve_handle).await;
-    }
-
-    /// Prove complete `wyrd get` clears stdout progress before its final JSON summary.
-    ///
-    /// # Panics
-    /// Panics when the embedded server, public CLI registration/get workflow,
+    /// Panics when the embedded server, public CLI declaration/get workflow,
     /// JSON summary, metadata-only read, or verified artifact bytes fail their
     /// expected contract.
     ///
     /// # Cancellation
     /// Cancellation can leave the isolated test server awaiting shutdown, but
-    /// the graph hydrator removes its unpublished staging bundle on failure.
+    /// the graph puller removes its unpublished staging bundle on failure.
     #[tokio::test]
-    async fn cli_get_renders_download_progress() {
+    async fn cli_pull_renders_download_progress() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
-        let destination = temp.path().join("hydrated");
+        let destination = temp.path().join("pulled");
         let metadata_only = temp.path().join("metadata-only");
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
@@ -2160,7 +2241,7 @@ mod pg_tests {
         };
         let receipt = run_cli_json(
             vec![
-                "apply".to_owned(),
+                "declare".to_owned(),
                 path.to_str().expect("prompt path is UTF-8").to_owned(),
                 "--server".to_owned(),
                 base_url.clone(),
@@ -2170,13 +2251,13 @@ mod pg_tests {
             &jwt,
         )
         .await
-        .expect("CLI apply succeeds");
+        .expect("CLI declare succeeds");
         let uid = receipt["root"]["uid"]
             .as_str()
-            .expect("apply receipt has Card UID");
+            .expect("declare receipt has Card UID");
         let output = run_cli_owned_with_token(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Prompt".to_owned(),
                 "--uid".to_owned(),
@@ -2184,7 +2265,7 @@ mod pg_tests {
                 "--output-dir".to_owned(),
                 destination
                     .to_str()
-                    .expect("hydration destination is UTF-8")
+                    .expect("pull destination is UTF-8")
                     .to_owned(),
                 "--server".to_owned(),
                 base_url.clone(),
@@ -2204,12 +2285,12 @@ mod pg_tests {
         assert_eq!(summary["mode"], "complete");
         assert_eq!(
             std::fs::read(destination.join("cards/root/artifacts/prompt.txt"))
-                .expect("hydrated artifact reads"),
+                .expect("pulled artifact reads"),
             b"cli-card-artifact"
         );
         let metadata = run_cli_json(
             vec![
-                "get".to_owned(),
+                "pull".to_owned(),
                 "--kind".to_owned(),
                 "Prompt".to_owned(),
                 "--uid".to_owned(),
@@ -2250,10 +2331,10 @@ mod pg_tests {
 
     /// The CLI enforces the shared Verifier contract against a real server.
     ///
-    /// `plan` and `apply` refuse the retired `kind: Drift` and `kind: Eval`
+    /// `plan` and `declare` refuse the retired `kind: Drift` and `kind: Eval`
     /// Cards with the loader's stable envelope diagnostic and leave no Card on
     /// the server; building-block `kind: Verifier` Cards with a drift check
-    /// and an assert check apply.
+    /// and an assert check declare.
     ///
     /// # Panics
     /// Panics when the server fails to start or stop, a bootstrap fails, a
@@ -2276,9 +2357,9 @@ mod pg_tests {
         else {
             panic!("journey bootstrap returned a non-user principal");
         };
-        let apply = |path: &str| {
+        let declare = |path: &str| {
             vec![
-                "apply".to_owned(),
+                "declare".to_owned(),
                 path.to_owned(),
                 "--server".to_owned(),
                 base_url.clone(),
@@ -2297,19 +2378,20 @@ mod pg_tests {
                 ),
             );
             let plan = run_cli_owned(vec![
-                "plan".to_owned(),
+                "declare".to_owned(),
+                "--check".to_owned(),
                 path.clone(),
                 "--format".to_owned(),
                 "json".to_owned(),
             ])
             .await;
             assert_eq!(plan.status.code(), Some(64), "{kind}");
-            let report: Value = serde_json::from_slice(&plan.stdout).expect("plan error is JSON");
+            let report: Value = serde_json::from_slice(&plan.stdout).expect("check error is JSON");
             assert_eq!(
                 report["diagnostics"][0]["code"], "WYRD_LOADER_400_INVALID_ENVELOPE",
                 "{kind}: {report}"
             );
-            let refused = run_cli_owned_with_token(apply(&path), Some(jwt.clone())).await;
+            let refused = run_cli_owned_with_token(declare(&path), Some(jwt.clone())).await;
             assert_eq!(refused.status.code(), Some(64), "{kind}");
             assert_eq!(
                 first_stderr_json(&refused)["code"],
@@ -2343,7 +2425,7 @@ mod pg_tests {
             ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);
-            let receipt = run_cli_json(apply(&path), &jwt)
+            let receipt = run_cli_json(declare(&path), &jwt)
                 .await
                 .unwrap_or_else(|error| panic!("{name} applies: {error}"));
             assert_eq!(receipt["root"]["name"], name, "{receipt}");
@@ -2606,7 +2688,7 @@ mod pg_tests {
             );
         }
         let still = connection_json(
-            "get",
+            "pull",
             &connection_cli(verb("get", &["--connection-id", &http]), &admin).await,
         );
         assert_eq!(

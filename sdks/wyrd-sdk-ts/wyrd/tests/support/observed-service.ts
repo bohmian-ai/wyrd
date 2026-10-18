@@ -23,8 +23,8 @@ export const observedService = (options: ServerOptions = {}) =>
     bundle: [
       async ({ server: _ }, use) => {
         const cards = await Cards.connect();
-        await cards.registerFromPath(fixture("cards/observe_a_run/observed-model.yaml"));
-        const { root } = await cards.registerFromPath(fixture("cards/observe_a_run/observed-service.yaml"));
+        await cards.declareFromPath(fixture("cards/observe_a_run/observed-model.yaml"));
+        const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/observed-service.yaml"));
         const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-observed-"));
         await cards.hydrate(root, bundle);
         await use(bundle);

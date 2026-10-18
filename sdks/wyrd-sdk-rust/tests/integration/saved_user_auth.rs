@@ -137,7 +137,7 @@ async fn newest_saved_login_is_used_without_a_selector() {
         .cards(None)
         .await
         .expect("the newest login resolves")
-        .register_from_path(&fixture(PROMPT))
+        .declare_from_path(&fixture(PROMPT))
         .await
         .expect("alice registers the Prompt");
 
@@ -161,7 +161,7 @@ async fn saved_reader_login_is_denied_a_write() {
         .cards(Some(FIXTURE_TENANT_SLUG))
         .await
         .expect("bob's login resolves")
-        .register_from_path(&fixture(PROMPT))
+        .declare_from_path(&fixture(PROMPT))
         .await
         .expect_err("a reader cannot register");
 

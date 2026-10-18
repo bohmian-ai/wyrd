@@ -11,7 +11,7 @@ use std::time::Duration;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
+use wyrd_client::cards::{CardGraphPuller, CardSelector, Cards, BundleMode};
 use wyrd_client::observe::Run;
 use wyrd_client::state::WyrdState;
 use wyrd_client::verify::Submission;
@@ -40,9 +40,9 @@ struct Observed {
     server: WyrdTestServer,
     /// The administrator's client, for setup and read-back.
     admin: WyrdClient,
-    /// The started state over the hydrated bundle.
+    /// The started state over the Card bundle.
     state: WyrdState,
-    /// Keeps the hydrated bundle on disk for the state's lifetime.
+    /// Keeps the Card bundle on disk for the state's lifetime.
     _bundle: tempfile::TempDir,
 }
 
@@ -68,18 +68,18 @@ impl Observed {
             ),
         );
         let cards = Cards::connect_with(&admin).await.expect("handle connects");
-        Box::pin(cards.register_from_path(&cards_dir.path().join("observed-model.yaml")))
+        Box::pin(cards.declare_from_path(&cards_dir.path().join("observed-model.yaml")))
             .await
             .expect("the Model registers");
         let receipt =
-            Box::pin(cards.register_from_path(&cards_dir.path().join("observed-service.yaml")))
+            Box::pin(cards.declare_from_path(&cards_dir.path().join("observed-service.yaml")))
                 .await
                 .expect("the Service registers");
         let bundle = tempfile::tempdir().expect("bundle directory creates");
-        Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
+        Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
             &CardSelector::exact(receipt.root.clone()),
             &bundle.path().join("bundle"),
-            HydrationMode::Complete,
+            BundleMode::Complete,
         ))
         .await
         .expect("the Service hydrates");

@@ -21,7 +21,7 @@ mod principal_roles;
 mod query_bifrost;
 /// Common analytical SQL over part-published, part-live tables.
 mod query_coverage;
-mod register_and_hydrate;
+mod declare_and_pull;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
 /// Every handle's `connect` forms against a real server.

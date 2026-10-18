@@ -11,7 +11,7 @@ use wyrd_ai::cli;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
 
-use crate::support::{Deployment, coordinates, fixture, register};
+use crate::support::{Deployment, coordinates, fixture, declare};
 
 /// A tenant-wide query over a built-in table, which `workload` permits.
 const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM vala.drift.observations";
@@ -42,8 +42,8 @@ fn assignment(role: &str, source: RoleSource) -> RoleAssignment {
 async fn service_principal() -> (Deployment, PrincipalId, String) {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    register(&cards, "cards/observe_a_run/observed-model.yaml").await;
-    let service: CardRef = register(&cards, "cards/observe_a_run/observed-service.yaml")
+    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let service: CardRef = declare(&cards, "cards/observe_a_run/observed-service.yaml")
         .await
         .root;
     let [kind, name, version, space] = coordinates(&service);
@@ -72,7 +72,7 @@ async fn service_principal() -> (Deployment, PrincipalId, String) {
 async fn author(deployment: &Deployment, key: &str) -> Result<(), WyrdError> {
     Cards::connect_with(&deployment.client(key))
         .await?
-        .register_from_path(&fixture(AUTHORED))
+        .declare_from_path(&fixture(AUTHORED))
         .await
         .map(|_| ())
 }

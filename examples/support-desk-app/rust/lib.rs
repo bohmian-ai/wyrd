@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
-use wyrd_ai::cards::{CardSelector, Cards, HydrationMode};
+use wyrd_ai::cards::{CardSelector, Cards, BundleMode};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::observe::Run;
 use wyrd_ai::state::WyrdState;
@@ -51,7 +51,7 @@ pub fn service_dir() -> PathBuf {
 /// The deployed support desk: the hydrated Service every request runs in.
 #[derive(Clone)]
 pub struct SupportDesk {
-    /// The Service's Cards, loaded from the hydrated bundle.
+    /// The Service's Cards, loaded from the Card bundle.
     state: WyrdState,
 }
 
@@ -70,13 +70,13 @@ impl SupportDesk {
         // ANCHOR: deploy
         let cards = Cards::connect_with(client).await?;
         let receipt = cards
-            .register_from_path(service_dir().join("support-desk.yaml"))
+            .declare_from_path(service_dir().join("support-desk.yaml"))
             .await?;
         cards
-            .hydrate(
+            .pull(
                 CardSelector::exact(receipt.root),
                 bundle,
-                HydrationMode::Complete,
+                BundleMode::Complete,
             )
             .await?;
         Gateway::connect_with(client)

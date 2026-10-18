@@ -22,13 +22,13 @@ from .._wyrd.cards import (
     DataCardRegistry,
     DataLoadArgs,
     DataSaveArgs,
-    HydrationSummary,
+    PullSummary,
     ModelCardRegistry,
     ModelLoadArgs,
     ModelSaveArgs,
     PromptCardRegistry,
-    RegistrationOutcome,
-    RegistrationReceipt,
+    DeclarationOutcome,
+    DeclarationReceipt,
     VersionBump,
 )
 from .._wyrd.cards.agent import AgentCard
@@ -50,7 +50,7 @@ __all__ = [
     "PromptCardRegistry",
     "CardSummary",
     "CardList",
-    "RegistrationOutcome",
-    "RegistrationReceipt",
-    "HydrationSummary",
+    "DeclarationOutcome",
+    "DeclarationReceipt",
+    "PullSummary",
 ]

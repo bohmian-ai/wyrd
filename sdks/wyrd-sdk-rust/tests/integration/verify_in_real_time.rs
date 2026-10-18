@@ -27,7 +27,7 @@ use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, coordinates, pull, declare, declared};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);
@@ -101,18 +101,18 @@ impl Assistant {
             .await
             .expect("the capture policy puts");
         let cards = deployment.cards().await;
-        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-        register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
-        let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
-        let bundle = hydrate(&cards, &assistant.root).await;
+        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+        let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+        let bundle = pull(&cards, &assistant.root).await;
         Self {
             deployment,
             judge,
             bundle,
             service: assistant.root.clone(),
-            answer_check: registered(&assistant, "answer-check"),
-            answer_judged: registered(&assistant, "answer-judged"),
-            agent: registered(&assistant, "assistant-agent"),
+            answer_check: declared(&assistant, "answer-check"),
+            answer_judged: declared(&assistant, "answer-judged"),
+            agent: declared(&assistant, "assistant-agent"),
         }
     }
 
@@ -858,8 +858,8 @@ async fn window_verifier_records_samples_and_refuses_verify() {
 async fn unfitted_baseline_is_skipped_on_schedule() {
     let assistant = Assistant::start().await;
     let cards = assistant.deployment.cards().await;
-    let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
-    let bundle = hydrate(&cards, &unfitted.root).await;
+    let unfitted = declare(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
+    let bundle = pull(&cards, &unfitted.root).await;
     let key = assistant.deployment.service_key(&unfitted.root).await;
     let state = WyrdState::from_path_with(
         bundle.path().join("bundle"),

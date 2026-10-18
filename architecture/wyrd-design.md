@@ -1756,7 +1756,7 @@ one card or many, and the server derives the root from the DAG of
 submissions.
 
 ```rust
-struct CreateCardRequest {
+struct DeclareCardRequest {
     submissions: Vec<CardSubmission>,
 }
 
@@ -1768,9 +1768,9 @@ struct CardSubmission {
     artifacts: Vec<ArtifactManifestEntry>,             // heavy uploads; default empty
 }
 
-struct CreateCardResponse {
+struct DeclareCardResponse {
     root: CardRef,                                     // server-derived, single no-in-degree node
-    outcomes: Vec<CardRegistrationOutcome>,           // one per submission
+    outcomes: Vec<CardDeclarationOutcome>,           // one per submission
     upload_plans: Vec<CardUploadPlan>,                // one per heavy submission (see §Heavy artifacts)
 }
 ```
@@ -1845,7 +1845,7 @@ Server-side behavior:
   `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`.
 - Key not seen → normal processing; key + hash stored on completion.
 
-Idempotency state lives in `wyrd.card_registration_operations` with a
+Idempotency state lives in `wyrd.card_declaration_operations` with a
 24h TTL. Expired records outside the retry window surface as
 `WYRD_REGISTRY_410_OPERATION_EXPIRED`.
 

@@ -458,7 +458,7 @@ async fn server_dev_first_run_is_client_ready() {
     .expect("checked-in prompt copied outside checkout");
     let applied = local
         .command()
-        .args(["apply", prompt.to_str().expect("UTF-8 prompt")])
+        .args(["declare", prompt.to_str().expect("UTF-8 prompt")])
         .output()
         .await
         .expect("fresh CLI write");
@@ -996,7 +996,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
     .expect("prompt fixture");
     let applied = local
         .command()
-        .args(["apply", prompt.to_str().expect("UTF-8 prompt")])
+        .args(["declare", prompt.to_str().expect("UTF-8 prompt")])
         .output()
         .await
         .expect("card write");

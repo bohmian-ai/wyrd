@@ -839,7 +839,7 @@ async fn scribe_unbound_writer_card_attribution_journey() {
     let trigger = wyrd_client::cards::Cards::connect_with(&client)
         .await
         .expect("handle connects")
-        .register_from_path(concat!(
+        .declare_from_path(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards/scheduled_drift_alerts_operator/daily.yaml"
         ))

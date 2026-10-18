@@ -131,7 +131,7 @@ def ancestry(spans: Sequence[SpanRecord], span: SpanRecord) -> list[SpanRecord]:
 
 def register(cards: Cards, path: str) -> dict[str, CardRef]:
     """Register one checked-in fixture file and return every Card it registered, by name."""
-    receipt = cards.register_from_path(FIXTURES / path)
+    receipt = cards.declare_from_path(FIXTURES / path)
     return {outcome.card_ref.name: outcome.card_ref for outcome in receipt.outcomes}
 
 

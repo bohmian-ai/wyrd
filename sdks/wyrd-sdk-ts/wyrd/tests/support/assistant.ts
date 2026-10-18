@@ -38,7 +38,7 @@ export const JudgeCall = z.object({
   card_uid: z.string().nullable(),
 });
 
-/** The registered assistant Service, its hydrated bundle, and its own key. */
+/** The registered assistant Service, its Card bundle, and its own key. */
 export interface Assistant {
   readonly bundle: string;
   readonly key: string;
@@ -82,9 +82,9 @@ export const assistantTest = (options: { readonly perTest?: boolean } = {}) =>
         await configureGateway(WyrdClient.connect());
         await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
         const cards = await Cards.connect();
-        await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-        await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-        const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
+        await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+        await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+        const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
         const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
         await cards.hydrate(receipt.root, bundle);
         const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" });

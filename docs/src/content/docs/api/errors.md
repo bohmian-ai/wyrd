@@ -305,7 +305,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_400_INVALID_OBSERVATION` | 400 | Invalid observation input | Emit a flat object of boolean, integer, finite float, or string values, with valid feature names and media bindings. |
 | `WYRD_SDK_400_INVALID_STATE_BUNDLE` | 400 | Invalid WyrdState bundle | Regenerate the bundle with wyrd get and load the complete output. |
 | `WYRD_SDK_400_RUNTIME_HYDRATION_FAILED` | 400 | Runtime Card hydration failed | Provide the required custom interface/load arguments or regenerate a complete compatible bundle. |
-| `WYRD_SDK_400_UNHYDRATED_ARTIFACT` | 400 | Hydrated bundle is missing artifact payloads | Run wyrd get without --metadata-only and load the complete bundle. |
+| `WYRD_SDK_400_UNHYDRATED_ARTIFACT` | 400 | Card bundle is missing artifact payloads | Run wyrd get without --metadata-only and load the complete bundle. |
 | `WYRD_SDK_404_UNKNOWN_ALIAS` | 404 | Unknown WyrdState alias | Use an alias returned by the loaded WyrdState bundle. |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | 404 | Verifier is not bound to this subject | Name a Verifier bound in `verified_by` to the view's subject Card, or open the view on the Card that binds it. |
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |

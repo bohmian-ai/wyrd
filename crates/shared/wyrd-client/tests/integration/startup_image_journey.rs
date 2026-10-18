@@ -29,7 +29,7 @@ use wyrd_spec::vala::api::{BifrostQueryRequest, RegisterOutcome};
 /// The checked-in Card with one artifact the journey registers and reads back.
 const CARD: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../fixtures/cards/register_and_hydrate/support-model.yaml"
+    "/../../../fixtures/cards/declare_and_pull/support-model.yaml"
 );
 
 /// The artifact the fixture Card declares, as its file name and bytes.
@@ -37,7 +37,7 @@ const ARTIFACT_NAME: &str = "support-model.bin";
 
 /// Bytes of the fixture artifact.
 const ARTIFACT: &[u8] =
-    include_bytes!("../../../../../fixtures/cards/register_and_hydrate/support-model.bin");
+    include_bytes!("../../../../../fixtures/cards/declare_and_pull/support-model.bin");
 
 /// One row of the journey table, as a caller declares it.
 #[derive(serde::Serialize)]
@@ -167,7 +167,7 @@ async fn startup_image_write() {
     let receipt = Cards::connect_with(&client)
         .await
         .expect("handle connects")
-        .register_from_path(std::path::Path::new(CARD))
+        .declare_from_path(std::path::Path::new(CARD))
         .await
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");

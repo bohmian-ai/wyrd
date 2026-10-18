@@ -59,7 +59,7 @@ def test_newest_saved_login_is_used_without_a_selector(
 ) -> None:
     sso_server.save_human_login(config_home, SECOND_TENANT, "alice", "alice-password")
 
-    receipt = Cards(WyrdClient(server_url=sso_server.base_url)).register_from_path(PROMPT)
+    receipt = Cards(WyrdClient(server_url=sso_server.base_url)).declare_from_path(PROMPT)
 
     assert receipt.root.name == "ask-prompt"
 
@@ -72,7 +72,7 @@ def test_saved_reader_login_is_denied_a_write(
     reader = Cards(WyrdClient(server_url=sso_server.base_url))
 
     with pytest.raises(WyrdError) as denied:
-        reader.register_from_path(PROMPT)
+        reader.declare_from_path(PROMPT)
     assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
 

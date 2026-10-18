@@ -301,7 +301,7 @@ def test_typed_registry_rejects_a_card_of_the_wrong_kind(cards: Cards) -> None:
     assert raised.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
-def test_card_registration_replay_is_idempotent(cards: Cards) -> None:
+def test_card_declaration_replay_is_idempotent(cards: Cards) -> None:
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Replay me"),
         space="python-e2e",
@@ -381,7 +381,7 @@ def test_registration_releases_the_gil(cards: Cards) -> None:
     assert counter[0] > 0
 
 
-def test_card_registration_rejects_invalid_artifact_layout(cards: Cards) -> None:
+def test_card_declaration_rejects_invalid_artifact_layout(cards: Cards) -> None:
     card = DataCard(
         SymlinkDataInterface({"rows": 1}),
         space="python-e2e",
@@ -393,7 +393,7 @@ def test_card_registration_rejects_invalid_artifact_layout(cards: Cards) -> None
     assert raised.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
-def test_card_registration_rejects_underprivileged_writer(wyrd_server: WyrdTestServer) -> None:
+def test_card_declaration_rejects_underprivileged_writer(wyrd_server: WyrdTestServer) -> None:
     denied = Cards(WyrdClient(credential=wyrd_server.bootstrap_service([], name="no-roles")))
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="No write permission"),

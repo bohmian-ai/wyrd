@@ -276,9 +276,9 @@ test("window verifier records samples and refuses verify", async ({ state }) => 
 
 test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const cards = await Cards.connect();
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-  const { root } = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+  const { root } = await cards.declareFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
   await cards.hydrate(root, bundle);
   const key = await cli.issueKey({ ...root, space: root.space ?? "default" });

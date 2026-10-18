@@ -1,4 +1,4 @@
-//! Composite card-registration persistence primitives.
+//! Composite card-declaration persistence primitives.
 #![deny(missing_docs)]
 
 use chrono::{DateTime, Utc};
@@ -11,7 +11,7 @@ use wyrd_spec::envelope::{Card, CardKind, SpecCanonicalizationError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, RegistrationOperationId};
+use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, DeclarationOperationId};
 
 use crate::row_types::cards::CardStatus;
 use crate::tenant_conn::TenantConn;
@@ -19,9 +19,9 @@ use crate::tenant_conn::TenantConn;
 // Dynamic query is intentional: the reference batch has request-dependent
 // cardinality, and every bind remains parameterized through QueryBuilder.
 
-/// Persisted registration operation used for idempotency replay.
+/// Persisted declaration operation used for idempotency replay.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CardRegistrationOperationRow {
+pub struct CardDeclarationOperationRow {
     /// Server-minted operation identifier.
     pub operation_id: Uuid,
     /// Tenant owning the operation.
@@ -45,11 +45,11 @@ pub struct CardRegistrationOperationRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Inputs for reserving a registration idempotency key.
-pub struct NewRegistrationOperation<'a> {
+/// Inputs for reserving a declaration idempotency key.
+pub struct NewDeclarationOperation<'a> {
     /// Server-minted operation identifier.
-    pub operation_id: RegistrationOperationId,
-    /// Verified subject and actor of the registering request; together with
+    pub operation_id: DeclarationOperationId,
+    /// Verified subject and actor of the declaring request; together with
     /// the key they scope replay.
     pub attribution: Attribution,
     /// Caller-provided idempotency key.
@@ -67,8 +67,8 @@ pub struct NewCardRow<'a> {
     /// Verified subject and actor that created the row; never rewritten by
     /// later updates.
     pub attribution: Attribution,
-    /// Registration operation owning the row.
-    pub operation_id: RegistrationOperationId,
+    /// Declaration operation owning the row.
+    pub operation_id: DeclarationOperationId,
     /// Initial lifecycle status.
     pub status: CardStatus,
     /// Canonical resolved-spec hash.
@@ -98,7 +98,7 @@ pub struct CardArtifactManifestRow {
     pub upload_id: Option<Uuid>,
 }
 
-/// Card row values needed to construct a registration response.
+/// Card row values needed to construct a declaration response.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RegisteredCardRow {
     /// Card UID.
@@ -121,8 +121,8 @@ pub struct RegisteredCardRow {
     pub created_at: DateTime<Utc>,
     /// Subject and actor that created the row.
     pub attribution: Attribution,
-    /// Registration operation identifier.
-    pub operation_id: RegistrationOperationId,
+    /// Declaration operation identifier.
+    pub operation_id: DeclarationOperationId,
 }
 
 /// Compute the canonical request hash from ordered submissions and manifest hashes.
@@ -158,13 +158,13 @@ pub async fn lookup_existing_operation(
     conn: &mut TenantConn<'_>,
     attribution: Attribution,
     idempotency_key: &str,
-) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
-    sqlx::query_as::<_, CardRegistrationOperationRow>(
+) -> Result<Option<CardDeclarationOperationRow>, WyrdError> {
+    sqlx::query_as::<_, CardDeclarationOperationRow>(
         r"SELECT operation_id, data_tenant_id, sub_principal_id, act_principal_id,
                   idempotency_key,
                   request_hash, stored_response, status,
                   created_at, updated_at
-             FROM wyrd.card_registration_operations
+             FROM wyrd.card_declaration_operations
             WHERE status <> 'expired'
               AND sub_principal_id = $1 AND act_principal_id = $2
               AND idempotency_key = $3",
@@ -193,13 +193,13 @@ pub async fn lookup_expired_operation(
     conn: &mut TenantConn<'_>,
     attribution: Attribution,
     idempotency_key: &str,
-) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
-    sqlx::query_as::<_, CardRegistrationOperationRow>(
+) -> Result<Option<CardDeclarationOperationRow>, WyrdError> {
+    sqlx::query_as::<_, CardDeclarationOperationRow>(
         r"SELECT operation_id, data_tenant_id, sub_principal_id, act_principal_id,
                   idempotency_key,
                   request_hash, stored_response, status,
                   created_at, updated_at
-             FROM wyrd.card_registration_operations
+             FROM wyrd.card_declaration_operations
             WHERE status = 'expired'
               AND sub_principal_id = $1 AND act_principal_id = $2
               AND idempotency_key = $3",
@@ -217,7 +217,7 @@ pub async fn lookup_expired_operation(
 /// Inserts a `pending` operation keyed by tenant, subject, actor, and
 /// idempotency key, recording the operation's attribution pair once. The row
 /// joins the caller's transaction, so it commits or rolls back with the
-/// registration it reserves; a cancelled or failed transaction leaves no
+/// declaration it reserves; a cancelled or failed transaction leaves no
 /// reservation.
 ///
 /// Returns `true` when this call reserved the key and `false` when the same
@@ -228,12 +228,12 @@ pub async fn lookup_expired_operation(
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
 /// and redacted, when the insert fails for any reason other than that
 /// conflict.
-pub async fn insert_registration_operation(
+pub async fn insert_declaration_operation(
     conn: &mut TenantConn<'_>,
-    operation: NewRegistrationOperation<'_>,
+    operation: NewDeclarationOperation<'_>,
 ) -> Result<bool, WyrdError> {
     let inserted = sqlx::query(
-        r"INSERT INTO wyrd.card_registration_operations
+        r"INSERT INTO wyrd.card_declaration_operations
                (operation_id, data_tenant_id, sub_principal_id, act_principal_id,
                 idempotency_key, request_hash, stored_response, status)
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, NULL, 'pending')
@@ -251,12 +251,12 @@ pub async fn insert_registration_operation(
     Ok(inserted.rows_affected() == 1)
 }
 
-/// Insert one resolved card owned by a registration operation.
+/// Insert one resolved card owned by a declaration operation.
 ///
 /// Writes the Card with its resolved space and pinned version, its creation
 /// pair, and the operation that owns it; a `pending` Card is stamped with its
 /// pending time and immediately due for reconciliation. The row joins the
-/// caller's transaction, so nothing is durable until the registration
+/// caller's transaction, so nothing is durable until the declaration
 /// commits, and the creation pair is never rewritten afterwards.
 ///
 /// # Errors
@@ -287,7 +287,7 @@ pub async fn insert_card_row(
                (card_uid, data_tenant_id, kind, space, name, version, spec,
         spec_hash, artifact_hash, labels, annotations, status,
                 sub_principal_id, act_principal_id,
-                registration_operation_id, pending_since,
+                declaration_operation_id, pending_since,
                 reconcile_status, reconcile_next_attempt_at)
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
                    $9, $10, $11, $12, $13, $14, $15,
@@ -337,7 +337,7 @@ pub async fn insert_card_row(
 /// Insert manifest rows in the same transaction as their card.
 ///
 /// The client computes every authored-omitted digest and size before
-/// registration, so each entry on the wire carries both.
+/// declaration, so each entry on the wire carries both.
 ///
 /// # Errors
 /// Returns `RegistryInvalidCardSpec` when an entry lacks `sha256` or
@@ -434,14 +434,14 @@ pub async fn mark_manifest_upload_initialized(
 }
 
 /// Commit the exact composite response used for future idempotent replay.
-pub async fn commit_registration_operation(
+pub async fn commit_declaration_operation(
     conn: &mut TenantConn<'_>,
-    operation_id: RegistrationOperationId,
-    seed: &wyrd_spec::registry::RegistrationReplaySeed,
+    operation_id: DeclarationOperationId,
+    seed: &wyrd_spec::registry::DeclarationReplaySeed,
 ) -> Result<(), WyrdError> {
     let stored_response = serde_json::to_value(seed).map_err(WyrdError::from_spec_serialization)?;
     let result = sqlx::query(
-        r"UPDATE wyrd.card_registration_operations
+        r"UPDATE wyrd.card_declaration_operations
               SET stored_response = $1, status = 'committed', updated_at = now()
             WHERE operation_id = $2 AND status = 'pending'",
     )

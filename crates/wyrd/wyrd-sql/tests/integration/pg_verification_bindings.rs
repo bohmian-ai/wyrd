@@ -15,13 +15,13 @@ use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, FeatureName, SlotName};
-use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     insert_role, list_service_account_roles, revoke_role_from_service_account,
 };
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
+    NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::verification::{
@@ -99,11 +99,11 @@ async fn register_service(
     actor: &Principal,
     card: &Card,
 ) -> (CardUid, PrincipalId) {
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let key = Uuid::now_v7().to_string();
-    insert_registration_operation(
+    insert_declaration_operation(
         conn,
-        NewRegistrationOperation {
+        NewDeclarationOperation {
             operation_id,
             attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,

@@ -1,19 +1,19 @@
-//! Lower the loader's local-only registration input to the flat wire request.
+//! Lower the loader's local-only declaration input to the flat wire request.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use wyrd_loader::RegistrationInput;
+use wyrd_loader::DeclarationInput;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::registry::{CardSubmission, CreateCardRequest, RelativeArtifactPath};
+use wyrd_spec::registry::{CardSubmission, DeclareCardRequest, RelativeArtifactPath};
 
 use super::hash_artifacts;
 use crate::cards::error::RegistryEngineError;
 
 /// Prepared request plus the local artifact provenance retained for transfer.
-pub(crate) struct PreparedRegistration {
+pub(crate) struct PreparedDeclaration {
     /// Wire-safe flat composite request.
-    pub(crate) request: CreateCardRequest,
+    pub(crate) request: DeclareCardRequest,
     /// Validated local sources keyed by manifest path.
     pub(crate) artifact_sources: BTreeMap<RelativeArtifactPath, PathBuf>,
 }
@@ -37,15 +37,15 @@ pub(crate) struct PreparedRegistration {
 /// Cancelling drops any open source file handle. Only local files have been
 /// read, so there is no remote progress to reconcile.
 pub(crate) async fn prepare(
-    input: &RegistrationInput,
-) -> Result<PreparedRegistration, RegistryEngineError> {
+    input: &DeclarationInput,
+) -> Result<PreparedDeclaration, RegistryEngineError> {
     let mut submissions = input.submissions.clone();
     for submission in &mut submissions {
         hash_artifacts::validate_and_stamp(submission, &input.artifact_sources).await?;
     }
     validate_source_set(&submissions, &input.artifact_sources)?;
-    Ok(PreparedRegistration {
-        request: CreateCardRequest { submissions },
+    Ok(PreparedDeclaration {
+        request: DeclareCardRequest { submissions },
         artifact_sources: input.artifact_sources.clone(),
     })
 }
@@ -54,7 +54,7 @@ pub(crate) async fn prepare(
 /// and the caller-supplied local sources.
 ///
 /// Runs after every submission has been hashed and stamped, before any
-/// registration network call, so a registration never starts with an
+/// declaration network call, so a declaration never starts with an
 /// artifact that cannot be uploaded or a local file nobody declared.
 ///
 /// # Errors

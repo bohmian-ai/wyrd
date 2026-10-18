@@ -1,4 +1,4 @@
-//! Composite card registration request and response contracts.
+//! Composite card declaration request and response contracts.
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -7,12 +7,12 @@ use crate::api_version::ApiVersion;
 use crate::envelope::{CardKind, Metadata};
 use crate::reference::CardRef;
 use crate::registry::{
-    CardLifecycleStatus, CardUploadEntry, RegistrationOutcomeKind, RelativeArtifactPath,
+    CardLifecycleStatus, CardUploadEntry, DeclarationOutcomeKind, RelativeArtifactPath,
 };
 
 /// Compute the stable BLAKE3 hash for an artifact manifest regardless of its authored order.
 ///
-/// Registration treats artifact files as a path-keyed publication. Sorting a
+/// Declaration treats artifact files as a path-keyed publication. Sorting a
 /// cloned manifest by its validated relative path before JCS serialization
 /// makes equivalent manifests produce the same durable hash without mutating
 /// the caller's request order.
@@ -38,7 +38,7 @@ pub fn canonical_artifact_manifest_hash(
     Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
 }
 
-/// One card submitted for registration.
+/// One card submitted for declaration.
 ///
 /// The server derives relationships, lifecycle status, resolved version, and
 /// UID. A submission is therefore intentionally smaller than a stored Card
@@ -66,13 +66,13 @@ pub struct CardSubmission {
 /// One heavy artifact declared by a submission.
 ///
 /// An author may omit `sha256` and `size_bytes`; the client computes both
-/// from the local file before any registration call, so a request sent to the
+/// from the local file before any declaration call, so a request sent to the
 /// server carries both and the server refuses an entry missing either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct ArtifactManifestEntry {
-    /// Validated path below the registered card's artifact prefix.
+    /// Validated path below the declared card's artifact prefix.
     pub relative_path: crate::registry::RelativeArtifactPath,
     /// Base64-encoded SHA-256 digest of the artifact bytes; computed by the
     /// client when authored without one.
@@ -86,20 +86,20 @@ pub struct ArtifactManifestEntry {
     pub content_type: Option<String>,
 }
 
-/// Composite registration request.
+/// Composite declaration request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct CreateCardRequest {
+pub struct DeclareCardRequest {
     /// Flat list of cards. The server topo-sorts the graph and derives root.
     pub submissions: Vec<CardSubmission>,
 }
 
-/// Outcome for one submission in a composite registration.
+/// Outcome for one submission in a composite declaration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct CardRegistrationOutcome {
+pub struct CardDeclarationOutcome {
     /// Server-resolved card identity.
     pub card_ref: CardRef,
     /// BLAKE3 hex hash of the JCS-canonical resolved spec.
@@ -109,8 +109,8 @@ pub struct CardRegistrationOutcome {
     pub artifact_hash: Option<String>,
     /// Server-managed lifecycle state.
     pub status: CardLifecycleStatus,
-    /// Registration result for this submission.
-    pub outcome: RegistrationOutcomeKind,
+    /// Declaration result for this submission.
+    pub outcome: DeclarationOutcomeKind,
     /// URI of the durable card blob once written.
     #[schemars(with = "Option<String>")]
     #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
@@ -129,35 +129,35 @@ pub struct CardUploadPlan {
     pub entries: Vec<CardUploadEntry>,
 }
 
-/// Composite registration response.
+/// Composite declaration response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct CreateCardResponse {
+pub struct DeclareCardResponse {
     /// Server-derived graph root.
     pub root: CardRef,
     /// Per-submission outcomes in server topo order.
-    pub outcomes: Vec<CardRegistrationOutcome>,
+    pub outcomes: Vec<CardDeclarationOutcome>,
     /// Upload plans for artifact-bearing submissions.
     pub upload_plans: Vec<CardUploadPlan>,
 }
 
 /// Public SDK receipt after the engine completes all required side effects.
 ///
-/// Upload plans and operation identifiers remain internal to the registration
+/// Upload plans and operation identifiers remain internal to the declaration
 /// engine and are intentionally absent from this projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct RegistrationReceipt {
+pub struct DeclarationReceipt {
     /// Server-derived graph root.
     pub root: CardRef,
     /// Dependency-first server outcomes with final lifecycle state.
-    pub outcomes: Vec<CardRegistrationOutcome>,
+    pub outcomes: Vec<CardDeclarationOutcome>,
 }
 
-impl From<CreateCardResponse> for RegistrationReceipt {
-    fn from(response: CreateCardResponse) -> Self {
+impl From<DeclareCardResponse> for DeclarationReceipt {
+    fn from(response: DeclareCardResponse) -> Self {
         Self {
             root: response.root,
             outcomes: response.outcomes,
@@ -165,15 +165,15 @@ impl From<CreateCardResponse> for RegistrationReceipt {
     }
 }
 
-/// Durable registration replay data used to mint upload URLs on demand.
+/// Durable declaration replay data used to mint upload URLs on demand.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct RegistrationReplaySeed {
+pub struct DeclarationReplaySeed {
     /// Server-derived graph root.
     pub root: CardRef,
     /// Stable per-card outcomes.
-    pub outcomes: Vec<CardRegistrationOutcome>,
+    pub outcomes: Vec<CardDeclarationOutcome>,
     /// Artifact paths grouped by their resolved card reference.
     pub artifact_manifest_paths: Vec<(CardRef, Vec<RelativeArtifactPath>)>,
 }
@@ -181,12 +181,12 @@ pub struct RegistrationReplaySeed {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactManifestEntry, CardSubmission, CreateCardRequest, CreateCardResponse,
-        RegistrationReceipt, canonical_artifact_manifest_hash,
+        ArtifactManifestEntry, CardSubmission, DeclareCardRequest, DeclareCardResponse,
+        DeclarationReceipt, canonical_artifact_manifest_hash,
     };
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
-    use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind, RelativeArtifactPath};
+    use crate::registry::{CardLifecycleStatus, DeclarationOutcomeKind, RelativeArtifactPath};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn create_card_request_is_flat_submissions_list() {
-        let request: CreateCardRequest = serde_json::from_value(json!({
+        let request: DeclareCardRequest = serde_json::from_value(json!({
             "submissions": [{
                 "apiVersion": "wyrd/v1",
                 "kind": "Audit",
@@ -246,7 +246,7 @@ mod tests {
         .expect("flat request deserializes");
         assert_eq!(request.submissions.len(), 1);
         assert!(
-            serde_json::from_value::<CreateCardRequest>(json!({
+            serde_json::from_value::<DeclareCardRequest>(json!({
                 "card": {}, "artifacts": []
             }))
             .is_err()
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn create_card_response_carries_root_outcomes_and_upload_plans() {
-        let response = CreateCardResponse {
+        let response = DeclareCardResponse {
             root: serde_json::from_value(json!({
                 "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
             }))
@@ -282,13 +282,13 @@ mod tests {
         assert!(response.upload_plans.is_empty());
         let _ = (
             CardLifecycleStatus::Pending,
-            RegistrationOutcomeKind::Registered,
+            DeclarationOutcomeKind::Declared,
         );
     }
 
     #[test]
     fn registration_receipt_excludes_internal_upload_plans() {
-        let response = CreateCardResponse {
+        let response = DeclareCardResponse {
             root: serde_json::from_value(json!({
                 "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
             }))
@@ -296,7 +296,7 @@ mod tests {
             outcomes: Vec::new(),
             upload_plans: Vec::new(),
         };
-        let receipt = RegistrationReceipt::from(response);
+        let receipt = DeclarationReceipt::from(response);
         let value = serde_json::to_value(receipt).expect("receipt serializes");
         assert!(value.get("upload_plans").is_none());
         assert!(value.get("operation_id").is_none());

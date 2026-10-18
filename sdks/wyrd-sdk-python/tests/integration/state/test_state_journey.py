@@ -72,7 +72,7 @@ def service(cards: Cards, models: dict[str, CardRef]) -> CardRef:
             PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
         )
     )
-    return cards.register_from_path(TYPED_STATE_SOURCE / "typed-service.yaml").root
+    return cards.declare_from_path(TYPED_STATE_SOURCE / "typed-service.yaml").root
 
 
 @pytest.fixture(scope="module")

@@ -29,7 +29,7 @@ use wyrd_utils::py::WyrdPyResult;
 
 use crate::client::PyWyrdClient;
 use crate::gateway::{PyGateway, decode};
-use crate::state::{PyHydrationSummary, PyRegistrationReceipt};
+use crate::state::{PyPullSummary, PyDeclarationReceipt};
 
 /// Run one shared command future on the Wyrd runtime with the GIL released.
 ///
@@ -316,7 +316,7 @@ fn apply(
     py: Python<'_>,
     path: PathBuf,
     client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyRegistrationReceipt> {
+) -> WyrdPyResult<PyDeclarationReceipt> {
     let client = rust_client(client);
     Ok(block_on(py, commands::apply(&path, client))?.into())
 }
@@ -358,14 +358,14 @@ fn get(
     fields: SelectorFields,
     metadata_only: bool,
     client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyHydrationSummary> {
+) -> WyrdPyResult<PyPullSummary> {
     let selector = selector(fields);
     let client = rust_client(client);
     let inner = block_on(
         py,
         commands::get(&selector, &output_dir, metadata_only, client),
     )?;
-    Ok(PyHydrationSummary::from(inner))
+    Ok(PyPullSummary::from(inner))
 }
 
 /// Load one Card and materialize its artifacts (`wyrd load`).

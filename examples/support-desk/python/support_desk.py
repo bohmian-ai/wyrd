@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 import openai
 from opentelemetry import trace
 from wyrd import verify
-from wyrd.cards import Cards, RegistrationReceipt
+from wyrd.cards import Cards, DeclarationReceipt
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.observe import Run
@@ -52,7 +52,7 @@ MCP_VERSION = "2026-07-28"
 class Desk:
     """The deployed support desk: its registration, loaded Card graph, and gateway client."""
 
-    receipt: RegistrationReceipt
+    receipt: DeclarationReceipt
     state: WyrdState
     gateway: openai.OpenAI
 
@@ -127,7 +127,7 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
             the Agent's gateway deployment does not exist.
     """
     cards = Cards(client)
-    receipt = cards.register_from_path(SERVICE / "support-desk.yaml")
+    receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
     state = WyrdState.from_path(cards.hydrate(receipt.root, bundle).destination, client)
     gateway = Gateway(client)
     gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})

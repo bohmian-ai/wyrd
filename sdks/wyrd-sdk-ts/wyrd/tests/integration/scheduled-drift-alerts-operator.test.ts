@@ -8,7 +8,7 @@ import { expect, vi } from "vitest";
 import {
   Cards,
   OperatorConnections,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   type VerificationResult,
   WyrdClient,
   WyrdState,
@@ -40,15 +40,15 @@ async function startWatch(
   cards: Cards,
   service: string,
   verifier: string,
-): Promise<RegistrationReceipt> {
+): Promise<DeclarationReceipt> {
   await (await OperatorConnections.connect()).create({
     provider: "http",
     name: "on-call-hooks",
     origin: hooks.url,
     auth: { scheme: "bearer", token: ON_CALL_TOKEN },
   });
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  const watch = await cards.registerFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  const watch = await cards.declareFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
   server.waitForBaseline(registered(watch, verifier).uid, WAIT_MS);
   return watch;
 }
@@ -62,7 +62,7 @@ async function startWatch(
 const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
   hooks: Receiver;
   cards: Cards;
-  watch: RegistrationReceipt;
+  watch: DeclarationReceipt;
 }>({
   hooks: async ({}, use) => {
     const hooks = await Receiver.start(() => ({ status: 200 }));
@@ -81,7 +81,7 @@ const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
 async function submit(
   server: NativeWyrdTestServer,
   cards: Cards,
-  watch: RegistrationReceipt,
+  watch: DeclarationReceipt,
   latencies: number[],
   verifier = "latency-shift",
 ) {
@@ -102,7 +102,7 @@ async function submit(
 async function judge(
   server: NativeWyrdTestServer,
   cards: Cards,
-  watch: RegistrationReceipt,
+  watch: DeclarationReceipt,
 ): Promise<VerificationResult> {
   const id = await binding(cards, watch.root);
   server.makeBindingDue(id);
@@ -198,7 +198,7 @@ test("ready spc baseline charts a scheduled window", async ({ server, hooks, car
 
 test("path only operator without connection is refused", async ({ server: _ }) => {
   const cards = await Cards.connect();
-  await expect(cards.registerFromPath(fixture("invalid/operator-path-without-connection.yaml"))).rejects.toMatchObject({
+  await expect(cards.declareFromPath(fixture("invalid/operator-path-without-connection.yaml"))).rejects.toMatchObject({
     code: "WYRD_SPEC_400_INVALID_OPERATOR",
   });
 });

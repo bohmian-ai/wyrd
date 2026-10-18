@@ -1,4 +1,4 @@
-//! Terminal-owned Card registration presentation.
+//! Terminal-owned Card declaration presentation.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -6,40 +6,40 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use wyrd_client::cards::RegistrationReceipt;
+use wyrd_client::cards::DeclarationReceipt;
 use wyrd_client::cards::{
-    Cards, RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink,
+    Cards, DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::RelativeArtifactPath;
 
-use crate::load::RegistrationInput;
+use crate::load::DeclarationInput;
 
-/// Run Card registration with terminal progress presentation.
+/// Run Card declaration with terminal progress presentation.
 ///
 /// The shared registry emits typed events; this module owns all `indicatif`
 /// state and terminal policy. The returned result is ready for a caller to
 /// print after the progress display has been cleared.
 ///
 /// # Errors
-/// Returns the registration error produced by the shared registry saga.
+/// Returns the declaration error produced by the shared registry saga.
 pub async fn register(
     cards: &Cards,
-    input: &RegistrationInput,
-) -> Result<RegistrationReceipt, WyrdError> {
-    let renderer = RegistrationProgressRenderer::new();
-    let result = cards.register_with_progress(input, renderer.sink()).await;
+    input: &DeclarationInput,
+) -> Result<DeclarationReceipt, WyrdError> {
+    let renderer = DeclarationProgressRenderer::new();
+    let result = cards.declare_with_progress(input, renderer.sink()).await;
     renderer.finish_and_clear();
     result
 }
 
-/// `indicatif` renderer for one registration lifecycle.
+/// `indicatif` renderer for one declaration lifecycle.
 #[derive(Clone)]
-pub struct RegistrationProgressRenderer {
+pub struct DeclarationProgressRenderer {
     state: Arc<Mutex<RendererState>>,
 }
 
-impl RegistrationProgressRenderer {
+impl DeclarationProgressRenderer {
     /// Create a renderer using stderr when it is interactive and a hidden draw
     /// target otherwise.
     #[must_use]
@@ -69,9 +69,9 @@ impl RegistrationProgressRenderer {
         }
     }
 
-    /// Build the thread-safe sink consumed by `Cards::register_with_progress`.
+    /// Build the thread-safe sink consumed by `Cards::declare_with_progress`.
     #[must_use]
-    pub fn sink(&self) -> RegistrationProgressSink {
+    pub fn sink(&self) -> DeclarationProgressSink {
         let state = Arc::clone(&self.state);
         Arc::new(move |event| handle_event(&state, event))
     }
@@ -85,13 +85,13 @@ impl RegistrationProgressRenderer {
     }
 }
 
-impl Default for RegistrationProgressRenderer {
+impl Default for DeclarationProgressRenderer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for RegistrationProgressRenderer {
+impl Drop for DeclarationProgressRenderer {
     fn drop(&mut self) {
         if Arc::strong_count(&self.state) == 1 {
             self.finish_and_clear();
@@ -176,13 +176,13 @@ impl RendererState {
     }
 }
 
-fn handle_event(state: &Arc<Mutex<RendererState>>, event: RegistrationProgressEvent) {
+fn handle_event(state: &Arc<Mutex<RendererState>>, event: DeclarationProgressEvent) {
     let Ok(mut state) = state.lock() else {
         return;
     };
     match event {
-        RegistrationProgressEvent::Phase(phase) => handle_phase(&mut state, phase),
-        RegistrationProgressEvent::ArtifactStarted {
+        DeclarationProgressEvent::Phase(phase) => handle_phase(&mut state, phase),
+        DeclarationProgressEvent::ArtifactStarted {
             artifact,
             total_bytes,
         } => {
@@ -193,7 +193,7 @@ fn handle_event(state: &Arc<Mutex<RendererState>>, event: RegistrationProgressEv
             state.ensure_artifact_bar(&artifact, total_bytes);
             state.update_aggregate();
         }
-        RegistrationProgressEvent::ArtifactProgress {
+        DeclarationProgressEvent::ArtifactProgress {
             artifact,
             uploaded_bytes,
             total_bytes,
@@ -210,7 +210,7 @@ fn handle_event(state: &Arc<Mutex<RendererState>>, event: RegistrationProgressEv
             bar.set_position(uploaded_bytes);
             state.update_aggregate();
         }
-        RegistrationProgressEvent::ArtifactFinished { artifact, .. } => {
+        DeclarationProgressEvent::ArtifactFinished { artifact, .. } => {
             if let Some(bar) = state.active_artifacts.remove(&artifact) {
                 bar.finish_and_clear();
             }
@@ -218,14 +218,14 @@ fn handle_event(state: &Arc<Mutex<RendererState>>, event: RegistrationProgressEv
     }
 }
 
-fn handle_phase(state: &mut RendererState, phase: RegistrationPhase) {
-    if matches!(phase, RegistrationPhase::Uploading) {
+fn handle_phase(state: &mut RendererState, phase: DeclarationPhase) {
+    if matches!(phase, DeclarationPhase::Uploading) {
         state.clear_spinner();
         return;
     }
     if matches!(
         phase,
-        RegistrationPhase::Completing | RegistrationPhase::CleaningUp
+        DeclarationPhase::Completing | DeclarationPhase::CleaningUp
     ) {
         state.clear_artifacts();
         if let Some(aggregate) = state.aggregate.take() {
@@ -245,14 +245,14 @@ fn handle_phase(state: &mut RendererState, phase: RegistrationPhase) {
     spinner.set_message(phase_message(phase));
 }
 
-fn phase_message(phase: RegistrationPhase) -> &'static str {
+fn phase_message(phase: DeclarationPhase) -> &'static str {
     match phase {
-        RegistrationPhase::Preparing => "preparing registration",
-        RegistrationPhase::Submitting => "submitting registration",
-        RegistrationPhase::Uploading => "uploading artifacts",
-        RegistrationPhase::Completing => "completing registration",
-        RegistrationPhase::Verifying => "verifying registration",
-        RegistrationPhase::CleaningUp => "cleaning up failed registration",
+        DeclarationPhase::Preparing => "preparing registration",
+        DeclarationPhase::Submitting => "submitting registration",
+        DeclarationPhase::Uploading => "uploading artifacts",
+        DeclarationPhase::Completing => "completing registration",
+        DeclarationPhase::Verifying => "verifying registration",
+        DeclarationPhase::CleaningUp => "cleaning up failed registration",
     }
 }
 
@@ -285,28 +285,28 @@ fn spinner_style() -> ProgressStyle {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegistrationProgressRenderer, handle_event};
-    use wyrd_client::cards::{RegistrationPhase, RegistrationProgressEvent};
+    use super::{DeclarationProgressRenderer, handle_event};
+    use wyrd_client::cards::{DeclarationPhase, DeclarationProgressEvent};
     use wyrd_spec::registry::RelativeArtifactPath;
 
     #[test]
     fn hidden_renderer_clears_active_artifacts() {
-        let renderer = RegistrationProgressRenderer::with_interactive(false);
+        let renderer = DeclarationProgressRenderer::with_interactive(false);
         let artifact = RelativeArtifactPath::new("weights.bin").expect("test path");
         let sink = renderer.sink();
-        sink(RegistrationProgressEvent::Phase(
-            RegistrationPhase::Uploading,
+        sink(DeclarationProgressEvent::Phase(
+            DeclarationPhase::Uploading,
         ));
-        sink(RegistrationProgressEvent::ArtifactStarted {
+        sink(DeclarationProgressEvent::ArtifactStarted {
             artifact: artifact.clone(),
             total_bytes: Some(10),
         });
-        sink(RegistrationProgressEvent::ArtifactProgress {
+        sink(DeclarationProgressEvent::ArtifactProgress {
             artifact: artifact.clone(),
             uploaded_bytes: 10,
             total_bytes: Some(10),
         });
-        sink(RegistrationProgressEvent::ArtifactFinished {
+        sink(DeclarationProgressEvent::ArtifactFinished {
             artifact,
             success: false,
         });
@@ -316,24 +316,24 @@ mod tests {
 
     #[test]
     fn renderer_handles_phase_cleanup_without_a_live_upload_bar() {
-        let renderer = RegistrationProgressRenderer::with_interactive(false);
+        let renderer = DeclarationProgressRenderer::with_interactive(false);
         let state = renderer.state.clone();
         handle_event(
             &state,
-            RegistrationProgressEvent::Phase(RegistrationPhase::CleaningUp),
+            DeclarationProgressEvent::Phase(DeclarationPhase::CleaningUp),
         );
         renderer.finish_and_clear();
     }
 
     #[test]
     fn upload_bars_do_not_start_in_finished_state() {
-        let renderer = RegistrationProgressRenderer::with_interactive(false);
+        let renderer = DeclarationProgressRenderer::with_interactive(false);
         let state = renderer.state.clone();
         let artifact = RelativeArtifactPath::new("weights.bin").expect("test path");
 
         handle_event(
             &state,
-            RegistrationProgressEvent::ArtifactStarted {
+            DeclarationProgressEvent::ArtifactStarted {
                 artifact,
                 total_bytes: Some(10),
             },

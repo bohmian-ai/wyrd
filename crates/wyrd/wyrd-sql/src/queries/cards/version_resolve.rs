@@ -6,7 +6,7 @@ use wyrd_semver::{VersionBlock, VersionBump, VersionSpec, seed_version};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
-use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::registry::DeclarationOperationId;
 
 use crate::queries::cards::version_sql::push_bounds;
 use crate::tenant_conn::TenantConn;
@@ -30,7 +30,7 @@ pub enum Resolution {
 /// versions it already chose; other operations' Pending rows stay excluded.
 pub struct SubmittedCardIdentity<'a> {
     /// Registration operation whose Pending rows are eligible.
-    pub operation_id: RegistrationOperationId,
+    pub operation_id: DeclarationOperationId,
     /// Canonical spec hash.
     pub spec_hash: &'a str,
     /// Canonical artifact-manifest hash, when the submission is heavy.
@@ -67,12 +67,12 @@ async fn latest_stable_in_line(
     kind: CardKind,
     space: &SpaceName,
     name: &CardName,
-    operation_id: RegistrationOperationId,
+    operation_id: DeclarationOperationId,
     bounds: Option<&wyrd_semver::VersionBounds>,
 ) -> Result<Option<LatestInLine>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT version, spec_hash, artifact_hash FROM wyrd.cards \
-         WHERE (status = 'active' OR (status = 'pending' AND registration_operation_id = ",
+         WHERE (status = 'active' OR (status = 'pending' AND declaration_operation_id = ",
     );
     qb.push_bind(operation_id.as_uuid());
     qb.push(")) AND NOT version_is_prerelease AND kind = ");

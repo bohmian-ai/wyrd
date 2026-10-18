@@ -1,4 +1,4 @@
-//! Authored-version wire-shape for the card-registration path.
+//! Authored-version wire-shape for the card-declaration path.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,7 +13,7 @@ use crate::block::VersionBlock;
 use crate::error::VersionError;
 use crate::range::VersionRange;
 
-/// Authored-version discriminator on the card-registration path.
+/// Authored-version discriminator on the card-declaration path.
 ///
 /// Two variants distinguished by input shape:
 ///
@@ -153,7 +153,7 @@ impl JsonSchema for VersionSpec {
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         serde_json::from_value(serde_json::json!({
             "type": "string",
-            "description": "Authored version on the card-registration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
+            "description": "Authored version on the card-declaration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
             "examples": ["1.4.2", "1.4.2-rc.1+meta", "1.0", "1"]
         }))
         .expect("VersionSpec schema is valid JSON Schema")
@@ -169,7 +169,7 @@ impl utoipa::PartialSchema for VersionSpec {
             ObjectBuilder::new()
                 .schema_type(Type::String)
                 .description(Some(
-                    "Authored version on the card-registration path. \
+                    "Authored version on the card-declaration path. \
                      Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") \
                      or a bare partial scope (e.g. \"1\", \"1.0\"). \
                      Range comparators (^, ~, *, >=, ...) are rejected on this path.",

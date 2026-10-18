@@ -4,31 +4,31 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, type RegistrationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
+import { Cards, type DeclarationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-const DESK = fixture("cards/register_and_hydrate/support-desk.yaml");
+const DESK = fixture("cards/declare_and_pull/support-desk.yaml");
 
 /** The support desk graph, registered after the artifact-bearing Model it references. */
 const test = serverTest().extend<{
   cards: Cards;
-  model: RegistrationReceipt;
-  desk: RegistrationReceipt;
+  model: DeclarationReceipt;
+  desk: DeclarationReceipt;
 }>({
   cards: [async ({ server: _ }, use) => use(await Cards.connect()), { scope: "file" }],
   model: [
     async ({ cards }, use) =>
-      use(await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"))),
+      use(await cards.declareFromPath(fixture("cards/declare_and_pull/support-model.yaml"))),
     { scope: "file" },
   ],
-  desk: [async ({ cards, model: _ }, use) => use(await cards.registerFromPath(DESK)), { scope: "file" }],
+  desk: [async ({ cards, model: _ }, use) => use(await cards.declareFromPath(DESK)), { scope: "file" }],
 });
 
-/** A fresh directory for one hydrated bundle. */
+/** A fresh directory for one Card bundle. */
 function bundleDir(): string {
   return mkdtempSync(join(tmpdir(), "wyrd-ts-bundle-"));
 }
@@ -49,7 +49,7 @@ test("service graph registers and hydrates", async ({ cards, desk }) => {
   const [artifact] = state.artifacts("model");
   expect(artifact.relative_path).toBe("support-model.bin");
   expect(readFileSync(artifact.local_path)).toEqual(
-    readFileSync(fixture("cards/register_and_hydrate/support-model.bin")),
+    readFileSync(fixture("cards/declare_and_pull/support-model.bin")),
   );
 });
 
@@ -61,7 +61,7 @@ test("latest version resolves to the registered card", async ({ cards, desk }) =
 });
 
 test("registering the graph again is idempotent", async ({ cards, desk }) => {
-  const again = await cards.registerFromPath(DESK);
+  const again = await cards.declareFromPath(DESK);
 
   expect(again.root).toEqual(desk.root);
   // The desk's only binding has no schedule Trigger, so none is projected.
@@ -69,8 +69,8 @@ test("registering the graph again is idempotent", async ({ cards, desk }) => {
 });
 
 test("cards get returns every kind typed", async ({ cards, model, desk }) => {
-  const baseline = await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  const daily = await cards.registerFromPath(fixture("cards/scheduled_drift_alerts_operator/daily.yaml"));
+  const baseline = await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  const daily = await cards.declareFromPath(fixture("cards/scheduled_drift_alerts_operator/daily.yaml"));
   const refs = [baseline, daily, model, desk].flatMap((receipt) => receipt.outcomes.map((outcome) => outcome.card_ref));
 
   const read = await Promise.all(refs.map((ref) => cards.get(ref)));
@@ -98,13 +98,13 @@ test("artifact without digest registers", async ({ model }) => {
 
 test("wrong artifact digest is refused", async ({ cards }) => {
   await expect(
-    cards.registerFromPath(fixture("invalid/wrong-artifact-digest/support-model.yaml")),
+    cards.declareFromPath(fixture("invalid/wrong-artifact-digest/support-model.yaml")),
   ).rejects.toMatchObject({ code: "WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH" });
 });
 
 // Registration reports the loader's refusal under its own catalog code.
 test("retired card kind is refused", async ({ cards }) => {
-  await expect(cards.registerFromPath(fixture("invalid/retired-drift-kind.yaml"))).rejects.toMatchObject({
+  await expect(cards.declareFromPath(fixture("invalid/retired-drift-kind.yaml"))).rejects.toMatchObject({
     code: "WYRD_LOADER_400_INVALID_ENVELOPE",
   });
 });
@@ -114,7 +114,7 @@ test("reader cannot register cards", async ({ server, desk: _ }) => {
     client: WyrdClient.connect({ credential: server.scopedApiKey("card_reader", ["cards:read"]) }),
   });
 
-  await expect(reader.registerFromPath(DESK)).rejects.toMatchObject({
+  await expect(reader.declareFromPath(DESK)).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
 });
@@ -140,8 +140,8 @@ test("refused cli command raises its catalog code", async ({ server: _ }) => {
 });
 
 test("hydrated agent prompt card navigation", async ({ cards }) => {
-  await cards.registerFromPath(fixture("cards/agent_prompt/desk-prompt.yaml"));
-  const desk = await cards.registerFromPath(fixture("cards/agent_prompt/prompt-desk.yaml"));
+  await cards.declareFromPath(fixture("cards/agent_prompt/desk-prompt.yaml"));
+  const desk = await cards.declareFromPath(fixture("cards/agent_prompt/prompt-desk.yaml"));
   const bundle = bundleDir();
   await cards.hydrate(desk.root, bundle);
   vi.stubEnv("WYRD_SERVER_URL", "http://127.0.0.1:1");
@@ -207,7 +207,7 @@ const NATIVE_SPEC = {
 };
 
 test("prompt forms round trip as authored", async ({ cards }) => {
-  const receipt = await cards.registerFromPath(fixture("cards/register_and_hydrate/authored-prompts.yaml"));
+  const receipt = await cards.declareFromPath(fixture("cards/declare_and_pull/authored-prompts.yaml"));
   const bundle = bundleDir();
   await cards.hydrate(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle);

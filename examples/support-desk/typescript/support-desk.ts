@@ -23,7 +23,7 @@ import { trace } from "@opentelemetry/api";
 import {
   Cards,
   Gateway,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   type Run,
   type VerificationResult,
   type VerifierInputs,
@@ -43,7 +43,7 @@ const MCP_VERSION = "2026-07-28";
 
 /** The deployed support desk: its registration and loaded Card graph. */
 export interface Desk {
-  readonly receipt: RegistrationReceipt;
+  readonly receipt: DeclarationReceipt;
   readonly state: WyrdState;
   /** The client the desk's model calls go through the gateway as. */
   readonly client: WyrdClient;
@@ -82,7 +82,7 @@ export function uid(desk: Desk, name: string): string {
  */
 export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> {
   const cards = await Cards.connect({ client });
-  const receipt = await cards.registerFromPath(join(SERVICE, "support-desk.yaml"));
+  const receipt = await cards.declareFromPath(join(SERVICE, "support-desk.yaml"));
   await cards.hydrate(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle, { client });
   const gateway = await Gateway.connect({ client });

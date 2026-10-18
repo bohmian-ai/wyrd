@@ -12,15 +12,15 @@ use wyrd_spec::error::WyrdError;
 
 use crate::cards::error::RegistryEngineError;
 
-/// Owns local paths and publication invariants for one hydration operation.
-pub(super) struct HydrationWorkspace {
+/// Owns local paths and publication invariants for one pull operation.
+pub(super) struct BundleWorkspace {
     /// Temporary directory containing the fully materialized bundle.
     staging: PathBuf,
     /// Final directory exposed after successful publication.
     destination: PathBuf,
 }
 
-impl HydrationWorkspace {
+impl BundleWorkspace {
     /// Validates the destination and creates an isolated sibling staging directory.
     ///
     /// # Errors
@@ -35,7 +35,7 @@ impl HydrationWorkspace {
         match fs::metadata(destination) {
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(WyrdError::RegistryInvalidCardSpec {
-                    message: "hydration destination is not a directory".to_owned(),
+                    message: "pull destination is not a directory".to_owned(),
                     details: serde_json::json!({ "destination": destination }),
                 });
             }
@@ -133,10 +133,10 @@ impl HydrationWorkspace {
                 error = %restoration_error,
                 destination = %self.destination.display(),
                 backup = %backup.display(),
-                "hydration publication failed and rollback failed"
+                "pull publication failed and rollback failed"
             );
             return Err(WyrdError::Internal {
-                message: "hydration publication and rollback failed".to_owned(),
+                message: "pull publication and rollback failed".to_owned(),
                 details: serde_json::json!({
                     "publication_error": publication_error.to_string(),
                     "rollback_error": restoration_error.to_string(),
@@ -157,7 +157,7 @@ impl HydrationWorkspace {
 fn promote(staging: &Path, destination: &Path) -> IoResult<()> {
     #[cfg(test)]
     if take_publish_fault(FAIL_PROMOTION) {
-        return Err(IoError::other("injected hydration promotion failure"));
+        return Err(IoError::other("injected pull promotion failure"));
     }
     fs::rename(staging, destination)
 }
@@ -170,7 +170,7 @@ fn promote(staging: &Path, destination: &Path) -> IoResult<()> {
 fn restore(backup: &Path, destination: &Path) -> IoResult<()> {
     #[cfg(test)]
     if take_publish_fault(FAIL_RESTORE) {
-        return Err(IoError::other("injected hydration restoration failure"));
+        return Err(IoError::other("injected pull restoration failure"));
     }
     fs::rename(backup, destination)
 }
@@ -179,7 +179,7 @@ fn restore(backup: &Path, destination: &Path) -> IoResult<()> {
 fn cleanup_backup(backup: &Path, destination: &Path) {
     #[cfg(test)]
     let cleanup = if take_publish_fault(FAIL_CLEANUP) {
-        Err(IoError::other("injected hydration backup cleanup failure"))
+        Err(IoError::other("injected pull backup cleanup failure"))
     } else {
         fs::remove_dir_all(backup)
     };
@@ -190,7 +190,7 @@ fn cleanup_backup(backup: &Path, destination: &Path) {
             error = %error,
             backup = %backup.display(),
             destination = %destination.display(),
-            "published hydration bundle but could not remove the previous bundle"
+            "published pull bundle but could not remove the previous bundle"
         );
     }
 }
@@ -214,7 +214,7 @@ fn take_publish_fault(fault: u8) -> bool {
     PUBLISH_FAULTS.fetch_and(!fault, Ordering::SeqCst) & fault != 0
 }
 
-/// Workspace layout for hydrated Cards.
+/// Workspace layout for pulled Cards.
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -223,7 +223,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, HydrationWorkspace, PUBLISH_FAULTS};
+    use super::{FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, BundleWorkspace, PUBLISH_FAULTS};
 
     /// Serializes tests that mutate the process-wide publication fault flags.
     static PUBLISH_FAULT_LOCK: Mutex<()> = Mutex::new(());
@@ -240,8 +240,8 @@ mod tests {
     }
 
     /// Constructs a workspace around test-controlled staging and destination paths.
-    fn test_workspace(staging: PathBuf, destination: PathBuf) -> HydrationWorkspace {
-        HydrationWorkspace {
+    fn test_workspace(staging: PathBuf, destination: PathBuf) -> BundleWorkspace {
+        BundleWorkspace {
             staging,
             destination,
         }
@@ -295,7 +295,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("hydration publication and rollback failed")
+                .contains("pull publication and rollback failed")
         );
         assert!(!destination.exists());
         assert!(

@@ -1,31 +1,31 @@
-//! Typed registration submission.
+//! Typed declaration submission.
 
 use crate::WyrdClient;
-use wyrd_spec::registry::{CreateCardRequest, CreateCardResponse};
+use wyrd_spec::registry::{DeclareCardRequest, DeclareCardResponse};
 
 use crate::cards::error::RegistryEngineError;
 
-/// Submit the flat card-registration request with a stable idempotency key.
+/// Submit the flat card-declaration request with a stable idempotency key.
 ///
 /// This helper lives in `submit` because it owns only the authenticated
-/// `POST /v1/cards` transport call. The registration saga calls it after local
+/// `POST /v1/cards` transport call. The declaration saga calls it after local
 /// preparation and before any artifact upload; `WyrdClient` owns transport and
 /// error mapping while the server owns durable lifecycle state.
 ///
 /// # Errors
 ///
 /// Returns the transport error or structured server refusal for the
-/// registration request.
+/// declaration request.
 ///
 /// # Cancellation
 ///
-/// Cancelling after the request is sent leaves registration outcome unknown;
+/// Cancelling after the request is sent leaves declaration outcome unknown;
 /// the request carries the saga's idempotency key for a keyed retry.
-pub(crate) async fn submit_card_registration(
+pub(crate) async fn submit_card_declaration(
     client: &WyrdClient,
-    request: &CreateCardRequest,
+    request: &DeclareCardRequest,
     idempotency_key: &str,
-) -> Result<CreateCardResponse, RegistryEngineError> {
+) -> Result<DeclareCardResponse, RegistryEngineError> {
     client
         .http
         .submit_with_idempotency_key(reqwest::Method::POST, "/v1/cards", request, idempotency_key)

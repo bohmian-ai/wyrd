@@ -16,7 +16,7 @@ import {
   Gateway,
   Principals,
   type ProviderDeployment,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   WyrdClient,
   WyrdError,
   WyrdState,
@@ -124,7 +124,7 @@ const test = serverTest({
     body: path === "/v1/responses" ? responsesTurn(body) : path === "/v1/messages" ? ANTHROPIC_MESSAGE : COMPLETION,
   }),
 }).extend<{
-  ask: RegistrationReceipt;
+  ask: DeclarationReceipt;
 }>({
   ask: [
     async ({ server: _ }, use) => {
@@ -146,7 +146,7 @@ const test = serverTest({
         auth: { api_key_header: { header: "x-api-key", credential: "anthropic-key" } },
       });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
+      await use(await (await Cards.connect()).declareFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
     },
     { scope: "file" },
   ],
@@ -427,7 +427,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   await gateway.putDeployment(openaiDeployment("openai-backup"));
   await gateway.putDeployment(openaiDeployment("openai-granted", "granted"));
   const cards = await Cards.connect();
-  const receipt = await cards.registerFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
+  const receipt = await cards.declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.hydrate(receipt.root, bundle);
   const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0", space: "default" });

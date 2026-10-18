@@ -1,4 +1,4 @@
-//! Client-side Card graph hydration and bundle publication.
+//! Client-side Card graph pull and bundle publication.
 
 mod bundle;
 mod graph;
@@ -10,22 +10,22 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::{error::WyrdError, reference::CardRef};
 
 pub use wyrd_spec::registry::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
 };
 
 use crate::cards::{CardSelector, RegistryContext};
 
-use self::{bundle::HydrationBundleWriter, workspace::HydrationWorkspace};
+use self::{bundle::BundleWriter, workspace::BundleWorkspace};
 
-/// Machine-readable result of a published hydration.
+/// Machine-readable result of a published pull.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydrationSummary {
+pub struct PullSummary {
     /// Exact resolved root reference.
     pub root: CardRef,
     /// Published bundle directory.
     pub destination: PathBuf,
-    /// Hydration mode used to build the bundle.
-    pub mode: HydrationMode,
+    /// Bundle mode used to build the bundle.
+    pub mode: BundleMode,
     /// Number of unique Cards in the bundle.
     pub card_count: usize,
     /// Number of server-owned artifact inventory entries.
@@ -34,20 +34,20 @@ pub struct HydrationSummary {
     pub downloaded_artifact_count: usize,
 }
 
-/// Hydrates a resolved Card graph into a locally published bundle.
+/// Pulls a resolved Card graph into a locally published bundle.
 ///
-/// The hydrator owns graph-oriented orchestration while sharing the authenticated registry
+/// The puller owns graph-oriented orchestration while sharing the authenticated registry
 /// context used by other client capabilities. It does not add graph behavior to [`crate::cards::Cards`].
 #[derive(Clone)]
-pub struct CardGraphHydrator {
+pub struct CardGraphPuller {
     /// Authenticated, tenant-scoped registry context shared with other client
     /// capabilities; every resolve and artifact download issued while
-    /// hydrating a graph goes through it.
+    /// pulling a graph goes through it.
     context: RegistryContext,
 }
 
-impl CardGraphHydrator {
-    /// Creates a graph hydrator from an authenticated registry context.
+impl CardGraphPuller {
+    /// Creates a graph puller from an authenticated registry context.
     ///
     /// # Arguments
     /// * `context` - The authenticated registry context every read goes through.
@@ -75,16 +75,16 @@ impl CardGraphHydrator {
     /// Returns an error when graph resolution fails, the destination is invalid, bundle content
     /// cannot be written, an artifact cannot be downloaded, or the staged bundle cannot be
     /// published safely.
-    pub async fn hydrate(
+    pub async fn pull(
         &self,
         selector: &CardSelector,
         destination: &Path,
-        mode: HydrationMode,
-    ) -> Result<HydrationSummary, WyrdError> {
+        mode: BundleMode,
+    ) -> Result<PullSummary, WyrdError> {
         let graph = self.resolve_graph(selector).await?;
-        let workspace = HydrationWorkspace::prepare(destination)?;
+        let workspace = BundleWorkspace::prepare(destination)?;
         let write_result = {
-            let writer = HydrationBundleWriter::new(&self.context, workspace.staging(), mode);
+            let writer = BundleWriter::new(&self.context, workspace.staging(), mode);
             writer.write(&graph).await
         };
         let stats = match write_result {
@@ -100,7 +100,7 @@ impl CardGraphHydrator {
             return Err(error);
         }
 
-        Ok(HydrationSummary {
+        Ok(PullSummary {
             root: graph.root,
             destination: workspace.destination().to_path_buf(),
             card_count: graph.cards.len(),
@@ -111,20 +111,20 @@ impl CardGraphHydrator {
     }
 }
 
-/// Hydration entry points.
+/// Pull entry points.
 #[cfg(test)]
 mod tests {
-    use super::HydrationMode;
+    use super::BundleMode;
 
-    /// Hydration modes retain their stable bundle wire values.
+    /// Bundle modes retain their stable bundle wire values.
     #[test]
-    fn hydration_mode_uses_bundle_wire_values() {
+    fn bundle_mode_uses_bundle_wire_values() {
         assert_eq!(
-            serde_json::to_string(&HydrationMode::MetadataOnly).expect("metadata mode serializes"),
+            serde_json::to_string(&BundleMode::MetadataOnly).expect("metadata mode serializes"),
             "\"metadata\""
         );
         assert_eq!(
-            serde_json::to_string(&HydrationMode::Complete).expect("complete mode serializes"),
+            serde_json::to_string(&BundleMode::Complete).expect("complete mode serializes"),
             "\"complete\""
         );
     }

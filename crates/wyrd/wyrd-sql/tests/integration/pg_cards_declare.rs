@@ -1,4 +1,4 @@
-//! PgFixture coverage for composite card-registration persistence primitives.
+//! PgFixture coverage for composite card-declaration persistence primitives.
 
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -9,10 +9,10 @@ use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
-use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
+use wyrd_spec::registry::{ArtifactManifestEntry, DeclarationOperationId};
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
-    insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
+    NewCardRow, NewDeclarationOperation, RECONCILE_KIND_DECLARATION, claim_card_reconciliation,
+    insert_artifact_manifest_rows, insert_card_row, insert_declaration_operation,
     lookup_existing_operation, manifest_completion_rows, persist_outbound_relationships,
     recheck_active_card_refs, record_card_reconciliation_failure, soft_delete_card_by_ref,
     soft_delete_card_with_state, upsert_service_account_from_card,
@@ -52,7 +52,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
          WHERE table_schema = 'wyrd' AND table_name = 'cards' \
-           AND column_name IN ('registration_operation_id', 'pending_since', 'finalized_at', \
+           AND column_name IN ('declaration_operation_id', 'pending_since', 'finalized_at', \
                                'card_blob_uri', 'blob_failed_at', \
                                'reconcile_kind', 'reconcile_status', 'reconcile_attempts', \
                                'reconcile_next_attempt_at', 'reconcile_lease_owner', \
@@ -80,13 +80,13 @@ async fn consolidated_registration_migration_has_locked_shape() {
             "reconcile_lease_owner",
             "reconcile_next_attempt_at",
             "reconcile_status",
-            "registration_operation_id",
+            "declaration_operation_id",
         ]
     );
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables \
          WHERE table_schema = 'wyrd' \
-           AND table_name IN ('card_registration_operations', 'card_artifact_manifest', 'card_relationships') \
+           AND table_name IN ('card_declaration_operations', 'card_artifact_manifest', 'card_relationships') \
          ORDER BY table_name",
     )
     .fetch_all(fixture.operator_pool().pool())
@@ -96,7 +96,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
         tables,
         vec![
             "card_artifact_manifest",
-            "card_registration_operations",
+            "card_declaration_operations",
             "card_relationships",
         ]
     );
@@ -107,7 +107,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
 async fn pending_card_and_manifest_share_registration_transaction() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
     let card = prompt_card("sql-registration");
     let manifest = vec![artifact()];
@@ -117,9 +117,9 @@ async fn pending_card_and_manifest_share_registration_transaction() {
         .expect("tenant connection opens");
 
     assert!(
-        insert_registration_operation(
+        insert_declaration_operation(
             &mut conn,
-            NewRegistrationOperation {
+            NewDeclarationOperation {
                 operation_id,
                 attribution: wyrd_spec::auth::Attribution::direct(principal_id),
                 idempotency_key: "sql-registration-001",
@@ -186,20 +186,20 @@ async fn pending_card_and_manifest_share_registration_transaction() {
 
 /// A reserved operation has no stored response until it commits; reading it
 /// back must decode the NULL `stored_response` rather than fail, because the
-/// registration replay reads pending rows.
+/// declaration replay reads pending rows.
 #[tokio::test]
 async fn pending_operation_with_null_stored_response_decodes() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
     assert!(
-        insert_registration_operation(
+        insert_declaration_operation(
             &mut conn,
-            NewRegistrationOperation {
+            NewDeclarationOperation {
                 operation_id,
                 attribution: wyrd_spec::auth::Attribution::direct(principal_id),
                 idempotency_key: "sql-pending-null-response",
@@ -224,17 +224,17 @@ async fn pending_operation_with_null_stored_response_decodes() {
     assert!(row.stored_response.is_none());
 }
 
-/// Registration idempotency is scoped by the full subject/actor pair, and the
+/// Declaration idempotency is scoped by the full subject/actor pair, and the
 /// pair a Card and its projected principal are created with never changes.
 ///
 /// A/A, A/B, and C/B reserve the same key independently; A/B's retry finds
 /// its own reservation with the original request digest, so the server can
 /// replay an identical body and refuse a different one. The A/B Card keeps
 /// A/B through deletion, and the Service principal projected by A/A keeps
-/// A/A when C/B re-registers the same Card.
+/// A/A when C/B re-declares the same Card.
 ///
 /// # Panics
-/// Panics when a fixture, reservation, registration, or read fails, when a
+/// Panics when a fixture, reservation, declaration, or read fails, when a
 /// pair fails to reserve its own key or finds another pair's, or when a
 /// stored creation pair changes.
 #[tokio::test]
@@ -253,11 +253,11 @@ async fn subject_actor_creation_and_replay() {
         .expect("tenant connection opens");
     let mut operations = Vec::new();
     for attribution in pairs {
-        let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
         assert!(
-            insert_registration_operation(
+            insert_declaration_operation(
                 &mut conn,
-                NewRegistrationOperation {
+                NewDeclarationOperation {
                     operation_id,
                     attribution,
                     idempotency_key: key,
@@ -271,10 +271,10 @@ async fn subject_actor_creation_and_replay() {
         operations.push(operation_id);
     }
     assert!(
-        !insert_registration_operation(
+        !insert_declaration_operation(
             &mut conn,
-            NewRegistrationOperation {
-                operation_id: RegistrationOperationId::new(Uuid::now_v7()),
+            NewDeclarationOperation {
+                operation_id: DeclarationOperationId::new(Uuid::now_v7()),
                 attribution: pairs[1],
                 idempotency_key: key,
                 request_hash: "different-body",
@@ -363,16 +363,16 @@ async fn subject_actor_creation_and_replay() {
 async fn reconciliation_claims_are_bounded_and_lease_safe() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
     let card = prompt_card("reconcile-bounded");
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    insert_registration_operation(
+    insert_declaration_operation(
         &mut conn,
-        NewRegistrationOperation {
+        NewDeclarationOperation {
             operation_id,
             attribution: wyrd_spec::auth::Attribution::direct(principal_id),
             idempotency_key: "reconcile-bounded-001",
@@ -398,7 +398,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     conn.commit().await.expect("setup commits");
 
     // A misleading host-derived reporting timestamp must not be able to defer
-    // eligibility: registration seeds it from PostgreSQL's own clock.
+    // eligibility: declaration seeds it from PostgreSQL's own clock.
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -442,7 +442,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     );
     let first = if left.is_empty() { right } else { left };
     assert_eq!(first.len(), 1);
-    assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
+    assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_DECLARATION);
     assert_eq!(first[0].reconcile_attempts, 1);
     assert!(
         first[0].lease_remaining_seconds > 0.0 && first[0].lease_remaining_seconds <= 30.0,
@@ -566,7 +566,7 @@ async fn make_retry_due(fixture: &PgFixture, card_uid: &CardUid) {
 async fn manifest_upload_liveness_is_decided_by_postgres() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
     let card = prompt_card("manifest-liveness");
     let upload_id = Uuid::now_v7();
@@ -575,9 +575,9 @@ async fn manifest_upload_liveness_is_decided_by_postgres() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    insert_registration_operation(
+    insert_declaration_operation(
         &mut conn,
-        NewRegistrationOperation {
+        NewDeclarationOperation {
             operation_id,
             attribution: wyrd_spec::auth::Attribution::direct(principal_id),
             idempotency_key: "manifest-liveness-001",
@@ -673,8 +673,8 @@ async fn manifest_upload_liveness_is_decided_by_postgres() {
 async fn relationship_rows_preserve_exact_target_identity() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
-    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_operation = DeclarationOperationId::new(Uuid::now_v7());
+    let source_operation = DeclarationOperationId::new(Uuid::now_v7());
     let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UUIDv7 is valid");
     let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UUIDv7 is valid");
     let target = prompt_card("relationship-target");
@@ -701,9 +701,9 @@ async fn relationship_rows_preserve_exact_target_identity() {
         (source_operation, "relationship-source-operation"),
     ] {
         assert!(
-            insert_registration_operation(
+            insert_declaration_operation(
                 &mut conn,
-                NewRegistrationOperation {
+                NewDeclarationOperation {
                     operation_id,
                     attribution: wyrd_spec::auth::Attribution::direct(principal_id),
                     idempotency_key: key,
@@ -781,8 +781,8 @@ async fn relationship_rows_preserve_exact_target_identity() {
 async fn relationship_recheck_blocks_target_lifecycle_race() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
-    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
-    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_operation = DeclarationOperationId::new(Uuid::now_v7());
+    let source_operation = DeclarationOperationId::new(Uuid::now_v7());
     let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UUIDv7 is valid");
     let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UUIDv7 is valid");
     let target = prompt_card("race-target");
@@ -805,9 +805,9 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
         (source_operation, "race-source-operation"),
     ] {
         assert!(
-            insert_registration_operation(
+            insert_declaration_operation(
                 &mut setup_conn,
-                NewRegistrationOperation {
+                NewDeclarationOperation {
                     operation_id,
                     attribution: wyrd_spec::auth::Attribution::direct(principal_id),
                     idempotency_key: key,
@@ -951,8 +951,8 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         Vec::new(),
         PermissionSet::new(),
     );
-    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
-    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_operation = DeclarationOperationId::new(Uuid::now_v7());
+    let source_operation = DeclarationOperationId::new(Uuid::now_v7());
     let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UID is valid");
     let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UID is valid");
     let target = prompt_card("delete-target");
@@ -988,9 +988,9 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         (source_operation, "delete-source-operation"),
     ] {
         assert!(
-            insert_registration_operation(
+            insert_declaration_operation(
                 &mut conn,
-                NewRegistrationOperation {
+                NewDeclarationOperation {
                     operation_id,
                     attribution: wyrd_spec::auth::Attribution::direct(principal.id),
                     idempotency_key: key,

@@ -122,5 +122,5 @@ def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> 
 
 def test_path_only_operator_without_connection_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as raised:
-        cards.register_from_path(FIXTURES / "invalid/operator-path-without-connection.yaml")
+        cards.declare_from_path(FIXTURES / "invalid/operator-path-without-connection.yaml")
     assert raised.value.code == "WYRD_SPEC_400_INVALID_OPERATOR"

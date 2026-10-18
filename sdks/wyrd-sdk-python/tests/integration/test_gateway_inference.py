@@ -89,7 +89,7 @@ def admin(server: WyrdTestServer) -> WyrdClient:
 @pytest.fixture
 def ask(admin: WyrdClient) -> CardRef:
     """The registered ``ask-agent`` Agent."""
-    return Cards(admin).register_from_path(ASK).root
+    return Cards(admin).declare_from_path(ASK).root
 
 
 def test_openai_client_calls_the_gateway_with_an_access_token(

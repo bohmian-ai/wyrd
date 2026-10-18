@@ -1,8 +1,8 @@
 import type {
   CardRef,
-  HydrationSummary,
+  PullSummary,
   ProviderCredentialView,
-  RegistrationReceipt,
+  DeclarationReceipt,
   WyrdClient,
 } from "wyrd-ai";
 
@@ -103,13 +103,13 @@ export declare const cli: {
   /** Validate a local Card tree without contacting a server (`wyrd plan`). */
   plan(path: string): PlanReport;
   /** Register a local Card tree and return its receipt (`wyrd apply`). */
-  apply(path: string, options?: CliClientOptions): Promise<RegistrationReceipt>;
+  apply(path: string, options?: CliClientOptions): Promise<DeclarationReceipt>;
   /** Hydrate a Card's reachable graph into `outputDir` (`wyrd get`). */
   get(
     selector: CliCardSelector,
     outputDir: string,
     options?: CliClientOptions & { readonly metadataOnly?: boolean },
-  ): Promise<HydrationSummary>;
+  ): Promise<PullSummary>;
   /** Load one Card and materialize its artifacts (`wyrd load`). */
   load(selector: CliCardSelector, options?: CliClientOptions & { readonly path?: string }): Promise<LoadOutput>;
   /** Issue an API key bound to one exact Card (`wyrd auth issue-key`). */

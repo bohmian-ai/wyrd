@@ -13,9 +13,9 @@ use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
-use wyrd_client::cards::{CardSelector, Cards, HydrationMode, HydrationSummary};
+use wyrd_client::cards::{CardSelector, Cards, BundleMode, PullSummary};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
-use wyrd_loader::{LoadError, RegistrationInput};
+use wyrd_loader::{LoadError, DeclarationInput};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata};
@@ -24,8 +24,8 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::MetadataQuery;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    CardLifecycleStatus, CardRegistrationOutcome, CardSummary, ListCardsRequest, ListCardsResponse,
-    RegistrationOutcomeKind, RegistrationReceipt,
+    CardLifecycleStatus, CardDeclarationOutcome, CardSummary, ListCardsRequest, ListCardsResponse,
+    DeclarationOutcomeKind, DeclarationReceipt,
 };
 
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
@@ -123,7 +123,7 @@ impl PyWyrdState {
     /// ```
     ///
     /// # Arguments
-    /// * `path` - The hydrated bundle directory, as `cards.hydrate` publishes it.
+    /// * `path` - The Card bundle directory, as `cards.hydrate` publishes it.
     /// * `client` - The `WyrdClient` this state's server calls run as, or
     ///   `None` for the ambient chain.
     /// * `interfaces` - Model and Data interfaces keyed by alias.
@@ -1627,14 +1627,14 @@ impl PyCardList {
 }
 
 /// One dependency-first registration outcome.
-#[pyclass(module = "wyrd.cards", name = "RegistrationOutcome")]
-pub struct PyRegistrationOutcome {
+#[pyclass(module = "wyrd.cards", name = "DeclarationOutcome")]
+pub struct PyDeclarationOutcome {
     /// Native per-Card outcome projected read-only through the Python getters.
-    inner: CardRegistrationOutcome,
+    inner: CardDeclarationOutcome,
 }
 
 #[pymethods]
-impl PyRegistrationOutcome {
+impl PyDeclarationOutcome {
     /// Server-resolved identity.
     #[getter]
     fn card_ref(&self) -> CardRefPy {
@@ -1673,22 +1673,22 @@ impl PyRegistrationOutcome {
 }
 
 /// Public registration result returned after upload and completion succeed.
-#[pyclass(module = "wyrd.cards", name = "RegistrationReceipt")]
-pub struct PyRegistrationReceipt {
+#[pyclass(module = "wyrd.cards", name = "DeclarationReceipt")]
+pub struct PyDeclarationReceipt {
     /// Completed native receipt; its root and outcomes are projected on access.
-    inner: RegistrationReceipt,
+    inner: DeclarationReceipt,
 }
 
 /// Wrap the native receipt; fields are projected lazily by the Python getters.
-impl From<RegistrationReceipt> for PyRegistrationReceipt {
+impl From<DeclarationReceipt> for PyDeclarationReceipt {
     /// Take ownership of the completed native receipt.
-    fn from(inner: RegistrationReceipt) -> Self {
+    fn from(inner: DeclarationReceipt) -> Self {
         Self { inner }
     }
 }
 
 #[pymethods]
-impl PyRegistrationReceipt {
+impl PyDeclarationReceipt {
     /// Server-resolved graph root.
     #[getter]
     fn root(&self) -> CardRefPy {
@@ -1697,12 +1697,12 @@ impl PyRegistrationReceipt {
 
     /// Dependency-first registration outcomes.
     #[getter]
-    fn outcomes(&self) -> Vec<PyRegistrationOutcome> {
+    fn outcomes(&self) -> Vec<PyDeclarationOutcome> {
         self.inner
             .outcomes
             .iter()
             .cloned()
-            .map(|inner| PyRegistrationOutcome { inner })
+            .map(|inner| PyDeclarationOutcome { inner })
             .collect()
     }
 }
@@ -1881,7 +1881,7 @@ impl PyCards {
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         PythonCardRegistry::new(self.cards(py)?).register(py, card, version_bump, save_args)
     }
 
@@ -1901,13 +1901,13 @@ impl PyCards {
     /// Returns a Wyrd error when the bundle is invalid, its artifacts cannot
     /// be read, or registration does not complete.
     #[pyo3(signature = (path))]
-    fn register_from_path(
+    fn declare_from_path(
         &self,
         py: Python<'_>,
         path: PathBuf,
-    ) -> CardPyResult<PyRegistrationReceipt> {
-        crate::trace::block_on(py, self.cards(py)?.register_from_path(&path))
-            .map(PyRegistrationReceipt::from)
+    ) -> CardPyResult<PyDeclarationReceipt> {
+        crate::trace::block_on(py, self.cards(py)?.declare_from_path(&path))
+            .map(PyDeclarationReceipt::from)
             .map_err(WyrdPyError::from)
     }
 
@@ -2032,36 +2032,36 @@ impl PyCards {
         card_ref: PyRef<'_, CardRefPy>,
         destination: PathBuf,
         metadata_only: bool,
-    ) -> CardPyResult<PyHydrationSummary> {
+    ) -> CardPyResult<PyPullSummary> {
         let selector = CardSelector::exact(card_ref.0.clone());
         let mode = if metadata_only {
-            HydrationMode::MetadataOnly
+            BundleMode::MetadataOnly
         } else {
-            HydrationMode::Complete
+            BundleMode::Complete
         };
         crate::trace::block_on(py, self.cards(py)?.hydrate(selector, &destination, mode))
-            .map(PyHydrationSummary::from)
+            .map(PyPullSummary::from)
             .map_err(WyrdPyError::from)
     }
 }
 
 /// Result of one published hydration: `Cards.hydrate` and the test CLI `get`.
-#[pyclass(module = "wyrd.cards", name = "HydrationSummary", frozen)]
-pub struct PyHydrationSummary {
+#[pyclass(module = "wyrd.cards", name = "PullSummary", frozen)]
+pub struct PyPullSummary {
     /// The shared Rust summary every getter reads.
-    inner: HydrationSummary,
+    inner: PullSummary,
 }
 
 /// Wraps a shared Rust summary for Python.
-impl From<HydrationSummary> for PyHydrationSummary {
+impl From<PullSummary> for PyPullSummary {
     /// Takes ownership of `inner`; no field is copied.
-    fn from(inner: HydrationSummary) -> Self {
+    fn from(inner: PullSummary) -> Self {
         Self { inner }
     }
 }
 
 #[pymethods]
-impl PyHydrationSummary {
+impl PyPullSummary {
     /// The exact resolved root reference.
     #[getter]
     fn root(&self) -> CardRefPy {
@@ -2432,7 +2432,7 @@ fn register_view_card(
     version_bump: Option<&Bound<'_, PyAny>>,
     save_args: Option<&Bound<'_, PyAny>>,
     kind: &CardKind,
-) -> CardPyResult<PyRegistrationReceipt> {
+) -> CardPyResult<PyDeclarationReceipt> {
     PythonCardRegistry::new(registry).register_typed(py, card, version_bump, save_args, kind)
 }
 
@@ -2462,7 +2462,7 @@ impl PyDataCardRegistry {
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         register_view_card(
             py,
             self.inner.get(py)?,
@@ -2663,7 +2663,7 @@ impl PyModelCardRegistry {
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         register_view_card(
             py,
             self.inner.get(py)?,
@@ -2863,7 +2863,7 @@ impl PyPromptCardRegistry {
         py: Python<'_>,
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         register_view_card(
             py,
             self.inner.get(py)?,
@@ -3013,7 +3013,7 @@ struct SavedCardEnvelope {
 /// Registration input whose manifest paths are confined to its retained workspace.
 struct PreparedPythonCard {
     /// Native input whose artifact sources were derived from `tempdir`.
-    input: RegistrationInput,
+    input: DeclarationInput,
     /// Workspace retained until hashing, upload, and completion finish.
     tempdir: TempDir,
 }
@@ -3034,7 +3034,7 @@ impl PreparedPythonCard {
         let manifest = wyrd_loader::build_artifact_manifest(root, "card.json")
             .map_err(|error| loader_manifest_error(&error))?;
         Ok(Self {
-            input: RegistrationInput {
+            input: DeclarationInput {
                 submissions: vec![wyrd_spec::registry::CardSubmission {
                     api_version: saved.envelope.api_version,
                     kind: saved.envelope.kind,
@@ -3084,7 +3084,7 @@ fn register_python_card(
     version_bump: Option<&Bound<'_, PyAny>>,
     save_args: Option<&Bound<'_, PyAny>>,
     expected_kind: Option<&CardKind>,
-) -> CardPyResult<PyRegistrationReceipt> {
+) -> CardPyResult<PyDeclarationReceipt> {
     let kind = holder_kind(card)?;
     if let Some(expected) = expected_kind
         && expected != &kind
@@ -3119,7 +3119,7 @@ fn register_python_card(
                 ))
                 .map_err(WyrdPyError::from)
         })
-        .map(PyRegistrationReceipt::from)?;
+        .map(PyDeclarationReceipt::from)?;
     stamp_python_holder(card, &receipt.inner.root)?;
     Ok(receipt)
 }
@@ -3570,11 +3570,11 @@ fn lifecycle_status_name(status: CardLifecycleStatus) -> &'static str {
 }
 
 /// Returns the stable snake-case Python spelling of a registration outcome.
-fn registration_outcome_name(outcome: RegistrationOutcomeKind) -> &'static str {
+fn registration_outcome_name(outcome: DeclarationOutcomeKind) -> &'static str {
     match outcome {
-        RegistrationOutcomeKind::Registered => "registered",
-        RegistrationOutcomeKind::IdempotentNoop => "idempotent_noop",
-        RegistrationOutcomeKind::Deduplicated => "deduplicated",
+        DeclarationOutcomeKind::Declared => "declared",
+        DeclarationOutcomeKind::IdempotentNoop => "idempotent_noop",
+        DeclarationOutcomeKind::Deduplicated => "deduplicated",
     }
 }
 
@@ -3650,8 +3650,8 @@ pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyPromptCardRegistry>()?;
     module.add_class::<PyCardSummary>()?;
     module.add_class::<PyCardList>()?;
-    module.add_class::<PyRegistrationOutcome>()?;
-    module.add_class::<PyRegistrationReceipt>()?;
-    module.add_class::<PyHydrationSummary>()?;
+    module.add_class::<PyDeclarationOutcome>()?;
+    module.add_class::<PyDeclarationReceipt>()?;
+    module.add_class::<PyPullSummary>()?;
     Ok(())
 }

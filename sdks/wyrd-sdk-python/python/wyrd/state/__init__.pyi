@@ -91,7 +91,7 @@ class HydratedArtifact:
 
     @property
     def local_path(self) -> Path:
-        """Return the absolute path confined beneath the hydrated bundle."""
+        """Return the absolute path confined beneath the Card bundle."""
         ...
 
     @property

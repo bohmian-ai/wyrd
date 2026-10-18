@@ -14,7 +14,7 @@ use std::time::Duration;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_ai::cards::{CardRef, CardSelector, Cards, BundleMode, DeclarationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
@@ -410,18 +410,18 @@ pub fn coordinates(card: &CardRef) -> [String; 4] {
 ///
 /// # Panics
 /// Panics when registration is refused.
-pub async fn register(cards: &Cards, relative: &str) -> RegistrationReceipt {
+pub async fn declare(cards: &Cards, relative: &str) -> DeclarationReceipt {
     cards
-        .register_from_path(&fixture(relative))
+        .declare_from_path(&fixture(relative))
         .await
-        .unwrap_or_else(|error| panic!("{relative} registers: {error}"))
+        .unwrap_or_else(|error| panic!("{relative} declares: {error}"))
 }
 
 /// The exact reference `receipt` registered for the Card named `name`.
 ///
 /// # Panics
 /// Panics when the receipt registered no Card of that name.
-pub fn registered(receipt: &RegistrationReceipt, name: &str) -> CardRef {
+pub fn declared(receipt: &DeclarationReceipt, name: &str) -> CardRef {
     receipt
         .outcomes
         .iter()
@@ -436,15 +436,15 @@ pub fn registered(receipt: &RegistrationReceipt, name: &str) -> CardRef {
 ///
 /// # Panics
 /// Panics when hydration fails.
-pub async fn hydrate(cards: &Cards, root: &CardRef) -> tempfile::TempDir {
+pub async fn pull(cards: &Cards, root: &CardRef) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("bundle directory creates");
     cards
-        .hydrate(
+        .pull(
             CardSelector::exact(root.clone()),
             dir.path().join("bundle"),
-            HydrationMode::Complete,
+            BundleMode::Complete,
         )
         .await
-        .expect("graph hydrates");
+        .expect("graph pulls");
     dir
 }

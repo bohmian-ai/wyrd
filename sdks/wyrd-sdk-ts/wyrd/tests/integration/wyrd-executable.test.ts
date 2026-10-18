@@ -8,13 +8,13 @@ import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
 
-import { Cards, type RegistrationReceipt } from "wyrd-ai";
+import { Cards, type DeclarationReceipt } from "wyrd-ai";
 
 import { fixture, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-const DESK = fixture("cards/register_and_hydrate/support-desk.yaml");
+const DESK = fixture("cards/declare_and_pull/support-desk.yaml");
 
 /** The `wyrd` executable the package installs, resolved from its `bin` entry. */
 const WYRD_BIN = (() => {
@@ -24,12 +24,12 @@ const WYRD_BIN = (() => {
 })();
 
 /** The support desk graph, registered after the artifact-bearing Model it references. */
-const test = serverTest().extend<{ desk: RegistrationReceipt }>({
+const test = serverTest().extend<{ desk: DeclarationReceipt }>({
   desk: [
     async ({ server: _ }, use) => {
       const cards = await Cards.connect();
-      await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"));
-      await use(await cards.registerFromPath(DESK));
+      await cards.declareFromPath(fixture("cards/declare_and_pull/support-model.yaml"));
+      await use(await cards.declareFromPath(DESK));
     },
     { scope: "file" },
   ],

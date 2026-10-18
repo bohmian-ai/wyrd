@@ -16,7 +16,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
 
-from ...cards import CardRef, RegistrationReceipt
+from ...cards import CardRef, DeclarationReceipt
 from ...client import WyrdClient
 from ...gateway import ProviderCredentialView
 from ._commands import get, issue_key, load
@@ -171,7 +171,7 @@ def plan(path: str | PathLike[str]) -> PlanReport:
     """
     ...
 
-def apply(path: str | PathLike[str], *, client: WyrdClient | None = None) -> RegistrationReceipt:
+def apply(path: str | PathLike[str], *, client: WyrdClient | None = None) -> DeclarationReceipt:
     """Register a local Card tree and return its receipt (``wyrd apply``).
 
     Args:

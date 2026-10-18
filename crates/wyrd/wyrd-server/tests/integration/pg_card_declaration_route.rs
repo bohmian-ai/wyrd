@@ -1,4 +1,4 @@
-//! Public card-registration journey through the authenticated HTTP surface.
+//! Public card-declaration journey through the authenticated HTTP surface.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +19,13 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_loader::{build_registration_input, load};
+use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
 use wyrd_spec::reference::{CardRef, InlineableRef};
-use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
+use wyrd_spec::registry::{CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::{
@@ -98,9 +98,9 @@ async fn seed_dependency(
     .await
 }
 
-/// Seed one already-registered Card of any kind for a reference to resolve to.
+/// Seed one already-declared Card of any kind for a reference to resolve to.
 ///
-/// Registration reads a referenced binding target's effective spec out of the
+/// Declaration reads a referenced binding target's effective spec out of the
 /// registry, so the server-only refusals need real rows rather than siblings in
 /// the same request.
 ///
@@ -220,7 +220,7 @@ async fn make_reconciliation_due(server: &WyrdTestServer, card_uid: &CardUid) {
     conn.commit().await.expect("reconciliation update commits");
 }
 
-/// Build an authenticated registration request from a JSON payload and key.
+/// Build an authenticated declaration request from a JSON payload and key.
 fn request_with_body(idempotency_key: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -264,7 +264,7 @@ fn registration_request() -> Request<Body> {
         .expect("registration request builds")
 }
 
-/// Build a metadata-only Prompt registration request.
+/// Build a metadata-only Prompt declaration request.
 ///
 /// # Panics
 /// Panics when the request does not build.
@@ -297,7 +297,7 @@ fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Bod
         .expect("prompt registration request builds")
 }
 
-/// Build an Agent registration request referencing an existing Prompt.
+/// Build an Agent declaration request referencing an existing Prompt.
 ///
 /// # Panics
 /// Panics when the request does not build.
@@ -401,7 +401,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
     )
 }
 
-/// Build one artifact-bearing card registration request.
+/// Build one artifact-bearing card declaration request.
 fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
     request_with_body(
         idempotency_key,
@@ -422,17 +422,17 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
 #[tokio::test(flavor = "current_thread")]
 /// The native registry saga returns only a final Active receipt.
 ///
-/// A Prompt with one artifact registers through `Cards` over a bearer JWT
+/// A Prompt with one artifact declares through `Cards` over a bearer JWT
 /// against local storage; connecting performs no exchange or dial. The
-/// registered Card then reads back through `get`, `list`, `resolve_latest`,
+/// declared Card then reads back through `get`, `list`, `resolve_latest`,
 /// and `load`, and Postgres holds it Active with a verified artifact
 /// manifest.
 ///
 /// # Panics
-/// Panics when a workspace, Card file, loader, registration input, server,
-/// bootstrap, handle, registration, read, load, tenant connection, SQL query,
+/// Panics when a workspace, Card file, loader, declaration input, server,
+/// bootstrap, handle, declaration, read, load, tenant connection, SQL query,
 /// or commit fails; when bootstrap returns a non-user principal; or when an
-/// assertion fails: the receipt is not one Active registered outcome with a
+/// assertion fails: the receipt is not one Active declared outcome with a
 /// blob URI and matching root UID, a read names another Card, the loaded
 /// artifact bytes differ, or the stored Card is not Active with a blob URI
 /// and verified manifest.
@@ -450,7 +450,7 @@ async fn client_registration_saga_returns_active_receipt() {
         ),
     )
     .expect("prompt card writes");
-    let input = build_registration_input(load(&prompt_path).expect("loader tree builds"))
+    let input = build_declaration_input(load(&prompt_path).expect("loader tree builds"))
         .expect("registration input builds");
 
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -482,14 +482,14 @@ async fn client_registration_saga_returns_active_receipt() {
     .expect("handle connects");
 
     let receipt = cards
-        .register(&input)
+        .declare(&input)
         .await
         .expect("native registration saga succeeds");
     assert_eq!(receipt.outcomes.len(), 1);
     assert_eq!(receipt.outcomes[0].status, CardLifecycleStatus::Active);
     assert_eq!(
         receipt.outcomes[0].outcome,
-        RegistrationOutcomeKind::Registered
+        DeclarationOutcomeKind::Declared
     );
     assert!(receipt.outcomes[0].card_blob_uri.is_some());
     assert_eq!(receipt.root.uid, receipt.outcomes[0].card_ref.uid);
@@ -532,15 +532,11 @@ async fn client_registration_saga_returns_active_receipt() {
         .expect("public Cards latest resolves the registered card");
     assert_eq!(latest.uid, Some(card_uid.clone()));
 
-    let load_destination = tempfile::tempdir().expect("load destination creates");
-    let loaded = cards
-        .load(
-            CardSelector::uid(CardKind::Prompt, card_uid.clone()),
-            Some(load_destination.path()),
-        )
+    let load_destination = tempfile::tempdir().expect("artifact destination creates");
+    cards
+        .download_artifacts_to(&card_uid, load_destination.path())
         .await
-        .expect("public Cards load downloads the registered artifact");
-    assert_eq!(loaded.card.metadata.uid, Some(card_uid.clone()));
+        .expect("Cards downloads the declared artifact");
     assert_eq!(
         tokio::fs::read(load_destination.path().join("prompt.txt"))
             .await
@@ -571,7 +567,7 @@ async fn client_registration_saga_returns_active_receipt() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// Registering the same request twice returns the stored response without duplicate writes.
+/// Declaring the same request twice returns the stored response without duplicate writes.
 async fn registration_replays_through_public_authenticated_route() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -590,7 +586,7 @@ async fn registration_replays_through_public_authenticated_route() {
         .expect("first registration responds");
     assert_eq!(first.status(), StatusCode::CREATED);
     let first_body = response_json(first).await;
-    assert_eq!(first_body["outcomes"][0]["outcome"], "registered");
+    assert_eq!(first_body["outcomes"][0]["outcome"], "declared");
 
     let replay = server
         .oneshot_authenticated(&jwt, registration_request())
@@ -619,7 +615,7 @@ async fn registration_replays_through_public_authenticated_route() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// Registration resolves an external child reference and persists its UID.
+/// Declaration resolves an external child reference and persists its UID.
 async fn registration_resolves_child_card_refs_before_persisting() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -681,7 +677,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// The offline loader hands its wire projection to the composite registration route.
+/// The offline loader hands its wire projection to the composite declaration route.
 ///
 /// # Panics
 /// Panics when the loader workspace, test server, a request, or an assertion fails.
@@ -700,11 +696,11 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
     )
     .expect("agent card writes");
 
-    let input = build_registration_input(load(&agent_path).expect("loader tree builds"))
+    let input = build_declaration_input(load(&agent_path).expect("loader tree builds"))
         .expect("registration input builds");
     let request = request_with_body(
         "loader-handoff-001",
-        serde_json::to_value(input.to_create_card_request()).expect("request serializes"),
+        serde_json::to_value(input.to_declare_card_request()).expect("request serializes"),
     );
 
     let server = WyrdTestServer::start_in_process()
@@ -793,9 +789,9 @@ async fn registration_rejects_idempotency_key_reuse_for_different_content() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Resolve failures return 422 before any registration operation is reserved.
+/// Resolve failures return 422 before any declaration operation is reserved.
 #[tokio::test(flavor = "current_thread")]
-async fn unresolved_dependency_leaves_no_registration_operation() {
+async fn unresolved_dependency_leaves_no_declaration_operation() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -824,7 +820,7 @@ async fn unresolved_dependency_leaves_no_registration_operation() {
         .await
         .expect("tenant connection opens");
     let operation_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+        "SELECT count(*) FROM wyrd.card_declaration_operations WHERE idempotency_key = $1",
     )
     .bind("missing-ref-001")
     .fetch_one(&mut **conn.transaction())
@@ -836,7 +832,7 @@ async fn unresolved_dependency_leaves_no_registration_operation() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Reject non-Active and cross-tenant targets before any registration write.
+/// Reject non-Active and cross-tenant targets before any declaration write.
 #[tokio::test(flavor = "current_thread")]
 async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
     let server = WyrdTestServer::start_in_process()
@@ -904,7 +900,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Build an Agent submission whose `verified_by` binds already-registered peers.
+/// Build an Agent submission whose `verified_by` binds already-declared peers.
 ///
 /// `trigger_name` names the binding's `runs_on` Trigger; `None` authors an
 /// explicit-only binding with no `runs_on`.
@@ -954,7 +950,7 @@ fn bound_agent_request(
 /// a schedule Trigger cannot activate that samples-free Verifier.
 ///
 /// Four branches are only reachable with a real registry behind them: the
-/// effective Operator and Trigger bodies come from previously registered
+/// effective Operator and Trigger bodies come from previously declared
 /// Cards, the cross-tenant case depends on RLS, and the under-privileged case
 /// depends on the route's own scope check. The fifth, a binding nested under
 /// an inline Agent, is decidable from the request alone, but it is proved here
@@ -966,7 +962,7 @@ fn bound_agent_request(
 /// bootstrap returns a non-user principal, when any fixture row fails to
 /// insert, when the route fails to respond, or when any refusal does not
 /// produce its exact status, stable error code, and absence of durable
-/// registration state.
+/// declaration state.
 #[tokio::test(flavor = "current_thread")]
 async fn referenced_binding_refusals_leave_no_writes() {
     let server = WyrdTestServer::start_in_process()
@@ -1218,7 +1214,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Build a one-Agent registration whose `verified_by` list is posted verbatim.
+/// Build a one-Agent declaration whose `verified_by` list is posted verbatim.
 ///
 /// The Agent's prompt is the seeded `vc-prompt`. Taking the raw list lets a
 /// test send wrong-kind or duplicated references that a local loader would
@@ -1242,7 +1238,7 @@ fn agent_with_bindings(name: &str, verified_by: Value, idempotency_key: &str) ->
     )
 }
 
-/// Build a one-Card registration for a standalone Card of `kind`.
+/// Build a one-Card declaration for a standalone Card of `kind`.
 fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Request<Body> {
     request_with_body(
         key,
@@ -1256,9 +1252,9 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
     )
 }
 
-/// The authenticated registration route enforces the shared Verifier contract.
+/// The authenticated declaration route enforces the shared Verifier contract.
 ///
-/// Through the public HTTP route, with real registered targets behind every
+/// Through the public HTTP route, with real declared targets behind every
 /// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
 /// are refused; a `verifier`, `runs_on`, or `on_failure`
 /// reference that resolves to a Card of the wrong kind is refused with its
@@ -1334,7 +1330,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         }
     };
 
-    // The registration body is decoded by the plain JSON extractor, whose
+    // The declaration body is decoded by the plain JSON extractor, whose
     // rejection is a 422 text body naming the failure rather than a Wyrd
     // problem document; the refusal and its no-write boundary are what hold.
     let undecodable = |label: &str, request: Request<Body>, needle: &str| {
@@ -1492,9 +1488,9 @@ async fn verifier_contract_refusals_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Confirm a rejected dependency did not append any durable registration state.
+/// Confirm a rejected dependency did not append any durable declaration state.
 ///
-/// Counts the registration operation under `operation_key` and, for Cards
+/// Counts the declaration operation under `operation_key` and, for Cards
 /// named `name`, the Card rows, their relationships, Card-bound principals of
 /// the same name, and verification bindings they own.
 ///
@@ -1506,7 +1502,7 @@ async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &
         .await
         .expect("tenant connection opens");
     let operation_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+        "SELECT count(*) FROM wyrd.card_declaration_operations WHERE idempotency_key = $1",
     )
     .bind(operation_key)
     .fetch_one(&mut **conn.transaction())
@@ -1595,7 +1591,7 @@ async fn composite_with_manifest_rejects_before_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Concurrent identical registrations persist one operation and one card.
+/// Concurrent identical declarations persist one operation and one card.
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_same_key_resolves_to_one_registration() {
     let server = WyrdTestServer::start_in_process()
@@ -1629,7 +1625,7 @@ async fn concurrent_same_key_resolves_to_one_registration() {
         .await
         .expect("tenant connection opens");
     let operation_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+        "SELECT count(*) FROM wyrd.card_declaration_operations WHERE idempotency_key = $1",
     )
     .bind("concurrent-key-001")
     .fetch_one(&mut **conn.transaction())
@@ -1877,7 +1873,7 @@ async fn heavy_registration_initializes_upload_after_commit() {
     assert_eq!(complete_response.status(), StatusCode::OK);
     let complete_body = response_json(complete_response).await;
     assert_eq!(complete_body["outcomes"][0]["status"], "active");
-    assert_eq!(complete_body["outcomes"][0]["outcome"], "registered");
+    assert_eq!(complete_body["outcomes"][0]["outcome"], "declared");
 
     let replay = server
         .oneshot_authenticated(&jwt, complete_request())
@@ -1973,7 +1969,7 @@ async fn card_reconciler_recovers_after_storage_retry() {
 /// records it as reconciliation lineage in the same durable state transition.
 ///
 /// # Panics
-/// Panics when the server cannot start, registration or reconciliation reads
+/// Panics when the server cannot start, declaration or reconciliation reads
 /// fail, or the dead-letter state, error metadata, or attempt count differ.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_dead_letters_after_three_failures() {
@@ -2030,7 +2026,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     .await
     .expect("dead-letter metadata reads");
     assert_eq!(metadata.0, "dead_lettered");
-    assert_eq!(metadata.1, "registration");
+    assert_eq!(metadata.1, "declaration");
     assert!(
         metadata.2.is_some(),
         "dead letter stores the stable error code"
@@ -2177,10 +2173,10 @@ async fn delete_storage_failure_preserves_cleanup_state() {
     std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
 }
 
-/// A blob storage failure refuses registration and leaves durable failure state.
+/// A blob storage failure refuses declaration and leaves durable failure state.
 ///
 /// # Panics
-/// Panics when the server cannot start, the registration succeeds, or the Card
+/// Panics when the server cannot start, the declaration succeeds, or the Card
 /// is not left `failed` with no blob URI and a recorded failure time.
 #[tokio::test(flavor = "current_thread")]
 async fn blob_storage_failure_leaves_durable_failure_state() {
@@ -2637,7 +2633,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Seed the active dependencies every bound-Service registration names.
+/// Seed the active dependencies every bound-Service declaration names.
 ///
 /// Inserts the `vb-prompt` Prompt, the `vb-drift` Custom Drift Verifier, and
 /// the daily `vb-schedule` Trigger, returning the Trigger's UID so a test can
@@ -2673,7 +2669,7 @@ fn schedule_trigger_ref() -> Value {
     json!({ "kind": "Trigger", "name": "vb-schedule", "version": "1.0.0", "space": "default" })
 }
 
-/// Build a Service-root registration whose Service and component both own a binding.
+/// Build a Service-root declaration whose Service and component both own a binding.
 ///
 /// The Service-level binding runs the drift Verifier on `runs_on` (a
 /// referenced or inline `schedule` Trigger) and dispatches one inline HTTP
@@ -2694,7 +2690,7 @@ fn bound_service_request(
     )
 }
 
-/// The JSON registration body [`bound_service_request`] posts.
+/// The JSON declaration body [`bound_service_request`] posts.
 ///
 /// Returned separately so a test can rewrite one binding, such as its
 /// `on_failure` list, before posting it with [`request_with_body`].
@@ -2799,13 +2795,13 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// Served binding IDs are stable, authorized, tenant-isolated, and activate
 /// only through the owner's real API-key exchange.
 ///
-/// Registers a Service owning a Service-level binding on a referenced
+/// Declares a Service owning a Service-level binding on a referenced
 /// schedule Trigger with an inline Operator, plus a component binding on an
 /// inline schedule; checks the referenced Trigger is frozen by UID
 /// and the inline Operator by digest; then reads `status.verification.binding_ids`
 /// through the public route, re-applies the identical graph, and checks the
 /// under-privileged and cross-tenant reads. Before any exchange it proves
-/// registration wrote no `wyrd.verifier_executions` row for the owner.
+/// declaration wrote no `wyrd.verifier_executions` row for the owner.
 /// Finally it exchanges an API key for the Service's own projected principal
 /// through `/auth/token` and proves that exchange stamped the owner's activity
 /// and armed both schedule cursors, the component's inherited from its owner. An unarmable schedule and a repeated component alias are refused
@@ -3115,14 +3111,14 @@ async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(S
     rows
 }
 
-/// Operator-bearing registration also needs `operators:invoke`, audited once.
+/// Operator-bearing declaration also needs `operators:invoke`, audited once.
 ///
-/// A caller holding only `cards:write` registers an Operator-free bound
+/// A caller holding only `cards:write` declares an Operator-free bound
 /// Service with one allowed `cards:write` row, but an inline or referenced
 /// `on_failure` Operator is refused with the stable 403, writes no Card,
 /// principal, binding, or operation, and audits the allowed `cards:write` and
 /// the denied `operators:invoke`. A caller holding both commits the
-/// registration with exactly one allowed row per permission.
+/// declaration with exactly one allowed row per permission.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, a fixture write fails, a
@@ -3281,10 +3277,10 @@ async fn operator_bearing_registration_requires_operator_invoke() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Register the bound `vb-twin` Service in `space` and return its Service UID.
+/// Declare the bound `vb-twin` Service in `space` and return its Service UID.
 ///
 /// # Panics
-/// Panics when the registration route fails to respond, refuses the graph, or
+/// Panics when the declaration route fails to respond, refuses the graph, or
 /// returns no Service outcome UID.
 async fn register_twin(server: &WyrdTestServer, jwt: &str, space: &str) -> Uuid {
     let mut body = bound_service_body("vb-twin", schedule_trigger_ref(), None);
@@ -3343,7 +3339,7 @@ async fn never_activated(server: &WyrdTestServer, owner: Uuid) -> bool {
 
 /// One Card identity in two spaces resolves only through an exact reference.
 ///
-/// Registers the same bound Service kind, name, and version in the `default`
+/// Declares the same bound Service kind, name, and version in the `default`
 /// and `blue` spaces, which projects two distinct Card-bound principals. An
 /// explicit-space `card_ref` issues a key for and — through the real API-key
 /// exchange — activates only its own space's owner; the same ref with its
@@ -3409,10 +3405,10 @@ async fn same_card_in_two_spaces_resolves_only_exact_refs() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Register the bound `vb-live` Service at `version` and return its Service UID.
+/// Declare the bound `vb-live` Service at `version` and return its Service UID.
 ///
 /// # Panics
-/// Panics when the registration route fails to respond, refuses the graph, or
+/// Panics when the declaration route fails to respond, refuses the graph, or
 /// returns no Service outcome UID.
 async fn register_live(server: &WyrdTestServer, jwt: &str, version: &str) -> Uuid {
     let mut body = bound_service_body("vb-live", schedule_trigger_ref(), None);
@@ -3582,7 +3578,7 @@ fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddlewa
 
 /// Runtime activity follows only qualifying exchanges of the exact owner.
 ///
-/// Registers two A/B versions of one bound Service and drives a real client
+/// Declares two A/B versions of one bound Service and drives a real client
 /// through `/auth/token`. The first API-key exchange activates only the exact
 /// version, arms its schedule cursor, and — through the component binding —
 /// activates every binding of that Service. A cached-token request, an idle
@@ -3899,11 +3895,11 @@ fn tickets_schema() -> Value {
 }
 
 /// A Service's declared tables are ensured before it becomes active, and an
-/// incompatible or unsupported declaration refuses the registration first.
+/// incompatible or unsupported declaration refuses the declaration first.
 ///
-/// Registering `ticket-desk` creates `vala.datasets.tickets` with exactly its
+/// Declaring `ticket-desk` creates `vala.datasets.tickets` with exactly its
 /// four declared fields; a second Service declaring the same table with the
-/// same schema registers against it. A Service declaring `tickets` with a
+/// same schema declares against it. A Service declaring `tickets` with a
 /// different field is refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`
 /// and a free-form object schema with `WYRD_VALA_400_SCHEMA_PARSE`; neither
 /// leaves any Card, operation, principal, or binding behind, and the stored
@@ -3998,7 +3994,7 @@ async fn service_declared_tables_are_ensured_before_activation() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Build an auto-versioned Agent registration whose Prompt is authored inline.
+/// Build an auto-versioned Agent declaration whose Prompt is authored inline.
 ///
 /// # Panics
 /// Panics through [`native_prompt`] when the declarative Prompt fixture does
@@ -4039,7 +4035,7 @@ fn portable_prompt(message: &str) -> Value {
     serde_json::to_value(spec.prompt).expect("native prompt serializes")
 }
 
-/// Register one inline Agent and return its response body after asserting success.
+/// Declare one inline Agent and return its response body after asserting success.
 ///
 /// # Panics
 /// Panics when the in-process server does not answer, the response body is not
@@ -4061,7 +4057,7 @@ async fn register_inline_agent(
     body
 }
 
-/// Return the response outcome registered for one Card kind.
+/// Return the response outcome declared for one Card kind.
 ///
 /// # Panics
 /// Panics when the body carries no `outcomes` array or no outcome of `kind`.
@@ -4101,14 +4097,14 @@ async fn persisted_agent_prompt(server: &WyrdTestServer, agent: &Value) -> CardR
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// An inline Agent Prompt registers as its own `<agent>-prompt` Card on its
+/// An inline Agent Prompt declares as its own `<agent>-prompt` Card on its
 /// own version line, and the Agent pins that exact UID-bearing reference.
 ///
 /// # Panics
 /// Panics when the server cannot start or shut down, the editor or viewer cannot
 /// bootstrap, a tenant query fails, or any outcome, stored pin, edge count,
 /// replay, version change, derived-name refusal, or authorization refusal
-/// differs from the registered-Prompt contract.
+/// differs from the declared-Prompt contract.
 async fn inline_agent_prompt_materializes() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -4128,7 +4124,7 @@ async fn inline_agent_prompt_materializes() {
     let agent = outcome_for(&first, "Agent");
     assert_eq!(prompt["card_ref"]["name"], "inline-agent-prompt");
     assert_eq!(prompt["card_ref"]["space"], "default");
-    assert_eq!(prompt["outcome"], "registered");
+    assert_eq!(prompt["outcome"], "declared");
     assert_eq!(prompt["status"], "active");
     let pinned = persisted_agent_prompt(&server, agent).await;
     assert_eq!(
@@ -4161,7 +4157,7 @@ async fn inline_agent_prompt_materializes() {
     let changed =
         register_inline_agent(&server, &jwt, "inline-agent", "goodbye", "inline-003").await;
     let changed_prompt = outcome_for(&changed, "Prompt");
-    assert_eq!(changed_prompt["outcome"], "registered");
+    assert_eq!(changed_prompt["outcome"], "declared");
     assert_eq!(changed_prompt["card_ref"]["name"], "inline-agent-prompt");
     assert_ne!(
         changed_prompt["card_ref"]["version"],
@@ -4258,7 +4254,7 @@ fn sibling_service(name: &str, components: &[(&str, &str, &str, &str)]) -> Value
     })
 }
 
-/// Submit one registration request and return its status and response body.
+/// Submit one declaration request and return its status and response body.
 ///
 /// # Panics
 /// Panics when the in-process server does not answer the request or the
@@ -4280,7 +4276,7 @@ async fn submit(
     (status, response_json(response).await)
 }
 
-/// Return every response outcome registered for one Card kind and name.
+/// Return every response outcome declared for one Card kind and name.
 ///
 /// # Panics
 /// Panics when the response body carries no `outcomes` array.
@@ -4295,7 +4291,7 @@ fn outcomes_named<'a>(body: &'a Value, kind: &str, name: &str) -> Vec<&'a Value>
         .collect()
 }
 
-/// Count the registration operations stored for one idempotency key and the
+/// Count the declaration operations stored for one idempotency key and the
 /// live Card rows stored under one name.
 ///
 /// # Panics
@@ -4310,7 +4306,7 @@ async fn operation_and_card_counts(
         .await
         .expect("tenant connection opens");
     let operations: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+        "SELECT count(*) FROM wyrd.card_declaration_operations WHERE idempotency_key = $1",
     )
     .bind(idempotency_key)
     .fetch_one(&mut **conn.transaction())
@@ -4334,7 +4330,7 @@ async fn operation_and_card_counts(
 ///
 /// # Panics
 /// Panics when the server cannot start, a writer cannot bootstrap, or any
-/// registration outcome, stored pin, edge, or conflict differs from the above.
+/// declaration outcome, stored pin, edge, or conflict differs from the above.
 async fn inline_agent_prompt_reapply_preserves_pin() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -4432,13 +4428,13 @@ async fn inline_agent_prompt_reapply_preserves_pin() {
 
 #[tokio::test(flavor = "current_thread")]
 /// Repeated Prompt selection on one line inside a single composite accounts
-/// for the selections this registration already made: identical bodies reuse
+/// for the selections this declaration already made: identical bodies reuse
 /// one Prompt, different bodies get successive versions, and an authored
 /// exact pin that conflicts with stored content still refuses atomically.
 ///
 /// # Panics
 /// Panics when the server cannot start, a writer cannot bootstrap, or any
-/// registration outcome, stored pin, row count, or conflict differs from the above.
+/// declaration outcome, stored pin, row count, or conflict differs from the above.
 async fn inline_agent_prompt_reuses_transaction_selection() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -4580,7 +4576,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Invalid authored Prompt declarations are refused by public registration
+/// Invalid authored Prompt declarations are refused by public declaration
 /// before anything is persisted.
 ///
 /// Each case is submitted as a standalone Prompt Card and as an inline Agent

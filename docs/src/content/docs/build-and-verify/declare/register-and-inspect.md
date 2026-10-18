@@ -28,7 +28,7 @@ registered: default/Service/support-desk@1.0.0#<uid>
 
 <Aside type="caution" title="Unverified">The line format is derived from the CLI source. A captured run replaces it on the first verified run.</Aside>
 
-From code, `register_from_path` does the same and returns the receipt. The example's deploy step then downloads what it registered:
+From code, `declare_from_path` does the same and returns the receipt. The example's deploy step then downloads what it registered:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">

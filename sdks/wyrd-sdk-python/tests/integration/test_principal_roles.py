@@ -57,7 +57,7 @@ def issue(server: WyrdTestServer, service: CardRef) -> tuple[str, str]:
 
 def author(server: WyrdTestServer, key: str) -> None:
     """Register ``AUTHORED`` through a fresh client, so it carries the key's next token."""
-    Cards(client_of(server, key)).register_from_path(AUTHORED)
+    Cards(client_of(server, key)).declare_from_path(AUTHORED)
 
 
 def test_granted_editor_reaches_the_next_token_until_revoked(

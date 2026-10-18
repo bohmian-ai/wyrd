@@ -134,7 +134,7 @@ cards.model.register(card)
 
 A `ModelCard` needs a signature, the names and types of the model's inputs and outputs; without one, construction fails with `WYRD_MODEL_400_MISSING_SIGNATURE`. Code-built Cards default to version `0.1.0`, so set `version` yourself. `register` updates the card object in place with its server-assigned `uid`. The Service can now list it as a component with `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }`.
 
-Python can register a Prompt from code the same way, with `cards.prompt.register`. The Rust and TypeScript SDKs do not build Cards in code; they register Card files, including `Data` and `Model` files that list `artifacts:`, with `register_from_path` and `registerFromPath`.
+Python can register a Prompt from code the same way, with `cards.prompt.register`. The Rust and TypeScript SDKs do not build Cards in code; they register Card files, including `Data` and `Model` files that list `artifacts:`, with `declare_from_path` and `declareFromPath`.
 
 ## Relationships come from references
 

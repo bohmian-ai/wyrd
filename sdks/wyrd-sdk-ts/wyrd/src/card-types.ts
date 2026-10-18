@@ -390,7 +390,7 @@ export interface CardRef {
 /**
  * Outcome for one submission in a composite registration.
  */
-export interface CardRegistrationOutcome {
+export interface CardDeclarationOutcome {
   /**
    * BLAKE3 hex hash of the sorted artifact manifest, when present.
    */
@@ -406,7 +406,7 @@ export interface CardRegistrationOutcome {
   /**
    * Registration result for this submission.
    */
-  readonly outcome: RegistrationOutcomeKind;
+  readonly outcome: DeclarationOutcomeKind;
   /**
    * BLAKE3 hex hash of the JCS-canonical resolved spec.
    */
@@ -4452,18 +4452,18 @@ export interface RegisteredVerifierCard {
 /**
  * Result of a registration write.
  */
-export type RegistrationOutcomeKind = "registered" | "idempotent_noop" | "deduplicated";
+export type DeclarationOutcomeKind = "registered" | "idempotent_noop" | "deduplicated";
 
 /**
  * Public SDK receipt after the engine completes all required side effects.
  *
  * Upload plans and operation identifiers remain internal to the registration engine and are intentionally absent from this projection.
  */
-export interface RegistrationReceipt {
+export interface DeclarationReceipt {
   /**
    * Dependency-first server outcomes with final lifecycle state.
    */
-  readonly outcomes: readonly CardRegistrationOutcome[];
+  readonly outcomes: readonly CardDeclarationOutcome[];
   /**
    * Server-derived graph root.
    */

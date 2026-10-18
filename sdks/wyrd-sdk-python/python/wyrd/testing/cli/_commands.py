@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from wyrd._wyrd.testing import cli as _native  # ty: ignore[unresolved-import]
 
 if TYPE_CHECKING:
-    from wyrd.cards import HydrationSummary
+    from wyrd.cards import PullSummary
     from wyrd.client import WyrdClient
     from wyrd.testing.cli import IssueKeyResponse, LoadOutput
 
@@ -28,7 +28,7 @@ def get(
     uid: str | None = None,
     metadata_only: bool = False,
     client: WyrdClient | None = None,
-) -> HydrationSummary:
+) -> PullSummary:
     """Hydrate a Card's reachable graph into ``output_dir`` (``wyrd get``).
 
     Select by ``uid`` (with ``kind``) or by ``kind``, ``space``, and ``name``;

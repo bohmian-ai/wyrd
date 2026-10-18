@@ -1,5 +1,5 @@
-apiVersion: wyrd/hydrated-bundle/v1
-hydration: complete
+apiVersion: wyrd/bundle/v1
+mode: complete
 root:
   kind: Service
   name: service

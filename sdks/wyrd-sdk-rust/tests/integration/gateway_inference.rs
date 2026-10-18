@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::cards::{CardKind, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, DeclarationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
     DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
@@ -26,7 +26,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
 
-use crate::support::{Deployment, ancestry, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, pull, declare, declared};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
@@ -38,7 +38,7 @@ struct Inference {
     /// The upstream every deployment reaches.
     upstream: MockServer,
     /// The registered `ask-agent` Agent and its Prompt.
-    ask: RegistrationReceipt,
+    ask: DeclarationReceipt,
 }
 
 impl Inference {
@@ -82,7 +82,7 @@ impl Inference {
             })
             .await
             .expect("the capture policy puts");
-        let ask = register(
+        let ask = declare(
             &deployment.cards().await,
             "cards/gateway_inference/ask-agent.yaml",
         )
@@ -476,7 +476,7 @@ struct CallAttribution {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gateway_call_records_whichever_attribution_it_carries() {
     let inference = Inference::start().await;
-    let agent = registered(&inference.ask, "ask-agent");
+    let agent = declared(&inference.ask, "ask-agent");
     let issued = cli::issue_key(
         "Agent",
         "ask-agent",
@@ -631,8 +631,8 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
 async fn run_invokes_its_agent_through_the_gateway() {
     let inference = Inference::start().await;
     let cards = inference.deployment.cards().await;
-    let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
-    let bundle = hydrate(&cards, &service.root).await;
+    let service = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let bundle = pull(&cards, &service.root).await;
     let state = |client: WyrdClient| {
         WyrdState::from_path_with(bundle.path().join("bundle"), client)
             .expect("bundle loads offline")
@@ -714,8 +714,8 @@ async fn agent_routes_and_pre_run_overrides() {
     )
     .await;
     let cards = inference.deployment.cards().await;
-    let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
-    let bundle = hydrate(&cards, &service.root).await;
+    let service = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let bundle = pull(&cards, &service.root).await;
     let client = inference
         .deployment
         .client(&inference.deployment.service_key(&service.root).await);
@@ -835,8 +835,8 @@ async fn agent_routes_reach_named_native_ingress() {
             .await;
     }
     let cards = inference.deployment.cards().await;
-    let service = register(&cards, "cards/gateway_inference/routed-service.yaml").await;
-    let bundle = hydrate(&cards, &service.root).await;
+    let service = declare(&cards, "cards/gateway_inference/routed-service.yaml").await;
+    let bundle = pull(&cards, &service.root).await;
     let client = inference
         .deployment
         .client(&inference.deployment.service_key(&service.root).await);
@@ -859,9 +859,9 @@ async fn agent_routes_reach_named_native_ingress() {
         (200, &json!({ "helpful": { "type": "noul", "noul": 0.9 } }))
     );
 
-    let asks = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let asks = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let asks = WyrdState::from_path_with(
-        hydrate(&cards, &asks.root).await.path().join("bundle"),
+        pull(&cards, &asks.root).await.path().join("bundle"),
         inference
             .deployment
             .client(&inference.deployment.service_key(&asks.root).await),

@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
-use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_ai::cards::{CardSelector, Cards, BundleMode, DeclarationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
 use wyrd_ai::observe::Run;
 use wyrd_ai::otel::start_telemetry;
@@ -43,7 +43,7 @@ pub fn service_dir() -> PathBuf {
 /// The deployed support desk: its registration and loaded Card graph.
 pub struct Desk {
     /// Every Card the Service registered.
-    pub receipt: RegistrationReceipt,
+    pub receipt: DeclarationReceipt,
     /// The hydrated Service.
     pub state: WyrdState,
 }
@@ -111,13 +111,13 @@ fn policy_check(answer: &str) -> Inputs {
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     let cards = Cards::connect_with(client).await?;
     let receipt = cards
-        .register_from_path(service_dir().join("support-desk.yaml"))
+        .declare_from_path(service_dir().join("support-desk.yaml"))
         .await?;
     cards
-        .hydrate(
+        .pull(
             CardSelector::exact(receipt.root.clone()),
             bundle,
-            HydrationMode::Complete,
+            BundleMode::Complete,
         )
         .await?;
     let state = WyrdState::from_path_with(bundle, client.clone())?;

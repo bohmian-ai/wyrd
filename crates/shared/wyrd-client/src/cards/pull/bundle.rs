@@ -11,7 +11,7 @@ use crate::cards::{
 };
 
 use super::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+    BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
     graph::{ResolvedCard, ResolvedGraph, graph_error, validate_alias},
 };
 
@@ -23,7 +23,7 @@ pub(super) struct BundleStats {
     pub(super) downloaded_artifact_count: usize,
 }
 
-/// Paths for the stable documents belonging to one hydrated Card.
+/// Paths for the stable documents belonging to one pulled Card.
 struct CardDocumentPaths<'a> {
     /// Card envelope path.
     card: &'a Path,
@@ -32,21 +32,21 @@ struct CardDocumentPaths<'a> {
 }
 
 /// Materializes one resolved graph below an isolated staging directory.
-pub(super) struct HydrationBundleWriter<'a> {
+pub(super) struct BundleWriter<'a> {
     /// Shared authenticated clients used for artifact downloads.
     context: &'a RegistryContext,
     /// Isolated directory that receives all bundle writes.
     staging: &'a Path,
-    /// Requested artifact hydration depth.
-    mode: HydrationMode,
+    /// Requested artifact bundle mode.
+    mode: BundleMode,
 }
 
-impl<'a> HydrationBundleWriter<'a> {
+impl<'a> BundleWriter<'a> {
     /// Creates a writer for one staged graph bundle.
     pub(super) fn new(
         context: &'a RegistryContext,
         staging: &'a Path,
-        mode: HydrationMode,
+        mode: BundleMode,
     ) -> Self {
         Self {
             context,
@@ -57,7 +57,7 @@ impl<'a> HydrationBundleWriter<'a> {
 
     /// Writes every Card projection and the root metadata manifest.
     ///
-    /// Local serialization and filesystem writes are synchronous. Complete hydration awaits each
+    /// Local serialization and filesystem writes are synchronous. Complete pull awaits each
     /// authorized artifact transfer before recording its local payload path.
     ///
     /// # Errors
@@ -68,9 +68,9 @@ impl<'a> HydrationBundleWriter<'a> {
     /// # Cancellation
     ///
     /// Cancellation during artifact transfer can leave partial files inside
-    /// staging. The owning hydrator removes its unpublished staging bundle.
+    /// staging. The owning puller removes its unpublished staging bundle.
     pub(super) async fn write(&self, graph: &ResolvedGraph) -> Result<BundleStats, WyrdError> {
-        let display = matches!(self.mode, HydrationMode::Complete)
+        let display = matches!(self.mode, BundleMode::Complete)
             .then(|| Arc::new(DownloadProgressDisplay::stdout()));
         let result = async {
             let mut manifests = Vec::with_capacity(graph.cards.len());
@@ -81,9 +81,9 @@ impl<'a> HydrationBundleWriter<'a> {
                 downloaded_artifact_count += downloaded;
             }
             let artifact_count = manifests.iter().map(|card| card.artifacts.len()).sum();
-            let manifest = HydratedBundleManifest {
-                api_version: "wyrd/hydrated-bundle/v1".to_owned(),
-                hydration: self.mode,
+            let manifest = BundleManifest {
+                api_version: "wyrd/bundle/v1".to_owned(),
+                mode: self.mode,
                 root: graph.root.clone(),
                 card_count: manifests.len(),
                 artifact_count,
@@ -113,17 +113,17 @@ impl<'a> HydrationBundleWriter<'a> {
     /// # Cancellation
     ///
     /// Cancellation during artifact transfer leaves only unpublished staging
-    /// content for the owning hydrator to remove.
+    /// content for the owning puller to remove.
     async fn write_card(
         &self,
         card: &ResolvedCard,
         display: Option<&Arc<DownloadProgressDisplay>>,
-    ) -> Result<(HydratedCardManifest, usize), WyrdError> {
+    ) -> Result<(BundleCardManifest, usize), WyrdError> {
         let canonical_alias = card
             .aliases
             .iter()
             .next()
-            .ok_or_else(|| graph_error("hydrated Card has no bundle alias", &card.card_ref))?;
+            .ok_or_else(|| graph_error("pulled Card has no bundle alias", &card.card_ref))?;
         validate_alias(canonical_alias)?;
         let card_dir = self.staging.join("cards").join(canonical_alias);
         let card_path = card_dir.join("card.yaml");
@@ -141,7 +141,7 @@ impl<'a> HydrationBundleWriter<'a> {
         write_yaml(&inventory_path, &artifacts)?;
         let aliases = self.write_aliases(card, &card_path)?;
         Ok((
-            HydratedCardManifest {
+            BundleCardManifest {
                 aliases,
                 card_ref: card.card_ref.clone(),
                 card_path: relative_path(self.staging, &card_path)?,
@@ -175,7 +175,7 @@ impl<'a> HydrationBundleWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error for unsafe paths, missing Card UIDs, a missing complete-hydration
+    /// Returns an error for unsafe paths, missing Card UIDs, a missing complete-pull
     /// display, local directory failures, or failed and unverifiable artifact transfers.
     ///
     /// # Cancellation
@@ -187,15 +187,15 @@ impl<'a> HydrationBundleWriter<'a> {
         card: &ResolvedCard,
         card_dir: &Path,
         display: Option<&Arc<DownloadProgressDisplay>>,
-    ) -> Result<(Vec<HydratedArtifactManifest>, usize), WyrdError> {
+    ) -> Result<(Vec<BundleArtifactManifest>, usize), WyrdError> {
         let mut artifacts = Vec::with_capacity(card.inventory.artifacts.len());
         let mut downloaded = 0;
         for entry in &card.inventory.artifacts {
             validate_artifact_path(entry.relative_path.as_str(), &card.card_ref)?;
-            let local_path = if matches!(self.mode, HydrationMode::Complete) {
+            let local_path = if matches!(self.mode, BundleMode::Complete) {
                 let display = display.ok_or_else(|| {
                     graph_error(
-                        "complete hydration is missing its download display",
+                        "complete pull is missing its download display",
                         &card.card_ref,
                     )
                 })?;
@@ -204,7 +204,7 @@ impl<'a> HydrationBundleWriter<'a> {
                     .join(entry.relative_path.as_str());
                 if !path.starts_with(self.staging) {
                     return Err(graph_error(
-                        "artifact path escaped hydration staging",
+                        "artifact path escaped pull staging",
                         &card.card_ref,
                     ));
                 }
@@ -231,7 +231,7 @@ impl<'a> HydrationBundleWriter<'a> {
             } else {
                 None
             };
-            artifacts.push(HydratedArtifactManifest {
+            artifacts.push(BundleArtifactManifest {
                 relative_path: entry.relative_path.as_str().to_owned(),
                 sha256: entry.sha256.clone(),
                 size_bytes: entry.size_bytes,
@@ -266,7 +266,7 @@ impl<'a> HydrationBundleWriter<'a> {
     }
 }
 
-/// Serializes one bounded hydration document and writes it below staging.
+/// Serializes one bounded pull document and writes it below staging.
 ///
 /// The document passes through the JSON data model first, so an externally
 /// tagged enum such as a native Prompt's `response_type` is written as a
@@ -278,7 +278,7 @@ impl<'a> HydrationBundleWriter<'a> {
 /// directory/file operation fails.
 fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
     let parent = path.parent().ok_or_else(|| WyrdError::Internal {
-        message: "hydration output path has no parent".to_owned(),
+        message: "pull output path has no parent".to_owned(),
         details: serde_json::json!({ "path": path }),
     })?;
     fs::create_dir_all(parent)
@@ -288,7 +288,7 @@ fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
         .map_err(|error| error.to_string())
         .and_then(|value| serde_yaml::to_string(&value).map_err(|error| error.to_string()))
         .map_err(|error| WyrdError::Internal {
-            message: "failed to serialize hydrated bundle YAML".to_owned(),
+            message: "failed to serialize Card bundle YAML".to_owned(),
             details: serde_json::json!({ "path": path, "error": error }),
         })?;
     fs::write(path, yaml)
@@ -304,7 +304,7 @@ fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
 fn relative_path(root: &Path, path: &Path) -> Result<String, WyrdError> {
     path.strip_prefix(root)
         .map_err(|_| WyrdError::RegistryInvalidCardSpec {
-            message: "hydrated path escaped bundle destination".to_owned(),
+            message: "pulled path escaped bundle destination".to_owned(),
             details: serde_json::json!({ "path": path, "root": root }),
         })
         .map(|path| path.to_string_lossy().replace('\\', "/"))
@@ -330,14 +330,14 @@ fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdErro
         })
     {
         return Err(graph_error(
-            "artifact path is not confined to the hydrated bundle",
+            "artifact path is not confined to the Card bundle",
             card_ref,
         ));
     }
     Ok(())
 }
 
-/// Bundle hydration.
+/// Bundle pull.
 #[cfg(test)]
 mod tests {
     use wyrd_semver::VersionBlock;

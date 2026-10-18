@@ -1,6 +1,6 @@
 //! Public `Cards` handle and client-side selector types.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::WyrdClient;
@@ -8,8 +8,7 @@ use crate::WyrdClient;
 use futures_util::StreamExt;
 #[cfg(feature = "internal")]
 use reqwest::Method;
-use tempfile::TempDir;
-use wyrd_loader::RegistrationInput;
+use wyrd_loader::DeclarationInput;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -28,9 +27,9 @@ use crate::cards::download_progress::DownloadProgressDisplay;
 use crate::cards::engine::{RegistryContext, RegistryEngine};
 #[cfg(feature = "internal")]
 use crate::cards::error::RegistryEngineError;
-use crate::cards::progress::RegistrationProgressSink;
+use crate::cards::progress::DeclarationProgressSink;
 use crate::cards::reads;
-use crate::cards::{CardGraphHydrator, HydrationMode, HydrationSummary, RegistrationReceipt};
+use crate::cards::{CardGraphPuller, BundleMode, PullSummary, DeclarationReceipt};
 
 /// A read-time Card lookup request.
 ///
@@ -152,22 +151,11 @@ impl CardSelector {
     }
 }
 
-/// One loaded Card envelope and its managed artifact directory, when needed.
-#[derive(Debug)]
-pub struct LoadedCard {
-    /// Server-hydrated Card envelope.
-    pub card: Card,
-    /// Managed temporary directory when the caller did not provide a path.
-    pub temporary_artifact_directory: Option<TempDir>,
-    /// Caller-provided artifact destination, when one was used.
-    pub artifact_directory: Option<PathBuf>,
-}
-
 /// Cheap-to-clone, tenant-scoped Card registry handle.
 #[derive(Clone)]
 pub struct Cards {
     /// Shared registry engine that owns the authenticated transport, tenant
-    /// scope, and registration/load sagas; cloning `Cards` only bumps this
+    /// scope, and declaration saga; cloning `Cards` only bumps this
     /// `Arc`, so every clone drives the same engine state.
     pub(crate) engine: Arc<RegistryEngine>,
 }
@@ -258,31 +246,31 @@ impl Cards {
         RegistryContext::new(Arc::clone(&self.engine))
     }
 
-    /// Loads one Card document from disk and registers it through the authenticated registry.
+    /// Loads one Card document from disk and declares it through the authenticated registry.
     ///
     /// The loader resolves the document and its local source context before this method
-    /// delegates the durable write to [`Self::register`].
+    /// delegates the durable write to [`Self::declare`].
     ///
     /// # Arguments
     /// * `path` - A Card file, or a bundle directory whose Card files and
-    ///   their local sources are registered together.
+    ///   their local sources are declared together.
     ///
     /// # Errors
     ///
     /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE`, carrying the loader's per-file
     /// diagnostics, when the document cannot be loaded or converted into a
-    /// registration request (the same code `wyrd apply` reports for that tree),
-    /// or the registry's error when it rejects the registration.
-    pub async fn register_from_path(
+    /// declaration request (the same code `wyrd declare` reports for that tree),
+    /// or the registry's error when it rejects the declaration.
+    pub async fn declare_from_path(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<RegistrationReceipt, WyrdError> {
+    ) -> Result<DeclarationReceipt, WyrdError> {
         let tree = wyrd_loader::load(path.as_ref())?;
-        let input = wyrd_loader::build_registration_input(tree)?;
-        self.register(&input).await
+        let input = wyrd_loader::build_declaration_input(tree)?;
+        self.declare(&input).await
     }
 
-    /// Register a loader-produced composite input and drive its private
+    /// Declare a loader-produced composite input and drive its private
     /// artifact transfer and server-owned completion lifecycle.
     ///
     /// Native language card holders lower into this input at their language
@@ -290,21 +278,21 @@ impl Cards {
     /// saga and never enter the request body.
     ///
     /// # Arguments
-    /// * `input` - The loader-produced registration input, including local artifact sources.
+    /// * `input` - The loader-produced declaration input, including local artifact sources.
     ///
     /// # Errors
-    /// Returns a Wyrd error when validation, registration, artifact upload, or
+    /// Returns a Wyrd error when validation, declaration, artifact upload, or
     /// server-owned completion fails.
-    pub async fn register(
+    pub async fn declare(
         &self,
-        input: &RegistrationInput,
-    ) -> Result<RegistrationReceipt, WyrdError> {
-        crate::cards::saga::register(&self.engine, input, None)
+        input: &DeclarationInput,
+    ) -> Result<DeclarationReceipt, WyrdError> {
+        crate::cards::saga::declare(&self.engine, input, None)
             .await
             .map_err(Into::into)
     }
 
-    /// Register a loader-produced composite input and forward typed progress
+    /// Declare a loader-produced composite input and forward typed progress
     /// events to the caller while the saga runs.
     ///
     /// The callback may be invoked concurrently for up to four active
@@ -313,18 +301,18 @@ impl Cards {
     /// multiple asynchronous tasks.
     ///
     /// # Arguments
-    /// * `input` - The loader-produced registration input, including local artifact sources.
+    /// * `input` - The loader-produced declaration input, including local artifact sources.
     /// * `progress` - The callback that receives each typed progress event.
     ///
     /// # Errors
-    /// Returns a Wyrd error when validation, registration, artifact upload, or
+    /// Returns a Wyrd error when validation, declaration, artifact upload, or
     /// server-owned completion fails.
-    pub async fn register_with_progress(
+    pub async fn declare_with_progress(
         &self,
-        input: &RegistrationInput,
-        progress: RegistrationProgressSink,
-    ) -> Result<RegistrationReceipt, WyrdError> {
-        crate::cards::saga::register(&self.engine, input, Some(progress))
+        input: &DeclarationInput,
+        progress: DeclarationProgressSink,
+    ) -> Result<DeclarationReceipt, WyrdError> {
+        crate::cards::saga::declare(&self.engine, input, Some(progress))
             .await
             .map_err(Into::into)
     }
@@ -427,88 +415,34 @@ impl Cards {
             .map_err(Into::into)
     }
 
-    /// Download a registered Card's reachable graph as a local bundle.
+    /// Pull a declared Card's reachable graph as a local bundle.
     ///
     /// Resolves `selector`, reads every Card its relationships reach, and
-    /// publishes them under `destination` in the hydrated-bundle layout
+    /// publishes them under `destination` in the Card bundle layout
     /// [`crate::state::WyrdState::from_path`] loads. Publication is atomic:
     /// the bundle is staged beside `destination` and renamed into place, so a
-    /// failed hydration leaves any prior bundle intact.
+    /// failed pull leaves any prior bundle intact.
     ///
     /// # Arguments
     /// * `selector` - The root Card; a named selector without a version reads
     ///   the latest Active version.
     /// * `destination` - The bundle directory to publish.
-    /// * `mode` - [`HydrationMode::Complete`] also downloads and verifies every
-    ///   artifact; [`HydrationMode::MetadataOnly`] writes Card metadata only.
+    /// * `mode` - [`BundleMode::Complete`] also downloads and verifies every
+    ///   artifact; [`BundleMode::MetadataOnly`] writes Card metadata only.
     ///
     /// # Errors
     /// Returns a Wyrd error when the graph cannot be resolved, the destination
     /// is invalid, an artifact cannot be downloaded or verified, or the staged
     /// bundle cannot be published.
-    pub async fn hydrate(
+    pub async fn pull(
         &self,
         selector: CardSelector,
         destination: impl AsRef<Path>,
-        mode: HydrationMode,
-    ) -> Result<HydrationSummary, WyrdError> {
-        CardGraphHydrator::new(RegistryContext::new(Arc::clone(&self.engine)))
-            .hydrate(&selector, destination.as_ref(), mode)
+        mode: BundleMode,
+    ) -> Result<PullSummary, WyrdError> {
+        CardGraphPuller::new(RegistryContext::new(Arc::clone(&self.engine)))
+            .pull(&selector, destination.as_ref(), mode)
             .await
-    }
-
-    /// Resolve one Card and materialize its server-owned artifacts.
-    ///
-    /// The returned envelope remains server-derived. A later language adapter
-    /// can lower it into a native holder without introducing another network
-    /// or storage implementation.
-    ///
-    /// # Arguments
-    /// * `selector` - The Card to read.
-    /// * `destination` - Where its artifacts are published, or `None` for a managed temporary directory the returned value owns.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when the Card, artifact inventory, destination, or
-    /// artifact transfer cannot be loaded.
-    #[cfg(feature = "internal")]
-    pub async fn load(
-        &self,
-        selector: CardSelector,
-        destination: Option<&Path>,
-    ) -> Result<LoadedCard, WyrdError> {
-        let card = self.get(selector).await?;
-        let card_uid =
-            card.metadata
-                .uid
-                .clone()
-                .ok_or_else(|| WyrdError::RegistryInvalidCardSpec {
-                    message: "server response did not contain a card uid".to_owned(),
-                    details: serde_json::json!({}),
-                })?;
-        let temporary_directory = if destination.is_none() {
-            Some(
-                tempfile::Builder::new()
-                    .prefix("wyrd-card-")
-                    .tempdir()
-                    .map_err(RegistryEngineError::from)
-                    .map_err(WyrdError::from)?,
-            )
-        } else {
-            None
-        };
-        let artifact_path = destination
-            .or_else(|| temporary_directory.as_ref().map(TempDir::path))
-            .ok_or_else(|| WyrdError::RegistryInvalidCardSpec {
-                message: "artifact load did not produce a destination".to_owned(),
-                details: serde_json::json!({}),
-            })?;
-        self.download_artifacts_to(&card_uid, artifact_path).await?;
-
-        Ok(LoadedCard {
-            card,
-            temporary_artifact_directory: temporary_directory,
-            artifact_directory: destination.map(Path::to_path_buf),
-        })
     }
 }
 
@@ -656,7 +590,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{CardSelector, Cards};
-    use crate::cards::HydrationMode;
+    use crate::cards::BundleMode;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::verifier::DriftBaselineState;
     use wyrd_spec::envelope::{CardKind, Spec};
@@ -799,7 +733,7 @@ mod tests {
         assert!(!staging_remains);
     }
 
-    /// One registered envelope for each Card kind `cards.get` types, paired
+    /// One declared envelope for each Card kind `cards.get` types, paired
     /// with its kind so the stub server can answer the matching exact read.
     ///
     /// The Verifier carries a building Drift baseline so the status projection
@@ -982,14 +916,14 @@ mod tests {
         }
     }
 
-    /// `Cards::hydrate` publishes a registered Service's graph as a bundle
+    /// `Cards::pull` publishes a declared Service's graph as a bundle
     /// that `WyrdState::from_path` loads with the root the server returned.
     ///
     /// # Panics
-    /// Panics when hydration fails, the bundle does not load, or the loaded
-    /// root differs from the registered Card.
+    /// Panics when the pull fails, the bundle does not load, or the loaded
+    /// root differs from the declared Card.
     #[tokio::test]
-    async fn hydrate_publishes_a_bundle_the_state_loads() {
+    async fn pull_publishes_a_bundle_the_state_loads() {
         let server = MockServer::start().await;
         let uid = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00";
         Mock::given(method("POST"))
@@ -1037,13 +971,13 @@ mod tests {
             .expect("test card ref is valid");
 
         let summary = cards
-            .hydrate(
+            .pull(
                 CardSelector::exact(card_ref),
                 &destination,
-                HydrationMode::Complete,
+                BundleMode::Complete,
             )
             .await
-            .expect("the registered graph hydrates");
+            .expect("the declared graph pulls");
         let state =
             crate::state::WyrdState::from_path(&destination).expect("the published bundle loads");
 

@@ -105,7 +105,7 @@ CREATE POLICY operator_access ON platform.principal_grants TO CURRENT_USER
 --
 -- The existing UNIQUE (data_tenant_id, principal_kind, card_kind, card_uid) is
 -- retained. Postgres treats NULLs as distinct there, so Card-free principals do
--- not collide with each other while `wyrd apply` re-application still resolves a
+-- not collide with each other while `wyrd declare` re-declaration still resolves a
 -- Card-bound principal to the same row.
 -- `space` and `version` are projections of the bound Card, so they travel with
 -- it rather than being invented for a principal that has none.

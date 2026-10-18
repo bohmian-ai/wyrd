@@ -93,11 +93,11 @@ impl Registry {
     /// its artifact manifest cannot be constructed.
     pub fn plan(
         &self,
-        input: &RegistrationInput,
-    ) -> Result<PreparedRegistration, RegistryError> {
+        input: &DeclarationInput,
+    ) -> Result<PreparedDeclaration, RegistryError> {
         self.policy.validate(input)?;
         let manifest = validate_manifest(input)?;
-        Ok(PreparedRegistration::new(input, manifest))
+        Ok(PreparedDeclaration::new(input, manifest))
     }
 
     /// Plans, uploads, and commits one registration through remote IO.
@@ -116,8 +116,8 @@ impl Registry {
     /// before commit returns. The server-side idempotency key makes retry safe.
     pub async fn register(
         &self,
-        input: &RegistrationInput,
-    ) -> Result<RegistrationReceipt, RegistryError> {
+        input: &DeclarationInput,
+    ) -> Result<DeclarationReceipt, RegistryError> {
         let prepared = self.plan(input)?;
         self.upload_and_commit(&prepared).await
     }
@@ -137,8 +137,8 @@ impl Registry {
     /// registration is safe because it retains the same idempotency key.
     async fn upload_and_commit(
         &self,
-        prepared: &PreparedRegistration,
-    ) -> Result<RegistrationReceipt, RegistryError> {
+        prepared: &PreparedDeclaration,
+    ) -> Result<DeclarationReceipt, RegistryError> {
         self.storage.upload(prepared).await?;
         self.client.commit(prepared).await
     }
@@ -152,7 +152,7 @@ impl Registry {
 /// # Errors
 ///
 /// Returns `RegistryError` when an artifact path or digest is invalid.
-fn validate_manifest(input: &RegistrationInput) -> Result<Manifest, RegistryError> {
+fn validate_manifest(input: &DeclarationInput) -> Result<Manifest, RegistryError> {
     Manifest::try_from(input)
 }
 ```
@@ -174,8 +174,8 @@ Reject functional dependency threading:
 pub async fn register(
     client: &WyrdClient,
     storage: &StorageClient,
-    input: &RegistrationInput,
-) -> Result<RegistrationReceipt, RegistryError> {
+    input: &DeclarationInput,
+) -> Result<DeclarationReceipt, RegistryError> {
     upload(client, storage, input).await?;
     commit(client, input).await
 }

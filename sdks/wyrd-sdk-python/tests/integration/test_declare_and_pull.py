@@ -17,8 +17,8 @@ from .support import FIXTURES, download, hydrated, register
 
 pytestmark = pytest.mark.integration
 
-SUPPORT_MODEL = "cards/register_and_hydrate/support-model.yaml"
-SUPPORT_DESK = "cards/register_and_hydrate/support-desk.yaml"
+SUPPORT_MODEL = "cards/declare_and_pull/support-model.yaml"
+SUPPORT_DESK = "cards/declare_and_pull/support-desk.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +54,7 @@ def test_latest_version_resolves_to_the_registered_card(
 def test_registering_the_graph_again_is_idempotent(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
-    again = cards.register_from_path(FIXTURES / SUPPORT_DESK)
+    again = cards.declare_from_path(FIXTURES / SUPPORT_DESK)
 
     assert again.root == support_desk["support-desk"]
     status = cards.get(again.root).status
@@ -115,13 +115,13 @@ def test_artifact_without_digest_registers(cards: Cards, support_desk: dict[str,
 
 def test_wrong_artifact_digest_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as refused:
-        cards.register_from_path(FIXTURES / "invalid/wrong-artifact-digest/support-model.yaml")
+        cards.declare_from_path(FIXTURES / "invalid/wrong-artifact-digest/support-model.yaml")
     assert refused.value.code == "WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH"
 
 
 def test_retired_card_kind_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as refused:
-        cards.register_from_path(FIXTURES / "invalid/retired-drift-kind.yaml")
+        cards.declare_from_path(FIXTURES / "invalid/retired-drift-kind.yaml")
     assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
@@ -129,7 +129,7 @@ def test_viewer_cannot_register_cards(viewer_key: str) -> None:
     reader = Cards(WyrdClient(credential=viewer_key))
 
     with pytest.raises(WyrdError) as refused:
-        reader.register_from_path(FIXTURES / SUPPORT_DESK)
+        reader.declare_from_path(FIXTURES / SUPPORT_DESK)
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
 
@@ -239,7 +239,7 @@ NATIVE_SPEC = {
 
 def test_prompt_forms_round_trip_as_authored(cards: Cards, tmp_path: Path) -> None:
     """Portable and native Prompts, standalone and inline, read and hydrate as authored with one hash."""
-    registered = register(cards, "cards/register_and_hydrate/authored-prompts.yaml")
+    registered = register(cards, "cards/declare_and_pull/authored-prompts.yaml")
     state = WyrdState.from_path(download(cards, "authored-prompts", tmp_path))
     answer = PORTABLE_SPEC["response_format"]
 

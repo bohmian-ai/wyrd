@@ -62,7 +62,7 @@ fixtures.
    `tuned/gemini-2.5-pro`, `jev-judge`).
 
    ```bash
-   wyrd apply agents/service.yaml
+   wyrd declare agents/service.yaml
    wyrd get --kind Service --name gateway-agents --version 1.0.0 --space default \
      --output-dir gateway-agents
    ```

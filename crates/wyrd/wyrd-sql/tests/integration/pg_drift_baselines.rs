@@ -16,12 +16,12 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
+    NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
 };
 use wyrd_sql::queries::drift_baselines::{ClaimedBaseline, DriftBaselineQueue};
 use wyrd_sql::queries::verifier_executions::{RetryOutcome, Settlement};
@@ -52,11 +52,11 @@ async fn insert_card(
     name: &str,
     spec: Value,
 ) -> CardUid {
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let key = Uuid::now_v7().to_string();
-    insert_registration_operation(
+    insert_declaration_operation(
         conn,
-        NewRegistrationOperation {
+        NewDeclarationOperation {
             operation_id,
             attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,

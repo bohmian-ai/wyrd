@@ -167,12 +167,12 @@ mod pg_tests {
         std::fs::create_dir_all(&root)?;
         std::fs::write(root.join("verifier.yaml"), VERIFIER)?;
         std::fs::write(root.join("service.yaml"), SERVICE)?;
-        let verifier = Box::pin(cards.register_from_path(&root.join("verifier.yaml"))).await?;
-        let receipt = Box::pin(cards.register_from_path(&root.join("service.yaml"))).await?;
+        let verifier = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
+        let receipt = Box::pin(cards.declare_from_path(&root.join("service.yaml"))).await?;
         std::fs::remove_dir_all(&root)?;
-        let assertion = Box::pin(cards.register_from_path(Path::new(concat!(
+        let assertion = Box::pin(cards.declare_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/register_and_hydrate/no-refund-promise.yaml"
+            "/../../../fixtures/cards/declare_and_pull/no-refund-promise.yaml"
         ))))
         .await?;
         let uid = |root: &CardRef| -> Result<String, McpJourneyError> {
@@ -223,17 +223,17 @@ mod pg_tests {
             ));
 
             Box::pin(
-                cards.register_from_path(&fixtures.join("register_and_hydrate/support-model.yaml")),
+                cards.declare_from_path(&fixtures.join("declare_and_pull/support-model.yaml")),
             )
             .await?;
             let desk = Box::pin(
-                cards.register_from_path(&fixtures.join("register_and_hydrate/support-desk.yaml")),
+                cards.declare_from_path(&fixtures.join("declare_and_pull/support-desk.yaml")),
             )
             .await?;
-            Box::pin(cards.register_from_path(&fixtures.join("observe_a_run/observed-model.yaml")))
+            Box::pin(cards.declare_from_path(&fixtures.join("observe_a_run/observed-model.yaml")))
                 .await?;
             Box::pin(
-                cards.register_from_path(&fixtures.join("observe_a_run/observed-service.yaml")),
+                cards.declare_from_path(&fixtures.join("observe_a_run/observed-service.yaml")),
             )
             .await?;
 
@@ -1036,7 +1036,7 @@ mod pg_tests {
             .await?;
         let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
         let fixture = register_fixture(&cards).await?;
-        let judged = Box::pin(cards.register_from_path(Path::new(concat!(
+        let judged = Box::pin(cards.declare_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards/verify_in_real_time/answer-judged.yaml"
         ))))

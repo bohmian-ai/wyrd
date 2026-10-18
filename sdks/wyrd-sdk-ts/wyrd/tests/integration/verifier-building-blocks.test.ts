@@ -166,7 +166,7 @@ function step(result: VerificationResult, id: string): CardTypes.StepResult {
   return found;
 }
 
-/** The registered `policy-desk` Service, its hydrated bundle, its own client, and its hydrated state with Bifrost started. */
+/** The registered `policy-desk` Service, its Card bundle, its own client, and its hydrated state with Bifrost started. */
 interface PolicyDesk {
   readonly bundle: string;
   readonly root: RegisteredRef;
@@ -185,7 +185,7 @@ const test = serverTest({ provider: upstream, verificationRuntime: true, perTest
   desk: async ({ server: _ }, use) => {
     await configureGateway(WyrdClient.connect());
     const cards = await Cards.connect();
-    const receipt = await cards.registerFromPath(fixture("cards/verifier_building_blocks/policy-desk.yaml"));
+    const receipt = await cards.declareFromPath(fixture("cards/verifier_building_blocks/policy-desk.yaml"));
     const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-policy-desk-"));
     await cards.hydrate(receipt.root, bundle);
     const root = registered(receipt);

@@ -1,12 +1,12 @@
-//! Pure wire projections for an offline hydrated Card bundle.
+//! Pure wire projections for an offline Card bundle.
 
 use serde::{Deserialize, Serialize};
 
 use crate::reference::CardRef;
 
-/// Hydration depth recorded in a published local Card bundle.
+/// Bundle mode recorded in a published local Card bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HydrationMode {
+pub enum BundleMode {
     /// Persist Card metadata and artifact inventories without payload bytes.
     #[serde(rename = "metadata")]
     MetadataOnly,
@@ -15,9 +15,9 @@ pub enum HydrationMode {
     Complete,
 }
 
-/// Renders hydration modes using their stable manifest values.
-impl std::fmt::Display for HydrationMode {
-    /// Format the stable hydration mode stored in the bundle manifest.
+/// Renders bundle modes using their stable manifest values.
+impl std::fmt::Display for BundleMode {
+    /// Format the stable bundle mode stored in the bundle manifest.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::MetadataOnly => "metadata",
@@ -26,18 +26,18 @@ impl std::fmt::Display for HydrationMode {
     }
 }
 
-/// Stable metadata written to `metadata.yaml` at a hydrated bundle root.
+/// Stable metadata written to `metadata.yaml` at a Card bundle root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydratedBundleManifest {
+pub struct BundleManifest {
     /// Bundle format version.
     #[serde(rename = "apiVersion")]
     pub api_version: String,
-    /// Hydration depth used to create the bundle.
-    pub hydration: HydrationMode,
+    /// Bundle mode used to create the bundle.
+    pub mode: BundleMode,
     /// Exact resolved root reference.
     pub root: CardRef,
     /// Per-Card local projections.
-    pub cards: Vec<HydratedCardManifest>,
+    pub cards: Vec<BundleCardManifest>,
     /// Number of unique Cards in the bundle.
     pub card_count: usize,
     /// Number of artifact inventory entries.
@@ -46,9 +46,9 @@ pub struct HydratedBundleManifest {
     pub downloaded_artifact_count: usize,
 }
 
-/// One Card's stable hydrated-bundle projection.
+/// One Card's stable Card bundle projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydratedCardManifest {
+pub struct BundleCardManifest {
     /// Every user-facing alias resolving to this exact Card.
     pub aliases: Vec<String>,
     /// Exact resolved Card reference.
@@ -60,12 +60,12 @@ pub struct HydratedCardManifest {
     /// Relative path to the artifact inventory.
     pub artifact_inventory_path: String,
     /// Artifact inventory and local payload projections.
-    pub artifacts: Vec<HydratedArtifactManifest>,
+    pub artifacts: Vec<BundleArtifactManifest>,
 }
 
-/// One artifact inventory entry in a hydrated bundle.
+/// One artifact inventory entry in a Card bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydratedArtifactManifest {
+pub struct BundleArtifactManifest {
     /// Relative server-owned artifact path.
     pub relative_path: String,
     /// Base64-encoded SHA-256 supplied by the server.
@@ -74,11 +74,11 @@ pub struct HydratedArtifactManifest {
     pub size_bytes: i64,
     /// Optional MIME type.
     pub content_type: Option<String>,
-    /// Relative local payload path when complete hydration downloaded the file.
+    /// Relative local payload path when complete pull downloaded the file.
     pub local_path: Option<String>,
 }
 
-/// Wire-compatibility fixtures for hydrated bundle projections.
+/// Wire-compatibility fixtures for Card bundle projections.
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -89,7 +89,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
 
     use super::{
-        HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+        BundleArtifactManifest, BundleManifest, BundleCardManifest, BundleMode,
     };
 
     /// Build the exact Service identity shared by the manifest root and Card projection.
@@ -108,21 +108,21 @@ mod tests {
         }
     }
 
-    /// Hydrated bundle DTO ownership preserves every field and its canonical JSON bytes.
+    /// Card bundle DTO ownership preserves every field and its canonical JSON bytes.
     #[test]
-    fn hydrated_bundle_manifest_preserves_wire_bytes() {
+    fn bundle_manifest_preserves_wire_bytes() {
         let card_ref = service_ref();
-        let manifest = HydratedBundleManifest {
-            api_version: "wyrd/hydrated-bundle/v1".to_owned(),
-            hydration: HydrationMode::Complete,
+        let manifest = BundleManifest {
+            api_version: "wyrd/bundle/v1".to_owned(),
+            mode: BundleMode::Complete,
             root: card_ref.clone(),
-            cards: vec![HydratedCardManifest {
+            cards: vec![BundleCardManifest {
                 aliases: vec!["root".to_owned()],
                 card_ref,
                 card_path: "cards/service/card.yaml".to_owned(),
                 relationships_path: "cards/service/relationships.yaml".to_owned(),
                 artifact_inventory_path: "cards/service/artifacts.yaml".to_owned(),
-                artifacts: vec![HydratedArtifactManifest {
+                artifacts: vec![BundleArtifactManifest {
                     relative_path: "model.joblib".to_owned(),
                     sha256: "YWJj".to_owned(),
                     size_bytes: 3,
@@ -135,13 +135,13 @@ mod tests {
             downloaded_artifact_count: 1,
         };
 
-        let bytes = serde_json::to_vec(&manifest).expect("hydrated manifest serializes");
+        let bytes = serde_json::to_vec(&manifest).expect("bundle manifest serializes");
         assert_eq!(
             bytes,
-            br#"{"apiVersion":"wyrd/hydrated-bundle/v1","hydration":"complete","root":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"cards":[{"aliases":["root"],"card_ref":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"card_path":"cards/service/card.yaml","relationships_path":"cards/service/relationships.yaml","artifact_inventory_path":"cards/service/artifacts.yaml","artifacts":[{"relative_path":"model.joblib","sha256":"YWJj","size_bytes":3,"content_type":"application/octet-stream","local_path":"cards/service/artifacts/model.joblib"}]}],"card_count":1,"artifact_count":1,"downloaded_artifact_count":1}"#
+            br#"{"apiVersion":"wyrd/bundle/v1","mode":"complete","root":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"cards":[{"aliases":["root"],"card_ref":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"card_path":"cards/service/card.yaml","relationships_path":"cards/service/relationships.yaml","artifact_inventory_path":"cards/service/artifacts.yaml","artifacts":[{"relative_path":"model.joblib","sha256":"YWJj","size_bytes":3,"content_type":"application/octet-stream","local_path":"cards/service/artifacts/model.joblib"}]}],"card_count":1,"artifact_count":1,"downloaded_artifact_count":1}"#
         );
-        let round_trip: HydratedBundleManifest =
-            serde_json::from_slice(&bytes).expect("hydrated manifest deserializes");
+        let round_trip: BundleManifest =
+            serde_json::from_slice(&bytes).expect("bundle manifest deserializes");
         assert_eq!(round_trip, manifest);
     }
 }

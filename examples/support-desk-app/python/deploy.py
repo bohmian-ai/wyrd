@@ -21,7 +21,7 @@ from desk import BUNDLE, SERVICE
 def deploy(client: WyrdClient | None = None) -> None:
     # ANCHOR: deploy
     cards = Cards(client)
-    receipt = cards.register_from_path(SERVICE / "support-desk.yaml")
+    receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
     shutil.rmtree(BUNDLE, ignore_errors=True)
     cards.hydrate(receipt.root, BUNDLE)
     Gateway(client).put_capture_policy({"mode": "metadata", "payload_fields": []})

@@ -5,7 +5,7 @@ use wyrd_client::cards::Cards;
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::envelope::CardKind;
 
-use super::{PyRegistrationReceipt, register_python_card};
+use super::{PyDeclarationReceipt, register_python_card};
 
 /// Owns the authenticated context for one Python registration operation.
 pub(super) struct PythonCardRegistry<'a> {
@@ -36,7 +36,7 @@ impl<'a> PythonCardRegistry<'a> {
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         register_python_card(py, self.registry, card, version_bump, save_args, None)
     }
 
@@ -52,7 +52,7 @@ impl<'a> PythonCardRegistry<'a> {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
         kind: &CardKind,
-    ) -> CardPyResult<PyRegistrationReceipt> {
+    ) -> CardPyResult<PyDeclarationReceipt> {
         register_python_card(py, self.registry, card, version_bump, save_args, Some(kind))
     }
 }

@@ -1,7 +1,7 @@
 //! Staged-contract gate for the committed fixture Verifier Cards.
 //!
 //! The shared Card loader still decodes Verifiers through the pre-blocks
-//! contract until its cutover, so `wyrd plan` cannot yet prove the journey
+//! contract until its cutover, so `wyrd declare --check` cannot yet prove the journey
 //! fixtures. This test decodes every fixture Verifier into
 //! [`blocks::VerifierSpec`], validates it with every path-referenced Agent and
 //! Prompt resolved from disk, and validates each schedule binding's `inputs`

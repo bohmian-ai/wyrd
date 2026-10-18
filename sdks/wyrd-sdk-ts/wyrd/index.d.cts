@@ -260,7 +260,7 @@ export declare class NativeCards {
    * Returns a napi error only when the receipt cannot be serialized; load,
    * validation, and registry failures are returned in the result.
    */
-  registerFromPath(path: string): Promise<NativeLifecycleResult>
+  declareFromPath(path: string): Promise<NativeLifecycleResult>
   /**
    * Fetches one Card envelope by exact reference.
    *
@@ -708,7 +708,7 @@ export declare class NativeWyrdClient {
    */
   cards(): Promise<NativeCardsConnection>
   /**
-   * Loads and validates one hydrated bundle whose server calls run as this
+   * Loads and validates one Card bundle whose server calls run as this
    * client.
    *
    * The state's identity is fixed here: Bifrost startup and every verify
@@ -716,7 +716,7 @@ export declare class NativeWyrdClient {
    *
    * # Arguments
    *
-   * * `path` - The hydrated bundle directory.
+   * * `path` - The Card bundle directory.
    */
   openWyrdState(path: string): NativeWyrdState
   /** Returns the effective HTTP server URL this client sends requests to. */
@@ -827,7 +827,7 @@ export declare class NativeWyrdClient {
 }
 
 /**
- * Offline hydrated-bundle view over the shared `wyrd_client` `WyrdState`.
+ * Offline Card bundle view over the shared `wyrd_client` `WyrdState`.
  *
  * The open result is retained so an invalid bundle surfaces its catalog error
  * on the first read instead of as an untyped constructor failure.
@@ -1257,7 +1257,7 @@ export interface NativeWyrdError {
 }
 
 /**
- * Loads and validates one hydrated bundle without contacting Wyrd.
+ * Loads and validates one Card bundle without contacting Wyrd.
  *
  * The state resolves the ambient client once, at its first server call, and
  * keeps it; [`NativeWyrdClient::open_wyrd_state`] fixes the client instead.

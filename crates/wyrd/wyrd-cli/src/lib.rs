@@ -21,7 +21,7 @@ mod operator_connection;
 mod platform;
 mod principal;
 pub mod query;
-pub mod registration;
+pub mod declaration;
 /// `wyrd server`: verified installation of official server releases.
 pub mod server;
 #[cfg(unix)]
@@ -42,7 +42,9 @@ pub use cli::{Cli, Command};
 /// does. No credential is ever a string argument.
 pub mod commands {
     pub use crate::auth::issue_key::issue_key;
-    pub use crate::card::{LoadOutput, PlanCard, PlanReport, SelectorArgs, apply, get, load, plan};
+    pub use crate::card::{
+        CheckCard, CheckReport, SelectorArgs, declare, declare_check, get, pull,
+    };
     pub use crate::gateway::{
         delete_provider_credential, put_provider_credential, revoke_provider_credential,
     };
@@ -52,8 +54,8 @@ pub mod commands {
 
 // Re-export the public loader API
 pub use load::{
-    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, RegistrationInput,
-    Severity, SourceSpan, build_registration_input, build_submissions, emit_json, load,
+    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, DeclarationInput,
+    Severity, SourceSpan, build_declaration_input, build_submissions, emit_json, load,
 };
 
 /// Parse and run the CLI using the same dispatcher and error formatter as the

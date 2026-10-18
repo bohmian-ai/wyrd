@@ -173,7 +173,7 @@ class CardRef:
 
     A reference identifies a kind, space, name, and version. A server-assigned
     `uid` is present after registration. Use a `CardRef` from `CardSummary` or
-    `RegistrationReceipt` when you need to pass an exact identity between
+    `DeclarationReceipt` when you need to pass an exact identity between
     operations.
     """
 
@@ -461,7 +461,7 @@ class Cards:
         card: RegisterableCard,
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | ModelSaveArgs | None = ...,
-    ) -> RegistrationReceipt:
+    ) -> DeclarationReceipt:
         """Register a caller-owned Card and stamp its resolved identity.
 
         Registration serializes the complete Card envelope, saves DataCard or
@@ -507,7 +507,7 @@ class Cards:
         """
         ...
 
-    def register_from_path(self, path: str | PathLike[str]) -> RegistrationReceipt:
+    def declare_from_path(self, path: str | PathLike[str]) -> DeclarationReceipt:
         """Register a declarative Card from a Card file or a bundle directory.
 
         This is the file-based registration path. For Python-authored
@@ -631,7 +631,7 @@ class Cards:
         card_ref: CardRef,
         destination: str | PathLike[str],
         metadata_only: bool = False,
-    ) -> HydrationSummary:
+    ) -> PullSummary:
         """Download a registered Card's reachable graph as a local bundle.
 
         The bundle is published atomically under `destination`, ready for
@@ -653,7 +653,7 @@ class Cards:
         """
         ...
 
-class HydrationSummary:
+class PullSummary:
     """Result of one published ``Cards.hydrate``."""
 
     @property
@@ -699,7 +699,7 @@ class DataCardRegistry:
         card: DataCard[Any],
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | None = ...,
-    ) -> RegistrationReceipt:
+    ) -> DeclarationReceipt:
         """Register a `DataCard` and upload its saved data artifacts.
 
         As ``Cards.register()``, restricted to `DataCard`. `save_args` is
@@ -889,7 +889,7 @@ class ModelCardRegistry:
         card: ModelCard[Any],
         version_bump: VersionBump = ...,
         save_args: ModelSaveArgs | None = ...,
-    ) -> RegistrationReceipt:
+    ) -> DeclarationReceipt:
         """Register a `ModelCard` and upload its saved model artifacts.
 
         As ``Cards.register()``, restricted to `ModelCard`. `save_args` is
@@ -1060,7 +1060,7 @@ class PromptCardRegistry:
         self,
         card: PromptCard,
         version_bump: VersionBump = ...,
-    ) -> RegistrationReceipt:
+    ) -> DeclarationReceipt:
         """Register a `PromptCard` and update its server identity.
 
         As ``Cards.register()``, restricted to `PromptCard`.
@@ -1233,7 +1233,7 @@ class CardList:
     refs: list[CardRef]
     next_cursor: str | None
 
-class RegistrationOutcome:
+class DeclarationOutcome:
     """Server-derived result for one registered Card.
 
     The outcome includes the exact reference and hashes that the server
@@ -1241,7 +1241,7 @@ class RegistrationOutcome:
 
     Attributes:
         status: the Card's lifecycle status, as in `CardSummary.status`.
-        outcome: ``"registered"`` for a new version, ``"deduplicated"`` when
+        outcome: ``"declared"`` for a new version, ``"deduplicated"`` when
             an Active Card with identical content already existed and was
             reused, or ``"idempotent_noop"`` when the same exact version was
             already registered with identical content.
@@ -1256,7 +1256,7 @@ class RegistrationOutcome:
     outcome: str
     card_blob_uri: str | None
 
-class RegistrationReceipt:
+class DeclarationReceipt:
     """Result returned after registration and artifact completion succeed."""
 
     @property
@@ -1264,7 +1264,7 @@ class RegistrationReceipt:
         """The server-resolved reference of the Card you registered."""
         ...
     @property
-    def outcomes(self) -> list[RegistrationOutcome]:
+    def outcomes(self) -> list[DeclarationOutcome]:
         """One outcome per Card in the registration, root included, dependencies first."""
         ...
 
@@ -1284,7 +1284,7 @@ __all__ = [
     "PromptCardRegistry",
     "CardSummary",
     "CardList",
-    "RegistrationOutcome",
-    "RegistrationReceipt",
-    "HydrationSummary",
+    "DeclarationOutcome",
+    "DeclarationReceipt",
+    "PullSummary",
 ]

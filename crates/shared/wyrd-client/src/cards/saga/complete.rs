@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::WyrdClient;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::registry::CreateCardResponse;
+use wyrd_spec::registry::DeclareCardResponse;
 
 use crate::cards::error::RegistryEngineError;
 
@@ -17,7 +17,7 @@ use crate::cards::error::RegistryEngineError;
 ///
 /// Cards are completed sequentially in upload-plan order under the saga's one
 /// idempotency key, and each server outcome is validated before it replaces
-/// the matching registration outcome.
+/// the matching declaration outcome.
 ///
 /// # Errors
 ///
@@ -33,9 +33,9 @@ use crate::cards::error::RegistryEngineError;
 /// carries the saga's idempotency key, so a retry is keyed to the same saga.
 pub(crate) async fn complete_uploaded_cards(
     client: &WyrdClient,
-    response: &CreateCardResponse,
+    response: &DeclareCardResponse,
     idempotency_key: &str,
-) -> Result<CreateCardResponse, RegistryEngineError> {
+) -> Result<DeclareCardResponse, RegistryEngineError> {
     let card_uids = collect_uploaded_card_uids(response)?;
     let mut completed = response.clone();
     for uid in card_uids {
@@ -52,7 +52,7 @@ pub(crate) async fn complete_uploaded_cards(
 ///
 /// Returns `RegistryInvalidCardSpec` when a plan's Card reference has no UID.
 fn collect_uploaded_card_uids(
-    response: &CreateCardResponse,
+    response: &DeclareCardResponse,
 ) -> Result<Vec<CardUid>, RegistryEngineError> {
     let mut seen = BTreeSet::new();
     let mut uids = Vec::with_capacity(response.upload_plans.len());
@@ -87,7 +87,7 @@ async fn complete_uploaded_card(
     client: &WyrdClient,
     uid: &CardUid,
     idempotency_key: &str,
-) -> Result<CreateCardResponse, RegistryEngineError> {
+) -> Result<DeclareCardResponse, RegistryEngineError> {
     let path = format!("/v1/cards/{uid}/complete");
     client
         .http
@@ -104,9 +104,9 @@ async fn complete_uploaded_card(
 /// Returns `RegistryArtifactVerifyFailed` unless the response holds exactly
 /// one outcome and it carries `uid`.
 fn validate_completion_response(
-    original: &CreateCardResponse,
+    original: &DeclareCardResponse,
     uid: &CardUid,
-    completed: &CreateCardResponse,
+    completed: &DeclareCardResponse,
 ) -> Result<(), RegistryEngineError> {
     let matching = completed
         .outcomes
@@ -136,8 +136,8 @@ fn validate_completion_response(
 /// Returns `RegistryArtifactVerifyFailed` when `completed` has no outcome or
 /// its outcome matches no Card in `response`; `response` is unchanged then.
 fn merge_completed_outcome(
-    response: &mut CreateCardResponse,
-    completed: CreateCardResponse,
+    response: &mut DeclareCardResponse,
+    completed: DeclareCardResponse,
 ) -> Result<(), RegistryEngineError> {
     let outcome = completed.outcomes.into_iter().next().ok_or_else(|| {
         WyrdError::RegistryArtifactVerifyFailed {
@@ -166,9 +166,9 @@ mod tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_spec::registry::CreateCardResponse;
+    use wyrd_spec::registry::DeclareCardResponse;
     use wyrd_spec::registry::{
-        CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind,
+        CardLifecycleStatus, CardDeclarationOutcome, DeclarationOutcomeKind,
     };
 
     /// Merging keeps the composite root and the server outcome order.
@@ -183,30 +183,30 @@ mod tests {
             space: Some(SpaceName::new("default").expect("test space")),
             uid: Some(uid),
         };
-        let first = CardRegistrationOutcome {
+        let first = CardDeclarationOutcome {
             card_ref: card_ref(first_uid, "first"),
             spec_hash: "first".to_owned(),
             artifact_hash: None,
             status: CardLifecycleStatus::Pending,
-            outcome: RegistrationOutcomeKind::Registered,
+            outcome: DeclarationOutcomeKind::Declared,
             card_blob_uri: None,
         };
-        let second = CardRegistrationOutcome {
+        let second = CardDeclarationOutcome {
             card_ref: card_ref(second_uid, "second"),
             spec_hash: "second".to_owned(),
             artifact_hash: None,
             status: CardLifecycleStatus::Pending,
-            outcome: RegistrationOutcomeKind::Registered,
+            outcome: DeclarationOutcomeKind::Declared,
             card_blob_uri: None,
         };
-        let mut response = CreateCardResponse {
+        let mut response = DeclareCardResponse {
             root: first.card_ref.clone(),
             outcomes: vec![first, second.clone()],
             upload_plans: Vec::new(),
         };
-        let completed = CreateCardResponse {
+        let completed = DeclareCardResponse {
             root: second.card_ref.clone(),
-            outcomes: vec![CardRegistrationOutcome {
+            outcomes: vec![CardDeclarationOutcome {
                 status: CardLifecycleStatus::Active,
                 ..second
             }],
@@ -231,7 +231,7 @@ mod tests {
             space: Some(SpaceName::new("default").expect("test space")),
             uid: Some(uid.clone()),
         };
-        let response = CreateCardResponse {
+        let response = DeclareCardResponse {
             root: card_ref,
             outcomes: Vec::new(),
             upload_plans: Vec::new(),
@@ -247,7 +247,7 @@ mod tests {
     fn rejects_duplicate_or_unrelated_completion_outcomes() {
         let requested = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
         let unrelated = CardUid::new("018f0000-0000-7000-8000-000000000002").expect("test UID");
-        let response = |uid: CardUid, name: &str| CardRegistrationOutcome {
+        let response = |uid: CardUid, name: &str| CardDeclarationOutcome {
             card_ref: CardRef {
                 kind: CardKind::Prompt,
                 name: CardName::new(name).expect("test name"),
@@ -258,10 +258,10 @@ mod tests {
             spec_hash: "sha256:spec".to_owned(),
             artifact_hash: None,
             status: CardLifecycleStatus::Active,
-            outcome: RegistrationOutcomeKind::Registered,
+            outcome: DeclarationOutcomeKind::Declared,
             card_blob_uri: Some("wyrd://blob".parse().expect("test blob URI")),
         };
-        let duplicate = CreateCardResponse {
+        let duplicate = DeclareCardResponse {
             root: response(requested.clone(), "requested").card_ref,
             outcomes: vec![
                 response(requested.clone(), "requested"),
@@ -271,7 +271,7 @@ mod tests {
         };
         assert!(validate_completion_response(&duplicate, &requested, &duplicate).is_err());
 
-        let unrelated_response = CreateCardResponse {
+        let unrelated_response = DeclareCardResponse {
             root: response(unrelated.clone(), "unrelated").card_ref,
             outcomes: vec![response(unrelated, "unrelated")],
             upload_plans: Vec::new(),

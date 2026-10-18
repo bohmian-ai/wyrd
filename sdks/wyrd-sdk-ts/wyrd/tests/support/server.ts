@@ -7,7 +7,7 @@ import {
   Bifrost,
   type CardRef,
   type Cards,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   type SpanRecord,
   verify,
   type VerificationResult,
@@ -61,7 +61,7 @@ export type RegisteredRef = CardRef & { readonly uid: string };
  * default. Throws when the receipt registered no such Card, so a story never
  * proceeds with a missing reference.
  */
-export function registered(receipt: RegistrationReceipt, name: string = receipt.root.name): RegisteredRef {
+export function registered(receipt: DeclarationReceipt, name: string = receipt.root.name): RegisteredRef {
   const ref = receipt.outcomes.find((outcome) => outcome.card_ref.name === name)?.card_ref;
   if (!ref?.uid) {
     throw new Error(`the receipt registered no Card named ${name}`);

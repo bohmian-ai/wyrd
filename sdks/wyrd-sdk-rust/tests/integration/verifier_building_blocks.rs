@@ -39,7 +39,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, fixture, hydrate, register};
+use crate::support::{Deployment, fixture, pull, declare};
 
 /// How long a test waits for a queued execution.
 const WAIT: Duration = Duration::from_secs(90);
@@ -241,7 +241,7 @@ struct PolicyDesk {
     deployment: Deployment,
     /// The local model upstream.
     upstream: MockServer,
-    /// The hydrated bundle, which every state loads from.
+    /// The Card bundle, which every state loads from.
     bundle: TempDir,
     /// The registered `policy-desk` Service.
     root: CardRef,
@@ -309,8 +309,8 @@ impl PolicyDesk {
         .await;
         configure_gateway(&deployment.admin()).await;
         let cards = deployment.cards().await;
-        let desk = register(&cards, "cards/verifier_building_blocks/policy-desk.yaml").await;
-        let bundle = hydrate(&cards, &desk.root).await;
+        let desk = declare(&cards, "cards/verifier_building_blocks/policy-desk.yaml").await;
+        let bundle = pull(&cards, &desk.root).await;
         let client = deployment.client(&deployment.service_key(&desk.root).await);
         let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
             .expect("bundle loads offline");

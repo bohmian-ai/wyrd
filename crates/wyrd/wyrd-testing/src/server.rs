@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -132,7 +132,8 @@ const READ_DECISION: &str = "bifrost.query.read_decision";
 /// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
-/// Renders one retained audit cell as text: a text column as its value and the
+/// Renders one retained audit cell as text: a text column (`Utf8`, or the
+/// `Utf8View` a SQL `CAST(... AS VARCHAR)` plans as) as its value and the
 /// Variant `detail` column as its JSON text, so assertions parse it like any
 /// other JSON. A null cell is `None`.
 ///
@@ -144,6 +145,9 @@ fn audit_cell_text(column: &dyn Array, row: usize) -> Result<Option<String>, Wyr
         return Ok(None);
     }
     if let Some(text) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(text.value(row).to_owned()));
+    }
+    if let Some(text) = column.as_any().downcast_ref::<StringViewArray>() {
         return Ok(Some(text.value(row).to_owned()));
     }
     if column.data_type() != &variant_storage_type() {
@@ -5904,6 +5908,36 @@ mod teardown_tests {
             aborted.load(Ordering::SeqCst),
             "the stalled serve task must be aborted and joined before shutdown returns"
         );
+    }
+}
+
+/// Proves the retained-record cell decoder reads every text layout a query
+/// plans.
+#[cfg(test)]
+mod cell_tests {
+    use arrow::array::{StringArray, StringViewArray};
+
+    use super::audit_cell_text;
+
+    /// A `Utf8` column and the `Utf8View` column a SQL `CAST(... AS VARCHAR)`
+    /// plans as both decode to their text, and a null cell to `None`.
+    ///
+    /// # Panics
+    /// Panics when either layout is rejected or decodes to other text.
+    #[test]
+    fn text_cells_decode_from_both_string_layouts() {
+        let plain = StringArray::from(vec![Some("plain"), None]);
+        let view = StringViewArray::from(vec![Some("view"), None]);
+        for (column, text) in [
+            (&plain as &dyn arrow::array::Array, "plain"),
+            (&view, "view"),
+        ] {
+            assert_eq!(
+                audit_cell_text(column, 0).expect("text decodes"),
+                Some(text.to_owned())
+            );
+            assert_eq!(audit_cell_text(column, 1).expect("null decodes"), None);
+        }
     }
 }
 

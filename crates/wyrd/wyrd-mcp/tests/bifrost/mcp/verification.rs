@@ -26,6 +26,7 @@ mod pg_tests {
         transport_with_headers,
     };
 
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::Duration;
 
@@ -1306,6 +1307,17 @@ mod pg_tests {
         Ok(binding_id)
     }
 
+    /// The `outcomes` source's execution IDs in a group review's pinned
+    /// snapshot, in list order; empty when the review pins none.
+    fn ids(review: &JsonValue) -> Vec<&str> {
+        review["group"]["sources"]["outcomes"]["execution_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(JsonValue::as_str)
+            .collect()
+    }
+
     /// A group review, read over MCP once its group comes due: poll
     /// `verification.get_binding` until it names a completed execution other
     /// than `after` whose result is visible, publishing captured rows each
@@ -1776,14 +1788,22 @@ mod pg_tests {
         )
         .await?;
         assert_eq!(failing["group_id"], "door-43", "{failing}");
+        // Frames ingested in one batch share its ingest time, so their list
+        // order is by execution ID rather than by submission.
+        let listed = ids(&failing);
+        assert_eq!(listed.len(), frames.len(), "{failing}");
         assert_eq!(
-            failing["group"]["sources"]["outcomes"]["execution_ids"],
-            serde_json::json!(frames),
-            "only this Service's frames, in submission order: {failing}"
+            listed.iter().copied().collect::<BTreeSet<_>>(),
+            frames.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+            "only this Service's frames: {failing}"
         );
+        let expected: Vec<_> = listed
+            .iter()
+            .map(|id| if *id == frames[1] { "failed" } else { "passed" })
+            .collect();
         assert_eq!(
             failing.pointer(outcomes),
-            Some(&serde_json::json!({ "kind": "json", "value": ["passed", "failed"] }))
+            Some(&serde_json::json!({ "kind": "json", "value": expected }))
         );
         assert_eq!(
             failing["result"]["outcome"]["verdict"], "failed",
@@ -1810,9 +1830,11 @@ mod pg_tests {
         )
         .await?;
         assert_eq!(passing["group_id"], "door-45", "{passing}");
+        let listed = ids(&passing);
+        assert_eq!(listed.len(), many.len(), "{passing}");
         assert_eq!(
-            passing["group"]["sources"]["outcomes"]["execution_ids"],
-            serde_json::json!(many),
+            listed.into_iter().collect::<BTreeSet<_>>(),
+            many.iter().map(String::as_str).collect::<BTreeSet<_>>(),
             "{passing}"
         );
         assert_eq!(

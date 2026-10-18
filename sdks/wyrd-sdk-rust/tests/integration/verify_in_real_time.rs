@@ -2787,8 +2787,10 @@ async fn denials(deployment: &Deployment, principal: &str) -> Vec<String> {
 /// not query Bifrost is never reviewed: the poll's source reads run under
 /// the Service's own grants and the denial is retained. A query grant
 /// scoped to the trace tables is still no grant on the verification
-/// sources. Once the Service holds its default role again, the next poll
-/// reviews the whole conversation from its inputs and outcomes.
+/// sources. Neither failed poll enqueues anything; once the Service holds its
+/// default role again, the next poll reviews the whole conversation from its
+/// inputs and outcomes, and with no trace slot or Agent check nothing else
+/// is queried.
 ///
 /// # Panics
 /// Panics when a step fails, a review happens while the reads are not
@@ -2884,6 +2886,15 @@ async fn grouped_reads_need_the_owner_grant() {
     assert_eq!(
         evidence(&judged, "answered"),
         json!({"kind": "json", "value": ["passed", "passed"]})
+    );
+    let asked = assistant
+        .judge
+        .received_requests()
+        .await
+        .expect("the judge records requests");
+    assert!(
+        asked.is_empty(),
+        "a review without a trace or Agent check queries nothing"
     );
     assistant.deployment.shutdown().await;
 }

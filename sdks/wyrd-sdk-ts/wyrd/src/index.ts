@@ -1612,7 +1612,7 @@ export class Cards {
   }
 
   /**
-   * Load a Card file or a bundle directory and register it as one composite.
+   * Load a Card file or a bundle directory and declare it as one composite.
    *
    * @param path - A Card file, or a directory of Card files.
    * @returns The graph root and each Card's dependency-first outcome.
@@ -1624,7 +1624,7 @@ export class Cards {
   }
 
   /**
-   * Fetch one registered Card envelope by exact reference.
+   * Fetch one declared Card envelope by exact reference, without artifacts.
    *
    * The envelope is discriminated by `kind`: `spec` and `status` are typed for
    * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
@@ -1632,7 +1632,7 @@ export class Cards {
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
    * @param ref - A Card reference, or its `space/Kind/name@version` text.
-   * @returns The registered envelope.
+   * @returns The declared envelope.
    * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
    * a transport or authorization failure.
    */
@@ -1668,10 +1668,10 @@ export class Cards {
   }
 
   /**
-   * Download a registered Card's reachable graph as a local bundle for
+   * Pull a declared Card's reachable graph into a local bundle for
    * {@link WyrdState}.
    *
-   * Publication is atomic: a failed hydration leaves any prior bundle intact.
+   * Publication is atomic: a failed pull leaves any prior bundle intact.
    *
    * @param ref - The root Card's reference, or its text form.
    * @param destination - The bundle directory to publish.
@@ -1681,13 +1681,13 @@ export class Cards {
    * graph, an invalid destination, or an artifact that cannot be downloaded
    * or verified.
    */
-  async hydrate(
+  async pull(
     ref: CardRef | string,
     destination: string,
     options: { readonly metadataOnly?: boolean } = {},
   ): Promise<PullSummary> {
     return lifecycleValue<PullSummary>(
-      await this.#native.hydrate(cardRefText(ref), destination, options.metadataOnly ?? false),
+      await this.#native.pull(cardRefText(ref), destination, options.metadataOnly ?? false),
     );
   }
 
@@ -2704,7 +2704,7 @@ export class WyrdState {
   /**
    * Load and validate one Card bundle.
    *
-   * @param path - The bundle directory {@link Cards.hydrate} published.
+   * @param path - The bundle directory {@link Cards.pull} published.
    * @param options - `client`, whose principal every server call of this
    * state runs as; omitted, the ambient client is resolved once, at the first
    * server call, and kept.

@@ -280,7 +280,7 @@ test("unfitted baseline is skipped on schedule", async ({ server }) => {
   await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
   const { root } = await cards.declareFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
-  await cards.hydrate(root, bundle);
+  await cards.pull(root, bundle);
   const key = await cli.issueKey({ ...root, space: root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key.key }) });
   await state.startBifrost();

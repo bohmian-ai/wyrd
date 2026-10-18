@@ -23,7 +23,7 @@ const WYRD_BIN = (() => {
   return join(root, bin.wyrd);
 })();
 
-/** The support desk graph, registered after the artifact-bearing Model it references. */
+/** The support desk graph, declared after the artifact-bearing Model it references. */
 const test = serverTest().extend<{ desk: DeclarationReceipt }>({
   desk: [
     async ({ server: _ }, use) => {

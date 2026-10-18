@@ -20,7 +20,7 @@ import type {
   WyrdState,
 } from "wyrd-ai";
 
-// Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
+// Narrowing a declared envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<
   NonNullable<
     NonNullable<NonNullable<Extract<RegisteredCard, { kind: "Verifier" }>["status"]>["verification"]>["baseline"]

@@ -37,7 +37,7 @@ import { cli } from "@wyrd/testing";
 import { judgeReply } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { type RegisteredRef, fixture, registered, serverTest, timeline } from "../support/server.js";
+import { type DeclaredRef, fixture, declared, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -166,17 +166,17 @@ function step(result: VerificationResult, id: string): CardTypes.StepResult {
   return found;
 }
 
-/** The registered `policy-desk` Service, its Card bundle, its own client, and its hydrated state with Bifrost started. */
+/** The declared `policy-desk` Service, its Card bundle, its own client, and its hydrated state with Bifrost started. */
 interface PolicyDesk {
   readonly bundle: string;
-  readonly root: RegisteredRef;
+  readonly root: DeclaredRef;
   readonly client: WyrdClient;
   readonly state: WyrdState;
 }
 
 /**
  * `test` on a fresh verification-capable server per test whose gateway
- * deploys `gpt-4o` on the local upstream, with `policy-desk` registered and
+ * deploys `gpt-4o` on the local upstream, with `policy-desk` declared and
  * hydrated and acting as its own Card-scoped key.
  */
 const test = serverTest({ provider: upstream, verificationRuntime: true, perTest: true }).extend<{
@@ -187,8 +187,8 @@ const test = serverTest({ provider: upstream, verificationRuntime: true, perTest
     const cards = await Cards.connect();
     const receipt = await cards.declareFromPath(fixture("cards/verifier_building_blocks/policy-desk.yaml"));
     const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-policy-desk-"));
-    await cards.hydrate(receipt.root, bundle);
-    const root = registered(receipt);
+    await cards.pull(receipt.root, bundle);
+    const root = declared(receipt);
     const client = WyrdClient.connect({
       credential: (await cli.issueKey({ ...root, space: root.space ?? "default" })).key,
     });

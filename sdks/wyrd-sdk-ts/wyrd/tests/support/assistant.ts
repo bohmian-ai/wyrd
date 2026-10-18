@@ -8,7 +8,7 @@ import { z } from "zod";
 
 import type { Reply } from "./http-receiver.js";
 import { configureGateway } from "./local-development.js";
-import { type RegisteredRef, fixture, registered, serverTest } from "./server.js";
+import { type DeclaredRef, fixture, declared, serverTest } from "./server.js";
 
 /** The Verdict the local judge returns for every answer: passed, citing the whole answer. */
 export const AGREES =
@@ -38,15 +38,15 @@ export const JudgeCall = z.object({
   card_uid: z.string().nullable(),
 });
 
-/** The registered assistant Service, its Card bundle, and its own key. */
+/** The declared assistant Service, its Card bundle, and its own key. */
 export interface Assistant {
   readonly bundle: string;
   readonly key: string;
   readonly principal: string;
-  readonly service: RegisteredRef;
-  readonly answerCheck: RegisteredRef;
-  readonly answerJudged: RegisteredRef;
-  readonly agent: RegisteredRef;
+  readonly service: DeclaredRef;
+  readonly answerCheck: DeclaredRef;
+  readonly answerJudged: DeclaredRef;
+  readonly agent: DeclaredRef;
 }
 
 /** The hydrated assistant, with its server calls fixed to `client`. */
@@ -67,7 +67,7 @@ export async function judgeCalls(server: { flushBifrost(): void }): Promise<z.in
 /**
  * `test` on a server running the verification runtime whose gateway deploys
  * `gpt-4o` on a local judge that answers {@link AGREES}, with the latency
- * baseline, the latency Model, and the assistant Service registered and
+ * baseline, the latency Model, and the assistant Service declared and
  * hydrated. The gateway captures call metadata, so every judge call lands in
  * Bifrost. `state` is the assistant as its own Service, through the key
  * `issueKey` mints with no Role grant beyond its default `workload`.
@@ -86,16 +86,16 @@ export const assistantTest = (options: { readonly perTest?: boolean } = {}) =>
         await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
         const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
         const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
-        await cards.hydrate(receipt.root, bundle);
+        await cards.pull(receipt.root, bundle);
         const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" });
         await use({
           bundle,
           key: issued.key,
           principal: issued.principal_id,
-          service: registered(receipt),
-          answerCheck: registered(receipt, "answer-check"),
-          answerJudged: registered(receipt, "answer-judged"),
-          agent: registered(receipt, "assistant-agent"),
+          service: declared(receipt),
+          answerCheck: declared(receipt, "answer-check"),
+          answerJudged: declared(receipt, "answer-judged"),
+          agent: declared(receipt, "assistant-agent"),
         });
       },
       { scope: options.perTest ? "test" : "file" },

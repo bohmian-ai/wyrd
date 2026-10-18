@@ -253,7 +253,7 @@ export declare class NativeBifrostQueryStream {
 /** Tenant-scoped Card registry handle over the shared `wyrd_client` Cards. */
 export declare class NativeCards {
   /**
-   * Loads one Card tree from disk and registers it as a composite.
+   * Loads one Card tree from disk and declares it as a composite.
    *
    * # Errors
    *
@@ -297,9 +297,9 @@ export declare class NativeCards {
    */
   resolveLatest(kind: string, space: string, name: string): Promise<NativeLifecycleResult>
   /**
-   * Hydrates one Card graph into a published local bundle.
+   * Pulls one Card graph into a published local bundle.
    *
-   * `metadata_only` skips artifact payload downloads. A failed hydration
+   * `metadata_only` skips artifact payload downloads. A failed pull
    * never publishes a partial bundle.
    *
    * # Errors
@@ -307,7 +307,7 @@ export declare class NativeCards {
    * Returns a napi error only when the summary cannot be serialized; graph,
    * destination, and transfer failures are returned in the result.
    */
-  hydrate(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
+  pull(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
   /**
    * Soft-deletes one Card by exact reference.
    *
@@ -847,7 +847,7 @@ export declare class NativeWyrdState {
    */
   rootRef(): NativeLifecycleResult
   /**
-   * Returns the stored envelope of the root Card the bundle was hydrated
+   * Returns the stored envelope of the root Card the bundle was pulled
    * from.
    *
    * # Errors

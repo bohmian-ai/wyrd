@@ -45,7 +45,7 @@ export async function work(client: WyrdClient): Promise<Worked> {
   await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
   const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-local-"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle, { client });
   await state.startBifrost();
 

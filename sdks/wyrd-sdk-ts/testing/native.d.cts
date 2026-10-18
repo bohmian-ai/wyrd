@@ -220,14 +220,25 @@ export declare class NativeWyrdTestServer {
 }
 
 /**
- * Registers a local Card tree and returns its receipt (`wyrd apply`).
+ * Declares a local Card tree and returns its receipt (`wyrd declare`).
  *
  * # Errors
  *
  * Returns a napi error only when the receipt cannot be serialized; local,
  * client, and server failures are returned in the outcome.
  */
-export declare function cliApply(path: string, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
+export declare function cliDeclare(path: string, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
+
+/**
+ * Checks a local Card tree without contacting a server
+ * (`wyrd declare --check`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the report cannot be serialized; a load
+ * failure is returned in the outcome.
+ */
+export declare function cliDeclareCheck(path: string): NativeCliOutcome
 
 /**
  * Deletes one unreferenced provider credential; an absent name succeeds
@@ -241,14 +252,14 @@ export declare function cliApply(path: string, connection?: NativeCliConnection 
 export declare function cliDeleteProviderCredential(name: string, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
- * Hydrates a Card's reachable graph into `output_dir` (`wyrd get`).
+ * Reads one Card envelope without downloading artifacts (`wyrd get`).
  *
  * # Errors
  *
- * Returns a napi error only when the summary cannot be serialized; selector,
- * client, and server failures are returned in the outcome.
+ * Returns a napi error only when the envelope cannot be serialized;
+ * selector, client, and server failures are returned in the outcome.
  */
-export declare function cliGet(selector: NativeCardSelector, outputDir: string, metadataOnly?: boolean | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
+export declare function cliGet(selector: NativeCardSelector, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
  * Issues an API key bound to one exact Card (`wyrd auth issue-key`).
@@ -261,16 +272,6 @@ export declare function cliGet(selector: NativeCardSelector, outputDir: string, 
  * coordinate, client, and server failures are returned in the outcome.
  */
 export declare function cliIssueKey(options: NativeIssueKey, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
-
-/**
- * Loads one Card and materializes its artifacts (`wyrd load`).
- *
- * # Errors
- *
- * Returns a napi error only when the output cannot be serialized; selector,
- * client, and server failures are returned in the outcome.
- */
-export declare function cliLoad(selector: NativeCardSelector, path?: string | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
  * Connects the named MCP hosts to Wyrd (`wyrd mcp install --host ...`).
@@ -287,14 +288,14 @@ export declare function cliLoad(selector: NativeCardSelector, path?: string | un
 export declare function cliMcpInstall(hosts: Array<string>, server?: string | undefined | null): NativeCliOutcome
 
 /**
- * Validates a local Card tree without contacting a server (`wyrd plan`).
+ * Pulls a Card's reachable graph into `output_dir` (`wyrd pull`).
  *
  * # Errors
  *
- * Returns a napi error only when the plan cannot be serialized; a load
- * failure is returned in the outcome.
+ * Returns a napi error only when the summary cannot be serialized; selector,
+ * client, and server failures are returned in the outcome.
  */
-export declare function cliPlan(path: string): NativeCliOutcome
+export declare function cliPull(selector: NativeCardSelector, outputDir: string, metadataOnly?: boolean | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
  * Creates or rotates one provider credential (`wyrd gateway credential put`).
@@ -321,7 +322,7 @@ export declare function cliPutProviderCredential(write: any, connection?: Native
 export declare function cliRevokeProviderCredential(name: string, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
- * Card selector for `get` and `load`: a `uid` with `kind`, or `kind`,
+ * Card selector for `get` and `pull`: a `uid` with `kind`, or `kind`,
  * `space`, and `name`; `version` narrows either.
  */
 export interface NativeCardSelector {

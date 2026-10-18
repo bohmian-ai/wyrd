@@ -16,7 +16,7 @@ import {
 import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
 
 import { Receiver } from "../support/http-receiver.js";
-import { binding, fixture, registered, scheduledResult, serverTest } from "../support/server.js";
+import { binding, fixture, declared, scheduledResult, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 240_000 });
 
@@ -49,13 +49,13 @@ async function startWatch(
   });
   await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
   const watch = await cards.declareFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
-  server.waitForBaseline(registered(watch, verifier).uid, WAIT_MS);
+  server.waitForBaseline(declared(watch, verifier).uid, WAIT_MS);
   return watch;
 }
 
 /**
  * The latency watch Service on a fresh server per test, so each window is
- * judged alone, registered after its baseline and after the `on-call-hooks`
+ * judged alone, declared after its baseline and after the `on-call-hooks`
  * connection, with the `latency-shift` baseline already fitted by the real
  * fitter.
  */
@@ -86,7 +86,7 @@ async function submit(
   verifier = "latency-shift",
 ) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
-  await cards.hydrate(watch.root, bundle);
+  await cards.pull(watch.root, bundle);
   const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();

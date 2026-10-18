@@ -23,7 +23,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
+import { ancestry, columnValues, fixture, declared, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -300,7 +300,7 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
   const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
   const caller = WyrdClient.connect({ credential: issued.key });
   const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
-  const cardUid = registered(ask, "ask-agent").uid;
+  const cardUid = declared(ask, "ask-agent").uid;
 
   for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
     const reply = await client.chat.completions.create(ASK, { headers });
@@ -429,7 +429,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const cards = await Cards.connect();
   const receipt = await cards.declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0", space: "default" });
   const caller = WyrdClient.connect({ credential: issued.key });
   const state = WyrdState.fromPath(bundle, { client: caller });

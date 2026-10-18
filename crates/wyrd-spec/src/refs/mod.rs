@@ -752,7 +752,6 @@ mod completeness_tests {
                 InlineableRef::Inline(Box::new(notify_operator())),
             ],
             on_verdict_change: vec![InlineableRef::Ref(card_ref(CardKind::Operator, "escalate"))],
-            inputs: BTreeMap::new(),
         }
     }
 

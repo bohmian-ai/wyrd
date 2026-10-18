@@ -52,7 +52,7 @@ fn assertion_verifier_spec() -> Value {
 /// A Custom Drift Verifier spec over the `latency_ms` metric samples.
 ///
 /// It needs no fitted baseline, and its one `samples` slot lets a schedule
-/// Trigger activate it through [`latency_inputs`].
+/// Trigger activate it.
 fn latency_drift_spec() -> Value {
     json!({
         "inputs": { "samples": { "type": "samples", "features": ["latency_ms"] } },
@@ -68,12 +68,6 @@ fn latency_drift_spec() -> Value {
             }
         }]
     })
-}
-
-/// The schedule binding `inputs` mapping that fills [`latency_drift_spec`]'s
-/// `samples` slot from the recorded `latency_ms` metric.
-fn latency_inputs() -> Value {
-    json!({ "samples": { "metric": "latency_ms" } })
 }
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
@@ -966,7 +960,8 @@ fn bound_agent_request(
 /// bootstrap returns a non-user principal, when any fixture row fails to
 /// insert, when the route fails to respond, or when any refusal does not
 /// produce its exact status, stable error code, and absence of durable
-/// registration state.
+/// registration state, or when the activation-mismatch remediation directs the
+/// caller to binding `inputs` instead of a recorded-samples Verifier.
 #[tokio::test(flavor = "current_thread")]
 async fn referenced_binding_refusals_leave_no_writes() {
     let server = WyrdTestServer::start_in_process()
@@ -1081,9 +1076,12 @@ async fn referenced_binding_refusals_leave_no_writes() {
         .await
         .expect("activation-mismatch registration responds");
     assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response_json(mismatch).await["code"],
-        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    let problem = response_json(mismatch).await;
+    assert_eq!(problem["code"], "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH");
+    let remediation = problem["remediation"].as_str().unwrap_or_default();
+    assert!(
+        remediation.contains("samples") && !remediation.contains("binding inputs"),
+        "remediation must point at samples Verifiers, never binding inputs: {problem}"
     );
     assert_no_registration_writes(
         &server,
@@ -1369,7 +1367,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         assert_no_registration_writes(&server, &operation, &name).await;
     }
 
-    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure, "inputs": latency_inputs() });
+    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure });
     let drift = card_ref("Verifier", "vc-drift-verifier");
     let trigger = card_ref("Trigger", "vc-schedule-trigger");
     let hook = card_ref("Operator", "vc-hook");
@@ -2730,8 +2728,7 @@ fn schedule_trigger_ref() -> Value {
 /// The Service-level binding runs the drift Verifier on `runs_on` (a
 /// referenced or inline `schedule` Trigger) and dispatches one inline HTTP
 /// Operator on failure; the `assistant` component binding runs the same
-/// Verifier on an inline daily `schedule` Trigger. Both bindings map the
-/// Verifier's samples slot through [`latency_inputs`]. `second_alias` adds a
+/// Verifier on an inline daily `schedule` Trigger. `second_alias` adds a
 /// second component occurrence under that alias so the alias-uniqueness
 /// refusal can reuse the builder.
 fn bound_service_request(
@@ -2761,8 +2758,7 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
             "verifier": {
                 "kind": "Verifier", "name": "vb-drift", "version": "1.0.0", "space": "default"
             },
-            "runs_on": { "kind": "schedule", "cron": "0 3 * * *" },
-            "inputs": latency_inputs()
+            "runs_on": { "kind": "schedule", "cron": "0 3 * * *" }
         }]
     })];
     if let Some(alias) = second_alias {
@@ -2780,7 +2776,6 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
                             "version": "1.0.0", "space": "default"
                         },
                         "runs_on": runs_on,
-                        "inputs": latency_inputs(),
                         "on_failure": [{
                             "kind": "http", "method": "post",
                             "url": "https://hooks.example.test/verification-failed"

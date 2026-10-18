@@ -1,0 +1,10 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: latency-budget
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./latency-error-budget.yaml
+      runs_on: ./daily.yaml

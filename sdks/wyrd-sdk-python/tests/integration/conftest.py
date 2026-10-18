@@ -350,12 +350,15 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
 
 
 @contextmanager
-def watching(tmp_path: Path, service: str, verifier: str) -> Iterator[Watch]:
+def watching(
+    tmp_path: Path, service: str, verifier: str, *, fitted: bool = True
+) -> Iterator[Watch]:
     """Deploy the scheduled-drift ``service`` on a server of its own until exit.
 
     The server's ``on-call-hooks`` connection points at a hook of its own,
-    ``verifier``'s baseline is fitted, and the Service is hydrated with
-    Bifrost started under its own key.
+    ``verifier``'s baseline is fitted unless ``fitted`` is false (a Custom
+    Verifier has none), and the Service is hydrated with Bifrost started
+    under its own key.
     """
     with (
         serving() as hooks,
@@ -373,7 +376,8 @@ def watching(tmp_path: Path, service: str, verifier: str) -> Iterator[Watch]:
         cards = Cards(admin)
         register(cards, "cards/latency_baseline/latency-baseline.yaml")
         registered = register(cards, f"cards/scheduled_drift_alerts_operator/{service}.yaml")
-        server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
+        if fitted:
+            server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
         key = cli.issue_key(
             kind="Service", name=service, version="1.0.0", space="default", client=admin
@@ -398,6 +402,13 @@ def latency_watch(tmp_path: Path) -> Iterator[Watch]:
 def latency_steady(tmp_path: Path) -> Iterator[Watch]:
     """The ``latency-steady`` Service with its SPC ``latency-control`` Verifier fitted."""
     with watching(tmp_path, "latency-steady", "latency-control") as watch:
+        yield watch
+
+
+@pytest.fixture
+def latency_budget(tmp_path: Path) -> Iterator[Watch]:
+    """The ``latency-budget`` Service with its two-slot Custom ``latency-error-budget`` Verifier."""
+    with watching(tmp_path, "latency-budget", "latency-error-budget", fitted=False) as watch:
         yield watch
 
 

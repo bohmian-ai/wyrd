@@ -26,33 +26,27 @@ use wyrd_sql::queries::verification::BindingSchedule;
 /// Identity key used to look up a resolved external reference.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 
-/// Reject a schedule binding whose Verifier judges no recorded samples, then
-/// check the binding's sample-slot mapping against the Verifier.
+/// Reject a schedule binding whose Verifier judges no recorded samples.
 ///
 /// A schedule occurrence supplies only recorded measurements for a window, so
-/// it can activate only a Verifier with a `samples` slot, and every required
-/// slot must be a mapped samples slot.
+/// it can activate only a Verifier with a `samples` slot; the Verifier's own
+/// samples declarations supply every such slot.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the Verifier has
-/// no samples slot, and the [`VerifierSpec::validate_schedule`] refusal for an
-/// incomplete or inexact `inputs` mapping.
-fn check_activation(
-    verifier: &VerifierSpec,
-    binding: &VerificationBinding,
-    field: &str,
-) -> Result<(), WyrdError> {
+/// no samples slot.
+fn check_activation(verifier: &VerifierSpec, field: &str) -> Result<(), WyrdError> {
     let samples = verifier
         .inputs
         .values()
         .any(|slot| matches!(slot, InputSlot::Samples { .. }));
-    if !samples {
-        return Err(WyrdError::SpecTriggerActivationMismatch {
-            message: format!("{field}.runs_on cannot activate a Verifier without a samples slot"),
-            details: serde_json::json!({ "field": format!("{field}.runs_on") }),
-        });
+    if samples {
+        return Ok(());
     }
-    verifier.validate_schedule(&binding.inputs)
+    Err(WyrdError::SpecTriggerActivationMismatch {
+        message: format!("{field}.runs_on cannot activate a Verifier without a samples slot"),
+        details: serde_json::json!({ "field": format!("{field}.runs_on") }),
+    })
 }
 
 /// Validate an Operator's shape and the exact connection authority it names.
@@ -298,8 +292,7 @@ impl EffectiveSpecs {
     ///
     /// # Errors
     /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the effective
-    /// Trigger cannot activate the effective Verifier, the schedule mapping
-    /// refusal of [`VerifierSpec::validate_schedule`],
+    /// Trigger cannot activate the effective Verifier,
     /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a `schedule` Trigger cannot
     /// be armed,
     /// the Operator shape and connection refusals of `check_operator`, and
@@ -402,12 +395,6 @@ impl EffectiveSpecs {
                 ));
             }
             if group_end {
-                if !binding.inputs.is_empty() {
-                    return Err(mismatch(
-                        format!("{field}.inputs"),
-                        "is not allowed on a group_end binding; sources come from the Verifier",
-                    ));
-                }
                 self.validate_sources(conn, binding, verifier, field, group)
                     .await?;
             }
@@ -416,7 +403,7 @@ impl EffectiveSpecs {
             (&verifier, &trigger)
             && matches!(trigger.activation, TriggerActivation::Schedule { .. })
         {
-            check_activation(verifier, binding, field)?;
+            check_activation(verifier, field)?;
         }
         if let Some(Spec::Trigger(TriggerSpec {
             activation: TriggerActivation::Schedule { cron, tz },

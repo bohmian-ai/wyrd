@@ -166,9 +166,8 @@ impl Harness {
             .expect("submission is accepted")
     }
 
-    /// Schedule `verifier` over the harness subject's `metric` series for a
-    /// fresh active owner and return the execution the scheduler creates for
-    /// its now-due occurrence.
+    /// Schedule `verifier` for a fresh active owner and return the execution
+    /// the scheduler creates for its now-due occurrence.
     ///
     /// The scheduler claims an occurrence 30 seconds after its window ends,
     /// so this waits up to [`WAIT`]; a runtime must be running.
@@ -176,19 +175,12 @@ impl Harness {
     /// # Panics
     /// Panics when the owner, binding, or activation write fails, or no new
     /// execution appears within [`WAIT`].
-    async fn schedule(&self, owner: &str, verifier: &CardUid, metric: &str) -> ExecutionId {
+    async fn schedule(&self, owner: &str, verifier: &CardUid) -> ExecutionId {
         let before = self.seed.executions().await.expect("executions read");
         let (owner, principal) = self.seed.service(owner).await.expect("owner registers");
         let binding = self
             .seed
-            .bind_schedule(
-                &owner,
-                &owner,
-                verifier,
-                "0 2 * * *",
-                VerificationFixture::metric_inputs(metric),
-                Vec::new(),
-            )
+            .bind_schedule(&owner, &owner, verifier, "0 2 * * *", Vec::new())
             .await
             .expect("binding projects");
         self.seed
@@ -761,9 +753,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         .custom_drift_verifier("telemetry-drift", "score", 1.0, 0.5)
         .await
         .expect("profiled verifier registers");
-    let real = harness
-        .schedule("telemetry-owner", &profiled, "score")
-        .await;
+    let real = harness.schedule("telemetry-owner", &profiled).await;
     let real_row = harness
         .wait_execution(real, |row| {
             !matches!(row.status.as_str(), "pending" | "running" | "retrying")
@@ -1011,7 +1001,7 @@ async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let run = harness
-        .schedule("unscorable-owner", &harness.verifier, "latency_ms")
+        .schedule("unscorable-owner", &harness.verifier)
         .await;
 
     let row = harness.wait_execution(run, status("errored")).await;
@@ -1882,14 +1872,7 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(
-            &owner,
-            &owner,
-            &harness.verifier,
-            "0 2 * * *",
-            VerificationFixture::metric_inputs("latency_ms"),
-            Vec::new(),
-        )
+        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
         .await
         .expect("binding projects");
     harness
@@ -1998,14 +1981,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(
-            &owner,
-            &owner,
-            &harness.verifier,
-            "0 2 * * *",
-            VerificationFixture::metric_inputs("latency_ms"),
-            Vec::new(),
-        )
+        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
         .await
         .expect("binding projects");
     harness
@@ -2086,14 +2062,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         bindings.push(
             harness
                 .seed
-                .bind_schedule(
-                    &owner,
-                    &owner,
-                    &harness.verifier,
-                    "0 2 * * *",
-                    VerificationFixture::metric_inputs("latency_ms"),
-                    Vec::new(),
-                )
+                .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
                 .await
                 .expect("binding projects"),
         );

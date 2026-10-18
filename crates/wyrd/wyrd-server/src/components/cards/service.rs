@@ -1386,7 +1386,6 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     trigger,
                     operators,
                     activation,
-                    inputs: binding.inputs.clone(),
                 });
             }
         }

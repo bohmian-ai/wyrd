@@ -235,7 +235,6 @@ impl Delivery {
                 &owner,
                 &self.verifier,
                 "0 2 * * *",
-                VerificationFixture::metric_inputs("latency_ms"),
                 operators
                     .iter()
                     .map(|uid| FrozenTarget::Uid((*uid).clone()))
@@ -309,7 +308,6 @@ impl Delivery {
                 &owner,
                 &verifier,
                 "0 2 * * *",
-                VerificationFixture::metric_inputs("latency_ms"),
                 vec![FrozenTarget::Uid(quick)],
             )
             .await

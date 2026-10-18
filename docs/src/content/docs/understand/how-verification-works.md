@@ -57,7 +57,7 @@ In `follows-policy`, the caller uploads one file: the refund decision letter the
 
 | Part | Holds |
 | --- | --- |
-| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false` |
+| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false`; `samples` slots are always required |
 | `steps` | Optional preparation. Each step runs one action and produces data |
 | `requirements` | Each has a unique `id`, a `statement`, and one `check`, and produces one verdict. Attach them to a step or to the whole Verifier |
 | `decide` | How requirement verdicts combine: `all` (the default) or `{ pass_rate: { threshold } }` |
@@ -161,7 +161,6 @@ The subject is the component the binding sits under; you can also bind on the Se
 | --- | --- | --- |
 | `verifier` | A Verifier Card, by path or exact reference | Required |
 | `runs_on` | A `schedule` Trigger | The server never runs this binding on its own |
-| `inputs` | For a scheduled Verifier, the source of each `samples` slot: `{ features: [...] }` or `{ metric: <name> }` | Required for every required slot of a scheduled Verifier |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
 `schedule` is the only automatic Trigger. [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.

@@ -21,5 +21,3 @@ spec:
       verified_by:
         - verifier: ./latency-drift.yaml
           runs_on: {kind: schedule, cron: "0 0 * * *"}
-          inputs:
-            latency: {features: [latency]}

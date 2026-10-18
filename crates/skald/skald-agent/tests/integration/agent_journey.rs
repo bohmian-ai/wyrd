@@ -100,7 +100,6 @@ async fn journey_author_save_load_run() {
                 ..prompt_card_ref("answers-grounded")
             }),
             runs_on: None,
-            inputs: std::collections::BTreeMap::new(),
             on_failure: Vec::new(),
             on_verdict_change: Vec::new(),
         }];

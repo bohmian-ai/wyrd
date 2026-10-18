@@ -15,7 +15,7 @@ fn fixture(name: &str) -> PathBuf {
 /// Load the canonical Service tree and prove all references resolve before submission.
 ///
 /// The tree binds sibling drift and assert Verifiers through `verified_by`,
-/// covering a referenced schedule Trigger Card with its samples inputs, a
+/// covering a referenced schedule Trigger Card, a
 /// referenced failure Operator, and explicit-only bindings without `runs_on`
 /// on a standalone Agent, the Service, and a Service component, so every
 /// binding slot must leave the loader resolved.
@@ -110,7 +110,6 @@ fn load_end_to_end_reference_tree() {
                 model_binding.on_failure.as_slice(),
                 [InlineableRef::Sibling { .. }]
             ));
-            assert_eq!(model_binding.inputs.len(), 1);
             let [agent_binding, component_task] = service.components[1].verified_by.as_slice()
             else {
                 panic!("agent1 component must carry its two explicit bindings");

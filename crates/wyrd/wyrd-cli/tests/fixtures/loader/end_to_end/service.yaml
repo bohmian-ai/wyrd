@@ -48,10 +48,6 @@ spec:
       verified_by:
         - verifier: ./model/drift.yaml
           runs_on: ./ops/trigger-drift-schedule.yaml
-          # The schedule reads these recorded features into the samples slot.
-          inputs:
-            current:
-              features: [tenure_months, monthly_charges, contract_type]
           on_failure:
             - ./ops/operator-slack.yaml
 

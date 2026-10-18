@@ -475,7 +475,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     turns = [{"turn": turn, "answer": f"answer {turn}"} for turn in range(1, 7)]
     first = state.run("agent")
     for turn in turns[:3]:
-        first.observe.verify("turn-check", turn, group_id=group)
+        first.observe.verify("turn-check", turn=turn, group_id=group)
     resumed = state.run("agent")
     resumed.observe.verify("turn-check", turns[3], group_id=group)
     queued = resumed.observe.submit("turn-check", turns[4], group_id=group)
@@ -700,15 +700,23 @@ def test_grouped_coding_uses_declared_sources(
     assert "edit-file" not in denied, "a denied read returns nothing"
     state.shutdown()
 
-    for relative, code, reason in [
-        ("coding-child.yaml", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
-        ("coding-unbound.yaml", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"),
-        ("coding-cycle.yaml", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"),
+    for name, kind, code, reason in [
+        ("coding-child", "Service", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
+        ("coding-unbound", "Service", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"),
+        ("support-ambiguous", "Service", "WYRD_SPEC_400_VALIDATION", "matches 2 bindings"),
+        ("support-undeclared", "Service", "WYRD_SPEC_400_VALIDATION", "does not declare"),
+        ("coding-cycle", "Service", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"),
+        ("reserved-typed", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"),
+        ("reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"),
     ]:
         with pytest.raises(WyrdError) as refused:
-            register(cards, f"cards/verify_in_real_time/{relative}")
-        assert refused.value.code == code, relative
-        assert reason in f"{refused.value} {refused.value.details}", relative
+            register(cards, f"cards/verify_in_real_time/{name}.yaml")
+        assert refused.value.code == code, name
+        assert reason in f"{refused.value} {refused.value.details}", name
+        with pytest.raises(WyrdError) as absent:
+            cards.resolve_latest(kind, "default", name)
+        assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND", name
+    register(cards, "cards/verify_in_real_time/coding-external.yaml")
 
 
 def frame(directory: Path, label: str) -> Path:

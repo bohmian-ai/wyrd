@@ -737,18 +737,26 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   expect(denied[0], "a denied read returns nothing").not.toContain("edit-file");
   await state.shutdown();
 
-  for (const [relative, code, reason] of [
-    ["coding-child.yaml", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
-    ["coding-unbound.yaml", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
-    ["coding-cycle.yaml", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
+  for (const [name, kind, code, reason] of [
+    ["coding-child", "Service", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
+    ["coding-unbound", "Service", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
+    ["support-ambiguous", "Service", "WYRD_SPEC_400_VALIDATION", "matches 2 bindings"],
+    ["support-undeclared", "Service", "WYRD_SPEC_400_VALIDATION", "does not declare"],
+    ["coding-cycle", "Service", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
+    ["reserved-typed", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
+    ["reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
   ] as const) {
-    const refused = await cards.registerFromPath(fixture(`cards/verify_in_real_time/${relative}`)).then(
+    const refused = await cards.registerFromPath(fixture(`cards/verify_in_real_time/${name}.yaml`)).then(
       () => undefined,
       (error: unknown) => error as WyrdError,
     );
-    expect(refused?.code, relative).toBe(code);
-    expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, relative).toContain(reason);
+    expect(refused?.code, name).toBe(code);
+    expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, name).toContain(reason);
+    await expect(cards.resolveLatest(kind, "default", name), name).rejects.toMatchObject({
+      code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+    });
   }
+  await cards.registerFromPath(fixture("cards/verify_in_real_time/coding-external.yaml"));
 }, 180_000);
 
 /**

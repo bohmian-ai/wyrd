@@ -2739,8 +2739,8 @@ fn evidence(review: &VerificationExecutionState, slot: &str) -> serde_json::Valu
 /// acknowledged result reaches exactly one more review. The first review's
 /// snapshot is unchanged by later evidence, every review stays retained,
 /// and nothing is reviewed again. Throughout, a neighbouring conversation
-/// bound under the largest `after` a Trigger accepts never comes due and
-/// never stops the scheduler.
+/// bound under a one-year `after`, the longest a Trigger accepts, does not
+/// come due and never holds up the late group's progress.
 ///
 /// # Panics
 /// Panics when a step fails, a review is not judged in time, or a review
@@ -2874,7 +2874,7 @@ async fn grouped_executions_include_late_evidence() {
             .await
             .last_execution_id,
         None,
-        "a conversation under the largest after never comes due"
+        "a conversation under a one-year after does not come due"
     );
     forever.state.shutdown().await.expect("Bifrost stops");
     assistant.deployment.shutdown().await;

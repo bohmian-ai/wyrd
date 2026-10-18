@@ -5478,7 +5478,7 @@ export type TorchSaveFormat2 = "Safetensors" | "Pickle";
 export type TraceId = string;
 
 /**
- * Positive whole duration <n><unit> with unit s, m, h, or d, such as 30m or 24h.
+ * Positive whole duration <n><unit> with unit s, m, h, or d, such as 30m or 24h, at most one year: 365d = 8760h = 525600m = 31536000s.
  */
 export type TriggerDuration = string;
 

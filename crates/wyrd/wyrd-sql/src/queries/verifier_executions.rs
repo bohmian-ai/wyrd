@@ -188,26 +188,19 @@ const DUE_BINDING_SQL: &str = r"
        FOR UPDATE SKIP LOCKED
 ";
 
-/// Upper bound, in seconds, on a `group_end` binding's `after` when deriving
-/// a due time, so an authored nine-digit day count stays inside
-/// PostgreSQL's timestamp range.
-// ponytail: ~100 years caps `after`; nobody waits longer for a group verdict.
-const GROUP_AFTER_MAX_SECONDS: i64 = 3_155_760_000;
-
 /// Record acknowledged source activity of grouped items: every `group_end`
 /// binding of the recorded owner with a source slot for the item's exact
 /// subject and source Verifier gets its group due `after` past PostgreSQL's
 /// statement time, moving an existing pending row's due time.
 ///
-/// `$1`..`$4` are aligned owner, subject, source Verifier, and group arrays;
-/// `$5` is [`GROUP_AFTER_MAX_SECONDS`]. `DISTINCT` keeps one row per binding
-/// and group so the upsert never touches a row twice.
+/// `$1`..`$4` are aligned owner, subject, source Verifier, and group arrays.
+/// `after` is the exact authored duration, at most the one year Trigger
+/// validation admits. `DISTINCT` keeps one row per binding and group so the
+/// upsert never touches a row twice.
 const RECORD_GROUP_ACTIVITY_SQL: &str = r"
     INSERT INTO wyrd.verification_group_pending (data_tenant_id, binding_id, group_id, due_at)
     SELECT DISTINCT wyrd.current_tenant(), b.binding_id, a.group_id,
-           statement_timestamp() + LEAST(
-               EXTRACT(EPOCH FROM (b.group_end ->> 'after')::interval), $5::bigint
-           ) * INTERVAL '1 second'
+           statement_timestamp() + (b.group_end ->> 'after')::interval
       FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[])
                AS a(owner_card_uid, card_uid, verifier_card_uid, group_id)
       JOIN wyrd.verification_bindings b
@@ -223,7 +216,7 @@ const RECORD_GROUP_ACTIVITY_SQL: &str = r"
 /// Lock the earliest expired pending group no other scheduler holds; forced
 /// RLS confines it to the caller's tenant.
 const DUE_GROUP_SQL: &str = r"
-    SELECT binding_id, group_id, due_at
+    SELECT binding_id, group_id
       FROM wyrd.verification_group_pending
      WHERE due_at <= statement_timestamp()
      ORDER BY due_at, binding_id, group_id
@@ -231,9 +224,9 @@ const DUE_GROUP_SQL: &str = r"
        FOR UPDATE SKIP LOCKED
 ";
 
-/// Read a pending group's binding targets and frozen `group_end` settings.
+/// Read a pending group's binding owner and frozen `group_end` settings.
 const GROUP_BINDING_SQL: &str = r"
-    SELECT owner_card_uid, card_uid, verifier_card_uid, group_end
+    SELECT owner_card_uid, group_end
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
 ";
@@ -258,6 +251,29 @@ const INSERT_GROUP_SQL: &str = r"
               $10, '{}'::jsonb, $11, $12, $13, $14, $15, $16, $17,
               statement_timestamp(), statement_timestamp(), statement_timestamp())
     ON CONFLICT DO NOTHING
+    RETURNING execution_id
+";
+
+/// Record one pending group refused before admission as a terminal errored
+/// group execution of binding `$2` and group `$3`, frozen from the binding
+/// like a runnable one but with no accepted authority, inputs, or snapshot:
+/// `$4` is the stored owner principal it would have served, `$5` the SYSTEM
+/// principal recording the refusal, `$6` the structured error. A missing
+/// binding or Verifier Card inserts nothing.
+const INSERT_GROUP_ERROR_SQL: &str = r"
+    INSERT INTO wyrd.verifier_executions (
+        execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
+        origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
+        group_id, sub_principal_id, act_principal_id, status, error, max_attempts,
+        created_at, updated_at, settled_at
+    )
+    SELECT $1, wyrd.current_tenant(), b.verifier_card_uid, v.version, b.card_uid,
+           'group', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
+           b.operators, $3, $4, $5, 'errored', $6, $7,
+           statement_timestamp(), statement_timestamp(), statement_timestamp()
+      FROM wyrd.verification_bindings b
+      JOIN wyrd.cards v ON v.card_uid = b.verifier_card_uid
+     WHERE b.binding_id = $2
     RETURNING execution_id
 ";
 
@@ -978,26 +994,23 @@ pub struct ScheduleTick {
 }
 
 /// One expired pending group locked by [`VerifierExecutionQueue::claim_due_group`]
-/// until the caller's transaction ends, with its binding's frozen targets.
+/// until the caller's transaction ends, with its binding's owner and frozen
+/// settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueGroup {
     /// The group's `group_end` binding.
     pub binding_id: BindingId,
     /// The caller group to judge.
     pub group_id: GroupId,
-    /// The stored due time that expired.
-    pub due_at: DateTime<Utc>,
     /// Binding owner whose attributed source rows form the group.
     pub owner_card_uid: CardUid,
-    /// Exact Card the group Verifier judges.
-    pub card_uid: CardUid,
-    /// Exact group Verifier Card version.
-    pub verifier_card_uid: CardUid,
     /// The pinned Trigger duration and source bindings.
     pub settings: GroupEndSettings,
-    /// The owner's Card-bound principal when it is runtime-active; `None`
-    /// means no group execution may be accepted for it.
+    /// The owner's stored Card-bound principal, whatever its status; `None`
+    /// when the owner has none, so nothing can be attributed to it.
     pub owner: Option<PrincipalId>,
+    /// Whether the owner is runtime-active, so its group may be admitted.
+    pub active: bool,
 }
 
 /// One acknowledged grouped source input or result: the recorded
@@ -1727,7 +1740,6 @@ impl VerifierExecutionQueue {
                     .map(|item| item.group_id.as_str())
                     .collect::<Vec<_>>(),
             )
-            .bind(GROUP_AFTER_MAX_SECONDS)
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -1751,31 +1763,26 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueGroup>, SqlxError> {
-        let due: Option<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(DUE_GROUP_SQL)
+        let due: Option<(Uuid, String)> = sqlx::query_as(DUE_GROUP_SQL)
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        let Some((binding_id, group_id, due_at)) = due else {
+        let Some((binding_id, group_id)) = due else {
             return Ok(None);
         };
-        let (owner, card, verifier, Json(settings)): (Uuid, Uuid, Uuid, Json<GroupEndSettings>) =
+        let (owner, Json(settings)): (Uuid, Json<GroupEndSettings>) =
             sqlx::query_as(GROUP_BINDING_SQL)
                 .bind(binding_id)
                 .fetch_one(&mut **conn.transaction())
                 .await?;
         let binding_id = stored(BindingId::new(binding_id))?;
-        let owner_principal = binding_activity(conn, binding_id, self.inactivity)
-            .await?
-            .filter(|activity| activity.active)
-            .and_then(|activity| activity.principal_id);
+        let activity = binding_activity(conn, binding_id, self.inactivity).await?;
         Ok(Some(DueGroup {
             binding_id,
             group_id: stored(GroupId::new(group_id))?,
-            due_at,
             owner_card_uid: stored(CardUid::from_uuid(owner))?,
-            card_uid: stored(CardUid::from_uuid(card))?,
-            verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
             settings,
-            owner: owner_principal,
+            owner: activity.as_ref().and_then(|activity| activity.principal_id),
+            active: activity.is_some_and(|activity| activity.active),
         }))
     }
 
@@ -1795,6 +1802,44 @@ impl VerifierExecutionQueue {
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
+    }
+
+    /// Record the claimed pending group `due` as refused before admission:
+    /// one terminal errored group execution carrying `error`, serving the
+    /// owner's stored principal `owner` and recorded by the tenant SYSTEM
+    /// principal `system`.
+    ///
+    /// For an owner that is inactive or whose authority was rejected. The
+    /// execution asserts no accepted authority, pins no inputs or snapshot,
+    /// has no result, and is never claimed, so no Verifier runs and no
+    /// Operator is dispatched. The caller consumes the pending row in the
+    /// same transaction and commits; rolling back records nothing and leaves
+    /// the group pending.
+    ///
+    /// # Errors
+    /// Returns the database error when the insert fails, including when the
+    /// binding or its Verifier Card no longer exists, or a decode error when
+    /// the returned identity is malformed.
+    #[tracing::instrument(skip(self, conn, due, error), fields(operation = "verification.group.refuse", binding_id = %due.binding_id, group_id = %due.group_id, code = %error.code))]
+    pub async fn refuse_group(
+        &self,
+        conn: &mut TenantConn<'_>,
+        due: &DueGroup,
+        owner: PrincipalId,
+        system: PrincipalId,
+        error: &VerificationError,
+    ) -> Result<ExecutionId, SqlxError> {
+        let execution_id: Uuid = sqlx::query_scalar(INSERT_GROUP_ERROR_SQL)
+            .bind(ExecutionId::new_v7().as_uuid())
+            .bind(due.binding_id.as_uuid())
+            .bind(due.group_id.as_str())
+            .bind(owner.as_uuid())
+            .bind(system.as_uuid())
+            .bind(Json(error))
+            .bind(self.retry.max_attempts)
+            .fetch_one(&mut **conn.transaction())
+            .await?;
+        stored(ExecutionId::new(execution_id))
     }
 
     /// Enqueue one group execution of `binding_id` judging `pinned`.

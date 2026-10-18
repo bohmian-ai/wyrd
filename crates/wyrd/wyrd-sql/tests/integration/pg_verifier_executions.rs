@@ -2573,14 +2573,18 @@ fn source_text() -> SourceText {
 }
 
 /// Acknowledged source activity schedules one pending row per matching
-/// binding and group, due `after` past database time and consumed by its
-/// claim; the same snapshot content enqueues once whatever its status, while
-/// distinct snapshots overlap; group verdicts are compared in settlement
-/// order — baseline, unchanged, changed — and a replay never recompares.
+/// binding and group, due exactly `after` past database time — a one-year
+/// `after` included — and consumed by its claim; the same snapshot content
+/// enqueues once whatever its status, while distinct snapshots overlap;
+/// group verdicts are compared in settlement order — baseline, unchanged,
+/// changed — and a replay never recompares. A group refused before
+/// admission is one terminal errored execution with no authority, inputs,
+/// snapshot, or result, which is never claimed, and no runnable execution
+/// may omit its authority.
 ///
 /// # Panics
-/// Panics when scheduling, snapshot identity, the pinned input, or
-/// verdict-change dispatch differs.
+/// Panics when scheduling, snapshot identity, the pinned input,
+/// verdict-change dispatch, or the refused shape differs.
 #[tokio::test]
 async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -2590,6 +2594,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
     let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
     let verifier = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
+    let yearly = register_verifier(&mut conn, &actor, "yearly", custom_drift()).await;
     let slot = SlotName::new("turns").expect("valid slot name");
     let settings = GroupEndSettings {
         after: TriggerDuration::parse("1h").expect("valid duration"),
@@ -2604,21 +2609,35 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         )]),
     };
     let operator = FrozenTarget::Digest("sha256:operator".to_owned());
-    let binding = project_bindings(
+    let bindings = project_bindings(
         &mut conn,
         &owner,
         &CardKind::Service,
-        &[NewBinding {
-            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-            card_uid: owner.clone(),
-            verifier_card_uid: verifier.clone(),
-            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
-            operators: vec![operator],
-            activation: BindingActivation::GroupEnd(settings.clone()),
-        }],
+        &[
+            NewBinding {
+                subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                card_uid: owner.clone(),
+                verifier_card_uid: verifier.clone(),
+                trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+                operators: vec![operator],
+                activation: BindingActivation::GroupEnd(settings.clone()),
+            },
+            NewBinding {
+                subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                card_uid: owner.clone(),
+                verifier_card_uid: yearly.clone(),
+                trigger: FrozenTarget::Digest("sha256:yearly".to_owned()),
+                operators: Vec::new(),
+                activation: BindingActivation::GroupEnd(GroupEndSettings {
+                    after: TriggerDuration::parse("365d").expect("one year is accepted"),
+                    ..settings.clone()
+                }),
+            },
+        ],
     )
     .await
-    .expect("binding projects")[0];
+    .expect("bindings project");
+    let (binding, year) = (bindings[0], bindings[1]);
     record_machine_authentication(&mut conn, principal)
         .await
         .expect("owner activates");
@@ -2650,8 +2669,9 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         "SELECT binding_id, group_id,
                 due_at BETWEEN statement_timestamp() + INTERVAL '59 minutes'
                            AND statement_timestamp() + INTERVAL '61 minutes'
-           FROM wyrd.verification_group_pending",
+           FROM wyrd.verification_group_pending WHERE binding_id = $1",
     )
+    .bind(binding.as_uuid())
     .fetch_all(&mut **conn.transaction())
     .await
     .expect("pending rows read");
@@ -2660,6 +2680,20 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         vec![(binding.as_uuid(), "order-1".to_owned(), true)],
         "one row per binding and group, due after the quiet period"
     );
+    let apart: bool = sqlx::query_scalar(
+        "SELECT y.due_at - h.due_at = INTERVAL '365 days' - INTERVAL '1 hour'
+           FROM wyrd.verification_group_pending h, wyrd.verification_group_pending y
+          WHERE h.binding_id = $1 AND y.binding_id = $2",
+    )
+    .bind(binding.as_uuid())
+    .bind(year.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("both rows read");
+    assert!(
+        apart,
+        "one statement schedules both, each exactly its own after"
+    );
     assert!(
         queue
             .claim_due_group(&mut conn)
@@ -2667,7 +2701,11 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
             .expect("claim")
             .is_none()
     );
-    sqlx::query("UPDATE wyrd.verification_group_pending SET due_at = statement_timestamp() - INTERVAL '1 second'")
+    let expire = "UPDATE wyrd.verification_group_pending
+                     SET due_at = statement_timestamp() - INTERVAL '1 second'
+                   WHERE binding_id = $1";
+    sqlx::query(expire)
+        .bind(binding.as_uuid())
         .execute(&mut **conn.transaction())
         .await
         .expect("row expires");
@@ -2677,8 +2715,14 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .expect("claim")
         .expect("an expired group is due");
     assert_eq!(
-        (due.binding_id, &due.group_id, &due.settings, due.owner),
-        (binding, &group, &settings, Some(principal))
+        (
+            due.binding_id,
+            &due.group_id,
+            &due.settings,
+            due.owner,
+            due.active
+        ),
+        (binding, &group, &settings, Some(principal), true)
     );
     queue
         .consume_group(&mut conn, &due)
@@ -2826,5 +2870,114 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     assert_eq!(
         context.render("{{group.previous_verdict}}->{{verdict}}"),
         Ok("failed->passed".to_owned())
+    );
+
+    let refused_group = GroupId::new("refused-1").expect("valid group id");
+    queue
+        .record_group_activity(
+            &mut conn,
+            &[GroupActivity {
+                group_id: refused_group.clone(),
+                ..activity(&source)
+            }],
+        )
+        .await
+        .expect("activity records");
+    sqlx::query(expire)
+        .bind(binding.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("row expires");
+    let due = queue
+        .claim_due_group(&mut conn)
+        .await
+        .expect("claim")
+        .expect("the refused group is due");
+    assert_eq!(due.group_id, refused_group);
+    let system = authority.attribution().act_principal_id;
+    let error = VerificationError {
+        code: "WYRD_AUTH_401_CREDENTIAL_REVOKED".to_owned(),
+        message: "the binding owner is not runtime-active".to_owned(),
+    };
+    let refused = queue
+        .refuse_group(&mut conn, &due, principal, system, &error)
+        .await
+        .expect("the refusal records");
+    queue
+        .consume_group(&mut conn, &due)
+        .await
+        .expect("row consumed");
+    let shape: (String, bool, bool, bool, bool, bool, bool, bool, i32) = sqlx::query_as(
+        "SELECT status, authority IS NULL, inputs IS NULL, group_snapshot_sha256 IS NULL,
+                group_sources IS NULL, result_id IS NULL, settled_at IS NOT NULL,
+                lease_token IS NULL AND next_attempt_at IS NULL, attempts
+           FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(refused.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the refusal reads");
+    assert_eq!(
+        shape,
+        (
+            "errored".to_owned(),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            0
+        ),
+        "terminal, authority-free, unpinned, and unleased"
+    );
+    let status = queue
+        .execution_status(&mut conn, refused)
+        .await
+        .expect("status reads")
+        .expect("the refusal exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Errored);
+    assert_eq!(status.state.error.as_ref(), Some(&error));
+    assert_eq!(status.state.group_id.as_ref(), Some(&refused_group));
+    assert_eq!(status.state.owner_card_uid.as_ref(), Some(&owner));
+    assert_eq!(status.state.group, None);
+    assert!(status.state.dispatches.is_empty(), "no Operator reacts");
+    assert_eq!(
+        status.attribution,
+        Attribution::new(principal, system),
+        "the owner's stored principal, recorded by SYSTEM"
+    );
+    assert!(
+        queue
+            .claim(&mut conn, Duration::minutes(5))
+            .await
+            .expect("claim runs")
+            .is_none(),
+        "a refusal is never claimed"
+    );
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("claim")
+            .is_none(),
+        "the refusal consumed its group"
+    );
+    let runnable = sqlx::query(
+        "UPDATE wyrd.verifier_executions
+            SET status = 'pending', error = NULL, settled_at = NULL,
+                next_attempt_at = statement_timestamp()
+          WHERE execution_id = $1",
+    )
+    .bind(refused.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect_err("a runnable execution needs accepted authority");
+    assert!(
+        runnable
+            .to_string()
+            .contains("verifier_executions_refused_shape"),
+        "{runnable}"
     );
 }

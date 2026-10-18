@@ -1,5 +1,6 @@
-# The support conversation under the largest `after` a Trigger accepts:
-# its groups never come due, and scheduling them must not stop the scheduler.
+# The support conversation under a one-year `after`, the longest a Trigger
+# accepts: its groups do not come due during a test, and scheduling them must
+# not hold up a neighboring group's progress.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -14,4 +15,4 @@ spec:
       verified_by:
         - verifier: ./turn-check.yaml
         - verifier: ./conversation-review.yaml
-          runs_on: {kind: group_end, after: 999999999d}
+          runs_on: {kind: group_end, after: 365d}

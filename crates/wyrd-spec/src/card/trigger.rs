@@ -55,7 +55,8 @@ pub enum TriggerActivation {
     },
 }
 
-/// A positive whole duration authored as `<n><unit>`, such as `30m`.
+/// A positive whole duration authored as `<n><unit>`, such as `30m`, of at
+/// most one fixed year ([`TriggerDuration::MAX_SECONDS`]).
 ///
 /// The unit is `s`, `m`, `h`, or `d` (seconds, minutes, hours, or 24-hour
 /// days) and `n` is a positive integer without a leading zero. The authored
@@ -74,16 +75,24 @@ pub struct TriggerDuration {
 const DURATION_PATTERN: &str = "^[1-9][0-9]{0,8}[smhd]$";
 
 /// Generated-schema description of a [`TriggerDuration`].
-const DURATION_DESCRIPTION: &str =
-    "Positive whole duration <n><unit> with unit s, m, h, or d, such as 30m or 24h.";
+const DURATION_DESCRIPTION: &str = "Positive whole duration <n><unit> with unit s, m, h, or d, \
+     such as 30m or 24h, at most one year: 365d = 8760h = 525600m = 31536000s.";
 
 impl TriggerDuration {
+    /// The longest accepted duration: one fixed year of 365 24-hour days.
+    pub const MAX_SECONDS: u64 = 365 * 86_400;
+
     /// Parse authored `<n><unit>` text.
+    ///
+    /// Every write and read of a Trigger decodes through here, so a longer
+    /// duration is refused before anything persists; an accepted duration is
+    /// used exactly.
     ///
     /// # Errors
     /// Returns a message naming the accepted form when the text has no known
     /// unit, its count is zero, has a leading zero or sign, or exceeds nine
-    /// digits.
+    /// digits, and one naming the maximum when it is longer than
+    /// [`Self::MAX_SECONDS`].
     pub fn parse(text: &str) -> Result<Self, String> {
         let invalid = || format!("{text:?} is not a duration <n><s|m|h|d>, such as 30m");
         let split = text.len().checked_sub(1).ok_or_else(invalid)?;
@@ -103,9 +112,15 @@ impl TriggerDuration {
             return Err(invalid());
         }
         let count: u64 = count.parse().map_err(|_| invalid())?;
+        let seconds = count * scale;
+        if seconds > Self::MAX_SECONDS {
+            return Err(format!(
+                "{text:?} is longer than the maximum duration of one year (365d)"
+            ));
+        }
         Ok(Self {
             text: text.to_owned(),
-            seconds: count * scale,
+            seconds,
         })
     }
 
@@ -281,8 +296,9 @@ mod tests {
     }
 
     /// Decode a group-end activation with its one duration, read back
-    /// verbatim, and refuse a missing `after`, the removed multi-clock fields,
-    /// or a malformed duration.
+    /// verbatim, accept one fixed year exactly in every unit, and refuse a
+    /// missing `after`, the removed multi-clock fields, a malformed duration,
+    /// or the smallest duration past one year in each unit.
     ///
     /// # Panics
     /// Panics when the authored form fails to decode, reads back differently,
@@ -326,5 +342,23 @@ mod tests {
             TriggerDuration::parse("45s").expect("seconds").seconds(),
             45
         );
+        for year in ["31536000s", "525600m", "8760h", "365d"] {
+            let after = TriggerDuration::parse(year).expect("one year is accepted");
+            assert_eq!(after.seconds(), 31_536_000, "{year}");
+            assert_eq!(after.as_str(), year);
+            let authored = serde_json::json!({"kind": "group_end", "after": year});
+            let spec: TriggerSpec =
+                serde_json::from_value(authored.clone()).expect("one year decodes");
+            assert_eq!(serde_json::to_value(&spec).expect("encodes"), authored);
+        }
+        for over in ["31536001s", "525601m", "8761h", "366d", "999999999d"] {
+            let error = TriggerDuration::parse(over).expect_err(over);
+            assert!(error.contains("365d"), "{over}: {error}");
+            let refused = serde_json::json!({"kind": "group_end", "after": over});
+            assert!(
+                serde_json::from_value::<TriggerSpec>(refused).is_err(),
+                "{over}"
+            );
+        }
     }
 }

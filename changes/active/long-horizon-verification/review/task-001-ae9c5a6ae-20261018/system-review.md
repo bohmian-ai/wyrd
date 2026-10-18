@@ -1,0 +1,76 @@
+# TASK-001 independent system resilience review
+
+Overall result: **FAIL**.
+
+## Subject and limits
+
+Repository: `/home/thorrester/Documents/GitHub/wyrd-worktrees/long-horizon-verification-task-001`. Immutable base `ef3a57b0776dd7bc451273b9176498fcca700550`; candidate/HEAD `ae9c5a6aee22b691e2dc04c805cb5d1dddfcb9bf`. Reviewed the cumulative runtime/contract/persistence diff and its surrounding owners; `47e0c9ab7...ae9c5a6ae` was remediation navigation only. Read original TASK-001, both prior verdict/validation/system reports, R1 and R2 tasks and their appended evidence. No current-round sibling report was read.
+
+Authority is the user-selected approved revision 13 behavior in `changes/active/long-horizon-verification/spec.md`. Its draft-14 header neither approves the exception nor creates a retained-upgrade obligation. The finding-1 amendment permits first-source-within-finality discovery, newest activity first and one bounded newest page; no continuing cursor is required. The finding-2 decision requires one selected identity result to own membership and capacity after exclusion. TASK-002 scheduled inputs, TASK-003 process pressure/progress and REQ-015 capacity qualification are excluded.
+
+Governing references: AGENTS.md, architecture/agent-rules.md, wyrd-design.md and wyrd-doctrine.mdx, bifrost-design.md (managed verification tables, cuts, terminal safety and outbox), operations/deployment-and-release.md and reliability-and-recovery.md, references/README.md, doctrine/architecture-constraints.md, domain/analytical-operations-reliability.md and evaluation.md, and languages/spec-driven-development.md, maintainer-style.md and testing-workflows.md. CodeGraph was consulted first for runtime navigation. No source or test was changed and no Cargo/test lane was run. Appended green claims are evidence claims inspected against source, with root reruns forthcoming.
+
+## Deployed paths, faults and recovery
+
+One logical wyrd-server has a gateway and may have role-targeted replicas. Verification-hosting processes compose GroupPoller into the existing scheduler, using Postgres for binding/cursor/snapshot/lease/dispatch authority, Scribe for acknowledged evidence and Oracle for local or peer analytical reads. No new serving process, transport, queue or durable group inventory appears.
+
+| Changed path / existing owner | Fault boundary, surviving state, and recovery | Assessment |
+|---|---|---|
+| Rust/Python/TS Observe → VerificationRequest → VerificationControl and ResultPayloadBuilder | `group_id` and authenticated Service owner extend ordinary input/result metadata. Staging remains process-local ScribeOutbox; submit acceptance is asynchronous. Abrupt death before Scribe acknowledgement may lose rows. Retained source rows survive producer process/Run lifetime. | Preserves REQ-005 and no extra producer Postgres dependency. |
+| Registration → EffectiveSpecs → BindingProjector → verification_bindings | Source syntax, slot/requirement existence, exact same-site identity, ambiguity, cycles and Trigger/reaction pairing are checked before persistence. Pinned source identities/settings survive restart. Server preflight and shared artifact-manifest validation retain existing request rollback/error boundaries. | No second resolver or loader is needed; invalid registration remains a request refusal. |
+| RuntimeBuilder → VerificationScheduler::poll_groups → GroupPoller | Each binding uses TenantConn and SKIP LOCKED. Oracle denial/outage/timeout/protocol failure maps to GroupPollError::Read; scheduler logs and commits cadence advancement, retrying later. SQL error aborts the transaction. Cancellation before commit selection rolls back; selected commit is awaited. | Failure stays at poll/request boundary; no changed path crashes shared server or requires unrelated APIs to stop. |
+| Discovery → selection → Ended → queue coverage | Each Oracle statement has its own cut. Actual returned distinct selection now supplies both capacity and membership. Refused rows are removed from selection and a capped selection is refilled. However discovery computes earliest activity before that exclusion. | SYS-R3-001 below. The accepted page bound does not resolve this eligibility mismatch. |
+| Snapshot → queue.enqueue_group | Exact-ID payload reads prevent new arrivals entering an already selected snapshot. Sources::complete rejects missing listed input/direct-result payloads. Genuine absent queued selected results stay null. Input lists and coverage are committed with cursor. Earlier whole groups can survive a later group read failure in the same committed tick. | Correct containment in source; incomplete-success integration proof is still absent (SYS-R3-002). |
+| Queue → VerifierRunner → settlement | Outstanding partial unique index and group_states fence one group execution. Pinned inputs survive process death and retry. Lease renewal/expiry, stale-settlement fencing, shutdown release and existing backoff remain the execution owner. Overflow marker completes inconclusive before invoking checks. | No new group-specific recovery machinery; a failed attempt does not change pinned input history. |
+| Serial settlement → Operator dispatch and result outbox | Complete persists group verdict and compares previous settled same-group result in queue owner; first is baseline, unchanged produces none, changed inserts ordinary dispatches. Dispatch retries keep frozen context. Result outbox loss does not roll back execution settlement. | Existing transaction, at-least-once delivery and allowed outbox loss boundaries retained. |
+| Agent check → HostedTools → BoundedQuery | Only declared bifrost.query is added, under accepted caller, tool/query/payload permissions, deadline and existing admission. Live spans remain outside frozen source snapshot. Failed model/query/check paths preserve existing inconclusive/retry behavior. | No new live-span persistence promise or workspace/mutating tool is introduced. |
+| Test fault adaptation → scheduled query and public collect siblings | QueryStreamFaultController::apply is test-support-only and shared by BoundedQuery and ScheduledQueryCaller; public HTTP fault handling remains separate. Scheduled consumer still validates terminal and clean EOF, cancels/settles failed streams. | Actual grouped internal path now consumes the armed truncation; the new proof is reachable. |
+
+The existing scheduler, queue, scheduled query caller, accepted authority, Vala engine and Operator delivery remain the appropriate complete workflow owners. The group reader supplies required source selection rather than duplicating a ready-made window reader. No recommendation below requires a new owner, receipt barrier, producer lookup or fault subsystem.
+
+## Proposed material findings
+
+### SYS-R3-001 — INCORRECT: refused input can permanently expire a valid group before refusal filtering
+
+**Obligation:** REQ-002/003/004/005 source eligibility, R2's instruction to remove refused submissions before selecting eligible source evidence, and TASK-001 replay/conflict exclusion. The approved discovery amendment uses the first *source* row; selection's own contract correctly says a refused submission is no source row.
+
+**Locations:** `crates/wyrd/wyrd-server/src/verification/groups.rs:201–220` computes `HAVING MIN(at)` over raw Sources::surfaces; `:248–272` applies `queue.refused_submissions` only after candidate discovery. Producer: `components/verification/service.rs:610–647` stages the input before acceptance; queue `accept`/`insert_submission`, `crates/wyrd/wyrd-sql/src/queries/verifier_executions.rs:1275–1385`, persists conflicts as errored unclaimed distinct execution IDs. Existing refusal authority is `REFUSED_SUBMISSIONS_SQL` and `refused_submissions` at `:259–265,1730–1743`.
+
+**Reachable path:** same Service/subject/Verifier uses key K for group H. At t0 it sends a different payload under K for group G. The input is retained with G, but asynchronous acceptance settles that distinct attempt as an idempotency conflict. There need be no accepted source in G at t0. At t1, more than the pinned finality after t0, the same owner sends valid newly keyed/unkeyed source executions for G. Those accepted rows are young and would establish an eligible group if selection ran. Every subsequent discovery nevertheless sees the retained refused input as G's MIN(at), rejects G in HAVING, and never reaches refusal filtering. Retention may be longer than finality; no corruption, overload or unusual failure injection is necessary. A dependency outage/restart does not repair it because both evidence and refusal survive in their normal stores.
+
+**Observable consequence:** valid retained source work receives no group snapshot/result or verdict-change reaction indefinitely, despite its actual earliest eligible source being within pinned finality. Repeated polls succeed and advance cadence, hiding the lost work. This is not a demand for a cursor, wider page, longer finality or retained-upgrade support.
+
+**Smallest correction:** keep candidate eligibility and timing on GroupPoller/Sources, but ensure a settled refused submission cannot determine the first/newest source activity used for discovery eligibility. Reuse the queue's existing refusal classification consistently with selection before applying that source-derived finality decision. Preserve bounded newest-page discovery, the user's accepted ceiling, owner/tuple/RLS filters, single selected membership authority, existing outbox and no producer IO. Do not bolt another check onto the runner: this group never reaches it. Private query layout is implementation-owned; no new group inventory is justified.
+
+**Focused proof:** through existing grouped poll/queue fixture, retain an old settled conflict as G's only old row and a newer accepted G execution within finality, with a key originally belonging to H; poll and assert G produces exactly the accepted IDs once. Use existing time/row fixtures, not long sleeps or synthetic host load. An actually accepted old source must still enforce finality. This is a sibling of prior FIND-TASK-001-2's refusal/source authority and should be consolidated there if validation confirms it, not multiplied by SDK caller.
+
+### SYS-R3-002 — MISSING: successful but incomplete payload read is proved only as a predicate
+
+**Obligation:** R2 FIND-TASK-001-2 focused closure explicitly requires a successfully terminated incomplete selected-payload read, no prefix enqueue, later complete recovery and genuine-null preservation. Original AC-006 requires lag/overlap not to become false completeness.
+
+**Locations:** `groups.rs:1192–1252` `incomplete_selections_defer` constructs Payloads and calls Sources::complete directly. Production seam is snapshot at `:311–346`, payloads at `:375–437`, and query run at `:461–476`. New `tests/integration/pg_verification_groups.rs` adds only transport truncation and stable conflict/ceiling scenarios.
+
+**Evidence/consequence:** the unit credibly proves missing input/direct outcome maps return false and a genuinely unpublished queued outcome stays null. It does not run a successfully terminated incomplete SQL payload result through snapshot, verify no queue row, then retry to one complete snapshot. The new partial_group_reads test truncates discovery before terminal; it closes FIND-8's distinct transport requirement. Static source appears to return None correctly, so this is a residual required proof gap, not a demonstrated production prefix bug.
+
+**Smallest correction/proof:** extend the existing grouped/query/queue seam proof to drive that success-with-missing-selected-payload condition and later completion; retain complete() at snapshot owner and terminal validation at stream owner. No duplicate guard, public fault API, generic harness, extra SDK restart control or broad suite is required. Consolidate with prior FIND-2's explicit proof obligation if retained by validation.
+
+## Prior finding closure
+
+| Prior ID | Current source/proof assessment |
+|---|---|
+| FIND-TASK-001-1 | Closed under user amendment. Completion watermark/hour cutoff are gone; newest one-page discovery and first-source finality are present, queue coverage handles late work. No cursor request. SYS-R3-001 concerns which rows are source evidence, not reopening that page decision. |
+| FIND-TASK-001-2 | Old separate count authority is removed. Selection owns over/under and IDs, exact payload predicates remain, stable accepted+conflict/over fixture exists. Residual source eligibility sibling and explicit incomplete-success proof above prevent full closure. |
+| FIND-TASK-001-3 | Checked DateTime arithmetic and elapsed spans retain largest accepted duration safety without crashing scheduler capability; largest-duration pure test exists. |
+| FIND-TASK-001-4 | SourceText schema remains source-owned string plus four typed object alternatives; TS/runtime/served OpenAPI coverage exists. No new runtime failure consequence found. |
+| FIND-TASK-001-5 | Group reads use Caller::accepted and ScheduledQueryCaller::authenticated; owner denial/regrant journey covers ordinary grants. Drift's separate narrow authority exception remains. |
+| FIND-TASK-001-6 | Original documented symbols remain fixed; FrameAgent::submit now documents rejected-upload panic. No new system finding. |
+| FIND-TASK-001-7 | Active evaluation/design text permits only declared bifrost.query with ordinary permission and no workspace/mutating tools; runtime and validation agree. |
+| FIND-TASK-001-8 | Transport gap closed by partial_group_reads_enqueue_nothing_until_a_complete_poll: EOF-after-batch now reaches internal caller, first tick errors, next enqueues one complete two-member snapshot, third is no-op. Remaining earlier schema/negative/live-query/MCP stories remain present. |
+
+## Recovery evidence and verdict
+
+Source-inspected journey owners cover support replay/conflict/isolation; refund serial snapshots/reactions; coding declared source resolution and live span tools; sampled media at/over ceiling and queued item restart; conversation restart/no duplicates; late work/null-to-result revisions; owner-grant denial/regrant. The new managed-Postgres tests directly exercise stable refused-at-ceiling and partial internal discovery failure/retry. Group units cover safe duration arithmetic, eligibility/ordering/value mapping, SQL predicates and completeness predicate. ScheduledQueryCaller retains clean-EOF/terminal validation, cancellation and settlement tests; the test-only adaptation reuses that trust boundary.
+
+R2's appended record claims six group units, two managed-Postgres tests, seven Rust journeys, eleven MCP/query cases, two query lifecycle cases, fmt/lints/tenant-isolation all pass. Those bodies and selected paths were inspected; I independently executed none. Root must reconcile fresh command results and immutable HEAD before final acceptance. No claim here turns healthy-path/restart tests into proof of missing incomplete-success recovery.
+
+Overall **FAIL**, with proposed SYS-R3-001 and SYS-R3-002 for independent validation. Fault containment, crash-loss boundary, queue restart recovery and changed internal terminal path otherwise satisfy this system lens. No new product/architecture decision or service-wide fail-closed action is required by these proposals.

@@ -1549,6 +1549,16 @@ async fn resolve_existing(
 }
 
 /// Enforce request-wide invariants before database access.
+///
+/// Each submission must be `wyrd/v1`, decode as its kind, bind validly, match
+/// its declared artifact hash, and, as a Verifier, pass the same
+/// [`VerifierSpec::validate`](wyrd_spec::card::verifier::VerifierSpec::validate)
+/// the loader runs, so a direct request cannot register what an SDK refuses.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*` for a multi-card artifact request, a wrong
+/// apiVersion, an undecodable spec or a manifest hash mismatch, and the
+/// binding or Verifier `WYRD_SPEC_400_VALIDATION` refusal otherwise.
 fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
     if request.submissions.len() > 1
         && request
@@ -1573,6 +1583,9 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
         if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
             return Err(error);
+        }
+        if let Spec::Verifier(verifier) = &spec {
+            verifier.validate()?;
         }
         let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()

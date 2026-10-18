@@ -18,7 +18,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::{CardRef, CardSelector, Cards, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
@@ -1650,8 +1650,13 @@ async fn script_coding_judge(judge: &MockServer, trace: &str) {
 /// `bifrost.query`, under the owning Service's ordinary tool and query
 /// grants, reads live the spans exported after the turns; once that grant
 /// is revoked, a later session's read is denied with nothing returned. An empty `each` selection is inconclusive `empty_selection`
-/// inline and after a step. A child-field source, a source with no binding
-/// on its site, and a source cycle are refused at registration.
+/// inline and after a step. Holding only one of the tool-invoke and query
+/// grants, a session's read is denied on the missing one. A child-field
+/// source, a source matching no or two bindings on its site, a source naming
+/// an undeclared slot, a source cycle, and a typed or source slot named
+/// `group_id` are refused at registration through the SDK and, for the
+/// reserved slot, over direct HTTP, leaving nothing registered; a source
+/// Verifier named by reference to its registered Card binds.
 ///
 /// # Panics
 /// Panics when a step fails, the session is not reviewed in time, or a
@@ -1820,59 +1825,125 @@ async fn grouped_coding_uses_declared_sources() {
         "the check reads the spans live: {read}"
     );
 
-    principals
-        .revoke_role(&principal, "live_reader")
-        .await
-        .expect("the live read is revoked");
-    let later = GroupId::new("session-2").expect("group id");
-    run.observe()
-        .group_id(later.clone())
-        .verify(
-            "coding-turn",
-            Inputs::named([
-                ("call", Input::from(calls[0].clone())),
-                ("trace", Input::from(json!(trace))),
-            ]),
+    let all = |resource: &str, action: &str| json!({ "resource": resource, "action": action, "scope": "all" });
+    deployment
+        .server()
+        .seed_role(
+            "verification_reader",
+            &[
+                all("cards", "read"),
+                all("verifier", "run"),
+                all("bifrost_table", "read"),
+                all("bifrost_table", "write"),
+                all("bifrost_record", "write"),
+                all("tool", "invoke"),
+                all("gateway", "invoke"),
+                json!({
+                    "resource": "bifrost_query",
+                    "action": "read",
+                    "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "verification" } } },
+                }),
+            ],
         )
         .await
-        .expect("the call is judged");
-    let revoked = deployment
-        .group_execution(&coding.binding, Some(&judged.execution_id), WAIT)
-        .await;
-    assert_eq!(revoked.group_id.as_ref(), Some(&later));
-    let denied: Vec<_> = judged_bodies(&assistant.judge, LIVE_REVIEW)
-        .await
-        .into_iter()
-        .filter(|body| body.contains(TOOL_TURN) && body.contains("WYRD_PERMISSION_403_DENIED_RBAC"))
-        .collect();
-    let [denied] = &denied[..] else {
-        panic!("the query read is denied once: {denied:?}");
-    };
-    assert!(
-        !denied.contains("edit-file"),
-        "a denied read returns nothing: {denied}"
-    );
+        .expect("role seeds");
+    let mut after = judged.execution_id;
+    for (granted, revoked, denial) in [
+        (None, "live_reader", "lacks Tool/Invoke"),
+        (
+            Some("verification_reader"),
+            "workload",
+            "WYRD_VALA_403_QUERY_FORBIDDEN",
+        ),
+    ] {
+        if let Some(role) = granted {
+            principals
+                .grant_role(&principal, role)
+                .await
+                .expect("the role is granted");
+        }
+        principals
+            .revoke_role(&principal, revoked)
+            .await
+            .expect("the role is revoked");
+        let later = GroupId::new(format!("session-{revoked}")).expect("group id");
+        run.observe()
+            .group_id(later.clone())
+            .verify(
+                "coding-turn",
+                Inputs::named([
+                    ("call", Input::from(calls[0].clone())),
+                    ("trace", Input::from(json!(trace))),
+                ]),
+            )
+            .await
+            .expect("the call is judged");
+        let review = deployment
+            .group_execution(&coding.binding, Some(&after), WAIT)
+            .await;
+        after = review.execution_id;
+        assert_eq!(review.group_id.as_ref(), Some(&later));
+        let reads: Vec<_> = judged_bodies(&assistant.judge, LIVE_REVIEW)
+            .await
+            .into_iter()
+            .filter(|body| body.contains(TOOL_TURN))
+            .collect();
+        let read = reads.last().expect("the review asked to read");
+        assert!(
+            read.contains(denial) && !read.contains("edit-file"),
+            "without {revoked}, the read is denied with nothing returned: {read}"
+        );
+    }
 
     let cards = deployment.cards().await;
-    for (relative, code, reason) in [
+    for (relative, kind, code, reason) in [
         (
-            "coding-child.yaml",
+            "coding-child",
+            CardKind::Service,
             "WYRD_LOADER_400_INVALID_ENVELOPE",
             "child fields",
         ),
         (
-            "coding-unbound.yaml",
+            "coding-unbound",
+            CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "matches 0 bindings",
         ),
         (
-            "coding-cycle.yaml",
+            "support-ambiguous",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 2 bindings",
+        ),
+        (
+            "support-undeclared",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "does not declare",
+        ),
+        (
+            "coding-cycle",
+            CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "forms a source cycle",
         ),
+        (
+            "reserved-typed",
+            CardKind::Verifier,
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+        (
+            "reserved-source",
+            CardKind::Verifier,
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
     ] {
         let refused = cards
-            .register_from_path(&fixture(&format!("cards/verify_in_real_time/{relative}")))
+            .register_from_path(&fixture(&format!(
+                "cards/verify_in_real_time/{relative}.yaml"
+            )))
             .await
             .expect_err(relative);
         assert_eq!(refused.code(), code, "{relative}: {refused}");
@@ -1880,6 +1951,66 @@ async fn grouped_coding_uses_declared_sources() {
             format!("{refused:?}").contains(reason),
             "{relative}: {refused:?}"
         );
+        let absent = cards
+            .resolve_latest(
+                kind,
+                "default".parse().expect("space parses"),
+                relative.parse().expect("name parses"),
+            )
+            .await
+            .expect_err("a refused Card is not registered");
+        assert_eq!(
+            absent.code(),
+            "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+            "{relative}"
+        );
+    }
+    cards
+        .register_from_path(&fixture("cards/verify_in_real_time/coding-external.yaml"))
+        .await
+        .expect("a registered source Verifier named by reference binds");
+    let token = deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    for (relative, slot) in [
+        ("reserved-typed", json!({"type": "json"})),
+        ("reserved-source", json!("verifiers.turn-check.inputs.turn")),
+    ] {
+        let card = json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Verifier",
+            "metadata": {"name": relative, "version": "1.0.0", "space": "default"},
+            "spec": {
+                "inputs": {"group_id": slot},
+                "requirements": [{
+                    "id": "present",
+                    "statement": "The slot is present",
+                    "check": {"kind": "assert", "path": "inputs.group_id", "operator": "is_not_null"},
+                }],
+            },
+            "artifacts": [],
+        });
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/cards",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header("Idempotency-Key", relative)
+            .json(&json!({ "submissions": [card] }))
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        let refused: serde_json::Value = response.json().await.expect("the body is JSON");
+        assert_eq!(status, 400, "{relative}: {refused}");
+        assert_eq!(refused["code"], "WYRD_SPEC_400_VALIDATION", "{refused}");
+        assert!(refused.to_string().contains("inputs.group_id"), "{refused}");
     }
     coding.state.shutdown().await.expect("Bifrost stops");
     assistant.deployment.shutdown().await;

@@ -458,6 +458,89 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Count the tenant's retained `vala.verification.execution_inputs` rows,
+/// in total and for `execution`, after the Scribe outbox settles.
+///
+/// # Panics
+/// Panics when staged writes do not publish or the rows cannot be read.
+async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, usize) {
+    server.flush_bifrost().await.expect("inputs publish");
+    let rows = server
+        .retained_records(
+            server.data_tenant_id(),
+            "SELECT execution_id FROM vala.verification.execution_inputs".to_owned(),
+        )
+        .await
+        .expect("inputs rows read");
+    let mine = rows
+        .iter()
+        .filter(|row| row.first().cloned().flatten() == Some(execution.to_string()))
+        .count();
+    (rows.len(), mine)
+}
+
+/// A keyed enqueue refused for a full Scribe staging share is refused with
+/// typed retryable pressure before anything is staged; once the share drains,
+/// the identical keyed request is accepted, its replay returns the same
+/// execution, and the tenant holds one execution and one inputs row per
+/// accepted request, none for the refused attempt.
+///
+/// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
+/// unwritten and hold the whole reserved share (two of three slots)
+/// deterministically.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, replay, queue, or inputs expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn staging_refusal_recovers_the_same_enqueue_identity() {
+    let server = WyrdTestServer::builder()
+        .with_scribe_outbox_capacity_for_test(3)
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vr-pressure", &["editor"]).await;
+    server.flush_bifrost().await.expect("setup settles");
+
+    let stall = server.stall_next_bifrost_write().expect("Scribe stalls");
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let (status, ahead) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ahead}");
+    stall.wait_entered().await;
+    let (status, behind) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{behind}");
+    let (status, refused) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
+    assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
+    assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
+
+    stall.release();
+    stall.wait_completed().await;
+    server.flush_bifrost().await.expect("the share drains");
+    for admitted in [&ahead, &behind] {
+        visible_execution(&server, &jwt, execution_id(admitted)).await;
+    }
+    assert_eq!(fixture.queued().await, 2, "the refusal queued nothing");
+    let (status, accepted) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let recovered = execution_id(&accepted);
+    assert_eq!(
+        input_rows(&server, recovered).await,
+        (3, 1),
+        "one inputs row per accepted request, none for the refused attempt"
+    );
+    let (status, replay) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(execution_id(&replay), recovered, "the retry replays");
+    assert_eq!(
+        fixture.queued().await,
+        3,
+        "one execution per accepted request"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Malformed and oversized bodies, an invalid Idempotency-Key, a caller
 /// without `verifier:run`, and a caller holding only an unrelated `operators:invoke` are refused
 /// with stable codes before anything is staged, each authorization refusal

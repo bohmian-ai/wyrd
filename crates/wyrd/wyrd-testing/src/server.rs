@@ -1999,10 +1999,14 @@ impl WyrdTestServer {
     /// Runs `sql` against the tenant's retained data under the inspection
     /// context, every selected column decoded as text or Variant JSON.
     ///
+    /// A journey reads retained tables that have no dedicated reader here,
+    /// such as `vala.verification.execution_inputs`, through this one query
+    /// path; the audit and span readers frame their SQL around it.
+    ///
     /// # Errors
     /// Returns the authorization, query, decode, or stream failure. A table
     /// the tenant has never published reads as no rows.
-    async fn retained_records(
+    pub async fn retained_records(
         &self,
         tenant: DataTenantId,
         sql: String,

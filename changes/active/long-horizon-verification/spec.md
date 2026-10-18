@@ -1,6 +1,6 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 17
+revision: 18
 status: approved
 ---
 
@@ -35,6 +35,13 @@ batches, pin available evidence, enqueue execution and consume the scheduling
 row after successful handoff. With no new activity there is no scheduling row
 and no further Bifrost read of that group. This replaces revision 16's repeated
 Bifrost discovery and its prohibition on a group scheduling table.
+
+Revision 18 records the owner's explicit subsequent approval of two corrections:
+retryable Wyrd blockage keeps pending work, whereas owner activity/auth rejection
+records a terminal errored group execution and consumes pending atomically;
+`group_end.after` above one fixed year (365 days) is rejected at write time.
+These decisions supersede prior blanket-retention and unrestricted-duration
+instructions for this remediation; other grouping behavior/tradeoffs are unchanged.
 
 Current implementation base: `ba92ac9b9` on
 `change/long-horizon-verification-task-001`. Extend the existing
@@ -295,7 +302,14 @@ runs_on:
   after: 30m
 ```
 
-`after` is the required existing positive TriggerDuration, without a default.
+`after` is the required positive TriggerDuration, without a default, capped at
+one fixed year: 365 days = 8760 hours = 525600 minutes = 31536000 seconds.
+Standalone Trigger writes and inline group_end binding writes reject anything
+larger before registration persists it, using existing invalid-Card-spec error
+handling. Accepted durations are preserved exactly; no SQL shortening or
+configurable alternate maximum. Shared descriptions/generated schemas document
+this bound. Existing pre-release reset policy applies to oversized stored data;
+no compatibility decoder or upgrade protocol is added.
 It replaces idle/max_age/finality, rejected through existing unknown-field
 validation without aliases. Frozen settings retain after and exact sources.
 
@@ -332,9 +346,33 @@ lock only through the bounded Bifrost snapshot query and queue handoff. In one
 transaction, pin/enqueue the successful snapshot using ordinary snapshot
 idempotence, delete that pending row, and commit. An identical snapshot conflict
 also completes the handoff and consumes the row. Release the capacity permit
-and database connection before any Verifier/provider execution. Query or SQL
-failure rolls back: the pending row remains for a later pass, with no partial
-execution or synthetic verdict. Other replicas skip the locked item.
+and database connection before any Verifier/provider execution. Retryable Wyrd
+capacity/configuration/database/query failures retain pending work and are traced;
+no partial inputs or synthetic verdict are produced. Existing non-auth enqueue
+refusals remain blocked enqueue outcomes. Other replicas skip the locked item.
+
+Owner activity rejection (including inactive/retired owner or disabled/deleted
+owner principal) and genuine authorization rejection are terminal for that
+pending item. Log the actual reason, record one terminal errored group execution
+and delete pending in the same tenant transaction. If error recording fails,
+roll back and retain pending. Run no Verifier/provider, create no verdict or
+result pointer and dispatch no Operator. A pre-admission error has binding/group/
+owner identity, actual stored owner-principal identity and SYSTEM as recording
+actor, structured error and database settlement time; it asserts no accepted
+owner authority and has no source inputs/snapshot. Only this terminal shape may
+omit authority/pinned inputs; every runnable execution retains existing mandatory
+accepted authority and input contracts. No fabricated grant or empty snapshot.
+Missing infrastructure/attribution identities or issuer configuration is a Wyrd
+problem, not authorization rejection, and preserves pending work.
+
+Use existing binding status last_execution_id then execution status/SDK readback
+to expose the error, group ID and absent result/snapshot. Binding status exposes
+only its latest execution; no new history/list API is required. Reading still
+requires normal authorization. Reactivation alone does not resurrect consumed
+pending work; new source activity follows normal scheduling. Keep retryable
+blockage from immediately reclaiming the same oldest row within one tenant pass;
+other tenants and the separate cron loop continue. Add no retry counter, expiry,
+queue, recovery protocol or fairness promise.
 
 An arrival updating that row during snapshot/handoff waits in the background on
 the SQL row lock. After the handoff commits, its upsert creates a fresh pending
@@ -789,8 +827,13 @@ without result is usable immediately; later evidence yields another revision;
 unchanged snapshots do not rerun, and a consumed pending row causes no further
 Bifrost read without a new acknowledged source input/result. Include newly acknowledged rows with equal/older ingest
 timestamps: PostgreSQL scheduling notifications, not timestamp cursors, select work. Retention and
-outbox loss limit available history; neither implies recovery. Failed/truncated
-queries enqueue no partial or synthetic result and retry through the same poller.
+outbox loss limit available history; neither implies recovery. Retryable failed/truncated queries enqueue no partial or synthetic result and
+retry through the same poller; genuine auth rejection records the terminal
+execution error and consumes pending as defined in REQ-004. Acceptance includes
+inactive/retired owner, auth rejection, runtime/configuration failures, atomic
+error-record rollback, one-error/no-repeat polling and real SDK error readback.
+Standalone and inline raw HTTP writes reject durations above one year before
+registration persists anything; exact equivalent boundaries succeed.
 Ordinary query resource refusal is not a subject failure or an inconclusive
 Verifier judgment. No custom source-execution ceiling remains.
 
@@ -947,8 +990,9 @@ is retired. REQ-015/AC-009 remain required subsequent opt-in benchmarking work;
 TASK-003a must leave its existing driver usable and scenarios configured with
 `after`, but neither implement new benchmark cases nor claim performance PASS.
 The owner explicitly accepted the tradeoffs above. No open material behavior
-decision remains for TASK-003a. Its revision-17
-implementation details define the pending-row, batching and capacity seams.
+decision remains for TASK-003a and its R1 remediation. Revision 18 amends failure
+classification/visibility and write-time duration validation; revision 17's other
+pending-row, batching and capacity seams remain.
 
 ## Revision history and authority links
 
@@ -971,6 +1015,8 @@ implementation details define the pending-row, batching and capacity seams.
 | 15 | approved | TASK-001 review found group timing compared PostgreSQL's clock with server-process row times (`recorded_at` stamped at enqueue, `ended_at` by the runner), which drift across replicas; AGENTS §15 makes PostgreSQL the only time source, client-produced timings excepted. Owner approved REQ-004 row times as the managed `wyrd_ingested_at` from Bifrost's PostgreSQL-anchored clock for source order, first/newest, idle/max_age, finality and coverage, and journeys advance time through binding durations and cursors only. Carries revision 14 unchanged. Owner explicitly approved this revision. |
 | 16 | approved | Owner approved the simple visible-evidence grouping proposal and cuts and requested TASK-003a on merged TASK-001–003. One after duration, fixed cadence, pinned visible snapshot, late-row revisions, overlapping execution with settlement-order reactions; no PG source reconciliation, outstanding gate, hard finality, public coverage or custom source ceiling. TASK-002/003 retained; all original functional scenarios remain; benchmarking follows functional closure. |
 | 17 | approved | Owner approved explicit background group scheduling: one pending PostgreSQL row per tenant/binding/group, post-ACK due-time upsert, bounded due-row polling, one visible snapshot, transactional execution handoff and row consumption. No repeated Bifrost discovery. New arrivals reschedule; evidence is retained. Ordinary cron and group loops are independent; existing execution capacity also gates snapshots. ACK/query-visibility, SQL backlog and background retry limits are explicit. |
+
+| 18 | approved | Owner approved retaining pending only for blocked enqueue/retryable Wyrd problems; inactive/retired owner or auth rejection records one terminal errored execution and consumes pending atomically, without evaluation/verdict/Operator or fabricated accepted authority/snapshot. Error-write failure retains pending; existing latest-binding/execution status supplies visibility. Owner explicitly capped group_end.after at one year (365 fixed days), rejected at write time; accepted durations remain exact and the hidden SQL clamp is deleted. Other accepted limits unchanged. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

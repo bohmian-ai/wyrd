@@ -1280,7 +1280,10 @@ occurrence (`verifiers.<name>.inputs.<slot>` or
 `verifiers.<name>.requirements.<id>.outcome`). Registration pins exact source
 identities; tenant, owner, subject and Verifier identity scope every read.
 
-A `group_end` Trigger declares one positive duration, `after`. After Scribe
+A `group_end` Trigger declares one positive duration, `after`, at most 365 fixed
+days. Standalone and inline Trigger writes reject larger durations before
+registration persists them; accepted durations are used exactly, with no silent
+SQL shortening. After Scribe
 acknowledges a matching source input or result, the existing background writer
 upserts one PostgreSQL pending scheduling row per tenant, binding and group ID,
 with due time computed as PostgreSQL statement time plus `after`. New activity
@@ -1301,8 +1304,18 @@ A group item is claimed with `FOR UPDATE SKIP LOCKED`. While holding that
 scheduling-row lock, one bounded Bifrost snapshot query selects the currently
 visible source inputs/results. The same tenant transaction pins/enqueues the
 ordinary execution and deletes its scheduling row. An unchanged snapshot's
-content-identity conflict also consumes the pending row. Failures roll back,
-retaining the pending item for a later pass. Concurrent activity waits only in
+content-identity conflict also consumes the pending row. Retryable runtime,
+capacity, database and query failures retain pending and are traced. Genuine auth
+or owner-activity rejection, including an inactive/retired owner, records one
+terminal errored group execution and consumes pending atomically. Recording
+failure rolls back and preserves pending. This pre-admission error runs no
+Verifier/provider, asserts no accepted owner authority or snapshot, has no verdict/
+result pointer and dispatches no Operator; actual identity and SYSTEM reporting
+actor remain attributable. Every runnable execution keeps its accepted-authority
+and input invariants. Missing issuer/SYSTEM/attribution infrastructure is retryable
+Wyrd failure, not proof of rejected owner authority. Existing latest binding
+execution status then execution readback exposes the terminal error; it is not a
+new group-history API. Concurrent activity waits only in
 the background on the row lock and recreates a pending row after successful
 handoff. Release the transaction and preparation permit before Verifier/provider
 execution. With no new activity, there is no pending row and no further Bifrost

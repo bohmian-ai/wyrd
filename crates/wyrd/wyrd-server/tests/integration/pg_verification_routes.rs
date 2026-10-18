@@ -150,6 +150,33 @@ impl Fixture {
     async fn queued(&self) -> usize {
         self.seed.executions().await.expect("executions read").len()
     }
+
+    /// Count the tenant's queued executions once every earlier request has
+    /// been processed, excluding a sentinel enqueued as `jwt` to order the
+    /// read.
+    ///
+    /// Enqueue answers before Scribe acknowledges the inputs and the
+    /// submission writer commits the execution, so a plain count can run
+    /// ahead of an earlier request's processing. The tenant's writes are
+    /// processed in arrival order on both outboxes, so once the later
+    /// sentinel is visible every earlier staged submission has been
+    /// processed too.
+    ///
+    /// # Panics
+    /// Panics when the sentinel is not accepted or never becomes visible, or
+    /// the queue cannot be read.
+    async fn queued_before_sentinel(&self, server: &WyrdTestServer, jwt: &str) -> usize {
+        let (status, sentinel) = enqueue(
+            server,
+            jwt,
+            &self.request(&self.assertion, json!("sentinel")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{sentinel}");
+        visible_execution(server, jwt, execution_id(&sentinel)).await;
+        self.queued().await - 1
+    }
 }
 
 /// POST one raw body to `uri` as `jwt`, optionally keyed.
@@ -489,10 +516,9 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 /// unwritten and hold the whole reserved share (two of three slots)
 /// deterministically.
 ///
-/// The replay's submission is processed after Scribe acknowledges its inputs,
-/// in the tenant's arrival order, so a distinct sentinel enqueued after it is
-/// visible only once the replay has been processed; the execution count is
-/// read after the sentinel appears.
+/// Both counts are ordered after the requests before them through
+/// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
+/// queued execution with one inputs row.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -523,31 +549,26 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
     stall.release();
     stall.wait_completed().await;
     server.flush_bifrost().await.expect("the share drains");
-    for admitted in [&ahead, &behind] {
-        visible_execution(&server, &jwt, execution_id(admitted)).await;
-    }
-    assert_eq!(fixture.queued().await, 2, "the refusal queued nothing");
+    assert_eq!(
+        fixture.queued_before_sentinel(&server, &jwt).await,
+        2,
+        "the refusal queued nothing"
+    );
     let (status, accepted) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
     let recovered = execution_id(&accepted);
     assert_eq!(
         input_rows(&server, recovered).await,
-        (3, 1),
-        "one inputs row per accepted request, none for the refused attempt"
+        (4, 1),
+        "one inputs row per accepted request and the sentinel, none for the refused attempt"
     );
     let (status, replay) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
     assert_eq!(execution_id(&replay), recovered, "the retry replays");
-    let later = fixture.request(&fixture.assertion, json!(2));
-    let (status, sentinel) = enqueue(&server, &jwt, &later, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{sentinel}");
-    let sentinel = execution_id(&sentinel);
-    assert_ne!(sentinel, recovered, "the sentinel is its own execution");
-    visible_execution(&server, &jwt, sentinel).await;
     assert_eq!(
-        fixture.queued().await,
+        fixture.queued_before_sentinel(&server, &jwt).await,
         4,
-        "the replay added no execution beside the sentinel written after it"
+        "the two fills, the first sentinel, and the recovered call; the replay added none"
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -633,7 +654,11 @@ async fn enqueue_refusals_fail_before_staging() {
     assert_eq!(problem["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
     let (status, problem) = get(&server, &jwt, "/v1/verification/executions/not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
-    assert_eq!(fixture.queued().await, 0, "no refusal staged a submission");
+    assert_eq!(
+        fixture.queued_before_sentinel(&server, &jwt).await,
+        0,
+        "no refusal staged a submission"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1046,7 +1071,7 @@ async fn direct_execution_judges_inline_without_enqueueing() {
         vec![run_decision("allowed"); 2],
         "one decision per request"
     );
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1163,7 +1188,7 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", machine.id().as_uuid()).await,
         vec![run_decision("allowed")]
     );
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1267,7 +1292,7 @@ async fn direct_execution_refuses_nonconforming_evidence() {
     let (status, missing) = execute(&server, &jwt, body(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["outcome"]["verdict"], "inconclusive", "{missing}");
-    assert_eq!(fixture.queued().await, 0);
+    assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 

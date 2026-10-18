@@ -1,7 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
-────────────
- Nextest run ID d31112eb-dcc2-460e-a0c9-7bc1e00f6049 with nextest profile: default
-    Starting 1 test across 1 binary (868 tests skipped)
-        PASS [   0.054s] (1/1) wyrd-spec card::blocks::validate::tests::verifier_spec_requires_check_agents_to_produce_a_verdict
-────────────
-     Summary [   0.056s] 1 test run: 1 passed, 868 skipped

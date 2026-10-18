@@ -1,7 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
-────────────
- Nextest run ID e74bfdb3-5dad-40ba-81e9-961ae7f67662 with nextest profile: default
-    Starting 1 test across 1 binary
-        PASS [   0.020s] (1/1) wyrd-spec::verifier_fixtures fixture_verifiers_satisfy_the_staged_contract
-────────────
-     Summary [   0.020s] 1 test run: 1 passed, 0 skipped

@@ -315,3 +315,113 @@ four-task split; report an actual unresolved boundary instead of creating tasks.
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md); implementation returns evidence, not independent task approval.
+
+## Implementation Evidence
+
+Status: **IMPLEMENTED** (candidate `bb233e4f7..HEAD` on
+`change/long-horizon-verification-task-001`). `PG` below abbreviates
+`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && …'`.
+
+### Commands and selected counts
+
+| Lane | Exact command (inside `PG`) | Selected | Result |
+|---|---|---|---|
+| Rust journeys | `mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(/^verify_in_real_time::grouped_/)"` | 5 | 5 passed |
+| Rust exact | same with `-E "test(=verify_in_real_time::<name>)"` for `grouped_support_resumes`, `grouped_refund_changes_verdict`, `grouped_coding_uses_declared_sources`, `grouped_sampled_frames_are_bounded`, `grouped_conversations_recover` | 1 each | passed |
+| Python journeys | `cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/test_verify_in_real_time.py -k grouped` and each `::test_<name>` above | 5 | 5 passed |
+| TypeScript journeys | `cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/verify-in-real-time.test.ts -t "^grouped"`; exact: `-t "^grouped <prose name>$"` | 5 | 5 passed |
+| MCP | `mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(=verification::pg_tests::grouped_verification_discover_act_observe)"` | 1 | passed |
+| OpenAPI | `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test integration -E "test(=pg_openapi_contract::grouped_verification_contract_is_served)"` | 1 | passed |
+| Checks | `mise run fmt`, `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `docs:check`; `git diff --check` | — | all PASS |
+
+Selector correction: the TypeScript file names tests in prose, so the planned
+`-t "^grouped_<snake>$"` selectors select nothing. The exact selectors are
+`^grouped support resumes$`, `^grouped refund changes verdict$`,
+`^grouped coding uses declared sources$`, `^grouped sampled frames are bounded$`
+and `^grouped conversations recover$`. Build prerequisites for each changed
+build: `mise run build:monty-worker`, `mise run py:setup` (Python wheel) and
+`mise run ts:build:testing` (TypeScript test addon).
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| J-001 / AC-001: a resumed support conversation (two Runs, a submit, a replayed HTTP enqueue) is judged once, whole, in call order; replay counts once; key conflicts, ownerless and unauthorized turns are excluded; a sourceless `group_end` is refused by field | `wyrd-client` Observe `group_id`; `wyrd-server` verification control/results owner metadata; `verification/groups.rs` discovery and snapshot | `grouped_support_resumes` in Rust, Python and TS | PASS |
+| J-002 / AC-002: serial refund reviews keep history; only a verdict change dispatches `on_verdict_change` with group and previous result; no review after finality; `on_failure` on `group_end` is refused | queue settlement verdict-change comparison; Trigger `finality`; spec validation | `grouped_refund_changes_verdict` ×3 | PASS |
+| J-003 / AC-003: a coding review reads declared sources, and its check Agent reads live spans through `bifrost.query` with the owner's ordinary grants | check-Agent tool validation; hosted `BifrostQuery` | `grouped_coding_uses_declared_sources` ×3 | PASS |
+| J-004 / AC-004: media frames are bounded by the source-execution ceiling (inconclusive, explicit reason); empty selection is inconclusive; other-owner and denied frames are excluded; a running frame recovers once after a server restart | `HostedLimits.source_executions_max`; `vala-verify` empty-each rule; snapshot ceiling read before payloads | `grouped_sampled_frames_are_bounded` ×3 (restart in Rust) | PASS |
+| AC-005 group portion: concurrent groups coexist with a Window/Drift sample; idle ticks, a replica and a restart create no duplicate review | binding/group serial fencing in the queue; `state.covers` in `poll()` | `grouped_conversations_recover` ×3 (replica and restart in Rust) | PASS |
+| AC-006: another tenant's same `group_id`, another owner, a newer source Card version, and an ungrouped call are excluded; `group_id` is preserved through SDK, HTTP, MCP and the persisted column | exact pinned source tuple; RLS tenant reads; `group_id` column on `execution_inputs`/`results` | `grouped_conversations_recover` ×3; MCP `grouped_verification_discover_act_observe`; Scenario 1 replay | PASS |
+| Agent surfaces: MCP discover → execute/enqueue with and without `group_id` → inspect the review; an unscoped grouped enqueue is refused; another tenant cannot read the review | existing MCP verification tools over the typed `VerificationRequest` | MCP journey | PASS |
+| Served contract: optional `group_id` on requests; state `group_id`/`owner_card_uid`/`group`; binding `group_end` settings; no alternate spelling | `utoipa` schemas in `wyrd-spec` | `grouped_verification_contract_is_served`; `codegen:check` | PASS |
+| Authority/docs updated | `architecture/wyrd-design.md` Verifier, Trigger and Operator sections; docs `how-verification-works`, `verification-runtime-limits`; regenerated `api/errors.md` | `docs:check` | PASS |
+
+### RED / GREEN / REFACTOR
+
+- RED: each scenario's journey was added first and failed on the missing
+  surface, for example: no `group_id` on Observe; a `group_end` Trigger
+  refused; empty `each` passing vacuously; no group execution identity.
+- GREEN: the scenarios were closed in order, one commit per surface (see
+  `git log bb233e4f7^..HEAD`).
+- REFACTOR: shared harness helpers were reused rather than copied (`Grouped`,
+  `group_execution`, `group_binding`, `grouped()`, `Deployment::restart`, the
+  hooks harness); one file-scoped TS judge; Python annotations deferred; the
+  grouped journeys were rerun after each change.
+
+### Diagnoses
+
+- **TS provider scope.** *Symptom:* coding and frame cases received the wrong
+  judge reply. *Cause:* Vitest fixtures with different provider closures
+  shared one file-scoped server. *Fix site:* one `localJudge` for the file.
+- **Restart loss (Rust frames).** *Symptom:* after the restart, the review
+  covered only the slow frame. *Evidence:* the trace showed the 19 judged rows
+  unpublished at shutdown. *Cause:* `restart_bound` rebuilds the Bifrost data
+  root, so unpublished outbox rows are lost; this is allowed outbox loss.
+  *Fix site:* the test publishes (`flush_bifrost`) before the process death,
+  which is the positive variant.
+- **Stale wheel.** *Symptom:* the Python ceiling was not applied. *Cause:* the
+  wheel was built before the harness limit changed. *Fix:* `mise run py:setup`.
+- **Python stub-only types.** *Symptom:* `AttributeError` on
+  `verify.ExecutionState`. *Cause:* runtime evaluation of a type that exists
+  only in the stubs. *Fix:* `from __future__ import annotations`.
+- **Ungrouped read in the recover journey.** *Symptom:* execution status
+  returned not-found for an inline `verify`. *Cause:* inline executions have
+  no queue row by design. *Fix:* the test asserts the persisted result row's
+  `group_id IS NULL` instead.
+- Earlier diagnoses (conflict inclusion, the `members` count semantics, the
+  citation slot reachability through a check input, owner-authority grants
+  for group Agent checks, the monty worker prerequisite) are recorded in the
+  scenario commits.
+
+### Material limits and interpretations
+
+- Worker or replica death and restart are exercised in Rust only. The Python
+  and TypeScript test servers expose exactly three sanctioned controls, and
+  the harness test forbids adding more; the SDK journeys prove idle-tick
+  non-duplication instead.
+- Failed or truncated discovery and snapshot reads defer without a partial
+  judgment (a poll error is logged, and the next tick retries). No
+  fault-injection control exists, so there is no journey for it; the
+  shutdown-race trace shows `group poll failed … query execution failed`
+  followed by no review.
+- Reversed completion order: ordering by recorded input is proven by 20
+  concurrently completing frames whose coverage matches submission order. A
+  dedicated reversed pair was not added.
+- An absent result yields a null outcome: this is seen in an idle review
+  before a recovered frame. It is asserted through the loop in the frames
+  journey but not pinned to a dedicated assertion.
+- A late-visible row timed earlier may still be judged in a later review, per
+  the spec. The discovery slack (1 h) and the group caps carry `ponytail:`
+  ceilings. Discovery runs only in block-hosting processes. The finality
+  journey waits about 41 s by design.
+- J-005 staging pressure and process bounds remain with TASK-003; scheduled
+  binding inputs remain with TASK-002.
+
+### Non-goals and diff audit
+
+The candidate diff touches only the owners listed in the write set: spec,
+client, vala-verify, the Bifrost managed tables, server, SQL queue, MCP,
+testing, the three SDKs, fixtures, docs and the design authority. Tables were
+changed in place with no migration path. No compatibility alias, new
+dependency, revision or lifecycle table, outbox change, budget system or
+`#[allow]` was added. No test was weakened or ignored. The worktree is clean.

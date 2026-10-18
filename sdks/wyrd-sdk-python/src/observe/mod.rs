@@ -13,7 +13,7 @@ use pyo3::types::{PyDict, PyMapping, PyModule, PyString, PyTuple, PyType};
 use wyrd_client::observe::{Observe, Run};
 use wyrd_client::verify::{Input, Inputs, Submission};
 use wyrd_spec::error::WyrdError;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, execution_route_from_py};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 use crate::verify::{PyArtifactRef, PyExecution, PyFile, PyRecorded, PyVerificationResult};
 
@@ -284,42 +284,6 @@ impl PyRun {
             )
         });
         false
-    }
-
-    /// Invoke this view's tool-free Agent once with string `variables` and
-    /// return its final text.
-    ///
-    /// `route`, when given, is an execution route dict that replaces the
-    /// Agent's declared route whole for this invocation only; it is decoded
-    /// into the Rust `ExecutionRoute` and passed to `Run::invoke_on`, which
-    /// owns every routing decision. Omitted, the Agent's declared route is
-    /// used. The GIL is released while the call runs.
-    ///
-    /// # Errors
-    /// Raises `WYRD_SPEC_400_VALIDATION` for a `route` that is not an
-    /// execution route, and otherwise the errors of `Run::invoke_on`.
-    #[pyo3(signature = (variables=None, *, route=None))]
-    fn invoke(
-        &self,
-        py: Python<'_>,
-        variables: Option<std::collections::BTreeMap<String, String>>,
-        route: Option<Bound<'_, PyDict>>,
-    ) -> WyrdPyResult<String> {
-        let route = route
-            .map(|route| execution_route_from_py(&route, "route"))
-            .transpose()?;
-        let variables = variables.unwrap_or_default();
-        let pairs: Vec<(&str, &str)> = variables
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        let invoked = async {
-            match &route {
-                Some(route) => self.inner.invoke_on(route, &pairs).await,
-                None => self.inner.invoke(&pairs).await,
-            }
-        };
-        crate::trace::block_on(py, invoked).map_err(WyrdPyError::from)
     }
 
     /// The emit surface for this view.

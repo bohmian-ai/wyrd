@@ -1,12 +1,12 @@
 """Opt-in live checks that Wyrd Prompts lower to requests current models accept.
 
-Each case authors one portable or native Prompt, wraps it in the public
-``wyrd.agent.Agent`` on its default ``native`` route, and runs it straight
-against the provider with no gateway in between, so a failure here is a Prompt
-lowering defect or a provider refusal, never a gateway defect. Portable cases
-cover the common use cases each provider's current model supports, not every
-setting on every model. The Agent's provider clients read the same
-conventional credential variables this lane checks.
+Each case authors one portable or native Prompt, renders it with the public
+``Prompt.render``, appends the fixed run input as the application's own turn,
+and posts the native body straight to the provider with no gateway in between,
+so a failure here is a Prompt lowering defect or a provider refusal, never a
+gateway defect. Portable cases cover the common use cases each provider's
+current model supports, not every setting on every model. Requests use the
+same conventional credential variables this lane checks.
 
 Run with ``mise run test:gateway:smoke:live``.
 """
@@ -16,8 +16,8 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+import httpx
 import pytest
-from wyrd.agent import Agent, AgentRun, local_registry, tool
 from wyrd.prompt import Prompt
 
 from .conftest import JEV_QUESTIONS, JEV_STATE, assert_jev_answers, credential, model
@@ -71,14 +71,6 @@ BASE_SETTINGS: dict[str, dict[str, Any]] = {
     "gemini": {},
 }
 
-# Settings each provider's model needs before it accepts function tools: a
-# reasoning OpenAI model refuses them while it reasons.
-TOOL_SETTINGS: dict[str, dict[str, Any]] = {
-    "openai": {"reasoning_effort": "none"},
-    "anthropic": {},
-    "gemini": {},
-}
-
 
 def prompt(provider: str, **fields: Any) -> Prompt:
     """Compile the authored Prompt ``fields`` for ``provider``'s current model.
@@ -107,22 +99,82 @@ def portable(provider: Portable, **fields: Any) -> Prompt:
     return prompt(provider, **fields)
 
 
-def run(authored: Prompt) -> AgentRun:
-    """Run ``authored`` once through a native-route Agent."""
-    return Agent(prompt=authored).run(INPUT)
+def endpoint(api: str) -> tuple[str, str, dict[str, str]]:
+    """The lane provider, provider URL, and auth headers for the rendered ``api`` body."""
+    if api in ("open_ai_chat_completion", "open_ai_responses"):
+        path = "chat/completions" if api == "open_ai_chat_completion" else "responses"
+        key = credential("openai")
+        return "openai", f"https://api.openai.com/v1/{path}", {"authorization": f"Bearer {key}"}
+    if api == "anthropic_message":
+        headers = {"x-api-key": credential("anthropic"), "anthropic-version": "2023-06-01"}
+        return "anthropic", "https://api.anthropic.com/v1/messages", headers
+    if api == "gemini_generate_content":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model('gemini')}:generateContent"
+        return "gemini", url, {"x-goog-api-key": credential("gemini")}
+    assert api == "jev_system_one", f"no provider endpoint for {api}"
+    return (
+        "jev",
+        "https://api.typesafe.ai/v1/systemone",
+        {"authorization": f"Bearer {credential('jev')}"},
+    )
 
 
-def assert_text(answer: AgentRun) -> None:
-    """Assert ``answer`` finished with non-empty assistant text."""
-    assert answer.error is None, f"the run failed: {answer.error}"
-    assert answer.output.strip(), "the run returned no text"
+def with_input(api: str, body: dict[str, Any]) -> dict[str, Any]:
+    """``body`` with the run input appended as the next user turn of its native shape.
+
+    A Jev ``systemone`` body asks typed questions about its own state and has
+    no turn to append.
+    """
+    if api in ("open_ai_chat_completion", "anthropic_message"):
+        body["messages"].append({"role": "user", "content": INPUT})
+    elif api == "open_ai_responses":
+        body["input"].append({"role": "user", "content": INPUT})
+    elif api == "gemini_generate_content":
+        body["contents"].append({"role": "user", "parts": [{"text": INPUT}]})
+    return body
+
+
+def call(authored: Prompt) -> tuple[str, dict[str, Any]]:
+    """Render ``authored``, add the run input, and post it to its provider once.
+
+    Returns the rendered API tag and the provider's decoded reply. Only the
+    provider and status reach the failure message, never a credential.
+    """
+    rendered = authored.render().model_dump()
+    api = rendered["provider"]
+    provider, url, headers = endpoint(api)
+    reply = httpx.post(url, json=with_input(api, rendered["body"]), headers=headers, timeout=120)
+    assert reply.status_code == 200, f"{provider} answered {reply.status_code}: {reply.text}"
+    return api, reply.json()
+
+
+def text(api: str, reply: dict[str, Any]) -> str:
+    """The assistant text of the ``api`` provider ``reply``."""
+    if api == "open_ai_chat_completion":
+        return reply["choices"][0]["message"]["content"] or ""
+    if api == "open_ai_responses":
+        return "".join(
+            part["text"]
+            for item in reply["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+            if part["type"] == "output_text"
+        )
+    if api == "anthropic_message":
+        return "".join(block["text"] for block in reply["content"] if block["type"] == "text")
+    return "".join(part.get("text", "") for part in reply["candidates"][0]["content"]["parts"])
+
+
+def assert_text(authored: Prompt) -> None:
+    """Assert ``authored``'s provider answered the run input with non-empty text."""
+    assert text(*call(authored)).strip(), "the provider returned no text"
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", PORTABLE)
 def test_portable_text(provider: Portable) -> None:
     """A portable Prompt holding one user turn answers the run input with text."""
-    assert_text(run(portable(provider)))
+    assert_text(portable(provider))
 
 
 @pytest.mark.smoke
@@ -137,54 +189,22 @@ def test_portable_system_and_history(provider: Portable) -> None:
             {"role": "assistant", "content": "ready"},
         ],
     )
-    assert_text(run(authored))
+    assert_text(authored)
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", PORTABLE)
 def test_portable_max_output_tokens(provider: Portable) -> None:
     """``max_output_tokens`` lowers to the provider's own output-budget field."""
-    authored = portable(provider, settings={"max_output_tokens": MAX_OUTPUT_TOKENS})
-    assert_text(run(authored))
+    assert_text(portable(provider, settings={"max_output_tokens": MAX_OUTPUT_TOKENS}))
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", PORTABLE)
 def test_portable_response_format(provider: Portable) -> None:
     """One closed, nested JSON Schema reaches every provider and decodes."""
-    authored = portable(provider, response_format=ANSWER_SCHEMA)
-    answer = run(authored)
-    assert answer.error is None, f"the run failed: {answer.error}"
-    assert answer.structured_output is not None, "the run decoded no structured output"
-    assert isinstance(answer.structured_output["answer"], str)
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize("provider", PORTABLE)
-def test_portable_local_tool_completes_the_loop(provider: Portable) -> None:
-    """The model calls one local ``@tool`` and the Agent loop answers with its result.
-
-    The tool records each call, so passing proves a real call was decoded,
-    executed, and fed back before the model's final text. A scoped registry
-    lets each provider's case declare the same tool name.
-    """
-    authored = portable(
-        provider,
-        system="Always call get_weather before answering a weather question.",
-        settings=TOOL_SETTINGS[provider],
-    )
-    calls: list[str] = []
-    with local_registry():
-
-        @tool(name="get_weather", description="Return the current weather for a city.")
-        def get_weather(city: str) -> str:
-            calls.append(city)
-            return f"It is sunny in {city}."
-
-        answer = Agent(prompt=authored, tools=[get_weather]).run("What is the weather in Paris?")
-    assert calls, "the model never called the local tool"
-    assert answer.iterations >= 2, "the loop ended without answering the tool result"
-    assert_text(answer)
+    answer = json.loads(text(*call(portable(provider, response_format=ANSWER_SCHEMA))))
+    assert isinstance(answer["answer"], str)
 
 
 @pytest.mark.smoke
@@ -198,7 +218,7 @@ def test_native_chat_completion() -> None:
             "max_completion_tokens": MAX_OUTPUT_TOKENS,
         },
     )
-    assert_text(run(authored))
+    assert_text(authored)
 
 
 @pytest.mark.smoke
@@ -209,7 +229,7 @@ def test_native_responses() -> None:
         format="responses",
         body={"instructions": SYSTEM, "input": [], "max_output_tokens": MAX_OUTPUT_TOKENS},
     )
-    assert_text(run(authored))
+    assert_text(authored)
 
 
 @pytest.mark.smoke
@@ -220,7 +240,7 @@ def test_native_messages() -> None:
         format="messages",
         body={"system": SYSTEM, "messages": [], "max_tokens": MAX_OUTPUT_TOKENS},
     )
-    assert_text(run(authored))
+    assert_text(authored)
 
 
 @pytest.mark.smoke
@@ -235,7 +255,7 @@ def test_native_generate_content() -> None:
             "contents": [],
         },
     )
-    assert_text(run(authored))
+    assert_text(authored)
 
 
 @pytest.mark.smoke
@@ -246,6 +266,5 @@ def test_native_system_one() -> None:
         format="system_one",
         body={"state": JEV_STATE, "questions": JEV_QUESTIONS},
     )
-    answer = run(authored)
-    assert answer.error is None, f"the run failed: {answer.error}"
-    assert_jev_answers(json.loads(answer.output))
+    _, reply = call(authored)
+    assert_jev_answers(reply["answers"])

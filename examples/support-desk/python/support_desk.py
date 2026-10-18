@@ -5,7 +5,8 @@ the ``support/policy-check`` Verifier.
 ``deploy`` registers the checked-in Cards under ``service/``, which ensures the
 declared ``vala.datasets.tickets`` table, turns on metadata capture, and checks
 the Agent's model is deployed. ``serve`` answers every question in its own
-Agent Run and submits each answer for a background policy check.
+Agent Run with ``answer``, the application's own gateway call, and submits each
+answer for a background policy check.
 ``wait_for_verdicts`` resumes each check from its execution ID alone and waits
 for its result, ``check`` judges one answer immediately, and ``explain`` joins
 one Run's evidence over MCP.
@@ -23,14 +24,19 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
+import openai
 from opentelemetry import trace
 from wyrd import verify
 from wyrd.cards import Cards, RegistrationReceipt
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.observe import Run
 from wyrd.state import WyrdState
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageParam
 
 REQUESTS = 100
 """How many requests ``serve`` answers; every tenth asks for a refund."""
@@ -44,10 +50,11 @@ MCP_VERSION = "2026-07-28"
 
 @dataclass
 class Desk:
-    """The deployed support desk: its registration and loaded Card graph."""
+    """The deployed support desk: its registration, loaded Card graph, and gateway client."""
 
     receipt: RegistrationReceipt
     state: WyrdState
+    gateway: openai.OpenAI
 
     def uid(self, name: str) -> str:
         """The registered UID of the Card named ``name``."""
@@ -70,6 +77,42 @@ class Served:
 def policy_check(answer: str) -> dict[str, Any]:
     """The ``policy-check`` inputs for ``answer``: the answer and the checked-in policy PDF."""
     return {"answer": answer, "policy": verify.File(SERVICE / "refund-policy.pdf")}
+
+
+def gateway_client(client: WyrdClient) -> openai.OpenAI:
+    """An OpenAI client for the Wyrd gateway that authenticates as ``client``.
+
+    ``http_auth`` replaces the placeholder key with a fresh Wyrd access token on
+    every request, so the application never holds a provider key.
+    """
+    return openai.OpenAI(
+        base_url=f"{client.server_url}/v1",
+        api_key="wyrd",
+        http_client=openai.DefaultHttpxClient(auth=client.http_auth),
+        max_retries=0,
+    )
+
+
+def answer(gateway: openai.OpenAI, state: WyrdState, run: Run, asked: str) -> str:
+    """Answer ``asked`` with the support Agent's Prompt through its gateway deployment.
+
+    The application makes the model call itself. The ``wyrd-run-id`` and
+    ``wyrd-card-uid`` headers tie the gateway's record of the call to ``run``
+    and the Agent Card; the gateway never forwards them upstream.
+
+    Raises:
+        openai.APIStatusError: the gateway's refusal, with Wyrd's stable code
+            in ``code``, such as ``WYRD_PERMISSION_403_DENIED_RBAC``.
+    """
+    deployment = state.card("agent").spec["execution_route"]["deployment"]
+    prompt = state.agent("agent").prompt().prompt
+    headers = {"wyrd-run-id": run.run_id, "wyrd-card-uid": str(state.card_ref("agent").uid)}
+    completion = gateway.chat.completions.create(
+        model=f"{deployment}/{prompt.model}",
+        messages=cast("list[ChatCompletionMessageParam]", prompt.render(question=asked).messages),
+        extra_headers=headers,
+    )
+    return completion.choices[0].message.content or ""
 
 
 def deploy(client: WyrdClient, bundle: Path) -> Desk:
@@ -95,7 +138,7 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
             f"the support Agent's model {route} is not deployed; configure a gateway "
             f"provider deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
         )
-    return Desk(receipt, state)
+    return Desk(receipt, state, gateway_client(client))
 
 
 def question(index: int) -> str:
@@ -107,7 +150,7 @@ def question(index: int) -> str:
 
 def serve(desk: Desk) -> list[Served]:
     """Answer ``REQUESTS`` questions, each in its own Agent Run inside a
-    ``support-desk.request`` span: invoke the Agent through the gateway, record
+    ``support-desk.request`` span: ``answer`` through the gateway, record
     the ticket, and submit the answer for a background ``policy-check`` without
     waiting for it. Telemetry and tickets are flushed on return.
     """
@@ -120,17 +163,17 @@ def serve(desk: Desk) -> list[Served]:
         run = state.run("agent")
         asked = question(index)
         with run, tracer.start_as_current_span("support-desk.request"):
-            answer = run.invoke({"question": asked})
+            reply = answer(desk.gateway, state, run, asked)
             run.observe.record(
                 "vala.datasets.tickets",
                 {
                     "ticket_id": f"T-{index}",
                     "question": asked,
-                    "answer": answer,
+                    "answer": reply,
                     "refund": "refund" in asked,
                 },
             )
-            execution = run.observe.submit("policy-check", **policy_check(answer))
+            execution = run.observe.submit("policy-check", **policy_check(reply))
         if not isinstance(execution, verify.Execution):
             raise TypeError("policy-check judges Run evidence, not a window")
         served.append(Served(run.run_id, execution.id))

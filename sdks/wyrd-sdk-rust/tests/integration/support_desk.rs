@@ -160,14 +160,20 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         "{conflict}"
     );
     let viewer = deployment.client(&deployment.key("desk_viewer", &["viewer"]).await);
-    let denied = WyrdState::from_path_with(&bundle, viewer)
-        .expect("the bundle loads")
-        .run_for_card("agent")
-        .expect("agent view resolves")
-        .invoke(&[("question", "Where is order 1?")])
-        .await
-        .expect_err("a viewer may not invoke the Agent");
-    assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC", "{denied}");
+    let viewing = WyrdState::from_path_with(&bundle, viewer).expect("the bundle loads");
+    let denied = example::answer(
+        &viewing,
+        &viewing.run_for_card("agent").expect("agent view resolves"),
+        "Where is order 1?",
+    )
+    .await
+    .expect_err("a viewer may not call the Agent's model");
+    assert!(
+        denied
+            .to_string()
+            .contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+        "{denied}"
+    );
     assert!(
         upstream
             .received_requests()

@@ -233,10 +233,8 @@ pub fn pydict_to_json_value(dict: &Bound<'_, PyDict>) -> PyResult<Value> {
 /// Decode a Python execution-route dict, such as `{"kind": "native"}` or
 /// `{"kind": "wyrd_gateway", "deployment": "openai-primary"}`, for `field`.
 ///
-/// The one decoder every Python surface that accepts an Agent route uses, so
-/// Agent construction, `Agent.run`, `AgentCard`, and `Run.invoke` refuse the
-/// same malformed shapes identically. It returns the catalog error so each
-/// Python boundary error type converts it with `?`.
+/// `AgentCard` decodes its `execution_route` with it. It returns the catalog
+/// error so the Python boundary error type converts it with `?`.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` naming `field` when a value cannot be

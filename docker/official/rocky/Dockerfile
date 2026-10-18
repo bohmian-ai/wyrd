@@ -14,10 +14,9 @@ RUN microdnf install -y --setopt=install_weak_deps=0 \
   && groupadd -r wyrd && useradd -r -g wyrd -d /app wyrd
 
 COPY release/wyrd-server /usr/local/bin/wyrd-server
-COPY release/wyrd-monty-worker /usr/local/bin/wyrd-monty-worker
 COPY docker/official/extras/nginx/nginx.conf.template /etc/nginx/nginx.conf.template
 COPY docker/official/extras/entrypoint.sh /entrypoint.sh
-RUN chmod 0755 /usr/local/bin/wyrd-server /usr/local/bin/wyrd-monty-worker /entrypoint.sh \
+RUN chmod 0755 /usr/local/bin/wyrd-server /entrypoint.sh \
   && mkdir -p /var/lib/wyrd/storage /var/lib/wyrd/bifrost /var/lib/nginx /var/log/nginx \
   && chown -R wyrd:wyrd /etc/nginx /var/lib/wyrd /var/lib/nginx /var/log/nginx
 

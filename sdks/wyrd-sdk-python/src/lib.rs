@@ -53,11 +53,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     cli::register_entrypoint(m)?;
     bifrost::register_timestamp_format(m)?;
 
-    let agent = PyModule::new(py, "agent")?;
-    skald_agent::python_register(&agent)?;
-    m.add_submodule(&agent)?;
-    register_submodule(py, "wyrd._wyrd.agent", &agent)?;
-
     wyrd_cards::register(py, m)?;
     state::register_cards(&m.getattr("cards")?.cast_into()?)?;
     register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
@@ -94,20 +89,10 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         &m.getattr("cards")?.getattr("agent")?.cast_into()?,
     )?;
 
-    let tool = PyModule::new(py, "tool")?;
-    skald_tool::python_register(&tool)?;
-    m.add_submodule(&tool)?;
-    register_submodule(py, "wyrd._wyrd.tool", &tool)?;
-
     let prompt = PyModule::new(py, "prompt")?;
     skald_prompt::register_prompt(&prompt)?;
     m.add_submodule(&prompt)?;
     register_submodule(py, "wyrd._wyrd.prompt", &prompt)?;
-
-    let providers = PyModule::new(py, "providers")?;
-    skald_runtime::python_register(&providers)?;
-    m.add_submodule(&providers)?;
-    register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
     let cli = PyModule::new(py, "cli")?;
     cli::register(&cli)?;

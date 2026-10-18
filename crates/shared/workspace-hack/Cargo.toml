@@ -17,6 +17,8 @@ publish = false
 ### BEGIN HAKARI SECTION
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
+aho-corasick = { version = "1" }
+arrayvec = { version = "0.7" }
 arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
 arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["chrono-tz"] }
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["prettyprint"] }
@@ -26,6 +28,7 @@ axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
+base64ct = { version = "1", default-features = false, features = ["alloc"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
@@ -35,6 +38,7 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
+compact_str = { version = "0.10" }
 console = { version = "0.16", default-features = false, features = ["ansi-parsing", "std", "unicode-width"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
@@ -54,6 +58,7 @@ futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+get-size2 = { version = "0.11", features = ["compact-str", "derive", "hashbrown", "indexmap", "ordermap", "smallvec", "thin-vec"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
@@ -64,27 +69,35 @@ hex = { version = "0.4" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+icu_properties = { version = "2" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
+lexical-parse-float = { version = "1", features = ["format"] }
+lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
+lexical-util = { version = "1", default-features = false, features = ["format", "parse-floats", "parse-integers", "std", "write-floats", "write-integers"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-bigint = { version = "0.4", features = ["serde"] }
+num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.14", features = ["aws", "azure", "gcp"] }
 once_cell = { version = "1" }
 opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+ordermap = { version = "1" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
+phf_shared = { version = "0.11" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
 quick-xml = { version = "0.41", features = ["encoding", "overlapped-lists", "serialize"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
@@ -93,6 +106,8 @@ regex-syntax = { version = "0.8" }
 reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "form", "gzip", "http2", "json", "query", "rustls", "rustls-no-provider", "stream"] }
 reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "json"] }
 rmcp = { version = "3", default-features = false, features = ["client", "macros", "server", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+ruff_source_file = { version = "0.0.14", default-features = false, features = ["get-size", "serde"] }
+ruff_text_size = { version = "0.0.14", default-features = false, features = ["get-size", "serde"] }
 rustls = { version = "0.23" }
 secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
@@ -104,11 +119,12 @@ sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "chrono", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2" }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
+thin-vec = { version = "0.2" }
 thiserror = { version = "2" }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -127,10 +143,13 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1" }
-zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
+zip-181b0d20215bb231 = { package = "zip", version = "8", default-features = false, features = ["deflate"] }
+zip-3b31131e45eafb45 = { package = "zip", version = "0.6" }
 
 [build-dependencies]
 ahash = { version = "0.8", features = ["serde"] }
+aho-corasick = { version = "1" }
+arrayvec = { version = "0.7" }
 arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
 arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["chrono-tz"] }
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["prettyprint"] }
@@ -140,6 +159,7 @@ axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
+base64ct = { version = "1", default-features = false, features = ["alloc"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
@@ -150,6 +170,7 @@ cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
+compact_str = { version = "0.10" }
 console = { version = "0.16", default-features = false, features = ["ansi-parsing", "std", "unicode-width"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
@@ -169,6 +190,7 @@ futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+get-size2 = { version = "0.11", features = ["compact-str", "derive", "hashbrown", "indexmap", "ordermap", "smallvec", "thin-vec"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
@@ -179,28 +201,36 @@ hex = { version = "0.4" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+icu_properties = { version = "2" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
+lexical-parse-float = { version = "1", features = ["format"] }
+lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
+lexical-util = { version = "1", default-features = false, features = ["format", "parse-floats", "parse-integers", "std", "write-floats", "write-integers"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-bigint = { version = "0.4", features = ["serde"] }
+num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.14", features = ["aws", "azure", "gcp"] }
 once_cell = { version = "1" }
 opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+ordermap = { version = "1" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
+phf_shared = { version = "0.11" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
 quick-xml = { version = "0.41", features = ["encoding", "overlapped-lists", "serialize"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
@@ -209,6 +239,8 @@ regex-syntax = { version = "0.8" }
 reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "form", "gzip", "http2", "json", "query", "rustls", "rustls-no-provider", "stream"] }
 reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "json"] }
 rmcp = { version = "3", default-features = false, features = ["client", "macros", "server", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+ruff_source_file = { version = "0.0.14", default-features = false, features = ["get-size", "serde"] }
+ruff_text_size = { version = "0.0.14", default-features = false, features = ["get-size", "serde"] }
 rustls = { version = "0.23" }
 secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
@@ -221,13 +253,14 @@ sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "chrono", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2" }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
+thin-vec = { version = "0.2" }
 thiserror = { version = "2" }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -246,7 +279,8 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1" }
-zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
+zip-181b0d20215bb231 = { package = "zip", version = "8", default-features = false, features = ["deflate"] }
+zip-3b31131e45eafb45 = { package = "zip", version = "0.6" }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -261,6 +295,7 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
+spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
@@ -280,6 +315,7 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
+spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
@@ -382,6 +418,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
+spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
@@ -399,6 +436,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
+spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }

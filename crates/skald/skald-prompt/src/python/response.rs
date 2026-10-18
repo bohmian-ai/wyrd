@@ -22,33 +22,8 @@ pub struct PyProviderResponse {
     pub(crate) inner: Arc<ProviderResponse>,
 }
 
-impl PyProviderResponse {
-    pub fn from_native(inner: ProviderResponse) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-    pub fn from_arc(inner: Arc<ProviderResponse>) -> Self {
-        Self { inner }
-    }
-    pub fn native(&self) -> &ProviderResponse {
-        &self.inner
-    }
-}
-
 #[pymethods]
 impl PyProviderResponse {
-    /// Build a finished OpenAI Chat Completions response whose one choice is
-    /// an assistant message carrying `text`.
-    ///
-    /// Return it from an `after_model_callback` to replace the model's answer;
-    /// it is the same deterministic shape the `mock` provider returns.
-    #[staticmethod]
-    #[pyo3(name = "text")]
-    pub fn text_py(text: String) -> Self {
-        Self::from_native(ProviderResponse::text(text))
-    }
-
     /// Return the response dialect's default provider, such as "google" for a Vertex body.
     /// `Prompt.provider` names the dispatch destination.
     #[getter]

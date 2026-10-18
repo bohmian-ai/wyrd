@@ -10,9 +10,6 @@ from wyrd import WyrdError
 from wyrd.cli import run_wyrd_cli
 from wyrd.testing.cli import plan
 
-EX_FAILURE = 1
-EX_VERIFICATION_FAILED = 2
-
 
 @pytest.fixture
 def run_cli(monkeypatch: pytest.MonkeyPatch):
@@ -23,21 +20,6 @@ def run_cli(monkeypatch: pytest.MonkeyPatch):
         return run_wyrd_cli()
 
     return run
-
-
-@pytest.fixture
-def eval_run(fixtures_dir: Path, tmp_path: Path) -> list[str]:
-    """An ``eval run`` of the bare ok-check Eval spec, short of its records."""
-    return [
-        "eval",
-        "run",
-        "--eval",
-        str(fixtures_dir / "authoring" / "verifier" / "ok-check.yaml"),
-        "--subject",
-        "tests/Agent/agent-under-test@1.0.0",
-        "--out",
-        str(tmp_path / "out"),
-    ]
 
 
 def test_production_cli_exposes_only_the_console_script() -> None:
@@ -51,20 +33,6 @@ def test_help_exits_zero(run_cli) -> None:
 
 def test_unknown_subcommand_exits_with_usage(run_cli) -> None:
     assert run_cli("dev", "bootstrap") == os.EX_USAGE
-
-
-def test_missing_records_file_exits_with_failure(
-    run_cli, eval_run: list[str], tmp_path: Path
-) -> None:
-    assert run_cli(*eval_run, "--records", str(tmp_path / "missing-records.jsonl")) == EX_FAILURE
-
-
-def test_failing_records_exit_with_verification_failed(
-    run_cli, eval_run: list[str], fixtures_dir: Path
-) -> None:
-    records = fixtures_dir / "authoring" / "verifier" / "not-ok-records.jsonl"
-
-    assert run_cli(*eval_run, "--records", str(records)) == EX_VERIFICATION_FAILED
 
 
 def test_in_process_plan_raises_catalog_error_for_missing_tree(tmp_path: Path) -> None:

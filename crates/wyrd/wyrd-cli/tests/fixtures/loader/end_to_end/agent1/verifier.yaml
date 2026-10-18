@@ -1,0 +1,27 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: churn-triage-check
+  version: "1.0.0"
+spec:
+  # NO subject. Subjects attach this Verifier through their own `verified_by`
+  # bindings, so multiple agents share it without reversioning it.
+  inputs:
+    triage:
+      type: json
+  requirements:
+    - id: lookup-called
+      statement: The triage agent looked up the customer.
+      check:
+        kind: assert
+        path: inputs.triage.tool_call_names
+        operator: contains
+        expected: customer_lookup
+    - id: cohort-valid
+      statement: The triage agent chose a supported cohort.
+      check:
+        kind: assert
+        path: inputs.triage.cohort
+        operator: in
+        expected: [loyal_win_back, price_sensitive, service_frustrated, unreachable]

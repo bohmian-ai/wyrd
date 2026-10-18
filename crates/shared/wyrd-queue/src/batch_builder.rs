@@ -1112,9 +1112,8 @@ mod batch_builder_tests {
         assert!(reader.next().is_none(), "single batch stream");
     }
 
-    /// Trace/span identity columns as `vala.eval.observations` and
-    /// `vala.traces.spans` describe them: nullable fixed-width binary keyed by
-    /// canonical lowercase hex text.
+    /// Trace/span identity columns as `vala.traces.spans` describes them:
+    /// nullable fixed-width binary keyed by canonical lowercase hex text.
     fn trace_schema() -> Schema {
         Schema::new(vec![
             Field::new("trace_id", DataType::FixedSizeBinary(16), true),

@@ -334,7 +334,7 @@ test("input that does not fit its slot fails locally", async ({ state }) => {
 
 test("caller without the verifier grant is refused", async ({ server, assistant }) => {
   const keys = [
-    server.scopedApiKey("evals_only", ["evals:run"]),
+    server.scopedApiKey("operators_only", ["operators:invoke"]),
     server.scopedApiKey("other_verifier", [
       { resource: "verifier", action: "run", scope: { verifier: assistant.answerJudged.uid } },
     ]),
@@ -344,6 +344,39 @@ test("caller without the verifier grant is refused", async ({ server, assistant 
 
     await expect(run.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(DENIED);
   }
+});
+
+test("retired verification contracts are refused", async ({ server, assistant }) => {
+  for (const action of ["run", "invoke"]) {
+    const credential = server.scopedApiKey(`evals_${action}`, [{ resource: "evals", action, scope: "all" }]);
+    const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
+
+    await expect(run.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject({
+      code: "WYRD_SPEC_500_INTERNAL",
+    });
+  }
+
+  const bifrost = await Bifrost.connect();
+  expect((await bifrost.listTables()).every((table) => table.namespace !== "vala.eval")).toBe(true);
+  const refusals = async (namespace: string, name: string) =>
+    Promise.all(
+      [
+        bifrost.sql(`SELECT * FROM ${namespace}.${name}`),
+        bifrost.describeTable(namespace, name),
+        (async () => (await Bifrost.connect()).useTableByName(`${namespace}.${name}`))(),
+      ].map((call) =>
+        call.then(
+          () => "accepted",
+          (error: { code: string }) => error.code,
+        ),
+      ),
+    );
+  for (const name of ["result_items", "observations"]) {
+    const retired = await refusals("vala.eval", name);
+    expect(retired).not.toContain("accepted");
+    expect(retired).toEqual(await refusals("vala.absent", name));
+  }
+  await bifrost.sql("SELECT COUNT(*) AS n FROM vala.verification.results");
 });
 
 test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {

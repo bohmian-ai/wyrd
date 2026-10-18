@@ -408,6 +408,10 @@ mod tests {
     /// caller's sampled flag, read the current context and the caller's own
     /// sampled flag; spans of a request that did not continue a caller's
     /// trace read none and report the caller unsampled.
+    ///
+    /// # Panics
+    /// Panics when a fixed traceparent fails to parse or a span reads the
+    /// wrong continued context or sampled flag.
     #[test]
     fn only_spans_of_a_continued_request_read_a_continued_context() {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
@@ -447,6 +451,11 @@ mod tests {
 
     /// Linked deferred work keeps a trace of its own but reads as continued
     /// inside it: its spans read that new trace's context and the original
+    /// caller's sampled flag.
+    ///
+    /// # Panics
+    /// Panics when a fixed trace or span id fails to parse, linked work reads
+    /// no continued context, reuses the cause's trace id, or loses the
     /// caller's sampled flag.
     #[test]
     fn linked_work_continues_its_own_trace_with_the_callers_decision() {

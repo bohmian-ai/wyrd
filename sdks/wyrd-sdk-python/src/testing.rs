@@ -419,11 +419,13 @@ impl WyrdTestServer {
     /// projection (`resource`, `action`, `scope`), which expresses object
     /// scope such as one gateway model. This is the door a journey uses to
     /// prove an access gate from the caller's side: it seeds one role carrying
-    /// only those grants and bootstraps a service named `role` onto it.
+    /// only those grants and bootstraps a service named `role` onto it. A dict
+    /// is stored as given, so one the current schema rejects reaches the
+    /// server and is refused by its own issuance decode.
     ///
     /// # Errors
     ///
-    /// Raises the harness error for an unparsable permission, and a Wyrd
+    /// Raises the harness error for an unparsable permission string, and a Wyrd
     /// Python error when the context manager is inactive or role seeding or
     /// bootstrapping fails.
     fn scoped_api_key(
@@ -441,16 +443,16 @@ impl WyrdTestServer {
             .iter()
             .map(|value| {
                 if let Ok(token) = value.extract::<String>() {
-                    return token.parse::<Permission>().map_err(|_| {
+                    let permission = token.parse::<Permission>().map_err(|_| {
                         harness_error(format!("`{token}` is not a resource:action permission"))
-                    });
+                    })?;
+                    return serde_json::to_value(permission).map_err(harness_error);
                 }
                 let json: String = dumps
                     .call1((value,))
                     .and_then(|dumped| dumped.extract())
                     .map_err(harness_error)?;
-                serde_json::from_str::<Permission>(&json)
-                    .map_err(|error| harness_error(format!("invalid permission {json}: {error}")))
+                serde_json::from_str::<serde_json::Value>(&json).map_err(harness_error)
             })
             .collect::<WyrdPyResult<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()

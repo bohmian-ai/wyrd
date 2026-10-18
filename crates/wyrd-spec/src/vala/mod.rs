@@ -1,4 +1,4 @@
-//! Vala primitive types — drift, eval, records, transport, trace, bifrost,
+//! Vala primitive types — drift, verification, records, transport, trace, bifrost,
 //! and OLAP shapes.
 //!
 //! `vala` is Wyrd's drift-monitoring engine, agent-evaluation runtime, OTel
@@ -22,7 +22,6 @@ pub mod audit_detail;
 pub mod drift;
 /// Public Bifrost error catalog for HTTP, MCP, and Python SDK boundaries.
 pub mod error;
-pub mod eval;
 pub mod ids;
 /// Log observation records (faithful OTel LogRecord).
 pub mod logs;

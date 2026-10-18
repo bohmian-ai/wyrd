@@ -24,8 +24,8 @@ use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::{FeatureName, SlotName};
 use crate::reference::InlineableRef;
-use crate::vala::eval::{ExecutionPlan, TaskId, plan_stages};
 use crate::verification::execution::Verdict;
+use crate::verification::{ExecutionPlan, TaskId, plan_stages};
 
 /// An Agent and its Prompt, resolved by the caller for validation.
 #[derive(Debug, Clone, Copy)]
@@ -828,7 +828,7 @@ fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
 /// Returns [`WyrdError::Validation`] with rule `operator` carrying the
 /// operator's own refusal.
 fn validate_operator(
-    operator: &crate::vala::eval::ComparisonOperator,
+    operator: &crate::verification::ComparisonOperator,
     path: &str,
 ) -> Result<(), WyrdError> {
     operator
@@ -1104,7 +1104,7 @@ mod tests {
                 stage
                     .tasks
                     .iter()
-                    .map(crate::vala::eval::TaskId::as_str)
+                    .map(crate::verification::TaskId::as_str)
                     .collect()
             })
             .collect();

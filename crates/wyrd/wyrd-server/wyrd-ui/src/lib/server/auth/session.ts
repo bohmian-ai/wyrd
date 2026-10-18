@@ -35,7 +35,7 @@ const localPrincipal: LocalPrincipal = {
       permissions: [
         'cards:read',
         'bifrost_query:read',
-        'evals:read',
+        'drift:read',
         'changes:read',
         'changes:write',
         'changes:review',
@@ -50,7 +50,7 @@ const localPrincipal: LocalPrincipal = {
       permissions: [
         'cards:read',
         'bifrost_query:read',
-        'evals:read',
+        'drift:read',
         'changes:read',
         'changes:write',
         'changes:review',

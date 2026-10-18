@@ -51,10 +51,10 @@ def test_bound_sql_text_is_treated_as_data(bifrost: Bifrost, query_table: str) -
 
 
 def test_unwritten_builtin_table_reads_as_empty() -> None:
-    # A fresh server, since the session server's journeys write and publish Eval results.
+    # A fresh server, since the session server's journeys write and publish Verifier results.
     with WyrdTestServer(mutate_env=False) as server:
         [counted] = Bifrost(client=client_of(server)).sql(
-            "SELECT COUNT(*) AS n FROM vala.eval.result_items", model=Count
+            "SELECT COUNT(*) AS n FROM vala.drift.result_features", model=Count
         )
     assert counted.n == 0
 

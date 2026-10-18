@@ -95,7 +95,7 @@ type Ledger = [Vec<Interval>; 5];
 /// Shareable recorder of one execution's dependency, evidence, and provider waits.
 ///
 /// Cloning shares the same interval list, so a wait measured inside a spawned
-/// task, such as a judge invocation on the Eval executor's task set, joins
+/// task, such as a judge invocation on the engine's task set, joins
 /// the execution that owns it.
 #[derive(Debug, Clone, Default)]
 pub struct WaitSink {

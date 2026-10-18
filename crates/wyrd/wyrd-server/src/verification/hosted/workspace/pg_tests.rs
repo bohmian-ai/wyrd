@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::FutureExt;
 use serde_json::json;
-use vala_eval::blocks::{CallInput, CallValue};
+use vala_verify::blocks::{CallInput, CallValue};
 
 use super::*;
 use crate::test_support::{test_caller, test_state};

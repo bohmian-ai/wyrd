@@ -75,7 +75,7 @@ Every tenant has four built-in roles. Each includes everything in the role above
 | Role | Adds | Typical holder |
 | --- | --- | --- |
 | `viewer` | `cards:read`, `artifacts:read`, `audit:read`, `operators:read`, `gateway:read`, `gateway_payload:read`, `bifrost_table:read`, `bifrost_query:read` | A person who inspects results |
-| `workload` | `bifrost_table:write`, `bifrost_record:write`, `evals:run`, `verifier:run`, `triggers:write`, `operators:invoke`, `gateway:invoke` | A deployed Service or Agent |
+| `workload` | `bifrost_table:write`, `bifrost_record:write`, `verifier:run`, `triggers:write`, `operators:invoke`, `gateway:invoke` | A deployed Service or Agent |
 | `editor` | `cards:write`, `cards:delete`, `artifacts:write`, `policy:lock`, `services:install` | A person or CI job that changes declarations |
 | `admin` | Every permission (`*:*`), including the administrative ones no other role holds: `service_accounts:write`, `operators:write`, `gateway:write`, and `gateway:delete` | The tenant administrator |
 

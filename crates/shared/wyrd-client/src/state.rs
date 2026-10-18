@@ -1038,9 +1038,10 @@ impl WyrdState {
 
     /// Resolve an alias to the pure Verifier spec borrowed from its envelope.
     ///
-    /// The caller matches on `implementation` to reach the Drift or Eval
-    /// payload; there is no separate per-implementation accessor because
-    /// `Verifier` is the only registrable verification kind.
+    /// Returns the declarative building blocks directly: `inputs`, `steps`,
+    /// `requirements`, `decide`, and `context_capture`. Drift and Agent
+    /// judging are requirement check kinds inside those blocks, so one
+    /// accessor covers every Verifier and no per-check accessor exists.
     ///
     /// # Arguments
     /// * `alias` - The bundle alias of a Verifier Card.
@@ -2360,7 +2361,7 @@ pub(crate) mod tests {
             let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
             let agent_ref = test_ref(CardKind::Agent, "triage", 6);
             let data_ref = test_ref(CardKind::Data, "training", 7);
-            let eval_ref = test_ref(CardKind::Verifier, "quality", 8);
+            let check_ref = test_ref(CardKind::Verifier, "quality", 8);
             let drift_ref = test_ref(CardKind::Verifier, "model-drift", 9);
 
             bundle.add_card(
@@ -2393,9 +2394,9 @@ pub(crate) mod tests {
                 &[],
             );
             bundle.add_card(
-                "quality_eval",
+                "quality_check",
                 card(
-                    &eval_ref,
+                    &check_ref,
                     CardKind::Verifier,
                     Spec::Verifier(assert_verifier()),
                     Relationships::default(),
@@ -2423,7 +2424,7 @@ pub(crate) mod tests {
                     service_component("agent_triage", &agent_ref),
                 ]);
                 spec.verified_by.extend([
-                    verification_binding(eval_ref, None),
+                    verification_binding(check_ref, None),
                     verification_binding(
                         drift_ref,
                         Some(TriggerActivation::Schedule {
@@ -2444,7 +2445,7 @@ pub(crate) mod tests {
         /// Panics if the agent-check fixture cannot be built, rewritten, or
         /// serialized.
         fn with_nested_prompt(&mut self, prompt_ref: CardRef, sibling: bool) -> CardRef {
-            use wyrd_spec::vala::eval::TaskId;
+            use wyrd_spec::verification::TaskId;
 
             let verifier_ref = test_ref(CardKind::Verifier, "judge", 4);
             let check = Check::Agent(AgentCall {
@@ -3030,7 +3031,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             state
-                .verifier("quality_eval")
+                .verifier("quality_check")
                 .expect("assert verifier resolves"),
             &assert_verifier()
         );
@@ -3191,7 +3192,7 @@ pub(crate) mod tests {
             Ok(HydratedCard::Data(_))
         ));
         assert!(matches!(
-            state.get("quality_eval"),
+            state.get("quality_check"),
             Ok(HydratedCard::Envelope(card)) if card.kind == CardKind::Verifier
         ));
         let Err(unknown) = state.get("missing") else {
@@ -3355,7 +3356,7 @@ pub(crate) mod tests {
         let bundle = TestBundle::with_typed_cards();
         let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
         assert_eq!(
-            state.card("quality_eval").expect("eval card").kind,
+            state.card("quality_check").expect("verifier card").kind,
             CardKind::Verifier
         );
         assert_eq!(

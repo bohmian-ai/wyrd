@@ -771,6 +771,13 @@ export interface ContentBlockText {
 }
 
 /**
+ * How a Verifier stores each requirement result's captured `actual` value.
+ *
+ * Verdict correctness is unaffected by this setting; only the stored snapshot of the extracted value changes. Set on the Verifier spec via `context_capture`; absent means `Full`.
+ */
+export type ContextCapture = "full" | "hash" | "redact";
+
+/**
  * `POST /v1/operator-connections` body.
  */
 export type CreateOperatorConnectionRequest = CreateOperatorConnectionRequestSlack | CreateOperatorConnectionRequestPagerDuty | CreateOperatorConnectionRequestHttp;
@@ -1527,15 +1534,6 @@ export interface DriftWindow {
    */
   readonly start: string;
 }
-
-/**
- * Declares how `vala-eval` populates [`AssertionResult::actual`] when writing result rows to `eval_task_results`.
- *
- * Evaluation correctness ([`AssertionResult::passed`]) is unaffected by this setting. Only the stored snapshot of the extracted value changes.
- *
- * Set at the [`super::spec::EvalSpec`] level via `context_capture`. Absent means `Full`.
- */
-export type EvalContextCapture = "full" | "hash" | "redact";
 
 /**
  * Where an Agent's model calls go.
@@ -5775,7 +5773,7 @@ export interface VerifierSpec {
   /**
    * How permitted `actual` values are stored; absent means full capture.
    */
-  readonly context_capture?: EvalContextCapture | null;
+  readonly context_capture?: ContextCapture | null;
   /**
    * How requirement outcomes combine into the verdict.
    */

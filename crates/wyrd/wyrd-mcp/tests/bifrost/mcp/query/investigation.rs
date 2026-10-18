@@ -18,10 +18,10 @@ use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::Check;
-use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::ids::{ExecutionId, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
@@ -39,14 +39,14 @@ pub(super) struct EvidenceInvestigation {
     agent: RunningService<RoleClient, ()>,
     /// Exact subject Card whose evidence is investigated.
     subject: CardRef,
-    /// Drift execution, whose UUID is its result ID, used as a detail pivot.
-    drift_result: ExecutionId,
-    /// Assertion execution, whose UUID is its result ID, used as a pivot.
-    eval_result: ExecutionId,
+    /// Drift result published for the subject, used as a detail pivot.
+    drift_result: VerificationResultId,
+    /// Assertion result published for the subject, used as a pivot.
+    assertion_result: VerificationResultId,
     /// Exact Drift Verifier matching the retained feature report.
     drift_verifier: CardRef,
-    /// Exact Eval Verifier from the shared assertion fixture.
-    eval_verifier: CardRef,
+    /// Exact assertion Verifier from the shared `no-refund-promise` fixture.
+    assertion_verifier: CardRef,
     /// Instrumentation scope isolating the canonical signals.
     scope: String,
 }
@@ -85,7 +85,7 @@ impl EvidenceInvestigation {
             cards.register_from_path(&fixtures.join("mcp_investigation/drift-verifier.yaml")),
         )
         .await?;
-        let eval = Box::pin(
+        let assertion = Box::pin(
             cards.register_from_path(&fixtures.join("register_and_hydrate/no-refund-promise.yaml")),
         )
         .await?;
@@ -112,26 +112,38 @@ impl EvidenceInvestigation {
                 discover(),
             )
             .await?;
-        let investigation = Self {
+        let [drift_result, assertion_result] =
+            Self::publish_results(&server, &receipt.root, &drift.root, &assertion.root).await?;
+        Ok(Self {
             server,
             agent,
             subject: receipt.root,
             drift_verifier: drift.root,
-            eval_verifier: eval.root,
+            assertion_verifier: assertion.root,
             scope: signals.scope,
-            drift_result: ExecutionId::new_v7(),
-            eval_result: ExecutionId::new_v7(),
-        };
-        investigation.publish_results().await?;
-        Ok(investigation)
+            drift_result,
+            assertion_result,
+        })
     }
 
     /// Reuse the native result mapper and shared Scribe outbox; no parallel row schema.
     ///
+    /// Publishes one failed drift result from `drift_verifier` and one failed
+    /// assertion result from `assertion_verifier` for `subject`, each under its own
+    /// execution, and flushes them to Bifrost.
+    ///
+    /// Returns the drift and assertion result IDs the payloads minted, in
+    /// that order.
+    ///
     /// # Errors
     /// Returns fixture decoding, result mapping, or publication failures.
-    async fn publish_results(&self) -> Result<(), McpJourneyError> {
-        let seed = self.server.verification_fixture().await?;
+    async fn publish_results(
+        server: &WyrdTestServer,
+        subject: &CardRef,
+        drift_verifier: &CardRef,
+        assertion_verifier: &CardRef,
+    ) -> Result<[VerificationResultId; 2], McpJourneyError> {
+        let seed = server.verification_fixture().await?;
         let now = chrono::Utc::now();
         let failed = |id: &str, statement: &str, detail, check| -> Result<_, McpJourneyError> {
             Ok(VerificationOutcome {
@@ -180,19 +192,11 @@ impl EvidenceInvestigation {
             start: now - chrono::Duration::hours(1),
             end: now,
         };
-        let subject_uid = self
-            .subject
-            .uid
-            .as_ref()
-            .ok_or("registered subject has a UID")?;
+        let subject_uid = subject.uid.as_ref().ok_or("registered subject has a UID")?;
+        let mut result_ids = Vec::with_capacity(2);
         for (execution_id, outcome, window, reference) in [
-            (
-                self.drift_result,
-                drift,
-                Some(&window),
-                &self.drift_verifier,
-            ),
-            (self.eval_result, assertion, None, &self.eval_verifier),
+            (ExecutionId::new_v7(), drift, Some(&window), drift_verifier),
+            (ExecutionId::new_v7(), assertion, None, assertion_verifier),
         ] {
             let version = reference.version.to_string();
             let uid = reference.uid.as_ref().ok_or("Verifier has a UID")?;
@@ -207,16 +211,19 @@ impl EvidenceInvestigation {
                 window,
             };
             let payload = ResultPayloadBuilder::new(run, uid, now, now).build(&outcome)?;
-            self.server.state().scribe_outbox.stage(
-                self.server.data_tenant_id(),
+            result_ids.push(payload.result_id());
+            server.state().scribe_outbox.stage(
+                server.data_tenant_id(),
                 ScribeWrite::Result {
                     payload,
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
         }
-        self.server.flush_bifrost().await?;
-        Ok(())
+        server.flush_bifrost().await?;
+        Ok(result_ids
+            .try_into()
+            .map_err(|_| "one result is published per seeded outcome")?)
     }
 
     /// Invoke a tool with its documented argument object.
@@ -312,7 +319,7 @@ impl EvidenceInvestigation {
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
     pub(super) async fn follow_subject_and_results(&self) -> Result<(), McpJourneyError> {
-        for reference in [&self.drift_verifier, &self.eval_verifier] {
+        for reference in [&self.drift_verifier, &self.assertion_verifier] {
             let response: GetCardResponse = serde_json::from_value(structured(
                 self.agent
                     .call_tool(Self::request(
@@ -326,7 +333,10 @@ impl EvidenceInvestigation {
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
         let rows = self.query(&format!("SELECT result_id, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
-        let mut expected = [self.drift_result.to_string(), self.eval_result.to_string()];
+        let mut expected = [
+            self.drift_result.to_string(),
+            self.assertion_result.to_string(),
+        ];
         expected.sort();
         assert_eq!(
             rows,

@@ -100,7 +100,7 @@ export type ServiceChart = {
 };
 
 /**
- * One published Drift/Eval intelligence panel projected from the selected
+ * One published Drift/Verifier intelligence panel projected from the selected
  * version's declaration bindings (REQ-126). `state` renders unauthorized or
  * no-data refusals with the subject kept visible; `chart` is the score trend
  * against its threshold.
@@ -204,7 +204,7 @@ export type ServiceDefinition = {
     note: string;
     component: {
       label: string;
-      /** Linked publication pairs: component Card → its Eval/Drift target. */
+      /** Linked publication pairs: component Card → its Verifier/Drift target. */
       flows: { from: { label: string; href: string }; to: { label: string; href: string } }[];
       /** Absence sentence rendered when a version declares no flows. */
       absent?: string;

@@ -471,34 +471,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Vala eval task graph failed DAG validation (cycle, self-loop, or missing dependency).
-    #[error("[WYRD_VALA_400_TASK_DAG_INVALID] {message}")]
-    #[wyrd_error(
-        code = "WYRD_VALA_400_TASK_DAG_INVALID",
-        status = 400,
-        title = "Eval task DAG validation failed",
-        remediation = "Remove cycles, self-dependencies, or references to missing eval tasks."
-    )]
-    ValaTaskDagInvalid {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Vala eval contract referenced a CardRef kind outside its allowlist.
-    #[error("[WYRD_VALA_400_EVAL_REF_KIND_MISMATCH] {message}")]
-    #[wyrd_error(
-        code = "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH",
-        status = 400,
-        title = "Eval reference kind mismatch",
-        remediation = "Use the required CardRef kind for the eval field being validated."
-    )]
-    ValaEvalRefKindMismatch {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Caller presented no credential or an unparseable one.
     #[error("[WYRD_AUTH_401_UNAUTHENTICATED] {message}")]
     #[wyrd_error(
@@ -3638,8 +3610,6 @@ impl WyrdError {
             | Self::Internal { message, details }
             | Self::UpstreamFailure { message, details }
             | Self::Timeout { message, details }
-            | Self::ValaTaskDagInvalid { message, details }
-            | Self::ValaEvalRefKindMismatch { message, details }
             | Self::Unauthenticated { message, details }
             | Self::TokenExpired { message, details }
             | Self::InvalidToken { message, details }

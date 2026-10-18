@@ -18,7 +18,7 @@ publish_no_verify = true
 # wyrd-auth) stay unpublished.
 
 [[package]]
-name = "vala-eval"
+name = "vala-verify"
 publish = true
 
 [[package]]

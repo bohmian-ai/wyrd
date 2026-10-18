@@ -13,7 +13,6 @@ mod card;
 mod cli;
 mod client;
 pub mod error;
-mod eval;
 pub mod gateway;
 pub mod load;
 /// `wyrd mcp`: MCP host installation and the host-facing stdio proxy.
@@ -86,7 +85,7 @@ where
     match cli.dispatch().await {
         Ok(code) => code_to_u8(code),
         Err(error) => {
-            eval::output::print_cli_error(&error);
+            error.print();
             error.exit_code()
         }
     }

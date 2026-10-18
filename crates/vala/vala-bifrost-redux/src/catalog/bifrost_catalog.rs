@@ -1387,6 +1387,10 @@ impl BifrostCatalog {
 
     /// List registrations visible under the exact tenant RLS bind.
     ///
+    /// A registration whose namespace is no longer a [`BifrostNamespace`] —
+    /// such as a stale development row for a retired table — names nothing
+    /// Bifrost can serve, so it is left out like any unknown table.
+    ///
     /// # Errors
     /// Returns a catalog error when SQL or row projection fails.
     pub async fn list_tables(
@@ -1396,7 +1400,10 @@ impl BifrostCatalog {
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let rows = vala_sql::queries::olap_catalog::list_tables_for_tenant(&mut conn).await?;
         conn.commit().await?;
-        rows.iter().map(entry_from_row).collect()
+        rows.iter()
+            .filter(|row| BifrostNamespace::split_fqn(&row.fqn).is_some())
+            .map(entry_from_row)
+            .collect()
     }
 
     /// Describe one tenant-qualified table and its stored physical schema.

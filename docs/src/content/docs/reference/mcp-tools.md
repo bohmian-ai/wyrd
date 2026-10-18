@@ -60,7 +60,7 @@ Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain do
 | `bifrost.describe_table` | Read; `bifrost_table:read` | `{namespace, name}` → table description | Read user fields, managed fields, partitioning, sorting, and Bloom columns |
 | `bifrost.query` | Read; scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one complete bounded SELECT over authorized tables |
 
-Schema/table object grants restrict the query to the allowed objects. Gateway request/response payload columns also require `gateway_payload:read`. Catalog listing and schema description require `bifrost_table:read`; query grants separately decide which objects can be read. Sensitive metadata on verification, Eval, or trace columns is descriptive; table query permission governs those columns.
+Schema/table object grants restrict the query to the allowed objects. Gateway request/response payload columns also require `gateway_payload:read`. Catalog listing and schema description require `bifrost_table:read`; query grants separately decide which objects can be read. Sensitive metadata on verification or trace columns is descriptive; table query permission governs those columns.
 
 ### Query limits
 

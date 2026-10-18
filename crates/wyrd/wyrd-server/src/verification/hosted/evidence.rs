@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use base64::Engine as _;
 use skald_spec::{MediaFormat, MediaRef, MediaSource};
-use vala_eval::blocks::{
-    ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EvidenceReader,
+use vala_verify::blocks::{
+    ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::card::verifier::Action;
+use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::CardRef;
@@ -159,25 +159,41 @@ impl TenantEvidence {
     /// The verified bytes of one file of exact Artifact `card`, and the
     /// media format its stored content type names.
     ///
-    /// The Card is resolved through the registry's own authorized read, so
-    /// the caller's `card:read` decision is checked and audited and a
-    /// mismatched UID is refused. The file comes from the Card's
-    /// server-authoritative inventory: `path` names it, or the Artifact must
-    /// hold exactly one. Its bytes are then read through [`Self::stored`]
-    /// against the inventory's size and digest. Code sources and evidence
-    /// share this one loader.
+    /// The file is located through [`Self::artifact_file`], then its bytes
+    /// are read through [`Self::stored`] against the inventory's size and
+    /// digest. Code sources and evidence share this one loader.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a non-Artifact reference, a
-    /// refused or missing Card, a path the inventory does not hold, a
-    /// malformed inventory row, and [`Self::stored`] refusals;
-    /// [`BlockError::Retryable`] when the registry or storage is
-    /// unavailable.
+    /// Returns [`Self::artifact_file`] and [`Self::stored`] refusals.
     pub async fn artifact(
         &self,
         card: &CardRef,
         path: Option<&str>,
     ) -> Result<(Vec<u8>, Option<MediaFormat>), BlockError> {
+        let file = self.artifact_file(card, path).await?;
+        let bytes = self.stored(&file.object, file.size, &file.sha256).await?;
+        Ok((bytes, file.format))
+    }
+
+    /// The stored metadata of one file of exact Artifact `card`, read
+    /// without its bytes.
+    ///
+    /// The Card is resolved through the registry's own authorized read, so
+    /// the caller's `card:read` decision is checked and audited and a
+    /// mismatched UID is refused. The file comes from the Card's
+    /// server-authoritative inventory: `path` names it, or the Artifact must
+    /// hold exactly one. Admission and [`Self::artifact`] share this lookup.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a non-Artifact reference, a
+    /// refused or missing Card, a path the inventory does not hold, or a
+    /// malformed inventory row, and [`BlockError::Retryable`] when the
+    /// registry is unavailable.
+    async fn artifact_file(
+        &self,
+        card: &CardRef,
+        path: Option<&str>,
+    ) -> Result<ArtifactFile, BlockError> {
         if card.kind != CardKind::Artifact {
             return Err(terminal("the reference does not name an Artifact Card"));
         }
@@ -214,12 +230,15 @@ impl TenantEvidence {
             tenant,
         )
         .map_err(|_| terminal("the Artifact file path is not a valid tenant path"))?;
-        let bytes = self.stored(&object, size, &sha256).await?;
-        let format = entry
-            .content_type
-            .as_deref()
-            .and_then(|mime| mime.parse().ok());
-        Ok((bytes, format))
+        Ok(ArtifactFile {
+            object,
+            size,
+            sha256,
+            format: entry
+                .content_type
+                .as_deref()
+                .and_then(|mime| mime.parse().ok()),
+        })
     }
 
     /// The bytes of stored object `path`, which must be `size` bytes long
@@ -281,8 +300,95 @@ impl TenantEvidence {
     }
 }
 
+/// One registered Artifact file's stored metadata, from its inventory.
+struct ArtifactFile {
+    /// The file's tenant storage object.
+    object: ValidatedPath,
+    /// Stored length in bytes.
+    size: u64,
+    /// Stored SHA-256.
+    sha256: Sha256Hex,
+    /// The media format its stored content type names, if supported.
+    format: Option<MediaFormat>,
+}
+
 #[async_trait]
 impl EvidenceReader for TenantEvidence {
+    /// Admit the execution's original input files before any block runs.
+    ///
+    /// Each selected Artifact file's metadata is resolved through
+    /// [`Self::artifact_file`], under the caller's audited `card:read`, and
+    /// must be a format its media slot accepts and within the slot's
+    /// `max_bytes`; uploaded files were checked by the engine from their
+    /// declarations. Every file and selected Artifact file, used or not,
+    /// must then fit the Deployment's individual input-file limit, and
+    /// their declared lengths must fit its combined input-file limit
+    /// together. Each original input counts once, whatever later
+    /// reads, workspaces, or retries do with it; no bytes are read here.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
+    /// combined limit,
+    /// [`EngineError::InputInvalid`] for an Artifact file that cannot be
+    /// resolved or that its slot does not accept, and
+    /// [`EngineError::EvidenceUnavailable`] when the registry is unavailable.
+    async fn admit(
+        &self,
+        slots: &BTreeMap<SlotName, InputSlot>,
+        evidence: &BTreeMap<SlotName, InputDeclaration>,
+    ) -> Result<(), EngineError> {
+        let mut total = 0_u64;
+        for (name, declaration) in evidence {
+            let size = match declaration {
+                InputDeclaration::File { size_bytes, .. } => *size_bytes,
+                InputDeclaration::Artifact { artifact, path } => {
+                    let file = self
+                        .artifact_file(artifact, path.as_deref())
+                        .await
+                        .map_err(|error| match error {
+                            BlockError::Retryable { reason } => {
+                                EngineError::EvidenceUnavailable(format!("input {name}: {reason}"))
+                            }
+                            error => EngineError::InputInvalid(format!("input {name}: {error}")),
+                        })?;
+                    if let Some(InputSlot::Media {
+                        formats, max_bytes, ..
+                    }) = slots.get(name)
+                    {
+                        if !file.format.is_some_and(|format| formats.contains(&format)) {
+                            return Err(EngineError::InputInvalid(format!(
+                                "input {name}: the slot does not accept the Artifact file's format"
+                            )));
+                        }
+                        if let Some(max) = max_bytes.filter(|max| file.size > *max) {
+                            return Err(EngineError::InputTooLarge(format!(
+                                "input {name}: the Artifact file exceeds the slot's {max}-byte limit"
+                            )));
+                        }
+                    }
+                    file.size
+                }
+                InputDeclaration::Json { .. } | InputDeclaration::Trace { .. } => continue,
+            };
+            if size > self.limits.file_max_bytes {
+                return Err(EngineError::InputTooLarge(format!(
+                    "input {name}: the file exceeds the {}-byte input file limit",
+                    self.limits.file_max_bytes
+                )));
+            }
+            total = total
+                .checked_add(size)
+                .filter(|total| *total <= self.limits.files_max_bytes)
+                .ok_or_else(|| {
+                    EngineError::InputTooLarge(format!(
+                        "the execution's input files exceed the combined {}-byte limit",
+                        self.limits.files_max_bytes
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Read `evidence` as inline provider-native media.
     ///
     /// # Errors
@@ -428,8 +534,8 @@ mod pg_tests {
 
     use std::future::Future;
 
-    use vala_eval::blocks::{CallInput, Position};
-    use wyrd_spec::vala::eval::TaskId;
+    use vala_verify::blocks::{CallInput, Position};
+    use wyrd_spec::verification::TaskId;
 
     use super::*;
     use crate::test_support::{test_caller, test_state, test_tenant};

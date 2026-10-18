@@ -26,7 +26,7 @@ use monty_types::{MontyObject, ResourceLimits};
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use vala_eval::blocks::{
+use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EvidenceReader,
 };

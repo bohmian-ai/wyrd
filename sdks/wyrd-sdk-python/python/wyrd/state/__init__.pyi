@@ -170,13 +170,12 @@ class WyrdState:
         table: TableConfig | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
-        """Connect this state's one Bifrost writer and describe the fixed tables.
+        """Connect this state's one Bifrost writer and describe the fixed table.
 
         The writer acts as the state's client: the one given to ``from_path``,
-        else the ambient client. Startup describes
-        ``vala.drift.observations`` and ``vala.eval.observations`` before
-        succeeding, so a run can never enqueue against a missing, unauthorized,
-        or incompatible system table.
+        else the ambient client. Startup describes ``vala.drift.observations``
+        before succeeding, so a run can never enqueue against a missing,
+        unauthorized, or incompatible system table.
 
         Args:
             table: the Bifrost write binding, as for ``Bifrost()``. It does

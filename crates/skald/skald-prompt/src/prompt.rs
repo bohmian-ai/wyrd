@@ -1265,6 +1265,16 @@ fn require_binding_args(owned: &[(String, String)]) -> WyrdPyResult<()> {
     Ok(())
 }
 
+/// Convert a Python `set_request` argument into a native [`ProviderRequest`].
+///
+/// A native `ProviderRequest` object is cloned as is; any other value is
+/// converted to JSON and decoded as a provider-shaped request body, so
+/// authored dicts reach the same typed wire shape.
+///
+/// # Errors
+/// Returns the boundary conversion error when the value cannot be converted
+/// to JSON, and [`PromptBuilderError::Validation`] (the public
+/// `WYRD_PROMPT_400_INVALID`) when the JSON is not a provider request.
 #[cfg(feature = "python")]
 fn provider_request_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ProviderRequest> {
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
@@ -1657,6 +1667,15 @@ fn append_native_json_content(
     Ok(out)
 }
 
+/// Decode authored native content as one part or an ordered list of parts.
+///
+/// Native content helpers accept either a single provider part object or an
+/// array of them; a single part becomes a one-element list.
+///
+/// # Errors
+/// Returns [`PromptBuilderError::Validation`] (the public
+/// `WYRD_PROMPT_400_INVALID`) when the value, or any element, is not a part
+/// of type `T`.
 #[cfg(feature = "python")]
 fn json_parts<T>(value: serde_json::Value) -> WyrdPyResult<Vec<T>>
 where

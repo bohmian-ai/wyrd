@@ -78,7 +78,7 @@ test('tenant binding rejects unknown, unauthorized, revoked and expired context 
     permissions: [
       'cards:read',
       'bifrost_query:read',
-      'evals:read',
+      'drift:read',
       'changes:read',
       'changes:write',
       'changes:review',

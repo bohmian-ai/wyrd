@@ -1,7 +1,7 @@
 <script lang="ts">
   // The default operational view (C-09/S-01/S-04/S-05/S-06/S-07): one
   // compact server-projected assessment, four separated state channels, the
-  // dominant shared-range chart grid, published Drift/Eval intelligence from
+  // dominant shared-range chart grid, published Drift/Verifier intelligence from
   // the declaration bindings, and one subordinate context band. Every state
   // is rendered from the projection — never computed here (REQ-124).
   import Badge from '$lib/components/Badge.svelte';
@@ -91,7 +91,7 @@
 </section>
 
 <p class="mono muted">
-  range applies to the operational charts — drift and eval signals keep their own windows
+  range applies to the operational charts — drift and verification signals keep their own windows
 </p>
 <div class="dashboard" aria-label="Operating dashboard">
   {#each view.charts as chart (chart.title)}

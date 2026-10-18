@@ -233,11 +233,12 @@ class WyrdTestServer:
             permissions: each a ``"resource:action"`` string granting every
                 object of that operation, or a typed permission dict
                 (``resource``, ``action``, ``scope``) naming objects such as one
-                gateway model.
+                gateway model. A dict is stored as given, so one the current
+                schema rejects reaches the server and is refused there.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
-                permission.
+                permission string.
 
         Returns:
             An API key for the service holding exactly ``role``.

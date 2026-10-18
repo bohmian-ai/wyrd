@@ -26,13 +26,13 @@ use serde_json::{Value, json};
 use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use vala_eval::blocks::{AgentToolset, BlockCall, BlockError, ToolSession};
+use vala_verify::blocks::{AgentToolset, BlockCall, BlockError, ToolSession};
 use wyrd_runtime::Permission;
 use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::card::verifier::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;

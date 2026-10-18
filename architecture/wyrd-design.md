@@ -1135,7 +1135,7 @@ lifecycle axis** (`subject_refs`, doctrine #8) and **the time axis**
 
 | Field         | Why it's optional                                                  |
 |---------------|--------------------------------------------------------------------|
-| `signals`     | Lets the audit pin to e.g. `Drift` only, or `EvalScore` only.      |
+| `signals`     | Lets the audit pin to e.g. `Drift` only, or `Verification` only.   |
 | `actors`      | Lets the audit pin to one service identity's emissions.            |
 | `request_ids` | Lets the audit pin to specific runtime hops (doctrine #15) when the investigator already knows them. |
 | `labels`      | Open-shape narrowing the registry doesn't model — tenant, region, deployment slice. |
@@ -1419,7 +1419,7 @@ check:
   profile: DriftProfile          # matching PSI, SPC, or Custom config
 ```
 
-**`Agent`, `External`, and Eval-score methods/signals are deliberately absent.**
+**`Agent`, `External`, and judge-score methods/signals are deliberately absent.**
 They have no complete input, fitting, or scoring contract here.
 
 `DriftSignal` is a closed enum:
@@ -1716,7 +1716,7 @@ Exact field schema lives in OpenAPI.
 
 The old verification `run_id` template field has no alias; `run_id` remains
 reserved for the optional application Run and is not a template field.
-Obsolete `eval.*` fields are rejected. Freeze the bounded generic result
+Fields outside this table are rejected. Freeze the bounded generic result
 summary and completion time with the existing failure context before delivery;
 all retries retain that context. Adapt existing dispatch foreign keys, claim
 joins, and deduplication to execution identity alongside this projection.

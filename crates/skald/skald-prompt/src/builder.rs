@@ -394,6 +394,18 @@ fn anthropic_output_config(
     })
 }
 
+/// Projects the effective response format onto the caller's native Google
+/// settings for [`google_prompt`].
+///
+/// Native settings are kept as authored. A JSON-object format sets the JSON
+/// MIME type; a JSON-schema format also replaces any native `response_schema`
+/// with `response_json_schema`, because Google refuses both together. An
+/// all-default generation config is omitted.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema)
+/// when the JSON-schema format is not a JSON object.
 fn google_settings(
     options: &GeminiOptions,
     format: Option<&ResponseFormat>,
@@ -409,6 +421,8 @@ fn google_settings(
             ResponseFormatKind::JsonSchema { schema, .. } => {
                 schema_object(schema)?;
                 config.response_mime_type = Some("application/json".to_owned());
+                // Google refuses a config carrying both schema fields.
+                config.response_schema = None;
                 config.response_json_schema = Some(schema.clone());
             }
         }
@@ -714,6 +728,52 @@ mod builder_tests {
             ProviderRequest::GeminiGenerateContent(_)
         ));
         assert_eq!(vertex_prompt.native().provider(), ProviderName::Vertex);
+    }
+
+    /// Proves an effective output schema replaces a native `response_schema`
+    /// for both Google builders: Google refuses a request carrying both schema
+    /// fields, so the serialized config must hold only `response_json_schema`
+    /// while unrelated native settings survive.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a builder refuses the request, emits a non-Google variant,
+    /// serializes both schema fields, or drops the native temperature.
+    #[test]
+    fn google_output_schema_replaces_native_response_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"]
+        });
+        let options = || GeminiOptions {
+            messages: vec!["summarize".to_owned()],
+            output: Some(ResponseFormat::json_schema("summary", schema.clone()).unwrap()),
+            settings: skald_spec::wire::google_generate::GoogleGenerateSettings {
+                generation_config: Some(
+                    skald_spec::wire::google_generate::GoogleGenerationConfig {
+                        temperature: Some(0.5),
+                        response_schema: Some(json!({"type": "STRING"})),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+            ..GeminiOptions::default()
+        };
+        for prompt in [
+            gemini("gemini-2.5-pro", options()).unwrap(),
+            vertex("gemini-2.5-pro", options()).unwrap(),
+        ] {
+            let ProviderRequest::GeminiGenerateContent(request) = &prompt.native().request else {
+                panic!("expected Google request");
+            };
+            let config =
+                serde_json::to_value(&request.settings).unwrap()["generation_config"].clone();
+            assert!(config.get("response_schema").is_none(), "{config}");
+            assert_eq!(config["response_json_schema"], schema);
+            assert_eq!(config["temperature"], json!(0.5));
+        }
     }
 
     #[test]

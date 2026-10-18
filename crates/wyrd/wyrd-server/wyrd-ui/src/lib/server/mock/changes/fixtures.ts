@@ -226,7 +226,7 @@ export const subjects: Subject[] = [
     commits: [{ sha: '88ff3a02', title: 'Update high-risk ranking evaluation' }],
     files: [
       {
-        path: 'eval/threshold.yaml',
+        path: 'verification/threshold.yaml',
         additions: 1,
         deletions: 1,
         lines: [
@@ -264,7 +264,7 @@ export const newDraft: Draft = {
     {
       id: 'CLAIM-2',
       title: 'Ranking quality does not regress',
-      checks: [{ name: 'Eval gate', required: true, mode: 'manual', billable: true }]
+      checks: [{ name: 'Verification gate', required: true, mode: 'manual', billable: true }]
     },
     {
       id: 'CLAIM-3',
@@ -621,7 +621,7 @@ export function checksFor(claim: string): Check[] {
     ];
   if (claim === 'CLAIM-2')
     return [
-      check('eval-gate', 'Eval gate', {
+      check('verification-gate', 'Verification gate', {
         version: '4',
         required: true,
         mode: 'manual',
@@ -683,7 +683,7 @@ export function checksFor(claim: string): Check[] {
 
 export const verifiers = [
   { name: 'Checkout suite', version: '5', billable: false },
-  { name: 'Eval gate', version: '4', billable: true },
+  { name: 'Verification gate', version: '4', billable: true },
   { name: 'PII review', version: '2', billable: true },
   { name: 'Hold-rate spot check', version: '1', billable: true },
   { name: 'Regression suite', version: '3', billable: false },

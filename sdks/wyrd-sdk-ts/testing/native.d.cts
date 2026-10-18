@@ -78,11 +78,13 @@ export declare class NativeWyrdTestServer {
    * permission projection (`resource`, `action`, `scope`), which expresses
    * object scope such as one Verifier. This is the door a journey uses to
    * prove an access gate from the caller's side: it seeds one role carrying
-   * only those grants and bootstraps a service onto it.
+   * only those grants and bootstraps a service onto it. A permission object is
+   * stored as given, so one the current schema rejects reaches the server and
+   * is refused by its own issuance decode.
    *
    * # Errors
    *
-   * Returns a napi error for an unparsable permission, or when the harness
+   * Returns a napi error for an unparsable permission string, or when the harness
    * is closed or role seeding or bootstrapping fails.
    */
   scopedApiKey(role: string, permissions: Array<any>): string
@@ -386,7 +388,7 @@ export interface NativeIssueKey {
 export interface NativeTestServerOptions {
   /**
    * Roots built-in gateway adapters at a local mock upstream; its `/v1`
-   * segment also serves the verification runtime's `OpenAI` Eval judge,
+   * segment also serves the verification runtime's `OpenAI` judge,
    * which calls `<providerBaseUrl>/v1/chat/completions`.
    */
   providerBaseUrl?: string

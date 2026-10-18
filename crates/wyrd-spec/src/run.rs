@@ -18,7 +18,7 @@ pub enum RunKind {
     /// Inference execution.
     Inference,
     /// Offline or batch evaluation execution.
-    OfflineEval,
+    OfflineEvaluation,
     /// Drift check execution.
     DriftCheck,
     /// Import execution.

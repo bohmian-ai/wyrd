@@ -372,14 +372,7 @@
   border-top-width: 3px;
 }
 
-/* Eval workflow drawer: the event page stays behind a scrim; the drawer is
-   a raised sheet holding stages, tasks and the dominant selected task. */
-.observe .drawer-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 5;
-  background: color-mix(in srgb, var(--bg) 72%, transparent);
-}
+/* Record drawer: a raised sheet beside the inventory. */
 .observe .drawer {
   position: fixed;
   top: 0;
@@ -392,132 +385,6 @@
   border-left: 3px solid var(--border);
   padding: 20px 24px;
 }
-.observe .stages {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.observe .stages .stage {
-  border: 2px solid var(--border);
-  border-radius: var(--r);
-  padding: 7px 12px;
-  background: var(--surface-2);
-  font: var(--weight-strong) 11px var(--font-mono);
-}
-.observe .stages .stage[data-tone='danger'] {
-  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
-  border-color: var(--danger);
-}
-.observe .stages .arrow {
-  color: var(--muted);
-}
-.observe .task-list {
-  display: grid;
-  gap: 0;
-}
-.observe .task-list .task {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 2px 10px;
-  padding: 10px 8px;
-  border-bottom: 1px solid var(--sep);
-  border-left: 4px solid transparent;
-  text-align: left;
-  background: none;
-  border-top: 0;
-  border-right: 0;
-  cursor: pointer;
-  font: 12px var(--font-sans);
-  color: var(--text);
-  text-decoration: none;
-}
-.observe .task-list .task:hover {
-  background: var(--surface-2);
-}
-.observe .task-list .task[aria-current='true'] {
-  background: var(--declare-soft);
-  border-left-color: var(--declare);
-}
-
-/* Score block: big numeral, threshold bar with a positional tick. */
-.observe .score {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 12px;
-  border: 2px solid var(--border);
-  border-radius: var(--r);
-  background: var(--surface-2);
-}
-.observe .score .n {
-  font: var(--weight-strong) 30px var(--font-sans);
-}
-.observe .score .n.fail {
-  color: var(--danger);
-}
-.observe .score .n.pass {
-  color: var(--ok);
-}
-.observe .score-bar {
-  position: relative;
-  flex: 1;
-  min-width: 140px;
-  height: 14px;
-  border: 2px solid var(--border);
-  border-radius: 3px;
-  background: var(--surface);
-}
-.observe .score-bar .fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: var(--danger);
-  border-radius: 1px;
-}
-.observe .score-bar .fill.pass {
-  background: var(--ok);
-}
-.observe .score-bar .tick {
-  position: absolute;
-  top: -6px;
-  bottom: -6px;
-  width: 3px;
-  background: var(--text);
-}
-.observe .history {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
-.observe .history > span {
-  width: 8px;
-  height: 18px;
-  border-radius: 2px;
-  background: var(--ok);
-}
-.observe .history > span.fail {
-  background: var(--danger);
-}
-
-/* Values comparison: expected beside actual, actual toned by verdict. */
-.observe .values {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-}
-.observe .values .val {
-  border: 2px solid var(--border);
-  border-radius: var(--r);
-  background: var(--surface-2);
-  padding: 10px 12px;
-  font: 11px var(--font-mono);
-}
-.observe .values .val.fail {
-  border-color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
-}
-
 /* Dashboards: read-only panel grid. */
 .observe .panel-grid {
   display: grid;

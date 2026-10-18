@@ -388,7 +388,7 @@ fn listed(snapshot: &Value, slot: &str) -> Value {
 fn result(source: &ClaimedExecution, payload: ResultPayload) -> ScribeWrite {
     ScribeWrite::Result {
         payload,
-        attribution: source.attribution.clone(),
+        attribution: source.attribution,
     }
 }
 

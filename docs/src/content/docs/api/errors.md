@@ -348,7 +348,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND` | 400 | Invalid Service component kind | Move Verifier, Trigger, Operator, Audit, and Source cards out of Service.components; attach a Verifier with verified_by. |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | 400 | Invalid Verifier reference kind | Set verified_by[..].verifier to a Verifier CardRef. |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | 400 | Operator connection unavailable | Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator. |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; supply other evidence through verify or submit. |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit. |
 | `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or register the shared Verifier separately. |
 | `WYRD_SPEC_400_VALIDATION` | 400 | Validation failed | Check the submitted Wyrd request fields against the published schema and retry. |
 | `WYRD_SPEC_404_NOT_FOUND` | 404 | Resource not found | Check that the referenced Wyrd resource exists. |

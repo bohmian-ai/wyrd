@@ -403,8 +403,9 @@ impl Visible {
     /// by earliest input time, else earliest result time, then execution ID.
     /// The selected result is the greatest `(at, result_id)`.
     fn executions(&self, tuple: usize) -> Vec<(ExecutionId, Option<VerificationResultId>)> {
-        let mut order: BTreeMap<ExecutionId, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
-            BTreeMap::new();
+        // Each execution's earliest input time and earliest result time.
+        type Firsts = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+        let mut order: BTreeMap<ExecutionId, Firsts> = BTreeMap::new();
         let mut selected: BTreeMap<ExecutionId, (DateTime<Utc>, VerificationResultId)> =
             BTreeMap::new();
         for (execution, (_, input)) in self.inputs.iter().filter(|(_, (t, _))| *t == tuple) {

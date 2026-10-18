@@ -160,10 +160,20 @@ The subject is the component the binding sits under; you can also bind on the Se
 | Field | Holds | If you leave it out |
 | --- | --- | --- |
 | `verifier` | A Verifier Card, by path or exact reference | Required |
-| `runs_on` | A `schedule` Trigger | The server never runs this binding on its own |
+| `runs_on` | A `schedule` or `group_end` Trigger | The server never runs this binding on its own |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
 `schedule` is the only automatic Trigger. [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
+
+`group_end` judges a whole caller group, such as one conversation or one event, once its evidence goes quiet. The bound Verifier reads source slots such as `verifiers.turn-check.inputs.turn`, and callers pass the same `group_id` on every `verify` or `submit` of that group:
+
+```yaml
+runs_on: {kind: group_end, after: 30m}
+```
+
+Each time Scribe acknowledges a grouped source input or result, the group becomes due `after` from then; new evidence moves that time later. Once it is due, one group execution judges every source input and result visible at that moment, listed in arrival order, with `null` for an outcome not yet visible. Later evidence makes the group due again and produces a new execution; earlier executions keep the evidence they judged. `on_verdict_change` Operators run when a group's verdict differs from its previous one.
+
+Three limits apply. Steady activity postpones the judgment for as long as it continues. A judgment uses what is visible when it reads, and evidence that becomes visible later without new activity does not schedule another. If the server dies after Scribe acknowledges evidence but before it records the due time, that activity schedules nothing; the next grouped evidence does.
 
 ## Run evidence and window evidence
 

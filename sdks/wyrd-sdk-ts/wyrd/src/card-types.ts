@@ -1977,38 +1977,26 @@ export interface GatewayPriceRate {
 }
 
 /**
- * The source evidence one group execution pinned when it was enqueued.
- *
- * Every retry of the execution judges exactly this snapshot; later source rows only ever reach a later group execution.
- */
-export interface GroupCoverage {
-  /**
-   * Distinct eligible source rows, inputs and results counted apart, the snapshot covers; a later-visible row timed earlier raises it.
-   */
-  readonly members: number;
-  /**
-   * The pinned selection of each source slot.
-   */
-  readonly sources: Readonly<Record<string, GroupSourceSnapshot>>;
-  /**
-   * Newest eligible source row time (the row's PostgreSQL-anchored `wyrd_ingested_at`) the snapshot covers.
-   */
-  readonly through: string;
-}
-
-/**
  * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
  */
 export type GroupId = string;
 
 /**
- * One source slot's pinned selection within a [`GroupCoverage`].
+ * The source evidence one group execution pinned when it was enqueued.
+ *
+ * Every retry of the execution judges exactly this snapshot; later source evidence only ever reaches a later group execution.
+ */
+export interface GroupSnapshot {
+  /**
+   * The pinned selection of each source slot.
+   */
+  readonly sources: Readonly<Record<string, GroupSourceSnapshot>>;
+}
+
+/**
+ * One source slot's pinned selection within a [`GroupSnapshot`].
  */
 export interface GroupSourceSnapshot {
-  /**
-   * The deployment source-execution ceiling, present only when the eligible executions exceeded it; nothing was read and the group judgment is inconclusive.
-   */
-  readonly exceeded_ceiling?: number | null;
   /**
    * The source executions the slot's list holds one value for, in list order: earliest input ingest time (earliest result ingest time for a result-only execution), then execution ID.
    */
@@ -5500,26 +5488,18 @@ export type TriggerDuration = string;
 export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
 
 /**
- * Activate once per `group_id` group of source executions that has gone quiet or grown old, re-judging it serially as new evidence arrives.
+ * Activate once per `group_id` group of source executions this long after its latest acknowledged source evidence; new evidence postpones it and, once judged, schedules a later group execution.
  */
 export interface TriggerSpecGroupEnd {
+  /**
+   * Quiet period after the latest acknowledged source input or result.
+   */
+  readonly after: TriggerDuration;
   /**
    * Optional human-readable purpose.
    */
   readonly description?: string | null;
-  /**
-   * Rows timed at or after the group's first source row plus this no longer reopen or expand the group; nothing is deleted.
-   */
-  readonly finality: TriggerDuration;
-  /**
-   * The group ends once its newest source input or result row is older than this.
-   */
-  readonly idle: TriggerDuration;
   readonly kind: "group_end";
-  /**
-   * The group ends once its first source row is older than this, even while activity continues.
-   */
-  readonly max_age: TriggerDuration;
 }
 
 /**
@@ -5739,7 +5719,7 @@ export interface VerificationExecutionState {
   /**
    * The source snapshot a group execution judges.
    */
-  readonly group?: GroupCoverage | null;
+  readonly group?: GroupSnapshot | null;
   /**
    * Caller group the execution belongs to, or the group a group execution judges.
    */

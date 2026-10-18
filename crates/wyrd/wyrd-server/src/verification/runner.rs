@@ -34,8 +34,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-#[cfg(feature = "test-support")]
 use tokio::sync::Semaphore;
+#[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;

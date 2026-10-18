@@ -269,6 +269,11 @@ const EXISTING_SNAPSHOT_SQL: &str = r"
        AND group_snapshot_sha256 = $3
 ";
 
+/// One applied [`COMPLETE_SQL`] settlement: the binding, its frozen
+/// Operators, whether the execution is a group execution, and whether the
+/// settlement replayed an earlier identical one.
+type SettledRow = (Option<Uuid>, Json<Vec<FrozenTarget>>, bool, bool);
+
 /// Lock the binding of group execution `$1` so its group completions settle
 /// one at a time; selects nothing for any other execution.
 const LOCK_GROUP_BINDING_SQL: &str = r"
@@ -1976,14 +1981,13 @@ impl VerifierExecutionQueue {
             .bind(lease.execution_id.as_uuid())
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        let settled: Option<(Option<Uuid>, Json<Vec<FrozenTarget>>, bool, bool)> =
-            sqlx::query_as(COMPLETE_SQL)
-                .bind(lease.execution_id.as_uuid())
-                .bind(lease.token.0)
-                .bind(result_id.as_uuid())
-                .bind(verdict_text)
-                .fetch_optional(&mut **conn.transaction())
-                .await?;
+        let settled: Option<SettledRow> = sqlx::query_as(COMPLETE_SQL)
+            .bind(lease.execution_id.as_uuid())
+            .bind(lease.token.0)
+            .bind(result_id.as_uuid())
+            .bind(verdict_text)
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
         let Some((binding_id, Json(operators), grouped, replayed)) = settled else {
             return Ok(Settlement::StaleLease);
         };

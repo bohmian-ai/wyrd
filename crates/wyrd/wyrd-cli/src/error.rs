@@ -239,7 +239,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE",
         status = 409,
         title = "Server version incompatible",
-        remediation = "Upgrade the wyrd CLI to the server's version line (pip install -U wyrd, or npm install wyrd-ai@latest), then retry."
+        remediation = "Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry."
     )]
     ServerVersionIncompatible {
         /// This CLI's version.

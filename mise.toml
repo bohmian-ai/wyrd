@@ -1459,10 +1459,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
-description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
+description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), and the quickstart's TypeScript reference app"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec tsc --noEmit"
+run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit"]
 
 [tasks."ts:test:unit"]
 description = "wyrd-ai unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"

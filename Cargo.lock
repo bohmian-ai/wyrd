@@ -11448,6 +11448,7 @@ name = "wyrd-rust-examples"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

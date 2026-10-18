@@ -20,6 +20,8 @@ status: runnable
 
 - PostgreSQL 16 with an ordinary login that owns the `wyrd` database. The server refuses superuser and `BYPASSRLS` logins.
 
+<Aside type="caution" title="Version">These pages describe Wyrd 0.2.0, built from this repository. The newest published packages (`wyrd-ai` on PyPI and npm), server release, and `bohmian/wyrd` images are 0.1.1, which predates `wyrd declare`, `wyrd get`, `wyrd pull`, and JSON output for setup commands. A 0.2.0 CLI refuses a 0.1.1 server with `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE`.</Aside>
+
 With Docker, this gives you a suitable database. The image's `postgres` user is a superuser, so the commands create a separate `wyrd` login:
 
 ```bash
@@ -32,9 +34,13 @@ SQL
 
 ## Start local Wyrd
 
+`wyrd server dev` runs in the foreground and serves until you stop it. Run it in a terminal you keep open, or as a background job you own. It is a development server: a team or production deployment runs the standalone `wyrd-server` from its container image on a platform that manages its lifetime, as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
+
 ```bash
 wyrd server dev
 ```
+
+When a coding agent does the work, you start the server and the agent connects to it once it is ready, through MCP and the saved CLI and SDK settings. The agent does not start, stop, or restart it.
 
 On a terminal, the command asks for what it cannot find: the PostgreSQL URL (typed with echo off, for example `postgresql://wyrd:wyrd@127.0.0.1:5432/wyrd`) and the tenant slug, such as `acme`. Each input is taken from, in order, a command argument, its environment variable, the saved setting, and finally that question:
 
@@ -56,6 +62,20 @@ export WYRD_DATABASE_URL="postgresql://wyrd:wyrd@127.0.0.1:5432/wyrd"
 wyrd server dev --tenant acme --non-interactive
 ```
 
+For a background job a script can wait on, add `--format json`. The command still serves in the foreground of that job. Once the server is ready it prints exactly one line to stdout, the readiness result, and keeps serving; progress and the server's own output go to the log file the result names, not to either stream:
+
+```bash
+wyrd server dev --tenant acme --non-interactive --format json > ready.json 2> error.json &
+until [ -s ready.json ] || [ -s error.json ]; do sleep 1; done
+cat ready.json error.json
+```
+
+```json
+{"ready":true,"endpoint":"http://127.0.0.1:8080","grpc":"http://127.0.0.1:50051","tenant":"acme","storage_url":"file:///home/you/.config/wyrd/server/data/storage","bifrost_data_dir":"/home/you/.config/wyrd/server/data/bifrost","config_dir":"/home/you/.config/wyrd","gateway":"skipped; configure it later with wyrd gateway deployment put --file","mcp":null,"log":"/home/you/.config/wyrd/server/logs/server-dev.log"}
+```
+
+`storage_url` never carries credentials, and `mcp` is `null` unless you passed `--host`. A failure, before readiness or after it, writes one error document to stderr instead, with its stable `code`, `remediation`, and `details.stage`, and the command exits nonzero. Stop the job with `kill -INT` or by ending the terminal that owns it.
+
 The first run downloads the newest server release, migrates the database, starts the server, saves its settings, and creates the tenant. It ends with a summary:
 
 ```text
@@ -76,7 +96,13 @@ A first interactive run offers the provider keys it finds in the environment: `O
 
 Unattended runs skip the offer. To configure the gateway without questions, pass a document whose credentials name environment variables, such as [`examples/gateway-setup/gateway.json`](https://github.com/bohmian-ai/wyrd/tree/main/examples/gateway-setup); `--gateway-file` applies it on every run that passes it, restarts included. `--skip-gateway` skips the offer explicitly. See [Set up the LLM gateway](/connect/set-up-the-llm-gateway/).
 
-Interactive runs then offer to connect the coding agents they find, such as Claude Code or Codex, through MCP. Accept, or skip and run `wyrd mcp install` later.
+Interactive runs then offer to connect the coding agents they find, such as Claude Code or Codex, through MCP. Accept, or skip and connect a host later. Without a terminal, name the host; the command never writes a credential into the host's configuration, and rerunning it changes nothing that is already in place:
+
+```bash
+wyrd mcp install --host claude-code --format json
+```
+
+Restart or reconnect the host afterwards so it loads the Wyrd server. A new agent then calls `wyrd.guide` with `{"topic":"start"}`, as the server's instructions tell it to. [Connect an agent through MCP](/connect/connect-an-agent-through-mcp/) lists every host.
 
 What the command saved, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else `$XDG_CONFIG_HOME/wyrd`, else `~/.config/wyrd`):
 

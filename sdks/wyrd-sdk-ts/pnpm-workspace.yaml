@@ -5,6 +5,7 @@ packages:
   - wyrd-linux-arm64-gnu
   - wyrd-darwin-arm64
   - ../../examples/support-desk/typescript
+  - ../../examples/support-desk-app/typescript
 allowBuilds:
   esbuild: true
   # `@grpc/grpc-js`, which the upstream OTLP/gRPC exporters dial through,

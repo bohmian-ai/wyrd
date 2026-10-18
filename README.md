@@ -9,6 +9,9 @@ can verify, understand, and control your AI systems. Declare your service and
 its requirements, observe what happens in real time, and verify its output
 against the declared requirements.
 
+💬 **Join the community:** [Wyrd Discord](https://discord.gg/K5bf23yPNb)
+— Ask questions, share what you're building, and help shape Wyrd.
+
 **Coming this week:** Wyrd `v0.2.0` is targeted for October 16, 2026, with the
 full verification primitive suite. Next release: the UI.
 
@@ -153,9 +156,13 @@ Start verifying your system with Wyrd now!
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-before starting a substantial change. Report vulnerabilities privately through
-[SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome! Read [CONTRIBUTING.md](CONTRIBUTING.md)
+before starting a substantial change.
+
+Want to discuss ideas, ask questions, or connect with other Wyrd developers?
+[Join our Discord community](https://discord.gg/K5bf23yPNb).
+
+Report vulnerabilities privately through [SECURITY.md](SECURITY.md).
 
 ## License
 

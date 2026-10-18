@@ -2204,6 +2204,12 @@ async fn grouped_sampled_frames_are_bounded() {
     deployment.shutdown().await;
 }
 
+/// One retained result's persisted `group_id` column.
+#[derive(Debug, Deserialize, PartialEq)]
+struct Grouping {
+    /// The group the result belongs to, absent for an ungrouped turn.
+    group_id: Option<String>,
+}
 /// The executions of `binding`'s retained group reviews, oldest first, read
 /// as the administrator after publishing every captured row of `servers`.
 ///
@@ -2425,12 +2431,6 @@ async fn grouped_conversations_recover() {
         ],
         "each conversation judges only its own pinned turns"
     );
-    /// One retained result's persisted `group_id` column.
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Grouping {
-        /// The group the result belongs to, absent for an ungrouped turn.
-        group_id: Option<String>,
-    }
     let solo: Vec<Grouping> = Bifrost::connect_with(&admin, BifrostOptions::default())
         .await
         .expect("Bifrost connects")

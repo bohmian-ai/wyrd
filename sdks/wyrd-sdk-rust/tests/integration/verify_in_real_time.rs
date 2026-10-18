@@ -2621,3 +2621,138 @@ async fn grouped_reviews_cover_late_work() {
     forever.state.shutdown().await.expect("Bifrost stops");
     assistant.deployment.shutdown().await;
 }
+
+/// The distinct permissions retained as denied for `principal` as subject,
+/// read as the administrator after publishing every captured row.
+///
+/// # Panics
+/// Panics when the flush or the read fails.
+async fn denials(deployment: &Deployment, principal: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    /// One denied permission.
+    struct Denied {
+        /// The permission the operation needed.
+        permission: String,
+    }
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let rows: Vec<Denied> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT DISTINCT permission FROM vala.system.audit_log \
+             WHERE sub_principal_id = $1 AND outcome = 'denied'",
+            &[QueryParam::String(principal.to_owned())],
+        )
+        .await
+        .expect("the denials read back");
+    rows.into_iter().map(|row| row.permission).collect()
+}
+
+/// A support conversation whose owning Service may run its turns but may
+/// not query Bifrost is never reviewed: the poll's source reads run under
+/// the Service's own grants and the denial is retained. A query grant
+/// scoped to the trace tables is still no grant on the verification
+/// sources. Once the Service holds its default role again, the next poll
+/// reviews the whole conversation from its inputs and outcomes.
+///
+/// # Panics
+/// Panics when a step fails, a review happens while the reads are not
+/// granted, a denial is not retained, or the review differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_reads_need_the_owner_grant() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let all = |resource: &str, action: &str| json!({ "resource": resource, "action": action, "scope": "all" });
+    let runs = [
+        all("cards", "read"),
+        all("verifier", "run"),
+        all("bifrost_table", "read"),
+        all("bifrost_table", "write"),
+        all("bifrost_record", "write"),
+    ];
+    let traces = json!({
+        "resource": "bifrost_query",
+        "action": "read",
+        "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "traces" } } },
+    });
+    let server = deployment.server();
+    server
+        .seed_role("turns_only", &runs)
+        .await
+        .expect("role seeds");
+    let mut traced = runs.to_vec();
+    traced.push(traces);
+    server
+        .seed_role("traces_reader", &traced)
+        .await
+        .expect("role seeds");
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("principals connect");
+    let owner = assistant.principal(&support.receipt.root).await;
+    let principal = owner.parse().expect("principal id");
+    let swap = |from: &'static str, to: &'static str| {
+        let principals = &principals;
+        let principal = &principal;
+        async move {
+            principals
+                .grant_role(principal, to)
+                .await
+                .expect("the role is granted");
+            principals
+                .revoke_role(principal, from)
+                .await
+                .expect("the role is revoked");
+        }
+    };
+    swap("workload", "turns_only").await;
+    let group = GroupId::new("guarded").expect("group id");
+    let turns: Vec<_> = (1..=2)
+        .map(|turn| json!({"turn": turn, "answer": format!("answer {turn}")}))
+        .collect();
+    for turn in &turns {
+        support.turn("turn-check", &group, turn.clone()).await;
+    }
+
+    assert_no_new_review(deployment, &[server], &support.binding, &[]).await;
+    let denied = denials(deployment, &owner).await;
+    assert!(
+        denied
+            .iter()
+            .any(|permission| permission == "bifrost_query:read"),
+        "the poll's query is denied as the owner: {denied:?}"
+    );
+    swap("turns_only", "traces_reader").await;
+    assert_no_new_review(deployment, &[server], &support.binding, &[]).await;
+    swap("traces_reader", "workload").await;
+    let judged = deployment
+        .group_execution(&support.binding, None, WAIT)
+        .await;
+
+    assert_eq!(judged.group_id.as_ref(), Some(&group));
+    let coverage = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    assert_eq!(
+        coverage.members, 4,
+        "two inputs and two results: {coverage:?}"
+    );
+    assert_eq!(
+        evidence(&judged, "turns"),
+        json!({"kind": "json", "value": turns})
+    );
+    assert_eq!(
+        evidence(&judged, "answered"),
+        json!({"kind": "json", "value": ["passed", "passed"]})
+    );
+    assistant.deployment.shutdown().await;
+}

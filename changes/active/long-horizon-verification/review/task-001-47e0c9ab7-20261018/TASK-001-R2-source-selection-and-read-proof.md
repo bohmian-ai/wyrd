@@ -106,3 +106,28 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
 Build the existing Monty worker if required by a touched real-server journey. Run only the exact focused counterexample/retry tests and narrowest regression lanes covering the actual write set. `mise run fmt` and `mise run lints` apply to changed Rust; `mise run check:tenant-isolation` applies if SQL/query paths change. Run `mise run check:deps` only if dependency/boundary composition changes, and codegen/language/docs checks only if those surfaces actually change. No current finding requires generated or foreign-runtime API changes.
 
 Do not require the full grouped journey set, full language suites, `mise run gate` or capacity runs for this remediation. Integrated change review owns broader verification. Return to cumulative review against the original task and all prior FIND IDs after implementation; no merge or deployment is authorized here.
+
+## Implementation evidence
+
+Commit `648089428`. Existing owners reused: `GroupPoller` and `BindingPoll` (selection), `QueryStreamFaultController` (the one armed fault, now applied by `ScheduledQueryCaller` as well as the public collect path), and the existing bound-server, registration-client and queue helpers.
+
+| Finding | Implementation | Verification | Result |
+|---|---|---|---|
+| FIND-TASK-001-2 | `groups.rs` `BindingPoll::selection` + `Sources::identities`: one `DENSE_RANK` statement per source tuple takes the first ceiling+1 executions. Refused submissions are dropped. The same rows feed `Ended::judge`, `Ended::over` and `snapshot`. It re-runs with more places only when refused rows sit inside a capped tuple (`ponytail:` marked). Overflow is decided before any payload read. | `pg_verification_groups::refused_submissions_do_not_count_toward_the_ceiling` (ceiling 2): 2 accepted + 1 refused conflict lists exactly the 2; 3 accepted gives `exceeded_ceiling: 2` and an empty list. Unit: `only_eligible_executions_exceed_the_ceiling`, `incomplete_selections_defer`, `reads_select_only_listed_membership` | PASS |
+| FIND-TASK-001-8 | `state.rs` `QueryStreamFaultController::apply`, shared by `query/collect.rs` and `query/scheduled.rs` (test-support only) | `pg_verification_groups::partial_group_reads_enqueue_nothing_until_a_complete_poll`: an armed EOF after the first batch gives `GroupPollError::Read` and the committed tick enqueues nothing. The next tick enqueues one snapshot listing both turns (members 2, no results yet). A third tick enqueues nothing. Negative control: with the scheduled `apply` removed, the same test fails because the truncated tick enqueued (`Ok([Enqueued(..)])`). | PASS |
+| FIND-TASK-001-6 | `wyrd-mcp/tests/bifrost/mcp/verification.rs` `FrameAgent::submit` `# Panics` (non-success storage PUT) | Source inspection; MCP selector below | PASS |
+
+Commands (sequential, all through mise):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/^verification::groups::tests::/)'   # 6 passed
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test integration --run-ignored=all -E "test(=pg_verification_groups::partial_group_reads_enqueue_nothing_until_a_complete_poll) | test(=pg_verification_groups::refused_submissions_do_not_count_toward_the_ceiling)"'   # 2 passed
+# wyrd-ai journey, -P journey: verify_in_real_time::{grouped_support_resumes, grouped_refund_changes_verdict, grouped_coding_uses_declared_sources, grouped_sampled_frames_are_bounded, grouped_conversations_recover, grouped_reviews_cover_late_work, grouped_reads_need_the_owner_grant}   # 7 passed
+# wyrd-mcp --test mcp: grouped_verification_discover_act_observe, grouped_frames_over_mcp_are_bounded, ^query::   # 11 passed
+# wyrd-testing --test server: query_lifecycle::   # 2 passed
+mise run fmt && mise run lints && mise run check:tenant-isolation && git diff --check   # pass
+```
+
+Limits: the partial-read proof truncates the first statement of a poll (discovery). A snapshot-statement truncation takes the same `Read` path through the same `?` and is not separately armed. Non-goals stayed excluded; no generated, dependency or foreign-runtime surface changed.
+
+Status: IMPLEMENTED, for cumulative re-review.

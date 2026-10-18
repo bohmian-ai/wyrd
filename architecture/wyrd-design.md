@@ -1244,9 +1244,10 @@ bound subject:
 ```yaml
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
-    runs_on?: InlineableRef<TriggerSpec>     # schedule; absent means caller-driven only
+    runs_on?: InlineableRef<TriggerSpec>     # schedule or group_end; absent means caller-driven only
     inputs?: { <samples slot>: { features: [name] } | { metric: name } }
-    on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
+    on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions; not on group_end
+    on_verdict_change: [InlineableRef<OperatorSpec>] # group_end only
 ```
 
 One binding is one subscription. Its subject is the containing Service,
@@ -1270,6 +1271,26 @@ verdict of a queued execution dispatches; `inconclusive`, execution errors,
 and `verify` never do, and a replayed submission creates no duplicate
 dispatch.
 
+**Grouped verification.** `verify` and `submit` take an optional caller
+`group_id`; the server records it with the authenticated owner Service on the
+execution's input and result rows, with no producer Postgres read or write.
+A group Verifier declares source inputs as whole slots or requirement
+outcomes of other Verifiers bound on the same owner occurrence
+(`verifiers.<name>.inputs.<slot>` or
+`verifiers.<name>.requirements.<id>.outcome`); registration resolves each to
+its exact pinned source binding, so a newer source Card version never joins a
+pinned group. A `group_end` binding is polled from Bifrost: once a group's
+newest source row is `idle` or its first is `max_age` old, one serial
+execution per binding and group pins a snapshot of the visible source
+executions of exactly that tenant, owner, subject, and Verifier tuple, in
+recorded-input order, with null outcomes for absent results. Later rows reach
+only a later review, rows past `finality` open none, and more than
+`WYRD_VERIFICATION_SOURCE_EXECUTIONS_MAX` source executions judge the
+requirement inconclusive without reading. A review dispatches its
+`on_verdict_change` Operators only when its verdict differs from the group's
+previous review. Outbox loss stays outbox loss: an unpublished source row
+never joins a review.
+
 `run_id` is the client's application invocation; one Run can have many
 executions. `ExecutionId` is the server-issued identity of one exact Verifier
 execution; scheduled executions have no `run_id`.
@@ -1278,9 +1299,10 @@ execution; scheduled executions have no `run_id`.
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
 | `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
-| `POST /v1/verification/execute` | Exact Verifier and subject, optional Run, named input declarations, optional route overrides → `200 VerificationResult` |
+| `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
-| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, and result when visible |
+| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and pinned source snapshot |
+| `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
 uploaded file does not become a Card. Remote storage backends return direct
@@ -1590,12 +1612,18 @@ of bindings.
 ```yaml
 spec:
   description?: string
-  kind: schedule                          # closed activation discriminator
+  kind: schedule | group_end              # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
+  idle: duration                          # group_end only
+  max_age: duration                       # group_end only
+  finality: duration                      # group_end only
 ```
 
-`schedule` is the only automatic activation. Each due occurrence creates one
+`group_end` binds only a Verifier with source inputs and judges each caller
+group once it ends (see Grouped verification under Verifier).
+
+For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling `samples` slots from the binding's
 `inputs` map. Missed occurrences are skipped, not backfilled. A Trigger never
@@ -1620,7 +1648,8 @@ does not push") means external data enters through a `Source`.
 A failure reaction. Performs exactly one action — a typed notification or a
 generic HTTP call. Operator is a pure side-effect
 template with no `pre_invoke` / `post_invoke` hooks and no subscription of its
-own: it runs only as an `on_failure` entry of a verification binding. A
+own: it runs only as an `on_failure` or `on_verdict_change` entry of a
+verification binding. A
 referenced Operator Card and an inline `on_failure` mapping use the same
 flattened `OperatorSpec` shape.
 ```yaml
@@ -1641,7 +1670,10 @@ spec:
 **Dispatch.** Only a completed, binding-created Verifier run with a `failed`
 verdict creates Operator work: one durable dispatch per configured
 `on_failure` Operator. Passed, inconclusive, cancelled, timed-out, errored,
-and direct analysis-only runs create none. Each dispatch has its own status,
+and direct analysis-only runs create none. A `group_end` binding instead
+dispatches each `on_verdict_change` Operator once when a completed group
+review's verdict differs from the group's previous one, carrying the group and
+the result it changed from. Each dispatch has its own status,
 bounded retry, and terminal error; one failure never blocks siblings or
 rewrites the result. There is no `Alert` resource, table, or alert router — a
 Notify Operator *is* the alert.

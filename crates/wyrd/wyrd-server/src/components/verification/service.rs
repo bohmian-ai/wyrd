@@ -461,8 +461,10 @@ impl<'a> VerificationControl<'a> {
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
     /// blocks, a block is refused process capacity (a Python worker or a
     /// workspace), or evidence metadata cannot be read now, a registry
-    /// unavailability error when a read fails, and the Verifier's planning
-    /// refusal.
+    /// unavailability error when a read fails, the Verifier's planning
+    /// refusal, and [`WyrdError::VerificationStagingFull`] when the Scribe
+    /// outbox cannot reserve the inputs and result slots, before anything
+    /// is staged or the engine runs.
     #[tracing::instrument(
         name = "verification.execute",
         skip_all,
@@ -606,8 +608,10 @@ impl<'a> VerificationControl<'a> {
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
     /// the Verifier or when a Card-bound caller's signed scope does not carry
     /// the subject's UID, [`WyrdError::VerificationInputTooLarge`] for inputs
-    /// past a Variant limit, and [`WyrdError::ServiceUnavailable`] when this
-    /// process hosts no Verifier queue.
+    /// past a Variant limit, [`WyrdError::ServiceUnavailable`] when this
+    /// process hosts no Verifier queue, and
+    /// [`WyrdError::VerificationStagingFull`] when the submission or Scribe
+    /// outbox cannot reserve its slot, before any input is staged.
     pub(crate) fn enqueue(
         &self,
         caller: &Caller,

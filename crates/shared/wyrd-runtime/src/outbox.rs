@@ -1076,6 +1076,11 @@ mod tests {
     /// one tenant's write hanging and another's retrying, a reservation past
     /// the reserved share is refused, retries do not charge their slice
     /// again, and capacity returns once the work is written.
+    ///
+    /// # Panics
+    /// Panics when a reservation within the share is refused, one past it is
+    /// admitted, the refusal reports other counts, or the work is not written
+    /// once in order.
     #[tokio::test]
     async fn bounded_staging_covers_retrying_and_inflight_work() {
         let sink = MemorySink::default();
@@ -1136,6 +1141,11 @@ mod tests {
     /// at once and counts the item lost; reservations cannot take the share
     /// kept for it, unreserved items never count against reservations, and a
     /// dropped reservation returns its unspent slots.
+    ///
+    /// # Panics
+    /// Panics when a full outbox blocks or keeps an unreserved item, the lost
+    /// count differs, or reservations are admitted or refused against the
+    /// wrong share.
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_audit_staging_remains_nonblocking() {
         let metrics = TestMetrics::default();

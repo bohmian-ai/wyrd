@@ -410,6 +410,10 @@ mod error_mapper_tests {
     /// Proves every retryable pressure error — auth verify, ingest busy,
     /// verification staging, and query admission — carries `Retry-After: 1`,
     /// while non-retryable Bifrost failures carry none.
+    ///
+    /// # Panics
+    /// Panics when a retryable error lacks `Retry-After: 1` or a
+    /// non-retryable one carries a `Retry-After` header.
     #[tokio::test]
     async fn ingest_busy_http_retry_metadata() {
         let retryable = WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {

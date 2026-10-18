@@ -655,6 +655,10 @@ impl ScribeSink {
     /// `request_bytes` is the deployment's configured Scribe request ceiling
     /// (`scribe.ingest_request_bytes`), which every Scribe a frame can reach
     /// enforces.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
         Self::bounded_outbox(route, request_bytes, SCRIBE_CAPACITY)
@@ -662,6 +666,10 @@ impl ScribeSink {
 
     /// Starts an outbox like [`Self::outbox`] admitting at most `capacity`
     /// writes (`scribe.outbox_capacity`).
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
     #[must_use]
     pub(crate) fn bounded_outbox(
         route: Option<ScribeRoute>,

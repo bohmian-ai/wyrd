@@ -466,7 +466,11 @@ Audit cardinality follows authorization decisions, not HTTP requests and not
 engine mechanics. Permissions are blocking; audits are non-blocking. Every
 audited surface stages its decision in memory on the one process Scribe outbox
 once the decision is known, outside the operation's transaction, and never
-waits for the write. The outbox queue is unbounded. Its one background writer
+waits for the write. The outbox admits a finite process capacity
+(`scribe.outbox_capacity`) covering queued, waiting, retrying, and in-flight
+writes. An audit decision staged past its share is not queued: it is logged,
+counted in `outbox_events_lost_total{outbox="scribe"}`, and dropped, and the
+operation is neither refused nor delayed. Its one background writer
 groups each tenant slice by destination, encodes Arrow frames with
 content-derived batch ids, and submits them to the local Scribe or over the
 mutually authenticated peer plane to a Scribe pod. A retryable failure is

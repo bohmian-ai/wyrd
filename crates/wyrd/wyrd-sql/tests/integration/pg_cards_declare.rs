@@ -47,7 +47,7 @@ fn artifact() -> ArtifactManifestEntry {
 
 /// Prove the consolidated migration contains every PR-one lifecycle column and table.
 #[tokio::test]
-async fn consolidated_registration_migration_has_locked_shape() {
+async fn consolidated_declaration_migration_has_locked_shape() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \

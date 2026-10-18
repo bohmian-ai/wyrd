@@ -235,7 +235,7 @@ fn request_with_body(idempotency_key: &str, body: Value) -> Request<Body> {
 ///
 /// # Panics
 /// Panics when the static request does not build.
-fn registration_request() -> Request<Body> {
+fn declaration_request() -> Request<Body> {
     Request::builder()
         .method(Method::POST)
         .uri("/v1/cards")
@@ -268,7 +268,7 @@ fn registration_request() -> Request<Body> {
 ///
 /// # Panics
 /// Panics when the request does not build.
-fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Body> {
+fn prompt_declaration_request(name: &str, idempotency_key: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
         .uri("/v1/cards")
@@ -301,11 +301,7 @@ fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Bod
 ///
 /// # Panics
 /// Panics when the request does not build.
-fn agent_registration_request(
-    name: &str,
-    child_name: &str,
-    idempotency_key: &str,
-) -> Request<Body> {
+fn agent_declaration_request(name: &str, child_name: &str, idempotency_key: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
         .uri("/v1/cards")
@@ -402,7 +398,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
 }
 
 /// Build one artifact-bearing card declaration request.
-fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
+fn heavy_declaration_request(idempotency_key: &str) -> Request<Body> {
     request_with_body(
         idempotency_key,
         json!({ "submissions": [{
@@ -436,7 +432,7 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
 /// blob URI and matching root UID, a read names another Card, the loaded
 /// artifact bytes differ, or the stored Card is not Active with a blob URI
 /// and verified manifest.
-async fn client_registration_saga_returns_active_receipt() {
+async fn client_declaration_saga_returns_active_receipt() {
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("client-prompt.yaml");
     let artifact = b"native registry artifact";
@@ -568,7 +564,7 @@ async fn client_registration_saga_returns_active_receipt() {
 
 #[tokio::test(flavor = "current_thread")]
 /// Declaring the same request twice returns the stored response without duplicate writes.
-async fn registration_replays_through_public_authenticated_route() {
+async fn declaration_replays_through_public_authenticated_route() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -581,7 +577,7 @@ async fn registration_replays_through_public_authenticated_route() {
     };
 
     let first = server
-        .oneshot_authenticated(&jwt, registration_request())
+        .oneshot_authenticated(&jwt, declaration_request())
         .await
         .expect("first registration responds");
     assert_eq!(first.status(), StatusCode::CREATED);
@@ -589,7 +585,7 @@ async fn registration_replays_through_public_authenticated_route() {
     assert_eq!(first_body["outcomes"][0]["outcome"], "declared");
 
     let replay = server
-        .oneshot_authenticated(&jwt, registration_request())
+        .oneshot_authenticated(&jwt, declaration_request())
         .await
         .expect("replay responds");
     assert_eq!(replay.status(), StatusCode::CREATED);
@@ -616,7 +612,7 @@ async fn registration_replays_through_public_authenticated_route() {
 
 #[tokio::test(flavor = "current_thread")]
 /// Declaration resolves an external child reference and persists its UID.
-async fn registration_resolves_child_card_refs_before_persisting() {
+async fn declaration_resolves_child_card_refs_before_persisting() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -631,7 +627,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
     let child = server
         .oneshot_authenticated(
             &jwt,
-            prompt_registration_request("resolved-prompt", "child-resolution-001"),
+            prompt_declaration_request("resolved-prompt", "child-resolution-001"),
         )
         .await
         .expect("child registration responds");
@@ -641,7 +637,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
     let parent = server
         .oneshot_authenticated(
             &jwt,
-            agent_registration_request("resolved-agent", "resolved-prompt", "child-resolution-002"),
+            agent_declaration_request("resolved-agent", "resolved-prompt", "child-resolution-002"),
         )
         .await
         .expect("parent registration responds");
@@ -681,7 +677,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
 ///
 /// # Panics
 /// Panics when the loader workspace, test server, a request, or an assertion fails.
-async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
+async fn declaration_accepts_loader_projection_and_persists_sibling_binding() {
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("prompt.yaml");
     let agent_path = temp.path().join("agent.yaml");
@@ -753,7 +749,7 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
 
 /// Reusing an idempotency key for different content returns the stable conflict.
 #[tokio::test(flavor = "current_thread")]
-async fn registration_rejects_idempotency_key_reuse_for_different_content() {
+async fn declaration_rejects_idempotency_key_reuse_for_different_content() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -768,7 +764,7 @@ async fn registration_rejects_idempotency_key_reuse_for_different_content() {
     let first = server
         .oneshot_authenticated(
             &jwt,
-            prompt_registration_request("conflict-first", "conflict-key-001"),
+            prompt_declaration_request("conflict-first", "conflict-key-001"),
         )
         .await
         .expect("first registration responds");
@@ -776,7 +772,7 @@ async fn registration_rejects_idempotency_key_reuse_for_different_content() {
     let conflict = server
         .oneshot_authenticated(
             &jwt,
-            prompt_registration_request("conflict-second", "conflict-key-001"),
+            prompt_declaration_request("conflict-second", "conflict-key-001"),
         )
         .await
         .expect("conflicting registration responds");
@@ -806,7 +802,7 @@ async fn unresolved_dependency_leaves_no_declaration_operation() {
     let response = server
         .oneshot_authenticated(
             &jwt,
-            agent_registration_request("missing-agent", "missing-prompt", "missing-ref-001"),
+            agent_declaration_request("missing-agent", "missing-prompt", "missing-ref-001"),
         )
         .await
         .expect("unresolved registration responds");
@@ -853,7 +849,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
         let response = server
             .oneshot_authenticated(
                 &jwt,
-                agent_registration_request("blocked-parent", &child_name, &operation_key),
+                agent_declaration_request("blocked-parent", &child_name, &operation_key),
             )
             .await
             .expect("blocked registration responds");
@@ -862,7 +858,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
             response_json(response).await["code"],
             "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
         );
-        assert_no_registration_writes(&server, &operation_key, "blocked-parent").await;
+        assert_no_declaration_writes(&server, &operation_key, "blocked-parent").await;
     }
 
     let other_tenant = DataTenantId::new_v7();
@@ -886,7 +882,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
     let response = server
         .oneshot_authenticated(
             &jwt,
-            agent_registration_request("cross-tenant-parent", child_name, operation_key),
+            agent_declaration_request("cross-tenant-parent", child_name, operation_key),
         )
         .await
         .expect("cross-tenant registration responds");
@@ -895,7 +891,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
         response_json(response).await["code"],
         "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
     );
-    assert_no_registration_writes(&server, operation_key, "cross-tenant-parent").await;
+    assert_no_declaration_writes(&server, operation_key, "cross-tenant-parent").await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1059,7 +1055,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
                 .is_some_and(|reason| reason.contains("drift.")),
             "{shape}: {problem}"
         );
-        assert_no_registration_writes(&server, &operation, &agent).await;
+        assert_no_declaration_writes(&server, &operation, &agent).await;
     }
 
     let mismatch = server
@@ -1081,7 +1077,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(mismatch).await["code"],
         "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
     );
-    assert_no_registration_writes(
+    assert_no_declaration_writes(
         &server,
         "binding-mismatch-operation",
         "binding-mismatch-agent",
@@ -1132,7 +1128,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(cross_tenant).await["code"],
         "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
     );
-    assert_no_registration_writes(
+    assert_no_declaration_writes(
         &server,
         "binding-cross-tenant-operation",
         "binding-cross-tenant-agent",
@@ -1158,8 +1154,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(denied).await["code"],
         "WYRD_PERMISSION_403_DENIED_RBAC"
     );
-    assert_no_registration_writes(&server, "binding-denied-operation", "binding-denied-agent")
-        .await;
+    assert_no_declaration_writes(&server, "binding-denied-operation", "binding-denied-agent").await;
 
     let nested = server
         .oneshot_authenticated(
@@ -1208,8 +1203,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(nested).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "binding-nested-operation", "binding-nested-judge")
-        .await;
+    assert_no_declaration_writes(&server, "binding-nested-operation", "binding-nested-judge").await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1362,7 +1356,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
             &format!("unknown card kind: {kind}"),
         )
         .await;
-        assert_no_registration_writes(&server, &operation, &name).await;
+        assert_no_declaration_writes(&server, &operation, &name).await;
     }
 
     let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure, "inputs": latency_inputs() });
@@ -1456,7 +1450,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
             code,
         )
         .await;
-        assert_no_registration_writes(&server, &operation, &name).await;
+        assert_no_declaration_writes(&server, &operation, &name).await;
     }
 
     let token_field = json!([binding(
@@ -1478,7 +1472,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
     )
     .await;
-    assert_no_registration_writes(
+    assert_no_declaration_writes(
         &server,
         "vc-secret-token-operation",
         "vc-secret-token-agent",
@@ -1496,7 +1490,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
 ///
 /// # Panics
 /// Panics when a count cannot be read or any count is non-zero.
-async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
+async fn assert_no_declaration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -1593,7 +1587,7 @@ async fn composite_with_manifest_rejects_before_writes() {
 
 /// Concurrent identical declarations persist one operation and one card.
 #[tokio::test(flavor = "current_thread")]
-async fn concurrent_same_key_resolves_to_one_registration() {
+async fn concurrent_same_key_resolves_to_one_declaration() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1607,11 +1601,11 @@ async fn concurrent_same_key_resolves_to_one_registration() {
 
     let first = server.oneshot_authenticated(
         &jwt,
-        prompt_registration_request("concurrent-prompt", "concurrent-key-001"),
+        prompt_declaration_request("concurrent-prompt", "concurrent-key-001"),
     );
     let second = server.oneshot_authenticated(
         &jwt,
-        prompt_registration_request("concurrent-prompt", "concurrent-key-001"),
+        prompt_declaration_request("concurrent-prompt", "concurrent-key-001"),
     );
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.expect("first response").status(), StatusCode::CREATED);
@@ -1646,7 +1640,7 @@ async fn concurrent_same_key_resolves_to_one_registration() {
 
 /// Persist a composite in leaf-first order and return the graph-selected root.
 #[tokio::test(flavor = "current_thread")]
-async fn composite_registration_returns_leaf_first_outcomes_and_root() {
+async fn composite_declaration_returns_leaf_first_outcomes_and_root() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1734,7 +1728,7 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
 
 /// Initialize a sole heavy card after commit and advance its manifest row.
 #[tokio::test(flavor = "current_thread")]
-async fn heavy_registration_initializes_upload_after_commit() {
+async fn heavy_declaration_initializes_upload_after_commit() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1758,7 +1752,7 @@ async fn heavy_registration_initializes_upload_after_commit() {
     };
 
     let response = server
-        .oneshot_authenticated(&jwt, heavy_registration_request("heavy-only-001"))
+        .oneshot_authenticated(&jwt, heavy_declaration_request("heavy-only-001"))
         .await
         .expect("heavy registration responds");
     let status = response.status();
@@ -1913,7 +1907,7 @@ async fn card_reconciler_recovers_after_storage_retry() {
     };
 
     let response = server
-        .oneshot_authenticated(&jwt, heavy_registration_request("reconcile-recovery-001"))
+        .oneshot_authenticated(&jwt, heavy_declaration_request("reconcile-recovery-001"))
         .await
         .expect("heavy registration responds");
     let body = response_json(response).await;
@@ -1996,10 +1990,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     };
 
     let response = server
-        .oneshot_authenticated(
-            &jwt,
-            heavy_registration_request("reconcile-dead-letter-001"),
-        )
+        .oneshot_authenticated(&jwt, heavy_declaration_request("reconcile-dead-letter-001"))
         .await
         .expect("heavy registration responds");
     let body = response_json(response).await;
@@ -2210,7 +2201,7 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
     let response = server
         .oneshot_authenticated(
             &jwt,
-            prompt_registration_request("blob-storage-failure", "blob-storage-failure-001"),
+            prompt_declaration_request("blob-storage-failure", "blob-storage-failure-001"),
         )
         .await
         .expect("registration responds");
@@ -2853,7 +2844,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         response_json(bad_cron).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "vb-bad-cron-operation", "vb-bad-cron").await;
+    assert_no_declaration_writes(&server, "vb-bad-cron-operation", "vb-bad-cron").await;
 
     let never = server
         .oneshot_authenticated(
@@ -2872,7 +2863,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         response_json(never).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "vb-never-cron-operation", "vb-never-cron").await;
+    assert_no_declaration_writes(&server, "vb-never-cron-operation", "vb-never-cron").await;
 
     let reserved = server
         .oneshot_authenticated(
@@ -2891,8 +2882,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         response_json(reserved).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "vb-reserved-alias-operation", "vb-reserved-alias")
-        .await;
+    assert_no_declaration_writes(&server, "vb-reserved-alias-operation", "vb-reserved-alias").await;
 
     let duplicate = server
         .oneshot_authenticated(
@@ -2911,7 +2901,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         response_json(duplicate).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "vb-dup-alias-operation", "vb-dup-alias").await;
+    assert_no_declaration_writes(&server, "vb-dup-alias-operation", "vb-dup-alias").await;
 
     let registered = server
         .oneshot_authenticated(
@@ -3085,7 +3075,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
 ///
 /// # Panics
 /// Panics when the Scribe outbox does not settle or the retained read fails.
-async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
+async fn declaration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
     server
         .await_audit_retained()
         .await
@@ -3124,7 +3114,7 @@ async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(S
 /// Panics when the server fails to start or stop, a fixture write fails, a
 /// route fails to respond, or any status, write, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn operator_bearing_registration_requires_operator_invoke() {
+async fn operator_bearing_declaration_requires_operator_invoke() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -3197,7 +3187,7 @@ async fn operator_bearing_registration_requires_operator_invoke() {
         response_json(free).await
     );
     assert_eq!(
-        registration_audits(&server, cards_only_id.as_uuid()).await,
+        declaration_audits(&server, cards_only_id.as_uuid()).await,
         vec![allowed("cards:write")],
         "operator-free registration spends only cards:write"
     );
@@ -3231,10 +3221,10 @@ async fn operator_bearing_registration_requires_operator_invoke() {
             response_json(response).await["code"],
             "WYRD_PERMISSION_403_DENIED_RBAC"
         );
-        assert_no_registration_writes(&server, &operation, name).await;
+        assert_no_declaration_writes(&server, &operation, name).await;
     }
     assert_eq!(
-        registration_audits(&server, cards_only_id.as_uuid()).await,
+        declaration_audits(&server, cards_only_id.as_uuid()).await,
         vec![
             allowed("cards:write"),
             allowed("cards:write"),
@@ -3269,7 +3259,7 @@ async fn operator_bearing_registration_requires_operator_invoke() {
         response_json(accepted).await
     );
     assert_eq!(
-        registration_audits(&server, both_id.as_uuid()).await,
+        declaration_audits(&server, both_id.as_uuid()).await,
         vec![allowed("cards:write"), allowed("operators:invoke")],
         "one allowed row per evaluated permission commits with the registration"
     );
@@ -3976,7 +3966,7 @@ async fn service_declared_tables_are_ensured_before_activation() {
             .expect("refused registration responds");
         assert_eq!(refused.status(), status, "{name}");
         assert_eq!(response_json(refused).await["code"], code, "{name}");
-        assert_no_registration_writes(&server, name, name).await;
+        assert_no_declaration_writes(&server, name, name).await;
     }
     let unchanged = server
         .oneshot_authenticated(&jwt, describe())
@@ -4191,7 +4181,7 @@ async fn inline_agent_prompt_materializes() {
         response_json(response).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(&server, "inline-005", &long_name).await;
+    assert_no_declaration_writes(&server, "inline-005", &long_name).await;
 
     let Bootstrap::User { jwt: viewer, .. } = server
         .bootstrap_user("inline-prompt-viewer", &["viewer"])
@@ -4208,8 +4198,8 @@ async fn inline_agent_prompt_materializes() {
         .await
         .expect("denied registration responds");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_no_registration_writes(&server, "inline-006", "denied-agent").await;
-    assert_no_registration_writes(&server, "inline-006", "denied-agent-prompt").await;
+    assert_no_declaration_writes(&server, "inline-006", "denied-agent").await;
+    assert_no_declaration_writes(&server, "inline-006", "denied-agent-prompt").await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -4709,7 +4699,7 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
             let text = String::from_utf8_lossy(&bytes);
             assert!(status.is_client_error(), "{name}: {status} {text}");
             assert!(text.contains(needle), "{name}: {text}");
-            assert_no_registration_writes(&server, name, name).await;
+            assert_no_declaration_writes(&server, name, name).await;
         }
     }
 

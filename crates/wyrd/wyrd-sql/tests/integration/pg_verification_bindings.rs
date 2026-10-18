@@ -94,7 +94,7 @@ fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
 ///
 /// # Panics
 /// Panics when the operation, Card, principal, or activation write fails.
-async fn register_service(
+async fn declare_service(
     conn: &mut TenantConn<'_>,
     actor: &Principal,
     card: &Card,
@@ -189,7 +189,7 @@ async fn first_projection_grants_default_role_once_and_revocation_stands() {
     .await
     .expect("default role seeds");
     let card = service_card("workload-svc", "1.0.0");
-    let (card_uid, principal) = register_service(&mut conn, &actor, &card).await;
+    let (card_uid, principal) = declare_service(&mut conn, &actor, &card).await;
     assert_eq!(
         list_service_account_roles(&mut conn, principal.as_uuid())
             .await
@@ -242,7 +242,7 @@ async fn projection_identity_is_stable_under_reapply_and_reorder() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, &service_card("svc", "1.0.0")).await;
+    let (owner, _) = declare_service(&mut conn, &actor, &service_card("svc", "1.0.0")).await;
     let verifier = uid();
     let service_level = schedule_binding(OWNER_OCCURRENCE_KEY, &verifier);
     let component = schedule_binding("retriever", &verifier);
@@ -334,7 +334,7 @@ async fn agent_owner_occurrence_is_the_reserved_key() {
         "relationships": { "outbound": [], "inbound": [] }
     }))
     .expect("agent fixture must deserialize");
-    let (owner, _) = register_service(&mut conn, &actor, &agent).await;
+    let (owner, _) = declare_service(&mut conn, &actor, &agent).await;
     let ids = project_bindings(
         &mut conn,
         &owner,
@@ -379,7 +379,7 @@ async fn projection_is_transactional_and_tenant_isolated() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, &service_card("rolled", "1.0.0")).await;
+    let (owner, _) = declare_service(&mut conn, &actor, &service_card("rolled", "1.0.0")).await;
     project_bindings(
         &mut conn,
         &owner,
@@ -399,7 +399,7 @@ async fn projection_is_transactional_and_tenant_isolated() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, &service_card("kept", "1.0.0")).await;
+    let (owner, _) = declare_service(&mut conn, &actor, &service_card("kept", "1.0.0")).await;
     let ids = project_bindings(
         &mut conn,
         &owner,
@@ -455,7 +455,7 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
         .await
         .expect("tenant connection opens");
     let (owner, principal) =
-        register_service(&mut conn, &actor, &service_card("armed", "1.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("armed", "1.0.0")).await;
     let ids = project_bindings(
         &mut conn,
         &owner,
@@ -543,7 +543,7 @@ async fn excluded_principals_record_nothing() {
     .await
     .expect("card-free principal inserts");
     let (owner, principal) =
-        register_service(&mut conn, &actor, &service_card("paused", "1.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("paused", "1.0.0")).await;
     let ids = project_bindings(
         &mut conn,
         &owner,
@@ -589,9 +589,9 @@ async fn activity_is_per_version_and_revoked_immediately() {
         .await
         .expect("tenant connection opens");
     let (a, principal_a) =
-        register_service(&mut conn, &actor, &service_card("ab-svc", "1.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("ab-svc", "1.0.0")).await;
     let (b, principal_b) =
-        register_service(&mut conn, &actor, &service_card("ab-svc", "2.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("ab-svc", "2.0.0")).await;
     assert_ne!(
         principal_a, principal_b,
         "A/B versions are distinct principals"
@@ -671,7 +671,7 @@ async fn out_of_order_exchanges_never_move_activity_backward() {
         .await
         .expect("tenant connection opens");
     let (owner, principal) =
-        register_service(&mut conn, &actor, &service_card("racing", "1.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("racing", "1.0.0")).await;
     let binding = project_bindings(
         &mut conn,
         &owner,
@@ -731,7 +731,7 @@ async fn non_v7_stored_identities_are_refused() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, &service_card("legacy", "1.0.0")).await;
+    let (owner, _) = declare_service(&mut conn, &actor, &service_card("legacy", "1.0.0")).await;
     insert_raw_binding(&mut conn, Uuid::new_v4(), owner.as_uuid()).await;
     assert!(matches!(
         owner_binding_ids(&mut conn, &owner).await,
@@ -802,7 +802,7 @@ async fn database_clock_owns_machine_activity_and_schedule_arming() {
         .await
         .expect("tenant connection opens");
     let (owner, principal) =
-        register_service(&mut conn, &actor, &service_card("db-clock", "1.0.0")).await;
+        declare_service(&mut conn, &actor, &service_card("db-clock", "1.0.0")).await;
     let binding = project_bindings(
         &mut conn,
         &owner,

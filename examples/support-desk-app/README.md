@@ -15,6 +15,9 @@ repositories, so the docs can embed the same code with `<CodeFromFile>`.
 Keep the three languages in step: same Service, same `tickets` table, same
 `/ask` and `/reviews` routes.
 
-Only the Python app runs from this directory. The Rust and TypeScript copies
-are reference code; their full projects, with manifests and tests, live in the
-example repositories.
+Only the Python app runs from this directory, and the Python SDK's integration
+suite runs it end to end against a local server. The Rust and TypeScript copies
+are reference code compiled against the public SDKs: `mise run check:examples`
+builds `rust/lib.rs` as the `support_desk_app` library of `examples/rust`, and
+`mise run ts:typecheck` type-checks `typescript/`. Their runnable projects, with
+manifests and tests, live in the example repositories.

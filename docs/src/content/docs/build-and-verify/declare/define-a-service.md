@@ -31,6 +31,8 @@ Each component is its own Card file with an exact `metadata.version`. The suppor
 
 `execution_route` says how the Agent reaches its model: `wyrd_gateway` sends it through the gateway deployment named `openai`, which [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) creates. Use `{kind: native}` when your own code calls the model.
 
+The Prompt's `provider` and `model` name a hosted model, such as `openai` and `gpt-4o`, and the gateway resolves `openai/gpt-4o` at call time. That string is not a Model Card and needs none. Declare a `Model` Card only for a model artifact you own and version, such as a trained classifier or a fine-tune, so verdicts and drift attach to its exact version.
+
 ## 2. Write the Service
 
 The Service gives each component an `alias`, the name your code uses at runtime, such as `state.run("agent")`:

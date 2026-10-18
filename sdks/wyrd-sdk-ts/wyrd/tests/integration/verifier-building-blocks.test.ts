@@ -34,7 +34,7 @@ import {
 import { spanExporter } from "wyrd-ai/otel";
 import { cli } from "@wyrd/testing";
 
-import { judgeReply } from "../support/assistant.js";
+import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import { type RegisteredRef, fixture, registered, serverTest, timeline } from "../support/server.js";
@@ -75,12 +75,6 @@ const DENIED = "WYRD_PERMISSION_403_DENIED_RBAC";
 /** The permissions every `tool-review` principal holds: run any Verifier and invoke the gateway its investigator calls the model through. */
 const VERIFIES = ["verifier:run", "gateway:invoke"];
 
-/** One assistant tool call of `tool` with JSON `args`, as the model returns it: under the provider-facing name, which spells the dotted wire name with underscores. */
-function toolCall(id: string, tool: string, args: unknown): unknown {
-  const name = tool.replaceAll(".", "_");
-  return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
-}
-
 /** The investigator's one tool turn: one call of each of {@link TOOLS}, in order. */
 const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
@@ -92,16 +86,6 @@ const INVESTIGATION = [
 
 /** The policy every review reads: the support desk's checked-in refund policy. */
 const POLICY = resolve(import.meta.dirname, "../../../../../examples/support-desk/service/refund-policy.pdf");
-
-/** A Chat Completions answer whose one assistant turn calls `calls`. */
-function toolTurn(calls: readonly unknown[]): Reply {
-  const reply = judgeReply("");
-  const message = { role: "assistant", content: null, tool_calls: calls };
-  return {
-    ...reply,
-    body: { ...(reply.body as object), choices: [{ index: 0, finish_reason: "tool_calls", message }] },
-  };
-}
 
 /**
  * The local model upstream. The refund reader fails by the scripted failure

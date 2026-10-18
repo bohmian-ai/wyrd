@@ -223,3 +223,57 @@ are reversible choices within existing owners.
 - [Agent harness](../../../../architecture/references/languages/agent-harness.md), [errors](../../../../architecture/references/languages/errors.md),
   [telemetry](../../../../architecture/references/domain/telemetry-observations.md), [evaluation](../../../../architecture/references/domain/evaluation.md),
   [security](../../../../architecture/wyrd-security-posture.md), [Bifrost](../../../../architecture/bifrost-design.md).
+
+## Implementation Evidence
+
+Commits: `d31002a61`, `47ac6e1b0`, `ec58c4fd9`, `aa3841193`, `fb89cb4c7`,
+`effa77458` (the user asked for frequent commits, which overrides "do not
+commit").
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Docs/MCP alone teach final Declare -> Observe -> Verify on an own app | `GuideTopic::Start` (`crates/wyrd-spec/src/mcp.rs`); `start` guide steps and initialization instructions (`crates/wyrd/wyrd-server/src/mcp/{guide,mod}.rs`); quickstart "Adapt it to your own app"; `reference/mcp-tools.md`, `connect/connect-an-agent-through-mcp.md` | P1 asserts instructions name `wyrd.guide {"topic":"start"}`, start steps carry setup/declare/get/pull/observe/verify/readback/Model Card text, and no declare/pull/check/upload/get_by_ref tool exists; P2 and `mcp_proxy_discovers_and_reads_with_shared_auth` assert forwarded instructions through the CLI proxy; P5 runs the documented path | PASS |
+| Visible recipes cover telemetry, custom rows, sync/async and correct semantics in all SDKs | Quickstart embeds `init` (`desk.py`) and `lifespan` (`app.py`) regions, adds `wyrd declare ../service --check --format json`, sync `verify` vs staged `submit`, transient not-found, terminal statuses, buffered/delayed evidence; Rust `lib.rs` compiles as `examples/rust` `[lib] support_desk_app`; TypeScript copy is a pnpm workspace package type-checked by `ts:typecheck`; README states this | P5 (declare check, viewer refusal `WYRD_PERMISSION_403_DENIED_RBAC`, both sync verdicts, `missing order_id` failure, `WYRD_SDK_404_UNKNOWN_VERIFIER`, `WYRD_VERIFICATION_400_INPUT_INVALID`, queued review to completed with line citations, post-shutdown evidence rows); P6-P8; `check:examples`; `ts:typecheck` | PASS |
+| llms full contains generated bodies/embeds; errors/help/output claims agree | `docs/src/lib/mdsvex/page-text.js` (+ test), `docs/scripts/page_text.mjs`, `generate_llms_txt.py` (base-relative links, Start here, bodies); `embedCodeFromFile` pluggable renderer; CLI remediation names `pip install -U wyrd-ai` / `npm install -g wyrd-ai@latest`; MCP install help no longer leaks a Rust type name; quickstart outputs captured from P5, not derived | P3 (42 vitest tests incl. bodies, embeds, no component markers, base links); P4 `docs:check` exit 0 (generate drift, build, links, a11y); `codegen:check` | PASS |
+| Setup teaches a person-owned foreground/background job and readiness, no new lifetime | `get-started/setup.md`: foreground lifetime owned by the person, background job with `--format json` readiness line and failure semantics, `kill -INT` stop, MCP install `--format json` then reload, agent never starts/stops the server | Source review against TASK-002's readiness JSON fields; no detached or stop API instruction added | PASS |
+| Owners/auth/durability remain; deterministic proof supports the later live lane | No SDK or server semantic change; guide is read-only; local provider fixture replaces only the external model | P1, P2, P5-P8; `check:deps` (axum in examples crate) | PASS |
+
+Reuse/gap: the guide topic extends the existing `wyrd.guide` owner;
+llms-full reuses the build-time `CodeFromFile` expansion through a renderer
+parameter rather than a second embed parser; P5 extends the existing
+support-desk integration module and its local upstream. The Rust and
+TypeScript reference copies reuse the existing `examples/rust` crate and
+the SDK pnpm workspace instead of new projects.
+
+Commands (all exit 0 on the final tree):
+
+- P1 `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=discovery::pg_tests::agent_discovers_mcp_guide_and_sql_examples)'` — 1 passed
+- P2 `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_selected_mcp_host_reads)'` — 1 passed; also `-E 'test(=mcp_proxy_discovers_and_reads_with_shared_auth)'` — 1 passed (after `cargo build --locked -p wyrd-cli -p wyrd-server --bins`)
+- P3 `mise exec -- pnpm --dir docs exec vitest run src/lib/content.test.ts src/lib/mdsvex/highlight.test.ts src/lib/mdsvex/page-text.test.ts src/lib/indexes.test.ts` — 4 files, 42 passed
+- P4 `mise run docs:check` — exit 0, 32 pages a11y OK
+- P5 `... pytest -q -m integration tests/integration/test_support_desk.py::test_published_quickstart_declares_observes_and_verifies` — 1 passed (needs `mise run build:server` for the code-check sandbox)
+- P6 `...::test_support_desk_answers_verifies_and_explains_every_request` — 1 passed
+- P7 `... cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=support_desk::support_desk_answers_verifies_and_explains_every_request)'` — 1 passed
+- P8 `... pnpm --dir sdks/wyrd-sdk-ts/wyrd exec vitest run tests/integration/support-desk.test.ts -t '^support desk answers, verifies, and explains every request$'` — 1 passed
+- `mise run fmt`, `lints`, `codegen:check`, `check:examples`, `check:deps`, `ts:typecheck`, `py:lints`, `py:typecheck`; `git diff --check` — all exit 0
+
+Observed output provenance: quickstart replies, the transient
+`WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` read, the completed review and the
+evidence rows were printed by a P5 run on this tree. Answer and letter text
+come from the local provider fixture and are labelled as such.
+
+Non-goals held: no MCP write/check/upload tool (P1 asserts), no detached
+mode or stop API, no `wyrd-ui` change, no sibling repository edit, no SDK or
+server semantic change, no compatibility alias, no live lane.
+
+Limits and risks:
+
+- Evidence blocker for a published walkthrough: every published artifact
+  (PyPI/npm `wyrd-ai`, GitHub release, `bohmian/wyrd` images) is 0.1.1, which
+  predates declare/get/pull and JSON setup output, and a 0.2.0 CLI refuses a
+  0.1.1 server (`WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE`). Setup and the
+  quickstart state this; neither claims 0.2.0 is published. A release is
+  required before the docs run from published packages.
+- The quickstart keeps `status: partial`: it ran against a local model
+  fixture only; a real provider run belongs to TASK-004's live lane.
+- Proof ran on Linux x86_64 only.

@@ -860,3 +860,93 @@ test("grouped sampled frames are bounded", async ({ server, provider, assistant 
   await state.shutdown();
   await otherState.shutdown();
 }, 180_000);
+
+/** One retained result's execution identity. */
+const Retained = z.object({ execution_id: z.string() });
+
+/** The executions of `bindingId`'s retained group reviews, oldest first, after publishing every captured row. */
+async function groupReviews(server: { flushBifrost(): void }, bindingId: string): Promise<string[]> {
+  server.flushBifrost();
+  const rows = await (await Bifrost.connect()).sql(
+    "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
+    [bindingId],
+    Retained,
+  );
+  return rows.map((row) => row.execution_id);
+}
+
+test("grouped conversations recover", async ({ server, state: drift }) => {
+  const { receipt, key, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
+  const turn = (answer: string) => ({ answer });
+  const said = (group: string, answer: string) =>
+    state.run("agent").observe.verify("turn-check", turn(answer), { positional: true, group_id: group });
+
+  await drift.startBifrost();
+  expect(await drift.run("model").observe.submit("latency-drift", { latency: 12.5 })).toEqual({ kind: "recorded" });
+  await said("conv-a", "a1");
+  await said("conv-b", "b1");
+  const queued = await state
+    .run("agent")
+    .observe.submit("turn-check", turn("a2"), { positional: true, group_id: "conv-a" });
+  if (queued.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  await said("conv-b", "");
+  const solo = await state.run("agent").observe.verify("turn-check", turn("solo"), { positional: true });
+  await queued.execution.wait({ timeoutMs: WAIT_MS });
+  const cards = await Cards.connect();
+  const newer = await cards.registerFromPath(fixture("cards/verify_in_real_time/turn-check-newer.yaml"));
+  const late = await enqueueOverHttp(server.baseUrl, key, "support-newer-turn", {
+    verifier_card_uid: registered(newer).uid,
+    card_uid: registered(receipt, "assistant-agent").uid,
+    group_id: "conv-a",
+    inputs: { turn: { kind: "json", value: turn("newer") } },
+  });
+  await (await verify.Execution.connect(late)).wait({ timeoutMs: WAIT_MS });
+  const tenantB = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant("tenant-b"), ["admin"], "tenant_b_admin"),
+  });
+  const bCards = await Cards.connect({ client: tenantB });
+  const bReceipt = await bCards.registerFromPath(fixture("cards/verify_in_real_time/support.yaml"));
+  const bBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
+  await bCards.hydrate(bReceipt.root, bBundle);
+  const bKey = await cli.issueKey({ ...bReceipt.root, space: bReceipt.root.space ?? "default" }, { client: tenantB });
+  const bState = WyrdState.fromPath(bBundle, { client: WyrdClient.connect({ credential: bKey.key }) });
+  await bState.startBifrost();
+  await bState.run("agent").observe.verify("turn-check", turn("tenant b"), { positional: true, group_id: "conv-a" });
+  for (const each of [state, drift, bState]) {
+    await each.shutdown();
+  }
+
+  const deadline = Date.now() + WAIT_MS;
+  let reviews = await groupReviews(server, bindingId);
+  while (reviews.length < 2) {
+    expect(Date.now(), "both conversations are reviewed").toBeLessThan(deadline);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    reviews = await groupReviews(server, bindingId);
+  }
+  const judged: Record<string, unknown> = {};
+  for (const id of reviews) {
+    const review = await (await verify.Execution.connect(id)).status();
+    judged[review.group_id ?? ""] = [
+      review.group?.sources.turns.execution_ids.length,
+      review.result?.outcome.evidence.turns,
+      review.result?.outcome.verdict,
+    ];
+  }
+  expect(judged, "each conversation judges only its own pinned turns").toEqual({
+    "conv-a": [2, { kind: "json", value: [turn("a1"), turn("a2")] }, "passed"],
+    "conv-b": [2, { kind: "json", value: [turn("b1"), turn("")] }, "failed"],
+  });
+  const ungrouped = await (await Bifrost.connect()).sql(
+    "SELECT execution_id FROM vala.verification.results WHERE execution_id = $1 AND group_id IS NULL",
+    [solo.execution_id],
+    Retained,
+  );
+  expect(ungrouped, "the ungrouped turn joins no group").toHaveLength(1);
+  const quiet = Date.now() + 8_000;
+  while (Date.now() < quiet) {
+    expect(await groupReviews(server, bindingId), "idle ticks review once").toEqual(reviews);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+});

@@ -24,6 +24,9 @@ mod pg_operator_delivery;
 mod pg_principal_roles;
 mod pg_router_smoke;
 mod pg_verification_routes;
+// Arms one-shot query faults, which exist only under `test-support`.
+#[cfg(feature = "test-support")]
+mod pg_verification_groups;
 #[cfg(feature = "test-support")]
 mod pg_verification_runtime;
 #[cfg(feature = "test-support")]

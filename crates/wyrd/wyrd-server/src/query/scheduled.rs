@@ -156,6 +156,13 @@ impl ScheduledQueryCaller {
                 )
                 .await?
         };
+        // Test servers truncate an armed stream here too, so a grouped or
+        // scheduled read meets the same early EOF as the public routes; a
+        // schema hold has no waiter on this path and is released at once.
+        #[cfg(feature = "test-support")]
+        if let Some(fault) = &self.state.query_stream_fault {
+            drop(fault.apply(&mut stream));
+        }
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.

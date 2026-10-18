@@ -1552,6 +1552,10 @@ mod pg_tests {
         /// # Errors
         ///
         /// Returns a tool-call, plan-shape, or upload failure.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the storage PUT answers a non-success status.
         async fn submit(&self, group: &str, label: &str) -> Result<String, McpJourneyError> {
             use sha2::Digest as _;
             let bytes = [b"\x89PNG\r\n\x1a\n\n".as_slice(), label.as_bytes()].concat();

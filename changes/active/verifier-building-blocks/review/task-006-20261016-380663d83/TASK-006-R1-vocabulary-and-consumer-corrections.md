@@ -3,12 +3,20 @@ id: TASK-006-R1
 kind: remediation
 status: ready
 spec: SPEC-verifier-building-blocks
-spec_revision: 10
+spec_revision: 11
 parent_task: TASK-006
-remediates: [FIND-TASK-006-1, FIND-TASK-006-2, FIND-TASK-006-3, FIND-TASK-006-4]
+remediates: [FIND-TASK-006-2, FIND-TASK-006-3, FIND-TASK-006-4]
 ---
 
 # Finish vocabulary enforcement and current consumer closure
+
+> **Owner amendment, approved revision 11:** FIND-TASK-006-1 is withdrawn as
+> repository-scan remediation. Do not retain or extend the removed `check:deps`
+> vocabulary block or its probe matrix. The original r10 diagnosis and executed
+> evidence below remain historical. Existing served OpenAPI contract proof is
+> retained under r11; this does not require a repository-wide scanner.
+> Findings 2–4 and all remaining behavioral/contract obligations still need
+> independent closure. See [owner-amendment-r11.md](owner-amendment-r11.md).
 
 Route directly to `$wyrd-implement`; UI asset work also uses `$wyrd-ui`. This task packages only the four independently validated causes in this review's findings-validation.md.
 

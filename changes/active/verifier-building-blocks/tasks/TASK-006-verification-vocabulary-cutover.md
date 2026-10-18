@@ -3,12 +3,19 @@ id: TASK-006
 kind: implementation
 status: proposed
 spec: SPEC-verifier-building-blocks
-spec_revision: 10
+spec_revision: 11
 requirements: [REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016]
 depends_on: [TASK-005]
 ---
 
 # Delete obsolete Eval machinery and finish the verification cutover
+
+> **Current authority: approved revision 11.** The repository-wide vocabulary
+> scan, matcher probes and policy exception are withdrawn. The revision-10
+> instructions and implementation evidence below are historical wherever they
+> require that scan. Current acceptance uses source/caller review, focused
+> refusal tests, existing generated/consumer checks and the served OpenAPI
+> contract assertion. Do not retain or rebuild a source-tree name checker.
 
 ## Outcome and Value
 

@@ -1,3 +1,9 @@
+> **Owner amendment (approved r11):** FIND-TASK-006-1 is withdrawn as
+> repository-scan remediation. The existing served OpenAPI contract assertion
+> remains; findings 2–4 still require independent closure. See
+> [owner-amendment-r11.md](owner-amendment-r11.md). The original r10 verdict below
+> is preserved as historical evidence.
+
 # TASK-006 verdict
 
 **FIX_REQUIRED** — FIND-TASK-006-1, FIND-TASK-006-2, FIND-TASK-006-3 and FIND-TASK-006-4 remain. TASK-006 is not complete. These are bounded corrections under approved revision 10; no new specification decision is required.

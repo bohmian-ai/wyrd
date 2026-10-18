@@ -1273,24 +1273,72 @@ and `verify` never do, and a replayed submission creates no duplicate
 dispatch.
 
 **Grouped verification.** `verify` and `submit` take an optional caller
-`group_id`; the server records it with the authenticated owner Service on the
-execution's input and result rows, with no producer Postgres read or write.
-A group Verifier declares source inputs as whole slots or requirement
-outcomes of other Verifiers bound on the same owner occurrence
-(`verifiers.<name>.inputs.<slot>` or
-`verifiers.<name>.requirements.<id>.outcome`); registration resolves each to
-its exact pinned source binding, so a newer source Card version never joins a
-pinned group. A `group_end` binding is polled from Bifrost: once a group's
-newest source row is `idle` or its first is `max_age` old, one serial
-execution per binding and group pins a snapshot of the visible source
-executions of exactly that tenant, owner, subject, and Verifier tuple, in
-recorded-input order, with null outcomes for absent results. Later rows reach
-only a later review, rows past `finality` open none, and more than
-`WYRD_VERIFICATION_SOURCE_EXECUTIONS_MAX` source executions judge the
-requirement inconclusive without reading. A review dispatches its
-`on_verdict_change` Operators only when its verdict differs from the group's
-previous review. Outbox loss stays outbox loss: an unpublished source row
-never joins a review.
+`group_id`; the server records it with the authenticated owner Service on input
+and result rows without producer PostgreSQL IO. A group Verifier declares whole
+source slots or requirement outcomes of other Verifiers bound on the same owner
+occurrence (`verifiers.<name>.inputs.<slot>` or
+`verifiers.<name>.requirements.<id>.outcome`). Registration pins exact source
+identities; tenant, owner, subject and Verifier identity scope every read.
+
+A `group_end` Trigger declares one positive duration, `after`. After Scribe
+acknowledges a matching source input or result, the existing background writer
+upserts one PostgreSQL pending scheduling row per tenant, binding and group ID,
+with due time computed as PostgreSQL statement time plus `after`. New activity
+updates that due time; evidence stays in Bifrost. Request handlers add no SQL,
+source lookup or explicit start/close operation. Continuous activity can postpone
+execution indefinitely. No max-age override or permanent finality exists.
+
+The scheduler polls due scheduling rows, not historical Bifrost groups. Ordinary
+cron scheduling and group work use separate bounded loops under the existing
+scheduler owner, each sleeping the runtime poll interval after a pass (default
+one second), visiting at most 64 overdue tenants and handling at most 32 due items
+per tenant. Group items are processed sequentially per process. Before claiming,
+group preparation acquires a permit from the same existing process execution
+capacity used by the runner (default 64). Full capacity leaves pending rows in
+PostgreSQL; no new concurrency option or distributed quota is introduced.
+
+A group item is claimed with `FOR UPDATE SKIP LOCKED`. While holding that
+scheduling-row lock, one bounded Bifrost snapshot query selects the currently
+visible source inputs/results. The same tenant transaction pins/enqueues the
+ordinary execution and deletes its scheduling row. An unchanged snapshot's
+content-identity conflict also consumes the pending row. Failures roll back,
+retaining the pending item for a later pass. Concurrent activity waits only in
+the background on the row lock and recreates a pending row after successful
+handoff. Release the transaction and preparation permit before Verifier/provider
+execution. With no new activity, there is no pending row and no further Bifrost
+read for that group. Distinct later snapshots may overlap earlier executions.
+
+Source lists share execution ordering, with null for missing inputs/outcomes.
+Physical identity duplicates count once; distinct executions remain distinct.
+When an execution has multiple visible results, select the latest by ingest time,
+then result ID. Grouping does not consult PostgreSQL submission acceptance or
+settlement to decide which Bifrost rows participate. Consequently a staged
+input later refused by the queue can participate. Ordinary source authorization
+and pre-staging pressure refusal still apply.
+
+The pending table contains scheduling metadata only, never source evidence,
+readiness inventories or revision state. Existing execution records hold the
+snapshot digest, pinned values and source identities. Ordinary queue claims and
+retries remain; no additional group crash-recovery protocol exists. Query
+admission/output/deadline bounds apply; failed or incomplete queries defer
+execution without truncated inputs or synthetic source-ceiling verdicts.
+
+Scribe acknowledgement schedules work but is not a query-completeness checkpoint.
+A snapshot uses what is visible when read; a later visibility change alone does
+not schedule another execution. A process death between ACK and scheduling commit
+can lose the notification; there is no repair/history scan. Background retries
+can postpone expiration. Retention and outbox loss limit available evidence.
+Runtime permits bound active work, not durable PostgreSQL backlog. These limits
+are explicit; no visibility barrier, activity ledger, quota service or new WAL
+is added.
+
+Group bindings use `on_verdict_change` only. The first settled verdict is a
+baseline; each subsequent different settled verdict creates existing Operator
+dispatches transactionally. Comparison follows settlement order, including when
+an older snapshot finishes later; there is no newest-revision adoption or
+outstanding-execution gate. A short lock on the existing binding row covers only
+completion, previous-verdict comparison and dispatch creation, never evaluation.
+Completion replay creates no new transition. Delivery remains at least once.
 
 `run_id` is the client's application invocation; one Run can have many
 executions. `ExecutionId` is the server-issued identity of one exact Verifier
@@ -1619,9 +1667,7 @@ spec:
   kind: schedule | group_end              # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
-  idle: duration                          # group_end only
-  max_age: duration                       # group_end only
-  finality: duration                      # group_end only
+  after: duration                         # group_end only — elapsed since newest visible source evidence
 ```
 
 `group_end` binds only a Verifier with source inputs and judges each caller
@@ -1679,7 +1725,7 @@ verdict creates Operator work: one durable dispatch per configured
 `on_failure` Operator. Passed, inconclusive, cancelled, timed-out, errored,
 and direct analysis-only runs create none. A `group_end` binding instead
 dispatches each `on_verdict_change` Operator once when a completed group
-review's verdict differs from the group's previous one, carrying the group and
+execution's verdict differs from the group's previous one, carrying the group and
 the result it changed from. Each dispatch has its own status,
 bounded retry, and terminal error; one failure never blocks siblings or
 rewrites the result. There is no `Alert` resource, table, or alert router — a
@@ -2195,8 +2241,8 @@ services/ops-copilot/
 │   ├── runbook-policy.yaml
 │   └── service-policy.yaml
 ├── observability/
-│   ├── triage-review.yaml       # agent steps and checks
-│   ├── runbook-review.yaml
+│   ├── triage-verifier.yaml       # agent steps and checks
+│   ├── runbook-verifier.yaml
 │   ├── triage-drift.yaml
 │   ├── runbook-drift.yaml
 │   └── service-latency-drift.yaml

@@ -1,6 +1,6 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 15
+revision: 17
 status: approved
 ---
 
@@ -18,69 +18,55 @@ calls sharing group_id, with per-item execution/retry on the existing queue and
 aggregation at group_end. Every Verifier remains a pure versioned function over
 closed inputs.
 
-Revision 13 retains the owner's replacement of the earlier
-evidence-append model. Current owner instructions override the older
-[proposal](advise-proposal.md), [notes](owner-notes.md) and
-[diagram](architecture-diagram.html) wherever they differ. The owner explicitly approved revision 13.
-Revision 8 supersedes earlier Postgres lifecycle,
-readiness and receipt guarantees with the owner's existing-outbox durability
-and background-query model. Revision 9 applies all accepted complexity-review
-cuts. Revision 10 resolves OD-007 by keeping fan-out entirely in the caller
-workflow; internal fan-out, checkpoints and media-processing extensions are cut.
-Revision 11 narrows source references, removes automatic trace expansion and
-overlapping group reactions, and permits bounded multi-query snapshot reads.
-Revision 12 adds load and overhead qualification through the existing opt-in
-capacity benchmark, with both overhead targets retained. Revision 13 reserves
-`group_id` as a Verifier input slot name to avoid the Python keyword collision.
-Revision 14 records that Wyrd has never shipped: managed table schemas change
-in place with no retained-table upgrade.
+Revision 16 recorded the owner's explicit approval of the simple grouping
+proposal and cut list, followed by the instruction to implement it as one
+TASK-003a on the merged TASK-001–003 worktree. It supersedes older grouping
+lifecycle requirements and the packets under `review/`; those packets are not
+implementation or review authority. TASK-002's scheduled samples and TASK-003's
+bounded staging outcomes remain required. TASK-003a delivers functional and
+documentation closure; REQ-015/AC-009 benchmarking follows it and is not claimed
+complete by this task.
 
-### Rechecked repository facts and required gaps
+Revision 17 records the owner's subsequent explicit approval of this flow and
+its ACK/visibility, post-ACK crash-loss and durable-backlog tradeoffs:
+record input/result evidence in Bifrost, update one PostgreSQL scheduling row per
+group binding, move its due time on new evidence, claim expired rows in bounded
+batches, pin available evidence, enqueue execution and consume the scheduling
+row after successful handoff. With no new activity there is no scheduling row
+and no further Bifrost read of that group. This replaces revision 16's repeated
+Bifrost discovery and its prohibition on a group scheduling table.
 
-| Inspected source | Fact and consequence |
-|---|---|
-| `crates/wyrd-spec/src/card/verifier/reference.rs::{ReferenceRoot,PathSegment,Reference::parse}` | Existing roots are `inputs.<slot>`, `steps.<id>.output`, `steps.<id>.status`, `steps.<id>.requirements.<requirement>.outcome\|reason`, and `requirement.id\|statement`. Fields, indexes and wildcards parse, but child selectors are limited to inputs/step outputs and wildcard use is restricted by validation. There is no `verifiers` root today. |
-| `crates/wyrd-spec/src/card/verifier/mod.rs::{VerifierSpec,VerificationBinding}`, `crates/wyrd-spec/src/reference.rs::Ref` | Input slots currently have typed bodies, not reference-string declarations. Binding `verifier` is a `Ref`: authored path, registration sibling, or registered CardRef, resolved to exact identity. New group input strings and binding-local name resolution are contract extensions. Declaration location cannot determine eligibility. |
-| `crates/shared/wyrd-client/src/observe/mod.rs::{Observe::verify,Observe::submit}`, `src/verify/mod.rs::{Target::execute,Target::enqueue,RunEvidence::pin}` | The client resolves a bound Verifier by name, projects its slots, and hashes/plans/uploads declared files as part of verify/submit. Run submit enqueues; verify executes inline. No new evidence-only producer verb is needed. |
-| `crates/vala/vala-bifrost-redux/src/tables/verification/{execution_inputs,results}.rs`, `wyrd-server/src/verification/results.rs::ResultPayloadBuilder::{inputs,build}` | `vala.verification.execution_inputs.inputs` stores pinned input declarations; `vala.verification.results.outcome` stores requirement IDs, outcomes/reasons and the result breakdown. They have execution/Verifier/binding correlation, and results have owner correlation. These are the source data, not a new contribution store. Retries may leave multiple result payloads; the completed execution's selected result identity is authoritative. |
-| `wyrd-server/src/components/verification/service.rs::{execute,enqueue,stage_direct}`, `src/verification/runner.rs`, `wyrd-runtime/src/principal.rs::Principal::card_ref` | Direct verify already reads Postgres; enqueue stages an input row without Postgres IO. Current builders set owner/binding to None. REQ-014 copies an authenticated owner Service UID without IO; group eligibility is resolved only in the background. Existing subject/Verifier/run/principal identities remain. No new producer Postgres read or write is permitted. |
-| Verification table schemas, `wyrd-sql/src/queries/{verification,verifier_executions}.rs` | Results already have nullable owner/binding fields; execution inputs lack owner_card_uid. Add the owner and group_id metadata required by REQ-001/014. No universal per-source binding_id propagation or global tuple-uniqueness rule is required. Ambiguity refusal is limited to bindings used by group lookup. |
-| `vala-verify/src/blocks/scope.rs::Scope::resolve`, `blocks/engine.rs::json`, `wyrd-server/src/verification/hosted/tools.rs::Invocation::call` | Generic trace references retain InputDeclaration::Trace containing the trace ID; automatic span fetch belongs to existing trace checks. Group sources project the recorded ID only. BuiltinTool::BifrostQuery already invokes the caller-authorized bounded query owner, including tool:invoke and bifrost:query:read; span queries remain live, not materialized group inputs. |
-| `crates/vala/vala-verify/src/{blocks/engine,walk}.rs`, `wyrd-server/src/verification/{runner,leases,claims,submissions}.rs` | The engine is vala-verify; runtime contracts live in wyrd_spec::verification. Existing async claims, leases, retries and settlement provide per-item execution/retry for separate submit calls. This change adds no checkpoint or internal fan-out engine. Existing staging is unbounded and enqueue is staging-only; bounded process staging remains required. |
-| `VerifierSpec::validate_schedule`, `wyrd-server/src/verification/drift.rs::DriftEngine::checks`, `wyrd-sql/src/queries/verifier_executions.rs` | Supplied schedule selectors must equal their samples slot's feature set; optional slots can currently be omitted. Runtime uses frozen slots only for check-key presence; series come from the check, subject from `card_uid`, window from the schedule. Claim freezes `schedule_inputs` into `ExecutionInput::Scheduled {window, slots}`. REQ-012 removes the duplicate mapping and omission path. |
-| `wyrd-spec/src/card/trigger.rs::TriggerActivation`, `wyrd-server/src/verification/scheduler.rs::VerificationScheduler`, `wyrd-sql/src/queries/verifier_executions.rs::{DUE_BINDING_SQL,SCHEDULE_CLAIM_DELAY,schedule_due}` | Only schedule activation exists today. The scheduler claims `wyrd.verification_bindings.next_run_at` via Postgres time and SKIP LOCKED with a 30-second schedule claim delay, then enqueues existing executions. REQ-004 extends this binding cursor to fixed-cadence Bifrost group queries, without per-call Postgres writes or group rows. |
-| `vala-bifrost-redux/src/tables/verification/results.rs`, `wyrd-server/src/verification/results.rs::ResultPayloadBuilder::summary` | Results already have execution_status but the builder emits completed. Revision 9 drops the status reference; selected requirement outcomes or null suffice. No execution-status tracking extension is required. |
-| `wyrd-runtime/src/outbox.rs::Outbox::stage`, `wyrd-server/src/verification/claims.rs::ClaimLoop::claim_round`, `verification/hosted/blocks.rs::STEP_CONCURRENCY`, `vala-verify/src/blocks/engine.rs::decide`, `wyrd-sql/src/queries/verifier_executions.rs::complete` | Outbox staging is unbounded today; a process bound is required work. Claims visit tenants in rounds; hosted step concurrency is four. Existing decide supports all/pass_rate and keeps known failures decisive for all; settlement fences an execution and creates dispatches transactionally, but does not serialize a whole group. Reuse these owners without claiming distributed quotas or existing group serialization. |
-| `vala-verify/src/assertion.rs::evaluate_item_mode`, `skald-spec/src/media.rs::MediaFormat` | evaluate_item_mode currently returns passed when its array is empty (zero failures); REQ-008 changes that to inconclusive. JPEG/PNG already exist; MP4 is absent and remains out of scope. Existing per-file upload and per-execution queue retries suffice for J-004. Source references and their read ceiling remain extensions. |
-| `mise.toml::bench:capacity`, `wyrd-testing/src/bin/capacity/{report,evidence}.rs`, `wyrd-server/src/verification/telemetry.rs`, `app/metrics.rs` | The existing opt-in capacity binary runs a four-tenant production mix over one/two release replicas, writes target/capacity reports, and belongs to no gate/verify lane. It judges direct overhead p95 < 10 ms (1,000 samples in the one-replica sustained step), >=95% offered traffic, zero errors, client queue drain <=1 s and backlogs <=60 s. CPU/memory are currently report-only and every refusal fails normal steps. Overhead subtracts measured external waits from engine intervals; report/evidence currently expose only overhead p95, using histogram bucket upper bounds. Verification buckets include 0.5 and 1 ms. REQ-015 adds p99 and overload-specific evidence without weakening the original checks. |
-| `sdks/wyrd-sdk-python/src/observe/mod.rs::{PyObserveHandle::verify,submit,inputs}`, `python/wyrd/observe/__init__.pyi`, `examples/support-desk-app/python/desk.py`, `wyrd-client/src/observe/mod.rs::Observe`, `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Observe`, `wyrd-spec/src/card/verifier/validate.rs::{validate_slot,invalid}` | Python uses `(verifier, /, *value, **named)` and the example passes slots as keywords. Positional-only verifier and variadic collectors do not reserve their names as slot keywords. Rust takes verifier/Inputs; TypeScript takes verifier/inputs/options with slots in the inputs map, so these argument names do not collide. No existing reserved-slot blacklist was found: SlotName validates identifier syntax and validate_slot checks slot constraints. Reuse its field-specific WyrdError::Validation pattern (rule=slot, path=inputs.group_id) for the new group_id refusal, not a language-specific guard. |
-| `architecture/bifrost-design.md`, existing evidence upload | Scribe ACK is a WAL/batch-fence boundary; the process outbox can lose unstaged/unacknowledged rows on abrupt crash. Oracle visibility can lag and overlap. Revision 8 accepts this evidence availability for grouping, deduplicates visible identities and pins each evaluated snapshot; it does not claim complete durable membership. Digest-addressed evidence storage already exists; sampling/segmentation belongs to the application. |
-
-Paths abbreviated with `wyrd-server` and `wyrd-sql` are under
-`crates/wyrd/`; `vala-verify` and `vala-bifrost-redux` are under `crates/vala/`
-and `wyrd-spec` is under `crates/`.
-Existing verification route/runtime and Rust/Python/TypeScript journeys are
-reuse evidence, not proof of the new model. Rechecking these facts found
-the owner-metadata and minimal source-reference gaps above. Attribution
-is a server-side extension, not a missing client-supplied binding identity.
+Current implementation base: `ba92ac9b9` on
+`change/long-horizon-verification-task-001`. Extend the existing
+`VerificationScheduler`, `GroupPoller`, `VerifierExecutionQueue`, source binding
+resolution, ScribeOutbox and SDK journeys. Remove group-specific completion
+reconciliation rather than replacing these owners. Ordinary `.verify` executes
+inline and stages inputs/results; `.submit` stages inputs and the acknowledged
+batch later enters the PostgreSQL queue. Neither request path uses PostgreSQL.
 
 ## Scope, invariants and non-goals
 
+Terminology: a group runs an ordinary Verifier execution. There is no separate
+review concept, entity, queue, state or operation in the verification grammar.
+Use “group Verifier”, “group Verifier execution” and “verification” throughout
+production code, contracts, fixtures, tests and product documentation.
+
 - **INV-001 — Wyrd-owned machinery.** Group identity, membership, ordering,
-  end/revisions and recovery are independent of tracing, a provider, external
+  end/revisions are independent of tracing, a provider, external
   queue or producer runtime. Telemetry is optional evidence. Callers provide
   the evidence the invoked Verifier declares; grouping never requires OTel.
 - **INV-002 — Designed for load.** Hundreds of requests/s per deployment and
   bursty multi-tenant load are invariants. Every staging buffer, runnable
-  queue, task set and source-reference read is bounded. Refuse excess work
+  queue, task set and source-reference read uses existing finite resource bounds.
+  Refuse excess work
   before staging excess work; outbox crash loss remains explicitly accepted
   under REQ-005, rather than being disguised as durable acceptance.
 - **INV-003 — Server ownership and tenancy.** Rust server owners retain durable
   behavior; `wyrd-spec` stays IO/async/PyO3-free. SDKs project the shared
   `wyrd-client`. TenantConn/RLS, storage authorization, accepted authority
   and exact owner/source identities apply to grouping and every injected read.
-- **INV-004 — Immutable judgments.** A group revision is a fixed set of
-  source execution identities; each group execution pins the selected values
+- **INV-004 — Immutable judgments.** A group revision is one fixed visible-evidence
+  snapshot; each group execution pins the selected values
   it actually reads. Results and historical revisions remain immutable.
   Explicit agent tool queries read live data, outside the pinned snapshot.
   Media uses existing uploaded-file digests/locators.
@@ -91,9 +77,9 @@ is a server-side extension, not a missing client-supplied binding identity.
   are lineage, not fabricated authorization audits.
 
 In scope: grouping ordinary verify/submit executions, explicit source references,
-background group discovery/re-judgment, owner isolation, existing outbox durability,
-process bounds/tenant progress, non-vacuous assert each, one source-execution
-read ceiling and REQ-012's scheduled binding simplification.
+background pending-group scheduling/execution, owner isolation, existing outbox durability,
+process bounds/tenant progress, non-vacuous assert each and REQ-012's
+scheduled binding simplification. There is no grouping-specific source-count ceiling.
 
 Unchanged: ordinary inline slot declarations and invocation flow, the 14 Card
 kinds, Source read-only behavior, Window/Drift scoring and schedules apart
@@ -112,7 +98,7 @@ that preserves retained state owns built-in table evolution.
 
 Non-goals: evidence-only append/upload producer verbs; a contribution ontology;
 deployment-wide quota coordination or strict allocation fairness;
-parallel judgments of one binding/group; universal source-binding attribution;
+group execution serialization or result-adoption protocols; universal source-binding attribution;
 Verifier-internal action fan-out or step checkpoints; server-owned video/MP4
 extraction, segmentation or new media formats; fan-out resource/coverage budgets;
 list-of-media slots for a single synchronous verify over many files;
@@ -155,7 +141,7 @@ still applies to every SDK and the wire independently of slot names.
 `VerificationRequest` carries the optional wire field `group_id` for both
 execute and enqueue; HTTP/MCP project that same spelling. The stored column
 is also `group_id` on execution-input/result records and the submitted execution
-queue as applicable. There is no grouping control-state table. It is never renamed to
+queue as applicable. The only new grouping control state is the pending scheduling row in REQ-004. It is never renamed to
 `group`, `key`, `grouping_key`, `session` or a language-specific alias.
 Omitting `group_id` preserves ordinary ungrouped invocation; no value is
 inferred from Run or trace identity.
@@ -176,9 +162,10 @@ matching owner/subject/Verifier binding. Services cannot mix through shared
 Producers coordinate only on that caller value, never a server resource ID.
 
 Grouping adds no synchronous Postgres write, group row, counter, acceptance
-sequence, revision row or readiness state to verify/submit. Both use today's
-ScribeOutbox input/result path. Group membership is discovered later from
-visible attributed rows. Persist original input declarations and existing
+sequence, revision row or readiness state to verify/submit. Pending scheduling
+rows are updated only in the background after Scribe acknowledgement. Both use today's
+ScribeOutbox input/result path. Source values are selected later from
+visible attributed rows; pending scheduling rows select which groups need work. Persist original input declarations and existing
 execution/subject/Verifier/principal identities, with `group_id` and
 authenticated owner metadata. Existing binding columns
 remain available for existing activated executions; this change does not require
@@ -186,8 +173,10 @@ populating them for every direct or submitted turn.
 No revision is allocated by a producer call.
 
 Existing enqueue idempotency remains: replay returns the same execution,
-conflicting content is refused, and duplicate physical rows do not become
-additional source executions. A deliberate second verify is another execution.
+conflicting content settles with the existing queue error, and duplicate physical
+rows do not become additional source executions. A conflicting submission can
+already have a visible input row before the queue refuses it; grouping does not
+consult acceptance state to hide that row. A deliberate second verify is another execution.
 Authorization precedes disclosure and staging.
 
 ### REQ-002 — Cross-Verifier input grammar and ordered values
@@ -223,8 +212,8 @@ spec:
     turn: {type: json}
     trace: {type: trace}
 ---
-# conversation-review.yaml: selected recorded data only
-metadata: {name: conversation-review, ...}
+# conversation-verification.yaml: selected recorded data only
+metadata: {name: conversation-verification, ...}
 spec:
   inputs:
     turns: verifiers.turn-verifier.inputs.turn
@@ -233,16 +222,21 @@ spec:
 ```
 
 At group execution, each reference returns an ordered list with one element
-per execution of the resolved source binding in that group revision. Order
+per visible execution of the resolved source binding in that group revision. Order
 is ascending input row time, then `execution_id` to break ties, using
-the row times REQ-004 defines rather than a Postgres acceptance counter. A
+the source ingest timestamps rather than a Postgres acceptance counter. A
 result-only execution uses its earliest visible result row time for this ordering. References
 to the same binding use the same source execution order. A group snapshot containing no executions of that binding yields an empty list, not invented evidence or a vacuous pass.
 
 For an input reference, each element is that execution's whole supplied slot
 value; JSON declarations unwrap to their original JSON values. For an outcome
-reference, each element is its requirement outcome from the authoritative
-result. Nothing is filtered by outcome. Missing selected inputs/results are
+reference, each element is its requirement outcome from the selected visible
+result. Select the latest visible result by `wyrd_ingested_at`, then result ID;
+this is independent of PostgreSQL settlement. Multiple physical copies of one
+logical input/result identity count once; the earliest ingest time of that
+identity supplies timing. An input is identified by execution ID and a result
+by result ID. Different executions with equal values remain different evidence.
+Nothing is filtered by outcome. Missing selected inputs/results are
 null in their aligned execution positions, never omitted or fabricated verdicts.
 A completed failed judgment remains `failed`; an absent result remains null.
 No per-execution source path projection or inner wildcard semantics are added.
@@ -270,138 +264,135 @@ new source declaration uses only the two forms above. Invalid roots,
 missing slots/requirements and unsupported suffixes are field-specific
 registration failures. Existing local check-selector validation is unchanged.
 
-### REQ-003 — Query-derived revisions, finality and retention
+### REQ-003 — Available-evidence executions and retention
 
-One binding/group has at most one outstanding group execution, including
-pending, running and retrying work. It pins a visible-evidence snapshot and
-coverage on the existing execution/result. While that work is outstanding,
-new source rows coalesce; they do not launch a parallel review or mutate its
-inputs. After settlement, the next poll evaluates uncovered rows using a new
-whole-group snapshot. Prior turn checks are not rerun.
+Each group execution pins the complete selected values and source execution
+identities it actually reads. Repeated polls of the same snapshot enqueue no
+additional execution. New visible evidence is eligible for a new whole-history
+snapshot, including while an earlier group execution is pending, running or
+retrying. Never mutate earlier inputs or rerun the individual source Verifiers.
+There is no outstanding-group gate, persisted revision number, coverage watermark,
+source-count comparison, completeness judgment or result-adoption protocol.
 
-History is identified by immutable execution/result IDs and source coverage.
-Any displayed revision numbering is derived from that history, not a persisted
-revision field, allocation counter, replacement flag or latest-result adoption
-protocol. Later settled judgments follow earlier ones serially; there are no
-competing group results. Use the existing queue/settlement boundary to enforce
-one outstanding execution across replicas and dispatch verdict changes under
-REQ-010. No group lifecycle or revision table is introduced.
+Ordinary snapshot idempotence belongs to the existing execution record: a
+content digest identifies one snapshot for a binding/group. It is not a source
+acceptance ledger. Existing queue claims, leases, retries and settlement remain;
+no new group crash-recovery protocol or recovery guarantee is introduced.
 
-Finality is measured from the earliest visible attributed source row using
-the effective Trigger duration. Rows whose server activity time is at/after
-group start + finality do not reopen the group or expand subsequent snapshots.
-This is a background eligibility bound, not a verify/submit refusal: calls
-still run and record their rows. Remove `session_finalized` and any synchronous
-finality lookup. A row visible late but timed within finality may still be
-judged; a result timed beyond finality does not reopen the group.
+There is no permanent finality cutoff. A day-three or later row can reopen a
+group and refresh its expiration. Existing evidence retention still applies;
+the next snapshot uses whatever history remains visible. Nothing restores lost
+outbox data or expired source rows. Revision labels, if displayed, derive from
+immutable execution history rather than allocating a revision counter.
 
-Finality deletes nothing. Source evidence, group snapshots/results and existing
-idempotency receipts follow existing evidence retention; no group-specific
-retention or tenant-default finality is added. Retention and outbox loss can limit discoverable history; no separate
-group-start/membership store restores unavailable rows.
+### REQ-004 — Pending group scheduling and one group-end duration
 
-### REQ-004 — Group-end Trigger lifecycle
-
-**OD-005, decided:** add `kind: group_end` as the second `TriggerActivation`
-variant alongside `schedule`. A group Verifier's binding uses this activation
-to run the group judgment when the group ends. Its end-timing configuration is:
+The public Trigger activation is exactly:
 
 ```yaml
 runs_on:
   kind: group_end
-  idle: 30m
-  max_age: 24h
+  after: 30m
 ```
 
-`idle` and `max_age` are durations. The previously decided Trigger-owned
-`finality` remains part of lifecycle configuration; the example above shows
-end timing only and introduces no finality default.
+`after` is the required existing positive TriggerDuration, without a default.
+It replaces idle/max_age/finality, rejected through existing unknown-field
+validation without aliases. Frozen settings retain after and exact sources.
 
-That Trigger owns `idle`, `max_age` and `finality`, e.g. 30 minutes, 24 hours
-and 30 days. They do not belong on Verifier specs, invocation input slots or
-a tenant-default finality policy. Each binding uses its own pinned Trigger's
-`idle`, `max_age` and `finality`; no longest-duration composition or shared
-lifecycle negotiation occurs. Those pinned settings are inspectable. Idle is
-measured from the newest visible source input/result row, max_age uses the
-first source row, and finality follows REQ-003.
+There is one PostgreSQL pending scheduling row per `(tenant, binding_id,
+group_id)`, containing `due_at`. The binding identifies the group Verifier,
+owner and subject; the row contains no evidence, source execution status,
+completion inventory or revision counter. Evidence remains in Bifrost under
+existing retention. No start/close producer operation is added.
 
-Reuse `VerificationScheduler` and the existing binding Trigger infrastructure.
-A `group_end` binding uses `wyrd.verification_bindings.next_run_at` as a fixed
-poll-cadence cursor. Each claimed tick performs bounded Bifrost discovery over
-the referenced source bindings' attributed input/result rows, then bounded
-snapshot reads as needed, scoped to tenant, owner and `group_id`. No Postgres
-group/lifecycle row exists. Discovery/snapshot reads deduplicate execution/result
-identities and compare source coverage
-against existing group results; the group's own rows are not source activity.
+After Scribe acknowledges a grouped source input or result, the existing
+background Scribe writer resolves matching registered group bindings from their
+frozen source tuples and batches an upsert of their pending rows. SQL computes
+`due_at = statement_timestamp() + after`. A subsequent acknowledged input/result
+for the same group/binding updates that same due time. It never deletes source
+rows or rewrites previous execution inputs. Request handlers perform no SQL or
+binding lookup. No separate notification queue, event broker or activity ledger
+is added; failed post-ACK SQL uses the existing bounded outbox retry path, whose
+identical Scribe batches are absorbed by existing batch fences.
 
-A group is due when its newest source row (input or result) is older than
-`idle`, or its first source row is older than `max_age`, and no group result
-covers its newest eligible source row. Apply REQ-003 finality. Row times are
-each input and result row's managed `wyrd_ingested_at`, which Bifrost stamps
-from its PostgreSQL-anchored clock; first/newest include both surfaces. No
-group decision reads a server process clock: PostgreSQL is the only time
-source, and the producer-owned `recorded_at` and `ended_at` remain result
-facts, never group timing. A result is new activity: it postpones idle and, if not already
-covered, can create another revision. There is no terminal-source readiness
-barrier, pending-turn tracking or additional max_age wait after discovery.
-At the cap, use whatever rows are visible, with missing values as REQ-002 says.
+The group loop polls pending scheduling rows, not Bifrost history and not every
+Verifier. Tenant RLS and the binding's exact owner/subject/source identities still
+apply. Use existing default one-second runtime poll interval; ordinary cron
+scheduling and group snapshot work run as separate bounded loops under the
+existing VerificationScheduler owner so a slow group read cannot stall cron.
+Each loop visits at most 64 overdue tenants per pass and handles at most 32 due
+items per tenant, oldest due first. A group item is one binding/group, not one
+binding followed by an unbounded set of its groups. Group snapshots are processed
+sequentially per process; no overlapping passes or unbounded task spawning.
 
-Each due group with no outstanding execution enqueues one group Verifier
-execution on the existing queue; arrivals during that execution coalesce.
-Reuse binding claims/cursor coordination and existing queue idempotency/fencing
-across replicas; no other execution for the same binding/group is enqueued until the
-outstanding execution settles, including while its result awaits visibility.
-Background execution/coverage state belongs to the
-existing queue/results, not a per-source or per-group lifecycle table. Failed
-query/admission leaves discovery retryable on subsequent ticks; never interpret
-a truncated/failed query as a complete group result.
+For one group item, acquire an existing verification-capacity permit without
+waiting, then open TenantConn and claim the oldest due scheduling row with
+`FOR UPDATE SKIP LOCKED LIMIT 1`. With no permit, claim no row. Hold that row
+lock only through the bounded Bifrost snapshot query and queue handoff. In one
+transaction, pin/enqueue the successful snapshot using ordinary snapshot
+idempotence, delete that pending row, and commit. An identical snapshot conflict
+also completes the handoff and consumes the row. Release the capacity permit
+and database connection before any Verifier/provider execution. Query or SQL
+failure rolls back: the pending row remains for a later pass, with no partial
+execution or synthetic verdict. Other replicas skip the locked item.
 
-Group-end latency is the poll interval plus Bifrost flush lag, in addition to
-the configured idle/max_age and any execution backlog. The fixed cadence and
-existing scheduler delay must be observable; no exact wall-clock seal or
-complete-evidence guarantee is promised. Registration still rejects self/cyclic
-reference dependencies. A retry is another attempt at the same snapshot.
+An arrival updating that row during snapshot/handoff waits in the background on
+the SQL row lock. After the handoff commits, its upsert creates a fresh pending
+row with a new due time. Thus consuming an older scheduling item cannot delete
+new activity. This uses ordinary transactions, not generation counters, claim
+leases, recovery sweepers or per-source lifecycle state. Crash before commit
+rolls back; after commit the ordinary execution queue owns the pinned execution.
+There is no additional group crash-recovery protocol.
 
-There is no per-turn Trigger or binding activation-scope field. Turn checks
-are today's direct verify/submit invocations. Ordinary bindings/inline bundles
-with no group-end Trigger do not implicitly acquire revisions or require a
-`group_id`. There is no explicit-close operation in this revision's
-producer workflow. Scheduled Window activation remains separate and REQ-012
-continues to govern its samples.
+One successful Bifrost statement reads the selected group's currently visible
+input/result rows together and pins their values. No Bifrost discovery scan,
+time checkpoint, payload reread of inactive groups, PostgreSQL source settlement
+filter or post-read completeness check is added. Lazy missing tables retain
+ordinary handling. Query admission, memory/output limits and deadlines remain.
+A failed, degraded or truncated query is not a group snapshot.
 
-### REQ-005 — Existing outbox acceptance and evidence availability
+The existing execution_slots setting supplies a single process-local capacity
+pool shared by queued execution and group snapshot preparation (default 64).
+An executing job holds a permit until completion; a group snapshot holds one only
+until handoff. Full capacity stops group claims, leaving pending rows in SQL.
+This bounds active work, not the durable PostgreSQL backlog: pending scheduling
+rows and queued executions can accumulate when arrivals exceed throughput.
+There is no distributed quota or new authored concurrency option.
 
-Revision 8 supersedes OD-001's content-plus-Postgres receipt requirement and
-OD-006's durable per-source readiness/status tracking. Verify/submit keep
-today's hot path: declared file transfer as today, then existing input/result
-rows staged through ScribeOutbox with nullable group_id and authenticated
-owner columns; no binding lookup.
-No per-call Postgres write, group membership commit, retained-result barrier,
-counter or lifecycle write is added. Enqueue still means async verification;
-its existing background queue handoff remains, rather than a new synchronous
-queue commit or receipt guarantee. Window submit still records samples.
+The first acknowledged source record starts scheduling; further records postpone
+it by after. Continuous activity can postpone execution indefinitely. Background
+retries can postpone a due time; the snapshot digest still prevents duplicate
+execution. Polling delay, resource contention and source visibility lag are
+accepted. Scribe acknowledgement is not a query-completeness checkpoint: a later
+visibility change alone does not generate a scheduling notification. A snapshot
+uses what is visible when it runs; the next acknowledged source activity causes
+the next execution. No visibility barrier or reconciliation scan is promised.
 
-Turn rows lost from the outbox on abrupt crash are absent from group evidence,
-with the same durability as today's direct verify. A successful direct result
-or submit response does not establish durable discoverable group membership.
-Scribe acknowledgement and eventual Bifrost visibility retain today's meaning;
-no extra WAL, durable receipt domain or reconciliation store is introduced.
-Flush/shutdown behavior, counted losses and non-blocking audit remain existing
-owner behavior. Durable storage only protects data that actually reached it.
+Existing source validation, exact-version/ambiguity/cycle checks and permissions
+remain. There is no max-age override, permanent finality or in-flight-source wait.
 
-Group execution uses the rows visible in its discovered snapshot, not an
-inventory of accepted calls. Deduplicate identities, preserve same-binding
-list alignment, and use the selected authoritative queued result rather than
-abandoned attempt payloads. Missing selected result values are null. Non-passing
-visible data remains included; no outcome filter or implicit platform failure
-is introduced. A later visible result is activity that can trigger a new
-revision within finality; it never mutates an already evaluated snapshot.
+### REQ-005 — Existing outbox and queue behavior stays intact
 
-Pin selected evidence and coverage on existing group executions/results so
-whole-execution retries use the same inputs. This background execution guarantee does not make source outbox staging durable. Postgres
-continues to coordinate existing background queue claims/leases
-and serial group settlement/reactions where required. Producer calls add no
-Postgres dependency; direct verify retains its existing reads.
+`.verify` authorizes and runs inline, returns its verdict and stages input/result
+rows on ScribeOutbox. `.submit` stages its input and returns an execution ID;
+only after Scribe acknowledges the input does the existing batched handoff
+insert `verifier_executions`. The runner claims, evaluates, settles and stages
+results as today. Neither request path reads or writes PostgreSQL.
+
+Grouping reads visible Bifrost evidence, without consulting submission acceptance,
+selected PostgreSQL result IDs, pending work or settlement status. A visible
+result can participate before its queue execution settles. A staged input can
+participate even if a later queue decision refuses that submission. Failed
+visible outcomes participate; absent outcomes occupy aligned null positions.
+Existing source authorization and TASK-003's pre-staging pressure refusal remain.
+
+Abrupt death or an expired shutdown deadline can lose unacknowledged outbox rows.
+A returned verdict or execution ID proves no durable group membership. There is
+no additional WAL, receipt, acceptance inventory, repair or reconciliation store.
+Pin successful snapshot values on the existing queued group execution; ordinary
+whole-execution retries reuse them and never reread Bifrost. Group execution
+history and normal queue retry remain, without a group recovery protocol. The
+post-ACK scheduling upsert is background SQL, never request-path SQL.
 
 ### REQ-006 — Process bounds, existing admission and tenant progress
 
@@ -409,7 +400,7 @@ Bound process staging bytes/items before accepting excess source rows, plus
 query output, group snapshot bytes and ordinary active execution work.
 Use existing resource admission and tenant claim rounds. Refuse excess producer
 work with a typed retryable pressure error and retry timing before staging;
-a refused call stages no source row. Audit remains non-blocking. Source outbox
+a pressure-refused call stages no source row. Audit remains non-blocking. Source outbox
 crash loss remains REQ-005's accepted boundary. No distributed quota ledger,
 replica-invariant quota, active-share or no-overtaking guarantee is introduced.
 
@@ -422,7 +413,9 @@ long evaluations hold no lifetime Postgres connection or in-memory group timer.
 At 300 4-KiB turns/s, source content is about 99 GiB/day before overhead.
 At 300 five-minute executions/s, unbounded occupancy would be 90,000: enforce
 finite process work limits and existing admission instead of accepting unlimited
-compute. Test a 1,000/s burst with bounded refusal. Bound discovery per binding tick and subsequent snapshot reads; query count
+compute. The later AC-009 benchmark tests a 1,000/s burst with bounded refusal;
+TASK-003a proves the functional pressure/drain behavior at normal test concurrency.
+Bound pending scheduling claims per tenant pass and subsequent snapshot reads; query count
 depends on due groups and bounded batches, not an exact statements-per-tick
 contract. Bound query work/output and defer further groups on pressure; never judge a
 truncated group or materialize all group payloads in API memory.
@@ -431,7 +424,7 @@ Reuse existing tenant claim rounds so a runnable tenant B progresses during
 A's burst when resources/dependencies permit. Test that progress, not exact
 shares or latency guarantees. Adding WYRD_TARGET replicas adds their local
 capacity; it does not create cluster-wide quotas. Existing Postgres claims,
-leases and fencing recover queued work and serialize binding/group execution;
+leases and fencing govern ordinary queued execution retries; they do not serialize group revisions;
 source outbox-only rows can be lost. Existing Oracle/Scribe admission remains
 owned by those services, not a new verification admission system.
 
@@ -454,47 +447,35 @@ for the journey's single requirement with decide=all, empty means inconclusive,
 all passed means passed, and any failed comparison means failed. This is not a
 new aggregation language or a list-of-media input contract.
 
-### REQ-009 — Source-execution read ceiling
+### REQ-009 — Retired group-specific source ceiling
 
-One deployment-set ceiling bounds how many distinct source executions each
-verifiers reference may read per group snapshot. Count eligible source
-execution IDs after owner/binding eligibility and identity deduplication, across
-visible inputs/results, not physical rows or retries. References to inputs and
-requirements of the same source Verifier see the same execution membership and
-alignment. The ceiling has no authored Verifier/binding override or dispatch,
-item, byte or derived-output budget system.
+The owner approved removal of the deployment source-execution ceiling,
+`source_execution_limit_exceeded`, synthetic ceiling verdicts and public ceiling
+metadata. REQ-006's ordinary process/query bounds remain. Keep this ID retired
+so earlier packets cannot silently restore its old requirement.
 
-Exactly the configured number is permitted. Exceeding it yields a completed
-group execution with verdict inconclusive and reason
-`source_execution_limit_exceeded` exposed in the affected requirement reasons
-and result summary, naming the reference and ceiling. Do not evaluate a truncated list or infer a subject failure from the ceiling.
-Record the result and source-query bounds for inspection; never eagerly read
-unbounded payloads merely to detect overflow. This is a result reason, not a
-producer refusal: ordinary source verify/submit still follows existing admission.
-Group source-row coverage for background re-judgment remains REQ-003–005; no
-fan-out coverage counts or policy are introduced.
+### REQ-010 — Verdict changes in settlement order
 
-### REQ-010 — Group verdict changes and Operators
+Group bindings use `on_verdict_change` only; ordinary bindings retain
+`on_failure`. The first settled group verdict establishes the baseline and
+creates no dispatch, even when failed. A new settled verdict differing from the
+previous settled verdict of the same binding/group creates the existing
+transactional Operator dispatch. Equal verdicts create none; changes to/from
+inconclusive and failed-to-passed are included.
 
-Keep `on_verdict_change` for J-002's passed→failed refund reaction and recovery.
-With one outstanding execution per binding/group, compare each settled result
-with its preceding settled result. No concurrent revision adoption is needed.
-Immutable execution/result IDs and coverage identify history. An unchanged
-verdict causes no repeated group reaction; the first result is the baseline.
+Revisions can run and finish out of admission order. Compare in settlement
+order, not admission order or a notion of the newest evidence winning. Use a
+short transaction on the existing binding row to make previous-verdict comparison,
+completion and dispatch insertion atomic; never hold this serialization during
+queries, evaluation, provider calls or retries. This is ordinary settlement
+atomicity, not an outstanding execution gate. A replayed completion never
+recomputes a verdict transition or creates a new logical dispatch. Existing
+lease fencing and dispatch uniqueness remain; delivery is still at least once.
 
-Group bindings use `on_verdict_change` alone, reacting between settled verdicts
-including changes to/from inconclusive and failed→passed. The first result,
-even failed, establishes the baseline and dispatches nothing. Registration
-refuses `on_failure` on a group_end binding at that field; use existing contract
-error families. No combined-list or cross-list deduplication rule is added.
-Ordinary bindings retain their existing `on_failure` behavior.
-
-Extend existing transactional execution settlement/dispatch creation to retain
-the preceding settled group result and unique verdict-change dispatch intent. Settlement replay creates no second logical dispatch; delivery
-remains at least once through existing Operators. Context contains bounded
-group_id, prior/current result IDs,
-old/new verdicts and summary—not raw inputs/traces/media or secrets.
-Operator delivery does not rewrite the result.
+Context contains bounded group_id, prior/current result IDs, old/new verdicts
+and summary, without raw inputs/traces/media or secrets. Delivery does not rewrite
+the result. Out-of-order completion can produce a later notification about an
+older snapshot; this is an accepted tradeoff, not grounds for adoption machinery.
 
 ### REQ-011 — Public surfaces and removed operations
 
@@ -510,7 +491,7 @@ Owner recording uses existing authentication under REQ-014, without IO or
 attribution wire/SDK fields; background binding eligibility follows REQ-013.
 
 Execution/binding inspection must expose the caller `group_id`, owner
-context, pinned Trigger settings, execution/result IDs, source coverage and
+context, pinned Trigger settings, execution/result IDs and
 visible source identities through bounded projections. Revision numbers, if
 displayed, are derived; no replacement state or revision field is required.
 Metadata inspection does not make input payloads readable without permission.
@@ -534,7 +515,6 @@ permission. Audit uses the existing non-blocking path.
 
 Typed errors cover permission denial, unknown/ambiguous reference binding,
 idempotency conflict, size, process overload and availability; no text parsing.
-Finality is background eligibility, not an invocation error.
 SDKs, served OpenAPI, runtime MCP catalogs, generated declarations/schemas and
 authored Python stubs agree. No compatibility aliases for removed proposals
 are added.
@@ -689,8 +669,8 @@ Unbound invocations still run; only matching owner/subject/Verifier tuples
 are eligible for group lookup.
 Journeys pass `group_id=` on verify/submit and configure `kind: group_end`
 on group bindings. Fixtures identify the common owner Service/component and
-flush source rows before discovery in basic flows, and use the visibility/cap
-variants below for absent results. Binding durations and cursors, never a process
+flush source rows and commit their pending updates before polling in basic flows, and use the available-evidence
+variants below for absent results. Database-derived pending due times and schedule cursors, never a process
 clock, simulate elapsed days; tests do not sleep for days or use producer
 timestamps to advance server time.
 
@@ -698,366 +678,127 @@ timestamps to advance server time.
 
 **Maps:** REQ-001–006, REQ-010–011, REQ-013–014; INV-001–005.
 
-Actors: Python chat backend, TypeScript human support console, Rust order
-service; eligible calls authenticate through the Card-bound support Service
-and invoke `turn-verifier` on its same component. The console/order adapters
-use that Service authority; an unbound principal is also exercised below.
-A `conversation-review` on that occurrence declares
-`turns: verifiers.turn-verifier.inputs.turn`. Its group-end Trigger has
-idle=30m, max_age=24h, finality=30d. All grouped calls use `group_id="order-123/chat-7"`.
-Optional trace slots may be supplied using today's exports, but the group
-receives no trace IDs unless it declares a trace-slot source. It never
-receives spans automatically.
+Python chat, TypeScript support and Rust order producers share
+`group_id="order-123/chat-7"` under the same authenticated owner. A source turn
+Verifier records six delivery-request, order-status, resumed-request, human-handoff,
+acceptance and replacement-confirmation values through ordinary verify/submit.
+A group source `turns: verifiers.turn-verifier.inputs.turn` and `after: 30m`
+produce one passed group Verifier execution with all six ordered values once evidence is quiet.
+An unchanged poll creates no execution; a later turn refreshes expiration and
+produces a new immutable group Verifier execution over available history. Settings are per binding;
+a second binding with `after: 15m` does not change the first.
 
-1. Python verifies a JSON turn asking for delivery help with `group_id="order-123/chat-7"`, receiving
-   its immediate passed result. Rust submits an order-status turn and polls
-   its queued execution to completed/passed. Both inputs/results and
-   authenticated owner, subject and Verifier identities are retained; visible
-   inputs use recorded-time/execution-ID order.
-2. The shopper leaves and returns within idle. Python verifies the resumed
-   request; TypeScript verifies human handoff and acceptance; Rust submits
-   replacement-confirmed. No producer discovers a Wyrd resource ID first.
-3. After the newest source input/result row's idle deadline and a poll, the
-   Trigger queues one group judgment, displayed as revision 1. The group receives exactly six
-   turn values in recorded-input order: delivery request, order status, resumed
-   request, human handoff, customer acceptance and replacement confirmation.
-   Its deterministic review requires confirmed replacement and resolution.
-   Polling returns completed/passed and the exact selected ordered inputs.
-4. SDK and MCP inspection through another process returns the same `group_id`,
-   effective lifecycle, source execution identities and retained result.
-
-Edges/negatives: concurrent first invocations on two replicas are discovered as
-one visible group; no producer revision row is written. Replay the same enqueue request/key: original execution,
-no extra list element or idle refresh; conflicting replay is refused.
-During the open group, an unbound principal with `verifier:run` uses existing
-HTTP execute with the same Verifier UID, subject and caller `group_id`. It returns
-completed/passed and persists input/result with null owner; the group
-review still receives only the six bound values. A new verify call is a new
-execution. Deny unauthorized invocation or payload
-read without changing membership. Use the same Verifier UID and caller `group_id`
-through another owner Service: its turn never appears. A second group binding
-with idle=15m, max_age=48h, finality=60d uses those settings independently; it
-does not change the first binding's 30m/24h/30d settings. New accepted verification after end
-and before finality is discovered as revision 2; rows timed after finality
-remain recorded but do not reopen the group or delete old records. No explicit-close/append
-flow is used.
-
-Registration negative (REQ-001): through Rust, Python and TypeScript Card
-registration plus direct HTTP/MCP registration, submit an otherwise valid
-Verifier declaring `spec.inputs.group_id` as a JSON slot. Expect the existing
-validation-family error with rule `slot` and spec-relative path
-`inputs.group_id`; no Card/binding persists and no execution is activated.
-Repeat for a group Verifier whose `group_id` input is a valid source-reference
-string: it is refused at the same field. A local authoring refusal may precede
-the request, but direct HTTP proves server enforcement. Rename the slot to
-`turn` and register successfully; Python verify/submit with `turn=...` and
-`group_id="order-123/chat-7"` records the turn and grouping metadata separately.
-Keep otherwise-valid slots such as `verifier` and `value` usable as Python
-keywords after the positional Verifier name, and as named inputs in Rust/TS;
-this change adds no wider reserved-name list.
-
-Persist: ordinary inputs/results, authenticated owner and existing caller/subject/
-Verifier context, visible source coverage, pinned inputs and immutable result IDs,
-and
-ordinary authorization audit decisions.
+Keep exact source/version and owner isolation, successful enqueue replay identity,
+conflicting-content queue error, permission denials, ordinary ungrouped behavior
+and field-specific `inputs.group_id` registration refusal across typed/source
+slots. Do not assert that a post-staging queue conflict hides an already visible
+input: REQ-005 explicitly accepts its participation. Keep other valid Python
+keyword slots usable. Inspection returns group_id, source identities and pinned
+values without old timing/coverage/ceiling fields.
 
 ### AC-002 / J-002 — Refund failure three days later
 
 **Maps:** REQ-001–006, REQ-010–011, REQ-013; INV-001–005.
 
-Actors: Python support backend, Rust payment service, TypeScript returns
-console, all invoking `refund-turn` bound on one refunds Service occurrence.
-`refund-review` declares `facts: verifiers.refund-turn.inputs.fact` and,
-when checking turn judgments, explicitly declares
-`checks: verifiers.refund-turn.requirements.valid-fact.outcome`.
-Verify/submit use `group_id="order-456/refund"`; group-end Trigger idle=30m, max_age=24h,
-finality=90d. The review passes an accepted refund promise with no overdue
-fact; authoritative overdue/returned-but-unrefunded facts fail it.
+Support, payment and returns producers use `group_id="order-456/refund"`,
+`refund-turn` and `after: 30m`. The group Verifier slots select whole fact inputs and named
+valid-fact outcomes. Day-zero promise/accepted-order evidence passes and sets
+the baseline without dispatch. Day-three overdue/returned-but-unrefunded facts
+refresh expiration; after 30m plus cadence/visibility, a group Verifier execution over available history
+fails and creates passed-to-failed dispatch. An additional failed revision creates
+no repeat reaction; corrected paid-in-full facts can pass and dispatch recovery.
+Prior snapshots/results remain immutable. There is no day-three max-age bypass
+or eventual finality cutoff.
 
-1. Day 0: verify the refund promise and submit the accepted order fact with
-   `group_id="order-456/refund"`; await both source results completed/passed. Idle ends revision 1.
-   Group result R1 is completed/passed and establishes the baseline, without
-   a verdict-change dispatch.
-2. Day 3: payment service submits `refund_overdue` with `group_id="order-456/refund"` and waits
-   for its valid-fact check. Its newly visible rows make revision 2 eligible. A burst
-   of payment and return rows before the next due snapshot coalesces.
-3. A background tick finds uncovered rows; group max_age has already elapsed
-   on day 3, so it need not wait another idle period. The group receives all
-   prior and new selected facts,
-   not only the delta, and returns completed/failed as R2. R1 remains passed,
-   immutable history; R2 is the next settled result. One `passed→failed` Operator dispatch is
-   persisted and eventually delivered.
-4. Another unchanged failed group revision produces no repeat reaction;
-   corrected paid-in-full facts can yield failed→passed and a recovery
-   dispatch. Settlement replay creates no extra logical dispatch.
+Keep one group Verifier execution running, add evidence and expire its `after` period. A new execution
+may be enqueued before the first completes. Prove immutable inputs and settlement-
+order comparison in both completion orders, including completion replay. Do not
+assert serial execution, coalescing until settlement or newest-revision adoption.
 
-Edges: hold the first group execution queued/running while payment/return
-rows arrive. Subsequent ticks create no second outstanding execution for that
-binding/group. The first completes with its pinned values; after settlement,
-the next poll coalesces uncovered rows into one next whole-group snapshot.
-It may dispatch a verdict change relative to the preceding settled result.
-No persisted revision numbers, replacement flags or concurrent result adoption
-are involved. A late refund result is new activity within finality. At finality,
-verify/submit still works, but rows timed beyond the bound never reopen the
-group. Retain both result IDs and source rows under existing retention.
+### AC-003 / J-003 — Coding work without tracing
 
-### AC-003 / J-003 — Coding-agent work without tracing
+**Maps:** REQ-001–006, REQ-008, REQ-010–011, REQ-013; INV-001–005.
 
-**Maps:** REQ-001–006, REQ-008–011, REQ-013; INV-001–005.
+Rust bridge, Python test runner and TypeScript editor record task prompt, edits,
+test results and final diff using ordinary calls with `group_id="issue-812/attempt-1"`
+and `after: 30m`. Individual no-secrets/forbidden-command checks return immediately.
+The group selects declared turn inputs and safety outcomes: clean work passes,
+exit-one tests or forbidden commands fail, missing required evidence follows
+existing inconclusive rules. Wyrd runs none of the producer's commands.
 
-Actors: Rust coding-agent bridge, Python test runner, TypeScript editor;
-same coding Service component, verify/submit use `group_id="issue-812/attempt-1"`. They invoke
-`coding-turn` with a JSON `turn` on every call and any declared file evidence, never an
-append operation. Its checks include no secrets written and no forbidden
-command. `coding-review` declares
-`turns: verifiers.coding-turn.inputs.turn` and
-`safety: verifiers.coding-turn.requirements.no-secrets.outcome`.
-Trigger: idle=30m, max_age=24h, finality=30d.
+Flush a submitted input while its result is absent. After `after`, the snapshot
+contains the input and aligned null outcome; a declared check decides what that
+means. A later visible result refreshes expiration and appears in the next
+snapshot even if PostgreSQL settlement has not selected it. With multiple visible
+result IDs, REQ-002's deterministic latest-visible rule applies.
 
-1. Verify the task prompt and tool-call results; submit edit/test/final-diff
-   JSON evidence through the turn Verifier, uploading any declared file slots
-   within those calls. The producer has no OTel provider or trace IDs.
-2. Every source verify returns its result now; each submit is polled to its
-   own result. A secret/forbidden-command fixture yields failed turn judgment
-   immediately, rather than waiting for group end. Wyrd does not run the
-   producer's commands.
-3. With complete sources, idle ends the group. The review judges task,
-   edits, test exit code/report and final diff and returns completed/passed
-   for the clean fixture. Tests exit 1 or a recorded forbidden command yield
-   failed; missing required task evidence follows existing inconclusive rules.
-4. In the optional telemetry variant, another producer exports spans as today
-   and coding-turn supplies its declared trace slot. The review declares
-   `trace_ids: verifiers.coding-turn.inputs.trace` and an Agent check using
-   `bifrost.query` to select bounded spans from `vala.traces.spans` by those
-   IDs. The accepted caller holds the declared tool-invoke permission and
-   `bifrost:query:read` plus existing table/payload access. For the fixture,
-   spans record a successful test tool call: the local deterministic agent
-   queries them and returns passed. The review snapshot contains only the
-   recorded trace IDs, never span documents. A variant without trace_ids or
-   the span-reading check performs no query and the non-trace journey passes.
+Retain the original optional telemetry branch: selected trace-slot references
+return IDs only. An explicitly authorized check Agent can use existing bounded
+`bifrost.query` to read live spans. A span appearing after pinning may be visible
+to that query without changing pinned IDs. Missing tool/query/payload permissions
+are ordinary typed denials; no automatic span expansion or fallback is added.
 
-   Prove live-read semantics: pin group inputs before a later span is flushed,
-   then let the agent query after it becomes visible. It can read that span;
-   the pinned input list remains the same IDs. Deny the tool-invoke or
-   bifrost:query:read grant in separate variants: the existing tool query is
-   refused with its ordinary structured authorization error, with no automatic
-   span-fetch fallback. These are existing query failures, not new group errors.
+### AC-004 / J-004 — Application-sampled media
 
-Edges: an accepted late test verification opens a new revision and re-runs
-only the group review, not previous turn checks. Replayed enqueue adds no
-source execution. Oversized tool evidence and unauthorized trace reads are
-typed refusals/failures, not passes. Raw producer attribution is not added to
-the selected input arrays. In an absent-result variant, the review declares
-`checks: verifiers.coding-turn.requirements.tests-pass.outcome`. Flush the test
-turn input while its queued execution has no visible result. Before idle, no
-group is due; a visible result resets idle. At max_age, a snapshot with no
-result includes its input and a null tests-pass outcome. A deterministic Code
-check requiring a passed tests-pass outcome returns completed/failed. Flush its eventual
-completed/failed result within finality: new activity produces a next revision
-with the actual `failed` requirement value, without filtering the failed test
-or editing history.
+**Maps:** REQ-001–006, REQ-008, REQ-010–011, REQ-013–014; INV-001–005.
 
-Persist: source inputs and requirement results, original file digests,
-group input selections, provenance and immutable execution/result history. The
-producer's application runtime and tracing remain optional machinery.
+The application samples twenty JPEG/PNG frames for `group_id="door-42"`, uploads
+and submits them individually through existing APIs, and records an ordinary
+JSON event fact. A group selects the frame Verifier's person-wearing-badge
+outcomes plus the event fact, with `after: 2m`. After the source results are
+visible and quiet, twenty passed outcomes pass; a failed frame fails; an event
+fact with zero frames produces `[]` and inconclusive/empty_selection. Existing
+per-frame whole-execution retry remains, without new group recovery tests or a
+fanout engine. Foreign-owner and denied calls retain existing isolation.
 
-### AC-004 / J-004 — Application-sampled person-detection media
+There is no special twentieth/twenty-first execution boundary. Twenty-one frames
+within ordinary query resources are evaluated normally. A missing result is null;
+a later result can create another group Verifier execution. No counters, source ceilings,
+checkpoints, video processing or new media formats are introduced.
 
-**Maps:** REQ-001–006, REQ-008–011, REQ-013–014; INV-001–005.
+### AC-005 / J-005 — Many conversations, pressure and existing Drift
 
-Actors: a user's person-detection application with Rust, Python and TypeScript
-producer adapters, and an HTTP/MCP review agent, under one authenticated owner
-Service. The application detects event `door-42` and itself samples 20 JPEG/PNG
-frames. Wyrd does not detect the event, sample frames or accept a video.
+**Maps:** REQ-001–006, REQ-008, REQ-010–014; INV-001–005.
 
-Register `frame-verifier` with one media slot `frame` accepting jpeg/png and
-Agent requirement `person-wearing-badge`; deterministic local provider responses
-judge each file. Bind `event-review` on the same Service occurrence with:
+Many owner-isolated conversations use grouped verify/submit alongside heavy queued
+work in tenants A/B. Exercise real grouped calls through TASK-003's finite staging:
+pressure gives the existing typed retryable refusal before any source row is
+staged; after drain retry succeeds; runnable B progresses during A's continuing
+burst. Accepted work drains through existing owners, audit remains non-blocking,
+and no additional queue, distributed quota or strict fairness claim is added.
+A separate existing scheduled Window/Drift check fails a resolution-score drop
+from 0.95 to 0.60 against threshold 0.80. Group revisions do not replace Drift.
+Functional proof uses normal bounded test concurrency, not host stress or capacity
+qualification; offered-rate/performance measurements remain AC-009's later work.
 
-- `outcomes: verifiers.frame-verifier.requirements.person-wearing-badge.outcome`;
-- one Assert `each` selecting `inputs.outcomes`, comparing each value to `passed`;
-- `decide=all`, group_end idle=2m, max_age=30m, and a pinned finality=30d.
+### AC-006 — Contract, available snapshots and unchanged platform behavior
 
-Also bind an ordinary JSON `event-fact` Verifier and declare
-`event: verifiers.event-fact.inputs.event` on the review. The application's
-ordinary verify of `{event_id: "door-42", detected: true}` with
-`group_id="door-42"` supplies a discovery row, including in the zero-frame
-variant. It is not a Wyrd create/upload verb or implicit evidence injection.
-A group with no source rows at all cannot be discovered; do not fabricate one.
+**Maps:** REQ-001–006, REQ-008, REQ-010–014; INV-001–005.
 
-1. Through each SDK, submit the 20 files individually to frame-verifier using
-   `group_id="door-42"` and existing per-file upload. Retain 20 execution IDs;
-   no list-of-media slot or internal fan-out call is used. The existing queue
-   supplies parallelism and retry. Await completed/passed frame results and
-   drain/flush them into Bifrost for the positive fixture.
-2. After the newest input/result row is older than 2m, a binding tick discovers
-   the group (or max_age=30m makes it due). It queues one event-review with 20
-   ordered `passed` values. Poll/inspect through SDK and HTTP/MCP: the group
-   execution is completed/passed; its pinned inputs contain exactly those 20
-   outcomes and the declared event fact, with matching source execution IDs.
-3. Kill a worker while one frame execution is running, with the other 19
-   already completed. Existing lease/retry recovers only that execution using
-   its original uploaded file. No successful frame is re-enqueued, no source
-   identity duplicates, and the whole frame execution may repeat. Once its
-   result is visible, idle restarts and the group can judge the complete set.
-   No step extraction or checkpoint resume guarantee exists.
+Prove all shipped SDKs and discover-act-observe HTTP/MCP paths use the same
+`group_id`, source grammar, `after` setting and inspection projection. Resolve
+paths, registration siblings and registered CardRefs to exact pinned versions.
+Wrong tenant, owner, subject, version or group cannot contribute. Ownerless calls
+still run without contributing. Reversed result completion must preserve common
+input/outcome execution ordering, null alignment and failed values. Physical
+identity duplicates do not add list elements; independent equal-valued executions
+do. Only declared slots appear, with no source child selectors or reason roots.
 
-Negatives/edges, repeated across Rust/Python/TypeScript and agent HTTP/MCP:
+An expired pending scheduling row selects one successful query and immutable snapshot. Visible input
+without result is usable immediately; later evidence yields another revision;
+unchanged snapshots do not rerun, and a consumed pending row causes no further
+Bifrost read without a new acknowledged source input/result. Include newly acknowledged rows with equal/older ingest
+timestamps: PostgreSQL scheduling notifications, not timestamp cursors, select work. Retention and
+outbox loss limit available history; neither implies recovery. Failed/truncated
+queries enqueue no partial or synthetic result and retry through the same poller.
+Ordinary query resource refusal is not a subject failure or an inconclusive
+Verifier judgment. No custom source-execution ceiling remains.
 
-- One of 20 frame outcomes is failed: the group assertion and verdict are
-  failed. Failed frames remain in the selected list.
-- Submit only the event fact and zero frames: the frame-outcome reference is
-  `[]`; the group is completed/inconclusive with reason `empty_selection`.
-- Another Service submits the same frame Verifier UID and group_id: its rows
-  never enter this group's outcomes. Denied invocation/upload/read is refused
-  under existing permissions, and rejected calls add no evidence.
-- Configure the source-reference ceiling to 20. Twenty frames pass the limit;
-  21 eligible distinct frame executions yield completed/inconclusive with
-  reason `source_execution_limit_exceeded`. No first-20 judgment is reported.
-  Duplicated physical rows or enqueue replay of one of 20 do not exceed it.
-  The event reference reads one execution independently, not a combined 21.
-- A result absent at max_age stays a null outcome position under REQ-002;
-  retain existing comparison semantics rather than inventing frame lifecycle
-  status or dropping that execution. A later visible result can trigger the
-  next serial group review within finality.
-
-Persist ordinary per-frame inputs/results, file digests, authenticated owner
-and source identities, queue retry state, and immutable group inputs/result
-coverage. No frame counters, checkpoints, derived-media catalog, new media
-formats, dispatch budget or fan-out coverage fields are required.
-
-### AC-005 / J-005 — Retail chatbot peak load and existing Drift
-
-**Maps:** REQ-001–006, REQ-008–013; INV-001–005.
-
-Actors: Python chatbot backends, TypeScript chat consoles and Rust order
-systems in tenants A/B. Each turn invokes `turn-verifier` through verify or
-submit with its conversation/order `group_id` (e.g. `group_id="conversation-123"`); the same-occurrence group review
-declares `turns: verifiers.turn-verifier.inputs.turn` and optionally selected
-requirement outcomes. Group Trigger idle=30m, max_age=24h, finality=30d.
-A distinct existing Window Verifier receives `resolution_score` samples
-through today's Window path and runs on a schedule; REQ-012 removes only
-its redundant binding mapping.
-
-1. Drive many conversations and source executions through all three SDKs.
-   Complete the sources; observe one group review per ended revision with
-   exact selected arrays while other heavy async executions take minutes.
-2. Fill one server process's finite staging bound using A's burst. A new invocation gets retryable
-   typed pressure with timing before staging source rows.
-   Retry the same enqueue identity after drain: one acceptance/array element.
-3. Keep accepted B work runnable through A's burst. Using existing resource
-   admission and tenant claim rounds, observe B complete while A is still
-   active and process memory/work stays bounded. Add a replica: each process
-   retains its own bounds; assert no cluster-wide share or quota. Kill a
-   worker/API replica: queued work recovers, while outbox-only loss is allowed.
-
-4. Feed resolution scores 0.95, later 0.60, to the existing scheduled Custom
-   metric check below 0.8. Read a failed Drift result with its subject/window.
-   Cross-conversation regression stays Window/Drift, not a streaming group
-   Verifier or an automatic new source reference.
-
-Edges: deny unscoped MCP invocation, cross-tenant `group_id`/payload reads and
-ambiguous binding lookup. More idle ticks/restarts create no duplicate group
-review. Refused calls stage no source rows. A source-reference ceiling breach
-returns inconclusive with its explicit reason; empty assertion selection is
-inconclusive. Insufficient Window samples preserve existing behavior.
-
-Capacity qualification offers 300 4-KiB source invocations/s and a 1,000/s
-ten-second burst, with multiple tenants/`group_id` values and cheap turn versus slow
-group/media checks. Record hardware/topology, configured finite bounds,
-accepted/refused counts, queue bytes/age, memory, latency and B's progress.
-Above provisioned capacity require bounded refusal; do not promise arbitrary
-acceptance on arbitrary hardware. No synthetic host load is needed.
-
-### AC-006 — Durability, reference isolation and compatibility
-
-**Maps:** REQ-001–006, REQ-008–011, REQ-013–014; INV-001–005.
-
-Register source Verifiers by local path, same-request sibling and registered
-CardRef (including a Card registered elsewhere), each bound on the group's
-owner occurrence. All valid forms resolve the actual metadata.name and exact
-pinned version, not declaration location. Zero and multiple same-name matches,
-missing slots/requirements, malformed roots/unsupported source suffixes and
-dependency cycles are field-specific registration refusals with no invalid binding persisted.
-
-Through real verify/submit, populate the same source Verifier UID under
-another owner Service, a non-matching subject/Verifier tuple and another
-`group_id`. Assert none enters the selected lists. Record owner and existing
-identities without source binding resolution; the background query matches
-them to its exact pinned bindings. Re-register a newer source Card: old pinned
-lookup does not silently select the newer Verifier version.
-
-In Rust, Python and TypeScript, exercise both verify and submit with optional
-`group_id`; the HTTP/MCP request, persisted `group_id` column and inspection
-response preserve the same value. Omit the argument/field in an ungrouped
-variant: invocation still works without creating group membership. Neither
-SDKs nor wire/storage projections use an alternate name for `group_id`.
-
-Use executions with reversed completion order to prove recorded-input ordering
-and parallel whole-slot/outcome-list alignment. Checks navigate nested JSON via
-existing local fields/indexes and Assert each wildcard selectors after resolving
-the whole source list. Refuse source declarations ending in `.field`, `[0]`,
-`[*]` or `.reason`; no source-path/schema projection validation is required.
-Only declared slots appear. A trace-slot reference returns recorded trace IDs;
-creating/pinning that source list performs no span query. J-003 tests explicit
-live Agent tool queries with existing permissions. Authorize recorded sensitive
-inputs/results through SDK and HTTP/MCP. Cover REQ-005's visibility/cap behavior.
-
-Through each SDK and HTTP/MCP, invoke grouped verify/submit with visible
-source inputs and completed/passed, completed/failed or absent results. Prove
-no additional producer Postgres read or write for grouping/attribution, and no
-lifecycle, revision, counter or readiness state. Inspect
-the binding next_run_at cadence; discovery and subsequent snapshot reads
-respect configured resource bounds, without asserting a statement count. Before
-idle/max_age no execution is due;
-a result row arriving before idle postpones it. At idle or max_age, enqueue
-one snapshot using only visible rows. Parallel input/outcome lists retain
-every eligible visible source identity; absent results give null outcomes,
-completed failed results give failed outcomes. The deterministic all-tests-pass
-fixture fails over missing/failed values; the platform does not invent a verdict.
-
-Flush a result after a group result within finality: it is uncovered activity,
-produces the next whole-group snapshot and preserves prior history. Burst rows
-before the next snapshot coalesce. Rows timed after finality are retained but
-do not trigger a revision. Polling an already covered group is a no-op.
-Race scheduler replicas and crash/retry around background enqueue: the extended queue/settlement coordination permits only one outstanding execution
-per binding/group, including while its result is awaiting visibility. Arrivals
-coalesce and are judged only after the preceding execution settles; another
-binding/group remains independently runnable. No revision/lifecycle table
-or pending-source inventory exists. Ownerless/non-matching rows are excluded.
-
-Exercise Bifrost lag, repeated/overlapping physical rows and failed/truncated
-queries: identity deduplication prevents duplicate list entries; lag delays or
-changes a later discovered snapshot, not a false completeness claim. Retry
-failed discovery without partial judgment. Kill the API before outbox drain:
-a staged turn row may be absent permanently; its returned direct result does
-not require recovery into the group. Flush/drain in the positive variant and
-prove discovery/readback. Do not assert node-loss or content+Postgres receipt
-durability. Existing whole-execution retries reuse pinned group inputs;
-process bounds and tenant progress remain J-005 obligations.
-
-Drive an ordinary inline JSON Verifier and a step requirement whose Assert
-each selects `[]`: both requirement outcomes are inconclusive/empty_selection,
-with no vacuous pass; the single-requirement decide=all result is inconclusive.
-Repeat with nonempty all-passing and one-failing arrays to retain comparison
-semantics. J-004 proves empty group-source lists and the ceiling end to end.
-For both source forms (whole input slot and requirement outcome),
-exercise exactly the deployment ceiling and ceiling+1 unique eligible executions;
-the latter is inconclusive/source_execution_limit_exceeded without truncated
-values. Duplicate rows/retries and excluded owners do not consume extra entries.
-
-For group_end registration, refuse any on_failure field with a field-specific
-error; valid on_verdict_change registration succeeds. An initially failed group
-result dispatches nothing and establishes the baseline; a subsequent changed
-verdict dispatches once through existing Operator delivery, while an unchanged
-verdict dispatches nothing. Ordinary on_failure fixtures remain unchanged.
-
-Preserve ordinary inline/document/trace/media and non-group Operator behavior,
-including direct analysis with no dispatch. Retain Window/Drift behavior with
-REQ-012 authoring changes. SDKs/served OpenAPI/MCP catalogs/generated types/
-Python stubs and fixtures agree. No append/close or scope API survives.
-Support journeys with pure reference/order/empty-assert/ceiling tests and real-Postgres
-race/lease tests; do not substitute these for real client→server→client proof.
+Keep real journey proof of producer SQL absence, owner copying, permissions,
+successful submit replay, ordinary ungrouped inline/document/trace/media checks,
+empty-each semantics, Window/Drift, non-group Operators and group verdict-change
+baseline/replay behavior. SDK types, served OpenAPI, runtime MCP schemas, authored
+Python stubs and generated declarations agree. There is no group start/close API.
 
 ### AC-007 — Schedule bindings supply every Verifier samples slot
 
@@ -1130,16 +871,16 @@ must remain tenant-isolated and pinned to the declared exact versions.
 
 ### AC-009 — Existing capacity benchmark covers overhead and grouping load
 
-**Maps:** REQ-015, REQ-001–006, REQ-008–010, REQ-013–014; INV-001–005.
+**Maps:** REQ-015, REQ-001–006, REQ-008, REQ-010, REQ-013–014; INV-001–005.
 
 Run the extended bench:capacity through the existing real public Rust-client
 capacity driver/server deployment; SDK functional parity stays in J-001–005,
 not three new performance harnesses. Store case verdicts plus raw measurement
 inputs in its existing Markdown/JSON report artifacts. Record revision/build,
 hardware, replica/tenant counts, workload/payload sizes, warmup/window/sample
-counts, process bounds, group/source ceiling, Trigger/poll settings, achieved
+counts, process bounds, group/source counts, Trigger/poll settings, achieved
 traffic, errors, memory/CPU and drain times so runs can be compared. Group
-fixtures use short declared idle/max_age durations to finish within the
+fixtures use short declared after durations to finish within the
 existing command lifetime; no extra long-running harness or host stress tool.
 
 | Case | Report | Pass/fail |
@@ -1147,60 +888,67 @@ existing command lifetime; no extra long-running harness or host stress tool.
 | 1. Baseline direct verify, assertion-only, no group_id | Overhead p95/p99, sample/bucket evidence and existing request/client timings at the matched load. | Correct judgments, normal-load SLOs and p99 < 1 ms. A current-baseline miss is explicitly marked pre-existing work in scope, not excluded from the verdict. |
 | 2. Same direct verify with group_id and authenticated owner metadata | The same metrics, grouped-minus-baseline overhead delta, repeated-baseline noise envelope, and evidence of recorded metadata. | Both overhead SLOs hold and the positive delta does not exceed the disclosed noise envelope. No additional producer Postgres IO; insufficient measurement resolution cannot pass as zero delta. |
 | 3. Grouped submit at rising load | Offered/accepted/completed executions/s, normal capacity knee, queue depth/age, throughput plateau, refusals by code, client latency and all backlog drain times. | Identify the throughput ceiling; below it retain normal-load SLOs. Saturation is reported as the limit, not hidden as acceptable loss. After stopping load, existing backlogs drain within 60 s; normal-load unexpected refusal/loss/wrong judgment fails. |
-| 4. Many groups × N source executions and group_end | Explicit group/N sweep including the configured source ceiling and ceiling+1; idle-expiry-to-result p50/p95/p99; Bifrost discovery/snapshot query count, latency and rows/bytes read, plus group queue/drain evidence. | Every eligible fixture gets its correct whole-group result, serially per binding/group, without truncated inputs or unbounded reads. Ceiling+1 yields inconclusive/source_execution_limit_exceeded. Ordinary due-group results complete within the existing 60-second drain allowance after their configured due point; report latency separately, without inventing a sub-ms group-latency SLO. |
+| 4. Many groups × N source executions and group_end | Explicit group/N sweep at representative N values; expiration-to-result p50/p95/p99; pending scheduling SQL and Bifrost snapshot query count, latency and rows/bytes read, plus group queue/drain evidence. | Every eligible fixture gets its correct whole-group result, without truncated inputs or bypassing ordinary query bounds. Resource refusal defers group verification rather than creating a synthetic verdict. Ordinary due-group results complete within the existing 60-second drain allowance after their configured due point; report latency separately, without inventing a sub-ms group-latency SLO. |
 | 5. Burst above the measured capacity | Per-process staged bytes/items against bounds, memory time series/peak, accepted/refused counts and typed retryability/retry timing, drain time and per-tenant completion timeline. | Staging stays within finite process bounds; warmed memory plateaus while overload continues, stays inside the declared process envelope and returns toward baseline after drain. Excess requests receive typed retryable refusal before staging; no unexpected loss/errors. An admitted tenant B completes work during A's continuing burst using existing claim rounds. Existing backlogs drain within 60 s after stopping the burst. No strict distributed fairness/quota claim. |
 
-Use J-005's 300/s qualification and 1,000/s ten-second burst as offered points
+Use the original J-005 workload's 300/s qualification and 1,000/s ten-second burst as offered points
 alongside the measured knee; bounded refusal is valid above provisioned capacity.
 For the memory case, repeated equal bursts must not increase retained staging
 or post-drain memory in proportion to offered requests; disclose baseline
 variation and envelope, rather than claiming byte-identical RSS. CPU/memory
 remain reported-only for the old normal steps; the new overload case expressly
-judges their boundedness. Deliberate ceiling/incomplete-evidence results are
+judges their boundedness. Declared incomplete-evidence results are
 correct judgments, not failed execution errors. Expected overload refusals are
 counted and judged only in the overload case; existing normal-load zero-error
 rules and client queue drain <=1 s remain unchanged. Produce an overall extension
 PASS only with all five case criteria satisfied, alongside the unchanged legacy
 capacity verdict. No benchmark result is claimed merely from specification edits.
 
-## Required boundaries and architecture impacts
+## Required boundaries, accepted tradeoffs and completion boundary
 
-Extend existing owners: `wyrd-spec` reference/Verifier/wire contracts;
-`wyrd-client` invocation context; `wyrd-server` registration, background
-group discovery/activation and runner orchestration; `wyrd-sql` control state;
-`wyrd-storage` durable evidence; `vala-verify` closed-input evaluation;
-Scribe/Bifrost recorded inputs/results; existing Operator delivery. Do not
-replace complete workflows with a second queue or group evidence pipeline.
-Private helpers, encoding, indexes and batching mechanics remain implementation
-choices within these owners.
+Keep existing owners: pure `wyrd-spec` contracts; shared `wyrd-client` and thin
+SDKs; Rust server registration/poller/runner; `wyrd-sql` binding/queue settlement;
+Bifrost evidence and admission; Vala checks; existing Operators. No new group
+evidence store, execution queue, lifecycle service, recovery worker or client-owned
+durable logic. The single pending scheduling table in REQ-004 is authorized.
 
-| Owning authority | Required change |
-|---|---|
-| Wyrd design/doctrine Verifier inputs and reference grammar | Add whole-slot and requirement-outcome source references only; checks reuse existing Reference selectors. Preserve exact-version background resolution and trace IDs without automatic span expansion. No source child paths, reason/status roots or implicit inputs. |
-| Invocation and verification record contracts | Optional group_id and authenticated owner_card_uid metadata on existing rows. Copy owner identity without IO; keep existing subject/Verifier/run/principal IDs. No additional producer Postgres read/write, per-call binding resolution or universal binding propagation. Reserve group_id in Verifier input declarations using existing field-specific slot validation; invocation group_id remains metadata. |
-| Group lookup ambiguity | Validate only bindings participating in group reference lookup. Match owner/subject/Verifier tuples in the background; refuse ambiguity there without a global tuple-uniqueness rule. |
-| Verifier execution durability/operations | REQ-005 preserves existing ScribeOutbox staging and crash-loss semantics; no per-call Postgres write or receipt barrier. Keep bounded admission and background execution recovery. Audit remains non-blocking through one outbox. |
-| Trigger/binding contract | Add group_end and poll binding cursors for bounded discovery followed by bounded snapshot reads. Each uses its own pinned idle/max_age/finality. One outstanding execution per binding/group coalesces arrivals through existing queue/settlement extension; no revision table or adoption protocol. |
-| Scheduled samples contract | Keep REQ-012: no schedule-binding inputs, samples cannot be optional, every drift requirement is judged; update claim-time authority, fixtures, schemas and docs with no alias. |
-| Operator contract | Group bindings accept on_verdict_change only; first result is baseline. Extend existing settlement/dispatch creation over serial group judgments. Ordinary bindings retain on_failure; no cross-list group deduplication rule. |
-| Evaluation contract | Fix empty assertion each to inconclusive everywhere and cap source executions read per reference with an explicit inconclusive reason. Caller fan-out uses existing verify/submit, media formats and queue retries; no checkpoint, step-action fan-out, video-processing or budget contract. |
-| Retention | Existing evidence retention only; finality deletes nothing. No new privacy-erasure policy. |
-| Capacity benchmark | Extend the existing capacity binary, report and overhead metric with REQ-015/AC-009 cases. Retain p95 <10 ms, add assertion-only direct p99 <1 ms and grouped delta/noise evidence. Opt-in bench:capacity stays outside every gate/verify lane; no parallel harness. |
+Accepted limits are part of the requirement, not review defects:
 
-Grouping deliberately uses available Bifrost evidence, with poll/flush lag and
-possible source outbox loss. Selected snapshot values are closed and reproducible;
-they do not prove every accepted turn was retained. Agent span queries are live
-and their returned spans are not frozen by that snapshot. Background queue and
-result coverage coordinate retries, not a new hot-path membership inventory.
+- Visible evidence is not an acceptance ledger. Missing, delayed, refused-after-
+  staging, attempt and retained rows follow the explicit selection rules.
+- Continuous arrivals can postpone group end indefinitely. No max-age override.
+- Late rows reopen groups without a finality cutoff; evidence retention still
+  limits history. Reusing a group_id intentionally refers to that same history.
+- Distinct snapshots can overlap. Settlement order governs reactions; older
+  evidence can finish later. No serial group execution gate or newest-result adoption.
+- No new group crash recovery. Existing queue retries persist pinned executions;
+  outbox loss remains loss. An errored snapshot is not automatically rediscovered
+  as new work solely because it failed; ordinary execution retries own that work.
+- Query limits can defer a pending group indefinitely until resources/data
+  change. No truncated group verification and no synthetic source-limit verdict. Benchmarking
+  measures this capacity boundary rather than adding preventive machinery now.
+- Acknowledgement triggers scheduling but does not guarantee query completeness.
+  A later visibility change alone does not trigger another execution. No scan or
+  barrier repairs this; subsequent acknowledged evidence schedules another snapshot.
+- Scheduling updates can wait on the bounded snapshot transaction's row lock;
+  this delays only background work, never the originating response or permission.
+- Runtime permits bound active work, not durable SQL backlog. Repeated source
+  notifications can postpone expiration; unchanged snapshots still execute once.
+- Optional Agent span queries remain live and outside pinned source values.
 
-## Open material decisions
+Reviewers must assess these declared semantics, not restore removed mechanisms
+as safeguards for these accepted limits. Security, tenant boundaries, trust-boundary
+validation, finite resources, ordinary errors and immutable evidence remain mandatory.
 
-None remain. The owner resolved OD-007: fan-out is N ordinary verify/submit
-calls sharing group_id, with application-chosen evidence and existing per-item
-queue parallelism/retry, aggregated through references at group_end. Internal
-fan-out, checkpoints, server video processing and fan-out budgets are removed.
-
-Revision 14 is a **draft** awaiting owner approval.
+TASK-003a closes functional AC-001–008 and documentation against the merged
+TASK-001–003 baseline. It preserves TASK-002/003, updates architecture and user
+examples, regenerates contracts, and records focused passing evidence. REQ-009
+is retired. REQ-015/AC-009 remain required subsequent opt-in benchmarking work;
+TASK-003a must leave its existing driver usable and scenarios configured with
+`after`, but neither implement new benchmark cases nor claim performance PASS.
+The owner explicitly accepted the tradeoffs above. No open material behavior
+decision remains for TASK-003a. Its revision-17
+implementation details define the pending-row, batching and capacity seams.
 
 ## Revision history and authority links
 
@@ -1221,6 +969,8 @@ Revision 14 is a **draft** awaiting owner approval.
 | 13 | approved | Owner reserved group_id as a Verifier input slot name to avoid the new Python keyword argument collision. Updated REQ-001 and AC-001 registration negatives across SDK/HTTP/MCP, including typed/source declarations and renamed-slot success. Rechecked existing SDK signatures: no other equivalent argument-name collision or reserved-slot blacklist; reuse validate_slot/invalid and WyrdError::Validation rule/path shape. No other reserved names added. Owner explicitly approved revision 13; this entry records that approval without changing the revision or requirements. |
 | 14 | draft | Plan-readiness PR-001 found no transition for existing managed verification tables. Owner confirmed nothing has ever shipped: added the pre-release schema constraint (in-place definition change, reset not upgrade, checks unchanged, no upgrade journey). Requirements and ACs otherwise unchanged; approval outstanding. |
 | 15 | approved | TASK-001 review found group timing compared PostgreSQL's clock with server-process row times (`recorded_at` stamped at enqueue, `ended_at` by the runner), which drift across replicas; AGENTS §15 makes PostgreSQL the only time source, client-produced timings excepted. Owner approved REQ-004 row times as the managed `wyrd_ingested_at` from Bifrost's PostgreSQL-anchored clock for source order, first/newest, idle/max_age, finality and coverage, and journeys advance time through binding durations and cursors only. Carries revision 14 unchanged. Owner explicitly approved this revision. |
+| 16 | approved | Owner approved the simple visible-evidence grouping proposal and cuts and requested TASK-003a on merged TASK-001–003. One after duration, fixed cadence, pinned visible snapshot, late-row revisions, overlapping execution with settlement-order reactions; no PG source reconciliation, outstanding gate, hard finality, public coverage or custom source ceiling. TASK-002/003 retained; all original functional scenarios remain; benchmarking follows functional closure. |
+| 17 | approved | Owner approved explicit background group scheduling: one pending PostgreSQL row per tenant/binding/group, post-ACK due-time upsert, bounded due-row polling, one visible snapshot, transactional execution handoff and row consumption. No repeated Bifrost discovery. New arrivals reschedule; evidence is retained. Ordinary cron and group loops are independent; existing execution capacity also gates snapshots. ACK/query-visibility, SQL backlog and background retry limits are explicit. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

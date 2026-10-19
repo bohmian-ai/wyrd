@@ -1141,7 +1141,7 @@ pub enum WyrdError {
         code = "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
         status = 400,
         title = "Card bundle is missing artifact payloads",
-        remediation = "Run wyrd get without --metadata-only and load the complete bundle."
+        remediation = "Run wyrd pull for the intended root Card with --output-dir <dir> and without --metadata-only, then load that directory."
     )]
     SdkUnhydratedArtifact {
         /// Human-readable error message.
@@ -1185,7 +1185,7 @@ pub enum WyrdError {
         code = "WYRD_SDK_400_INVALID_STATE_BUNDLE",
         status = 400,
         title = "Invalid WyrdState bundle",
-        remediation = "Regenerate the bundle with wyrd get and load the complete output."
+        remediation = "Pull the intended root Card again with wyrd pull --output-dir <dir>, then load that complete directory."
     )]
     SdkInvalidStateBundle {
         /// Human-readable error message.

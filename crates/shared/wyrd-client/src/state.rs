@@ -2944,6 +2944,22 @@ pub(crate) mod tests {
         );
     }
 
+    /// Assert that a rejected bundle's recovery prescribes a complete pull into
+    /// an explicit directory, never the envelope-only `get`.
+    ///
+    /// # Panics
+    /// Panics if the bundle loads or the remediation names another recovery.
+    fn assert_pull_recovery(result: Result<WyrdState, WyrdError>) {
+        let error = result.expect_err("bundle fixture must be rejected");
+        let remediation = error.remediation();
+        assert!(
+            remediation.contains("wyrd pull")
+                && remediation.contains("--output-dir")
+                && !remediation.contains("wyrd get"),
+            "{remediation}"
+        );
+    }
+
     /// Assert the stable error shape used when durable state contains a sibling.
     fn assert_sibling_error(result: Result<WyrdState, WyrdError>, expected_ref: &CardRef) {
         let error = result.expect_err("sibling reference must be rejected");
@@ -3367,10 +3383,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// Rejects metadata-only bundles because `WyrdState` requires complete hydration.
+    /// Rejects metadata-only bundles because `WyrdState` requires complete
+    /// hydration, and prescribes a complete pull as the recovery.
     ///
     /// # Panics
-    /// Panics if fixture rewriting fails or the expected unhydrated error is not returned.
+    /// Panics if fixture rewriting fails, the expected unhydrated error is not
+    /// returned, or its remediation does not prescribe a complete pull.
     fn rejects_metadata_only_bundle_as_unhydrated() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.mode = BundleMode::MetadataOnly);
@@ -3379,13 +3397,16 @@ pub(crate) mod tests {
             "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
             "path",
         );
+        assert_pull_recovery(WyrdState::from_path(bundle.path()));
     }
 
     #[test]
-    /// Rejects the retired `wyrd/hydrated-bundle/v1` header: no compatibility reader exists.
+    /// Rejects the retired `wyrd/hydrated-bundle/v1` header: no compatibility
+    /// reader exists, and the recovery is a fresh complete pull.
     ///
     /// # Panics
-    /// Panics if fixture rewriting fails or the retired header is accepted.
+    /// Panics if fixture rewriting fails, the retired header is accepted, or
+    /// the remediation does not prescribe a complete pull.
     fn rejects_retired_bundle_api_version() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| {
@@ -3396,6 +3417,7 @@ pub(crate) mod tests {
             "WYRD_SDK_400_INVALID_STATE_BUNDLE",
             "api_version",
         );
+        assert_pull_recovery(WyrdState::from_path(bundle.path()));
     }
 
     #[test]

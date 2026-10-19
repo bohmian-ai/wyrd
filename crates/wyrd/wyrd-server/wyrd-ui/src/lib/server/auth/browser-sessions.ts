@@ -2,9 +2,8 @@ import { createHash } from 'node:crypto';
 import type { Cookies } from '@sveltejs/kit';
 import * as client from 'openid-client';
 import { decodeJwt } from 'jose';
-import type { SessionMetadata } from '$lib/views';
 import { serverUrl } from '../upstream';
-import { reject, type TenantContext } from './session';
+import { reject, type SessionMetadata, type TenantContext } from './session';
 
 const sessionPrefix = 'wyrd_session_';
 const loginCookie = 'wyrd_login';

@@ -1,9 +1,8 @@
 import { forwardAuth } from '$lib/server/upstream';
 import { error, redirect, type Handle, type HandleServerError } from '@sveltejs/kit';
-import { localAuthEnabled, mockDataEnabled } from '$lib/server/development';
+import { localAuthEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
-import { WyrdClient } from '$lib/server/wyrd';
 import { problem } from '$lib/server/problem';
 
 const loginRoutes = ['/t/[tenantKey]/login', '/t/[tenantKey]/login/api-key'];
@@ -12,7 +11,6 @@ export const handle: Handle = async ({ event, resolve }) => {
   // The browser's leg of Wyrd's authorization server, served on this public origin.
   if (event.url.pathname.startsWith('/auth/')) return forwardAuth(event.request, event.url);
   event.setHeaders({ 'cache-control': 'private, no-store' });
-  event.locals.mockData = mockDataEnabled(event.cookies);
   const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;
   if (!localAuthEnabled()) {
     event.locals.session = null;
@@ -28,8 +26,6 @@ export const handle: Handle = async ({ event, resolve }) => {
       }
       event.locals.browserSession = session;
       event.locals.tenant = session.context();
-      // Mock projections belong to the development identity only.
-      event.locals.wyrd = new WyrdClient(event.locals.tenant, false);
     }
     return resolve(event);
   }
@@ -48,7 +44,6 @@ export const handle: Handle = async ({ event, resolve }) => {
       error(value.status, { ...value, message: value.title });
     }
     event.locals.tenant = sessions.bind(result.session, tenantKey);
-    event.locals.wyrd = new WyrdClient(event.locals.tenant, event.locals.mockData);
   }
   return resolve(event);
 };

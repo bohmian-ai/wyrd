@@ -1,11 +1,8 @@
-import { loginScenario } from '$lib/server/development';
-import { dev } from '$app/environment';
+import { localAuthEnabled, loginScenario } from '$lib/server/development';
 import type { LayoutServerLoad } from './$types';
 
-export const load: LayoutServerLoad = ({ locals, cookies }) => ({
+export const load: LayoutServerLoad = ({ cookies }) => ({
   mode: cookies.get('wyrd-mode') === 'light' ? ('light' as const) : ('dark' as const),
-  navCollapsed: cookies.get('wyrd-nav') === 'collapsed',
-  development: dev,
-  loginScenario: dev ? loginScenario(cookies) : undefined,
-  mockData: locals.mockData
+  localAuth: localAuthEnabled(),
+  loginScenario: localAuthEnabled() ? loginScenario(cookies) : undefined
 });

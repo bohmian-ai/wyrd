@@ -26,6 +26,7 @@ use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
     SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
 };
+use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::execution::VerificationExecutionState;
 use wyrd_spec::verification::{VerificationExecutionStatus, VerifierReadiness};
@@ -1314,22 +1315,141 @@ impl Grouped {
             .and_then(|id| id.parse().ok())
             .expect("the response names its execution")
     }
+
+    /// Judge `value` with `verifier` in a new Run of the Service's `agent`
+    /// under `group`, as the Service, from a fresh `runtime` SDK process.
+    ///
+    /// The child loads this hydrated bundle through its own public SDK and
+    /// resolves the deployment and the Service key from its environment, the
+    /// way a deployed process does, with an empty config home so no saved
+    /// login replaces that key. It returns once the child's verify returned.
+    ///
+    /// # Panics
+    /// Panics when the child cannot start or exits unsuccessfully.
+    async fn foreign_turn(
+        &self,
+        deployment: &Deployment,
+        runtime: Runtime,
+        verifier: &str,
+        group: &GroupId,
+        value: &serde_json::Value,
+    ) {
+        let sdks = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the Rust SDK sits under sdks/");
+        let mut command = match runtime {
+            Runtime::Python => {
+                let mut command = std::process::Command::new("uv");
+                command.current_dir(sdks.join("wyrd-sdk-python")).args([
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "-c",
+                    PYTHON_TURN,
+                ]);
+                command
+            }
+            Runtime::TypeScript => {
+                let mut command = std::process::Command::new("node");
+                command.current_dir(sdks.join("wyrd-sdk-ts/wyrd")).args([
+                    "--input-type=module",
+                    "-e",
+                    TYPESCRIPT_TURN,
+                ]);
+                command
+            }
+        };
+        let config_home = TempDir::new().expect("config home");
+        command
+            .arg(self.bundle.path().join("bundle"))
+            .arg(verifier)
+            .arg(group.as_str())
+            .arg(value.to_string())
+            .env("WYRD_CONFIG_HOME", config_home.path())
+            .env(
+                "WYRD_SERVER_URL",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL"),
+            )
+            .env(
+                "WYRD_GRPC_URL",
+                deployment
+                    .server()
+                    .grpc_url()
+                    .expect("bound server has a gRPC URL"),
+            )
+            .env("WYRD_API_KEY", &self.key)
+            .env_remove("WYRD_ACCESS_TOKEN")
+            .env_remove("WYRD_WORKLOAD_TOKEN")
+            .env_remove("WYRD_TENANT");
+        let output = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .expect("child joins")
+            .expect("child starts");
+        assert!(
+            output.status.success(),
+            "{runtime:?} turn failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
-/// A support conversation resumed over two Runs, a background submit, and an
-/// agent's replayed HTTP enqueue, all sharing one `group_id`, is judged once
-/// its `after` period expires: the group execution reads back its group and
-/// owner and judges the Service's six turns in call order. The replay counts
-/// once; an ungrouped key conflict joins no group, and a same-group verify
-/// the administrator made with no owning Service and a turn from a principal
-/// without `verifier:run` on the source Verifier are excluded, and the
-/// binding status names the execution.
+/// A first-class SDK runtime other than Rust that [`Grouped::foreign_turn`]
+/// runs in its own process.
+#[derive(Clone, Copy, Debug)]
+enum Runtime {
+    /// The Python SDK, run by the package's `uv` environment.
+    Python,
+    /// The TypeScript SDK, run by Node from the built package.
+    TypeScript,
+}
+
+/// The Python turn: verify `argv[4]` as JSON with Verifier `argv[2]` under
+/// group `argv[3]` in a new `agent` Run of the bundle at `argv[1]`.
+const PYTHON_TURN: &str = "\
+import json, sys
+from wyrd.client import WyrdClient
+from wyrd.state import WyrdState
+bundle, verifier, group, value = sys.argv[1:]
+WyrdState.from_path(bundle, WyrdClient()).run('agent').observe.verify(
+    verifier, json.loads(value), group_id=group
+)
+";
+
+/// The TypeScript turn: the same verify as [`PYTHON_TURN`], through the
+/// package's public `wyrd-ai` entry point.
+const TYPESCRIPT_TURN: &str = "\
+const { WyrdClient, WyrdState } = await import('wyrd-ai');
+const [bundle, verifier, group, value] = process.argv.slice(1);
+await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
+  .run('agent')
+  .observe.verify(verifier, JSON.parse(value), { positional: true, group_id: group });
+process.exit(0);
+";
+
+/// A support conversation populated by the Rust, Python, and TypeScript SDKs,
+/// each from its own process, then resumed over another Run, a background
+/// submit, and an agent's replayed HTTP enqueue, all as the Service under one
+/// `group_id`, is judged once its `after` period expires: the group execution
+/// reads back its group and owner and judges the Service's six turns in call
+/// order. The replay counts once; an ungrouped key conflict joins no group,
+/// and a same-group verify the administrator made with no owning Service and
+/// a turn from a principal without `verifier:run` on the source Verifier are
+/// excluded, and the binding status names the execution.
+/// A standalone or inline `group_end` Trigger longer than one year is refused
+/// over plain HTTP with nothing persisted, and one of exactly a year
+/// registers. Once the Service's principal is revoked, its next group is
+/// recorded as an errored group execution the binding status names, carrying
+/// the group and the refusal with no snapshot, result, or dispatch.
 /// Binding the source Verifier itself to `group_end` is refused at
 /// registration, naming the binding's `runs_on` field.
 ///
 /// # Panics
-/// Panics when a step fails, the group is not judged in time, or the
-/// judgment or refusal differs.
+/// Panics when a step fails, the group is not judged or refused in time, or
+/// the judgment or a refusal differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn grouped_support_resumes() {
@@ -1342,18 +1462,19 @@ async fn grouped_support_resumes() {
     let turns: Vec<_> = (1..=6)
         .map(|turn| json!({"turn": turn, "answer": format!("answer {turn}")}))
         .collect();
-    let first = support
-        .state
-        .run_for_card("agent")
-        .expect("agent run opens");
-    for turn in &turns[..3] {
-        first
-            .observe()
-            .group_id(group.clone())
-            .verify("turn-check", turn.clone())
-            .await
-            .expect("the turn is judged");
-    }
+    support.turn("turn-check", &group, turns[0].clone()).await;
+    support
+        .foreign_turn(deployment, Runtime::Python, "turn-check", &group, &turns[1])
+        .await;
+    support
+        .foreign_turn(
+            deployment,
+            Runtime::TypeScript,
+            "turn-check",
+            &group,
+            &turns[2],
+        )
+        .await;
     let resumed = support
         .state
         .run_for_card("agent")
@@ -1466,6 +1587,164 @@ async fn grouped_support_resumes() {
     assert_eq!(outcome.verdict, VerificationVerdict::Passed);
     let status = deployment.binding_status(&support.binding).await;
     assert_eq!(status.last_execution_id, Some(judged.execution_id));
+
+    // One year is the longest `after` a standalone or inline Trigger takes;
+    // a longer one is refused over plain HTTP before anything persists.
+    let token = deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    let register_raw = async |card: serde_json::Value| {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/cards",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header(
+                "idempotency-key",
+                format!("{}-{}", card["kind"], card["metadata"]["name"]),
+            )
+            .json(&json!({"submissions": [card]}))
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        (
+            status,
+            response
+                .json::<serde_json::Value>()
+                .await
+                .expect("the body is JSON"),
+        )
+    };
+    let trigger = |name: &str, after: &str| {
+        json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Trigger",
+            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "spec": {"kind": "group_end", "after": after},
+            "artifacts": [],
+        })
+    };
+    let service = |name: &str, after: &str| {
+        json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Service",
+            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "spec": {
+                "service_type": "agent",
+                "components": [{
+                    "alias": "agent",
+                    "ref": registered(&support.receipt, "assistant-agent"),
+                    "verified_by": [{
+                        "verifier": registered(&support.receipt, "turn-check"),
+                    }, {
+                        "verifier": registered(&support.receipt, "conversation-review"),
+                        "runs_on": {"kind": "group_end", "after": after},
+                    }],
+                }],
+            },
+            "artifacts": [],
+        })
+    };
+    let cards = deployment.cards().await;
+    for (kind, card) in [
+        (CardKind::Trigger, trigger("over-a-year", "366d")),
+        (CardKind::Service, service("over-a-year", "8761h")),
+    ] {
+        let (status, refusal) = register_raw(card).await;
+        assert_eq!(status, 400, "{kind:?}: {refusal}");
+        assert!(refusal.to_string().contains("365d"), "{kind:?}: {refusal}");
+        cards
+            .get(CardSelector::named(
+                kind,
+                "default".parse().expect("space"),
+                "over-a-year".parse().expect("name"),
+            ))
+            .await
+            .expect_err("a refused Card never persists");
+    }
+    for card in [trigger("a-year", "365d"), service("a-year", "31536000s")] {
+        let (status, receipt) = register_raw(card).await;
+        assert!((200..300).contains(&status), "{status}: {receipt}");
+    }
+
+    // An owner revoked before its group comes due is refused: the binding's
+    // latest execution is an errored group execution naming the group and
+    // the reason, with no snapshot or result.
+    let lapsed = GroupId::new("conv-2").expect("group id");
+    WyrdState::from_path_with(
+        support.bundle.path().join("bundle"),
+        deployment.client(&support.key),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(lapsed.clone())
+    .verify("turn-check", turns[0].clone())
+    .await
+    .expect("the turn is judged");
+    let owner = assistant
+        .principal(&support.receipt.root)
+        .await
+        .parse()
+        .expect("principal id");
+    Principals::connect_with(&deployment.admin())
+        .await
+        .expect("principals connect")
+        .revoke_principal(
+            &owner,
+            &RevokePrincipalRequest {
+                principal_kind: PrincipalKindTag::Service,
+                reason: "the support Service retires".to_owned(),
+            },
+        )
+        .await
+        .expect("the owner is revoked");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let refused_group = loop {
+        deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        let latest = deployment
+            .binding_status(&support.binding)
+            .await
+            .last_execution_id;
+        if let Some(id) = latest.filter(|id| *id != judged.execution_id) {
+            break Execution::connect_with(id, &deployment.admin())
+                .await
+                .expect("the execution handle connects")
+                .status()
+                .await
+                .expect("the execution reads");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused group recorded no execution within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(refused_group.status, VerificationExecutionStatus::Errored);
+    assert_eq!(
+        refused_group
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("WYRD_AUTH_401_CREDENTIAL_REVOKED"),
+        "{refused_group:?}"
+    );
+    assert_eq!(refused_group.group_id, Some(lapsed));
+    assert_eq!(refused_group.owner_card_uid, support.receipt.root.uid);
+    assert!(refused_group.group.is_none() && refused_group.result.is_none());
+    assert!(refused_group.dispatches.is_empty());
     let refused = deployment
         .cards()
         .await

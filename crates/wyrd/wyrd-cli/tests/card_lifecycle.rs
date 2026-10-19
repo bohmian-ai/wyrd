@@ -23,7 +23,25 @@ fn run_cli(arguments: &[&str]) -> Output {
     run_cli_with_token(arguments, None)
 }
 
+/// Run `arguments` on the isolated [`cli_command`] as the optional bearer
+/// `token`, capturing both streams.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot be built or started.
 fn run_cli_with_token(arguments: &[&str], token: Option<&str>) -> Output {
+    cli_command(token)
+        .args(arguments)
+        .output()
+        .expect("wyrd command runs")
+}
+
+/// Build the isolated `wyrd` command every Card journey runs: an empty
+/// configuration home, the optional bearer `token`, and no ambient credential
+/// or log selection.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot be built.
+fn cli_command(token: Option<&str>) -> Command {
     let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
     let empty_config =
         std::env::temp_dir().join(format!("wyrd-cli-empty-config-{}", std::process::id()));
@@ -38,7 +56,7 @@ fn run_cli_with_token(arguments: &[&str], token: Option<&str>) -> Output {
         .env_remove("WYRD_TENANT")
         .env_remove("WYRD_API_KEY")
         .env_remove("RUST_LOG");
-    command.args(arguments).output().expect("wyrd command runs")
+    command
 }
 
 async fn run_cli_owned_with_token(arguments: Vec<String>, token: Option<String>) -> Output {
@@ -584,6 +602,14 @@ spec:
 }
 
 /// The removed `plan`, `apply`, and `load` verbs are usage errors, not aliases.
+///
+/// Each verb is invoked with `--help`, the one argument an alias would accept
+/// without contacting a server, so a surviving alias would exit 0 with its
+/// help instead of the parser's usage code.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot run or any removed verb exits with a
+/// code other than 64.
 #[test]
 fn removed_card_verbs_are_usage_errors() {
     for verb in ["plan", "apply", "load"] {
@@ -613,6 +639,13 @@ fn delete_rejects_ambiguous_named_selector_before_client_construction() {
     );
 }
 
+/// `pull` without `--output-dir` is refused by the parser before any client,
+/// credential, or server is consulted, and the refusal names the missing
+/// destination so a caller learns where the bundle must go.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot run, the exit code is not 64, or
+/// stderr does not name `--output-dir`.
 #[test]
 fn pull_requires_an_output_directory_before_client_construction() {
     let output = run_cli(&[
@@ -647,6 +680,14 @@ fn pull_help_describes_the_bundle_and_does_not_advertise_argv_credentials() {
 }
 
 /// `get` reads one envelope: it takes no output directory or bundle mode.
+///
+/// Its help names the envelope and advertises neither bundle option, and a
+/// `get` given `--output-dir` is refused by the parser instead of writing a
+/// bundle, so the envelope read and the bundle pull stay separate commands.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot run, help exits non-zero or mentions
+/// a bundle option, or `get --output-dir` exits with a code other than 64.
 #[test]
 fn get_help_describes_one_envelope_without_bundle_options() {
     let output = run_cli(&["get", "--help"]);
@@ -843,6 +884,27 @@ mod pg_tests {
     /// # Errors
     /// Returns a string error when the subprocess exits unsuccessfully or its
     /// stdout is not a JSON value.
+    /// Run `arguments` as `token` with `RUST_LOG=debug` and `config_home` as
+    /// the Wyrd configuration directory, so requested tracing has a known
+    /// diagnostic log.
+    ///
+    /// # Panics
+    /// Panics when the subprocess cannot start or its blocking task fails.
+    async fn run_cli_logged(arguments: Vec<String>, token: &str, config_home: &Path) -> Output {
+        let token = token.to_owned();
+        let config_home = config_home.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            cli_command(Some(&token))
+                .env("WYRD_CONFIG_HOME", config_home)
+                .env("RUST_LOG", "debug")
+                .args(arguments)
+                .output()
+                .expect("wyrd command runs")
+        })
+        .await
+        .expect("CLI subprocess joins")
+    }
+
     async fn run_cli_json(arguments: Vec<String>, token: &str) -> Result<Value, String> {
         let output = run_cli_owned_with_token(arguments, Some(token.to_owned())).await;
         if !output.status.success() {
@@ -2374,7 +2436,38 @@ mod pg_tests {
         let summary: Value = serde_json::from_slice(&pulled.stdout).expect("one summary");
         assert_eq!(summary["mode"], "complete");
 
-        for output in [&declared, &denied_run, &got, &pulled] {
+        let logs = tempfile::tempdir().expect("log config home creates");
+        let get_args = |server: &str| {
+            ["get", "--kind", "Prompt", "--uid", &uid, "--server", server]
+                .into_iter()
+                .chain(["--format", "json"])
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let logged = run_cli_logged(get_args(&base_url), &jwt, logs.path()).await;
+        assert!(
+            logged.status.success() && logged.stderr.is_empty(),
+            "requested tracing reached stderr: {}",
+            String::from_utf8_lossy(&logged.stderr)
+        );
+        let card: Value = serde_json::from_slice(&logged.stdout).expect("one logged envelope");
+        assert_eq!(card["metadata"]["uid"], uid);
+        let synthetic = "synthetic-unreachable-credential";
+        let unreachable =
+            run_cli_logged(get_args("http://127.0.0.1:1"), synthetic, logs.path()).await;
+        json_failure(&unreachable, 1);
+        let log = std::fs::read_to_string(logs.path().join("logs/cli.log"))
+            .expect("requested tracing is retained in the CLI diagnostic log");
+        assert!(
+            log.contains("127.0.0.1:1"),
+            "unreachable attempt is logged: {log}"
+        );
+        assert!(
+            !log.contains(&jwt) && !log.contains(synthetic),
+            "a credential reached the diagnostic log"
+        );
+
+        for output in [&declared, &denied_run, &got, &pulled, &logged, &unreachable] {
             let streams = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
             let streams = String::from_utf8_lossy(&streams);
             assert!(
@@ -2385,23 +2478,85 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
-    /// Prove complete `wyrd pull` clears stdout progress before its final JSON summary.
+    /// Run `arguments` as `token` with stdout attached to a fresh
+    /// pseudo-terminal, the condition under which a progress renderer paints,
+    /// and return the exit status, the terminal's bytes with its `\r\n`
+    /// line discipline folded back to `\n`, and the piped stderr.
     ///
     /// # Panics
-    /// Panics when the embedded server, public CLI declaration/get workflow,
-    /// JSON summary, metadata-only read, or verified artifact bytes fail their
-    /// expected contract.
+    /// Panics when the pseudo-terminal cannot be opened or the subprocess
+    /// cannot start or be awaited.
+    async fn run_cli_on_terminal(
+        arguments: Vec<String>,
+        token: &str,
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let token = token.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let controller =
+                openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("pseudo-terminal opens");
+            grantpt(&controller).expect("pseudo-terminal is granted");
+            unlockpt(&controller).expect("pseudo-terminal unlocks");
+            let name = ptsname(&controller, Vec::new()).expect("pseudo-terminal has a name");
+            let terminal = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(std::ffi::OsStr::from_bytes(name.as_bytes()))
+                .expect("pseudo-terminal device opens");
+            let mut command = cli_command(Some(&token));
+            command
+                .args(arguments)
+                .stdin(std::process::Stdio::null())
+                .stdout(terminal)
+                .stderr(std::process::Stdio::piped());
+            let child = command.spawn().expect("wyrd command starts");
+            drop(command);
+            let reader = std::thread::spawn(move || {
+                let mut controller = std::fs::File::from(controller);
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                // The read ends with EOF or EIO once the child's terminal closes.
+                while let Ok(read @ 1..) = controller.read(&mut buffer) {
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                bytes
+            });
+            let output = child.wait_with_output().expect("wyrd command completes");
+            let stdout = reader.join().expect("terminal reader joins");
+            let stdout = String::from_utf8_lossy(&stdout).replace("\r\n", "\n");
+            (output.status, stdout.into_bytes(), output.stderr)
+        })
+        .await
+        .expect("CLI subprocess joins")
+    }
+
+    /// Complete `wyrd pull --format json` on a terminal stdout prints only its
+    /// one JSON summary, and a refused artifact transfer prints nothing on
+    /// stdout while the previously published bundle stays usable.
+    ///
+    /// The pull runs with stdout attached to a pseudo-terminal because a
+    /// progress renderer paints only to a terminal; the refusal tampers with
+    /// the stored artifact bytes so the transfer starts and then fails
+    /// verification.
+    ///
+    /// # Panics
+    /// Panics when the embedded server, public CLI declaration, either pull's
+    /// stream contract, the metadata-only read, or the retained artifact
+    /// bytes differ from that contract.
     ///
     /// # Cancellation
     /// Cancellation can leave the isolated test server awaiting shutdown, but
     /// the graph puller removes its unpublished staging bundle on failure.
     #[tokio::test]
-    async fn cli_pull_renders_download_progress() {
+    async fn terminal_json_pull_prints_only_its_result() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
         let destination = temp.path().join("pulled");
         let metadata_only = temp.path().join("metadata-only");
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
             .bootstrap_user("cli-get-progress", &["editor"])
             .await
@@ -2424,47 +2579,85 @@ mod pg_tests {
         .expect("CLI declare succeeds");
         let uid = receipt["root"]["uid"]
             .as_str()
-            .expect("declare receipt has Card UID");
-        let output = run_cli_owned_with_token(
-            vec![
-                "pull".to_owned(),
-                "--kind".to_owned(),
-                "Prompt".to_owned(),
-                "--uid".to_owned(),
-                uid.to_owned(),
-                "--output-dir".to_owned(),
-                destination
-                    .to_str()
-                    .expect("pull destination is UTF-8")
-                    .to_owned(),
-                "--server".to_owned(),
-                base_url.clone(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            Some(jwt.clone()),
-        )
-        .await;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let summary: Value = serde_json::from_slice(&output.stdout)
-            .expect("get stdout remains JSON after progress clears");
+            .expect("declare receipt has Card UID")
+            .to_owned();
+        let pull_args = vec![
+            "pull".to_owned(),
+            "--kind".to_owned(),
+            "Prompt".to_owned(),
+            "--uid".to_owned(),
+            uid.clone(),
+            "--output-dir".to_owned(),
+            destination
+                .to_str()
+                .expect("pull destination is UTF-8")
+                .to_owned(),
+            "--server".to_owned(),
+            base_url.clone(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ];
+        let (status, stdout, stderr) = run_cli_on_terminal(pull_args.clone(), &jwt).await;
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty(), "success writes no stderr");
+        let summary: Value = serde_json::from_slice(&stdout).unwrap_or_else(|error| {
+            panic!(
+                "terminal stdout is not one JSON document ({error}): {:?}",
+                String::from_utf8_lossy(&stdout)
+            )
+        });
         assert_eq!(summary["mode"], "complete");
+        let pulled_artifact = destination.join("cards/root/artifacts/prompt.txt");
         assert_eq!(
-            std::fs::read(destination.join("cards/root/artifacts/prompt.txt"))
-                .expect("pulled artifact reads"),
+            std::fs::read(&pulled_artifact).expect("pulled artifact reads"),
             b"cli-card-artifact"
         );
+
+        let superuser = server
+            .pg_fixture()
+            .superuser_pool()
+            .expect("superuser pool opens");
+        let storage_path: String = sqlx::query_scalar(
+            "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
+        )
+        .bind(&uid)
+        .fetch_one(&superuser)
+        .await
+        .expect("artifact storage path reads");
+        std::fs::write(
+            storage_root
+                .path()
+                .join(storage_path.trim_start_matches("wyrd://")),
+            b"cli-card-XXXXXXXX",
+        )
+        .expect("stored artifact bytes corrupt with the same length");
+        let (status, stdout, stderr) = run_cli_on_terminal(pull_args, &jwt).await;
+        assert_eq!(
+            status.code(),
+            Some(74),
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            stdout.is_empty(),
+            "a refused transfer paints nothing on stdout: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+        let refusal: Value = serde_json::from_slice(&stderr).expect("stderr is one JSON error");
+        assert_eq!(refusal["code"], "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
+        assert_eq!(
+            std::fs::read(&pulled_artifact).expect("prior bundle artifact still reads"),
+            b"cli-card-artifact",
+            "the previously published bundle is preserved"
+        );
+
         let metadata = run_cli_json(
             vec![
                 "pull".to_owned(),
                 "--kind".to_owned(),
                 "Prompt".to_owned(),
                 "--uid".to_owned(),
-                uid.to_owned(),
+                uid,
                 "--output-dir".to_owned(),
                 metadata_only
                     .to_str()
@@ -2479,7 +2672,7 @@ mod pg_tests {
             &jwt,
         )
         .await
-        .expect("metadata-only get succeeds without artifact download");
+        .expect("metadata-only pull succeeds without artifact download");
         assert_eq!(metadata["mode"], "metadata");
         assert!(
             !metadata_only

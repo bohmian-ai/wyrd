@@ -154,13 +154,7 @@ impl Diagnostics {
             return Ok(Self::Terminal);
         }
         let path = root.join("logs").join("server-dev.log");
-        std::fs::create_dir_all(root.join("logs"))
-            .and_then(|()| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-            })
+        crate::open_diagnostic_log(&path)
             .map(|file| Self::Log { path, file })
             .map_err(|_| {
                 dev_error(

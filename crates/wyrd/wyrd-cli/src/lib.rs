@@ -92,6 +92,68 @@ where
     false
 }
 
+/// Install the `wyrd` executable's tracing subscriber.
+///
+/// Human mode logs to stderr at `warn` unless `RUST_LOG` selects otherwise.
+/// JSON mode keeps stdout and stderr for its one result or error document:
+/// without a valid `RUST_LOG` it logs nothing, and a `RUST_LOG` selection is
+/// appended without color to `<wyrd config dir>/logs/cli.log`, so requested
+/// diagnostics are retained outside both machine streams. Only the binary
+/// calls this; in-process embedders own their own subscriber.
+///
+/// # Errors
+/// Returns [`error::WyrdCliError::Io`] when JSON mode's requested log cannot
+/// be resolved or opened. No command has run.
+pub fn install_tracing(json: bool) -> Result<(), error::WyrdCliError> {
+    use tracing_subscriber::EnvFilter;
+
+    let requested = EnvFilter::try_from_default_env();
+    if !json {
+        tracing_subscriber::fmt()
+            .with_env_filter(requested.unwrap_or_else(|_| EnvFilter::new("warn")))
+            .with_writer(std::io::stderr)
+            .init();
+        return Ok(());
+    }
+    let Ok(filter) = requested else {
+        return Ok(());
+    };
+    let path = wyrd_client::environment::Environment::Process
+        .config_dir()
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "cannot resolve the Wyrd config directory for the RUST_LOG diagnostic log: set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME, or unset RUST_LOG",
+            )
+        })
+        .map(|dir| dir.join("logs").join("cli.log"));
+    let file = path
+        .and_then(|path| open_diagnostic_log(&path))
+        .map_err(|source| error::WyrdCliError::Io { source })?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .init();
+    Ok(())
+}
+
+/// Open `path` for appending diagnostics, creating it and its directory.
+///
+/// Shared by JSON mode's CLI tracing log and `server dev`'s diagnostic log, so
+/// both keep machine streams clean the same way.
+///
+/// # Errors
+/// Propagates directory creation and open failures.
+pub(crate) fn open_diagnostic_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Parse and run the CLI, returning its numeric process exit code for language
 /// bindings and other embedding surfaces.
 ///
@@ -153,6 +215,12 @@ mod tests {
     use super::{code_to_u8, json_requested, run_cli_code};
 
     /// Only an exact `--format json` before `--` selects machine output.
+    ///
+    /// Covers both spellings, a different format value, a lookalike value,
+    /// and a `--format json` after `--`, which belongs to a child command.
+    ///
+    /// # Panics
+    /// Panics when any of those argument lists is classified the other way.
     #[test]
     fn json_mode_is_read_from_raw_arguments() {
         assert!(json_requested(["wyrd", "get", "--format", "json"]));

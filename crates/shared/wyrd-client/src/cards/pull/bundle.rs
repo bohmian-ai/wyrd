@@ -54,7 +54,9 @@ impl<'a> BundleWriter<'a> {
     /// Writes every Card projection and the root metadata manifest.
     ///
     /// Local serialization and filesystem writes are synchronous. Complete pull awaits each
-    /// authorized artifact transfer before recording its local payload path.
+    /// authorized artifact transfer before recording its local payload path. Transfers are
+    /// tracked on a hidden display, so pull never paints progress onto the stdout its caller
+    /// may be using for a machine-readable result.
     ///
     /// # Errors
     ///
@@ -67,7 +69,7 @@ impl<'a> BundleWriter<'a> {
     /// staging. The owning puller removes its unpublished staging bundle.
     pub(super) async fn write(&self, graph: &ResolvedGraph) -> Result<BundleStats, WyrdError> {
         let display = matches!(self.mode, BundleMode::Complete)
-            .then(|| Arc::new(DownloadProgressDisplay::stdout()));
+            .then(|| Arc::new(DownloadProgressDisplay::hidden()));
         let result = async {
             let mut manifests = Vec::with_capacity(graph.cards.len());
             let mut downloaded_artifact_count = 0;

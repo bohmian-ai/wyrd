@@ -171,7 +171,7 @@ The subject is the component the binding sits under; you can also bind on the Se
 runs_on: {kind: group_end, after: 30m}
 ```
 
-`after` is at most one year (`365d`, `8760h`, `525600m` or `31536000s`); registration refuses a longer duration, standalone or inline, before anything is stored.
+`after` is at most one year (`365d`, `8760h`, `525600m` or `31536000s`); declaration refuses a longer duration, standalone or inline, before anything is stored.
 
 Each time Scribe acknowledges a grouped source input or result, the group becomes due `after` from then; new evidence moves that time later. Once it is due, one group execution judges every source input and result visible at that moment, listed in arrival order, with `null` for an outcome not yet visible. Later evidence makes the group due again and produces a new execution; earlier executions keep the evidence they judged. `on_verdict_change` Operators run when a group's verdict differs from its previous one.
 

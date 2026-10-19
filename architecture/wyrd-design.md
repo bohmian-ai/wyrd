@@ -1277,12 +1277,12 @@ dispatch.
 and result rows without producer PostgreSQL IO. A group Verifier declares whole
 source slots or requirement outcomes of other Verifiers bound on the same owner
 occurrence (`verifiers.<name>.inputs.<slot>` or
-`verifiers.<name>.requirements.<id>.outcome`). Registration pins exact source
+`verifiers.<name>.requirements.<id>.outcome`). Declaration pins exact source
 identities; tenant, owner, subject and Verifier identity scope every read.
 
 A `group_end` Trigger declares one positive duration, `after`, at most 365 fixed
 days. Standalone and inline Trigger writes reject larger durations before
-registration persists them; accepted durations are used exactly, with no silent
+declaration persists them; accepted durations are used exactly, with no silent
 SQL shortening. After Scribe
 acknowledges a matching source input or result, the existing background writer
 upserts one PostgreSQL pending scheduling row per tenant, binding and group ID,

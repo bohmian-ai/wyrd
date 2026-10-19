@@ -1303,7 +1303,7 @@ None of these bindings has `runs_on`, so nothing runs them on its own. Your code
 
 ## Bind a Verifier to a schedule
 
-A schedule judges samples your service recorded over time, such as request latency, instead of one request. Add `runs_on` with a Trigger, `inputs` to say which recorded features fill the Verifier's `samples` slot, and optionally `on_failure` with the Operators to run when it fails:
+A schedule judges samples your service recorded over time, such as request latency, instead of one request. Add `runs_on` with a Trigger and optionally `on_failure` with the Operators to run when it fails:
 
 **latency-watch.yaml**
 
@@ -1318,8 +1318,6 @@ spec:
   verified_by:
     - verifier: ./latency-shift.yaml
       runs_on: ./daily.yaml
-      inputs:
-        latency: {features: [latency]}
       on_failure:
         - ./alert-on-call.yaml
 
@@ -1404,7 +1402,6 @@ Every day at midnight UTC, the server compares the day's `latency` samples with 
 | --- | --- | --- |
 | `verifier` | Yes | A path to the Verifier's Card file, or a declared Verifier |
 | `runs_on` | No | A Trigger, as a path, a declared Card, or inline. Absent, only your code runs the Verifier |
-| `inputs` | No | For a scheduled Verifier, each `samples` slot's recorded `features` |
 | `on_failure` | No | Operators to run after a `failed` verdict, as paths, declared Cards, or inline |
 
 A Trigger is `{kind: schedule, cron: "<cron>", tz: <zone>}`, with `tz` defaulting to UTC. Schedules only judge recorded samples: binding `runs_on` to a Verifier with other inputs fails declaration. A binding has no other fields, and an unknown field such as `when` is rejected.
@@ -2705,6 +2702,7 @@ A Verifier with `samples` slots and `drift` checks judges a scheduled window, so
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | A file is larger than its slot's `max_bytes` or the deployment limit | Send a smaller file, or raise `max_bytes` up to the deployment limit |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | The Verifier judges a scheduled window | Use `submit` |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks `verifier:run` on this Verifier, or read access to an Artifact or trace it names | Grant a role that includes it |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | The server is staging more verification work than it holds | Nothing was staged. `submit` retries it for you; retry `verify` after `details.retry_after_seconds` |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The execution took longer than 60 seconds, usually a slow Agent step | Decide your fallback in code, or use `submit`. The SDK does not retry `verify` |
 
 A missing required input is not an error: the requirements that need it come back `inconclusive`. For when to check in real time versus in the background, see [How verification works](/wyrd/understand/how-verification-works/).
@@ -2791,7 +2789,7 @@ Declaration refuses a Verifier that mixes `samples` slots or `drift` checks with
 
 ## 3. Bind it to a schedule and declare
 
-List the model as a component of a Service and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
+List the model as a component of a Service and bind the Verifier to it. The schedule reads each `samples` slot's own `features` and judges every drift requirement in the Verifier:
 
 ```yaml title="service/churn-service.yaml"
 apiVersion: wyrd/v1
@@ -2805,11 +2803,9 @@ spec:
       verified_by:
         - verifier: ./churn-input-drift.yaml
           runs_on: {kind: schedule, cron: "0 * * * *"}
-          inputs:
-            current: {features: [tenure_months, monthly_spend]}
 ```
 
-A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, see [Respond to a failed verification](/wyrd/build-and-verify/verify/respond-to-a-failed-verification/).
+Every `samples` slot is required; a requirement whose slot recorded nothing in the window is `inconclusive`. To page someone when it fails, see [Respond to a failed verification](/wyrd/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ```bash
 wyrd declare service/churn-service.yaml
@@ -2962,7 +2958,7 @@ const rows = await bifrost.sql(
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
 | Declaration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
-| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or an `inputs` entry missing or naming other measurements than its slot | Bind with `runs_on: { kind: schedule, ... }` and one `inputs` entry per `samples` slot |
+| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or a binding with `inputs` | Bind with `runs_on: { kind: schedule, ... }` and no `inputs` |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | `verify` on a window Verifier | Use `submit` |
 | Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and declare a new version |
 | No results on schedule | The Service has not authenticated in 24 hours, or no samples landed in the window | Deploy the Service; submit on the bound component's alias |
@@ -3196,8 +3192,6 @@ spec:
   verified_by:
     - verifier: ./latency-shift.yaml
       runs_on: ./daily.yaml
-      inputs:
-        latency: {features: [latency]}
       on_failure:
         - ./alert-on-call.yaml
 
@@ -4634,7 +4628,7 @@ In `follows-policy`, the caller uploads one file: the refund decision letter the
 
 | Part | Holds |
 | --- | --- |
-| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false` |
+| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false`; `samples` slots are always required |
 | `steps` | Optional preparation. Each step runs one action and produces data |
 | `requirements` | Each has a unique `id`, a `statement`, and one `check`, and produces one verdict. Attach them to a step or to the whole Verifier |
 | `decide` | How requirement verdicts combine: `all` (the default) or `{ pass_rate: { threshold } }` |
@@ -4676,7 +4670,7 @@ An Agent step has two input channels. `inputs` values are injected into the mode
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | PSI, SPC, or Custom over a `samples` slot (`on`), with full statistics |
 
-Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no tools and no workspace; registration refuses one that does.
+Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no workspace and may declare only the `bifrost.query` tool, for example to read the spans of trace IDs it was given; registration refuses any other tool. That query reads live data under the ordinary tool and query permissions, so its results are not part of the pinned evidence.
 
 A citation names an original input `slot` and a locator: `page`, `slide`, `lines`, `json_pointer`, or `region`. A step can return citations in its ordinary output, and a downstream judge can reuse them through its input bindings. The server checks that every cited location exists in the pinned evidence. An `agent` check that says `passed` without a valid citation becomes `inconclusive`.
 
@@ -4790,11 +4784,26 @@ The subject is the component the binding sits under; you can also bind on the Se
 | Field | Holds | If you leave it out |
 | --- | --- | --- |
 | `verifier` | A Verifier Card, by path or exact reference | Required |
-| `runs_on` | A `schedule` Trigger | The server never runs this binding on its own |
-| `inputs` | For a scheduled Verifier, the source of each `samples` slot: `{ features: [...] }` or `{ metric: <name> }` | Required for every required slot of a scheduled Verifier |
+| `runs_on` | A `schedule` or `group_end` Trigger | The server never runs this binding on its own |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
-`schedule` is the only automatic Trigger. [Bind a Verifier](/wyrd/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
+[Bind a Verifier](/wyrd/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
+
+`group_end` judges a whole caller group, such as one conversation or one event, once its evidence goes quiet. The bound Verifier reads source slots such as `verifiers.turn-check.inputs.turn`, and callers pass the same `group_id` on every `verify` or `submit` of that group:
+
+```yaml
+runs_on: {kind: group_end, after: 30m}
+```
+
+`after` is at most one year (`365d`, `8760h`, `525600m` or `31536000s`); declaration refuses a longer duration, standalone or inline, before anything is stored.
+
+Each time Scribe acknowledges a grouped source input or result, the group becomes due `after` from then; new evidence moves that time later. Once it is due, one group execution judges every source input and result visible at that moment, listed in arrival order, with `null` for an outcome not yet visible. Later evidence makes the group due again and produces a new execution; earlier executions keep the evidence they judged. `on_verdict_change` Operators run when a group's verdict differs from its previous one.
+
+Three limits apply. Steady activity postpones the judgment for as long as it continues. A judgment uses what is visible when it reads, and evidence that becomes visible later without new activity does not schedule another. If the server dies after Scribe acknowledges evidence but before it records the due time, that activity schedules nothing; the next grouped evidence does.
+
+When a group comes due while its binding owner is inactive or retired, or the owner's authority is refused, the server records one `errored` group execution with the reason in `error` and drops the due group. Nothing is evaluated, no verdict or result is written and no Operator runs. The binding status's `last_execution_id` names that execution, but only until a later execution replaces it; there is no list of earlier failures. Reactivating the owner does not bring the dropped group back; the group's next evidence schedules it again. A transient server, database or query failure instead keeps the group due and retries it on a later pass.
+
+A source execution whose result is visible but whose input is not yet visible means the read caught evidence mid-publication. An input without a result is normal and judged with a `null` outcome, as is an absent value inside a visible input; a missing whole input is not. The group then pins nothing and stays due, retrying on later passes. If the input is still missing more than five minutes past the group's due time, by the database clock, the server records one `errored` group execution with `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` and drops the due group in the same step. The execution IDs missing their inputs are named in the error message. Nothing is evaluated, no verdict or result is written and no Operator runs. The group's next evidence schedules it again as usual.
 
 ## Run evidence and window evidence
 
@@ -6100,6 +6109,7 @@ Always on, whatever the settings, and identical on macOS and Linux:
 | Limit reached | Result |
 | --- | --- |
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
+| The server's verification staging is full (`scribe.outbox_capacity`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
 | No Python worker or workspace free | Queued: the execution stays queued and its attempt is refunded. Direct: `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
 | Any other limit inside a step or check, including a spent `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |
@@ -6541,7 +6551,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND` | 400 | Invalid Service component kind | Move Verifier, Trigger, Operator, Audit, and Source cards out of Service.components; attach a Verifier with verified_by. |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | 400 | Invalid Verifier reference kind | Set verified_by[..].verifier to a Verifier CardRef. |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | 400 | Operator connection unavailable | Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator. |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit. |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit. |
 | `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or declare the shared Verifier separately. |
 | `WYRD_SPEC_400_VALIDATION` | 400 | Validation failed | Check the submitted Wyrd request fields against the published schema and retry. |
 | `WYRD_SPEC_404_NOT_FOUND` | 404 | Resource not found | Check that the referenced Wyrd resource exists. |
@@ -6704,10 +6714,12 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
+| `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` | 409 | Verification snapshot incomplete | Check Bifrost publication for the named source executions, then submit a new turn to the group. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |
 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | 422 | Verification input incompatible | Supply every feature the Verifier scores, with the value type its baseline or profile expects. |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | 422 | Verification input unsupported | Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule. |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | 429 | Verification staging is full | Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate. |
 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | 502 | Verification dependency failed | The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers. |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | 504 | Verification execution timed out | Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds. |
 

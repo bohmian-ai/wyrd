@@ -425,9 +425,13 @@ fn digest_for(checksums: &[u8], name: &str) -> Result<String, WyrdCliError> {
 
 /// Extract a verified bundle into `dest` with the system `tar`.
 ///
+/// A runnable bundle holds the `wyrd-server` binary and the production UI:
+/// `ui/package.json`, the adapter-node entry `ui/build/index.js`, and the
+/// UI's production `ui/node_modules`.
+///
 /// # Errors
 /// Returns [`WyrdCliError::ServerReleaseUnverified`] when `tar` fails or
-/// the result holds no `wyrd-server` file, and [`WyrdCliError::Io`] when
+/// the result lacks any of those payload files, and [`WyrdCliError::Io`] when
 /// `dest` cannot be created or `tar` cannot start.
 fn extract(bundle: &Path, dest: &Path) -> Result<(), WyrdCliError> {
     std::fs::create_dir_all(dest).map_err(io)?;
@@ -438,7 +442,11 @@ fn extract(bundle: &Path, dest: &Path) -> Result<(), WyrdCliError> {
         .arg(dest)
         .status()
         .map_err(io)?;
-    if !status.success() || !dest.join("wyrd-server").is_file() {
+    let runnable = ["wyrd-server", "ui/package.json", "ui/build/index.js"]
+        .iter()
+        .all(|file| dest.join(file).is_file())
+        && dest.join("ui/node_modules").is_dir();
+    if !status.success() || !runnable {
         return Err(unverified(
             "bundle did not extract to a runnable server".to_owned(),
         ));

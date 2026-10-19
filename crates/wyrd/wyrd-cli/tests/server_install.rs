@@ -41,13 +41,21 @@ struct MockRelease {
 }
 
 /// Build a gzipped server bundle whose `wyrd-server` prints `version`.
+/// With `ui`, it also holds the production UI payload `scripts/build.sh
+/// bundle` stages: `ui/package.json`, the `ui/build` server entry, and
+/// `ui/node_modules`; without it, only an empty `ui/build` directory.
 ///
 /// # Panics
 /// Panics when the scratch directory or system `tar` fails.
-fn bundle(version: &str) -> Vec<u8> {
+fn bundle(version: &str, ui: bool) -> Vec<u8> {
     let work = tempfile::tempdir().expect("scratch directory");
     let content = work.path().join("content");
     std::fs::create_dir_all(content.join("ui/build")).expect("bundle layout");
+    if ui {
+        std::fs::create_dir_all(content.join("ui/node_modules")).expect("UI dependencies");
+        std::fs::write(content.join("ui/package.json"), "{}").expect("UI package");
+        std::fs::write(content.join("ui/build/index.js"), "").expect("UI server entry");
+    }
     let binary = content.join("wyrd-server");
     std::fs::write(&binary, format!("#!/bin/sh\necho wyrd-server {version}\n")).expect("binary");
     std::fs::set_permissions(
@@ -71,7 +79,7 @@ fn bundle(version: &str) -> Vec<u8> {
 /// A correctly signed release of `version` for [`TARGET`].
 fn signed_release(tag: &'static str) -> MockRelease {
     let name = format!("wyrd-server-{TARGET}.tar.gz");
-    let bytes = bundle(tag.trim_start_matches('v'));
+    let bytes = bundle(tag.trim_start_matches('v'), true);
     let sums = format!("{:x}  {name}\n", Sha256::digest(&bytes)).into_bytes();
     let signature = signing_key().sign(&sums).to_bytes().to_vec();
     MockRelease {
@@ -200,7 +208,8 @@ async fn server_install_selects_latest_stable() {
 }
 
 /// Each failed update fails closed with a stable code and leaves the prior
-/// verified installation active and runnable.
+/// verified installation active and runnable, including a correctly signed
+/// bundle that lacks the production UI payload.
 ///
 /// # Panics
 /// Panics when a failure is accepted, its code differs, or the previous
@@ -233,20 +242,22 @@ async fn server_install_preserves_previous_on_failure() {
         let bytes = &mut release.assets[0].1;
         bytes.truncate(bytes.len() / 2);
     };
-    let not_runnable = |release: &mut MockRelease| {
-        let bytes = b"not a gzip archive".to_vec();
+    let resign = |release: &mut MockRelease, bytes: Vec<u8>| {
         let sums = format!("{:x}  {name}\n", Sha256::digest(&bytes)).into_bytes();
         release.assets[2].1 = signing_key().sign(&sums).to_bytes().to_vec();
         release.assets[0].1 = bytes;
         release.assets[1].1 = sums;
     };
-    let cases: [(&str, &Corruption<'_>); 6] = [
+    let not_runnable = |release: &mut MockRelease| resign(release, b"not a gzip archive".to_vec());
+    let no_ui = |release: &mut MockRelease| resign(release, bundle("0.2.1", false));
+    let cases: [(&str, &Corruption<'_>); 7] = [
         ("WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE", &missing_target),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &unsigned),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &altered_sums),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &altered_bytes),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &truncated),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &not_runnable),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &no_ui),
     ];
     for (code, corrupt) in cases {
         let server = MockServer::start().await;

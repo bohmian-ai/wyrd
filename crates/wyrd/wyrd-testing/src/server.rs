@@ -5358,7 +5358,8 @@ fn reservation_band() -> Option<Range<u16>> {
     .clone()
 }
 
-/// Ask the OS for one currently free loopback address used by a bound harness.
+/// Ask the OS for one currently free loopback address used by a bound harness
+/// or by a test that hands the address to a server process it spawns.
 ///
 /// Reserving before server composition gives membership a concrete nonzero
 /// private endpoint. The production binder later claims this exact address, so
@@ -5375,7 +5376,7 @@ fn reservation_band() -> Option<Range<u16>> {
 /// Returns a bind error when no candidate in the band is free within
 /// [`RESERVATION_ATTEMPTS`], when the port claim directory is unusable, or
 /// when loopback binding or address lookup fails.
-pub(crate) fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
+pub fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
     /// Process-wide offset into the band so successive reservations probe fresh ports.
     static CURSOR: AtomicU32 = AtomicU32::new(0);
     let Some(band) = reservation_band() else {

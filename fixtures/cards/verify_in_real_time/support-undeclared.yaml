@@ -11,5 +11,5 @@ spec:
       ref: ./assistant-agent.yaml
       verified_by:
         - verifier: ./turn-check.yaml
-        - verifier: ./undeclared-review.yaml
+        - verifier: ./undeclared-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

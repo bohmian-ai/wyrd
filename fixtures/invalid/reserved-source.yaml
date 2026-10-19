@@ -6,7 +6,7 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  description: A conversation review whose source slot takes the reserved group_id name.
+  description: A conversation Verifier whose source slot takes the reserved group_id name.
   inputs:
     group_id: verifiers.turn-check.inputs.turn
   requirements:

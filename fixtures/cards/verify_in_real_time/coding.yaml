@@ -12,5 +12,5 @@ spec:
       verified_by:
         - verifier: ./coding-turn.yaml
         - verifier: ./empty-each.yaml
-        - verifier: ./coding-review.yaml
+        - verifier: ./coding-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

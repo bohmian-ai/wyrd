@@ -1,4 +1,4 @@
-# coding-review's source is the coding-turn Card registered earlier, named by reference.
+# coding-verifier's source is the coding-turn Card registered earlier, named by reference.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -12,5 +12,5 @@ spec:
       ref: ./assistant-agent.yaml
       verified_by:
         - verifier: {kind: Verifier, name: coding-turn, version: 1.0.0, space: default}
-        - verifier: ./coding-review.yaml
+        - verifier: ./coding-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

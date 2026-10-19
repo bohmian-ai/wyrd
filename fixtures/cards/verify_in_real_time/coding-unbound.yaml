@@ -1,4 +1,4 @@
-# coding-review's coding-turn source has no binding on this site.
+# coding-verifier's coding-turn source has no binding on this site.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -11,5 +11,5 @@ spec:
     - alias: agent
       ref: ./assistant-agent.yaml
       verified_by:
-        - verifier: ./coding-review.yaml
+        - verifier: ./coding-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

@@ -1,7 +1,7 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: event-review
+  name: event-verifier
   version: 1.0.0
   space: default
 spec:

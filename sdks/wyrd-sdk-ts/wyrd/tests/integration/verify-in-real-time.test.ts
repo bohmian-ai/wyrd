@@ -50,7 +50,7 @@ const CALLER_SPAN = "b7ad6b7169203331";
 /** The stable refusal for a caller no grant authorizes. */
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
-/** The `coding-review` statement every request of its `spans-reviewed` check carries. */
+/** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */
 const LIVE_REVIEW = "spans were reviewed live";
 
 /** What a Chat Completions request carrying tool results contains. */
@@ -613,11 +613,11 @@ test("grouped refund changes verdict", async ({ server }) => {
   const recovered = await groupExecution(server, bindingId, WAIT_MS, unchanged.execution_id);
 
   expect(
-    [promised, corrected, unchanged, recovered].map((review) => [
-      review.group?.sources.facts.execution_ids.length,
-      review.result?.outcome.verdict,
-      review.result?.outcome.requirements.map((requirement) => requirement.id),
-      review.dispatches.length,
+    [promised, corrected, unchanged, recovered].map((execution) => [
+      execution.group?.sources.facts.execution_ids.length,
+      execution.result?.outcome.verdict,
+      execution.result?.outcome.requirements.map((requirement) => requirement.id),
+      execution.dispatches.length,
     ]),
     "only verdict changes dispatch",
   ).toEqual([
@@ -633,7 +633,7 @@ test("grouped refund changes verdict", async ({ server }) => {
   );
   expect(
     history.map((row) => [row.execution_id, row.verdict]),
-    "every review stays retained",
+    "every execution stays retained",
   ).toEqual([
     [promised.execution_id, "passed"],
     [corrected.execution_id, "failed"],
@@ -641,7 +641,7 @@ test("grouped refund changes verdict", async ({ server }) => {
     [recovered.execution_id, "passed"],
   ]);
   const alerts = await hooks.requests(2);
-  expect(alerts.map((alert) => alert.path)).toEqual(["/hooks/refund-review", "/hooks/refund-review"]);
+  expect(alerts.map((alert) => alert.path)).toEqual(["/hooks/refund-verification", "/hooks/refund-verification"]);
   expect(alerts.map((alert) => JSON.parse(alert.body))).toEqual([
     {
       execution_id: corrected.execution_id,
@@ -744,16 +744,17 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   expect(denied[0], "a denied read returns nothing").not.toContain("edit-file");
   await state.shutdown();
 
-  for (const [name, kind, code, reason] of [
-    ["coding-child", "Service", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
-    ["coding-unbound", "Service", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
-    ["support-ambiguous", "Service", "WYRD_SPEC_400_VALIDATION", "matches 2 bindings"],
-    ["support-undeclared", "Service", "WYRD_SPEC_400_VALIDATION", "does not declare"],
-    ["coding-cycle", "Service", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
-    ["reserved-typed", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
-    ["reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
+  for (const [relative, kind, code, reason] of [
+    ["invalid/coding-child", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"],
+    ["cards/verify_in_real_time/coding-unbound", "Service", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"],
+    ["cards/verify_in_real_time/support-ambiguous", "Service", "WYRD_SPEC_400_VALIDATION", "matches 2 bindings"],
+    ["cards/verify_in_real_time/support-undeclared", "Service", "WYRD_SPEC_400_VALIDATION", "does not declare"],
+    ["cards/verify_in_real_time/coding-cycle", "Service", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"],
+    ["invalid/reserved-typed", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
+    ["invalid/reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
   ] as const) {
-    const refused = await cards.registerFromPath(fixture(`cards/verify_in_real_time/${name}.yaml`)).then(
+    const name = relative.split("/").at(-1) ?? relative;
+    const refused = await cards.registerFromPath(fixture(`${relative}.yaml`)).then(
       () => undefined,
       (error: unknown) => error as WyrdError,
     );
@@ -893,8 +894,8 @@ async function reportedGroup(
 /** One retained result's execution identity. */
 const Retained = z.object({ execution_id: z.string() });
 
-/** The executions of `bindingId`'s retained group reviews, oldest first, after publishing every captured row. */
-async function groupReviews(server: { flushBifrost(): void }, bindingId: string): Promise<string[]> {
+/** The executions of `bindingId`'s retained group executions, oldest first, after publishing every captured row. */
+async function groupExecutions(server: { flushBifrost(): void }, bindingId: string): Promise<string[]> {
   server.flushBifrost();
   const rows = await (await Bifrost.connect()).sql(
     "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
@@ -948,19 +949,19 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   }
 
   const deadline = Date.now() + WAIT_MS;
-  let reviews = await groupReviews(server, bindingId);
-  while (reviews.length < 2) {
-    expect(Date.now(), "both conversations are reviewed").toBeLessThan(deadline);
+  let executions = await groupExecutions(server, bindingId);
+  while (executions.length < 2) {
+    expect(Date.now(), "both conversations are verified").toBeLessThan(deadline);
     await new Promise((resolve) => setTimeout(resolve, 500));
-    reviews = await groupReviews(server, bindingId);
+    executions = await groupExecutions(server, bindingId);
   }
   const judged: Record<string, unknown> = {};
-  for (const id of reviews) {
-    const review = await (await verify.Execution.connect(id)).status();
-    judged[review.group_id ?? ""] = [
-      review.group?.sources.turns.execution_ids.length,
-      review.result?.outcome.evidence.turns,
-      review.result?.outcome.verdict,
+  for (const id of executions) {
+    const execution = await (await verify.Execution.connect(id)).status();
+    judged[execution.group_id ?? ""] = [
+      execution.group?.sources.turns.execution_ids.length,
+      execution.result?.outcome.evidence.turns,
+      execution.result?.outcome.verdict,
     ];
   }
   expect(judged, "each conversation judges only its own pinned turns").toEqual({
@@ -975,7 +976,9 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   expect(ungrouped, "the ungrouped turn joins no group").toHaveLength(1);
   const quiet = Date.now() + 8_000;
   while (Date.now() < quiet) {
-    expect(await groupReviews(server, bindingId), "without new activity no group is reviewed again").toEqual(reviews);
+    expect(await groupExecutions(server, bindingId), "without new activity no group is verified again").toEqual(
+      executions,
+    );
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 });

@@ -571,15 +571,15 @@ def test_grouped_refund_changes_verdict(
     recovered = group_execution(wyrd_server, binding_id, WAIT_SECONDS, unchanged["execution_id"])
     state.shutdown()
 
-    reviews = [promised, overdue, unchanged, recovered]
+    executions = [promised, overdue, unchanged, recovered]
     assert [
         (
-            len(review["group"]["sources"]["facts"]["execution_ids"]),
-            review["result"]["outcome"]["verdict"],
-            [requirement["id"] for requirement in review["result"]["outcome"]["requirements"]],
-            len(review["dispatches"]),
+            len(execution["group"]["sources"]["facts"]["execution_ids"]),
+            execution["result"]["outcome"]["verdict"],
+            [requirement["id"] for requirement in execution["result"]["outcome"]["requirements"]],
+            len(execution["dispatches"]),
         )
-        for review in reviews
+        for execution in executions
     ] == [
         (2, "passed", ["latest-not-overdue"], 0),
         (4, "failed", ["latest-not-overdue"], 1),
@@ -597,14 +597,15 @@ def test_grouped_refund_changes_verdict(
         .to_pylist()
     )
     assert [(row["execution_id"], row["verdict"]) for row in history] == [
-        (review["execution_id"], review["result"]["outcome"]["verdict"]) for review in reviews
-    ], "every review stays retained"
+        (execution["execution_id"], execution["result"]["outcome"]["verdict"])
+        for execution in executions
+    ], "every execution stays retained"
     with receiver.delivered:
         assert receiver.delivered.wait_for(
-            lambda: len(receiver.to("/hooks/refund-review")) >= 2, WAIT_SECONDS
+            lambda: len(receiver.to("/hooks/refund-verification")) >= 2, WAIT_SECONDS
         ), "the failure and the recovery each dispatch"
     alerts = sorted(
-        (alert.body for alert in receiver.to("/hooks/refund-review")),
+        (alert.body for alert in receiver.to("/hooks/refund-verification")),
         key=lambda body: body["verdict"] == "passed",
     )
     assert alerts == [
@@ -717,17 +718,48 @@ def test_grouped_coding_uses_declared_sources(
     assert "edit-file" not in denied, "a denied read returns nothing"
     state.shutdown()
 
-    for name, kind, code, reason in [
-        ("coding-child", "Service", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
-        ("coding-unbound", "Service", "WYRD_SPEC_400_VALIDATION", "matches 0 bindings"),
-        ("support-ambiguous", "Service", "WYRD_SPEC_400_VALIDATION", "matches 2 bindings"),
-        ("support-undeclared", "Service", "WYRD_SPEC_400_VALIDATION", "does not declare"),
-        ("coding-cycle", "Service", "WYRD_SPEC_400_VALIDATION", "forms a source cycle"),
-        ("reserved-typed", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"),
-        ("reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"),
+    for relative, kind, code, reason in [
+        ("invalid/coding-child", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
+        (
+            "cards/verify_in_real_time/coding-unbound",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 0 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-ambiguous",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 2 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-undeclared",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "does not declare",
+        ),
+        (
+            "cards/verify_in_real_time/coding-cycle",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "forms a source cycle",
+        ),
+        (
+            "invalid/reserved-typed",
+            "Verifier",
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+        (
+            "invalid/reserved-source",
+            "Verifier",
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
     ]:
         with pytest.raises(WyrdError) as refused:
-            register(cards, f"cards/verify_in_real_time/{name}.yaml")
+            register(cards, f"{relative}.yaml")
+        name = relative.rsplit("/", 1)[-1]
         assert refused.value.code == code, name
         assert reason in f"{refused.value} {refused.value.details}", name
         with pytest.raises(WyrdError) as absent:
@@ -851,8 +883,8 @@ def test_grouped_sampled_frames_use_visible_outcomes(
     other.shutdown()
 
 
-def group_reviews(server: WyrdTestServer, binding_id: str, groups: list[str]) -> list[str]:
-    """The executions of ``binding_id``'s retained reviews of ``groups``, oldest first."""
+def group_executions(server: WyrdTestServer, binding_id: str, groups: list[str]) -> list[str]:
+    """The executions of ``binding_id``'s retained executions of ``groups``, oldest first."""
     server.flush_bifrost()
     rows = Bifrost(client=client_of(server)).sql(
         "SELECT execution_id FROM vala.verification.results "
@@ -926,15 +958,15 @@ def test_grouped_conversations_coexist_with_drift(
         each.shutdown()
 
     deadline = time.monotonic() + WAIT_SECONDS
-    while len(reviews := group_reviews(wyrd_server, binding_id, [a, b])) < 2:
-        assert time.monotonic() < deadline, "both conversations are reviewed"
+    while len(executions := group_executions(wyrd_server, binding_id, [a, b])) < 2:
+        assert time.monotonic() < deadline, "both conversations are verified"
         time.sleep(0.5)
     judged = {}
-    for execution_id in reviews:
-        review = verify.Execution.connect(execution_id, admin).status()
-        outcome = review["result"]["outcome"]
-        judged[review["group_id"]] = (
-            len(review["group"]["sources"]["turns"]["execution_ids"]),
+    for execution_id in executions:
+        execution = verify.Execution.connect(execution_id, admin).status()
+        outcome = execution["result"]["outcome"]
+        judged[execution["group_id"]] = (
+            len(execution["group"]["sources"]["turns"]["execution_ids"]),
             outcome["evidence"]["turns"],
             outcome["verdict"],
         )
@@ -951,7 +983,7 @@ def test_grouped_conversations_coexist_with_drift(
     assert len(ungrouped) == 1, "the ungrouped turn joins no group"
     quiet = time.monotonic() + 8
     while time.monotonic() < quiet:
-        assert group_reviews(wyrd_server, binding_id, [a, b]) == reviews, (
+        assert group_executions(wyrd_server, binding_id, [a, b]) == executions, (
             "without new activity a judged group is not read again"
         )
         time.sleep(0.5)

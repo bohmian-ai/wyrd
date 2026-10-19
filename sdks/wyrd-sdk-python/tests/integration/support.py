@@ -29,7 +29,7 @@ ON_CALL_TOKEN = "on-call-bearer-token"
 """The bearer secret the ``on-call-hooks`` connection presents to the receiver."""
 
 LIVE_REVIEW = "spans were reviewed live"
-"""The ``coding-review`` statement every request of its ``spans-reviewed`` check carries."""
+"""The ``coding-verifier`` statement every request of its ``spans-reviewed`` check carries."""
 
 FRAME_CLAIM = "Cite the frame."
 """Text every ``frame-verifier`` judge request carries."""

@@ -1307,10 +1307,10 @@ mod pg_tests {
         Ok(binding_id)
     }
 
-    /// The `outcomes` source's execution IDs in a group review's pinned
-    /// snapshot, in list order; empty when the review pins none.
-    fn ids(review: &JsonValue) -> Vec<&str> {
-        review["group"]["sources"]["outcomes"]["execution_ids"]
+    /// The `outcomes` source's execution IDs in a group execution's pinned
+    /// snapshot, in list order; empty when the execution pins none.
+    fn ids(execution: &JsonValue) -> Vec<&str> {
+        execution["group"]["sources"]["outcomes"]["execution_ids"]
             .as_array()
             .into_iter()
             .flatten()
@@ -1318,17 +1318,17 @@ mod pg_tests {
             .collect()
     }
 
-    /// A group review, read over MCP once its group comes due: poll
+    /// A group execution, read over MCP once its group comes due: poll
     /// `verification.get_binding` until it names a completed execution other
     /// than `after` whose result is visible, publishing captured rows each
-    /// round so the group poller discovers them and a completed review's
+    /// round so the group poller discovers them and a completed execution's
     /// staged result becomes readable.
     ///
     /// # Errors
     ///
-    /// Returns a tool-call or flush failure, or an error when no review
+    /// Returns a tool-call or flush failure, or an error when no execution
     /// completes within [`SETTLE`].
-    async fn group_review(
+    async fn group_execution(
         server: &WyrdTestServer,
         client: &RunningService<RoleClient, ()>,
         binding_id: &str,
@@ -1354,7 +1354,7 @@ mod pg_tests {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!("binding {binding_id} completed no group review").into());
+                return Err(format!("binding {binding_id} completed no group execution").into());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1363,21 +1363,21 @@ mod pg_tests {
     /// An agent discovers its `group_end` binding, judges a conversation's
     /// turns through `verification.execute` and a keyed
     /// `verification.enqueue` that both carry `group_id`, and inspects the
-    /// group review over MCP.
+    /// group execution over MCP.
     ///
     /// The Service reads its Card and finds the binding whose status pins
     /// `group_end` settings. Each grouped tool result and execution read
     /// echoes the same `group_id`, and an ungrouped `execute` leaves its
     /// result without one. Once its `after` period expires the binding names one
-    /// review whose snapshot holds exactly the two grouped turns in call
+    /// execution whose snapshot holds exactly the two grouped turns in call
     /// order, and `bifrost.query` reads the same `group_id` on its persisted
     /// result row. A reader is refused a grouped enqueue, and another
-    /// tenant's administrator cannot read the review.
+    /// tenant's administrator cannot read the execution.
     ///
     /// # Errors
     ///
     /// Returns server startup, bootstrap, registration, MCP transport, or
-    /// tool-call failures, or an error when an execution or the review never
+    /// tool-call failures, or an error when a turn or the group execution never
     /// settles.
     ///
     /// # Panics
@@ -1462,28 +1462,35 @@ mod pg_tests {
         )?;
         let solo = text(&ungrouped, "/execution_id")?.to_owned();
 
-        // Observe: one review over exactly the two grouped turns, in call order.
-        let review = group_review(&server, &agent_client, binding_id, None).await?;
-        assert_eq!(review["group_id"], "conv-mcp", "{review}");
-        assert_eq!(review["owner_card_uid"], service_uid.as_str(), "{review}");
+        // Observe: one execution over exactly the two grouped turns, in call order.
+        let execution = group_execution(&server, &agent_client, binding_id, None).await?;
+        assert_eq!(execution["group_id"], "conv-mcp", "{execution}");
         assert_eq!(
-            review["group"]["sources"]["turns"]["execution_ids"],
+            execution["owner_card_uid"],
+            service_uid.as_str(),
+            "{execution}"
+        );
+        assert_eq!(
+            execution["group"]["sources"]["turns"]["execution_ids"],
             serde_json::json!([first, second]),
-            "{review}"
+            "{execution}"
         );
         assert_eq!(
-            review["result"]["outcome"]["evidence"]["turns"],
+            execution["result"]["outcome"]["evidence"]["turns"],
             serde_json::json!({ "kind": "json", "value": [{ "answer": "first" }, { "answer": "second" }] }),
-            "{review}"
+            "{execution}"
         );
-        assert_eq!(review["result"]["outcome"]["verdict"], "passed", "{review}");
-        let review_id = text(&review, "/execution_id")?.to_owned();
+        assert_eq!(
+            execution["result"]["outcome"]["verdict"], "passed",
+            "{execution}"
+        );
+        let group_execution_id = text(&execution, "/execution_id")?.to_owned();
         server.flush_bifrost().await?;
         let persisted = rows(
             &agent_client,
             format!(
                 "SELECT execution_id, group_id FROM vala.verification.results \
-                 WHERE execution_id IN ('{first}', '{solo}', '{review_id}') ORDER BY ended_at"
+                 WHERE execution_id IN ('{first}', '{solo}', '{group_execution_id}') ORDER BY ended_at"
             ),
         )
         .await?;
@@ -1492,7 +1499,7 @@ mod pg_tests {
             serde_json::json!([
                 [first, "conv-mcp"],
                 [solo, JsonValue::Null],
-                [review_id, "conv-mcp"]
+                [group_execution_id, "conv-mcp"]
             ]),
             "the persisted group_id column matches each call"
         );
@@ -1517,13 +1524,13 @@ mod pg_tests {
             foreign_client
                 .call_tool(call(
                     GET_EXECUTION,
-                    serde_json::json!({ "execution_id": review_id }),
+                    serde_json::json!({ "execution_id": group_execution_id }),
                 )?)
                 .await,
         )?;
         assert!(
             foreign_read.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
-            "another tenant cannot read the group review: {foreign_read}"
+            "another tenant cannot read the group execution: {foreign_read}"
         );
         foreign_client.cancel().await?;
         server.shutdown().await?;
@@ -1630,11 +1637,11 @@ mod pg_tests {
         }
     }
 
-    /// An HTTP/MCP review agent submits an event's sampled frames as
+    /// An HTTP/MCP agent submits an event's sampled frames as
     /// uploaded files under the event id as `group_id`, reports the event
-    /// fact, and reads the event review over MCP.
+    /// fact, and reads the event's group execution over MCP.
     ///
-    /// The event fact alone yields a review over `[]` frame outcomes,
+    /// The event fact alone yields an execution over `[]` frame outcomes,
     /// inconclusive `empty_selection`. Two frames, one unbadged, fail the
     /// event with the failed frame kept in place, while a frame another
     /// Service submits under the same `group_id` never joins it and a
@@ -1644,13 +1651,13 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns provider, server, bootstrap, registration, MCP transport,
-    /// upload, or tool-call failures, or an error when a review never
+    /// upload, or tool-call failures, or an error when an execution never
     /// settles.
     ///
     /// # Panics
     ///
-    /// Panics when an upload is refused or a review, coverage, or refusal
-    /// expectation fails.
+    /// Panics when an upload is refused, or when a group execution's selected
+    /// frame executions, their outcomes, its verdict, or a refusal differ.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn grouped_frames_use_visible_outcomes() -> Result<(), McpJourneyError> {
@@ -1744,7 +1751,7 @@ mod pg_tests {
         let reason = "/result/outcome/requirements/0/reason";
 
         structured(agent.client.call_tool(fact("door-44")?).await?)?;
-        let empty = group_review(&server, &agent.client, &binding_id, None).await?;
+        let empty = group_execution(&server, &agent.client, &binding_id, None).await?;
         assert_eq!(empty["group_id"], "door-44", "{empty}");
         assert_eq!(
             empty.pointer(outcomes),
@@ -1780,7 +1787,7 @@ mod pg_tests {
             "completed"
         );
         structured(agent.client.call_tool(fact("door-43")?).await?)?;
-        let failing = group_review(
+        let failing = group_execution(
             &server,
             &agent.client,
             &binding_id,
@@ -1822,7 +1829,7 @@ mod pg_tests {
             settle(&agent.client, execution).await?;
         }
         structured(agent.client.call_tool(fact("door-45")?).await?)?;
-        let passing = group_review(
+        let passing = group_execution(
             &server,
             &agent.client,
             &binding_id,

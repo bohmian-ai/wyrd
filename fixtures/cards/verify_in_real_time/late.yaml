@@ -1,6 +1,6 @@
-# A judged conversation whose whole-conversation review is slow, so turns
+# A judged conversation whose whole-conversation group execution is slow, so turns
 # can arrive while it runs and a turn's own judgment can land after the next
-# review pinned it.
+# execution pinned it.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -14,5 +14,5 @@ spec:
       ref: ./assistant-agent.yaml
       verified_by:
         - verifier: ./answer-judged.yaml
-        - verifier: ./late-review.yaml
+        - verifier: ./late-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

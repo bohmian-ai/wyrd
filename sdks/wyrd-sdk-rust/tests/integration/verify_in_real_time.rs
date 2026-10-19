@@ -1644,7 +1644,7 @@ async fn grouped_support_resumes() {
                     "verified_by": [{
                         "verifier": registered(&support.receipt, "turn-check"),
                     }, {
-                        "verifier": registered(&support.receipt, "conversation-review"),
+                        "verifier": registered(&support.receipt, "conversation-verifier"),
                         "runs_on": {"kind": "group_end", "after": after},
                     }],
                 }],
@@ -1774,20 +1774,20 @@ struct GroupResultRow {
     verdict: String,
 }
 
-/// An order conversation's refund promises are reviewed over their whole
+/// An order conversation's refund promises are verified over their whole
 /// history each time new acknowledged evidence lets the binding's `after`
-/// period expire, with no finality cutoff; the review judges the latest
-/// fact. The first review passes and dispatches nothing; a burst of turns
-/// ending overdue debounces into one failed review that dispatches its
+/// period expire, with no finality cutoff; the execution judges the latest
+/// fact. The first execution passes and dispatches nothing; a burst of turns
+/// ending overdue debounces into one failed execution that dispatches its
 /// Operator once with the group and the passed result it changed from; a
 /// further overdue turn keeps the verdict failed and dispatches nothing; and
 /// a corrected paid-in-full fact passes again, dispatching the recovery with
-/// the failed result it changed from. Every review stays retained history.
+/// the failed result it changed from. Every execution stays retained history.
 /// A `group_end` binding declaring `on_failure` is refused at registration,
 /// naming the field.
 ///
 /// # Panics
-/// Panics when a step fails, a review is not judged in time, or a review,
+/// Panics when a step fails, an execution is not judged in time, or an execution,
 /// dispatch, or refusal differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -1828,14 +1828,14 @@ async fn grouped_refund_changes_verdict() {
         .group_execution(&refund.binding, Some(&unchanged.execution_id), WAIT)
         .await;
 
-    let verdicts = [&promised, &overdue, &unchanged, &recovered].map(|review| {
-        let result = review.result.as_ref().expect("the result is visible");
+    let verdicts = [&promised, &overdue, &unchanged, &recovered].map(|execution| {
+        let result = execution.result.as_ref().expect("the result is visible");
         (
-            review.group.as_ref().expect("snapshot").sources[&slot]
+            execution.group.as_ref().expect("snapshot").sources[&slot]
                 .execution_ids
                 .len(),
             result.outcome.verdict,
-            review.dispatches.len(),
+            execution.dispatches.len(),
         )
     });
     assert_eq!(
@@ -1858,7 +1858,7 @@ async fn grouped_refund_changes_verdict() {
                 &[QueryParam::String(refund.binding.to_string())],
             )
             .await
-            .expect("the reviews read back");
+            .expect("the executions read back");
     assert_eq!(
         history
             .iter()
@@ -1870,7 +1870,7 @@ async fn grouped_refund_changes_verdict() {
             (unchanged.execution_id.to_string(), "failed"),
             (recovered.execution_id.to_string(), "passed"),
         ],
-        "every review stays retained"
+        "every execution stays retained"
     );
     for (changed, previous, verdict, previous_verdict) in
         [(1, 0, "failed", "passed"), (3, 2, "passed", "failed")]
@@ -1913,7 +1913,7 @@ async fn grouped_refund_changes_verdict() {
     assistant.deployment.shutdown().await;
 }
 
-/// The `coding-review` judge's statement, which every request of its
+/// The `coding-verifier` judge's statement, which every request of its
 /// `spans-reviewed` check carries.
 const LIVE_REVIEW: &str = "spans were reviewed live";
 
@@ -2028,13 +2028,13 @@ async fn script_coding_judge(
 }
 
 /// A coding session's prompt, edit, and test calls are judged per turn, and
-/// once its `after` period expires the whole session is reviewed from only
+/// once its `after` period expires the whole session is verified from only
 /// its declared sources:
 /// each call, its trace ID where one was recorded and null where none was,
 /// and each call's test outcome, failed one included. The trace slot carries
 /// the ID alone: the check Agent's first request names no span, and its
 /// `bifrost.query`, under the owning Service's ordinary tool and query
-/// grants, reads live a span exported only after the review pinned and sent
+/// grants, reads live a span exported only after the execution pinned and sent
 /// its trace IDs, which stay unchanged; once that grant
 /// is revoked, a later session's read is denied with nothing returned. An empty `each` selection is inconclusive `empty_selection`
 /// inline and after a step. Holding only one of the tool-invoke and query
@@ -2046,7 +2046,7 @@ async fn script_coding_judge(
 /// Verifier named by reference to its registered Card binds.
 ///
 /// # Panics
-/// Panics when a step fails, the session is not reviewed in time, or a
+/// Panics when a step fails, the session is not verified in time, or a
 /// judgment, a judge request, or a refusal differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -2269,17 +2269,17 @@ async fn grouped_coding_uses_declared_sources() {
             )
             .await
             .expect("the call is judged");
-        let review = deployment
+        let execution = deployment
             .group_execution(&coding.binding, Some(&after), WAIT)
             .await;
-        after = review.execution_id;
-        assert_eq!(review.group_id.as_ref(), Some(&later));
+        after = execution.execution_id;
+        assert_eq!(execution.group_id.as_ref(), Some(&later));
         let reads: Vec<_> = judged_bodies(&assistant.judge, LIVE_REVIEW)
             .await
             .into_iter()
             .filter(|body| body.contains(TOOL_TURN))
             .collect();
-        let read = reads.last().expect("the review asked to read");
+        let read = reads.last().expect("the execution asked to read");
         assert!(
             read.contains(denial) && !read.contains("edit-file"),
             "without {revoked}, the read is denied with nothing returned: {read}"
@@ -2289,52 +2289,54 @@ async fn grouped_coding_uses_declared_sources() {
     let cards = deployment.cards().await;
     for (relative, kind, code, reason) in [
         (
-            "coding-child",
-            CardKind::Service,
+            "invalid/coding-child",
+            CardKind::Verifier,
             "WYRD_LOADER_400_INVALID_ENVELOPE",
             "child fields",
         ),
         (
-            "coding-unbound",
+            "cards/verify_in_real_time/coding-unbound",
             CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "matches 0 bindings",
         ),
         (
-            "support-ambiguous",
+            "cards/verify_in_real_time/support-ambiguous",
             CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "matches 2 bindings",
         ),
         (
-            "support-undeclared",
+            "cards/verify_in_real_time/support-undeclared",
             CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "does not declare",
         ),
         (
-            "coding-cycle",
+            "cards/verify_in_real_time/coding-cycle",
             CardKind::Service,
             "WYRD_SPEC_400_VALIDATION",
             "forms a source cycle",
         ),
         (
-            "reserved-typed",
+            "invalid/reserved-typed",
             CardKind::Verifier,
             "WYRD_LOADER_400_INVALID_ENVELOPE",
             "inputs.group_id",
         ),
         (
-            "reserved-source",
+            "invalid/reserved-source",
             CardKind::Verifier,
             "WYRD_LOADER_400_INVALID_ENVELOPE",
             "inputs.group_id",
         ),
     ] {
+        let name = relative
+            .rsplit('/')
+            .next()
+            .expect("a fixture path names its Card");
         let refused = cards
-            .register_from_path(&fixture(&format!(
-                "cards/verify_in_real_time/{relative}.yaml"
-            )))
+            .register_from_path(&fixture(&format!("{relative}.yaml")))
             .await
             .expect_err(relative);
         assert_eq!(refused.code(), code, "{relative}: {refused}");
@@ -2346,7 +2348,7 @@ async fn grouped_coding_uses_declared_sources() {
             .resolve_latest(
                 kind,
                 "default".parse().expect("space parses"),
-                relative.parse().expect("name parses"),
+                name.parse().expect("name parses"),
             )
             .await
             .expect_err("a refused Card is not registered");
@@ -2505,7 +2507,7 @@ async fn submit_frames(
 
 /// An application samples door events into PNG frames, submits each frame
 /// under the event id as `group_id`, and reports the event fact; once the
-/// event's `after` period expires `event-review` judges the whole frame list
+/// event's `after` period expires `event-verifier` judges the whole frame list
 /// from the visible frame outcomes. Zero frames are inconclusive
 /// `empty_selection`; one unbadged frame of twenty fails the event, and
 /// frames another Service or an unauthorized caller submits never join it;
@@ -2766,15 +2768,15 @@ struct Grouping {
     group_id: Option<String>,
 }
 
-/// The executions of `binding`'s retained group reviews, oldest first, read
+/// The executions of `binding`'s retained group executions, oldest first, read
 /// as the administrator after publishing every captured row.
 ///
 /// # Panics
 /// Panics when a flush or the read fails.
-async fn group_reviews(deployment: &Deployment, binding: &BindingId) -> Vec<ExecutionId> {
+async fn group_executions(deployment: &Deployment, binding: &BindingId) -> Vec<ExecutionId> {
     /// One `vala.verification.results` row's execution identity.
     #[derive(Deserialize)]
-    struct Review {
+    struct Row {
         /// The group execution the result settled.
         execution_id: String,
     }
@@ -2783,7 +2785,7 @@ async fn group_reviews(deployment: &Deployment, binding: &BindingId) -> Vec<Exec
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let rows: Vec<Review> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+    let rows: Vec<Row> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as(
@@ -2792,7 +2794,7 @@ async fn group_reviews(deployment: &Deployment, binding: &BindingId) -> Vec<Exec
             &[QueryParam::String(binding.to_string())],
         )
         .await
-        .expect("the reviews read back");
+        .expect("the executions read back");
     rows.into_iter()
         .map(|row| {
             row.execution_id
@@ -2802,13 +2804,13 @@ async fn group_reviews(deployment: &Deployment, binding: &BindingId) -> Vec<Exec
         .collect()
 }
 
-/// Assert `binding` retains exactly `expected` group reviews for eight
+/// Assert `binding` retains exactly `expected` group executions for eight
 /// seconds while the scheduler keeps polling: a handed-off group with no new
 /// acknowledged activity is never judged again.
 ///
 /// # Panics
-/// Panics when a further review is retained.
-async fn assert_no_new_review(
+/// Panics when a further execution is retained.
+async fn assert_no_new_group_execution(
     deployment: &Deployment,
     binding: &BindingId,
     expected: &[ExecutionId],
@@ -2816,9 +2818,9 @@ async fn assert_no_new_review(
     let quiet = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < quiet {
         assert_eq!(
-            group_reviews(deployment, binding).await,
+            group_executions(deployment, binding).await,
             expected,
-            "no group is reviewed twice"
+            "no group is verified twice"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -2827,12 +2829,12 @@ async fn assert_no_new_review(
 /// Two support conversations run at once beside a drift sample, an
 /// ungrouped turn, the same `group_id` in another tenant, and a turn judged
 /// by a newer `turn-check` registered after the binding pinned its source.
-/// Each conversation is reviewed once with only its own pinned turns, in
+/// Each conversation is verified once with only its own pinned turns, in
 /// call order, the ungrouped turn reads back with no group, the drift sample
-/// is recorded as usual, and later passes review no group a second time.
+/// is recorded as usual, and later passes judge no group a second time.
 ///
 /// # Panics
-/// Panics when a step fails, a review is not judged in time, or a review
+/// Panics when a step fails, an execution is not judged in time, or an execution
 /// differs or repeats.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -2934,30 +2936,33 @@ async fn grouped_conversations_coexist_with_drift() {
     }
 
     let deadline = tokio::time::Instant::now() + WAIT;
-    let reviews = loop {
-        let reviews = group_reviews(deployment, &support.binding).await;
-        if reviews.len() >= 2 {
-            break reviews;
+    let executions = loop {
+        let executions = group_executions(deployment, &support.binding).await;
+        if executions.len() >= 2 {
+            break executions;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "both conversations are reviewed within {WAIT:?}"
+            "both conversations are verified within {WAIT:?}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     let admin = deployment.admin();
     let mut judged = Vec::new();
-    for id in &reviews {
+    for id in &executions {
         let state = Execution::connect_with(*id, &admin)
             .await
             .expect("the execution handle connects")
             .status()
             .await
-            .expect("the review reads");
+            .expect("the execution reads");
         let result = state.result.expect("the result is visible");
         judged.push((
-            state.group_id.expect("a group review names its group"),
-            state.group.expect("the review pins its snapshot").sources[&slot]
+            state.group_id.expect("a group execution names its group"),
+            state
+                .group
+                .expect("the execution pins its snapshot")
+                .sources[&slot]
                 .execution_ids
                 .len(),
             serde_json::to_value(&result.outcome.evidence[&slot]).expect("evidence encodes"),
@@ -2998,31 +3003,31 @@ async fn grouped_conversations_coexist_with_drift() {
         "the turn joins no group"
     );
 
-    assert_no_new_review(deployment, &support.binding, &reviews).await;
+    assert_no_new_group_execution(deployment, &support.binding, &executions).await;
     assistant.deployment.shutdown().await;
 }
 
-/// One evidence slot of `review`'s result as JSON.
+/// One evidence slot of `execution`'s result as JSON.
 ///
 /// # Panics
-/// Panics when the review has no result or no such slot.
-fn evidence(review: &VerificationExecutionState, slot: &str) -> serde_json::Value {
-    let result = review.result.as_ref().expect("the result is visible");
+/// Panics when the execution has no result or no such slot.
+fn evidence(execution: &VerificationExecutionState, slot: &str) -> serde_json::Value {
+    let result = execution.result.as_ref().expect("the result is visible");
     serde_json::to_value(&result.outcome.evidence[&slot.parse().expect("slot name")])
         .expect("evidence encodes")
 }
 
-/// A judged conversation's review is slow. Answers acknowledged while it
-/// runs reach exactly one next, overlapping review, which pins a
+/// A judged conversation's execution is slow. Answers acknowledged while it
+/// runs reach exactly one next, overlapping execution, which pins a
 /// still-running answer's judgment as null; once that judgment lands, its
-/// acknowledged result reaches exactly one more review. The first review's
-/// snapshot is unchanged by later evidence, every review stays retained,
-/// and nothing is reviewed again. Throughout, a neighbouring conversation
+/// acknowledged result reaches exactly one more execution. The first execution's
+/// snapshot is unchanged by later evidence, every execution stays retained,
+/// and nothing is verified again. Throughout, a neighbouring conversation
 /// bound under a one-year `after`, the longest a Trigger accepts, does not
 /// come due and never holds up the late group's progress.
 ///
 /// # Panics
-/// Panics when a step fails, a review is not judged in time, or a review
+/// Panics when a step fails, an execution is not judged in time, or an execution
 /// differs or repeats.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -3074,7 +3079,7 @@ async fn grouped_executions_include_late_evidence() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the first review is enqueued"
+            "the first execution is enqueued"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
@@ -3092,16 +3097,23 @@ async fn grouped_executions_include_late_evidence() {
     else {
         panic!("an answer-judged submission queues an execution");
     };
-    let review = Execution::connect_with(first_id, &deployment.admin())
+    let execution = Execution::connect_with(first_id, &deployment.admin())
         .await
         .expect("the execution handle connects");
     assert_ne!(
-        review.status().await.expect("the review reads").status,
+        execution
+            .status()
+            .await
+            .expect("the execution reads")
+            .status,
         VerificationExecutionStatus::Completed,
-        "both answers were recorded while the first review ran"
+        "both answers were recorded while the first execution ran"
     );
-    review.wait(WAIT).await.expect("the first review completes");
-    let first = review.status().await.expect("the review reads");
+    execution
+        .wait(WAIT)
+        .await
+        .expect("the first execution completes");
+    let first = execution.status().await.expect("the execution reads");
     assert_eq!(
         evidence(&first, "answer"),
         json!({"kind": "json", "value": ["first answer"]})
@@ -3113,7 +3125,7 @@ async fn grouped_executions_include_late_evidence() {
     assert_eq!(
         evidence(&next, "answer"),
         json!({"kind": "json", "value": ["first answer", "second answer", "late answer"]}),
-        "one next review covers every answer recorded during the first"
+        "one next execution covers every answer recorded during the first"
     );
     assert_eq!(
         evidence(&next, "agreed"),
@@ -3127,7 +3139,7 @@ async fn grouped_executions_include_late_evidence() {
     assert_eq!(
         evidence(&settled, "agreed"),
         json!({"kind": "json", "value": ["passed", "passed", "passed"]}),
-        "the late judgment is judged by exactly one more review"
+        "the late judgment is judged by exactly one more execution"
     );
     late.state.shutdown().await.expect("Bifrost stops");
     assert_eq!(
@@ -3136,12 +3148,12 @@ async fn grouped_executions_include_late_evidence() {
             .expect("the execution handle connects")
             .status()
             .await
-            .expect("the review reads")
+            .expect("the execution reads")
             .group,
         first.group,
         "later evidence leaves the first snapshot unchanged"
     );
-    assert_no_new_review(
+    assert_no_new_group_execution(
         deployment,
         &late.binding,
         &[first_id, next.execution_id, settled.execution_id],
@@ -3190,17 +3202,17 @@ async fn denials(deployment: &Deployment, principal: &str) -> Vec<String> {
 }
 
 /// A support conversation whose owning Service may run its turns but may
-/// not query Bifrost is never reviewed: the snapshot reads run under the
+/// not query Bifrost is never verified: the snapshot reads run under the
 /// Service's own grants and the denial is retained. A query grant scoped to
 /// the trace tables is still no grant on the verification sources. A denied
 /// read enqueues nothing and leaves the group pending; once the Service
-/// holds its default role again, the next pass reviews the whole
+/// holds its default role again, the next pass judges the whole
 /// conversation from its inputs and outcomes, and with no trace slot or
 /// Agent check nothing else is queried.
 ///
 /// # Panics
-/// Panics when a step fails, a review happens while the reads are not
-/// granted, a denial is not retained, or the review differs.
+/// Panics when a step fails, an execution happens while the reads are not
+/// granted, a denial is not retained, or the execution differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn grouped_reads_need_the_owner_grant() {
@@ -3261,7 +3273,7 @@ async fn grouped_reads_need_the_owner_grant() {
         support.turn("turn-check", &group, turn.clone()).await;
     }
 
-    assert_no_new_review(deployment, &support.binding, &[]).await;
+    assert_no_new_group_execution(deployment, &support.binding, &[]).await;
     let denied = denials(deployment, &owner).await;
     assert!(
         denied
@@ -3270,7 +3282,7 @@ async fn grouped_reads_need_the_owner_grant() {
         "the poll's query is denied as the owner: {denied:?}"
     );
     swap("turns_only", "traces_reader").await;
-    assert_no_new_review(deployment, &support.binding, &[]).await;
+    assert_no_new_group_execution(deployment, &support.binding, &[]).await;
     swap("traces_reader", "workload").await;
     let judged = deployment
         .group_execution(&support.binding, None, WAIT)
@@ -3303,7 +3315,7 @@ async fn grouped_reads_need_the_owner_grant() {
         .expect("the judge records requests");
     assert!(
         asked.is_empty(),
-        "a review without a trace or Agent check queries nothing"
+        "an execution without a trace or Agent check queries nothing"
     );
     assistant.deployment.shutdown().await;
 }

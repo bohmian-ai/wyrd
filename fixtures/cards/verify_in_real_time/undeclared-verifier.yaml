@@ -1,11 +1,11 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: undeclared-review
+  name: undeclared-verifier
   version: 1.0.0
   space: default
 spec:
-  description: A conversation review sourcing a slot turn-check does not declare.
+  description: A conversation Verifier sourcing a slot turn-check does not declare.
   inputs:
     questions: verifiers.turn-check.inputs.question
   requirements:

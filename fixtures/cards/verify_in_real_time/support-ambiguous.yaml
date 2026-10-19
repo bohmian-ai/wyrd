@@ -1,4 +1,4 @@
-# turn-check is bound twice on this site, so conversation-review's source matches two bindings.
+# turn-check is bound twice on this site, so conversation-verifier's source matches two bindings.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -13,5 +13,5 @@ spec:
       verified_by:
         - verifier: ./turn-check.yaml
         - verifier: ./turn-check-newer.yaml
-        - verifier: ./conversation-review.yaml
+        - verifier: ./conversation-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

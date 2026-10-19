@@ -1,5 +1,5 @@
 # A person-detection application: its sampled frames and the event fact it
-# reports share the event id as group id, and event-review judges the event
+# reports share the event id as group id, and event-verifier judges the event
 # once the group comes due.
 apiVersion: wyrd/v1
 kind: Service
@@ -15,5 +15,5 @@ spec:
       verified_by:
         - verifier: ./frame-verifier.yaml
         - verifier: ./event-fact.yaml
-        - verifier: ./event-review.yaml
+        - verifier: ./event-verifier.yaml
           runs_on: {kind: group_end, after: 3s}

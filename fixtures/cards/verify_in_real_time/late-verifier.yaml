@@ -1,11 +1,11 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: late-review
+  name: late-verifier
   version: 1.0.0
   space: default
 spec:
-  description: A judge Agent reviews every answer of the conversation and its judgment.
+  description: A judge Agent judges every answer of the conversation and its judgment.
   inputs:
     answer: verifiers.answer-judged.inputs.answer
     agreed: verifiers.answer-judged.requirements.agrees.outcome

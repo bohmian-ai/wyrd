@@ -216,8 +216,16 @@ mod pg_tests {
 
         /// The onboarding topic names the final CLI and SDK workflow and its docs.
         ///
+        /// Reads `wyrd.guide {"topic":"start"}` through the live MCP session,
+        /// joins its string steps, and requires every term an agent needs to
+        /// go from setup through declare, pull, observe, and verify readback.
+        ///
         /// # Errors
-        /// Returns a transport failure or a guide without onboarding steps.
+        /// Returns the MCP transport or tool failure from the guide read, or a
+        /// shape error when the `start` topic has no `steps` array.
+        ///
+        /// # Panics
+        /// Panics when the joined steps omit any taught term.
         async fn onboarding(&self) -> Result<(), McpJourneyError> {
             let guide = self.read("wyrd.guide", json!({ "topic": "start" })).await?;
             let steps = guide["steps"]

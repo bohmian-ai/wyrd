@@ -183,8 +183,8 @@ async fn part_url(
     ),
     request_body = UploadCompleteRequest,
     responses(
-        (status = 200, description = "The stored artifact's recorded metadata",
-         body = wyrd_spec::storage::UploadCompleteResponse),
+        (status = 200, description = "The stored artifact's recorded metadata, also for an \
+          upload already completed", body = wyrd_spec::storage::UploadCompleteResponse),
         (status = 400, description = "The idempotency key or upload identifier is malformed, or \
           the stored bytes disagree with what was declared (WYRD_SPEC_400_VALIDATION, \
           WYRD_STORAGE_400_INVALID_UPLOAD_ID, WYRD_STORAGE_400_SHA256_MISMATCH, \
@@ -197,7 +197,7 @@ async fn part_url(
         (status = 404, description = "No such upload, or its object never reached the backend \
           (WYRD_STORAGE_404_UPLOAD_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
          body = WyrdProblem),
-        (status = 409, description = "The upload is already terminal, the backend did not \
+        (status = 409, description = "The upload was aborted or failed, the backend did not \
           advertise encryption, or the artifact row conflicts \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING, WYRD_STORAGE_409_ENCRYPTION_MISSING, \
           WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),

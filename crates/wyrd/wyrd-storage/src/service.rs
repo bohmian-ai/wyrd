@@ -323,6 +323,18 @@ pub async fn upload_part_url(
 }
 
 /// Complete an upload and return the verified stored object descriptor.
+///
+/// A pending upload has its backend upload finished, its object verified,
+/// and its metadata recorded. An already completed upload is a replay: the
+/// Card reconciler can activate a Card, completing its upload, between the
+/// client's object write and this call, and a transport retry can repeat an
+/// applied completion. The replay skips the backend step and re-verifies the
+/// stored object, whose metadata writes are idempotent.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_409_UPLOAD_NOT_PENDING` for an aborted or failed
+/// upload, and the storage, validation, or SQL error of any failed step;
+/// a failed backend completion or verification marks a pending upload failed.
 #[instrument(
     skip(storage, postgres, caller, body, idempotency_key),
     fields(
@@ -343,7 +355,14 @@ pub async fn upload_complete(
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    let row = load_pending_upload(&mut conn, upload_uuid).await?;
+    let row = load_upload(&mut conn, upload_uuid).await?;
+    let replay = match row.status {
+        UploadStatus::Pending => false,
+        UploadStatus::Completed => true,
+        UploadStatus::Initiating | UploadStatus::Aborted | UploadStatus::Failed => {
+            return Err(WyrdStorageError::UploadNotPending.into());
+        }
+    };
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
     let payload = build_complete_payload(
@@ -354,7 +373,9 @@ pub async fn upload_complete(
     )?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
-    complete_backend_upload(&state, caller, upload_uuid, &validated, &row, payload).await?;
+    if !replay {
+        complete_backend_upload(&state, caller, upload_uuid, &validated, &row, payload).await?;
+    }
     let head = verified_object_head(&state, caller, upload_uuid, &validated, &row).await?;
     verify_object_head(&state, caller, upload_uuid, &validated, &row, &head).await?;
 

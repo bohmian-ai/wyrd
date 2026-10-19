@@ -1941,7 +1941,13 @@ async fn heavy_registration_initializes_upload_after_commit() {
 }
 
 /// The production reconciler retries a missing artifact and activates the Card
-/// after the object becomes available.
+/// after the object becomes available; the client's upload completion,
+/// arriving after that activation already completed the upload, still
+/// succeeds.
+///
+/// # Panics
+/// Panics when registration, the object write, reconciliation, or the late
+/// completion fails.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_recovers_after_storage_retry() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -1976,6 +1982,10 @@ async fn card_reconciler_recovers_after_storage_retry() {
     let upload_url = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
         .as_str()
         .expect("local upload plan contains a URL");
+    let upload_id = body["upload_plans"][0]["entries"][0]["upload_id"]
+        .as_str()
+        .expect("upload entry names its upload")
+        .to_owned();
 
     wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
 
@@ -2011,6 +2021,21 @@ async fn card_reconciler_recovers_after_storage_retry() {
         .expect("card state reads");
         conn.commit().await.expect("card state read commits");
         if state == ("active".to_owned(), "idle".to_owned(), 0) {
+            let complete = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/cards/upload/{upload_id}/complete"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"protocol": "single_put", "data": {}}).to_string(),
+                ))
+                .expect("upload completion request builds");
+            let response = server
+                .oneshot_authenticated(&jwt, complete)
+                .await
+                .expect("late upload completion responds");
+            let status = response.status();
+            let body = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
             server.shutdown().await.expect("test server shuts down");
             return;
         }

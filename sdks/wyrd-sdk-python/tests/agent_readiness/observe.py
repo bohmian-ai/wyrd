@@ -118,8 +118,11 @@ class Observer:
         """Evidence for the declared Service that got furthest, or empty evidence."""
         best = Evidence()
         # ponytail: first page of Services; an agent declaring >200 is a failure anyway.
-        for summary in self.cards.list(kind="Service", limit=200).items:
-            evidence = self.service(summary.card_ref)
+        for summary in self.cards.list(kind="Service", status="active", limit=200).items:
+            try:
+                evidence = self.service(summary.card_ref)
+            except WyrdError as error:
+                evidence = Evidence(service=str(summary.card_ref), notes=[error.code])
             if evidence.progress() > best.progress() or best.service is None:
                 best = evidence
         return best
@@ -138,7 +141,11 @@ class Observer:
             time.sleep(interval)
 
     def service(self, ref: CardRef) -> Evidence:
-        """Pull ``ref``'s graph as metadata and read its correlated evidence."""
+        """Pull ``ref``'s graph as metadata and read its correlated evidence.
+
+        Raises:
+            WyrdError: when the graph cannot be pulled.
+        """
         evidence = Evidence(service=str(ref))
         with tempfile.TemporaryDirectory(prefix="wyrd-readiness-graph-") as scratch:
             bundle = Path(scratch) / "graph"
@@ -152,7 +159,7 @@ class Observer:
                 uids.append(str(card["card_ref"]["uid"]))
                 if envelope["kind"] == "Service" and card["card_ref"]["uid"] == ref.uid:
                     tables = [table["name"] for table in envelope["spec"].get("tables", [])]
-        evidence.kinds.sort()
+        evidence.kinds = sorted(set(evidence.kinds))
         cards = ", ".join(f"${index}" for index in range(1, len(uids) + 1))
         evidence.telemetry_runs = self.runs(
             f"SELECT DISTINCT run_id FROM vala.traces.spans "
@@ -217,7 +224,7 @@ class Observer:
         except WyrdError as error:
             evidence.notes.append(f"{error.code}: {sql.split(' FROM ')[1].split()[0]}")
             return []
-        outcome = result.terminal().outcome
+        outcome = result.terminal.outcome
         if outcome != "success":
             evidence.notes.append(f"query {outcome}: {sql.split(' FROM ')[1].split()[0]}")
             return []

@@ -314,16 +314,9 @@ def test_published_quickstart_declares_observes_and_verifies(
             modules["deploy"].deploy(viewer)
         assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
-        # The live readiness observer finds nothing before declaration and
-        # stops at telemetry once the graph exists without application evidence.
-        assert Observer(WyrdClient()).observe().failure_point() == "declared"
-
         # 4. Deploy the Cards.
         modules["deploy"].deploy()
         assert (root / ".wyrd-bundle/metadata.yaml").is_file()
-        declared = Observer(WyrdClient()).observe()
-        assert declared.failure_point() == "telemetry", declared.report()
-        assert {"Agent", "Prompt", "Service", "Verifier"} <= set(declared.kinds)
 
         with TestClient(modules["app"].app) as http:
             # 5. Ask a question: both model-free checks judge it before the reply.
@@ -395,8 +388,14 @@ def test_published_quickstart_declares_observes_and_verifies(
         # The readiness observer accepts the app from server evidence alone:
         # the queued review by its completed status, the direct checks by
         # their results, and another tenant's client sees none of it.
-        evidence = Observer(WyrdClient()).watch(120, interval=0.5)
-        assert evidence.failure_point() is None, evidence.report()
+        # The shared test tenant keeps earlier runs' rows, so only this run's
+        # Run and execution identify it.
+        observer = Observer(WyrdClient())
+        desk_ref = Cards(WyrdClient()).resolve_latest("Service", "default", "support-desk")
+        evidence = poll(
+            lambda: observer.service(desk_ref), lambda evidence: evidence.failure_point() is None
+        )
+        assert {"Agent", "Prompt", "Service", "Verifier"} <= set(evidence.kinds)
         assert run_id in evidence.custom_runs["tickets"]
         assert run_id in evidence.telemetry_runs
         assert {(each.execution_id, each.verdict) for each in evidence.queued if each.judged()} == {

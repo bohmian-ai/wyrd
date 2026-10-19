@@ -690,8 +690,8 @@ mod pg_tests {
     /// `verification.get_execution` reaches `completed` with a failed result
     /// naming the exact Verifier and subject, and no Operator dispatch.
     /// `bifrost.query` returns exactly one failed summary row for that
-    /// execution, with null `owner_card_uid` and `binding_id` and the exact
-    /// subject UID. A reader is refused the enqueue; another tenant's
+    /// execution, stamped with the calling Service as `owner_card_uid`, a null
+    /// `binding_id` and the exact subject UID. A reader is refused the enqueue; another tenant's
     /// administrator cannot read the execution back, and its `bifrost.query`
     /// reads its own provisioned, empty result table.
     ///
@@ -792,10 +792,10 @@ mod pg_tests {
                 "completed",
                 "failed",
                 fixture.service_uid,
-                JsonValue::Null,
+                fixture.service_uid,
                 JsonValue::Null
             ]]),
-            "one summary with null owner and binding"
+            "one summary owned by the calling Service, with no binding"
         );
         agent_client.cancel().await?;
 

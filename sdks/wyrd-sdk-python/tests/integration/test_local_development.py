@@ -710,8 +710,8 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     document applied from the environment, and the two-step deployment list,
     converge; and a restart with ``--gateway-file`` reapplies it, a fresh TypeScript process calls every deployment
     with the saved deployment alone, and each upstream sees its own key and
-    never a Wyrd credential. One Agent per provider is then applied, downloaded
-    with ``wyrd get``, and loaded from that bundle by a fresh Python process,
+    never a Wyrd credential. One Agent per provider is then declared, pulled
+    with ``wyrd pull``, and loaded from that bundle by a fresh Python process,
     which sends each Agent's rendered Prompt to its deployment. A restarted
     server still decrypts the credentials and serves the same downloaded
     Agents, and a revoked credential or an under-granted caller is refused. A
@@ -798,7 +798,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert captured.returncode == 0, captured.stderr
 
                 agent = root / "fixtures/cards/gateway_inference/ask-agent.yaml"
-                assert wyrd("apply", str(agent)).returncode == 0
+                assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
                     *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
                     *("--version", "1.0.0", "--space", "default"),
@@ -824,10 +824,10 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 run_typescript(env, "cli_gateway_setup")
                 direct = len(recorded.deliveries)
 
-                applied = wyrd("apply", str(root / "examples/gateway-setup/agents/service.yaml"))
+                applied = wyrd("declare", str(root / "examples/gateway-setup/agents/service.yaml"))
                 assert applied.returncode == 0, applied.stderr
                 got = wyrd(
-                    *("get", "--kind", "Service", "--name", "gateway-agents"),
+                    *("pull", "--kind", "Service", "--name", "gateway-agents"),
                     *("--version", "1.0.0", "--space", "default", "--output-dir", "gateway-agents"),
                 )
                 assert got.returncode == 0, got.stderr

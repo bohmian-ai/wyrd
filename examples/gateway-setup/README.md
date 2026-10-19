@@ -55,7 +55,7 @@ fixtures.
    | `gemini-team` | `POST /v1beta/models/gemini-team/gemini-2.5-flash:generateContent` | in the path |
    | `judge-pool` | `POST /v1/systemone` | `judge-pool/jev-latest` |
 
-5. Register one Agent per provider from `agents/`, download them, and call
+5. Declare one Agent per provider from `agents/`, pull them, and call
    each downloaded Agent's deployment from your application. Each Agent's
    `execution_route` names its deployment; its Prompt keeps the provider and
    the model the upstream receives (`acme/gpt-4o-agent`, `claude-haiku-4-5`,
@@ -63,7 +63,7 @@ fixtures.
 
    ```bash
    wyrd declare agents/service.yaml
-   wyrd get --kind Service --name gateway-agents --version 1.0.0 --space default \
+   wyrd pull --kind Service --name gateway-agents --version 1.0.0 --space default \
      --output-dir gateway-agents
    ```
 

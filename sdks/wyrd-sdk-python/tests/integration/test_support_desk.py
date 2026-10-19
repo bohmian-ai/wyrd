@@ -383,3 +383,52 @@ def test_published_quickstart_declares_observes_and_verifies(
         assert {row["run_id"] for row in rows} == {run_id}
         assert all(row["call_id"] and row["trace_id"] for row in rows)
         assert len({row["execution_id"] for row in rows}) == 2
+
+
+def test_quickstart_deploy_keeps_the_prior_bundle_until_pull_replaces_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused repeat pull leaves the previous bundle usable; a successful one replaces it.
+
+    Declaration and pull are stand-ins, so only the published ``deploy.py``
+    caller is under test: the shared pull owner's staged replacement and
+    rollback have their own proof.
+    """
+    shutil.copytree(QUICKSTART, tmp_path / "app", ignore=shutil.ignore_patterns(".wyrd-bundle"))
+    modules = quickstart_modules(tmp_path / "app" / "python")
+    bundle = tmp_path / "app" / ".wyrd-bundle"
+    bundle.mkdir()
+    (bundle / "metadata.yaml").write_text("prior")
+
+    def refused(destination: Path) -> None:
+        raise RuntimeError("pull refused")
+
+    def replaced(destination: Path) -> None:
+        (destination / "metadata.yaml").write_text("replaced")
+
+    pulls = [refused, replaced]
+
+    class Declared:
+        root = "default/Service/support-desk@1.0.0"
+
+    class StandInCards:
+        def __init__(self, client: object) -> None: ...
+
+        def declare_from_path(self, path: Path) -> Declared:
+            return Declared()
+
+        def pull(self, root: str, destination: Path) -> None:
+            pulls.pop(0)(destination)
+
+    class StandInGateway:
+        def __init__(self, client: object) -> None: ...
+
+        def put_capture_policy(self, policy: dict[str, Any]) -> None: ...
+
+    monkeypatch.setattr(modules["deploy"], "Cards", StandInCards)
+    monkeypatch.setattr(modules["deploy"], "Gateway", StandInGateway)
+    with pytest.raises(RuntimeError, match="pull refused"):
+        modules["deploy"].deploy()
+    assert (bundle / "metadata.yaml").read_text() == "prior"
+    modules["deploy"].deploy()
+    assert (bundle / "metadata.yaml").read_text() == "replaced"

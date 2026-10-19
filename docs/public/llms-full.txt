@@ -549,7 +549,6 @@ This declares all seven Cards, which creates the `vala.datasets.tickets` table. 
 ```python title="deploy.py"
 cards = Cards(client)
 receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
-shutil.rmtree(BUNDLE, ignore_errors=True)
 cards.pull(receipt.root, BUNDLE)
 Gateway(client).put_capture_policy({"mode": "metadata", "payload_fields": []})
 print(f"declared {receipt.root} into {BUNDLE.name}")
@@ -583,7 +582,6 @@ Gateway::connect_with(client)
 ```typescript title="deploy.ts"
 const cards = await Cards.connect({ client });
 const receipt = await cards.declareFromPath(join(SERVICE_DIR, "support-desk.yaml"));
-rmSync(bundle, { recursive: true, force: true });
 await cards.pull(receipt.root, bundle);
 // Record each gateway call's metadata, never its content, in vala.gateway.calls.
 await (await Gateway.connect({ client })).putCapturePolicy({ mode: "metadata", payload_fields: [] });
@@ -593,7 +591,9 @@ It ends with `declared <card-uid> into .wyrd-bundle`. Declaring is idempotent: r
 
 ## 5. Start the app
 
-The app connects once at startup. `WyrdState.from_path` loads the pulled bundle, `start_bifrost` starts the buffered writer for the `tickets` table, and `start_telemetry` exports spans, including the Agents SDK's own traces, to Wyrd:
+The app connects once at startup. `WyrdState.from_path` loads the pulled bundle, `start_bifrost` starts the buffered writer for the `tickets` table, and telemetry exports spans, including the Agents SDK's own traces, to Wyrd:
+
+**Python**
 
 ```python title="desk.py"
 self.client = client or WyrdClient()
@@ -605,13 +605,60 @@ self.state.start_telemetry()
 set_trace_processors([WyrdAgentsTraceProcessor()])
 ```
 
-Rows and spans are buffered, so they reach Wyrd in batches, not on every call. On exit the app flushes them:
+**Rust**
+
+```rust title="lib.rs"
+let state = WyrdState::from_path_with(bundle, client.clone())?;
+// Starts the buffered writer the ticket rows go through.
+state.start_bifrost().await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+// WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd server dev` saved, say which server to use and who the app is.
+const client = WyrdClient.connect();
+// The declared Service, pulled by `npm run deploy`.
+const state = WyrdState.fromPath(BUNDLE_DIR, { client });
+await state.startBifrost(); // writes tickets to Bifrost
+await state.startTelemetry(); // exports spans to Wyrd
+```
+
+Rows and spans are buffered, so they reach Wyrd in batches, not on every call. On exit the app flushes them. In Python and TypeScript, `state.shutdown()` flushes the spans of the provider `start_telemetry` installed, then drains the writer. In Rust, `start_telemetry(&state)` returns a `Telemetry` handle that the server keeps while it serves; it flushes that handle before draining the state:
+
+**Python**
 
 ```python title="app.py"
 app.state.desk = Desk()
 yield
 # Flush buffered tickets and spans to Wyrd before exiting.
 app.state.desk.state.shutdown()
+```
+
+**Rust**
+
+```rust title="lib.rs"
+let telemetry = start_telemetry(&self.state)?;
+let state = self.state.clone();
+let served = axum::serve(listener, self.router())
+    .with_graceful_shutdown(stop)
+    .await;
+// Flush spans first, then drain buffered tickets, before exiting.
+telemetry.shutdown()?;
+state.shutdown().await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+// Flush every span and row before exiting: shutdown flushes the provider startTelemetry installed, then drains the writer.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    server.close();
+    await state.shutdown();
+    process.exit(0);
+  });
+}
 ```
 
 A process killed before `shutdown()` loses whatever was still buffered.
@@ -1408,7 +1455,6 @@ From code, `declare_from_path` does the same and returns the receipt. The exampl
 ```python title="deploy.py"
 cards = Cards(client)
 receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
-shutil.rmtree(BUNDLE, ignore_errors=True)
 cards.pull(receipt.root, BUNDLE)
 Gateway(client).put_capture_policy({"mode": "metadata", "payload_fields": []})
 print(f"declared {receipt.root} into {BUNDLE.name}")
@@ -1442,7 +1488,6 @@ Gateway::connect_with(client)
 ```typescript title="deploy.ts"
 const cards = await Cards.connect({ client });
 const receipt = await cards.declareFromPath(join(SERVICE_DIR, "support-desk.yaml"));
-rmSync(bundle, { recursive: true, force: true });
 await cards.pull(receipt.root, bundle);
 // Record each gateway call's metadata, never its content, in vala.gateway.calls.
 await (await Gateway.connect({ client })).putCapturePolicy({ mode: "metadata", payload_fields: [] });
@@ -1531,131 +1576,238 @@ Leave `version` out of a Card instead, and the server picks one: `0.1.0` first, 
 
 Page: /wyrd/build-and-verify/observe/record-a-run-and-observations/
 
-> Load your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
+> Pull your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
 
-Load the exact Service version you deployed, wrap each request in a run, record what each component saw and did, and hand it to a Verifier with `verify` or `submit`. Verifiers judge these runs, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/wyrd/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
+Pull and load the exact Service version you deployed, wrap each request in a run, record what each component saw and did, and hand it to a Verifier with `verify` or `submit`. Verifiers judge these runs, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/wyrd/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
 
 [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/) explains the model behind these calls.
 
 ## Prerequisites
 
-- A declared Service, such as `support-desk` from [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/).
-- A credential bound to that Service version, so the server can attribute what it records. A tenant administrator issues one:
+- The declared `support-desk` Service from [Verify your first agent](/wyrd/get-started/quickstart/). Its Cards live in `examples/support-desk-app/service/`: the Service declares a `tickets` table with `question` and `answer` columns, binds `no-refund-promise` (one `answer` input) to itself, and binds `ticket-complete` (one `ticket` input) and `follows-policy` (one `letter` file) to its `agent` component.
+- A credential bound to that Service version, so the server can attribute what it records. Against the local server from [Set up Wyrd](/wyrd/get-started/setup/), the saved settings work as they are, as in the quickstart. Elsewhere, a tenant administrator issues one:
 
   ```bash
   wyrd auth issue-key --kind Service --name support-desk --version 1.0.0 --space default
   ```
 
   The key prints once. Give it to the service as `WYRD_API_KEY`, alongside `WYRD_SERVER_URL`.
-- The SDK for your language: `pip install wyrd-ai`, `npm install wyrd-ai`, or the `wyrd-ai` crate.
+- The SDK for your language: `pip install "wyrd-ai[otel]"`, `npm install wyrd-ai`, or the `wyrd-ai` crate with its `otel` feature.
 
-## 1. Download the bundle
+## 1. Pull the bundle
 
-`wyrd get` writes the Service and every Card it references, including model weights and datasets, to a local directory. Do this at build or deploy time, not per request:
+`wyrd pull` writes the Service and every Card it references, including model weights and datasets, into the directory you name. Do this at build or deploy time, not per request:
 
 ```bash
-wyrd get --space default --kind Service --name support-desk --version 1.0.0 \
-  --output-dir ./support-desk
+wyrd pull --space default --kind Service --name support-desk --version 1.0.0 \
+  --output-dir ./.wyrd-bundle
 ```
 
-## 2. Load it and start Bifrost
+Pull replaces an existing bundle only once the new one is complete, so a failed pull leaves the previous bundle usable. `wyrd get` with the same selector prints the Service's envelope only and writes nothing. The example apps pull from code instead, right after declaring; see step 4 of the [quickstart](/wyrd/get-started/quickstart/#4-deploy-the-cards).
+
+## 2. Load it and start Bifrost and telemetry
 
 Once, at startup:
 
 **Python**
 
-```python
-from wyrd import WyrdState
-
-state = WyrdState.from_path("./support-desk")
-state.start_bifrost()
+```python title="desk.py"
+self.client = client or WyrdClient()
+self.state = WyrdState.from_path(BUNDLE, self.client)
+self.state.start_bifrost()
+# Spans export to Wyrd through the SDK's OTLP exporter; the Agents SDK's
+# own traces become spans too, under the request's Run.
+self.state.start_telemetry()
+set_trace_processors([WyrdAgentsTraceProcessor()])
 ```
 
 **Rust**
 
-```rust
-use wyrd_ai::state::WyrdState;
-
-let state = WyrdState::from_path("./support-desk")?;
+```rust title="lib.rs"
+let state = WyrdState::from_path_with(bundle, client.clone())?;
+// Starts the buffered writer the ticket rows go through.
 state.start_bifrost().await?;
 ```
 
 **TypeScript**
 
-```typescript
-import { WyrdState } from "wyrd-ai";
-
-const state = WyrdState.fromPath("./support-desk");
-await state.startBifrost();
+```typescript title="server.ts"
+// WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd server dev` saved, say which server to use and who the app is.
+const client = WyrdClient.connect();
+// The declared Service, pulled by `npm run deploy`.
+const state = WyrdState.fromPath(BUNDLE_DIR, { client });
+await state.startBifrost(); // writes tickets to Bifrost
+await state.startTelemetry(); // exports spans to Wyrd
 ```
 
-`from_path` reads local files only. `start_bifrost` is the first server call: it connects the writer and fails at startup if the server is unreachable or your credential cannot write observations.
+`from_path` reads local files only. `start_bifrost` is the first server call: it connects the writer and fails at startup if the server is unreachable or your credential cannot write observations. Telemetry exports spans started inside a run with that run's ID. In Python and TypeScript it is `state.start_telemetry()` (`startTelemetry`). In Rust it is `wyrd_ai::otel::start_telemetry(&state)`, which returns a `Telemetry` handle you keep until shutdown; the Rust app starts it when it begins serving, in step 4.
 
 ## 3. Record, verify, and submit
 
-Open a run, then call `observe` on it. Everything in one run shares a `run_id`.
+Open a run, then call `observe` on it. Everything in one run shares a `run_id`. The app answers a question in a new run of the Service and records the ticket in the `tickets` table:
 
 **Python**
 
-```python
-from wyrd import verify
-
-with state.run() as run:
-    # Store a row
-    run.observe.record("vala.datasets.answers", {"question": question, "answer": answer})
-
-    # Run a Verifier now and wait for the result
-    result = run.observe.verify("my-check", answer=answer)
-    print(result.verdict)
-
-    # Queue a Verifier and return immediately
-    execution = run.observe.submit("my-review", document=verify.File("report.pdf"))
-    print(execution.id)
+```python title="desk.py"
+run = self.state.run()
+with run, tracer.start_as_current_span("support-desk.ask"):
+    # These headers tie the gateway's record of the call to this Run.
+    headers = {
+        "wyrd-run-id": run.run_id,
+        "wyrd-card-uid": str(self.state.card_ref("agent").uid),
+    }
+    model = OpenAIChatCompletionsModel(
+        self.model, self.gateway.with_options(default_headers=headers)
+    )
+    agent = Agent(name="support-agent", model=model)
+    result = await Runner.run(agent, self.template.replace("{{question}}", question))
+    answer = str(result.final_output)
+    run.observe.record(TICKETS, {"question": question, "answer": answer})
 ```
 
 **Rust**
 
-```rust
-use serde_json::json;
-use wyrd_ai::verify::{File, Input, Inputs};
-
-let run = state.run();
-
-// Store a row
+```rust title="lib.rs"
+let agent = self.state.agent(run.alias())?;
+let ExecutionRoute::WyrdGateway { deployment } = &agent.card().spec.execution_route else {
+    return Err(ApiError::internal(
+        "the Agent does not route through the Wyrd gateway",
+    ));
+};
+let prompt = &agent.prompt().metadata.prompt;
+let rendered = prompt
+    .render(&[("question", question)])
+    .map_err(|_| ApiError::internal("the Agent's Prompt does not render"))?;
+let mut body = serde_json::to_value(rendered)
+    .map_err(|_| ApiError::internal("the rendered Prompt does not serialize"))?["body"]
+    .take();
+body["model"] = json!(format!("{deployment}/{}", prompt.model));
+let client = self.state.client()?;
+// These headers tie the gateway's record of the call to this Run.
+let reply = reqwest::Client::new()
+    .post(format!("{}/v1/chat/completions", client.server_url()))
+    .bearer_auth(client.access_token().await?.expose())
+    .header("wyrd-run-id", run.run_id().as_str())
+    .header("wyrd-card-uid", run.subject_uid().as_str())
+    .json(&body)
+    .timeout(ANSWER_TIMEOUT)
+    .send()
+    .await
+    .map_err(|_| ApiError::internal("the Wyrd gateway call failed"))?;
+let status = reply.status();
+let reply: Option<Value> = reply.json().await.ok();
+if !status.is_success() {
+    return Err(ApiError::refusal(status, reply.as_ref()));
+}
+let reply =
+    reply.ok_or_else(|| ApiError::internal("the gateway reply could not be read"))?;
+let answer = reply["choices"][0]["message"]["content"]
+    .as_str()
+    .ok_or_else(|| ApiError::internal("the gateway reply carries no text"))?
+    .to_owned();
 run.observe()
-    .record("vala.datasets.answers", &json!({ "question": question, "answer": answer }))
-    .await?;
-
-// Run a Verifier now and wait for the result
-let result = run
-    .observe()
-    .verify("my-check", Inputs::named([("answer", Input::from(json!(answer)))]))
-    .await?;
-println!("{:?}", result.outcome.verdict);
-
-// Queue a Verifier and return immediately
-let submission = run
-    .observe()
-    .submit("my-review", Inputs::named([("document", Input::from(File::path("report.pdf")))]))
+    .record(
+        "vala.datasets.tickets",
+        &json!({ "question": question, "answer": answer }),
+    )
     .await?;
 ```
 
 **TypeScript**
 
-```typescript
-import { verify } from "wyrd-ai";
+```typescript title="server.ts"
+const wyrdRun = support.state.run();
+// Spans started inside the scope carry the Run's ID.
+return wyrdRun.scope(async () => {
+  const text = await answer(support.gateway, support.state, wyrdRun, question);
+  await wyrdRun.observe.record(TICKETS, { question, answer: text });
+  return check(wyrdRun, text);
+});
+```
 
-const run = state.run();
+Then it runs the two model-free Verifiers and waits for their verdicts. `no-refund-promise` is bound to the Service, so it runs on the run itself. `ticket-complete` is bound to the agent, so it runs on `for_card("agent")`, the run's agent view, which shares the same `run_id`:
 
-// Store a row
-await run.observe.record("vala.datasets.answers", { question, answer });
+**Python**
 
-// Run a Verifier now and wait for the result
-const result = await run.observe.verify("my-check", { answer });
-console.log(result.outcome.verdict);
+```python title="desk.py"
+return {
+    "no-refund-promise": run.observe.verify("no-refund-promise", answer=ticket["answer"]),
+    "ticket-complete": run.for_card("agent").observe.verify(
+        "ticket-complete", ticket=ticket
+    ),
+}
+```
 
-// Queue a Verifier and return immediately
-const submitted = await run.observe.submit("my-review", { document: verify.File.path("report.pdf") });
+**Rust**
+
+```rust title="lib.rs"
+let run = desk.state.run();
+let agent = run.for_card("agent")?;
+let work = async {
+    let answer = desk.answer(&agent, &body.question).await?;
+    let promise = run
+        .observe()
+        .verify(
+            "no-refund-promise",
+            Inputs::named([("answer", Input::from(json!(answer)))]),
+        )
+        .await?;
+    let ticket = json!({
+        "question": body.question,
+        "answer": answer,
+        "order_id": body.order_id,
+    });
+    let complete = agent
+        .observe()
+        .verify(
+            "ticket-complete",
+            Inputs::named([("ticket", Input::from(ticket))]),
+        )
+        .await?;
+    Ok::<_, ApiError>((answer, promise, complete))
+};
+let (answer, promise, complete) = run
+    .scope(work.instrument(tracing::info_span!("support-desk.ask")))
+    .await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+const ticket = { question, answer: text, order_id: orderId ?? null };
+const [promise, complete] = await Promise.all([
+  wyrdRun.observe.verify("no-refund-promise", { answer: text }),
+  wyrdRun.forCard("agent").observe.verify("ticket-complete", { ticket }),
+]);
+```
+
+`follows-policy` calls a model judge, so the app queues it on the agent's letter instead of waiting:
+
+**Python**
+
+```python title="desk.py"
+execution = run.for_card("agent").observe.submit(
+    "follows-policy", letter=verify.File(letter.encode(), filename="letter.md")
+)
+assert isinstance(execution, verify.Execution)  # Run evidence always queues one
+```
+
+**Rust**
+
+```rust title="lib.rs"
+let submission = run
+    .observe()
+    .submit("follows-policy", letter_inputs(&letter))
+    .await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+const letter = verify.File.bytes(new TextEncoder().encode(text), { filename: "letter.md" });
+const inputs = { letter };
+const submitted = await wyrdRun.forCard("agent").observe.submit("follows-policy", inputs);
+if (submitted.kind !== "queued") throw new Error("follows-policy judges Run evidence, so submit queues it");
 ```
 
 | Call | Does | Returns |
@@ -1664,112 +1816,150 @@ const submitted = await run.observe.submit("my-review", { document: verify.File.
 | `verify(name, inputs)` | Runs a Verifier and waits for it | The verdict (`passed`, `failed`, or `inconclusive`) and one result per requirement |
 | `submit(name, inputs)` | Queues a Verifier on the server | An execution whose `id` reads the result later |
 
-`verify` and `submit` take a Verifier bound to the run's Card, and one input per slot that Verifier declares. `verify.File` fills a file slot. A failed verdict is a normal return, not an error.
+`verify` and `submit` take a Verifier bound to the Card of the run or view you call them on, and one input per slot that Verifier declares: `answer` for `no-refund-promise`, `ticket` for `ticket-complete`, and the `letter` file for `follows-policy`. `verify.File` fills a file slot. A failed verdict is a normal return, not an error.
 
-To run on one component instead of the Service, use `run.for_card("<alias>")`; it shares the same `run_id`.
-
-Read a submitted result back from any process:
+Read a submitted result back from any process, by its execution ID alone:
 
 **Python**
 
-```python
-execution = verify.Execution.connect(execution_id, client)
-result = execution.wait(30)
+```python title="app.py"
+# Any process can pick a check up from its execution ID alone.
+state = verify.Execution.connect(execution_id, request.app.state.desk.client).status()
 ```
 
 **Rust**
 
-```rust
-let execution = Execution::connect_with(id, state.client()?).await?;
-let result = execution.wait(Duration::from_secs(30)).await?;
-```
-
-**TypeScript**
-
-```typescript
-const execution = await verify.Execution.connect(executionId, { client });
-const result = await execution.wait({ timeoutMs: 30_000 });
-```
-
-`status()` on the execution returns its state without waiting.
-
-## 4. Shut down cleanly
-
-Queued rows are not stored yet. Flush before you depend on them, and shut down once when the process stops:
-
-**Python**
-
-```python
-import atexit
-
-atexit.register(state.shutdown)
-```
-
-**Rust**
-
-```rust
-state.shutdown().await?;
-```
-
-**TypeScript**
-
-```typescript
-await state.shutdown();
-```
-
-`shutdown` sends everything still queued and returns once the server has it. A process killed without it can lose its last rows. `flush` does the same without closing the writer, for tests and batch jobs. With `start_telemetry`, both first flush the tracer provider it installed, and still drain the writer if that flush fails.
-
-## 5. Read a run back
-
-**Python**
-
-```python
-from wyrd.bifrost import Bifrost
-
-rows = Bifrost().sql(
-    "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
-    [run.run_id],
-)
-print(rows.to_pandas())
-```
-
-**Rust**
-
-```rust
-use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
-
-let rows = Bifrost::connect(BifrostOptions::default())
+```rust title="lib.rs"
+let state = Execution::connect_with(id, desk.state.client()?)
     .await?
-    .sql(
-        "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
-        &[QueryParam::String(run.run_id().to_string())],
-    )
+    .status()
     .await?;
 ```
 
 **TypeScript**
 
-```typescript
-import { Bifrost } from "wyrd-ai";
-
-const bifrost = await Bifrost.connect();
-const rows = await bifrost.sql(
-  "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
-  [run.runId],
-);
+```typescript title="server.ts"
+const execution = await verify.Execution.connect(executionId, { client: support.client });
+const { status, error, result } = await execution.status();
 ```
 
-The agent's spans read back the same way, by run:
+`status()` returns the execution's state without waiting; `wait` on the same execution blocks until it is final, up to the timeout you pass.
 
-```sql
-SELECT name, gen_ai_request_model, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens
-FROM vala.traces.spans
-WHERE run_id = $1
+## 4. Shut down cleanly
+
+Queued rows and spans are not stored yet. Shut down once when the process stops:
+
+**Python**
+
+```python title="app.py"
+app.state.desk = Desk()
+yield
+# Flush buffered tickets and spans to Wyrd before exiting.
+app.state.desk.state.shutdown()
 ```
 
-`Bifrost().trace_timeline(trace_id)` (`traceTimeline` in TypeScript) returns one trace's spans with their parent ids, status, and attributes.
+**Rust**
 
-The row has `card_uid` set to the Card version that ran. Spans in `vala.traces.spans` and gateway calls in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
+```rust title="lib.rs"
+let telemetry = start_telemetry(&self.state)?;
+let state = self.state.clone();
+let served = axum::serve(listener, self.router())
+    .with_graceful_shutdown(stop)
+    .await;
+// Flush spans first, then drain buffered tickets, before exiting.
+telemetry.shutdown()?;
+state.shutdown().await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+// Flush every span and row before exiting: shutdown flushes the provider startTelemetry installed, then drains the writer.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    server.close();
+    await state.shutdown();
+    process.exit(0);
+  });
+}
+```
+
+`shutdown` sends everything still queued and returns once the server has it. A process killed without it can lose its last rows and spans. `flush` does the same without closing the writer, for tests and batch jobs. In Python and TypeScript, both first flush the tracer provider `start_telemetry` installed, and still drain the writer if that flush fails. In Rust, `WyrdState::shutdown` drains only the writer: call `shutdown()` on the `Telemetry` handle first, as above.
+
+## 5. Read a run back
+
+Every row a run produced carries its `run_id`, so one query joins the ticket to the request span, the gateway call, and each verdict:
+
+**Python**
+
+```python title="evidence.py"
+SQL = """
+SELECT t.run_id, t.question, t.answer, s.trace_id, g.call_id, r.execution_id, r.verdict
+FROM vala.datasets.tickets t
+JOIN vala.traces.spans s ON s.run_id = t.run_id AND s.name = 'support-desk.ask'
+JOIN vala.gateway.calls g ON g.run_id = t.run_id
+JOIN vala.verification.results r ON r.run_id = t.run_id
+WHERE t.run_id = $1
+"""
+```
+
+**TypeScript**
+
+```typescript title="evidence.ts"
+/**
+ * Read one Run's evidence back through Bifrost. Every row a Run produced
+ * carries its `run_id`, so one join links the ticket to the agent's
+ * span, its gateway call, and each verdict.
+ *
+ *   npm run evidence -- <run_id>
+ */
+
+import { Bifrost, type WyrdClient } from "wyrd-ai";
+import { z } from "zod";
+
+import { TICKETS } from "./wyrd.ts";
+
+const Evidence = z.object({
+  run_id: z.string(),
+  question: z.string(),
+  answer: z.string(),
+  span: z.string(),
+  trace_id: z.string(),
+  call_id: z.string(),
+  verdict: z.string(),
+  execution_id: z.string(),
+});
+
+/** The joined evidence of Run `runId`, read as `client` (the ambient client by default). */
+export async function evidence(runId: string, client?: WyrdClient) {
+  const bifrost = await Bifrost.connect({ client });
+  try {
+    return await bifrost.sql(
+      `SELECT c.run_id, c.question, c.answer, s.name AS span, encode(s.trace_id, 'hex') AS trace_id, g.call_id, r.verdict, r.execution_id
+         FROM ${TICKETS} c
+         JOIN vala.traces.spans s ON s.run_id = c.run_id AND s.name LIKE 'invoke_agent %'
+         JOIN vala.gateway.calls g ON g.run_id = c.run_id
+         JOIN vala.verification.results r ON r.run_id = c.run_id
+        WHERE c.run_id = $1`,
+      [runId],
+      Evidence,
+    );
+  } finally {
+    await bifrost.shutdown();
+  }
+}
+
+if (import.meta.main) {
+  const runId = process.argv[2];
+  if (!runId) throw new Error("usage: npm run evidence -- <run_id>");
+  console.table(await evidence(runId));
+}
+
+```
+
+The Rust app runs the same join in its `evidence` function. `Bifrost().trace_timeline(trace_id)` (`traceTimeline` in TypeScript) returns one trace's spans with their parent ids, status, and attributes.
+
+Rows become queryable a short time after `flush` or `shutdown` returns. An empty result right after a flush is not proof they are missing; retry first.
 
 ## What can go wrong
 
@@ -4728,7 +4918,7 @@ The examples continue the `support-desk` service from [How verification works](/
 
 ## Your code runs an exact version
 
-Your application starts from a bundle of the exact Service version it was deployed with: `wyrd get` downloads the Service and every Card it references, and the SDK loads it from disk with no network call. Because the bundle is pinned, every observation can name the exact Card versions that produced it. [Record a run and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/) walks through it in all three SDKs.
+Your application starts from a bundle of the exact Service version it was deployed with: `wyrd pull --output-dir <dir>` downloads the Service and every Card it references into that directory, and the SDK loads it from disk with no network call. `wyrd get` only prints a Card's envelope. Because the bundle is pinned, every observation can name the exact Card versions that produced it. [Record a run and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/) walks through it in all three SDKs.
 
 ## A run is one invocation
 
@@ -6306,9 +6496,9 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_400_BIFROST_NOT_STARTED` | 400 | WyrdState Bifrost writer is not started | Call start_bifrost on the state before opening a run and emitting observations. |
 | `WYRD_SDK_400_CARD_KIND_MISMATCH` | 400 | WyrdState Card kind mismatch | Use an alias for a Card of the expected kind. |
 | `WYRD_SDK_400_INVALID_OBSERVATION` | 400 | Invalid observation input | Emit a flat object of boolean, integer, finite float, or string values, with valid feature names and media bindings. |
-| `WYRD_SDK_400_INVALID_STATE_BUNDLE` | 400 | Invalid WyrdState bundle | Regenerate the bundle with wyrd get and load the complete output. |
+| `WYRD_SDK_400_INVALID_STATE_BUNDLE` | 400 | Invalid WyrdState bundle | Pull the intended root Card again with wyrd pull --output-dir &lt;dir&gt;, then load that complete directory. |
 | `WYRD_SDK_400_RUNTIME_HYDRATION_FAILED` | 400 | Runtime Card hydration failed | Provide the required custom interface/load arguments or regenerate a complete compatible bundle. |
-| `WYRD_SDK_400_UNHYDRATED_ARTIFACT` | 400 | Card bundle is missing artifact payloads | Run wyrd get without --metadata-only and load the complete bundle. |
+| `WYRD_SDK_400_UNHYDRATED_ARTIFACT` | 400 | Card bundle is missing artifact payloads | Run wyrd pull for the intended root Card with --output-dir &lt;dir&gt; and without --metadata-only, then load that directory. |
 | `WYRD_SDK_404_UNKNOWN_ALIAS` | 404 | Unknown WyrdState alias | Use an alias returned by the loaded WyrdState bundle. |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | 404 | Verifier is not bound to this subject | Name a Verifier bound in `verified_by` to the view's subject Card, or open the view on the Card that binds it. |
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |

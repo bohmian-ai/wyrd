@@ -146,13 +146,45 @@ It ends with `declared <card-uid> into .wyrd-bundle`. Declaring is idempotent: r
 
 ## 5. Start the app
 
-The app connects once at startup. `WyrdState.from_path` loads the pulled bundle, `start_bifrost` starts the buffered writer for the `tickets` table, and `start_telemetry` exports spans, including the Agents SDK's own traces, to Wyrd:
+The app connects once at startup. `WyrdState.from_path` loads the pulled bundle, `start_bifrost` starts the buffered writer for the `tickets` table, and telemetry exports spans, including the Agents SDK's own traces, to Wyrd:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
 
 <CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="init" title="desk.py" />
 
-Rows and spans are buffered, so they reach Wyrd in batches, not on every call. On exit the app flushes them:
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="init" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="startup" title="server.ts" />
+
+</LangTab>
+</LangTabs>
+
+Rows and spans are buffered, so they reach Wyrd in batches, not on every call. On exit the app flushes them. In Python and TypeScript, `state.shutdown()` flushes the spans of the provider `start_telemetry` installed, then drains the writer. In Rust, `start_telemetry(&state)` returns a `Telemetry` handle that the server keeps while it serves; it flushes that handle before draining the state:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
 
 <CodeFromFile file="examples/support-desk-app/python/app.py" lang="python" region="lifespan" title="app.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="serve" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="shutdown" title="server.ts" />
+
+</LangTab>
+</LangTabs>
 
 A process killed before `shutdown()` loses whatever was still buffered.
 

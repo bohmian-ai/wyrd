@@ -195,12 +195,14 @@ const DUE_BINDING_SQL: &str = r"
 ///
 /// `$1`..`$4` are aligned owner, subject, source Verifier, and group arrays.
 /// `after` is the exact authored duration, at most the one year Trigger
-/// validation admits. `DISTINCT` keeps one row per binding and group so the
+/// validation admits; it is added as elapsed seconds, so a day is always
+/// 86,400 seconds whatever the session time zone's daylight time. `DISTINCT` keeps one row per binding and group so the
 /// upsert never touches a row twice.
 const RECORD_GROUP_ACTIVITY_SQL: &str = r"
     INSERT INTO wyrd.verification_group_pending (data_tenant_id, binding_id, group_id, due_at)
     SELECT DISTINCT wyrd.current_tenant(), b.binding_id, a.group_id,
-           statement_timestamp() + (b.group_end ->> 'after')::interval
+           statement_timestamp()
+               + extract(epoch FROM (b.group_end ->> 'after')::interval) * INTERVAL '1 second'
       FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[])
                AS a(owner_card_uid, card_uid, verifier_card_uid, group_id)
       JOIN wyrd.verification_bindings b

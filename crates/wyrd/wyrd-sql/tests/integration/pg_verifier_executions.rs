@@ -2574,13 +2574,14 @@ fn source_text() -> SourceText {
 
 /// Acknowledged source activity schedules one pending row per matching
 /// binding and group, due exactly `after` past database time — a one-year
-/// `after` included — and consumed by its claim; the same snapshot content
+/// `after` included, and `1d` equal to `24h` across a session time zone's
+/// daylight-time change — and consumed by its claim; the same snapshot content
 /// enqueues once whatever its status, while distinct snapshots overlap;
 /// group verdicts are compared in settlement order — baseline, unchanged,
 /// changed — and a replay never recompares. A group refused before
 /// admission is one terminal errored execution with no authority, inputs,
-/// snapshot, or result, which is never claimed, and no runnable execution
-/// may omit its authority.
+/// snapshot, or result, which is never claimed; the database rejects any
+/// runnable status, input, window, record, or snapshot field on it.
 ///
 /// # Panics
 /// Panics when scheduling, snapshot identity, the pinned input,
@@ -2595,6 +2596,8 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
     let verifier = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
     let yearly = register_verifier(&mut conn, &actor, "yearly", custom_drift()).await;
+    let daily = register_verifier(&mut conn, &actor, "daily", custom_drift()).await;
+    let hourly = register_verifier(&mut conn, &actor, "hourly", custom_drift()).await;
     let slot = SlotName::new("turns").expect("valid slot name");
     let settings = GroupEndSettings {
         after: TriggerDuration::parse("1h").expect("valid duration"),
@@ -2609,6 +2612,17 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         )]),
     };
     let operator = FrozenTarget::Digest("sha256:operator".to_owned());
+    let lasting = |verifier: &CardUid, after: &str| NewBinding {
+        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+        card_uid: owner.clone(),
+        verifier_card_uid: verifier.clone(),
+        trigger: FrozenTarget::Digest(format!("sha256:{after}")),
+        operators: Vec::new(),
+        activation: BindingActivation::GroupEnd(GroupEndSettings {
+            after: TriggerDuration::parse(after).expect("accepted duration"),
+            ..settings.clone()
+        }),
+    };
     let bindings = project_bindings(
         &mut conn,
         &owner,
@@ -2622,22 +2636,14 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
                 operators: vec![operator],
                 activation: BindingActivation::GroupEnd(settings.clone()),
             },
-            NewBinding {
-                subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-                card_uid: owner.clone(),
-                verifier_card_uid: yearly.clone(),
-                trigger: FrozenTarget::Digest("sha256:yearly".to_owned()),
-                operators: Vec::new(),
-                activation: BindingActivation::GroupEnd(GroupEndSettings {
-                    after: TriggerDuration::parse("365d").expect("one year is accepted"),
-                    ..settings.clone()
-                }),
-            },
+            lasting(&yearly, "365d"),
+            lasting(&daily, "1d"),
+            lasting(&hourly, "24h"),
         ],
     )
     .await
     .expect("bindings project");
-    let (binding, year) = (bindings[0], bindings[1]);
+    let (binding, year, day, hours) = (bindings[0], bindings[1], bindings[2], bindings[3]);
     record_machine_authentication(&mut conn, principal)
         .await
         .expect("owner activates");
@@ -2694,6 +2700,50 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         apart,
         "one statement schedules both, each exactly its own after"
     );
+    // A session zone whose daylight time starts within the next hour, so a
+    // calendar day from now lasts 23 hours: accepted `1d` still waits the
+    // same 86,400 elapsed seconds as `24h`.
+    sqlx::query(
+        "SELECT set_config('TimeZone', format('XST0XDT,%s/%s,%s/%s', d, h + 1, d, h + 49), true)
+           FROM (SELECT extract(doy FROM statement_timestamp() AT TIME ZONE 'UTC')::int - 1 AS d,
+                        extract(hour FROM statement_timestamp() AT TIME ZONE 'UTC')::int AS h) t",
+    )
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("session zone sets");
+    let crosses: bool = sqlx::query_scalar(
+        "SELECT statement_timestamp() + INTERVAL '1 day'
+              = statement_timestamp() + INTERVAL '23 hours'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("calendar day reads");
+    assert!(crosses, "a calendar day in this session is 23 hours");
+    queue
+        .record_group_activity(&mut conn, &[activity(&source)])
+        .await
+        .expect("activity records across daylight time");
+    let elapsed: (bool, bool) = sqlx::query_as(
+        "SELECT d.due_at = c.due_at, d.due_at - h.due_at = INTERVAL '23 hours'
+           FROM wyrd.verification_group_pending h, wyrd.verification_group_pending d,
+                wyrd.verification_group_pending c
+          WHERE h.binding_id = $1 AND d.binding_id = $2 AND c.binding_id = $3",
+    )
+    .bind(binding.as_uuid())
+    .bind(day.as_uuid())
+    .bind(hours.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("rows read");
+    assert_eq!(
+        elapsed,
+        (true, true),
+        "1d and 24h are both exactly 86,400 seconds past the activity"
+    );
+    sqlx::query("RESET TimeZone")
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("session zone resets");
     assert!(
         queue
             .claim_due_group(&mut conn)
@@ -2964,20 +3014,44 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
             .is_none(),
         "the refusal consumed its group"
     );
-    let runnable = sqlx::query(
+    // An otherwise valid refusal admits no runnable status or any input,
+    // window, record, or snapshot field, malformed or not.
+    for change in [
         "UPDATE wyrd.verifier_executions
             SET status = 'pending', error = NULL, settled_at = NULL,
                 next_attempt_at = statement_timestamp()
           WHERE execution_id = $1",
-    )
-    .bind(refused.as_uuid())
-    .execute(&mut **conn.transaction())
-    .await
-    .expect_err("a runnable execution needs accepted authority");
-    assert!(
-        runnable
-            .to_string()
-            .contains("verifier_executions_refused_shape"),
-        "{runnable}"
-    );
+        "UPDATE wyrd.verifier_executions
+            SET inputs = '{}', route_overrides = '{}' WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET window_start = statement_timestamp() - INTERVAL '1 hour',
+                window_end = statement_timestamp()
+          WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET input_record_id = 'record', input_event_time = statement_timestamp()
+          WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET group_snapshot_sha256 = '\\x00' WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET group_sources = '[]' WHERE execution_id = $1",
+    ] {
+        let mut attempt = sqlx::Connection::begin(&mut **conn.transaction())
+            .await
+            .expect("nested transaction begins");
+        let error = sqlx::query(change)
+            .bind(refused.as_uuid())
+            .execute(&mut *attempt)
+            .await
+            .expect_err("the refused shape rejects the change");
+        assert!(
+            error
+                .to_string()
+                .contains("verifier_executions_refused_shape"),
+            "{change}: {error}"
+        );
+        attempt
+            .rollback()
+            .await
+            .expect("nested transaction rolls back");
+    }
 }

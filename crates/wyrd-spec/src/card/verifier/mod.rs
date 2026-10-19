@@ -319,20 +319,32 @@ impl<'de> Deserialize<'de> for InputSlot {
         /// Visits one authored slot value.
         struct Slot;
         impl<'de> serde::de::Visitor<'de> for Slot {
+            /// The decoded slot: a verbatim source declaration or a typed slot.
             type Value = InputSlot;
 
             /// Names the two accepted forms in a type error.
+            ///
+            /// # Errors
+            /// Returns the formatter's error when writing the description fails.
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a typed input slot or a source reference string")
             }
 
-            /// A string is a source declaration.
+            /// A string is a source declaration, kept verbatim; its reference
+            /// grammar is validated later, not while decoding.
+            ///
+            /// # Errors
+            /// None in practice: the source text wrapper accepts any string.
             fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<InputSlot, E> {
                 SourceText::deserialize(serde::de::value::StrDeserializer::new(text))
                     .map(InputSlot::Source)
             }
 
-            /// A map is a typed slot.
+            /// A map is a typed slot, decoded by the tagged typed-slot decoder.
+            ///
+            /// # Errors
+            /// Returns that decoder's error for a missing or unknown `type` tag,
+            /// an unknown or missing field, or a malformed field value.
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 map: A,

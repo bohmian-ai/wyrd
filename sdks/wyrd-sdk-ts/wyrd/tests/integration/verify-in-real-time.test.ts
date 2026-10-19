@@ -939,7 +939,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   const bCards = await Cards.connect({ client: tenantB });
   const bReceipt = await bCards.declareFromPath(fixture("cards/verify_in_real_time/support.yaml"));
   const bBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
-  await bCards.hydrate(bReceipt.root, bBundle);
+  await bCards.pull(bReceipt.root, bBundle);
   const bKey = await cli.issueKey({ ...bReceipt.root, space: bReceipt.root.space ?? "default" }, { client: tenantB });
   const bState = WyrdState.fromPath(bBundle, { client: WyrdClient.connect({ credential: bKey.key }) });
   await bState.startBifrost();

@@ -42,10 +42,11 @@ from .support import (
     binding_ids,
     binding_status,
     client_of,
-    pull,
+    declare,
     group_binding,
     group_execution,
     hydrated,
+    pull,
     service_key,
     timeline,
 )
@@ -905,9 +906,7 @@ def test_grouped_conversations_coexist_with_drift(
     registered = declare(cards, "cards/verify_in_real_time/support.yaml")
     key = service_key("support")
     binding_id = group_binding(wyrd_server, cards, registered["support"])
-    state = WyrdState.from_path(
-        pull(cards, "support", tmp_path / "a"), WyrdClient(credential=key)
-    )
+    state = WyrdState.from_path(pull(cards, "support", tmp_path / "a"), WyrdClient(credential=key))
     state.start_bifrost()
     assistant.start_bifrost()
     suffix = secrets.token_hex(4)
@@ -944,12 +943,12 @@ def test_grouped_conversations_coexist_with_drift(
         wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name=f"b-admin-{suffix}"),
     )
     b_cards = Cards(tenant_b)
-    register(b_cards, "cards/verify_in_real_time/support.yaml")
+    declare(b_cards, "cards/verify_in_real_time/support.yaml")
     b_key = cli.issue_key(
         kind="Service", name="support", version="1.0.0", space="default", client=tenant_b
     ).key
     b_state = WyrdState.from_path(
-        download(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
+        pull(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
     )
     b_state.start_bifrost()
     b_state.run("agent").observe.verify("turn-check", turn("tenant b"), group_id=a)

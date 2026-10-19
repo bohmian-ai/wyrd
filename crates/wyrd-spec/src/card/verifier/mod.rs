@@ -211,7 +211,7 @@ impl utoipa::ToSchema for InputSlotSchema {
 
 /// One named evidence slot. Slots are required unless `required: false`;
 /// samples and source slots are always required.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(rename = "TypedInputSlot")]
@@ -259,6 +259,89 @@ pub enum InputSlot {
     #[serde(untagged)]
     #[schemars(skip)]
     Source(SourceText),
+}
+
+/// The tagged forms of [`InputSlot`], decoded without its untagged source
+/// fallback so a malformed typed slot reports its own error, such as an
+/// unknown field, instead of "did not match any variant". The remote derive
+/// constructs each [`InputSlot`] variant, so a field added there and missing
+/// here fails to compile.
+#[derive(Deserialize)]
+#[serde(
+    remote = "InputSlot",
+    tag = "type",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum TypedInputSlot {
+    /// [`InputSlot::Json`].
+    Json {
+        /// JSON Schema the value must satisfy.
+        #[serde(default)]
+        schema: Option<Value>,
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
+        required: bool,
+    },
+    /// [`InputSlot::Media`].
+    Media {
+        /// Accepted formats.
+        formats: Vec<MediaFormat>,
+        /// Lower size bound than the deployment limit.
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
+        required: bool,
+    },
+    /// [`InputSlot::Trace`].
+    Trace {
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
+        required: bool,
+    },
+    /// [`InputSlot::Samples`].
+    Samples {
+        /// Measurement names, including metric names.
+        features: Vec<FeatureName>,
+    },
+}
+
+/// Decode a string as a source declaration and a map as a typed slot, the
+/// same two forms the derived `untagged` source variant accepts.
+impl<'de> Deserialize<'de> for InputSlot {
+    /// Dispatch on the authored value's shape without buffering it.
+    ///
+    /// # Errors
+    /// Returns the typed slot's own decode error for a malformed map, and a
+    /// type error for anything that is neither a string nor a map.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Visits one authored slot value.
+        struct Slot;
+        impl<'de> serde::de::Visitor<'de> for Slot {
+            type Value = InputSlot;
+
+            /// Names the two accepted forms in a type error.
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a typed input slot or a source reference string")
+            }
+
+            /// A string is a source declaration.
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<InputSlot, E> {
+                SourceText::deserialize(serde::de::value::StrDeserializer::new(text))
+                    .map(InputSlot::Source)
+            }
+
+            /// A map is a typed slot.
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<InputSlot, A::Error> {
+                TypedInputSlot::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        deserializer.deserialize_any(Slot)
+    }
 }
 
 impl InputSlot {

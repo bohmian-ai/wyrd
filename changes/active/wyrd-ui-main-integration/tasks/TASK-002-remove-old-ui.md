@@ -78,3 +78,32 @@ Stop for a changed public contract, credential/security or durable ownership req
 - [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md), [design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx).
 - [Execution](../../../../architecture/references/languages/implementation-execution.md), [TDD](../../../../architecture/references/languages/spec-driven-development.md), [testing](../../../../architecture/references/languages/testing-workflows.md).
 - [Bifrost contracts](../../../../architecture/bifrost-design.md), [security](../../../../architecture/wyrd-security-posture.md), [deployment/release](../../../../architecture/operations/deployment-and-release.md).
+
+## Implementation Evidence
+
+Candidate: commits `a701d4ef0` (deletions) and the follow-up rewrite commit on this task branch. UI paths are relative to `crates/wyrd/wyrd-server/wyrd-ui/`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-032 delete list: `src/lib/components/`, `src/lib/features/`, `src/lib/server/{wyrd.ts,mock/,changes/}`, `src/lib/{registry,views}.ts` + tests, routes `styleguide/`, `t/[tenantKey]/{cards,changes,observe}/` | `git rm` in `a701d4ef0`; also removed the domain loader `t/[tenantKey]/+page.server.ts` and the chart-only ResizeObserver polyfill in `vitest-setup.ts`. `views.ts` types moved to their owners: `WyrdProblem` → `src/lib/server/problem.ts`, `Tenant`/`SessionMetadata` → `src/lib/server/auth/session.ts` | `rg` inventory below: no hit | PASS |
+| REQ-032 mock switch removed: `mockDataEnabled`, `mockCookie`, `mockTenantKey`, `WYRD_UI_MOCK_DATA`, `WYRD_UI_MOCK_TENANT`, `locals.mockData`, `locals.wyrd` | `development.ts`, `hooks.server.ts` (mock + `WyrdClient` lines only), `app.d.ts`, root `+page.server.ts` (`mockData` action removed; local login/scenario/reauth gate on `localAuthEnabled()` alone; single-tenant scenario uses the development principal's first membership), root `+layout.*` (dev control is now only **DEV · Test login** when local auth is on), `mise.toml` `dev:frontend`, `README.md` | TASK-002 Vitest asserts no `mock*` export; `rg` inventory | PASS |
+| REQ-032 keep list unchanged in behavior (auth, problem, upstream, routing, `localAuthEnabled` + login-scenario helpers, hooks, kept routes, `brand/`, `app.css`, `theme.svelte.ts`, `format.ts`) | Only type moves / mock-line removals in kept server modules; `brand/DESIGN.md` and `brand/components.json` `$comment` lost only their pointers to deleted paths | `pnpm test` (auth/session/problem/upstream/routing tests), identity journey | PASS |
+| Kept routes rewritten as plain markup, no shared component imports; `t/[tenantKey]/+page` is a plain signed-in page | `+layout.svelte` (mode root), `+page.svelte` (inline tenant chooser), `+error.svelte`, `t/[tenantKey]/+layout.svelte` (tenant, tenant switch form, principal, sign out, Settings link, mode toggle), `t/[tenantKey]/+page.svelte`, `login/`, `login/api-key/`, `settings/`; shared `.app-problem` notice style in `src/app.css` | `src/lib/ui-library.test.ts` `TASK-002: Retained pages without mocks` | PASS |
+| UI check, unit tests, production build pass | — | `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` → 0 errors 0 warnings; `... test` → 8 files, 24 tests passed; `... build` → done | PASS |
+| Unchanged identity journey remains passing | — | `mise run test:identity:journey` (owner setup: Postgres, migrate, Keycloak/Dex, seed, UI build) ran `cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'` → PASS (57.1s; inner Vitest 4/4). Lane stopped afterwards by me (the later CLI device-login step was SIGKILLed by that stop, not a failure); unrelated lane steps not run | PASS |
+| No new package, shell or domain integration | No dependency change (`package.json`/lockfile untouched) | `git diff d2e2d25a8 --stat` | PASS |
+| Human visual checkpoint (tenant chooser, login/API-key recovery, signed-in page, settings; states, desktop/mobile, light/dark) | — | Not performed by the implementing agent | UNVERIFIED — pending human |
+
+Scenario 1 RED/GREEN: `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-002: Retained pages without mocks$'` — RED before the change (1 selected, 1 failed: retained routes imported `$lib/components/`), GREEN after (1 selected, 1 passed).
+
+Directly affected tests: `routing/tenant.test.ts` dropped the mock-Home/`WyrdClient` cases (their subject was deleted); `routing/journey.test.ts` (local-auth dev server) now asserts the plain signed-in page, tenant switch and sign-out instead of mock Home content and the mock toggle.
+
+Removal inventory (excluding `changes/`, `node_modules`, build output):
+
+```bash
+rg -n --hidden "wyrd-ui/src/lib/(components|features)|\$lib/(components|features)|lib/server/(wyrd|mock|changes)|\$lib/(registry|views)|component-contracts|registry\.test|routes/styleguide|t/\[tenantKey\]/(cards|changes|observe)|mockDataEnabled|mockCookie|mockTenantKey|WYRD_UI_MOCK_(DATA|TENANT)|wyrd_ui_mock_data|locals\.(mockData|wyrd)|\?/mockData|ModeProvider|TenantChooser|StateBlock" -g '!changes/**' -g '!**/node_modules/**' -g '!.git/**' .
+```
+
+Remaining hits are not deleted paths: `docs/` site's own `$lib/components` (separate app) and component *names* inside `brand/components.json` contracts (brand is kept). `brand/gen-theme` tests 5/5 and `gen-theme.mjs --check` in sync. `git diff --check` clean.
+
+Limits: `@xyflow/svelte`, `micromark`, `micromark-extension-gfm` are now unused by the UI source; removing them made pnpm re-resolve the `latest` dev dependencies (unrelated lockfile churn), so they were left for the package owner. Non-goals held: no `/auth` forwarding, no new components, no `crates/wyrd-spec/src/vala/trace/*` change.

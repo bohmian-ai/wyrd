@@ -5,6 +5,7 @@ members = [
     "crates/vala/*",
     "crates/skald/*",
     "crates/shared/*",
+    "crates/patches/*",
     "crates/wyrd-spec",
     "examples/rust",
     "sdks/wyrd-sdk-python",
@@ -270,6 +271,10 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
+# monty-proto's `worker` feature, which wyrd-server needs to serve as its own
+# Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
+# so a stand-in with the same API refuses every check and keeps the checker out.
+monty-type-checking = { path = "crates/patches/monty-type-checking" }
 datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
 datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
 datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }

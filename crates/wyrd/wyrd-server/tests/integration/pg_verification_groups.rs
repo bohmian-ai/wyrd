@@ -32,6 +32,7 @@ use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
+use wyrd_spec::registry::RegistrationReceipt;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::verifier_executions::{
@@ -79,21 +80,8 @@ impl Support {
         else {
             panic!("user bootstrap returned a machine principal");
         };
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/verify_in_real_time/support.yaml"
-        );
-        let input = build_registration_input(load(std::path::Path::new(path)).expect("loads"))
-            .expect("registration input builds");
-        let receipt = Cards::connect_with(&client(
-            server.base_url().expect("bound server has a URL"),
-            &admin,
-        ))
-        .await
-        .expect("handle connects")
-        .register(&input)
-        .await
-        .expect("support registers");
+        let (receipt, service) =
+            register(&server, &admin, "verify_in_real_time/support.yaml").await;
         let uid = |name: &str| {
             receipt
                 .outcomes
@@ -102,14 +90,6 @@ impl Support {
                 .and_then(|outcome| outcome.card_ref.uid.clone())
                 .expect("the receipt names the Card")
         };
-        let machine = server
-            .credential_registered_service(&receipt.root, &["editor"])
-            .await
-            .expect("Service credentials");
-        let service = server
-            .exchange_api_key(machine.api_key().expect("machine has an API key"))
-            .await
-            .expect("API key exchanges");
         Self {
             owner: uid("support"),
             agent: uid("assistant-agent"),
@@ -219,6 +199,61 @@ impl Support {
             GroupPoller::new(state.clone(), Duration::from_secs(30)),
             Arc::clone(capacity),
         )
+    }
+
+    /// A scheduler like [`Self::scheduler`] resolving owner authority through
+    /// `authority` instead of the server's tenant issuer.
+    fn scheduler_with(
+        &self,
+        capacity: &Arc<Semaphore>,
+        authority: BackgroundAuthority,
+    ) -> VerificationScheduler {
+        let state = self.server.state();
+        VerificationScheduler::new(
+            state.postgres.wyrd().clone(),
+            self.server.operator_pool(),
+            VerifierExecutionQueue::default(),
+            authority,
+            Duration::from_secs(1),
+        )
+        .with_groups(
+            GroupPoller::new(state.clone(), Duration::from_secs(30)),
+            Arc::clone(capacity),
+        )
+    }
+
+    /// Run one tenant statement as the admin's tenant transaction and commit.
+    ///
+    /// # Panics
+    /// Panics when the statement or commit fails.
+    async fn exec(&self, sql: &'static str) {
+        let mut conn = self.conn().await;
+        sqlx::query(sql)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("the statement applies");
+        conn.commit().await.expect("the statement commits");
+    }
+
+    /// The errored group executions of `group` with their error codes, and
+    /// whether each asserts no authority, inputs, snapshot, or result.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn errored(&self, group: &str) -> Vec<(String, bool)> {
+        let mut conn = self.conn().await;
+        sqlx::query_as(
+            "SELECT error ->> 'code',
+                    authority IS NULL AND inputs IS NULL AND group_sources IS NULL
+                    AND group_snapshot_sha256 IS NULL AND result_id IS NULL
+               FROM wyrd.verifier_executions
+              WHERE origin = 'group' AND group_id = $1 AND status = 'errored'
+              ORDER BY created_at",
+        )
+        .bind(group)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("errored executions read")
     }
 
     /// The due time of `group`'s pending row, if one exists.
@@ -345,6 +380,53 @@ impl Support {
         let execution = self.execution(*execution).await;
         execution["group"].clone()
     }
+}
+
+/// Register the Service fixture at `fixture` under `fixtures/cards/` as
+/// `admin`, credential it as an editor, and exchange its API key, which
+/// records the Service's activity.
+///
+/// Returns the registration receipt and the Service's access token.
+///
+/// # Panics
+/// Panics when loading, registration, or the credential exchange fails.
+async fn register(
+    server: &WyrdTestServer,
+    admin: &str,
+    fixture: &str,
+) -> (RegistrationReceipt, String) {
+    let receipt = register_card(server, admin, fixture).await;
+    let machine = server
+        .credential_registered_service(&receipt.root, &["editor"])
+        .await
+        .expect("Service credentials");
+    let token = server
+        .exchange_api_key(machine.api_key().expect("machine has an API key"))
+        .await
+        .expect("API key exchanges");
+    (receipt, token)
+}
+
+/// Register the Card fixture at `fixture` under `fixtures/cards/` as `admin`.
+///
+/// # Panics
+/// Panics when loading or registration fails.
+async fn register_card(server: &WyrdTestServer, admin: &str, fixture: &str) -> RegistrationReceipt {
+    let path = format!(
+        "{}/../../../fixtures/cards/{fixture}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let input = build_registration_input(load(std::path::Path::new(&path)).expect("loads"))
+        .expect("registration input builds");
+    Cards::connect_with(&client(
+        server.base_url().expect("bound server has a URL"),
+        admin,
+    ))
+    .await
+    .expect("handle connects")
+    .register(&input)
+    .await
+    .expect("the Card registers")
 }
 
 /// Assemble the production HTTP client the registry saga runs over.
@@ -547,11 +629,18 @@ async fn available_rows_form_expiring_group_snapshots() {
 }
 
 /// Pending groups debounce on acknowledged activity and stop after handoff:
-/// a later ACK moves the one due time, a full capacity pool claims nothing,
-/// a handoff consumes the row and repeated passes hand off nothing, two
-/// claimers never take one group, activity arriving during a handoff stays
-/// pending, a pass hands off at most 32 groups of a tenant, and a blocked
-/// group read does not hold up the cron pass.
+/// a later ACK moves the one due time; a full capacity pool and a pass with
+/// nothing due issue no Bifrost read, which a query fault armed before them
+/// and consumed only by the next real read observes; a handoff consumes the
+/// row; two claimers never take one group; a source item Scribe
+/// acknowledges while a handoff holds its group waits on that row lock and
+/// leaves fresh pending work; a pass hands off at most 32 groups of a
+/// tenant; the scheduler's own run schedules a real cron occurrence that
+/// became due while its group read is stalled, and cancellation leaves the
+/// group pending. Unconfigured authority keeps a group pending, while an
+/// inactive, retired, or query-denied owner records exactly one terminal
+/// errored execution, once, consuming the group — unless writing it fails,
+/// which rolls back and keeps it pending.
 ///
 /// # Panics
 /// Panics when setup fails or the pending state differs.
@@ -593,18 +682,25 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     let stop = CancellationToken::new();
     support.make_due().await;
     let held = capacity.try_acquire().expect("the one permit");
+    support.server.fail_next_query_after_batch();
     let starved = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert!(starved.is_empty(), "no permit, no claim: {starved:?}");
     assert!(support.pending("debounce").await.is_some());
     drop(held);
+    let faulted = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        faulted.is_empty() && support.pending("debounce").await.is_some(),
+        "the fault armed before the starved pass is still armed, so it read nothing: {faulted:?}"
+    );
     let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert_eq!(handed.len(), 1, "{handed:?}");
     assert!(
         support.pending("debounce").await.is_none(),
         "the handoff consumes it"
     );
+    support.server.fail_next_query_after_batch();
     let idle = scheduler.group_pass(&stop).await.expect("the pass runs");
-    assert!(idle.is_empty(), "no activity, no read: {idle:?}");
+    assert!(idle.is_empty(), "no activity, no handoff: {idle:?}");
 
     support.turn("debounce", "three", None).await;
     support
@@ -617,6 +713,11 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         "new activity reschedules"
     );
     support.make_due().await;
+    let faulted = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        faulted.is_empty() && support.pending("debounce").await.is_some(),
+        "the fault armed before the idle pass is still armed, so it read nothing: {faulted:?}"
+    );
     let queue = VerifierExecutionQueue::default();
     let mut claimer = support.conn().await;
     let due = queue
@@ -634,23 +735,50 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         "a claimed group is skipped"
     );
     drop(rival);
-    let mut arrival = support.conn().await;
-    let activity = [support.activity("debounce")];
     let state = support.server.state();
     let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox))
-        .resolve(&mut claimer, due.owner.expect("the Service is active"))
+        .resolve(
+            &mut claimer,
+            due.owner.expect("the Service has a principal"),
+        )
         .await
         .expect("authority resolves")
         .expect("the owner is accepted");
     let poller = GroupPoller::new(state.clone(), Duration::from_secs(30));
+    let assertion = support
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
     let ((), ()) = tokio::join!(
         async {
-            queue
-                .record_group_activity(&mut arrival, &activity)
+            support.turn("debounce", "four", None).await;
+            support
+                .server
+                .flush_bifrost()
                 .await
-                .expect("the arrival records");
+                .expect("the arrival is acknowledged");
         },
         async {
+            let deadline = tokio::time::Instant::now() + VISIBLE;
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity
+                      WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+                        AND query LIKE '%INSERT INTO wyrd.verification_group_pending%'",
+                )
+                .fetch_one(&assertion)
+                .await
+                .expect("activity reads");
+                if waiting > 0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the acknowledged arrival never waited on the held group"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             let outcome = poller
                 .poll(&mut claimer, &queue, &due, &authority)
                 .await
@@ -666,10 +794,9 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
             claimer.commit().await.expect("the handoff commits");
         },
     );
-    arrival.commit().await.expect("the arrival commits");
     assert!(
         support.pending("debounce").await.is_some(),
-        "activity during a handoff stays pending"
+        "an arrival acknowledged during a handoff leaves fresh pending work"
     );
 
     let mut conn = support.conn().await;
@@ -689,6 +816,18 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     let second_pass = batched.group_pass(&stop).await.expect("the pass runs");
     assert_eq!(second_pass.len(), 2, "the remainder: {second_pass:?}");
 
+    register_card(
+        &support.server,
+        &support.admin,
+        "observe_a_run/observed-model.yaml",
+    )
+    .await;
+    let (observed, _) = register(
+        &support.server,
+        &support.admin,
+        "observe_a_run/observed-service.yaml",
+    )
+    .await;
     support.turn("blocked", "one", None).await;
     support
         .server
@@ -697,20 +836,192 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         .expect("Bifrost flushes");
     support.make_due().await;
     support.server.stall_next_query_after_schema();
-    let (blocked, cron) = tokio::join!(batched.group_pass(&stop), async {
-        support
-            .server
-            .wait_query_schema_stall()
-            .await
-            .expect("the group read stalls");
-        let cron = batched.pass(&stop).await;
-        stop.cancel();
-        cron
-    });
-    cron.expect("the cron pass runs while a group read is blocked");
-    assert!(blocked.expect("the pass stops").is_empty());
+    let running = Arc::new(support.scheduler(&wide));
+    let halt = CancellationToken::new();
+    let run = tokio::spawn(Arc::clone(&running).run(halt.clone()));
+    support
+        .server
+        .wait_query_schema_stall()
+        .await
+        .expect("the group read stalls");
+    // ponytail: a daily occurrence due at today's UTC midnight is claimable
+    // only 30s after it, so this run fails in the first 30s of a UTC day.
+    support
+        .exec(
+            "UPDATE wyrd.verification_bindings
+                SET next_run_at = date_trunc('day', statement_timestamp() AT TIME ZONE 'UTC')
+                                  AT TIME ZONE 'UTC'
+              WHERE activation = 'schedule'",
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + VISIBLE;
+    loop {
+        let mut conn = support.conn().await;
+        let scheduled: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.verifier_executions
+              WHERE origin = 'schedule' AND owner_card_uid = $1",
+        )
+        .bind(
+            observed
+                .root
+                .uid
+                .as_ref()
+                .expect("the receipt has a uid")
+                .as_uuid(),
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("executions read");
+        if scheduled == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cron loop never scheduled while the group read was blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         support.pending("blocked").await.is_some(),
-        "the group stays pending"
+        "the group read is still held"
     );
+    halt.cancel();
+    run.await.expect("the scheduler stops");
+    assert!(
+        support.pending("blocked").await.is_some(),
+        "a cancelled handoff rolls back and the group stays pending"
+    );
+    let unavailable = support.scheduler_with(&wide, BackgroundAuthority::new(None));
+    let blocked = unavailable.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        blocked.is_empty() && support.pending("blocked").await.is_some(),
+        "unconfigured authority is retryable, not a refusal: {blocked:?}"
+    );
+    assert!(support.errored("blocked").await.is_empty());
+    let recovered = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        matches!(recovered.as_slice(), [GroupHandoff::Enqueued(_)]),
+        "{recovered:?}"
+    );
+
+    support.turn("lapsed", "one", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    support
+        .exec(
+            "UPDATE wyrd.auth_service_accounts
+                SET last_authenticated_at = statement_timestamp() - INTERVAL '400 days'
+              WHERE card_uid IS NOT NULL AND principal_kind <> 'system'",
+        )
+        .await;
+    support.make_due().await;
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_group_refusal() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected refusal failure'; END $$",
+        "CREATE TRIGGER fail_group_refusal BEFORE INSERT ON wyrd.verifier_executions \
+         FOR EACH ROW WHEN (NEW.status = 'errored' AND NEW.authority IS NULL) \
+         EXECUTE FUNCTION public.fail_group_refusal()",
+    ] {
+        sqlx::query(statement)
+            .execute(&assertion)
+            .await
+            .expect("the refusal fault installs");
+    }
+    let failed = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        failed.is_empty() && support.pending("lapsed").await.is_some(),
+        "a failed refusal write rolls back and keeps the group pending: {failed:?}"
+    );
+    assert!(
+        support.errored("lapsed").await.is_empty(),
+        "no partial record"
+    );
+    sqlx::query("DROP TRIGGER fail_group_refusal ON wyrd.verifier_executions")
+        .execute(&assertion)
+        .await
+        .expect("the refusal fault uninstalls");
+    let refused = batched.group_pass(&stop).await.expect("the pass runs");
+    let [GroupHandoff::Errored(lapsed)] = refused.as_slice() else {
+        panic!("an inactive owner records one refusal: {refused:?}");
+    };
+    assert!(support.pending("lapsed").await.is_none(), "it is consumed");
+    assert_eq!(
+        support.errored("lapsed").await,
+        [("WYRD_AUTH_401_CREDENTIAL_REVOKED".to_owned(), true)]
+    );
+    let readback = support.execution(*lapsed).await;
+    assert_eq!(readback["status"], "errored", "{readback}");
+    assert_eq!(readback["group_id"], "lapsed", "{readback}");
+    assert!(readback["group"].is_null() && readback["result"].is_null());
+    assert!(readback["dispatches"].as_array().is_some_and(Vec::is_empty));
+    let again = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(again.is_empty(), "a refusal is not polled again: {again:?}");
+    assert_eq!(support.errored("lapsed").await.len(), 1);
+    support
+        .exec(
+            "UPDATE wyrd.auth_service_accounts SET last_authenticated_at = statement_timestamp()
+              WHERE card_uid IS NOT NULL AND principal_kind <> 'system'",
+        )
+        .await;
+
+    support.turn("retired", "one", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let mut conn = support.conn().await;
+    sqlx::query("UPDATE wyrd.cards SET status = 'deprecated' WHERE card_uid = $1")
+        .bind(support.owner.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the owner retires");
+    conn.commit().await.expect("the retirement commits");
+    support.make_due().await;
+    let refused = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        matches!(refused.as_slice(), [GroupHandoff::Errored(_)]),
+        "a retired owner records one refusal: {refused:?}"
+    );
+    assert_eq!(support.errored("retired").await.len(), 1);
+    let mut conn = support.conn().await;
+    sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
+        .bind(support.owner.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the owner returns");
+    conn.commit().await.expect("the return commits");
+
+    support.turn("denied", "one", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let mut conn = support.conn().await;
+    sqlx::query(
+        "DELETE FROM wyrd.auth_service_account_roles
+          WHERE service_account_id = (SELECT id FROM wyrd.auth_service_accounts WHERE card_uid = $1)",
+    )
+    .bind(support.owner.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("the owner loses its roles");
+    conn.commit().await.expect("the revocation commits");
+    support.make_due().await;
+    let refused = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        matches!(refused.as_slice(), [GroupHandoff::Errored(_)]),
+        "a denied snapshot read records one refusal: {refused:?}"
+    );
+    let denied = support.errored("denied").await;
+    assert!(
+        matches!(denied.as_slice(), [(code, true)] if code.starts_with("WYRD_PERMISSION_403")),
+        "{denied:?}"
+    );
+    let again = batched.group_pass(&stop).await.expect("the pass runs");
+    assert!(again.is_empty(), "a refusal is not polled again: {again:?}");
 }

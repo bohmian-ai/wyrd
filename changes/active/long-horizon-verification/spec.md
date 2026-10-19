@@ -1,6 +1,6 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 19
+revision: 20
 status: approved
 ---
 
@@ -50,6 +50,12 @@ runs as the tenant's internal read principal, not under the owning Service's
 grants. Work the resulting execution performs keeps the owner's accepted
 authority. A removed or missing owner Bifrost grant can no longer block or
 error the snapshot read.
+
+Revision 20 records the owner's explicit approval of one completeness rule. A
+snapshot in which a selected source execution has a visible result but no
+visible input caught a publication mid-read. It is not pinned and stays pending
+for the next pass. A group still incomplete five minutes after its due time
+records one terminal errored group execution and consumes pending.
 
 Current implementation base: `ba92ac9b9` on
 `change/long-horizon-verification-task-001`. Extend the existing
@@ -396,8 +402,9 @@ only its latest execution; no new history/list API is required. Reading still
 requires normal authorization. Reactivation alone does not resurrect consumed
 pending work; new source activity follows normal scheduling. Keep retryable
 blockage from immediately reclaiming the same oldest row within one tenant pass;
-other tenants and the separate cron loop continue. Add no retry counter, expiry,
-queue, recovery protocol or fairness promise.
+other tenants and the separate cron loop continue. Add no retry counter, queue,
+recovery protocol or fairness promise. The only expiry is the incomplete-snapshot
+deadline below.
 
 An arrival updating that row during snapshot/handoff waits in the background on
 the SQL row lock. After the handoff commits, its upsert creates a fresh pending
@@ -409,9 +416,23 @@ There is no additional group crash-recovery protocol.
 
 One successful Bifrost statement reads the selected group's currently visible
 input/result rows together and pins their values. No Bifrost discovery scan,
-time checkpoint, payload reread of inactive groups, PostgreSQL source settlement
-filter or post-read completeness check is added. Lazy missing tables retain
-ordinary handling. Query admission, memory/output limits and deadlines remain.
+time checkpoint, payload reread of inactive groups or PostgreSQL source settlement
+filter is added. Lazy missing tables retain ordinary handling.
+
+One post-read check applies. Every source execution stages its input before its
+result, so a read showing a selected execution's result without that execution's
+input caught rows moving from unpublished to published. Such a read is incomplete.
+Nothing is pinned or enqueued, the pending row is kept, and a warning naming the
+executions is traced. The next pass reads again. An execution with an input but
+no result is normal and still pins a null result. If the read is still incomplete
+when PostgreSQL's `statement_timestamp()` is more than five minutes past the row's
+`due_at`, the item is terminal. It records one terminal errored group execution
+with the stable error `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE`, whose details
+name the executions missing inputs, and deletes pending in the same tenant
+transaction. This uses the same pre-admission shape as an owner rejection: no
+accepted owner authority, no snapshot, no evaluation, verdict or Operator. The
+five-minute bound is fixed, not configurable. New source activity schedules the
+group again through normal scheduling. Query admission, memory/output limits and deadlines remain.
 A failed, degraded or truncated query is not a group snapshot.
 
 The existing execution_slots setting supplies a single process-local capacity
@@ -429,7 +450,8 @@ execution. Polling delay, resource contention and source visibility lag are
 accepted. Scribe acknowledgement is not a query-completeness checkpoint: a later
 visibility change alone does not generate a scheduling notification. A snapshot
 uses what is visible when it runs; the next acknowledged source activity causes
-the next execution. No visibility barrier or reconciliation scan is promised.
+the next execution. The only exception is the incomplete-snapshot rule above. No
+other visibility barrier or reconciliation scan is promised.
 
 Existing source validation, exact-version/ambiguity/cycle checks and permissions
 remain. There is no max-age override, permanent finality or in-flight-source wait.
@@ -999,6 +1021,8 @@ Accepted limits are part of the requirement, not review defects:
 - Acknowledgement triggers scheduling but does not guarantee query completeness.
   A later visibility change alone does not trigger another execution. No scan or
   barrier repairs this; subsequent acknowledged evidence schedules another snapshot.
+  The one repaired case is a result visible without its input, which retries for
+  up to five minutes past due and then errors.
 - Scheduling updates can wait on the bounded snapshot transaction's row lock;
   this delays only background work, never the originating response or permission.
 - Runtime permits bound active work, not durable SQL backlog. Repeated source
@@ -1016,7 +1040,8 @@ is retired. REQ-015/AC-009 remain required subsequent opt-in benchmarking work;
 TASK-003a must leave its existing driver usable and scenarios configured with
 `after`, but neither implement new benchmark cases nor claim performance PASS.
 The owner explicitly accepted the tradeoffs above. No open material behavior
-decision remains for TASK-003a and its R1 remediation. Revision 19 moves the
+decision remains for TASK-003a and its R1 remediation. Revision 20 adds the
+incomplete-snapshot retry and deadline. Revision 19 moves the
 group snapshot read to the internal read principal. Revision 18 amends failure
 classification/visibility and write-time duration validation; revision 17's other
 pending-row, batching and capacity seams remain.
@@ -1045,6 +1070,7 @@ pending-row, batching and capacity seams remain.
 
 | 18 | approved | Owner approved retaining pending only for blocked enqueue/retryable Wyrd problems; inactive/retired owner or auth rejection records one terminal errored execution and consumes pending atomically, without evaluation/verdict/Operator or fabricated accepted authority/snapshot. Error-write failure retains pending; existing latest-binding/execution status supplies visibility. Owner explicitly capped group_end.after at one year (365 fixed days), rejected at write time; accepted durations remain exact and the hidden SQL clamp is deleted. Other accepted limits unchanged. |
 | 19 | approved | Owner directed that core verification never rely on owner credentials an outside party can remove. The group snapshot read of verification inputs/results runs as the tenant's credentialless, role-free internal read principal: table-scoped `bifrost_query:read`, owner/source filter in the statement. The owner activity/authority check before kickoff and revision 18's terminal errored execution are unchanged. Execution work, including Agent actions/tool reads and gateway spend, keeps the owner's accepted authority and sub/act. The snapshot-read 403 path is removed. Owner explicitly approved this revision. |
+| 20 | approved | Owner approved one post-read completeness rule. A snapshot read in which a selected source execution has a visible result but no visible input caught a publication mid-read; it pins nothing and stays pending, with a traced warning. Still incomplete more than five minutes past `due_at` (PostgreSQL time, fixed bound) records one terminal errored group execution with `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` naming the executions and consumes pending, using revision 18's pre-admission shape. An input without a result remains a normal null. This replaces revision 18's blanket no-expiry and the no-post-read-completeness-check wording for this one case. Owner explicitly approved this revision. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

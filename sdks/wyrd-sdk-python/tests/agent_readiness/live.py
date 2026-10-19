@@ -469,7 +469,15 @@ def resolve(binary: str, which: Any = shutil.which) -> str | None:
     if found is None or "/mise/shims/" not in found:
         return found
     real = subprocess.run(["mise", "which", binary], capture_output=True, text=True)
-    return (real.stdout.strip() or None) if real.returncode == 0 else None
+    if real.returncode == 0 and real.stdout.strip():
+        return real.stdout.strip()
+    # A shim inactive here still leaves any real install later on PATH.
+    path = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if "/mise/shims" not in entry
+    )
+    return which(binary, path=path)
 
 
 def agent_environment(
@@ -631,23 +639,41 @@ def identity() -> dict[str, str]:
 def run(
     agents: Sequence[Agent], artifacts: Path, timeout: float, cancel: threading.Event
 ) -> list[Outcome]:
-    """Prepare the shared wheel and docs, then exercise every agent concurrently.
+    """Prepare the shared wheel and docs, then exercise every ready agent concurrently.
 
-    A missing prerequisite or failed shared stage blocks every affected agent
-    with its reason; nothing is skipped.
+    A missing prerequisite blocks only the agents it affects (all of them for
+    a harness one); a failed shared stage fails every exercised agent with
+    its reason. Nothing is skipped.
     """
     redact = Redactor.from_environment(os.environ)
     missing = preflight(agents, os.environ)
-    if missing:
-        return [
-            Outcome(
-                agent=agent.name,
-                outcome="blocked",
-                failure_point="preflight",
-                detail="; ".join(v for k, v in missing.items() if k in ("harness", agent.name)),
-            )
-            for agent in agents
-        ]
+    outcomes = {
+        agent.name: Outcome(
+            agent=agent.name,
+            outcome="blocked",
+            failure_point="preflight",
+            detail="; ".join(v for k, v in missing.items() if k in ("harness", agent.name)),
+        )
+        for agent in agents
+        if "harness" in missing or agent.name in missing
+    }
+    ready = [agent for agent in agents if agent.name not in outcomes]
+    if ready:
+        outcomes |= {
+            outcome.agent: outcome
+            for outcome in exercise_all(ready, artifacts, timeout, redact, cancel)
+        }
+    return [outcomes[agent.name] for agent in agents]
+
+
+def exercise_all(
+    agents: Sequence[Agent],
+    artifacts: Path,
+    timeout: float,
+    redact: Redactor,
+    cancel: threading.Event,
+) -> list[Outcome]:
+    """Build the shared wheel, serve the docs, and exercise ``agents`` concurrently."""
     try:
         build_wheel(artifacts / "wheels")
         with (

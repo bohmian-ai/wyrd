@@ -129,6 +129,26 @@ def test_missing_prerequisites_block_every_agent_instead_of_skipping(
     assert "API_KEY" in outcomes[0].detail and "codex login" in outcomes[1].detail
 
 
+def test_one_agents_missing_prerequisite_leaves_the_other_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.agent_readiness import live
+
+    monkeypatch.setattr(live, "preflight", lambda agents, environ: {"codex": "missing codex"})
+    monkeypatch.setattr(
+        live,
+        "exercise_all",
+        lambda agents, *_: [live.Outcome(agent.name, outcome="passed") for agent in agents],
+    )
+
+    outcomes = run(list(AGENTS.values()), tmp_path, 1.0, threading.Event())
+
+    assert [(each.agent, each.outcome, each.detail) for each in outcomes] == [
+        ("claude", "passed", ""),
+        ("codex", "blocked", "missing codex"),
+    ]
+
+
 def test_linked_login_replaced_by_the_agent_is_copied_back(tmp_path: Path) -> None:
     original = tmp_path / "owner" / "auth.json"
     original.parent.mkdir()

@@ -92,7 +92,7 @@ mod tests {
     /// A session that asks for type checking is refused rather than run unchecked.
     #[test]
     fn every_check_is_refused() {
-        let mut checker = TypeChecker::default();
+        let mut checker = TypeChecker;
         let source = SourceFile::new("x: int = 1", "main.py");
 
         let refused = checker.run(&source, None, TypeCheckingConfig::default());

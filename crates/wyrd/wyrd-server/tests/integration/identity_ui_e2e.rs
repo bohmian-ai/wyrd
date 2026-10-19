@@ -6,14 +6,15 @@
 //! on the same Keycloak issuer, one on Dex, a different provider), and a
 //! provider-replacement tenant (Active first realm, replaced by the second
 //! Keycloak realm through the settings page), starts two production
-//! BFF processes (`node build`) configured as the official image configures
-//! them — the first in front of replica A over loopback HTTP, the second in front of
+//! BFF processes (`node build`) configured as `wyrd server dev` configures
+//! them, with the public origin set and `/auth/*` forwarded to their server —
+//! the first in front of replica A over loopback HTTP, the second in front of
 //! replica B only through a Node TLS terminator whose certificate the
 //! repository's test CA issues and the BFF trusts — and runs the Vitest HTTP journey
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
-//! journey drives both BFFs over HTTP like a browser behind a load balancer,
-//! sending the public origin's `/auth/*` routes to either server replica as
-//! the gateway would; no Vitest mock stands in for the BFF or the server.
+//! journey drives both BFFs over HTTP like a browser behind a TCP load
+//! balancer, reaching every `/auth/*` route only through a BFF's public
+//! origin; no Vitest mock stands in for the BFF or the server.
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
 //! it visibly; `mise run test:identity:journey` builds the UI and runs it.
@@ -102,15 +103,16 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wyrd-ui")
 }
 
-/// Start one production BFF replica against `server_url`, configured as the
-/// official image configures it, and wait until it answers. `extra_ca` is the
+/// Start one production BFF replica against `server_url` at public `origin`,
+/// configured as `wyrd server dev` configures it (the public origin is set,
+/// never read from request headers), and wait until it answers. `extra_ca` is the
 /// PEM file Node adds to its trust store, so a replica given the TLS
 /// terminator's `https:` origin verifies it through the ordinary native
 /// `fetch` path.
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
-async fn start_bff(server_url: &str, extra_ca: Option<&std::path::Path>) -> Bff {
+async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::Path>) -> Bff {
     let ui = ui_dir();
     assert!(
         ui.join("build/index.js").is_file(),
@@ -126,8 +128,7 @@ async fn start_bff(server_url: &str, extra_ca: Option<&std::path::Path>) -> Bff 
         .current_dir(&ui)
         .env("HOST", "127.0.0.1")
         .env("PORT", port.to_string())
-        .env("PROTOCOL_HEADER", "x-forwarded-proto")
-        .env("HOST_HEADER", "x-forwarded-host")
+        .env("ORIGIN", origin)
         .env("WYRD_SERVER_URL", server_url)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -484,8 +485,8 @@ async fn production_ui_bff_journey() {
     // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
-    let first = start_bff(&server, None).await;
-    let second = start_bff(&terminator.url, Some(&ca)).await;
+    let first = start_bff(&server, &origin, None).await;
+    let second = start_bff(&terminator.url, &origin, Some(&ca)).await;
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],

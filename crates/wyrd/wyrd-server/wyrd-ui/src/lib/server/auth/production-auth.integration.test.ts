@@ -6,17 +6,18 @@
  * runs this file with the `WYRD_UI_JOURNEY` fixture. Every request goes over
  * the wire; nothing here mocks the BFF or the server.
  *
- * The BFF is the public OAuth client `wyrd-ui`, configured as the official
- * image configures it (no secret, no public origin): sign-in is the
- * authorization code grant with PKCE, a replica that has not cached a
- * session's access token renews it with the refresh token, and logout revokes
- * that refresh token (RFC 7009).
+ * The BFF is the public OAuth client `wyrd-ui`, configured as `wyrd server
+ * dev` configures it: its public origin is configured, not taken from request
+ * headers, and every browser `/auth/*` request reaches Wyrd only through the
+ * BFF's forwarding. Sign-in is the authorization code grant with PKCE, a
+ * replica that has not cached a session's access token renews it with the
+ * refresh token, and logout revokes that refresh token (RFC 7009).
  */
 import { expect, test } from 'vitest';
 
 type Journey = {
   origin: string;
-  /** The Wyrd replicas, in BFF order: the server routes the gateway sends `/auth/*` to. */
+  /** The Wyrd replicas, in BFF order: each BFF forwards `/auth/*` to its own. */
   servers: [string, string];
   bffs: [string, string];
   ssoTenant: string;
@@ -45,21 +46,28 @@ const sessionCookie = (tenant: string) => `wyrd_session_${tenant}`;
 const journeyTimeout = 60_000;
 
 /**
- * The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica
- * `replica`, with the scheme and host it forwards; the redirect is returned.
+ * Forwarded-origin headers a hostile browser sends on every request. Each BFF
+ * establishes the public origin from its own configuration, so these never
+ * reach a sign-in redirect, callback, or cookie.
+ */
+const hostileForwarding = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'evil.test' };
+
+/**
+ * A browser's visit to a public-origin `/auth/*` URL, which BFF `replica`
+ * forwards to its Wyrd replica; the redirect is returned, not followed.
  */
 function gateway(url: string, replica: 0 | 1 = 0): Promise<Response> {
   const target = new URL(url);
   expect(target.origin).toBe(journey.origin);
-  return fetch(journey.servers[replica] + target.pathname + target.search, {
+  return fetch(journey.bffs[replica] + target.pathname + target.search, {
     redirect: 'manual',
-    headers: { 'x-forwarded-proto': 'http', 'x-forwarded-host': target.host }
+    headers: hostileForwarding
   });
 }
 
 /**
- * One browser behind a load balancer: a host-only cookie jar for the public
- * origin, sent to whichever BFF replica a request is routed to.
+ * One browser behind a TCP load balancer: a host-only cookie jar for the
+ * public origin, sent to whichever BFF replica a request is routed to.
  */
 class Browser {
   readonly cookies = new Map<string, string>();
@@ -71,12 +79,7 @@ class Browser {
     path: string,
     options: { form?: Record<string, string>; origin?: string } = {}
   ): Promise<Response> {
-    // The scheme and host the gateway forwards, as the image's nginx does.
-    const headers = new Headers({
-      accept: 'text/html',
-      'x-forwarded-proto': 'http',
-      'x-forwarded-host': new URL(journey.origin).host
-    });
+    const headers = new Headers({ accept: 'text/html', ...hostileForwarding });
     if (this.cookies.size)
       headers.set('cookie', [...this.cookies].map(([k, v]) => `${k}=${v}`).join('; '));
     if (options.form) {
@@ -202,9 +205,9 @@ async function beginSso(
 }
 
 /**
- * Finish the provider leg the way the gateway routes it: the provider's
- * callback location is on the public origin, and `/auth/callback` belongs to
- * the server, which answers with the BFF's authorization response. Returns
+ * Finish the provider leg through the public origin: the provider's callback
+ * location is on it, and the BFF forwards `/auth/callback` to the server,
+ * which answers with the BFF's authorization response. Returns
  * that response's path and query on the public origin.
  */
 async function providerCallback(
@@ -258,9 +261,7 @@ async function expectMixedCallbackRefused(
 ) {
   const query = new URL(providerReturn).searchParams;
   query.set('state', state);
-  const mixed = await fetch(`${journey.servers[0]}/auth/callback?${query}`, {
-    redirect: 'manual'
-  });
+  const mixed = await gateway(`${journey.origin}/auth/callback?${query}`);
   expect(mixed.status, await mixed.clone().text()).toBe(303);
   const returned = new URL(mixed.headers.get('location')!);
   expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);

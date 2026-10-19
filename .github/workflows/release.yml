@@ -570,6 +570,15 @@ jobs:
           sudo swapon /mnt/wyrd-build.swap
           free -h
 
+      # wyrd-server's text outgrows aarch64's +/-128 MiB direct-call range,
+      # and GNU ld fails with `relocation truncated to fit: R_AARCH64_CALL26`
+      # instead of placing veneers; lld inserts range-extension thunks.
+      - name: Link with lld
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: |
+          sudo apt-get install -y lld
+          echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+
       - name: Build bundle
         run: scripts/build.sh bundle
 

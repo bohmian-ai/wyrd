@@ -408,15 +408,14 @@ impl VerificationScheduler {
     /// execution, or `None` to leave it pending.
     ///
     /// An active owner's recovered authority pins and enqueues one snapshot
-    /// (or finds the identical snapshot's execution). An inactive owner, a
-    /// rejected owner authority, or a snapshot read query authorization
-    /// denies is recorded through [`VerifierExecutionQueue::refuse_group`]
-    /// as one terminal errored execution, serving the owner's stored
-    /// principal and recorded by SYSTEM. Everything else is a Wyrd-side
-    /// blockage that is traced and leaves the group pending: an owner with
-    /// no Card-bound principal, unavailable authority, a non-auth enqueue
-    /// refusal, a failed or degraded read, or a tenant without SYSTEM to
-    /// record a refusal.
+    /// (or finds the identical snapshot's execution), read as the tenant's
+    /// SYSTEM principal. An inactive owner or a rejected owner authority is
+    /// recorded through [`VerifierExecutionQueue::refuse_group`] as one
+    /// terminal errored execution, serving the owner's stored principal and
+    /// recorded by SYSTEM. Everything else is a Wyrd-side blockage that is
+    /// traced and leaves the group pending: an owner with no Card-bound
+    /// principal, a tenant without SYSTEM, unavailable authority, a non-auth
+    /// enqueue refusal, or a failed, refused or degraded read.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a statement fails, including the refusal's
@@ -439,6 +438,13 @@ impl VerificationScheduler {
         let Some(owner) = due.owner else {
             return Ok(pending(&"the owner has no Card-bound principal"));
         };
+        let Some(system) = system_principal_id(conn)
+            .await
+            .map_err(SqlError::Query)?
+            .map(PrincipalId::new)
+        else {
+            return Ok(pending(&"the tenant has no SYSTEM principal"));
+        };
         let refusal = 'refusal: {
             if !due.active {
                 break 'refusal WyrdError::CredentialRevoked {
@@ -453,7 +459,11 @@ impl VerificationScheduler {
                     return Ok(pending(&"the owner authority is unavailable"));
                 }
             };
-            match groups.poller.poll(conn, &self.queue, due, &authority).await {
+            match groups
+                .poller
+                .poll(conn, &self.queue, due, &authority, system)
+                .await
+            {
                 Ok(EnqueueOutcome::Enqueued(id)) => return Ok(Some(GroupHandoff::Enqueued(id))),
                 Ok(EnqueueOutcome::AlreadyEnqueued(id)) => {
                     return Ok(Some(GroupHandoff::AlreadyEnqueued(id)));
@@ -462,18 +472,8 @@ impl VerificationScheduler {
                     return Ok(pending(&format!("{refusal:?}")));
                 }
                 Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
-                Err(GroupPollError::Denied(error)) => error,
                 Err(error @ GroupPollError::Read(_)) => return Ok(pending(&error)),
             }
-        };
-        let Some(system) = system_principal_id(conn)
-            .await
-            .map_err(SqlError::Query)?
-            .map(PrincipalId::new)
-        else {
-            return Ok(pending(
-                &"the tenant has no SYSTEM principal to record the refusal",
-            ));
         };
         let execution = self
             .queue

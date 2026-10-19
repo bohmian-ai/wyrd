@@ -26,6 +26,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::groups::GroupPoller;
@@ -35,6 +36,7 @@ use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::registry::RegistrationReceipt;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, VerifierExecutionQueue,
 };
@@ -638,9 +640,10 @@ async fn available_rows_form_expiring_group_snapshots() {
 /// tenant; the scheduler's own run schedules a real cron occurrence that
 /// became due while its group read is stalled, and cancellation leaves the
 /// group pending. Unconfigured authority keeps a group pending, while an
-/// inactive, retired, or query-denied owner records exactly one terminal
-/// errored execution, once, consuming the group — unless writing it fails,
-/// which rolls back and keeps it pending.
+/// inactive or retired owner records exactly one terminal errored execution,
+/// once, consuming the group — unless writing it fails, which rolls back and
+/// keeps it pending. An owner stripped of its roles is still verified: the
+/// snapshot reads as the tenant's internal read principal, never the owner.
 ///
 /// # Panics
 /// Panics when setup fails or the pending state differs.
@@ -744,6 +747,11 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         .await
         .expect("authority resolves")
         .expect("the owner is accepted");
+    let system = system_principal_id(&mut claimer)
+        .await
+        .expect("SYSTEM reads")
+        .map(PrincipalId::new)
+        .expect("the tenant has SYSTEM");
     let poller = GroupPoller::new(state.clone(), Duration::from_secs(30));
     let assertion = support
         .server
@@ -780,7 +788,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let outcome = poller
-                .poll(&mut claimer, &queue, &due, &authority)
+                .poll(&mut claimer, &queue, &due, &authority, system)
                 .await
                 .expect("the snapshot pins");
             assert!(
@@ -995,7 +1003,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         .expect("the owner returns");
     conn.commit().await.expect("the return commits");
 
-    support.turn("denied", "one", None).await;
+    support.turn("unroled", "one", None).await;
     support
         .server
         .flush_bifrost()
@@ -1012,16 +1020,14 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     .expect("the owner loses its roles");
     conn.commit().await.expect("the revocation commits");
     support.make_due().await;
-    let refused = batched.group_pass(&stop).await.expect("the pass runs");
+    let handed = batched.group_pass(&stop).await.expect("the pass runs");
     assert!(
-        matches!(refused.as_slice(), [GroupHandoff::Errored(_)]),
-        "a denied snapshot read records one refusal: {refused:?}"
+        matches!(handed.as_slice(), [GroupHandoff::Enqueued(_)]),
+        "an owner without roles is still verified: {handed:?}"
     );
-    let denied = support.errored("denied").await;
+    assert!(support.pending("unroled").await.is_none(), "it is consumed");
     assert!(
-        matches!(denied.as_slice(), [(code, true)] if code.starts_with("WYRD_PERMISSION_403")),
-        "{denied:?}"
+        support.errored("unroled").await.is_empty(),
+        "nothing is refused"
     );
-    let again = batched.group_pass(&stop).await.expect("the pass runs");
-    assert!(again.is_empty(), "a refusal is not polled again: {again:?}");
 }

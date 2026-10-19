@@ -12,8 +12,10 @@
 //! input ingest time, else earliest result ingest time, then execution ID;
 //! an absent value is null. The pinned snapshot's content digest makes an
 //! unchanged re-read enqueue nothing. Every row time is Bifrost's managed
-//! `wyrd_ingested_at`, stamped from PostgreSQL, and every read runs under the
-//! binding owner's accepted authority, executed by SYSTEM.
+//! `wyrd_ingested_at`, stamped from PostgreSQL. Every read runs as the
+//! tenant's internal read principal ([`SystemReadAuthority`]), granted only
+//! the two verification tables and serving the binding owner, so no owner
+//! grant can block it; the owner filter stays in the statement.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -24,6 +26,9 @@ use arrow::util::display::array_value_to_string;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ExecutionId, IdError, SlotName, VerificationResultId};
@@ -36,8 +41,8 @@ use wyrd_sql::queries::verifier_executions::{
     VerifierExecutionQueue,
 };
 
+use super::authority::SystemReadAuthority;
 use super::drift::ObservationWindow;
-use crate::components::auth::Caller;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -50,25 +55,18 @@ pub enum GroupPollError {
     /// A Postgres statement failed; the caller's transaction is unusable.
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
-    /// Query authorization refused the owner's accepted authority the
-    /// snapshot read; the caller records the refusal as terminal.
-    #[error("group snapshot read denied: {0}")]
-    Denied(WyrdError),
-    /// A Bifrost read failed, was degraded, or returned malformed rows; the
+    /// The internal read authority could not be built, or a Bifrost read
+    /// failed, was refused, was degraded, or returned malformed rows; the
     /// caller rolls back so the group stays pending.
     #[error("group snapshot read failed: {0}")]
     Read(String),
 }
 
 impl From<WyrdError> for GroupPollError {
-    /// A permission denial (HTTP 403) is [`Self::Denied`]; every other
-    /// failure is a retryable [`Self::Read`] naming its stable code.
+    /// Every query failure, a refusal of the internal reader included, is a
+    /// retryable [`Self::Read`] naming its stable code.
     fn from(error: WyrdError) -> Self {
-        if error.status() == 403 {
-            Self::Denied(error)
-        } else {
-            Self::Read(format!("{}: {error}", error.code()))
-        }
+        Self::Read(format!("{}: {error}", error.code()))
     }
 }
 
@@ -94,17 +92,18 @@ impl GroupPoller {
     /// Pin one snapshot of the claimed pending group `due` and enqueue its
     /// group execution under the owner's accepted `authority`.
     ///
-    /// The statement runs as `authority` executed by its SYSTEM actor, so
-    /// ordinary query admission, table authorization and denial audit decide
-    /// what the owner may read. A tenant without a results table is read from
-    /// inputs alone. An unchanged snapshot answers with its existing
-    /// execution. The caller consumes the pending row and commits.
+    /// The statement runs as the tenant's `system` principal holding
+    /// `bifrost_query:read` on exactly the registered verification inputs and
+    /// results tables, recorded as serving the owner; the owner's own grants
+    /// play no part in the read. A tenant without a results table is read
+    /// from inputs alone. An unchanged snapshot answers with its existing
+    /// execution, and the enqueued execution keeps `authority` for its work.
+    /// The caller consumes the pending row and commits.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Sql`] when a Postgres statement fails and
-    /// [`GroupPollError::Denied`] when query authorization denies the owner
-    /// the read, and [`GroupPollError::Read`] when the read fails, is refused
-    /// for resources or degraded, or a stored declaration or row is
+    /// [`GroupPollError::Read`] when the read authority cannot be built, the
+    /// read fails, is refused or degraded, or a stored declaration or row is
     /// malformed.
     pub async fn poll(
         &self,
@@ -112,17 +111,21 @@ impl GroupPoller {
         queue: &VerifierExecutionQueue,
         due: &DueGroup,
         authority: &ExecutionAuthority,
+        system: PrincipalId,
     ) -> Result<EnqueueOutcome, GroupPollError> {
-        let caller = Caller::accepted(
-            authority.authority(),
-            authority.attribution().act_principal_id,
-        );
+        let tables = ["execution_inputs", "results"]
+            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let read =
+            SystemReadAuthority::resolve(&self.state, conn.data_tenant_id(), Some(system), &tables)
+                .await
+                .map_err(|error| GroupPollError::Read(error.to_string()))?
+                .serving(authority.authority());
         let reader = Reader {
-            query: ScheduledQueryCaller::authenticated(
+            query: ScheduledQueryCaller::new(
                 self.state.clone(),
-                caller,
+                read.into_context(),
                 CancellationToken::new(),
-            )?,
+            ),
             deadline_ms: i64::try_from(self.query_timeout.as_millis()).unwrap_or(i64::MAX),
         };
         let sources = Sources::new(&due.settings, &due.owner_card_uid.to_string())?;
@@ -151,9 +154,9 @@ impl GroupPoller {
     }
 }
 
-/// The owner's accepted reader of one pending group.
+/// The internal reader of one pending group.
 struct Reader {
-    /// The owner's accepted caller every statement runs through.
+    /// The internal read principal every statement runs through.
     query: ScheduledQueryCaller,
     /// Deadline of one statement, in milliseconds.
     deadline_ms: i64,

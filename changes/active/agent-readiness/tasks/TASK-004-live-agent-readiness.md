@@ -244,3 +244,64 @@ invocation flags are implementation-owned; verify flags from installed help.
 - [Agent harness](../../../../architecture/references/languages/agent-harness.md),
   [security](../../../../architecture/wyrd-security-posture.md), [Bifrost](../../../../architecture/bifrost-design.md),
   [telemetry](../../../../architecture/references/domain/telemetry-observations.md), [evaluation](../../../../architecture/references/domain/evaluation.md).
+
+## Implementation Evidence
+
+Write set: `mise.toml` (`test:agent-readiness:smoke:live`),
+`sdks/wyrd-sdk-python/tests/agent_readiness/{__init__,live,observe}.py`,
+`sdks/wyrd-sdk-python/tests/unit/test_agent_readiness.py`, and the observer
+seam in `sdks/wyrd-sdk-python/tests/integration/test_support_desk.py`.
+Reuse map: `local_deployment`/`stop_local_cli` (isolated home, database,
+server binary), `wyrd server dev --format json` readiness, `wyrd mcp install`,
+`mise run docs:preview`, `scripts/postgres/with-test-postgres.sh`, and the
+public `Cards`/`Bifrost`/`Execution` SDK reads. No production code, contract,
+UI, docs content, or dependency changed.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Tracked opt-in task, untracked local settings, excluded from gate/CI | `mise.toml` task; credentials from untracked `mise.local.toml` (`pass`), Codex via owner's login | `test_no_gate_or_ci_path_reaches_the_live_lane`; `mise run check:ci-selection` 7 passed | PASS |
+| Harness owns ready foreground Wyrd and commit-local docs before both isolated connected agents | `live.py` `wyrd_served`, `docs_served`, `exercise` (per-agent `local_deployment`, isolated HOME/CODEX_HOME/WYRD_CONFIG_HOME, `mcp install`, current-build wheel via find-links) | readiness/interrupt/server-failure unit doubles; P1 `mcp-install.json`, agents used `mcp__wyrd__*` tools and `http://127.0.0.1` docs | PASS |
+| Server evidence proves graph/Observe/sync/async workflow | `observe.py` `Observer` (pulled graph, Run+Card-correlated spans and Service-table rows, direct results, queued `Execution.status()`) | 16 `test_evidence_failure_point` cases; real-server seam in `test_published_quickstart_declares_observes_and_verifies` incl. other-tenant negative; P1 below | PASS |
+| Missing authority/evidence never passes; outcomes inspectable; cleanup safe | preflight blocks per agent, deadline/cancel `settle`, `Redactor`, `shared_login`/`keep_login`, `report.json` | blocked/redaction/deadline/cancel/login-copy-back/per-agent-block unit tests; P1 secret and process audit below | PASS |
+
+Non-goals: no agent recipe or prewritten solution in the objective, no public-site
+fallback (Claude disallows WebSearch; external URLs in transcripts are quoted
+docs text only), no MCP mutation tools added, no gate/CI wiring, no owner host
+config write (`~/.codex/auth.json` and `config.toml` unchanged; link intact so
+no copy-back), no spec edit.
+
+### Commands
+
+- Unit (28 passed): `cd sdks/wyrd-sdk-python && uv run python -m pytest -q tests/unit/test_agent_readiness.py`
+- Real-server observer seam (passed): `scripts/postgres/with-test-postgres.sh -- bash -lc 'cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration "tests/integration/test_support_desk.py::test_published_quickstart_declares_observes_and_verifies"'`
+- `mise run py:typecheck`, `mise run py:lints`, ruff format/check, `git diff --check`, `mise run check:ci-selection`: pass.
+- P1: `mise run test:agent-readiness:smoke:live` — exit 0 in 334.79s.
+- P2 not run: CLI install/host support unchanged.
+
+### P1 result (`target/agent-readiness/20261019T182810Z/`)
+
+Identity: commit `47f5db244` (worktree dirty only with untracked review
+packets), `wyrd 0.2.0` debug build, docs built and served from this checkout.
+
+| Agent | Version | Outcome | Service | Evidence IDs |
+|---|---|---|---|---|
+| claude | Claude Code 2.1.284 | passed | `default/Service/word-stats@1.0.0` (Prompt, Service, Verifier) | runs `01a1556c-d3a9…`, `01a1556e-be45…`, `01a15570-77e9…` in spans and `summaries`; direct `01a1556c-d3b3-7f01-999b-a9be73a37ca3` passed; queued `f763199e-e30e-71e9-94ac-f58eb2c35ceb` completed passed (+2 each more) |
+| codex | codex-cli 0.163.0 | passed | `default/Service/codex-policy-helper@1.0.0` (Prompt, Service, Verifier) | run `01a1556d-3d08-7cd8-83b4-b448d92f8066` in spans and `codex_policy_answers`; direct `01a1556d-3d11-7a23-9cd7-04e57eac1bbc` passed; queued `497e9de5-d254-72a8-9c61-c3ec484f72e2` completed passed |
+
+Transcripts: `<run>/claude/transcript.jsonl`, `<run>/codex/transcript.jsonl`;
+apps under `<run>/<agent>/app`. Audit: zero occurrences of the Claude token or
+any Codex login value in run artifacts; Wyrd key pattern only inside the
+compiled SDK binary; no wyrd-server/docs processes left.
+
+An earlier P1 attempt (`20261019T182637Z`) blocked at preflight: an inactive
+mise shim hid the real `codex`, and one agent's gap blocked both. Fixed in
+`47f5db244` (`resolve` falls back to the non-shim PATH; preflight blocks only
+the affected agent) with a unit test.
+
+### Limits
+
+- The objective fixes Python because the current-build SDK is provisioned as a wheel.
+- MCP-run verifications are indistinguishable from app-run ones on the server.
+- Fetching the published site cannot be blocked for Codex; only Claude disallows WebSearch.
+- Custom rows count only for tables the Service declares.
+- No time-range bound; per-agent fresh database and tenant isolation instead.

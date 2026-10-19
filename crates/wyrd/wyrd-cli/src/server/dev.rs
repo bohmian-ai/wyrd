@@ -246,7 +246,7 @@ impl DevServer {
             .trim()
             .strip_prefix('v')
             .and_then(|version| version.split('.').next()?.parse::<u32>().ok());
-        if !version.status.success() || !major.is_some_and(|major| major >= NODE_MAJOR) {
+        if !version.status.success() || major.is_none_or(|major| major < NODE_MAJOR) {
             return Err(dev_error("ui", NODE_REQUIRED));
         }
         Ok(())

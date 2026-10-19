@@ -268,7 +268,9 @@ impl LocalDev {
             .build()
             .expect("browser client");
         let device = browser
-            .get(format!("{origin}/auth/device?tenant=local&user_code=ABCD-EFGH"))
+            .get(format!(
+                "{origin}/auth/device?tenant=local&user_code=ABCD-EFGH"
+            ))
             .send()
             .await
             .expect("device page at the UI origin");
@@ -307,18 +309,12 @@ impl LocalDev {
             .send()
             .await
             .expect("API-key sign-in");
-        if signed_in.status() != 303 {
-            panic!(
-                "API-key sign-in answered {}: {}",
-                signed_in.status(),
-                signed_in.text().await.unwrap_or_default()
-            );
-        }
+        assert_eq!(signed_in.status(), 303, "API-key sign-in redirects");
         assert_eq!(
             signed_in
                 .headers()
                 .get("location")
-                .map(|value| value.as_bytes()),
+                .map(reqwest::header::HeaderValue::as_bytes),
             Some(b"/t/local".as_slice())
         );
         let session = signed_in

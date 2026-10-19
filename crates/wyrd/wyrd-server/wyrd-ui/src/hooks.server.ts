@@ -1,3 +1,4 @@
+import { forwardAuth } from '$lib/server/upstream';
 import { error, redirect, type Handle, type HandleServerError } from '@sveltejs/kit';
 import { localAuthEnabled, mockDataEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
@@ -8,6 +9,8 @@ import { problem } from '$lib/server/problem';
 const loginRoutes = ['/t/[tenantKey]/login', '/t/[tenantKey]/login/api-key'];
 
 export const handle: Handle = async ({ event, resolve }) => {
+  // The browser's leg of Wyrd's authorization server, served on this public origin.
+  if (event.url.pathname.startsWith('/auth/')) return forwardAuth(event.request, event.url);
   event.setHeaders({ 'cache-control': 'private, no-store' });
   event.locals.mockData = mockDataEnabled(event.cookies);
   const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;

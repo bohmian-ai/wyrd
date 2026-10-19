@@ -1,9 +1,97 @@
+// @vitest-environment node
 import { expect, test, vi } from 'vitest';
 import { env } from '$env/dynamic/private';
 
 vi.mock('$env/dynamic/private', () => ({ env: { WYRD_SERVER_URL: 'https://wyrd.internal:8443' } }));
 
-const { serverReady, serverUrl } = await import('./upstream');
+const { forwardAuth, serverReady, serverUrl } = await import('./upstream');
+
+/** One forwarded call as the configured server received it. */
+type Forwarded = { url: string; init: RequestInit };
+
+/** Fetcher that records each forwarded call and answers with `answer`. */
+function upstream(answer: () => Response) {
+  const calls: Forwarded[] = [];
+  const fetcher = (async (url: URL, init: RequestInit) => {
+    calls.push({ url: url.toString(), init });
+    return answer();
+  }) as unknown as typeof fetch;
+  return { calls, fetcher };
+}
+
+test('auth forwarding sends the browser request to the configured server under the established origin', async () => {
+  const { calls, fetcher } = upstream(() => new Response('{}'));
+  const request = new Request('http://127.0.0.1:3000/auth/token?x=1', {
+    method: 'POST',
+    headers: {
+      cookie: 'wyrd_login=abc',
+      'content-type': 'application/x-www-form-urlencoded',
+      host: 'evil.test',
+      'x-forwarded-host': 'evil.test',
+      'x-forwarded-proto': 'https',
+      forwarded: 'host=evil.test',
+      'accept-encoding': 'gzip'
+    },
+    body: 'grant_type=refresh_token'
+  });
+  await forwardAuth(request, new URL('http://ui.example:3000/auth/token?x=1'), fetcher);
+  expect(calls).toHaveLength(1);
+  const [{ url, init }] = calls;
+  expect(url).toBe('https://wyrd.internal:8443/auth/token?x=1');
+  expect(init.method).toBe('POST');
+  expect(init.redirect).toBe('manual');
+  expect(await new Response(init.body).text()).toBe('grant_type=refresh_token');
+  const headers = new Headers(init.headers);
+  expect(headers.get('cookie')).toBe('wyrd_login=abc');
+  expect(headers.get('content-type')).toBe('application/x-www-form-urlencoded');
+  expect(headers.get('x-forwarded-host')).toBe('ui.example:3000');
+  expect(headers.get('x-forwarded-proto')).toBe('http');
+  for (const name of ['host', 'forwarded', 'accept-encoding']) expect(headers.has(name)).toBe(false);
+});
+
+test('auth forwarding returns redirects, cookies, and errors unchanged without following', async () => {
+  const redirect = upstream(() => {
+    const headers = new Headers({ location: 'https://idp.example/authorize?state=s' });
+    headers.append('set-cookie', 'a=1; HttpOnly');
+    headers.append('set-cookie', 'b=2; HttpOnly');
+    return new Response(null, { status: 303, headers });
+  });
+  const url = new URL('http://ui.example/auth/authorize?tenant=acme');
+  const moved = await forwardAuth(new Request(url), url, redirect.fetcher);
+  expect(moved.status).toBe(303);
+  expect(moved.headers.get('location')).toBe('https://idp.example/authorize?state=s');
+  expect(moved.headers.getSetCookie()).toEqual(['a=1; HttpOnly', 'b=2; HttpOnly']);
+  expect(redirect.calls[0].init.body).toBeUndefined();
+
+  const refusal = upstream(
+    () =>
+      new Response('{"error":"invalid_request"}', {
+        status: 400,
+        headers: { 'content-type': 'application/json' }
+      })
+  );
+  const refused = await forwardAuth(new Request(url), url, refusal.fetcher);
+  expect(refused.status).toBe(400);
+  expect(await refused.json()).toEqual({ error: 'invalid_request' });
+});
+
+test('an unreachable or misconfigured server is the upstream problem', async () => {
+  const url = new URL('http://ui.example/auth/authorize');
+  const down = (async () => {
+    throw new TypeError('connection refused');
+  }) as unknown as typeof fetch;
+  const failed = await forwardAuth(new Request(url), url, down);
+  expect(failed.status).toBe(502);
+  expect((await failed.json()).code).toBe('WYRD_SPEC_502_UPSTREAM_FAILURE');
+  try {
+    env.WYRD_SERVER_URL = 'http://wyrd.internal:8080';
+    const { calls, fetcher } = upstream(() => new Response('{}'));
+    expect((await forwardAuth(new Request(url), url, fetcher)).status).toBe(502);
+    expect(calls).toEqual([]);
+  } finally {
+    env.WYRD_SERVER_URL = 'https://wyrd.internal:8443';
+  }
+});
 
 /** Fetcher that records every URL it is asked for and answers ready. */
 function recording() {

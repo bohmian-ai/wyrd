@@ -388,6 +388,19 @@ WYRD_LIVE_SLACK_CHANNEL_ID, and WYRD_LIVE_PAGERDUTY_KEY from the environment, no
 mise.local.toml. Deliberately outside every credential-free lane and the CI gate."""
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --run-ignored only --test-threads=1 -E \"test(=pg_operator_delivery::live_smoke_delivers_to_slack) | test(=pg_operator_delivery::live_smoke_delivers_to_pagerduty)\"'"
 
+[tasks."test:agent-readiness:smoke:live"]
+description = """Opt-in live coding-agent readiness: Claude Code and Codex each build and run a Wyrd-verified Python
+application from this checkout's locally served docs and connected MCP, against a foreground `wyrd server dev` the
+harness owns for that agent alone. Only authorized server evidence decides each outcome. Calls paid agents. Reads
+ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and CODEX_API_KEY, from the environment, normally an untracked
+mise.local.toml; a missing one blocks that agent. Transcripts, apps, and report.json land in
+target/agent-readiness/<UTC time>/. Deliberately outside the CI gate."""
+depends = ["py:setup", "docs:install"]
+run = [
+  "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m tests.agent_readiness.live",
+]
+
 [tasks."test:bifrost:integration:server"]
 description = "Run wyrd-server integration targets that exercise Bifrost serving seams."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:integration:server:inner'"

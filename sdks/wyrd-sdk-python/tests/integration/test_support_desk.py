@@ -38,6 +38,7 @@ from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
+from ..agent_readiness.observe import Observer
 from .gateway.support import OPENAI_COMPLETION
 from .support import FIXTURES, Delivery, Receiver
 from .test_local_development import configure_gateway
@@ -313,9 +314,16 @@ def test_published_quickstart_declares_observes_and_verifies(
             modules["deploy"].deploy(viewer)
         assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
+        # The live readiness observer finds nothing before declaration and
+        # stops at telemetry once the graph exists without application evidence.
+        assert Observer(WyrdClient()).observe().failure_point() == "declared"
+
         # 4. Deploy the Cards.
         modules["deploy"].deploy()
         assert (root / ".wyrd-bundle/metadata.yaml").is_file()
+        declared = Observer(WyrdClient()).observe()
+        assert declared.failure_point() == "telemetry", declared.report()
+        assert {"Agent", "Prompt", "Service", "Verifier"} <= set(declared.kinds)
 
         with TestClient(modules["app"].app) as http:
             # 5. Ask a question: both model-free checks judge it before the reply.
@@ -383,6 +391,26 @@ def test_published_quickstart_declares_observes_and_verifies(
         assert {row["run_id"] for row in rows} == {run_id}
         assert all(row["call_id"] and row["trace_id"] for row in rows)
         assert len({row["execution_id"] for row in rows}) == 2
+
+        # The readiness observer accepts the app from server evidence alone:
+        # the queued review by its completed status, the direct checks by
+        # their results, and another tenant's client sees none of it.
+        evidence = Observer(WyrdClient()).watch(120, interval=0.5)
+        assert evidence.failure_point() is None, evidence.report()
+        assert run_id in evidence.custom_runs["tickets"]
+        assert run_id in evidence.telemetry_runs
+        assert {(each.execution_id, each.verdict) for each in evidence.queued if each.judged()} == {
+            (queued["execution_id"], "passed")
+        }
+        assert {each.run_id for each in evidence.sync if each.judged()} >= {run_id}
+        other = WyrdClient(
+            server_url=server.base_url,
+            credential=server.bootstrap_service_in_tenant(
+                server.seed_tenant("other-agent"), ["admin"]
+            ),
+            grpc_url=server.grpc_url,
+        )
+        assert Observer(other).observe().failure_point() == "declared"
 
 
 def test_quickstart_deploy_keeps_the_prior_bundle_until_pull_replaces_it(

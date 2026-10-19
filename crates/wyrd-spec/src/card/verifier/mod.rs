@@ -37,7 +37,10 @@ pub mod reference;
 mod schema_path;
 mod validate;
 
-pub use reference::{PathSegment, Reference, ReferenceError, ReferenceRoot, VerdictField};
+pub use reference::{
+    PathSegment, Reference, ReferenceError, ReferenceRoot, SourceField, SourceReference,
+    SourceText, VerdictField,
+};
 pub use validate::ResolvedAgent;
 
 /// Most retries one step may declare after its first attempt.
@@ -53,6 +56,8 @@ pub struct VerifierSpec {
     pub description: Option<String>,
     /// Named evidence slots, addressed as `inputs.<slot>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(with = "BTreeMap<SlotName, InputSlotSchema>")]
+    #[cfg_attr(feature = "server", schema(value_type = BTreeMap<String, InputSlotSchema>))]
     pub inputs: BTreeMap<SlotName, InputSlot>,
     /// Preparation steps; independent steps may run concurrently.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -125,10 +130,91 @@ impl VerifierSpec {
     }
 }
 
-/// One named evidence slot. Slots are required unless `required: false`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// The JSON Schema of an authored [`InputSlot`]: one typed slot object or a
+/// source reference string, exactly the forms [`InputSlot`] decodes.
+///
+/// schemars projects a per-variant `#[serde(untagged)]` as one more tagged
+/// object, so the derived schema of [`InputSlot`] omits its source variant
+/// and this uninhabited type unions it back in for [`VerifierSpec::inputs`].
+enum InputSlotSchema {}
+
+impl JsonSchema for InputSlotSchema {
+    /// Names the authored slot schema in generated definitions.
+    fn schema_name() -> String {
+        "InputSlot".to_owned()
+    }
+
+    /// One of the typed slot objects or the source reference string.
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{Metadata, SchemaObject, SubschemaValidation};
+
+        SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "One named evidence slot. Slots are required unless `required: false`."
+                        .to_owned(),
+                ),
+                ..Metadata::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    generator.subschema_for::<InputSlot>(),
+                    generator.subschema_for::<SourceText>(),
+                ]),
+                ..SubschemaValidation::default()
+            })),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for InputSlotSchema {
+    /// The derived typed slot objects with the source variant, which utoipa
+    /// projects as an unsatisfiable tagged string, replaced by the source
+    /// reference string.
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::Schema;
+
+        let mut slot = <InputSlot as utoipa::PartialSchema>::schema();
+        if let RefOr::T(Schema::OneOf(one_of)) = &mut slot {
+            one_of
+                .items
+                .retain(|item| !matches!(item, RefOr::T(Schema::AllOf(_))));
+            one_of
+                .items
+                .push(<SourceText as utoipa::PartialSchema>::schema());
+        }
+        slot
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for InputSlotSchema {
+    /// Names the authored slot schema as the served contract's `InputSlot`.
+    fn name() -> std::borrow::Cow<'static, str> {
+        "InputSlot".into()
+    }
+
+    /// Registers the schemas the typed slot objects reference.
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        <InputSlot as utoipa::ToSchema>::schemas(schemas);
+    }
+}
+
+/// One named evidence slot. Slots are required unless `required: false`;
+/// samples and source slots are always required.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(rename = "TypedInputSlot")]
 pub enum InputSlot {
     /// A JSON value, optionally constrained by JSON Schema.
     Json {
@@ -158,13 +244,116 @@ pub enum InputSlot {
         required: bool,
     },
     /// Feature measurements or metric samples recorded for a scheduled window.
+    ///
+    /// Always required: a schedule binding supplies every samples slot of its
+    /// Verifier from the subject's recorded measurements, so the slot has no
+    /// `required` field and no drift check can be omitted by configuration.
     Samples {
         /// Measurement names, including metric names.
         features: Vec<FeatureName>,
-        /// Whether the schedule binding must fill the slot.
-        #[serde(default = "required_default", skip_serializing_if = "is_true")]
+    },
+    /// A group Verifier's input authored as a source reference string,
+    /// `verifiers.<name>.inputs.<slot>` or
+    /// `verifiers.<name>.requirements.<requirement>.outcome`, resolved at
+    /// group execution to one ordered value per source execution.
+    #[serde(untagged)]
+    #[schemars(skip)]
+    Source(SourceText),
+}
+
+/// The tagged forms of [`InputSlot`], decoded without its untagged source
+/// fallback so a malformed typed slot reports its own error, such as an
+/// unknown field, instead of "did not match any variant". The remote derive
+/// constructs each [`InputSlot`] variant, so a field added there and missing
+/// here fails to compile.
+#[derive(Deserialize)]
+#[serde(
+    remote = "InputSlot",
+    tag = "type",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum TypedInputSlot {
+    /// [`InputSlot::Json`].
+    Json {
+        /// JSON Schema the value must satisfy.
+        #[serde(default)]
+        schema: Option<Value>,
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
         required: bool,
     },
+    /// [`InputSlot::Media`].
+    Media {
+        /// Accepted formats.
+        formats: Vec<MediaFormat>,
+        /// Lower size bound than the deployment limit.
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
+        required: bool,
+    },
+    /// [`InputSlot::Trace`].
+    Trace {
+        /// Whether a caller must supply the slot.
+        #[serde(default = "required_default")]
+        required: bool,
+    },
+    /// [`InputSlot::Samples`].
+    Samples {
+        /// Measurement names, including metric names.
+        features: Vec<FeatureName>,
+    },
+}
+
+/// Decode a string as a source declaration and a map as a typed slot, the
+/// same two forms the derived `untagged` source variant accepts.
+impl<'de> Deserialize<'de> for InputSlot {
+    /// Dispatch on the authored value's shape without buffering it.
+    ///
+    /// # Errors
+    /// Returns the typed slot's own decode error for a malformed map, and a
+    /// type error for anything that is neither a string nor a map.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Visits one authored slot value.
+        struct Slot;
+        impl<'de> serde::de::Visitor<'de> for Slot {
+            /// The decoded slot: a verbatim source declaration or a typed slot.
+            type Value = InputSlot;
+
+            /// Names the two accepted forms in a type error.
+            ///
+            /// # Errors
+            /// Returns the formatter's error when writing the description fails.
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a typed input slot or a source reference string")
+            }
+
+            /// A string is a source declaration, kept verbatim; its reference
+            /// grammar is validated later, not while decoding.
+            ///
+            /// # Errors
+            /// None in practice: the source text wrapper accepts any string.
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<InputSlot, E> {
+                SourceText::deserialize(serde::de::value::StrDeserializer::new(text))
+                    .map(InputSlot::Source)
+            }
+
+            /// A map is a typed slot, decoded by the tagged typed-slot decoder.
+            ///
+            /// # Errors
+            /// Returns that decoder's error for a missing or unknown `type` tag,
+            /// an unknown or missing field, or a malformed field value.
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<InputSlot, A::Error> {
+                TypedInputSlot::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        deserializer.deserialize_any(Slot)
+    }
 }
 
 impl InputSlot {
@@ -174,8 +363,8 @@ impl InputSlot {
         match self {
             Self::Json { required, .. }
             | Self::Media { required, .. }
-            | Self::Trace { required }
-            | Self::Samples { required, .. } => *required,
+            | Self::Trace { required } => *required,
+            Self::Samples { .. } | Self::Source(_) => true,
         }
     }
 }
@@ -518,28 +707,6 @@ impl Decide {
     }
 }
 
-/// One scheduled-evidence source selector in a binding's `inputs` map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ScheduledInput {
-    /// Recorded feature measurements.
-    Features(Vec<FeatureName>),
-    /// One recorded metric.
-    Metric(FeatureName),
-}
-
-impl ScheduledInput {
-    /// Returns the measurement names the selector reads.
-    #[must_use]
-    pub fn names(&self) -> &[FeatureName] {
-        match self {
-            Self::Features(names) => names,
-            Self::Metric(name) => std::slice::from_ref(name),
-        }
-    }
-}
-
 /// Reserved subject-occurrence key of a Service-level or standalone-Agent
 /// verification binding.
 ///
@@ -666,14 +833,123 @@ pub struct VerificationBinding {
     pub runs_on: Option<InlineableRef<TriggerSpec>>,
     /// Operators dispatched independently after a `failed` verdict.
     ///
-    /// Empty means a failed result stays durable with no reaction.
+    /// Empty means a failed result stays durable with no reaction. A
+    /// `group_end` binding refuses this list; it reacts through
+    /// [`Self::on_verdict_change`] instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_failure: Vec<InlineableRef<OperatorSpec>>,
-    /// Scheduled evidence: the recorded measurements filling each samples
-    /// slot of the Verifier within the subject's schedule window.
+    /// Operators dispatched independently when a settled group judgment's
+    /// verdict differs from the preceding settled judgment of the same
+    /// binding and group.
     ///
-    /// Checked against the Verifier with [`VerifierSpec::validate_schedule`];
-    /// names are never inferred.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub inputs: BTreeMap<SlotName, ScheduledInput>,
+    /// Valid only on a `group_end` binding. The first judgment of a group is
+    /// the baseline and dispatches nothing; an unchanged verdict dispatches
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_verdict_change: Vec<InlineableRef<OperatorSpec>>,
+}
+
+impl VerificationBinding {
+    /// Each authored Operator list beside its field name, in declaration
+    /// order, so every validator and reference walker covers both reactions.
+    #[must_use]
+    pub fn operator_lists(&self) -> [(&'static str, &[InlineableRef<OperatorSpec>]); 2] {
+        [
+            ("on_failure", &self.on_failure),
+            ("on_verdict_change", &self.on_verdict_change),
+        ]
+    }
+
+    /// Each authored Operator list beside its field name, mutably, for
+    /// reference pinning.
+    pub fn operator_lists_mut(
+        &mut self,
+    ) -> [(&'static str, &mut Vec<InlineableRef<OperatorSpec>>); 2] {
+        [
+            ("on_failure", &mut self.on_failure),
+            ("on_verdict_change", &mut self.on_verdict_change),
+        ]
+    }
+}
+
+/// Schema projection parity of authored Verifier input slots.
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{InputSlot, VerifierSpec};
+
+    /// The generated schema offers exactly the four typed slot objects and
+    /// the source string, the forms decoding accepts; a `{type: "source"}`
+    /// object is neither generated nor decoded.
+    ///
+    /// # Panics
+    /// Panics when the schema or decoding admits another form.
+    #[test]
+    fn input_slot_schema_matches_decoding() {
+        let schema = serde_json::to_value(schemars::schema_for!(VerifierSpec))
+            .expect("invariant: a schema serializes");
+        let definitions = &schema["definitions"];
+        assert_eq!(
+            definitions["InputSlot"]["oneOf"],
+            json!([
+                {"$ref": "#/definitions/TypedInputSlot"},
+                {"$ref": "#/definitions/SourceText"}
+            ])
+        );
+        let tags: Vec<&Value> = definitions["TypedInputSlot"]["oneOf"]
+            .as_array()
+            .expect("invariant: typed slots are a oneOf")
+            .iter()
+            .map(|variant| &variant["properties"]["type"]["enum"][0])
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                &json!("json"),
+                &json!("media"),
+                &json!("trace"),
+                &json!("samples")
+            ]
+        );
+        assert_eq!(definitions["SourceText"]["type"], json!("string"));
+
+        let decode = |value| serde_json::from_value::<InputSlot>(value);
+        assert!(matches!(
+            decode(json!("verifiers.turn.inputs.message")),
+            Ok(InputSlot::Source(_))
+        ));
+        assert!(decode(json!({"type": "trace"})).is_ok());
+        assert!(decode(json!({"type": "source"})).is_err());
+    }
+
+    /// The served projection offers the same forms: the four typed slot
+    /// objects and the source string, never a tagged source object.
+    ///
+    /// # Panics
+    /// Panics when the served schema admits another form.
+    #[cfg(feature = "server")]
+    #[test]
+    fn served_input_slot_schema_matches_decoding() {
+        let schema =
+            serde_json::to_value(<super::InputSlotSchema as utoipa::PartialSchema>::schema())
+                .expect("invariant: a schema serializes");
+        let forms: Vec<Value> = schema["oneOf"]
+            .as_array()
+            .expect("invariant: slots are a oneOf")
+            .iter()
+            .map(|form| form["properties"]["type"]["enum"][0].clone())
+            .collect();
+        assert_eq!(
+            forms,
+            [
+                json!("json"),
+                json!("media"),
+                json!("trace"),
+                json!("samples"),
+                Value::Null
+            ]
+        );
+        assert_eq!(schema["oneOf"][4]["type"], json!("string"));
+    }
 }

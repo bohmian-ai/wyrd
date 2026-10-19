@@ -1,0 +1,52 @@
+# Focused follow-up: exact-key pressure recovery replay observation
+
+**RESOLVED — the conflicting claims concern a real residual acceptance-proof gap.** Retain INV-R2-001 for independent validation under stable **FIND-TASK-003-3**, limited to the final downstream observation in the new HTTP test. This report establishes no production duplicate execution or new replay policy.
+
+## Subject and scope
+
+Base `ef3a57b0776dd7bc451273b9176498fcca700550`; immutable candidate and checked HEAD `ea317179820b24d8b08ed499454ce2cf4675ce4e`. Read the cumulative diff of the affected generic outbox, enqueue, Scribe and submission owners and HTTP/test-server proof, not just the latest fix. CodeGraph exploration preceded code navigation. Reviewed original TASK-003 Scenario 3, the authorized specification REQ-006/AC-005/006, prior findings-validation FIND-3 and R1 diagnosis/recommendation/R1-AC-3, current invariant, behavior and durability reports' relevant claims, and actual source below. Repository agent rules, spec-driven development, maintainer style and task-review instructions govern this read-only follow-up. No other finding is reassessed here.
+
+R1 expressly requires the identical tuple after refusal/drain, accepted replay, equal returned identity **and one durable queued execution**. The prior validated correction explicitly distinguishes durable cardinality from response equality. The existing no-pressure replay regression was already available when that composed proof was required (`task-003-9ffdf753a/findings-validation.md:73–83`; R1 task `:51–59,101`). Its continued presence cannot alone discharge the remaining temporal observation in that composed test.
+
+## Source trace and conflict resolution
+
+| Inspected owner/path | Evidence and implication |
+|---|---|
+| HTTP test and helpers, `pg_verification_routes.rs:159–249,381–543` | The new test preserves body/JWT/key across refusal, recovery and replay. It observes two prior executions after drain, then reconciles retained inputs `(3,1)` before replay. The replay returns 202/equal ID, immediately followed by `fixture.queued() == 3`, then shutdown. This closes exact-key recovery and refused-source absence, but supplies no completion observation for the final replay. |
+| `VerificationControl::enqueue`, `components/verification/service.rs:616–685` | Builds the same Submission using existing identity derivation, reserves both downstream and source capacity, synchronously stages its source item, and returns. It does not await Scribe or SQL. HTTP return is therefore earlier than either durable processing stage on a reachable schedule. |
+| `ScribeSink::write`, `scribe_outbox.rs:903–962` | Processes frames, awaits ACKs, and only then enumerates original items in order, handing off non-lost queued submissions through their retained Reservation. This remains an asynchronous task after HTTP return. |
+| `SubmissionSink::write`, `verification/submissions.rs:90–119` | Separately awaits TenantConn, ordered `accept_submissions`, and transaction commit. Its completion is not part of enqueue response or Scribe publication. |
+| `VerifierExecutionQueue::{accept_submissions,accept}`, `wyrd-sql/src/queries/verifier_executions.rs:1078–1160` | Accepts each submission in slice order; existing execution ID returns Replayed; keyed matching request also returns Replayed. SQL remains unchanged in the cumulative diff. This supports correctness of the retained owner and refutes any inference that duplication was demonstrated; it does not make the test's earlier read occur after this code runs. |
+| `Fixture::queued` and `VerificationFixture::executions`, routes `:142–151`, testing `verification.rs:566–581` | Ordinary tenant-scoped SELECT at the time called. No writer drain or acknowledgment is implied. |
+| `input_rows`, routes `:466–480`; `WyrdTestServer::flush_bifrost`, testing `server.rs:1231–1253` | Publication settles the Scribe outbox, not the independent submission writer. More importantly, the current call precedes replay. Repeating flush alone after replay still would not imply SQL commit. |
+| Existing replay/conflict test, routes `:381–458` | It enqueues later distinct requests and waits for their execution visibility before counting. Those later observations order its own replay before the final count. They do not order the new test's replay, which belongs to a different server/tenant/run. |
+| Shutdown/inspection, testing `server.rs:859–866,1161–1201` | Shutdown consumes the server; no subsequent queue assertion exists here. Successful cleanup cannot retrospectively turn the pre-shutdown count into a post-replay observation. The existing shutdown inspection returns lifecycle/Scribe facts, not execution cardinality. |
+
+A concrete admissible schedule is: recovered submission has committed; final replay stages and returns 202; the queue SELECT sees the three existing rows; only afterward does Scribe ACK/handoff and SubmissionSink process the replay. The assertion passes before the tested replay reaches its authoritative consumer. Current source will replay safely on that schedule; the missing assertion ordering is an evidence defect, not a diagnosed production execution defect.
+
+The behavior and durability reports correctly establish exact identity, source reconciliation, existing SQL idempotency, and green focused regressions. Their closure conclusion goes beyond those observations for R1-AC-3. The invariant report correctly identifies the asynchronous gap. Its existing-owner sentinel suggestion is viable with the boundaries below.
+
+## Smallest safe correction boundary
+
+Extend only `staging_refusal_recovers_the_same_enqueue_identity` and its matching rustdoc: after the final accepted replay, enqueue one distinct **same-tenant** later request with existing helpers, assert acceptance and a distinct execution ID, await that sentinel through existing `visible_execution`, then check total durable execution cardinality **4**, comprising the two pressure-fill requests, the recovered identity, and the sentinel. Preserve the pre-replay `(3,1)` input reconciliation. No public testing API, receipt, scheduler, production identity change, new sink or broad suite is needed.
+
+The ordering argument is source-backed, not an assumption that a later HTTP response is a barrier:
+
+1. These calls execute sequentially against the same process/tenant. Each source stage completes its mpsc send before its HTTP response, so replay precedes sentinel in that queue.
+2. `OutboxWriter::run` appends received items in arrival order (`outbox.rs:530–539`). `dispatch/is_ready` permits only one in-flight slice per tenant and prioritizes that tenant's exact failed slice over later waiting items (`:550–620`). Retry preserves predecessor order; concurrency 4 is across tenants, not four concurrent writes for this tenant.
+3. Scribe frame grouping may group destinations, but handoff enumerates the original items in order after the slice completes (`scribe_outbox.rs:950–962`). Thus successful handoffs enqueue replay before sentinel even if they share a slice. Subsequent source slices for this tenant cannot overtake it.
+4. SubmissionOutbox uses the same generic ordering owner. `accept_submissions` loops in slice order; SubmissionSink commits once after that loop. Sentinel SQL visibility therefore implies the earlier replay was processed in its transaction or a previously committed transaction. Awaiting visibility of the **recovered** ID itself would not suffice: its earlier committed row already exists.
+
+Capacity and loss boundaries matter. At this stage the test's pre-replay flush has emptied Scribe pending work. Capacity 3 admits two reserved source items (`floor(3*3/4)=2`), enough for replay and sentinel together; audit/spans use the separate unreserved share. Each accepted enqueue has already reserved its SubmissionOutbox slot before source staging (`service.rs:671–682`), so the bounded downstream handoff cannot overflow and silently skip the replay. The fresh test has only these few submissions versus submission capacity 16,384. Keep source alive until sentinel visibility and do not initiate shutdown before the observation.
+
+The sentinel is an ordered healthy-path observation, not a loss-free receipt. Scribe explicitly skips source items whose frame was terminally rejected or could not be encoded; late stage after shutdown is also lost. The test releases its sole injected stall, uses the same known-valid small inline request/schema, keeps both writers live, and injects no subsequent terminal failure. These current source guards bound the sentinel argument to the required post-drain healthy recovery path. It does not prove delivery through a terminal Scribe rejection, crash, expired shutdown, or a wholly dropped replay; those are preserved loss semantics, not additional FIND-3 obligations. Do not alter those semantics or introduce per-attempt persistence merely to make replay externally observable.
+
+Do not impose accepted-source replay deduplication. The current pre-replay retained-input assertion already proves the refused attempt staged nothing. The required new observation is durable execution cardinality after ordered replay processing, including the known sentinel, not a new contract about the number of retained source rows for accepted replay.
+
+## Proposal for independent validation and proof limits
+
+**FOLLOW-R2-001 (same proposal as INV-R2-001; stable FIND-TASK-003-3): MISSING acceptance proof**, at `pg_verification_routes.rs:532–541`, violating R1-AC-3's final durable replay observation. Observable consequence: this exact test can pass while its final replay has not reached durable acceptance. Required correction: the existing same-tenant sentinel observation above, followed by cardinality, confined to this test/docs. No production duplicate execution is asserted. Do not assign a new stable finding ID.
+
+No test was run in this follow-up. The domain review's exact HTTP pair passed 2/2 and runtime reviewers' focused tests passed 7/7; those results are retained evidence, not completion ordering proof. After correction, rerun only R1's exact HTTP pair through the existing managed-Postgres wrapper, with tracing for any failure diagnosis. No broad/full suite or extra runtime run is required for this local proof change. Independent validation must make the final retained/rejected finding decision.
+
+Only this new `followup-review.md` was written. No source, test, original task, prior report directory, index or HEAD was changed.

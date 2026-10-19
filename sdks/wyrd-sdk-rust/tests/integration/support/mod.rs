@@ -14,13 +14,21 @@ use std::time::Duration;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 
 use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
+use wyrd_ai::operator_connections::{
+    ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
+    OperatorConnections, SecretBearer,
+};
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_ai::verify::Execution;
 use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
 use wyrd_spec::ids::BindingId;
+use wyrd_spec::verification::VerificationExecutionStatus;
+use wyrd_spec::verification::execution::VerificationExecutionState;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
@@ -367,6 +375,94 @@ impl Deployment {
         .expect("the retained result reads")
     }
 
+    /// The newest completed execution of group `binding` other than `after`,
+    /// read as the administrator: publish captured rows so the group poller
+    /// discovers them, then read the binding's `last_execution_id` and its
+    /// execution state until that execution completes with a result.
+    ///
+    /// # Panics
+    /// Panics when no such execution completes within `timeout` or a read
+    /// fails.
+    pub async fn group_execution(
+        &self,
+        binding: &BindingId,
+        after: Option<&ExecutionId>,
+        timeout: Duration,
+    ) -> VerificationExecutionState {
+        let admin = self.admin();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.server.flush_bifrost().await.expect("rows publish");
+            let latest = self.binding_status(binding).await.last_execution_id;
+            if let Some(id) = latest.filter(|id| Some(id) != after) {
+                let state = Execution::connect_with(id, &admin)
+                    .await
+                    .expect("the execution handle connects")
+                    .status()
+                    .await
+                    .expect("the execution reads");
+                if state.status == VerificationExecutionStatus::Completed && state.result.is_some()
+                {
+                    return state;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "group binding {binding} completed no new execution within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Start a local Operator hook and create the HTTP connection
+    /// `connection` pointing at it with bearer `token`, so a registered
+    /// Operator naming that connection delivers to the hook.
+    ///
+    /// # Panics
+    /// Panics when the connection cannot be created.
+    pub async fn hooks(&self, connection: &str, token: &str) -> Hooks {
+        let server = MockServer::start().await;
+        let (sender, received) = unbounded_channel();
+        Mock::given(wiremock::matchers::any())
+            .respond_with(Forward(sender))
+            .mount(&server)
+            .await;
+        OperatorConnections::connect_with(&self.admin())
+            .await
+            .expect("handle connects")
+            .create(&CreateOperatorConnectionRequest::Http {
+                name: ConnectionName::new(connection).expect("connection name"),
+                origin: HttpsOrigin::parse(&server.uri()).expect("hook origin parses"),
+                auth: HttpConnectionAuth::Bearer {
+                    token: SecretBearer::new(token.to_owned()),
+                },
+            })
+            .await
+            .expect("connection creates");
+        Hooks {
+            _server: server,
+            received,
+        }
+    }
+
+    /// Shut the server down and boot `builder` over the same Postgres and
+    /// artifact storage, as a process restart does. Durable rows, the
+    /// administrator key among them, survive; the address changes, so
+    /// clients are built again from the returned deployment.
+    ///
+    /// # Panics
+    /// Panics when the server does not shut down or the replacement does
+    /// not start.
+    pub async fn restart(self, builder: WyrdTestServerBuilder) -> Self {
+        let server = Box::pin(self.server.restart_bound(builder))
+            .await
+            .expect("test server restarts");
+        Self {
+            server,
+            admin_key: self.admin_key,
+        }
+    }
+
     /// Stop the server.
     ///
     /// # Panics
@@ -376,6 +472,42 @@ impl Deployment {
             .shutdown()
             .await
             .expect("test server shuts down");
+    }
+}
+
+/// A local Operator hook a [`Deployment::hooks`] connection points at.
+pub struct Hooks {
+    /// The local hook; kept so it keeps listening.
+    _server: MockServer,
+    /// Every request the hook receives, in arrival order.
+    pub received: UnboundedReceiver<Request>,
+}
+
+impl Hooks {
+    /// Assert the hook receives nothing for `quiet`.
+    ///
+    /// # Panics
+    /// Panics when a delivery arrives.
+    pub async fn assert_quiet(&mut self, quiet: Duration) {
+        if let Ok(Some(delivery)) = tokio::time::timeout(quiet, self.received.recv()).await {
+            panic!("no delivery is due: {} {}", delivery.method, delivery.url);
+        }
+    }
+}
+
+/// The hook's responder: answers 200 and hands every request to the story.
+struct Forward(
+    /// The story's delivery channel; a send after the story dropped its
+    /// receiver is ignored.
+    UnboundedSender<Request>,
+);
+
+impl Respond for Forward {
+    /// Forward `request` to the story and acknowledge it.
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        // The story may have finished and dropped its receiver.
+        let _ = self.0.send(request.clone());
+        ResponseTemplate::new(200)
     }
 }
 

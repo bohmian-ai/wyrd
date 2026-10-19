@@ -32,7 +32,7 @@ use crate::components::auth::Caller;
 use crate::oracle::RunningQueryControls;
 use crate::state::AppState;
 #[cfg(feature = "test-support")]
-use crate::state::{QueryStreamFault, QueryStreamStall};
+use crate::state::QueryStreamStall;
 
 /// Wire name of the bounded read-only query tool on every agent surface.
 pub(crate) const QUERY: &str = "bifrost.query";
@@ -272,35 +272,13 @@ impl BoundedQuery {
             max_bytes: arguments.max_bytes,
             bytes: STRUCTURED_OVERHEAD_BYTES,
             #[cfg(feature = "test-support")]
-            stall: self.claim_fault(&mut stream),
+            stall: self
+                .state
+                .query_stream_fault
+                .as_ref()
+                .and_then(|fault| fault.apply(&mut stream)),
         };
         collector.collect(stream, cancel).await
-    }
-
-    /// Apply the armed test-only stream fault to this stream.
-    ///
-    /// An end-of-stream fault truncates the frames after the schema or the
-    /// first batch, so the collector meets the same early EOF a broken owner
-    /// stream produces. A schema hold is bound to this stream's resource probe
-    /// and returned; the cancellation journey waits for it before cancelling,
-    /// so fast fixture execution cannot make cancellation evidence vacuous. A
-    /// probe capture is consumed and changes nothing.
-    #[cfg(feature = "test-support")]
-    fn claim_fault(&self, stream: &mut OracleQueryStream) -> Option<Arc<QueryStreamStall>> {
-        let controller = self.state.query_stream_fault.as_ref()?;
-        let kept = match controller.claim()? {
-            QueryStreamFault::EofAfterSchema => 1,
-            QueryStreamFault::EofAfterBatch => 2,
-            QueryStreamFault::StallAfterSchema => {
-                let stall = controller.claim_stall()?;
-                stall.bind_resource_probe(stream.resource_probe_for_test());
-                return Some(stall);
-            }
-            QueryStreamFault::CaptureProbe => return None,
-        };
-        let frames = std::mem::replace(&mut stream.frames, Box::pin(futures_util::stream::empty()));
-        stream.frames = Box::pin(frames.take(kept));
-        None
     }
 }
 

@@ -1415,6 +1415,29 @@ impl QueryStreamFaultController {
     pub fn claim_stall(&self) -> Option<Arc<QueryStreamStall>> {
         self.stall.lock().ok().and_then(|mut stall| stall.take())
     }
+
+    /// Apply the armed one-shot fault to an in-process consumer's `stream`.
+    ///
+    /// An end-of-stream fault truncates the frames after the schema or the
+    /// first batch, so the consumer meets the same early EOF a broken owner
+    /// stream produces. A schema hold is bound to this stream's resource
+    /// probe and returned for a consumer that waits on it. A probe capture
+    /// is consumed and changes nothing.
+    pub fn apply(&self, stream: &mut OracleQueryStream) -> Option<Arc<QueryStreamStall>> {
+        let kept = match self.claim()? {
+            QueryStreamFault::EofAfterSchema => 1,
+            QueryStreamFault::EofAfterBatch => 2,
+            QueryStreamFault::StallAfterSchema => {
+                let stall = self.claim_stall()?;
+                stall.bind_resource_probe(stream.resource_probe_for_test());
+                return Some(stall);
+            }
+            QueryStreamFault::CaptureProbe => return None,
+        };
+        let frames = std::mem::replace(&mut stream.frames, Box::pin(futures_util::stream::empty()));
+        stream.frames = Box::pin(futures_util::StreamExt::take(frames, kept));
+        None
+    }
 }
 
 impl Default for LimitsConfig {

@@ -1,0 +1,18 @@
+# The support conversation under a one-year `after`, the longest a Trigger
+# accepts: its groups do not come due during a test, and scheduling them must
+# not hold up a neighboring group's progress.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: forever
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./turn-check.yaml
+        - verifier: ./conversation-verifier.yaml
+          runs_on: {kind: group_end, after: 365d}

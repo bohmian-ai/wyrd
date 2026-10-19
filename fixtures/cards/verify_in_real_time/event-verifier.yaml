@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: event-verifier
+  version: 1.0.0
+  space: default
+spec:
+  description: Every sampled frame of one door event shows a badged person.
+  inputs:
+    outcomes: verifiers.frame-verifier.requirements.person-wearing-badge.outcome
+    event: verifiers.event-fact.inputs.event
+  requirements:
+    - id: every-frame-badged
+      statement: Every sampled frame shows a badged person
+      check: {kind: assert, each: "inputs.outcomes[*]", operator: equals, expected: passed}

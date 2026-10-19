@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -28,7 +29,10 @@ from wyrd.testing import WyrdTestServer, cli
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    FRAME_CLAIM,
+    LIVE_REVIEW,
     ON_CALL_TOKEN,
+    UNBADGED_BASE64,
     Delivery,
     QueryRow,
     Receiver,
@@ -123,6 +127,46 @@ The model names each tool by its provider-facing name, the dotted wire name
 spelled with underscores.
 """
 
+REVIEWED = (
+    '{"outcome":"passed","reason":"the spans were read",'
+    '"citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}'
+)
+"""The coding judge's Verdict once it read the spans: passed, citing the first trace ID."""
+
+
+def live_query(trace_id: str) -> dict:
+    """The coding judge's first turn: read ``trace_id``'s span names live as ``bifrost_query``."""
+    sql = (
+        "SELECT name FROM vala.traces.spans "
+        f"WHERE trace_id = decode('{trace_id}', 'hex') ORDER BY name"
+    )
+    arguments = json.dumps({"sql": sql, "max_rows": 10})
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-spans",
+                "type": "function",
+                "function": {"name": "bifrost_query", "arguments": arguments},
+            }
+        ],
+    }
+
+
+BADGED = (
+    '{"outcome":"passed","reason":"a badge is visible",'
+    '"citations":[{"slot":"frame","locator":{"page":1}}]}'
+)
+"""The frame judge's Verdict for a frame showing a badge: passed, citing the frame as its one page."""
+
+NO_BADGE = (
+    '{"outcome":"failed","reason":"no badge is visible",'
+    '"citations":[{"slot":"frame","locator":{"page":1}}]}'
+)
+"""The frame judge's Verdict for the frame showing no badge."""
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -134,7 +178,10 @@ def completion(body: dict) -> tuple[int, dict]:
     schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
     ``SLOW-READER``; otherwise it first calls ``fs.read`` and, once the tool
     result is back, answers a 100-dollar limit. The investigator calls each
-    of its tools once and finishes once the results are back. The policy
+    of its tools once and finishes once the results are back. The coding
+    judge reads the trace's spans live through ``bifrost_query`` and passes,
+    citing the first trace ID, once the read is back. The frame judge fails
+    the frame carrying ``UNBADGED_BASE64`` and passes every other. The policy
     judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
     Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
@@ -155,6 +202,12 @@ def completion(body: dict) -> tuple[int, dict]:
             message = {"role": "assistant", "content": '{"max_refund":100}'}
     elif "INVESTIGATE" in text:
         message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
+    elif FRAME_CLAIM in text:
+        content = NO_BADGE if UNBADGED_BASE64 in text else BADGED
+        message = {"role": "assistant", "content": content}
+    elif LIVE_REVIEW in text:
+        [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
+        message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)
     else:
         content = AGREES
         if "Rules:" in text:
@@ -193,8 +246,12 @@ def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextmanager
-def serving() -> Iterator[Receiver]:
-    """Serve the local model provider and Operator hook endpoint until exit."""
+def serving(delay: float = 0.0) -> Iterator[Receiver]:
+    """Serve the local model provider and Operator hook endpoint until exit.
+
+    With a ``delay``, each judge call is recorded on arrival and answered
+    ``delay`` seconds later, so a test can hold judgments in flight.
+    """
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
 
@@ -202,12 +259,16 @@ def serving() -> Iterator[Receiver]:
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)) or b"{}")
             headers = {name.lower(): value for name, value in self.headers.items()}
+            if delay:
+                received.record(Delivery(self.path, headers, body))
+                time.sleep(delay)
             status, reply = completion(body) if self.path == "/v1/chat/completions" else (200, {})
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
-            received.record(Delivery(self.path, headers, body))
+            if not delay:
+                received.record(Delivery(self.path, headers, body))
 
         def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""
@@ -259,19 +320,28 @@ def viewer_key(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture(scope="session")
-def assistant_bundle(
-    wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
+def assistant_bundle(wyrd_server: WyrdTestServer, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded."""
+    return registered_assistant(WyrdClient(), tmp_path_factory.mktemp("assistant"), wyrd_server)
+
+
+def registered_assistant(
+    client: WyrdClient, destination: Path, fitted_by: WyrdTestServer | None = None
 ) -> Path:
-    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded.
+    """Register the ``assistant`` Service as ``client`` and download it.
 
     Its agent checks call the gateway, so their model is deployed there first.
+    With ``fitted_by``, the download waits for the latency baseline, which that
+    server can only observe in its fixture tenant.
     """
-    configure_gateway(WyrdClient())
+    cards = Cards(client)
+    configure_gateway(client)
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
-    wyrd_server.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
-    return download(cards, "assistant", tmp_path_factory.mktemp("assistant"))
+    if fitted_by is not None:
+        fitted_by.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
+    return download(cards, "assistant", destination)
 
 
 @pytest.fixture(scope="session")
@@ -297,12 +367,15 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
 
 
 @contextmanager
-def watching(tmp_path: Path, service: str, verifier: str) -> Iterator[Watch]:
+def watching(
+    tmp_path: Path, service: str, verifier: str, *, fitted: bool = True
+) -> Iterator[Watch]:
     """Deploy the scheduled-drift ``service`` on a server of its own until exit.
 
     The server's ``on-call-hooks`` connection points at a hook of its own,
-    ``verifier``'s baseline is fitted, and the Service is hydrated with
-    Bifrost started under its own key.
+    ``verifier``'s baseline is fitted unless ``fitted`` is false (a Custom
+    Verifier has none), and the Service is hydrated with Bifrost started
+    under its own key.
     """
     with (
         serving() as hooks,
@@ -320,7 +393,8 @@ def watching(tmp_path: Path, service: str, verifier: str) -> Iterator[Watch]:
         cards = Cards(admin)
         register(cards, "cards/latency_baseline/latency-baseline.yaml")
         registered = register(cards, f"cards/scheduled_drift_alerts_operator/{service}.yaml")
-        server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
+        if fitted:
+            server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
         key = cli.issue_key(
             kind="Service", name=service, version="1.0.0", space="default", client=admin
@@ -345,6 +419,13 @@ def latency_watch(tmp_path: Path) -> Iterator[Watch]:
 def latency_steady(tmp_path: Path) -> Iterator[Watch]:
     """The ``latency-steady`` Service with its SPC ``latency-control`` Verifier fitted."""
     with watching(tmp_path, "latency-steady", "latency-control") as watch:
+        yield watch
+
+
+@pytest.fixture
+def latency_budget(tmp_path: Path) -> Iterator[Watch]:
+    """The ``latency-budget`` Service with its two-slot Custom ``latency-error-budget`` Verifier."""
+    with watching(tmp_path, "latency-budget", "latency-error-budget", fitted=False) as watch:
         yield watch
 
 

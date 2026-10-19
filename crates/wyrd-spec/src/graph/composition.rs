@@ -121,8 +121,9 @@ pub fn validate_composition(
 ///
 /// The checks are: the Verifier reference names a `Verifier` Card; one subject
 /// occurrence binds each Verifier version at most once; `runs_on` names a
-/// `Trigger` Card or is inline; each `on_failure` entry names an `Operator`
-/// Card or is inline; and one binding lists each Operator at most once.
+/// `Trigger` Card or is inline; each `on_failure` and `on_verdict_change`
+/// entry names an `Operator` Card or is inline; and one list names each
+/// Operator at most once.
 ///
 /// Duplicate detection uses the canonical named identity
 /// ([`crate::reference::CardRef::identity_key`]) for referenced Verifiers and
@@ -161,7 +162,9 @@ pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) 
         if let Some(runs_on) = &binding.runs_on {
             check_runs_on(runs_on, &binding_field, &mut errors);
         }
-        check_on_failure(&binding.on_failure, &binding_field, &mut errors);
+        for (list, operators) in binding.operator_lists() {
+            check_operators(operators, &format!("{binding_field}.{list}"), &mut errors);
+        }
     }
     errors
 }
@@ -191,18 +194,19 @@ fn check_runs_on(
     }
 }
 
-/// Push kind and duplicate errors for one `on_failure` list.
-fn check_on_failure(
-    on_failure: &[InlineableRef<OperatorSpec>],
-    binding_field: &str,
+/// Push kind and duplicate errors for one Operator list at `list_field`,
+/// such as `verified_by[0].on_failure`.
+fn check_operators(
+    operators: &[InlineableRef<OperatorSpec>],
+    list_field: &str,
     errors: &mut Vec<WyrdError>,
 ) {
     let mut seen_operators = BTreeSet::new();
     // ponytail: inline specs have no total order, so equality is a linear scan
-    // over one binding's `on_failure` list. Key them if a list ever grows large.
+    // over one binding's Operator list. Key them if a list ever grows large.
     let mut seen_inline_operators: Vec<&OperatorSpec> = Vec::new();
-    for (index, operator) in on_failure.iter().enumerate() {
-        let operator_field = format!("{binding_field}.on_failure[{index}]");
+    for (index, operator) in operators.iter().enumerate() {
+        let operator_field = format!("{list_field}[{index}]");
         match operator {
             InlineableRef::Inline(spec) => {
                 if seen_inline_operators
@@ -211,7 +215,7 @@ fn check_on_failure(
                 {
                     errors.push(WyrdError::SpecDuplicateBindingOperator {
                         message: format!(
-                            "duplicate {binding_field}.on_failure inline Operator at {operator_field}"
+                            "duplicate {list_field} inline Operator at {operator_field}"
                         ),
                         details: serde_json::json!({
                             "field": operator_field,
@@ -240,9 +244,7 @@ fn check_on_failure(
                 }
                 if !seen_operators.insert(card_ref.identity_key()) {
                     errors.push(WyrdError::SpecDuplicateBindingOperator {
-                        message: format!(
-                            "duplicate {binding_field}.on_failure Operator {card_ref}"
-                        ),
+                        message: format!("duplicate {list_field} Operator {card_ref}"),
                         details: serde_json::json!({
                             "field": operator_field,
                             "operator": card_ref

@@ -734,6 +734,7 @@ fn target(spec: &wyrd_spec::card::verifier::VerifierSpec) -> crate::verify::Targ
         card_uid: serde_json::from_value(json!("018f4d8e-0000-7000-8000-000000000002"))
             .expect("subject UID"),
         run_id: wyrd_spec::vala::ids::RunId::new(),
+        group_id: None,
     }
 }
 

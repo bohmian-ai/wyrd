@@ -3,8 +3,12 @@
 //! Both capabilities drain a durable, tenant-scoped, leased queue the same
 //! way: claim one item per due tenant each round in its own committed
 //! transaction that races shutdown, then spawn the claimed item. A round
-//! considers every tenant with claimable work; there is no tenant limit. Only
-//! Operator delivery takes execution permits before claiming. An item refused
+//! considers every tenant with claimable work; there is no tenant limit.
+//! Every claim takes one permit of the loop's capacity before claiming and
+//! holds it until the item finishes, so a loop claims nothing while its
+//! capacity is spent; the Verifier runner shares its capacity with group
+//! snapshot handoff. Operator delivery also takes delivery permits before
+//! claiming. An item refused
 //! by a full shared resource pauses claiming until a running item finishes.
 //! On shutdown admit no further claim, give in-flight work the drain grace,
 //! then cancel and let it release its lease. [`ClaimLoop`] owns that
@@ -15,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
@@ -89,6 +94,9 @@ pub(super) struct ClaimLoop {
     postgres: WyrdPostgres,
     /// Operator delivery capacity; Verifier execution has no permit gate.
     permits: Option<OperatorPermits>,
+    /// Active-work capacity in this process; each running item holds one
+    /// permit.
+    capacity: Arc<Semaphore>,
     /// Idle wait between empty claim rounds.
     poll_interval: Duration,
     /// How long shutdown waits for in-flight items before cancelling them.
@@ -99,15 +107,18 @@ pub(super) struct ClaimLoop {
 }
 
 impl ClaimLoop {
-    /// Build a loop claiming through `postgres` under `permits` and `limits`.
+    /// Build a loop claiming through `postgres` under `permits` and `limits`,
+    /// each running item holding one permit of `capacity`.
     pub(super) fn new(
         postgres: WyrdPostgres,
         permits: Option<OperatorPermits>,
+        capacity: Arc<Semaphore>,
         limits: &RuntimeLimits,
     ) -> Self {
         Self {
             postgres,
             permits,
+            capacity,
             poll_interval: limits.poll_interval,
             drain_grace: limits.drain_grace,
             #[cfg(feature = "test-support")]
@@ -124,8 +135,9 @@ impl ClaimLoop {
     /// Claim and process `work` until `stop` is cancelled, then drain.
     ///
     /// Each turn claims one item per due tenant and spawns it; Operator work
-    /// holds its delivery permit. An empty round waits the poll interval or until an
-    /// item finishes. Once an item reports a shared-resource refusal, rounds
+    /// holds its delivery permit. While no capacity permit is free no round is
+    /// claimed.
+    /// An empty round waits the poll interval or until an item finishes. Once an item reports a shared-resource refusal, rounds
     /// are skipped until a running item finishes (or none is running). On
     /// `stop` no further claim is admitted (an uncommitted
     /// claim rolls back and a claim committed after `stop` is released
@@ -147,7 +159,7 @@ impl ClaimLoop {
                 crash.check(W::CAPABILITY);
             }
             paused &= !spawned.is_empty();
-            let claimed = if paused {
+            let claimed = if paused || self.capacity.available_permits() == 0 {
                 0
             } else {
                 match self.claim_round(work, &stop, &abandon, &mut spawned).await {
@@ -193,7 +205,8 @@ impl ClaimLoop {
         self.record_active::<W>(spawned.len());
     }
 
-    /// Claim at most one item for each due tenant.
+    /// Claim at most one item for each due tenant, stopping once no capacity
+    /// permit is free.
     ///
     /// Only Operator work takes delivery permits before the claim and drops
     /// them unused when the tenant has nothing claimable. A claim committed after `stop`
@@ -234,6 +247,9 @@ impl ClaimLoop {
             {
                 break;
             }
+            let Ok(slot) = Arc::clone(&self.capacity).try_acquire_owned() else {
+                break;
+            };
             let permit = if let Some(permits) = &self.permits {
                 let Some(permit) = permits.try_acquire(tenant) else {
                     continue;
@@ -268,7 +284,7 @@ impl ClaimLoop {
                 Instant::now(),
             );
             spawned.spawn(async move {
-                let _permit = permit;
+                let _held = (slot, permit);
                 process.await
             });
         }

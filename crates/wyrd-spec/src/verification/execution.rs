@@ -16,14 +16,14 @@ use serde_json::Value;
 use skald_spec::MediaFormat;
 
 use super::{
-    DriftReport, DriftWindow, OperatorDispatchState, VerificationError,
+    DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
     VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
 use crate::card::agent::{BuiltinTool, ExecutionRoute};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, ExecutionId, SlotName};
+use crate::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use crate::reference::CardRef;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
@@ -44,6 +44,11 @@ pub struct VerificationRequest {
     /// The caller's application Run, when the execution belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// Caller-chosen group this execution belongs to, scoped to the tenant
+    /// and authenticated owner Service. Grouped Verifier bindings discover
+    /// executions sharing it; omitting it keeps the invocation ungrouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<GroupId>,
     /// Input declarations keyed by the Verifier's slot names.
     #[serde(default)]
     pub inputs: BTreeMap<SlotName, InputDeclaration>,
@@ -160,11 +165,21 @@ pub struct VerificationExecutionState {
     /// The result once completed and visible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<VerificationResult>,
-    /// Every Operator dispatch of a failed background binding execution, in
-    /// identity order; empty otherwise. Delivery completes independently of
-    /// the execution and never changes its verdict.
+    /// Every Operator dispatch of a failed background binding execution or a
+    /// changed group verdict, in identity order; empty otherwise. Delivery
+    /// completes independently of the execution and never changes its verdict.
     #[serde(default)]
     pub dispatches: Vec<OperatorDispatchState>,
+    /// Caller group the execution belongs to, or the group a group execution
+    /// judges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<GroupId>,
+    /// Binding owner of a background execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_card_uid: Option<CardUid>,
+    /// The source snapshot a group execution judges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupSnapshot>,
 }
 
 /// The attributable result of one Verifier execution.

@@ -124,7 +124,7 @@ mod tests {
             fixture.vala_postgres().clone(),
         );
         let scribe = Arc::new(RecordingScribe::default());
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let writer = PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&outbox))
             .await
             .expect("exact sentinel enables peer audit");

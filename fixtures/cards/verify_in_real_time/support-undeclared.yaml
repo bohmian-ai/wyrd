@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-undeclared
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./turn-check.yaml
+        - verifier: ./undeclared-verifier.yaml
+          runs_on: {kind: group_end, after: 3s}

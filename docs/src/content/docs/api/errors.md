@@ -348,7 +348,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND` | 400 | Invalid Service component kind | Move Verifier, Trigger, Operator, Audit, and Source cards out of Service.components; attach a Verifier with verified_by. |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | 400 | Invalid Verifier reference kind | Set verified_by[..].verifier to a Verifier CardRef. |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | 400 | Operator connection unavailable | Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator. |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit. |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit. |
 | `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or register the shared Verifier separately. |
 | `WYRD_SPEC_400_VALIDATION` | 400 | Validation failed | Check the submitted Wyrd request fields against the published schema and retry. |
 | `WYRD_SPEC_404_NOT_FOUND` | 404 | Resource not found | Check that the referenced Wyrd resource exists. |
@@ -511,9 +511,11 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID registered in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
+| `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` | 409 | Verification snapshot incomplete | Check Bifrost publication for the named source executions, then submit a new turn to the group. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |
 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | 422 | Verification input incompatible | Supply every feature the Verifier scores, with the value type its baseline or profile expects. |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | 422 | Verification input unsupported | Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule. |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | 429 | Verification staging is full | Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate. |
 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | 502 | Verification dependency failed | The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers. |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | 504 | Verification execution timed out | Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds. |

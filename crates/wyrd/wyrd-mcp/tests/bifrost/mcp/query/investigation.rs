@@ -206,6 +206,7 @@ impl EvidenceInvestigation {
                 verifier_version: &version,
                 card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
+                group_id: None,
                 binding_id: None,
                 trigger: None,
                 window,

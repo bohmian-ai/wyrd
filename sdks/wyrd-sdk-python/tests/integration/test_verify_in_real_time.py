@@ -7,28 +7,44 @@ the named Verifier authorizes a verify; the local model provider stands in
 for the judge and agrees with every answer, citing it.
 """
 
+from __future__ import annotations
+
+import json
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from wyrd import WyrdError, verify
+from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
+from .conftest import registered_assistant, serving
 from .support import (
     BASELINE_TIMEOUT_SECONDS,
+    FRAME_CLAIM,
+    LIVE_REVIEW,
+    UNBADGED,
+    Count,
     Receiver,
+    Retained,
     ancestry,
     binding_ids,
     binding_status,
     client_of,
+    download,
+    group_binding,
+    group_execution,
     hydrated,
     register,
     service_key,
@@ -52,10 +68,10 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
 
 
-def principal() -> str:
-    """The ``assistant`` Service's principal id, which every judgment here is requested as."""
+def principal(service: str = "assistant") -> str:
+    """The ``service`` principal id; ``assistant``'s is the one most judgments here are requested as."""
     return cli.issue_key(
-        kind="Service", name="assistant", version="1.0.0", space="default"
+        kind="Service", name=service, version="1.0.0", space="default"
     ).principal_id
 
 
@@ -433,3 +449,648 @@ def test_another_tenant_cannot_verify_the_assistant(
         with pytest.raises(WyrdError) as raised:
             run.observe.verify(verifier, "yes")
         assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
+
+
+def enqueue_over_http(server: WyrdTestServer, key: str, idempotency_key: str, body: dict) -> str:
+    """Enqueue ``body`` over plain HTTP as ``key`` with ``idempotency_key``; return the execution."""
+    response = httpx.post(
+        f"{server.base_url}/v1/verification/enqueue",
+        headers={
+            "x-wyrd-access-token": f"Bearer {WyrdClient(credential=key).access_token()}",
+            "idempotency-key": idempotency_key,
+        },
+        json=body,
+        timeout=60,
+    )
+    accepted = response.json()
+    assert response.status_code == 202, accepted
+    return accepted["execution_id"]
+
+
+def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path) -> None:
+    registered = register(cards, "cards/verify_in_real_time/support.yaml")
+    bundle = download(cards, "support", tmp_path)
+    key = service_key("support")
+    binding_id = group_binding(wyrd_server, cards, registered["support"])
+    state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+    state.start_bifrost()
+    group = f"conv-{secrets.token_hex(4)}"
+    turns = [{"turn": turn, "answer": f"answer {turn}"} for turn in range(1, 7)]
+    first = state.run("agent")
+    for turn in turns[:3]:
+        first.observe.verify("turn-check", turn=turn, group_id=group)
+    resumed = state.run("agent")
+    resumed.observe.verify("turn-check", turns[3], group_id=group)
+    queued = resumed.observe.submit("turn-check", turns[4], group_id=group)
+    assert isinstance(queued, verify.Execution)
+    queued.wait(WAIT_SECONDS)
+
+    def body(turn: dict) -> dict:
+        return {
+            "verifier_card_uid": str(registered["turn-check"].uid),
+            "card_uid": str(registered["assistant-agent"].uid),
+            "group_id": group,
+            "inputs": {"turn": {"kind": "json", "value": turn}},
+        }
+
+    idempotency_key = f"support-turn-{group}"
+    replayed = enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5]))
+    assert enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5])) == replayed
+    admin = client_of(wyrd_server)
+    verify.Execution.connect(replayed, admin).wait(WAIT_SECONDS)
+    WyrdState.from_path(bundle, admin).run("agent").observe.verify(
+        "turn-check", {"answer": ""}, group_id=group
+    )
+    other = wyrd_server.scoped_api_key("py_group_other", [verifier_run(cards, "answer-check")])
+    with pytest.raises(WyrdError) as denied:
+        WyrdState.from_path(bundle, WyrdClient(credential=other)).run("agent").observe.verify(
+            "turn-check", {"answer": ""}, group_id=group
+        )
+    assert denied.value.code == DENIED
+    state.shutdown()
+
+    judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+
+    assert (judged["group_id"], judged["owner_card_uid"]) == (group, str(registered["support"].uid))
+    sources = judged["group"]["sources"]
+    listed = sources["turns"]["execution_ids"]
+    assert len(listed) == 6 and listed[5] == replayed, "six turns, the replay once"
+    assert sources["answered"]["execution_ids"] == listed, "each turn's outcome aligns"
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["turns"] == {"kind": "json", "value": turns}
+    assert outcome["evidence"]["answered"] == {"kind": "json", "value": ["passed"] * 6}
+    assert outcome["verdict"] == "passed"
+    assert binding_status(wyrd_server, binding_id)["last_execution_id"] == judged["execution_id"]
+    # A conflicting replay is refused by the queue after staging; it is sent
+    # to its own group so the conversation above keeps its six turns.
+    conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
+    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, conflicting)
+    with pytest.raises(WyrdError) as conflicted:
+        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
+    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
+    with pytest.raises(WyrdError) as refused:
+        register(cards, "cards/verify_in_real_time/support-unsourced.yaml")
+    assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    assert "verified_by[0].runs_on" in str(refused.value)
+
+
+def test_grouped_refund_changes_verdict(
+    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
+) -> None:
+    admin = client_of(wyrd_server)
+    OperatorConnections(admin).create(
+        {
+            "provider": "http",
+            "name": "refund-hooks",
+            "origin": receiver.url,
+            "auth": {"scheme": "bearer", "token": "refund-hook-token"},
+        }
+    )
+    registered = register(cards, "cards/verify_in_real_time/refund.yaml")
+    bundle = download(cards, "refund", tmp_path)
+    binding_id = group_binding(wyrd_server, cards, registered["refund"])
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("refund")))
+    state.start_bifrost()
+    group = f"order-{secrets.token_hex(4)}"
+
+    def turn(overdue: bool) -> None:
+        state.run("agent").observe.verify(
+            "refund-turn", {"order": "A-1", "overdue": overdue}, group_id=group
+        )
+
+    turn(False)
+    turn(False)
+    promised = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+    turn(False)
+    turn(True)
+    overdue = group_execution(wyrd_server, binding_id, WAIT_SECONDS, promised["execution_id"])
+    turn(True)
+    unchanged = group_execution(wyrd_server, binding_id, WAIT_SECONDS, overdue["execution_id"])
+    # A paid-in-full correction is the latest fact, so the order recovers.
+    turn(False)
+    recovered = group_execution(wyrd_server, binding_id, WAIT_SECONDS, unchanged["execution_id"])
+    state.shutdown()
+
+    executions = [promised, overdue, unchanged, recovered]
+    assert [
+        (
+            len(execution["group"]["sources"]["facts"]["execution_ids"]),
+            execution["result"]["outcome"]["verdict"],
+            [requirement["id"] for requirement in execution["result"]["outcome"]["requirements"]],
+            len(execution["dispatches"]),
+        )
+        for execution in executions
+    ] == [
+        (2, "passed", ["latest-not-overdue"], 0),
+        (4, "failed", ["latest-not-overdue"], 1),
+        (5, "failed", ["latest-not-overdue"], 0),
+        (6, "passed", ["latest-not-overdue"], 1),
+    ], "only verdict changes dispatch"
+    history = (
+        Bifrost(client=admin)
+        .sql(
+            "SELECT execution_id, result_id, verdict FROM vala.verification.results "
+            "WHERE binding_id = $1 ORDER BY ended_at",
+            [binding_id],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert [(row["execution_id"], row["verdict"]) for row in history] == [
+        (execution["execution_id"], execution["result"]["outcome"]["verdict"])
+        for execution in executions
+    ], "every execution stays retained"
+    with receiver.delivered:
+        assert receiver.delivered.wait_for(
+            lambda: len(receiver.to("/hooks/refund-verification")) >= 2, WAIT_SECONDS
+        ), "the failure and the recovery each dispatch"
+    alerts = sorted(
+        (alert.body for alert in receiver.to("/hooks/refund-verification")),
+        key=lambda body: body["verdict"] == "passed",
+    )
+    assert alerts == [
+        {
+            "execution_id": overdue["execution_id"],
+            "result_id": history[1]["result_id"],
+            "verdict": "failed",
+            "group_id": group,
+            "previous_result_id": history[0]["result_id"],
+            "previous_verdict": "passed",
+        },
+        {
+            "execution_id": recovered["execution_id"],
+            "result_id": history[3]["result_id"],
+            "verdict": "passed",
+            "group_id": group,
+            "previous_result_id": history[2]["result_id"],
+            "previous_verdict": "failed",
+        },
+    ]
+    with pytest.raises(WyrdError) as refused:
+        register(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
+    assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    assert "verified_by[1].on_failure" in str(refused.value)
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_coding_uses_declared_sources(
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    receiver: Receiver,
+    tmp_path: Path,
+    fresh_tracer_provider: None,
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/coding.yaml")
+    bundle = download(cards, "coding", tmp_path)
+    binding_id = group_binding(wyrd_server, cards, registered["coding"])
+    wyrd_server.scoped_api_key("py_live_reader", ["tool:invoke", "bifrost_query:read"])
+    principals = Principals(client_of(wyrd_server))
+    coding = principal("coding")
+    principals.grant_role(coding, "py_live_reader")
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("coding")))
+    state.start_bifrost()
+    state.start_telemetry()
+    tracer = trace.get_tracer("journey.coding")
+    session = tracer.start_span("coding-session")
+    with trace.use_span(session), tracer.start_as_current_span("edit-file"):
+        pass
+    trace_id = format(session.get_span_context().trace_id, "032x")
+    group = f"session-{secrets.token_hex(4)}"
+    calls = [
+        {"call": "prompt", "tests": "passed"},
+        {"call": "edit", "tests": "failed"},
+        {"call": "test", "tests": "passed"},
+    ]
+    run = state.run("agent")
+    verdicts = [
+        run.observe.verify(
+            "coding-turn", call=call, group_id=group, **({"trace": trace_id} if index == 0 else {})
+        ).verdict
+        for index, call in enumerate(calls)
+    ]
+    assert verdicts == ["passed", "failed", "passed"]
+    empty = run.observe.verify("empty-each", [])
+    assert empty.verdict == "inconclusive"
+    assert [
+        (requirement["id"], requirement["outcome"], requirement["reason"])
+        for requirement in empty.requirements
+    ] == [
+        ("listed-ok", "inconclusive", "empty_selection"),
+        ("items-ok", "inconclusive", "empty_selection"),
+    ]
+    with trace.use_span(session), tracer.start_as_current_span("late-test-run"):
+        pass
+    session.end()
+    state.flush()
+
+    judged = group_execution(wyrd_server, binding_id, WAIT_SECONDS)
+
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["calls"] == {"kind": "json", "value": calls}
+    assert outcome["evidence"]["traces"] == {"kind": "json", "value": [trace_id, None, None]}
+    assert outcome["evidence"]["tests"] == {
+        "kind": "json",
+        "value": ["passed", "failed", "passed"],
+    }
+    assert [
+        (requirement["id"], requirement["outcome"]) for requirement in outcome["requirements"]
+    ] == [("every-call-tested", "failed"), ("spans-reviewed", "passed")], outcome["requirements"]
+    assert outcome["verdict"] == "failed"
+
+    def reviews() -> list[str]:
+        return [
+            text
+            for delivery in receiver.to(CALLS)
+            if LIVE_REVIEW in (text := json.dumps(delivery.body)) and trace_id in text
+        ]
+
+    [ask] = [text for text in reviews() if '"role": "tool"' not in text]
+    assert "edit-file" not in ask, "the trace slot carries its ID only"
+    [read] = [text for text in reviews() if '"role": "tool"' in text]
+    assert "edit-file" in read and "late-test-run" in read, "the check reads the spans live"
+
+    principals.revoke_role(coding, "py_live_reader")
+    later = f"session-{secrets.token_hex(4)}"
+    run.observe.verify("coding-turn", call=calls[0], trace=trace_id, group_id=later)
+    revoked = group_execution(wyrd_server, binding_id, WAIT_SECONDS, judged["execution_id"])
+    assert revoked["group_id"] == later
+    [denied] = [text for text in reviews() if '"role": "tool"' in text and DENIED in text]
+    assert "edit-file" not in denied, "a denied read returns nothing"
+    state.shutdown()
+
+    for relative, kind, code, reason in [
+        ("invalid/coding-child", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "child fields"),
+        (
+            "cards/verify_in_real_time/coding-unbound",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 0 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-ambiguous",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 2 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-undeclared",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "does not declare",
+        ),
+        (
+            "cards/verify_in_real_time/coding-cycle",
+            "Service",
+            "WYRD_SPEC_400_VALIDATION",
+            "forms a source cycle",
+        ),
+        (
+            "invalid/reserved-typed",
+            "Verifier",
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+        (
+            "invalid/reserved-source",
+            "Verifier",
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+    ]:
+        with pytest.raises(WyrdError) as refused:
+            register(cards, f"{relative}.yaml")
+        name = relative.rsplit("/", 1)[-1]
+        assert refused.value.code == code, name
+        assert reason in f"{refused.value} {refused.value.details}", name
+        with pytest.raises(WyrdError) as absent:
+            cards.resolve_latest(kind, "default", name)
+        assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND", name
+    register(cards, "cards/verify_in_real_time/coding-external.yaml")
+
+
+def frame(directory: Path, label: str) -> Path:
+    """A PNG frame in ``directory`` carrying the nine-byte ``label`` after its signature and a newline.
+
+    Nine bytes start the label on a base64 boundary, so its base64 appears
+    verbatim in the image data URL the judge receives.
+    """
+    assert len(label) == 9, "a frame label is nine bytes"
+    path = directory / f"{label}.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n\n" + label.encode())
+    return path
+
+
+def submit_frames(state: WyrdState, group: str, paths: list[Path]) -> list[verify.Execution]:
+    """Submit each frame at ``paths`` to ``frame-verifier`` in one Run under ``group``."""
+    run = state.run("agent")
+    executions = []
+    for path in paths:
+        queued = run.observe.submit("frame-verifier", verify.File(path), group_id=group)
+        assert isinstance(queued, verify.Execution)
+        executions.append(queued)
+    return executions
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_sampled_frames_use_visible_outcomes(
+    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/frames.yaml")
+    register(cards, "cards/verify_in_real_time/frames-other.yaml")
+    binding_id = group_binding(wyrd_server, cards, registered["frames"])
+    bundle = download(cards, "frames", tmp_path / "frames")
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("frames")))
+    state.start_bifrost()
+    other = WyrdState.from_path(
+        download(cards, "frames-other", tmp_path / "other"),
+        WyrdClient(credential=service_key("frames-other")),
+    )
+    other.start_bifrost()
+    events = {name: f"{name}-{secrets.token_hex(4)}" for name in ("empty", "failing", "many")}
+
+    def reported(event: str) -> None:
+        state.run("agent").observe.verify(
+            "event-fact", {"event_id": event, "detected": True}, group_id=event
+        )
+
+    def judged_after(after: str | None) -> verify.ExecutionState:
+        state.flush()
+        return group_execution(wyrd_server, binding_id, WAIT_SECONDS, after)
+
+    def badged(judged: verify.ExecutionState) -> tuple[str, str]:
+        outcome = judged["result"]["outcome"]
+        [requirement] = outcome["requirements"]
+        return outcome["verdict"], requirement["reason"]
+
+    reported(events["empty"])
+    judged = judged_after(None)
+    assert judged["group_id"] == events["empty"]
+    assert badged(judged) == ("inconclusive", "empty_selection")
+    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {"kind": "json", "value": []}
+
+    paths = [frame(tmp_path, f"fail-{index:04}") for index in range(19)]
+    paths.insert(7, frame(tmp_path, UNBADGED))
+    executions = submit_frames(state, events["failing"], paths)
+    for foreign in submit_frames(other, events["failing"], [frame(tmp_path, "other-001")]):
+        foreign.wait(WAIT_SECONDS)
+    unauthorized = wyrd_server.scoped_api_key(
+        "py_frames_denied", [verifier_run(cards, "answer-check")]
+    )
+    with pytest.raises(WyrdError) as denied:
+        WyrdState.from_path(bundle, WyrdClient(credential=unauthorized)).run(
+            "agent"
+        ).observe.submit(
+            "frame-verifier", verify.File(frame(tmp_path, "denied-01")), group_id=events["failing"]
+        )
+    assert denied.value.code == DENIED
+    reported(events["failing"])
+    for execution in executions:
+        execution.wait(WAIT_SECONDS)
+    judged = judged_after(judged["execution_id"])
+    assert judged["group_id"] == events["failing"]
+    coverage = judged["group"]["sources"]
+    # Frames ingested in one batch share its ingest time, so their list
+    # order is by execution ID rather than by submission.
+    listed = coverage["outcomes"]["execution_ids"]
+    assert len(listed) == 20
+    assert set(listed) == {execution.id for execution in executions}, (
+        "only the Service's own frames"
+    )
+    assert len(coverage["event"]["execution_ids"]) == 1
+    expected = ["failed" if id == executions[7].id else "passed" for id in listed]
+    outcome = judged["result"]["outcome"]
+    assert outcome["evidence"]["outcomes"] == {"kind": "json", "value": expected}
+    assert outcome["verdict"] == "failed"
+
+    paths = [frame(tmp_path, f"many-{index:04}") for index in range(21)]
+    executions = submit_frames(state, events["many"], paths)
+    reported(events["many"])
+    for execution in executions:
+        execution.wait(WAIT_SECONDS)
+    judged = judged_after(judged["execution_id"])
+    assert judged["group_id"] == events["many"]
+    assert sorted(judged["group"]["sources"]["outcomes"]["execution_ids"]) == sorted(
+        execution.id for execution in executions
+    ), "twenty-one frames are judged like any other group"
+    assert judged["result"]["outcome"]["evidence"]["outcomes"] == {
+        "kind": "json",
+        "value": ["passed"] * 21,
+    }
+    assert judged["result"]["outcome"]["verdict"] == "passed"
+    frames_judged = [d for d in receiver.to(CALLS) if FRAME_CLAIM in json.dumps(d.body)]
+    assert len(frames_judged) == 20 + 1 + 21, "every frame is judged once"
+    state.shutdown()
+    other.shutdown()
+
+
+def group_executions(server: WyrdTestServer, binding_id: str, groups: list[str]) -> list[str]:
+    """The executions of ``binding_id``'s retained executions of ``groups``, oldest first."""
+    server.flush_bifrost()
+    rows = Bifrost(client=client_of(server)).sql(
+        "SELECT execution_id FROM vala.verification.results "
+        "WHERE binding_id = $1 AND group_id IN ($2, $3) ORDER BY ended_at",
+        [binding_id, *groups],
+        model=Retained,
+    )
+    return [row.execution_id for row in rows]
+
+
+@pytest.mark.usefixtures("assistant_bundle")
+def test_grouped_conversations_coexist_with_drift(
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    assistant: WyrdState,
+    other_tenant: str,
+    tmp_path: Path,
+) -> None:
+    registered = register(cards, "cards/verify_in_real_time/support.yaml")
+    key = service_key("support")
+    binding_id = group_binding(wyrd_server, cards, registered["support"])
+    state = WyrdState.from_path(
+        download(cards, "support", tmp_path / "a"), WyrdClient(credential=key)
+    )
+    state.start_bifrost()
+    assistant.start_bifrost()
+    suffix = secrets.token_hex(4)
+    a, b = f"conv-a-{suffix}", f"conv-b-{suffix}"
+
+    def turn(answer: str) -> dict:
+        return {"answer": answer}
+
+    sampled = assistant.run("model").observe.submit("latency-drift", {"latency": 12.5})
+    assert isinstance(sampled, verify.Recorded)
+    state.run("agent").observe.verify("turn-check", turn("a1"), group_id=a)
+    state.run("agent").observe.verify("turn-check", turn("b1"), group_id=b)
+    queued = state.run("agent").observe.submit("turn-check", turn("a2"), group_id=a)
+    assert isinstance(queued, verify.Execution)
+    state.run("agent").observe.verify("turn-check", turn(""), group_id=b)
+    solo = state.run("agent").observe.verify("turn-check", turn("solo"))
+    queued.wait(WAIT_SECONDS)
+    newer = register(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
+    late = enqueue_over_http(
+        wyrd_server,
+        key,
+        f"support-newer-{suffix}",
+        {
+            "verifier_card_uid": str(newer["turn-check"].uid),
+            "card_uid": str(registered["assistant-agent"].uid),
+            "group_id": a,
+            "inputs": {"turn": {"kind": "json", "value": turn("newer")}},
+        },
+    )
+    admin = client_of(wyrd_server)
+    verify.Execution.connect(late, admin).wait(WAIT_SECONDS)
+    tenant_b = client_of(
+        wyrd_server,
+        wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name=f"b-admin-{suffix}"),
+    )
+    b_cards = Cards(tenant_b)
+    register(b_cards, "cards/verify_in_real_time/support.yaml")
+    b_key = cli.issue_key(
+        kind="Service", name="support", version="1.0.0", space="default", client=tenant_b
+    ).key
+    b_state = WyrdState.from_path(
+        download(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
+    )
+    b_state.start_bifrost()
+    b_state.run("agent").observe.verify("turn-check", turn("tenant b"), group_id=a)
+    for each in (state, assistant, b_state):
+        each.shutdown()
+
+    deadline = time.monotonic() + WAIT_SECONDS
+    while len(executions := group_executions(wyrd_server, binding_id, [a, b])) < 2:
+        assert time.monotonic() < deadline, "both conversations are verified"
+        time.sleep(0.5)
+    judged = {}
+    for execution_id in executions:
+        execution = verify.Execution.connect(execution_id, admin).status()
+        outcome = execution["result"]["outcome"]
+        judged[execution["group_id"]] = (
+            len(execution["group"]["sources"]["turns"]["execution_ids"]),
+            outcome["evidence"]["turns"],
+            outcome["verdict"],
+        )
+    assert judged == {
+        a: (2, {"kind": "json", "value": [turn("a1"), turn("a2")]}, "passed"),
+        b: (2, {"kind": "json", "value": [turn("b1"), turn("")]}, "failed"),
+    }, "each conversation judges only its own pinned turns"
+    ungrouped = Bifrost(client=admin).sql(
+        "SELECT execution_id FROM vala.verification.results "
+        "WHERE execution_id = $1 AND group_id IS NULL",
+        [solo.execution_id],
+        model=Retained,
+    )
+    assert len(ungrouped) == 1, "the ungrouped turn joins no group"
+    quiet = time.monotonic() + 8
+    while time.monotonic() < quiet:
+        assert group_executions(wyrd_server, binding_id, [a, b]) == executions, (
+            "without new activity a judged group is not read again"
+        )
+        time.sleep(0.5)
+
+
+STAGING_CAPACITY = 6
+"""Scribe outbox capacity of the staging-pressure story: its reserved three
+quarters, four writes, is what two direct judgments reserve."""
+
+JUDGE_DELAY_SECONDS = 15.0
+"""How long the staging-pressure story's judge holds each call."""
+
+STAGING_FULL = "WYRD_VERIFICATION_429_STAGING_FULL"
+
+
+def await_judge_calls(judge: Receiver, calls: int) -> None:
+    """Block until ``judge`` has received ``calls`` judge calls."""
+    with judge.delivered:
+        assert judge.delivered.wait_for(lambda: len(judge.to(CALLS)) >= calls, WAIT_SECONDS)
+
+
+def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
+    with (
+        serving(delay=JUDGE_DELAY_SECONDS) as judge,
+        WyrdTestServer(
+            verification_runtime=True,
+            provider_base_url=judge.url,
+            scribe_outbox_capacity=STAGING_CAPACITY,
+        ) as server,
+    ):
+        bundle = registered_assistant(WyrdClient(), tmp_path / "assistant", server)
+        state = hydrated(bundle, WyrdClient(credential=service_key("assistant")))
+        neighbor_admin = server.bootstrap_service_in_tenant(
+            server.seed_tenant("burst-neighbor"), ["admin"], name="burst-admin"
+        )
+        neighbor_client = client_of(server, neighbor_admin)
+        neighbor = hydrated(
+            registered_assistant(neighbor_client, tmp_path / "neighbor"),
+            client_of(server, service_key("assistant", neighbor_client)),
+        )
+        cards = Cards(WyrdClient())
+        registered = register(cards, "cards/verify_in_real_time/support.yaml")
+        binding_id = group_binding(server, cards, registered["support"])
+        support = WyrdState.from_path(
+            download(cards, "support", tmp_path / "support"),
+            WyrdClient(credential=service_key("support")),
+        )
+        support.start_bifrost()
+        group = f"pressured-{secrets.token_hex(4)}"
+        pressured = {"answer": "pressured"}
+        server.flush_bifrost()
+
+        offered = 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            burst = []
+            for in_flight in (1, 2):
+                burst.append(
+                    pool.submit(lambda: state.run("agent").observe.verify("answer-judged", "yes"))
+                )
+                await_judge_calls(judge, in_flight)
+                if in_flight == 1:
+                    accepted = neighbor.run("agent").observe.submit("answer-check", "yes")
+                    assert isinstance(accepted, verify.Execution)
+                    neighbor_waits = pool.submit(accepted.wait, WAIT_SECONDS)
+                    while True:
+                        normal = state.run("agent").observe.submit("answer-check", "yes")
+                        assert isinstance(normal, verify.Execution)
+                        assert normal.wait(WAIT_SECONDS).verdict == "passed"
+                        offered += 1
+                        if neighbor_waits.done():
+                            break
+                    assert neighbor_waits.result().verdict == "passed"
+                    assert not burst[0].done(), "the burst's judgment is still in flight"
+                    server.flush_bifrost()
+
+            refused_run = state.run("agent")
+            grouped_run = support.run("agent")
+            for call in (
+                lambda: refused_run.observe.verify("answer-check", "yes"),
+                lambda: refused_run.observe.submit("answer-check", "yes"),
+                lambda: grouped_run.observe.verify("turn-check", pressured, group_id=group),
+                lambda: grouped_run.observe.submit("turn-check", pressured, group_id=group),
+            ):
+                with pytest.raises(WyrdError) as refused:
+                    call()
+                assert refused.value.code == STAGING_FULL
+                assert refused.value.status == 429
+                assert refused.value.details["retry_after_seconds"] == 1
+            assert not any(judging.done() for judging in burst)
+            assert [judging.result().verdict for judging in burst] == ["passed", "passed"]
+
+        server.flush_bifrost()
+        recovered = refused_run.observe.submit("answer-check", "yes")
+        assert isinstance(recovered, verify.Execution)
+        judged = recovered.wait(WAIT_SECONDS)
+        assert (judged.verdict, judged.run_id) == ("passed", refused_run.run_id)
+        grouped_run.observe.verify("turn-check", pressured, group_id=group)
+        support.shutdown()
+        grouped = group_execution(server, binding_id, WAIT_SECONDS)
+        assert grouped["group_id"] == group
+        assert grouped["result"]["outcome"]["evidence"]["turns"] == {
+            "kind": "json",
+            "value": [pressured],
+        }, "the refused grouped turn staged nothing"
+
+        server.flush_bifrost()
+        rows = Bifrost(client=client_of(server)).sql(
+            "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
+        )
+        assert [row.n for row in rows] == [4 + offered]

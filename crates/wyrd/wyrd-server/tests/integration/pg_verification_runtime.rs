@@ -166,9 +166,8 @@ impl Harness {
             .expect("submission is accepted")
     }
 
-    /// Schedule `verifier` over the harness subject's `metric` series for a
-    /// fresh active owner and return the execution the scheduler creates for
-    /// its now-due occurrence.
+    /// Schedule `verifier` for a fresh active owner and return the execution
+    /// the scheduler creates for its now-due occurrence.
     ///
     /// The scheduler claims an occurrence 30 seconds after its window ends,
     /// so this waits up to [`WAIT`]; a runtime must be running.
@@ -176,19 +175,12 @@ impl Harness {
     /// # Panics
     /// Panics when the owner, binding, or activation write fails, or no new
     /// execution appears within [`WAIT`].
-    async fn schedule(&self, owner: &str, verifier: &CardUid, metric: &str) -> ExecutionId {
+    async fn schedule(&self, owner: &str, verifier: &CardUid) -> ExecutionId {
         let before = self.seed.executions().await.expect("executions read");
         let (owner, principal) = self.seed.service(owner).await.expect("owner registers");
         let binding = self
             .seed
-            .bind_schedule(
-                &owner,
-                &owner,
-                verifier,
-                "0 2 * * *",
-                VerificationFixture::metric_inputs(metric),
-                Vec::new(),
-            )
+            .bind_schedule(&owner, &owner, verifier, "0 2 * * *", Vec::new())
             .await
             .expect("binding projects");
         self.seed
@@ -761,9 +753,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         .custom_drift_verifier("telemetry-drift", "score", 1.0, 0.5)
         .await
         .expect("profiled verifier registers");
-    let real = harness
-        .schedule("telemetry-owner", &profiled, "score")
-        .await;
+    let real = harness.schedule("telemetry-owner", &profiled).await;
     let real_row = harness
         .wait_execution(real, |row| {
             !matches!(row.status.as_str(), "pending" | "running" | "retrying")
@@ -1011,7 +1001,7 @@ async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let run = harness
-        .schedule("unscorable-owner", &harness.verifier, "latency_ms")
+        .schedule("unscorable-owner", &harness.verifier)
         .await;
 
     let row = harness.wait_execution(run, status("errored")).await;
@@ -1882,14 +1872,7 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(
-            &owner,
-            &owner,
-            &harness.verifier,
-            "0 2 * * *",
-            VerificationFixture::metric_inputs("latency_ms"),
-            Vec::new(),
-        )
+        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
         .await
         .expect("binding projects");
     harness
@@ -1998,14 +1981,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(
-            &owner,
-            &owner,
-            &harness.verifier,
-            "0 2 * * *",
-            VerificationFixture::metric_inputs("latency_ms"),
-            Vec::new(),
-        )
+        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
         .await
         .expect("binding projects");
     harness
@@ -2086,14 +2062,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         bindings.push(
             harness
                 .seed
-                .bind_schedule(
-                    &owner,
-                    &owner,
-                    &harness.verifier,
-                    "0 2 * * *",
-                    VerificationFixture::metric_inputs("latency_ms"),
-                    Vec::new(),
-                )
+                .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
                 .await
                 .expect("binding projects"),
         );
@@ -2665,20 +2634,45 @@ fn first_runner_round(logs: &LogCapture) -> String {
         .expect("the runner logs its claim rounds")
 }
 
-/// With more than 64 tenants each holding a claimable run, the runner's
-/// first claim round considers and claims every one of them.
+/// With more than 64 tenants each holding a claimable run and a slot for
+/// each, the runner's first claim round considers and claims every one of
+/// them.
 ///
 /// # Panics
 /// Panics when seeding fails, the first round misses a tenant, or a run does
 /// not complete.
 #[tokio::test]
 async fn every_tenant_is_claimed_in_the_first_round() {
+    claim_first_round(70, 70).await;
+}
+
+/// With more due tenants than execution slots, the runner's first claim
+/// round claims only as many executions as it has slots; the rest are
+/// claimed once a running execution finishes.
+///
+/// # Panics
+/// Panics when seeding fails, the first round claims past the slots, or a
+/// run does not complete.
+#[tokio::test]
+async fn the_runner_claims_no_more_than_its_execution_slots() {
+    claim_first_round(3, 2).await;
+}
+
+/// Seed `tenants` tenants with one claimable run each, hold the engine on a
+/// runner with `slots` execution slots, and assert its first claim round
+/// claims `min(tenants, slots)` before every run completes on release.
+///
+/// # Panics
+/// Panics when seeding fails, the first round claims another count, or a
+/// run does not complete.
+async fn claim_first_round(tenants: usize, slots: usize) {
+    let claimed = tenants.min(slots);
     let logs = LogCapture::install();
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
     let mut runs = vec![(harness.seed.clone(), harness.submit().await)];
-    for index in 1..70 {
+    for index in 1..tenants {
         let tenant = DataTenantId::new_v7();
         harness
             .server
@@ -2693,15 +2687,19 @@ async fn every_tenant_is_claimed_in_the_first_round() {
             .expect("run enqueues");
         runs.push((seed, run));
     }
-    for _ in 0..70 {
+    for _ in 0..tenants {
         script.push(EngineOutcome::Completed(unscored_report()));
     }
-    let runtime = harness.spawn(&Harness::limits(), &script);
-    wait_until("all 70 executions", || script.entered() == 70).await;
+    let limits = RuntimeLimits {
+        execution_slots: slots,
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &script);
+    wait_until("the slotted executions", || script.entered() == claimed).await;
     let round = first_runner_round(&logs);
     assert!(
-        round.contains("due=70") && round.contains("claimed=70"),
-        "the first round claims every tenant: {round}"
+        round.contains(&format!("due={tenants}")) && round.contains(&format!("claimed={claimed}")),
+        "the first round claims one run per tenant up to the slots: {round}"
     );
     script.release();
     for (seed, run) in &runs {
@@ -2815,7 +2813,7 @@ async fn renewal_keeps_a_long_run_and_a_taken_token_cancels_it() {
 }
 
 /// Two hundred held runs released at once on the eight-connection test pool
-/// all complete on their first attempt: no settlement fails and no
+/// all complete on their first attempt with a slot each: no settlement fails and no
 /// connection acquire times out, because a run holds a connection only to
 /// claim, settle, and renew.
 ///
@@ -2833,7 +2831,11 @@ async fn two_hundred_released_runs_complete_on_their_first_attempt() {
         script.push(EngineOutcome::Completed(unscored_report()));
         runs.push(harness.submit().await);
     }
-    let runtime = harness.spawn(&Harness::limits(), &script);
+    let limits = RuntimeLimits {
+        execution_slots: 200,
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &script);
     wait_until("all 200 executions", || script.entered() == 200).await;
     script.release();
     for run in runs {

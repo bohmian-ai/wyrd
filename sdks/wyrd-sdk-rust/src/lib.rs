@@ -177,6 +177,10 @@ pub use wyrd_spec::verification::execution::{
 /// `Execution::connect` takes it.
 pub use wyrd_spec::ids::ExecutionId;
 
+/// The caller group `observe().group_id` attaches to verify and submit
+/// executions, which a `group_end` binding judges together.
+pub use wyrd_spec::ids::GroupId;
+
 /// The document or image format a media input slot accepts, declared on a
 /// `File` with `with_format` when its path or bytes do not imply it.
 pub use skald_spec::MediaFormat;

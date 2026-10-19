@@ -40,7 +40,8 @@ pub enum SlotValue<'a> {
     InlineableAgent(&'a mut InlineableRef<AgentSpec>),
     /// An inlineable Trigger spec slot (`verified_by[..].runs_on`).
     InlineableTrigger(&'a mut InlineableRef<TriggerSpec>),
-    /// An inlineable Operator spec slot (`verified_by[..].on_failure[..]`).
+    /// An inlineable Operator spec slot (`verified_by[..].on_failure[..]` or
+    /// `verified_by[..].on_verdict_change[..]`).
     InlineableOperator(&'a mut InlineableRef<OperatorSpec>),
 }
 
@@ -427,7 +428,7 @@ impl Visit for ArtifactSpec {
 ///
 /// Each binding yields its Verifier reference, its `runs_on` Trigger slot when
 /// one is authored, and
-/// every `on_failure` Operator slot. Inline Triggers and Operators carry no
+/// every `on_failure` and `on_verdict_change` Operator slot. Inline Triggers and Operators carry no
 /// references of their own.
 fn visit_verified_by<F>(bindings: &mut [VerificationBinding], path: &str, f: &mut F)
 where
@@ -444,11 +445,13 @@ where
                 value: SlotValue::InlineableTrigger(runs_on),
             });
         }
-        for (operator_index, operator) in binding.on_failure.iter_mut().enumerate() {
-            f(SlotEntry {
-                path: format!("{path}[{index}].on_failure[{operator_index}]"),
-                value: SlotValue::InlineableOperator(operator),
-            });
+        for (list, operators) in binding.operator_lists_mut() {
+            for (operator_index, operator) in operators.iter_mut().enumerate() {
+                f(SlotEntry {
+                    path: format!("{path}[{index}].{list}[{operator_index}]"),
+                    value: SlotValue::InlineableOperator(operator),
+                });
+            }
         }
     }
 }
@@ -737,8 +740,9 @@ mod completeness_tests {
         .expect("fixture notify Operator decodes")
     }
 
-    /// Build one binding with a referenced Trigger, a referenced Operator, and
-    /// an inline Operator so every `verified_by` slot shape is visited.
+    /// Build one binding with a referenced Trigger, referenced and inline
+    /// failure Operators, and a verdict-change Operator so every
+    /// `verified_by` slot shape and Operator list is visited.
     fn binding(verifier: &str) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(card_ref(CardKind::Verifier, verifier)),
@@ -747,7 +751,7 @@ mod completeness_tests {
                 InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
                 InlineableRef::Inline(Box::new(notify_operator())),
             ],
-            inputs: BTreeMap::new(),
+            on_verdict_change: vec![InlineableRef::Ref(card_ref(CardKind::Operator, "escalate"))],
         }
     }
 
@@ -848,7 +852,7 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 23);
+        assert_eq!(count, 24);
         assert!(visit_paths(Spec::Service(service.clone())).contains(&(
             "spec.components[0].verified_by[0].verifier".to_owned(),
             "durable"
@@ -914,6 +918,10 @@ mod completeness_tests {
                 (format!("{prefix}[0].runs_on"), "inlineable_trigger"),
                 (format!("{prefix}[0].on_failure[0]"), "inlineable_operator"),
                 (format!("{prefix}[0].on_failure[1]"), "inlineable_operator"),
+                (
+                    format!("{prefix}[0].on_verdict_change[0]"),
+                    "inlineable_operator",
+                ),
             ]
         };
         let service = ServiceSpec {

@@ -6,6 +6,7 @@ use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::spec_binding_errors;
 use wyrd_spec::refs::ReferenceSlotVisitor;
+use wyrd_spec::registry::validate_artifact_manifest;
 
 use super::error::{Diagnostic, Severity};
 use super::parse::AuthoredCard;
@@ -144,48 +145,17 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
     }
 }
 
-/// Reject artifact manifests whose paths overlap as files and directories.
+/// Report a card whose artifact manifest repeats or nests a path, through
+/// the registration rule the server enforces.
 ///
-/// An artifact publication cannot contain both `a` and `a/b`: the former is a
-/// file target while the latter requires it to be a directory. The check also
-/// rejects exact reuse before a manifest reaches storage materialization.
+/// Only a sole submission may carry artifacts, so checking each card's own
+/// manifest covers the loaded tree.
 fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
-    let mut seen = HashMap::<String, &std::path::PathBuf>::new();
     for card in cards {
-        for artifact in &card.artifacts {
-            let path = artifact.relative_path.as_str();
-            if let Some((first_artifact, first_path)) = seen
-                .iter()
-                .find(|(existing, _)| artifact_paths_conflict(existing, path))
-            {
-                diagnostics.push(Diagnostic::invalid_envelope(
-                    card.source_path.clone(),
-                    format!(
-                        "duplicate artifact path {} conflicts with {} (first authored at {})",
-                        artifact.relative_path,
-                        first_artifact,
-                        first_path.display()
-                    ),
-                ));
-            }
-            seen.insert(path.to_owned(), &card.source_path);
+        if let Err(error) = validate_artifact_manifest(&card.artifacts) {
+            diagnostics.push(catalog_error(card, &error));
         }
     }
-}
-
-/// Return whether two validated artifact paths are identical or prefix-conflict.
-///
-/// Artifact paths use `/` as their canonical separator, so string boundaries
-/// are sufficient and avoid platform-specific path semantics.
-#[must_use]
-fn artifact_paths_conflict(left: &str, right: &str) -> bool {
-    left == right
-        || left
-            .strip_prefix(right)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-        || right
-            .strip_prefix(left)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Convert a catalogued specification error into a source-aware diagnostic.
@@ -331,7 +301,7 @@ mod tests {
                 },
             }))),
             on_failure: Vec::new(),
-            inputs: BTreeMap::new(),
+            on_verdict_change: Vec::new(),
         }
     }
 }

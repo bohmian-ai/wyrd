@@ -2892,7 +2892,7 @@ pub(crate) mod tests {
                 }))
             }),
             on_failure: Vec::new(),
-            inputs: BTreeMap::new(),
+            on_verdict_change: Vec::new(),
         }
     }
 

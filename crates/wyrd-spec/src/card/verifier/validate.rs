@@ -15,7 +15,7 @@ use super::reference::{Reference, ReferenceRoot};
 use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
-    InputSlot, MAX_STEP_RETRIES, Requirement, ScheduledInput, Step, VerifierSpec,
+    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -558,11 +558,14 @@ where
                 ));
             }
         } else {
-            if !tools.is_empty() {
+            if tools
+                .iter()
+                .any(|name| name != BuiltinTool::BifrostQuery.as_str())
+            {
                 return Err(invalid(
                     "check_agent_tools",
                     path,
-                    "check Agents have no tools",
+                    "check Agents may declare only the bifrost.query tool",
                 ));
             }
             let produces_verdict = match &resolved.prompt.response_type {
@@ -780,11 +783,21 @@ fn verdict_schema() -> Value {
 /// Validates one slot's own constraints.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] with rule `slot` for an empty media
-/// format list, a zero `max_bytes`, a samples slot without measurements, or a
-/// non-schema JSON `schema`.
+/// Returns [`WyrdError::Validation`] with rule `slot` for the reserved
+/// `group_id` slot name, which collides with the SDK verify/submit argument,
+/// an empty media format list, a zero `max_bytes`, a samples slot without
+/// measurements, or a non-schema JSON `schema`, and with rule `source` for a
+/// source declaration that is not a whole-slot or requirement-outcome
+/// reference.
 fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
     let path = format!("inputs.{slot}");
+    if slot.as_str() == "group_id" {
+        return Err(invalid(
+            "slot",
+            &path,
+            "group_id is reserved for the verify/submit group_id argument; rename the slot",
+        ));
+    }
     match input {
         InputSlot::Media {
             formats, max_bytes, ..
@@ -806,6 +819,11 @@ fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
                 &path,
                 "samples slots name at least one measurement",
             ));
+        }
+        InputSlot::Source(source) => {
+            source
+                .parse()
+                .map_err(|error| invalid("source", &path, error))?;
         }
         InputSlot::Json {
             schema: Some(schema),
@@ -866,50 +884,6 @@ fn ancestors<'a>(
     ancestors
 }
 
-impl VerifierSpec {
-    /// Validates a schedule binding's `inputs` map against this Verifier.
-    ///
-    /// Every required slot must be mapped, every mapped slot must be a
-    /// samples slot of this Verifier, and each selector must name exactly
-    /// the slot's measurements. Names are never inferred.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `scheduled_input`.
-    pub fn validate_schedule(
-        &self,
-        inputs: &BTreeMap<SlotName, ScheduledInput>,
-    ) -> Result<(), WyrdError> {
-        for (slot, input) in &self.inputs {
-            if input.required() && !inputs.contains_key(slot) {
-                return Err(invalid(
-                    "scheduled_input",
-                    &format!("inputs.{slot}"),
-                    "the schedule binding must map every required slot",
-                ));
-            }
-        }
-        for (slot, selector) in inputs {
-            let path = format!("inputs.{slot}");
-            let Some(InputSlot::Samples { features, .. }) = self.inputs.get(slot) else {
-                return Err(invalid(
-                    "scheduled_input",
-                    &path,
-                    "only samples slots of this Verifier are scheduled",
-                ));
-            };
-            let selected: BTreeSet<_> = selector.names().iter().collect();
-            if selected != features.iter().collect() {
-                return Err(invalid(
-                    "scheduled_input",
-                    &path,
-                    "the selector must name exactly the slot's measurements",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Registration refusals and acceptances for authored Verifiers, driven
@@ -917,7 +891,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::super::{ScheduledInput, VerifierSpec};
+    use super::super::VerifierSpec;
     use crate::error::WyrdError;
 
     /// Parses an authored Verifier body.
@@ -1138,6 +1112,73 @@ mod tests {
         }
     }
 
+    /// `group_id` is reserved for the SDK argument, so a slot of that name is
+    /// refused under rule `slot` at `inputs.group_id` whatever its type.
+    ///
+    /// # Panics
+    /// Panics when the reserved slot is accepted or refused under the wrong
+    /// rule or path.
+    #[test]
+    fn verifier_spec_reserves_group_id_slot() {
+        for slot in [json!({"type": "json"}), json!({"type": "trace"})] {
+            let body = json!({"inputs": {"group_id": slot}});
+            match parse(&body).validate() {
+                Err(WyrdError::Validation { details, message }) => {
+                    assert_eq!(details["rule"], "slot", "{body}");
+                    assert_eq!(details["path"], "inputs.group_id", "{body}");
+                    assert!(message.contains("group_id"), "{message}");
+                }
+                other => panic!("expected a slot refusal for {body}, got {other:?}"),
+            }
+        }
+        assert!(
+            parse(&json!({"inputs": {"group": {"type": "json"}}}))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// A string slot is a source declaration: valid forms decode, validate,
+    /// and serialize back as the same string; a malformed source is refused
+    /// under rule `source` at its own slot path.
+    ///
+    /// # Panics
+    /// Panics when a source declaration is decoded, printed, or refused
+    /// incorrectly.
+    #[test]
+    fn verifier_spec_declares_source_slots() {
+        let body = json!({"inputs": {
+            "turns": "verifiers.turn-verifier.inputs.turn",
+            "checks": "verifiers.turn-verifier.requirements.on-topic.outcome",
+        }});
+        let spec = parse(&body);
+        spec.validate().expect("source slots validate");
+        assert_eq!(
+            serde_json::to_value(&spec).expect("serializes")["inputs"],
+            body["inputs"]
+        );
+        for source in [
+            "verifiers.turn-verifier.inputs.turn.text",
+            "verifiers.turn-verifier.inputs.turn[0]",
+            "verifiers.turn-verifier.inputs.turn[*]",
+            "verifiers.turn-verifier.requirements.on-topic.reason",
+            "steps.a.output",
+        ] {
+            let body = json!({"inputs": {"turns": source}});
+            match parse(&body).validate() {
+                Err(WyrdError::Validation { details, .. }) => {
+                    assert_eq!(details["rule"], "source", "{source}");
+                    assert_eq!(details["path"], "inputs.turns", "{source}");
+                }
+                other => panic!("expected a source refusal for {source}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            rule(&json!({"inputs": {"group_id": "verifiers.turn-verifier.inputs.turn"}})),
+            "slot"
+        );
+    }
+
     /// Unknown authored fields and malformed shapes are refused at decode.
     ///
     /// # Panics
@@ -1316,7 +1357,8 @@ mod tests {
         assert_eq!(rule(&bad), "drift_source");
     }
 
-    /// Agent calls follow their Prompt placeholders and position rules.
+    /// Agent calls follow their Prompt placeholders and position rules; a
+    /// check Agent may declare `bifrost.query` and no other tool.
     ///
     /// # Panics
     /// Panics when an Agent rule is not enforced.
@@ -1416,6 +1458,17 @@ mod tests {
         parse(&registered)
             .validate()
             .expect("an unresolved registered Agent is validated by its resolver");
+        let live_query = with(
+            "/requirements/2/check/agent",
+            agent(
+                &["bifrost.query"],
+                json!([{"type": "document", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]),
+                Some(verdict_schema()),
+            ),
+        );
+        parse(&live_query)
+            .validate()
+            .expect("a check Agent may query Bifrost live");
     }
 
     /// Every built-in tool validates on a step Agent, with a workspace only
@@ -1709,34 +1762,6 @@ mod tests {
                 })
             });
             assert_eq!(outcome.is_ok(), valid, "{selector}: {outcome:?}");
-        }
-    }
-
-    /// Schedule bindings map every required samples slot by exact names.
-    ///
-    /// # Panics
-    /// Panics when a binding mapping is classified incorrectly.
-    #[test]
-    fn verifier_spec_validates_schedule_inputs() {
-        let spec = parse(&drift());
-        let mapping =
-            |value: Value| -> std::collections::BTreeMap<crate::ids::SlotName, ScheduledInput> {
-                serde_json::from_value(value).expect("mapping")
-            };
-        spec.validate_schedule(&mapping(
-            json!({"current": {"features": ["dti", "income"]}}),
-        ))
-        .expect("exact selector");
-        for invalid in [
-            json!({}),
-            json!({"current": {"features": ["income"]}}),
-            json!({"current": {"metric": "income"}}),
-            json!({"current": {"features": ["income", "dti"]}, "other": {"metric": "x"}}),
-        ] {
-            assert!(
-                spec.validate_schedule(&mapping(invalid.clone())).is_err(),
-                "{invalid}"
-            );
         }
     }
 }

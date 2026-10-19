@@ -1197,7 +1197,7 @@ never a refusal: checks that need it are inconclusive.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | A tool-less Agent returning the closed Verdict schema `{outcome, reason, citations}` |
+| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` |
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
@@ -1244,9 +1244,9 @@ bound subject:
 ```yaml
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
-    runs_on?: InlineableRef<TriggerSpec>     # schedule; absent means caller-driven only
-    inputs?: { <samples slot>: { features: [name] } | { metric: name } }
-    on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
+    runs_on?: InlineableRef<TriggerSpec>     # schedule or group_end; absent means caller-driven only
+    on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions; not on group_end
+    on_verdict_change: [InlineableRef<OperatorSpec>] # group_end only
 ```
 
 One binding is one subscription. Its subject is the containing Service,
@@ -1255,8 +1255,10 @@ and Operator Cards may be reused by any number of bindings. Registration
 UID-pins every referenced Verifier, Trigger, and Operator, and rejects
 unresolved, wrong-kind, unauthorized, and cross-tenant references, duplicate
 bindings to the same Verifier version for one subject, `workflow` in
-`on_failure`, and a schedule binding whose `inputs` cannot fill every required
-`samples` slot. The runtime direction is fixed:
+`on_failure`, and a schedule binding to a Verifier without `samples` slots.
+A binding has no `inputs`: a scheduled execution judges every drift
+requirement of the pinned Verifier from the samples recorded under each
+`samples` slot's own `features`, and every `samples` slot is required. The runtime direction is fixed:
 
 ```text
 verify ───────────────► execute inline ─► VerificationResult (no dispatch)
@@ -1270,6 +1272,96 @@ verdict of a queued execution dispatches; `inconclusive`, execution errors,
 and `verify` never do, and a replayed submission creates no duplicate
 dispatch.
 
+**Grouped verification.** `verify` and `submit` take an optional caller
+`group_id`; the server records it with the authenticated owner Service on input
+and result rows without producer PostgreSQL IO. A group Verifier declares whole
+source slots or requirement outcomes of other Verifiers bound on the same owner
+occurrence (`verifiers.<name>.inputs.<slot>` or
+`verifiers.<name>.requirements.<id>.outcome`). Registration pins exact source
+identities; tenant, owner, subject and Verifier identity scope every read.
+
+A `group_end` Trigger declares one positive duration, `after`, at most 365 fixed
+days. Standalone and inline Trigger writes reject larger durations before
+registration persists them; accepted durations are used exactly, with no silent
+SQL shortening. After Scribe
+acknowledges a matching source input or result, the existing background writer
+upserts one PostgreSQL pending scheduling row per tenant, binding and group ID,
+with due time computed as PostgreSQL statement time plus `after`. New activity
+updates that due time; evidence stays in Bifrost. Request handlers add no SQL,
+source lookup or explicit start/close operation. Continuous activity can postpone
+execution indefinitely. No max-age override or permanent finality exists.
+
+The scheduler polls due scheduling rows, not historical Bifrost groups. Ordinary
+cron scheduling and group work use separate bounded loops under the existing
+scheduler owner, each sleeping the runtime poll interval after a pass (default
+one second), visiting at most 64 overdue tenants and handling at most 32 due items
+per tenant. Group items are processed sequentially per process. Before claiming,
+group preparation acquires a permit from the same existing process execution
+capacity used by the runner (default 64). Full capacity leaves pending rows in
+PostgreSQL; no new concurrency option or distributed quota is introduced.
+
+A group item is claimed with `FOR UPDATE SKIP LOCKED`. While holding that
+scheduling-row lock, one bounded Bifrost snapshot query selects the currently
+visible source inputs/results. The same tenant transaction pins/enqueues the
+ordinary execution and deletes its scheduling row. An unchanged snapshot's
+content-identity conflict also consumes the pending row. Retryable runtime,
+capacity, database and query failures retain pending and are traced. Genuine auth
+or owner-activity rejection, including an inactive/retired owner, records one
+terminal errored group execution and consumes pending atomically. Recording
+failure rolls back and preserves pending. This pre-admission error runs no
+Verifier/provider, asserts no accepted owner authority or snapshot, has no verdict/
+result pointer and dispatches no Operator; actual identity and SYSTEM reporting
+actor remain attributable. Every runnable execution keeps its accepted-authority
+and input invariants. Missing issuer/SYSTEM/attribution infrastructure is retryable
+Wyrd failure, not proof of rejected owner authority. Existing latest binding
+execution status then execution readback exposes the terminal error; it is not a
+new group-history API. Concurrent activity waits only in
+the background on the row lock and recreates a pending row after successful
+handoff. Release the transaction and preparation permit before Verifier/provider
+execution. With no new activity, there is no pending row and no further Bifrost
+read for that group. Distinct later snapshots may overlap earlier executions.
+
+Source lists share execution ordering, with null for a missing outcome or an
+absent selected value. A visible result whose execution's input is not visible
+is a read caught mid-publication: the snapshot pins nothing and the pending row
+remains for retry. More than five minutes past the current due time, by
+PostgreSQL's `statement_timestamp()`, the scheduler instead records one terminal
+`WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` group execution through the refusal
+path and consumes the pending row in the same transaction: no accepted
+authority, inputs, snapshot, evaluation, verdict, result or Operator dispatch.
+The stored error message names the missing execution IDs; no persisted details
+object exists. New matching source activity schedules the group again normally.
+Physical identity duplicates count once; distinct executions remain distinct.
+When an execution has multiple visible results, select the latest by ingest time,
+then result ID. Grouping does not consult PostgreSQL submission acceptance or
+settlement to decide which Bifrost rows participate. Consequently a staged
+input later refused by the queue can participate. Ordinary source authorization
+and pre-staging pressure refusal still apply.
+
+The pending table contains scheduling metadata only, never source evidence,
+readiness inventories or revision state. Existing execution records hold the
+snapshot digest, pinned values and source identities. Ordinary queue claims and
+retries remain; no additional group crash-recovery protocol exists. Query
+admission/output/deadline bounds apply; failed or incomplete queries defer
+execution without truncated inputs or synthetic source-ceiling verdicts.
+
+Scribe acknowledgement schedules work but is not a query-completeness checkpoint.
+A snapshot uses what is visible when read; a later visibility change alone does
+not schedule another execution. A process death between ACK and scheduling commit
+can lose the notification; there is no repair/history scan. Background retries
+can postpone expiration. Retention and outbox loss limit available evidence.
+Runtime permits bound active work, not durable PostgreSQL backlog. These limits
+are explicit; no visibility barrier, activity ledger, quota service or new WAL
+is added.
+
+Group bindings use `on_verdict_change` only. The first settled verdict is a
+baseline; each subsequent different settled verdict creates existing Operator
+dispatches transactionally. Comparison follows settlement order, including when
+an older snapshot finishes later; there is no newest-revision adoption or
+outstanding-execution gate. A short lock on the existing binding row covers only
+completion, previous-verdict comparison and dispatch creation, never evaluation.
+Completion replay creates no new transition. Delivery remains at least once.
+
 `run_id` is the client's application invocation; one Run can have many
 executions. `ExecutionId` is the server-issued identity of one exact Verifier
 execution; scheduled executions have no `run_id`.
@@ -1278,9 +1370,10 @@ execution; scheduled executions have no `run_id`.
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
 | `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
-| `POST /v1/verification/execute` | Exact Verifier and subject, optional Run, named input declarations, optional route overrides → `200 VerificationResult` |
+| `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
-| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, and result when visible |
+| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and pinned source snapshot |
+| `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
 uploaded file does not become a Card. Remote storage backends return direct
@@ -1373,7 +1466,13 @@ restart; caller submission never switches to binding-owner or SYSTEM
 authority. A scheduled execution runs with its binding owner's accepted
 authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
-actor; SYSTEM is never a subject and authorizes nothing extra. Gateway spend
+actor; SYSTEM is never a subject and authorizes nothing extra. The runtime's
+own reads that prepare an execution never depend on owner credentials. These
+are scheduled Drift observation reads and a group's snapshot of its recorded
+verification inputs and results. They run as the tenant's credentialless,
+role-free internal read principal, which holds `bifrost_query:read` only on
+the tables that read needs, with owner and source filters in the statement.
+The owner's activity and authority are checked before such work starts. Gateway spend
 is charged to the subject.
 
 #### Agents, tools, and workspaces
@@ -1381,7 +1480,10 @@ is charged to the subject.
 Agent owns Prompt, tools, run configuration, and `execution_route`;
 server-hosted calls require `wyrd_gateway`. Overrides are keyed by step or
 requirement ID and replace that call's route whole. A check-position Agent is
-tool-less. A step Agent may declare a `workspace` mapping read-only `/inputs`
+tool-less unless it explicitly declares `bifrost.query`, its only permitted
+tool: each call needs the ordinary tool-invoke, query and payload permissions,
+there is no workspace and no mutating tool, and span data it reads live stays
+outside the pinned snapshot. A step Agent may declare a `workspace` mapping read-only `/inputs`
 paths to evidence; `/work` is bounded scratch for that invocation only.
 
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
@@ -1590,15 +1692,19 @@ of bindings.
 ```yaml
 spec:
   description?: string
-  kind: schedule                          # closed activation discriminator
+  kind: schedule | group_end              # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
+  after: duration                         # group_end only — elapsed since the newest acknowledged source evidence
 ```
 
-`schedule` is the only automatic activation. Each due occurrence creates one
+`group_end` binds only a Verifier with source inputs and judges each caller
+group once it ends (see Grouped verification under Verifier).
+
+For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
-`[previous boundary, due)`, filling `samples` slots from the binding's
-`inputs` map. Missed occurrences are skipped, not backfilled. A Trigger never
+`[previous boundary, due)`, filling each `samples` slot from its own
+`features`. Missed occurrences are skipped, not backfilled. A Trigger never
 fires on its own: nothing runs merely because a Trigger Card is registered,
 and one schedule occurrence shared by two subjects creates two subject-scoped
 executions, never one mixed-subject execution.
@@ -1607,9 +1713,12 @@ Queued-execution creation follows Scribe's acknowledgement and never delays
 it. After the ack, the server puts one request per submission into an
 in-process outbox. One writer drains it, one multi-row insert per tenant,
 deciding idempotent replay and conflict in that transaction, so a repeated
-request inserts nothing. The outbox has no count limit and never drops a
-request because PostgreSQL is slow or down: a failed write keeps its batch and
-retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
+request inserts nothing. The outbox is bounded, but each submission reserves
+its slot before its inputs are staged, so the hand-off is never refused; a
+`submit` that finds no room is refused with
+`WYRD_VERIFICATION_429_STAGING_FULL` before anything is staged. The outbox
+never drops a request because PostgreSQL is slow or down: a failed write
+keeps its batch and retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 
@@ -1620,7 +1729,8 @@ does not push") means external data enters through a `Source`.
 A failure reaction. Performs exactly one action — a typed notification or a
 generic HTTP call. Operator is a pure side-effect
 template with no `pre_invoke` / `post_invoke` hooks and no subscription of its
-own: it runs only as an `on_failure` entry of a verification binding. A
+own: it runs only as an `on_failure` or `on_verdict_change` entry of a
+verification binding. A
 referenced Operator Card and an inline `on_failure` mapping use the same
 flattened `OperatorSpec` shape.
 ```yaml
@@ -1641,7 +1751,10 @@ spec:
 **Dispatch.** Only a completed, binding-created Verifier run with a `failed`
 verdict creates Operator work: one durable dispatch per configured
 `on_failure` Operator. Passed, inconclusive, cancelled, timed-out, errored,
-and direct analysis-only runs create none. Each dispatch has its own status,
+and direct analysis-only runs create none. A `group_end` binding instead
+dispatches each `on_verdict_change` Operator once when a completed group
+execution's verdict differs from the group's previous one, carrying the group and
+the result it changed from. Each dispatch has its own status,
 bounded retry, and terminal error; one failure never blocks siblings or
 rewrites the result. There is no `Alert` resource, table, or alert router — a
 Notify Operator *is* the alert.
@@ -2156,8 +2269,8 @@ services/ops-copilot/
 │   ├── runbook-policy.yaml
 │   └── service-policy.yaml
 ├── observability/
-│   ├── triage-review.yaml       # agent steps and checks
-│   ├── runbook-review.yaml
+│   ├── triage-verifier.yaml       # agent steps and checks
+│   ├── runbook-verifier.yaml
 │   ├── triage-drift.yaml
 │   ├── runbook-drift.yaml
 │   └── service-latency-drift.yaml

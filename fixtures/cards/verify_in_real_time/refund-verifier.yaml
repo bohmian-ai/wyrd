@@ -1,0 +1,24 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: refund-verifier
+  version: 1.0.0
+  space: default
+spec:
+  description: The order conversation's latest refund fact is within its deadline.
+  inputs:
+    facts: verifiers.refund-turn.inputs.fact
+  steps:
+    - id: latest
+      action:
+        kind: code
+        entrypoint: latest
+        inputs: {facts: inputs.facts}
+        source:
+          inline: |
+            def latest(facts):
+                return facts[-1]
+  requirements:
+    - id: latest-not-overdue
+      statement: The latest promised refund fact is within its deadline
+      check: {kind: assert, path: steps.latest.output.overdue, operator: equals, expected: false}

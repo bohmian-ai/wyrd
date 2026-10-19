@@ -81,7 +81,9 @@ class Observe:
     acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
     """
 
-    def verify(self, verifier: str, /, *value: Any, **inputs: Any) -> VerificationResult:
+    def verify(
+        self, verifier: str, /, *value: Any, group_id: str | None = None, **inputs: Any
+    ) -> VerificationResult:
         """Execute the bound Verifier ``verifier`` on this view's subject now.
 
         Pass one positional value for a single-slot Verifier, or one keyword
@@ -93,6 +95,8 @@ class Observe:
         Args:
             verifier: the name of a Verifier bound to this view's subject.
             *value: the one value of a single-slot Verifier.
+            group_id: the caller's group, such as a conversation or order ID,
+                that grouped Verifiers judge together; never an input slot.
             **inputs: values keyed by input slot name.
 
         Returns:
@@ -101,7 +105,8 @@ class Observe:
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_VERIFIER`` for an unbound
                 Verifier; ``WYRD_SPEC_400_VALIDATION`` for both positional and
-                keyword values or a value JSON cannot represent;
+                keyword values, a value JSON cannot represent, or an invalid
+                ``group_id``;
                 ``WYRD_VERIFICATION_400_INPUT_INVALID`` for an unknown slot, a
                 value of the wrong kind, or an unreadable or unaccepted file;
                 ``WYRD_VERIFICATION_413_INPUT_TOO_LARGE`` for a file above its
@@ -110,7 +115,9 @@ class Observe:
         """
         ...
 
-    def submit(self, verifier: str, /, *value: Any, **inputs: Any) -> Execution | Recorded:
+    def submit(
+        self, verifier: str, /, *value: Any, group_id: str | None = None, **inputs: Any
+    ) -> Execution | Recorded:
         """Submit evidence for the bound Verifier ``verifier`` without waiting.
 
         Run evidence is staged for one queued ``wyrd.verify.Execution`` and
@@ -121,6 +128,7 @@ class Observe:
         Args:
             verifier: the name of a Verifier bound to this view's subject.
             *value: the one value of a single-slot Verifier.
+            group_id: the caller's group, as for ``verify``.
             **inputs: values keyed by input slot name.
 
         Returns:

@@ -22,7 +22,7 @@ pub use oidc_fixture::{
 pub use principal::Bootstrap;
 pub use server::{
     OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
-    server_postgres_from_fixture,
+    reserve_loopback_addr, server_postgres_from_fixture,
 };
 pub use time::ClockHandle;
 /// Isolated empty database for a test that runs a deployment's own migration,

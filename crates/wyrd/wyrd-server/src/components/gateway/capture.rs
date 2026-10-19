@@ -1506,7 +1506,7 @@ pub(crate) mod recording {
         /// Owners built from `state` before this call keep the replaced
         /// outbox, so record before deriving any.
         pub(crate) fn record(self: &Arc<Self>, mut state: AppState) -> AppState {
-            state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(self) as _);
+            state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(self) as _, None);
             state
         }
 

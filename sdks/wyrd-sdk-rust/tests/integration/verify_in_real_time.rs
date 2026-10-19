@@ -9,25 +9,33 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 use wyrd_ai::bifrost::BifrostOptions;
 
+use opentelemetry::trace::TraceContextExt as _;
 use serde::Deserialize;
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::CardRef;
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Execution, File, Inputs, Submission};
+use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
-    VerificationVerdict, WyrdClient, WyrdError, cli,
+    Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
+    SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
 };
-use wyrd_spec::verification::VerifierReadiness;
-use wyrd_testing::server::WyrdTestServer;
+use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
+use wyrd_spec::ids::BindingId;
+use wyrd_spec::verification::execution::VerificationExecutionState;
+use wyrd_spec::verification::{VerificationExecutionStatus, VerifierReadiness};
+use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
+use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, coordinates, fixture, hydrate, register, registered};
+use crate::verifier_building_blocks::{completion, requirement, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
 const WAIT: Duration = Duration::from_secs(90);
@@ -57,6 +65,17 @@ pub(crate) struct Assistant {
     agent: CardRef,
 }
 
+/// `builder` running the verification runtime, its gateway provider root
+/// at the local `judge`.
+///
+/// # Panics
+/// Panics when the judge URL does not parse.
+fn on_judge(builder: WyrdTestServerBuilder, judge: &MockServer) -> WyrdTestServerBuilder {
+    builder
+        .with_verification_runtime_for_test()
+        .with_gateway_provider_root_for_test(judge.uri().parse().expect("judge URL parses"))
+}
+
 impl Assistant {
     /// Start the judge and the server, deploy the judge model on the gateway,
     /// then register the latency baseline, the latency Model, and the
@@ -65,31 +84,38 @@ impl Assistant {
     /// # Panics
     /// Panics when a setup step fails.
     pub(crate) async fn start() -> Self {
+        Box::pin(Self::start_with(WyrdTestServer::builder(), Duration::ZERO)).await
+    }
+
+    /// [`Self::start`] on a server `builder` configures, which also runs
+    /// the verification runtime on the local judge, with the judge answering
+    /// each call after `judge_delay`.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start_with(builder: WyrdTestServerBuilder, judge_delay: Duration) -> Self {
         let judge = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-judge",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": { "role": "assistant", "content": AGREES },
-                }],
-                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 },
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(judge_delay)
+                    .set_body_json(json!({
+                        "id": "chatcmpl-judge",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": { "role": "assistant", "content": AGREES },
+                        }],
+                        "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 },
+                    })),
+            )
             .mount(&judge)
             .await;
-        let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
-                .with_verification_runtime_for_test()
-                .with_gateway_provider_root_for_test(
-                    judge.uri().parse().expect("judge URL parses"),
-                ),
-        )
-        .await;
+        let deployment = Deployment::start_with(on_judge(builder, &judge)).await;
         configure_gateway(&deployment.admin()).await;
         Gateway::connect_with(&deployment.admin())
             .await
@@ -134,6 +160,58 @@ impl Assistant {
         state
     }
 
+    /// The assistant registered and hydrated in a new tenant `slug`, loaded
+    /// as that tenant's assistant Service with Bifrost started, beside the
+    /// bundle directory it was loaded from.
+    ///
+    /// # Panics
+    /// Panics when the tenant, a registration, the hydration, the key, or
+    /// Bifrost startup fails.
+    async fn in_tenant(&self, slug: &str) -> (WyrdState, TempDir) {
+        let admin = self
+            .deployment
+            .client(&self.deployment.other_tenant_admin(slug).await);
+        let cards = Cards::connect_with(&admin).await.expect("handle connects");
+        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+        let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+        let bundle = hydrate(&cards, &assistant.root).await;
+        let [kind, name, version, space] = coordinates(&assistant.root);
+        let key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(admin))
+            .await
+            .expect("the CLI issues the Service key");
+        let state = WyrdState::from_path_with(
+            bundle.path().join("bundle"),
+            self.deployment.client(key.key.expose()),
+        )
+        .expect("bundle loads offline");
+        state.start_bifrost().await.expect("Bifrost starts");
+        (state, bundle)
+    }
+
+    /// Wait until the judge has received `calls` requests, so that many
+    /// judged executions are in flight.
+    ///
+    /// # Panics
+    /// Panics when the judge stops recording or the calls never arrive.
+    async fn await_judge_calls(&self, calls: usize) {
+        let deadline = std::time::Instant::now() + WAIT;
+        while self
+            .judge
+            .received_requests()
+            .await
+            .expect("the judge records requests")
+            .len()
+            < calls
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the judge never received {calls} calls"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The hydrated assistant, loaded with its server calls fixed to
     /// `client` and Bifrost not started.
     ///
@@ -144,13 +222,14 @@ impl Assistant {
             .expect("bundle loads offline")
     }
 
-    /// The principal id of the assistant Service, the identity every
-    /// [`Self::state`] and [`Self::verify_over_http`] judgment is requested as.
+    /// The principal id of the Service `service`; for the assistant, the
+    /// identity every [`Self::state`] and [`Self::verify_over_http`]
+    /// judgment is requested as.
     ///
     /// # Panics
     /// Panics when the CLI refuses to issue the Service key.
-    async fn principal(&self) -> String {
-        let [kind, name, version, space] = coordinates(&self.service);
+    async fn principal(&self, service: &CardRef) -> String {
+        let [kind, name, version, space] = coordinates(service);
         cli::issue_key(
             &kind,
             &name,
@@ -478,7 +557,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
     state.shutdown().await.expect("Bifrost stops");
 
     let calls = assistant.judge_calls().await;
-    let principal = assistant.principal().await;
+    let principal = assistant.principal(&assistant.service).await;
     let run_id = run.run_id().to_string();
     assert!(
         calls.iter().all(|call| call.act_principal_id != principal),
@@ -529,7 +608,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         .verify_over_http(&format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"))
         .await;
 
-    let principal = assistant.principal().await;
+    let principal = assistant.principal(&assistant.service).await;
     let calls = assistant.judge_calls().await;
     let [call] = &calls[..] else {
         panic!("exactly one judge call: {calls:?}");
@@ -1115,5 +1194,2179 @@ async fn another_tenant_cannot_verify_the_assistant() {
             "{verifier}"
         );
     }
+    assistant.deployment.shutdown().await;
+}
+
+/// A registered Service whose component binds a `group_end` Verifier, with
+/// its hydrated bundle loaded as the Service itself.
+struct Grouped {
+    /// The Service registration, naming every Card it registered.
+    receipt: RegistrationReceipt,
+    /// The hydrated bundle the Service state and any other caller load.
+    bundle: TempDir,
+    /// The Service's API key.
+    key: String,
+    /// The Service's state, started with Bifrost.
+    state: WyrdState,
+    /// The Service's `group_end` binding.
+    binding: BindingId,
+}
+
+impl Assistant {
+    /// Register and hydrate the Service fixture at `relative`, start its
+    /// state with the Service's own key, and find the binding whose status
+    /// pins `group_end` settings.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails or the Service has no `group_end`
+    /// binding.
+    async fn grouped(&self, relative: &str) -> Grouped {
+        let cards = self.deployment.cards().await;
+        let receipt = register(&cards, relative).await;
+        let bundle = hydrate(&cards, &receipt.root).await;
+        let key = self.deployment.service_key(&receipt.root).await;
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
+                .expect("bundle loads");
+        state.start_bifrost().await.expect("Bifrost starts");
+        let ids = cards
+            .get(CardSelector::exact(receipt.root.clone()))
+            .await
+            .expect("the Service reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the Service serves verification status")
+            .binding_ids;
+        let mut binding = None;
+        for id in ids {
+            if self
+                .deployment
+                .binding_status(&id)
+                .await
+                .group_end
+                .is_some()
+            {
+                binding = Some(id);
+            }
+        }
+        Grouped {
+            receipt,
+            bundle,
+            key,
+            state,
+            binding: binding.expect("the Service binds a group_end Verifier"),
+        }
+    }
+}
+
+impl Grouped {
+    /// Judge `value` with `verifier` in a new Run of the Service's `agent`
+    /// under `group`, as the Service.
+    ///
+    /// # Panics
+    /// Panics when the Run does not open or the verify fails.
+    async fn turn(&self, verifier: &str, group: &GroupId, value: serde_json::Value) {
+        self.state
+            .run_for_card("agent")
+            .expect("agent run opens")
+            .observe()
+            .group_id(group.clone())
+            .verify(verifier, value)
+            .await
+            .expect("the turn is judged");
+    }
+
+    /// Enqueue `body` over plain HTTP as the Service with `idempotency_key`,
+    /// the way an agent replays a submission, and return the accepted
+    /// execution.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the submission is not accepted.
+    async fn enqueue_over_http(
+        &self,
+        deployment: &Deployment,
+        idempotency_key: &str,
+        body: &serde_json::Value,
+    ) -> ExecutionId {
+        let token = deployment
+            .client(&self.key)
+            .access_token()
+            .await
+            .expect("access token mints");
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/verification/enqueue",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header("idempotency-key", idempotency_key)
+            .json(body)
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
+        assert_eq!(status, 202, "{accepted}");
+        accepted["execution_id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .expect("the response names its execution")
+    }
+
+    /// Judge `value` with `verifier` in a new Run of the Service's `agent`
+    /// under `group`, as the Service, from a fresh `runtime` SDK process.
+    ///
+    /// The child loads this hydrated bundle through its own public SDK and
+    /// resolves the deployment and the Service key from its environment, the
+    /// way a deployed process does, with an empty config home so no saved
+    /// login replaces that key. It returns once the child's verify returned.
+    ///
+    /// # Panics
+    /// Panics when the child cannot start or exits unsuccessfully.
+    async fn foreign_turn(
+        &self,
+        deployment: &Deployment,
+        runtime: Runtime,
+        verifier: &str,
+        group: &GroupId,
+        value: &serde_json::Value,
+    ) {
+        let sdks = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the Rust SDK sits under sdks/");
+        let mut command = match runtime {
+            Runtime::Python => {
+                let mut command = std::process::Command::new("uv");
+                command.current_dir(sdks.join("wyrd-sdk-python")).args([
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "-c",
+                    PYTHON_TURN,
+                ]);
+                command
+            }
+            Runtime::TypeScript => {
+                let mut command = std::process::Command::new("node");
+                command.current_dir(sdks.join("wyrd-sdk-ts/wyrd")).args([
+                    "--input-type=module",
+                    "-e",
+                    TYPESCRIPT_TURN,
+                ]);
+                command
+            }
+        };
+        let config_home = TempDir::new().expect("config home");
+        command
+            .arg(self.bundle.path().join("bundle"))
+            .arg(verifier)
+            .arg(group.as_str())
+            .arg(value.to_string())
+            .env("WYRD_CONFIG_HOME", config_home.path())
+            .env(
+                "WYRD_SERVER_URL",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL"),
+            )
+            .env(
+                "WYRD_GRPC_URL",
+                deployment
+                    .server()
+                    .grpc_url()
+                    .expect("bound server has a gRPC URL"),
+            )
+            .env("WYRD_API_KEY", &self.key)
+            .env_remove("WYRD_ACCESS_TOKEN")
+            .env_remove("WYRD_WORKLOAD_TOKEN")
+            .env_remove("WYRD_TENANT");
+        let output = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .expect("child joins")
+            .expect("child starts");
+        assert!(
+            output.status.success(),
+            "{runtime:?} turn failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A first-class SDK runtime other than Rust that [`Grouped::foreign_turn`]
+/// runs in its own process.
+#[derive(Clone, Copy, Debug)]
+enum Runtime {
+    /// The Python SDK, run by the package's `uv` environment.
+    Python,
+    /// The TypeScript SDK, run by Node from the built package.
+    TypeScript,
+}
+
+/// The Python turn: verify `argv[4]` as JSON with Verifier `argv[2]` under
+/// group `argv[3]` in a new `agent` Run of the bundle at `argv[1]`.
+const PYTHON_TURN: &str = "\
+import json, sys
+from wyrd.client import WyrdClient
+from wyrd.state import WyrdState
+bundle, verifier, group, value = sys.argv[1:]
+WyrdState.from_path(bundle, WyrdClient()).run('agent').observe.verify(
+    verifier, json.loads(value), group_id=group
+)
+";
+
+/// The TypeScript turn: the same verify as [`PYTHON_TURN`], through the
+/// package's public `wyrd-ai` entry point.
+const TYPESCRIPT_TURN: &str = "\
+const { WyrdClient, WyrdState } = await import('wyrd-ai');
+const [bundle, verifier, group, value] = process.argv.slice(1);
+await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
+  .run('agent')
+  .observe.verify(verifier, JSON.parse(value), { positional: true, group_id: group });
+process.exit(0);
+";
+
+/// A support conversation populated by the Rust, Python, and TypeScript SDKs,
+/// each from its own process, then resumed over another Run, a background
+/// submit, and an agent's replayed HTTP enqueue, all as the Service under one
+/// `group_id`, is judged once its `after` period expires: the group execution
+/// reads back its group and owner and judges the Service's six turns in call
+/// order. The replay counts once; an ungrouped key conflict joins no group,
+/// and a same-group verify the administrator made with no owning Service and
+/// a turn from a principal without `verifier:run` on the source Verifier are
+/// excluded, and the binding status names the execution.
+/// A standalone or inline `group_end` Trigger longer than one year is refused
+/// over plain HTTP with nothing persisted, and one of exactly a year
+/// registers. Once the Service's principal is revoked, its next group is
+/// recorded as an errored group execution the binding status names, carrying
+/// the group and the refusal with no snapshot, result, or dispatch.
+/// Binding the source Verifier itself to `group_end` is refused at
+/// registration, naming the binding's `runs_on` field.
+///
+/// # Panics
+/// Panics when a step fails, the group is not judged or refused in time, or
+/// the judgment or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_support_resumes() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let group = GroupId::new("conv-1").expect("group id");
+    let turns: Vec<_> = (1..=6)
+        .map(|turn| json!({"turn": turn, "answer": format!("answer {turn}")}))
+        .collect();
+    support.turn("turn-check", &group, turns[0].clone()).await;
+    support
+        .foreign_turn(deployment, Runtime::Python, "turn-check", &group, &turns[1])
+        .await;
+    support
+        .foreign_turn(
+            deployment,
+            Runtime::TypeScript,
+            "turn-check",
+            &group,
+            &turns[2],
+        )
+        .await;
+    let resumed = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens");
+    resumed
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", turns[3].clone())
+        .await
+        .expect("the resumed turn is judged");
+    let Submission::Queued(queued) = resumed
+        .observe()
+        .group_id(group.clone())
+        .submit("turn-check", turns[4].clone())
+        .await
+        .expect("the turn is submitted")
+    else {
+        panic!("a turn-check submission queues an execution");
+    };
+    queued.wait(WAIT).await.expect("the queued turn is judged");
+    let body = |turn: &serde_json::Value| {
+        json!({
+            "verifier_card_uid": registered(&support.receipt, "turn-check").uid,
+            "card_uid": registered(&support.receipt, "assistant-agent").uid,
+            "group_id": group,
+            "inputs": {"turn": {"kind": "json", "value": turn}},
+        })
+    };
+    let replayed = support
+        .enqueue_over_http(deployment, "support-turn-0006", &body(&turns[5]))
+        .await;
+    assert_eq!(
+        support
+            .enqueue_over_http(deployment, "support-turn-0006", &body(&turns[5]))
+            .await,
+        replayed,
+        "the same key and body replay one execution"
+    );
+    let conflict = support
+        .enqueue_over_http(
+            deployment,
+            "support-turn-0006",
+            &json!({
+                "verifier_card_uid": registered(&support.receipt, "turn-check").uid,
+                "card_uid": registered(&support.receipt, "assistant-agent").uid,
+                "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
+            }),
+        )
+        .await;
+    let conflicted = Execution::connect_with(conflict, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect_err("the key conflict settles errored");
+    assert_eq!(conflicted.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
+    Execution::connect_with(replayed, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the enqueued turn is judged");
+    WyrdState::from_path_with(support.bundle.path().join("bundle"), deployment.admin())
+        .expect("bundle loads")
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", json!({"answer": ""}))
+        .await
+        .expect("an ownerless turn is judged");
+    let unauthorized = deployment
+        .verifier_key("other_verifier", &assistant.answer_check)
+        .await;
+    let denied = WyrdState::from_path_with(
+        support.bundle.path().join("bundle"),
+        deployment.client(&unauthorized),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(group.clone())
+    .verify("turn-check", json!({"answer": ""}))
+    .await
+    .expect_err("verifier:run on another Verifier is no grant");
+    assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC", "{denied}");
+    support.state.shutdown().await.expect("Bifrost stops");
+
+    let judged = deployment
+        .group_execution(&support.binding, None, WAIT)
+        .await;
+
+    assert_eq!(judged.group_id.as_ref(), Some(&group));
+    assert_eq!(judged.owner_card_uid, support.receipt.root.uid);
+    let slot = "turns".parse().expect("slot name");
+    let snapshot = judged.group.expect("the execution pins its snapshot");
+    let answered = "answered".parse().expect("slot name");
+    assert_eq!(
+        snapshot.sources[&answered].execution_ids, snapshot.sources[&slot].execution_ids,
+        "every turn's input and result align: {snapshot:?}"
+    );
+    assert_eq!(snapshot.sources[&slot].execution_ids.len(), 6);
+    assert_eq!(snapshot.sources[&slot].execution_ids[5], replayed);
+    let outcome = judged.result.expect("the result is visible").outcome;
+    assert_eq!(
+        serde_json::to_value(&outcome.evidence[&slot]).expect("evidence encodes"),
+        json!({"kind": "json", "value": turns}),
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+    let status = deployment.binding_status(&support.binding).await;
+    assert_eq!(status.last_execution_id, Some(judged.execution_id));
+
+    // One year is the longest `after` a standalone or inline Trigger takes;
+    // a longer one is refused over plain HTTP before anything persists.
+    let token = deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    let register_raw = async |card: serde_json::Value| {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/cards",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header(
+                "idempotency-key",
+                format!("{}-{}", card["kind"], card["metadata"]["name"]),
+            )
+            .json(&json!({"submissions": [card]}))
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        (
+            status,
+            response
+                .json::<serde_json::Value>()
+                .await
+                .expect("the body is JSON"),
+        )
+    };
+    let trigger = |name: &str, after: &str| {
+        json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Trigger",
+            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "spec": {"kind": "group_end", "after": after},
+            "artifacts": [],
+        })
+    };
+    let service = |name: &str, after: &str| {
+        json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Service",
+            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "spec": {
+                "service_type": "agent",
+                "components": [{
+                    "alias": "agent",
+                    "ref": registered(&support.receipt, "assistant-agent"),
+                    "verified_by": [{
+                        "verifier": registered(&support.receipt, "turn-check"),
+                    }, {
+                        "verifier": registered(&support.receipt, "conversation-verifier"),
+                        "runs_on": {"kind": "group_end", "after": after},
+                    }],
+                }],
+            },
+            "artifacts": [],
+        })
+    };
+    let cards = deployment.cards().await;
+    for (kind, card) in [
+        (CardKind::Trigger, trigger("over-a-year", "366d")),
+        (CardKind::Service, service("over-a-year", "8761h")),
+    ] {
+        let (status, refusal) = register_raw(card).await;
+        assert_eq!(status, 400, "{kind:?}: {refusal}");
+        assert!(refusal.to_string().contains("365d"), "{kind:?}: {refusal}");
+        cards
+            .get(CardSelector::named(
+                kind,
+                "default".parse().expect("space"),
+                "over-a-year".parse().expect("name"),
+            ))
+            .await
+            .expect_err("a refused Card never persists");
+    }
+    for card in [trigger("a-year", "365d"), service("a-year", "31536000s")] {
+        let (status, receipt) = register_raw(card).await;
+        assert!((200..300).contains(&status), "{status}: {receipt}");
+    }
+
+    // An owner revoked before its group comes due is refused: the binding's
+    // latest execution is an errored group execution naming the group and
+    // the reason, with no snapshot or result.
+    let lapsed = GroupId::new("conv-2").expect("group id");
+    WyrdState::from_path_with(
+        support.bundle.path().join("bundle"),
+        deployment.client(&support.key),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(lapsed.clone())
+    .verify("turn-check", turns[0].clone())
+    .await
+    .expect("the turn is judged");
+    let owner = assistant
+        .principal(&support.receipt.root)
+        .await
+        .parse()
+        .expect("principal id");
+    Principals::connect_with(&deployment.admin())
+        .await
+        .expect("principals connect")
+        .revoke_principal(
+            &owner,
+            &RevokePrincipalRequest {
+                principal_kind: PrincipalKindTag::Service,
+                reason: "the support Service retires".to_owned(),
+            },
+        )
+        .await
+        .expect("the owner is revoked");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let refused_group = loop {
+        deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        let latest = deployment
+            .binding_status(&support.binding)
+            .await
+            .last_execution_id;
+        if let Some(id) = latest.filter(|id| *id != judged.execution_id) {
+            break Execution::connect_with(id, &deployment.admin())
+                .await
+                .expect("the execution handle connects")
+                .status()
+                .await
+                .expect("the execution reads");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused group recorded no execution within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(refused_group.status, VerificationExecutionStatus::Errored);
+    assert_eq!(
+        refused_group
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("WYRD_AUTH_401_CREDENTIAL_REVOKED"),
+        "{refused_group:?}"
+    );
+    assert_eq!(refused_group.group_id, Some(lapsed));
+    assert_eq!(refused_group.owner_card_uid, support.receipt.root.uid);
+    assert!(refused_group.group.is_none() && refused_group.result.is_none());
+    assert!(refused_group.dispatches.is_empty());
+    let refused = deployment
+        .cards()
+        .await
+        .register_from_path(&fixture("cards/verify_in_real_time/support-unsourced.yaml"))
+        .await
+        .expect_err("a group_end binding needs a Verifier with sources");
+    assert_eq!(
+        refused.code(),
+        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("verified_by[0].runs_on"),
+        "{refused}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
+/// One retained `vala.verification.results` row of a group binding.
+#[derive(Debug, Deserialize)]
+struct GroupResultRow {
+    /// The execution the result settled.
+    execution_id: String,
+    /// The result's identity, which a verdict-change dispatch names.
+    result_id: String,
+    /// The result's verdict.
+    verdict: String,
+}
+
+/// An order conversation's refund promises are verified over their whole
+/// history each time new acknowledged evidence lets the binding's `after`
+/// period expire, with no finality cutoff; the execution judges the latest
+/// fact. The first execution passes and dispatches nothing; a burst of turns
+/// ending overdue debounces into one failed execution that dispatches its
+/// Operator once with the group and the passed result it changed from; a
+/// further overdue turn keeps the verdict failed and dispatches nothing; and
+/// a corrected paid-in-full fact passes again, dispatching the recovery with
+/// the failed result it changed from. Every execution stays retained history.
+/// A `group_end` binding declaring `on_failure` is refused at registration,
+/// naming the field.
+///
+/// # Panics
+/// Panics when a step fails, an execution is not judged in time, or an execution,
+/// dispatch, or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_refund_changes_verdict() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let mut hooks = deployment.hooks("refund-hooks", "refund-hook-token").await;
+    let refund = assistant
+        .grouped("cards/verify_in_real_time/refund.yaml")
+        .await;
+    let group = GroupId::new("order-1").expect("group id");
+    let turn = |overdue: bool| {
+        refund.turn(
+            "refund-turn",
+            &group,
+            json!({"order": "A-1", "overdue": overdue}),
+        )
+    };
+    let slot = "facts".parse().expect("slot name");
+
+    turn(false).await;
+    turn(false).await;
+    let promised = deployment
+        .group_execution(&refund.binding, None, WAIT)
+        .await;
+    for overdue in [false, false, true] {
+        turn(overdue).await;
+    }
+    let overdue = deployment
+        .group_execution(&refund.binding, Some(&promised.execution_id), WAIT)
+        .await;
+    turn(true).await;
+    let unchanged = deployment
+        .group_execution(&refund.binding, Some(&overdue.execution_id), WAIT)
+        .await;
+    turn(false).await;
+    let recovered = deployment
+        .group_execution(&refund.binding, Some(&unchanged.execution_id), WAIT)
+        .await;
+
+    let verdicts = [&promised, &overdue, &unchanged, &recovered].map(|execution| {
+        let result = execution.result.as_ref().expect("the result is visible");
+        (
+            execution.group.as_ref().expect("snapshot").sources[&slot]
+                .execution_ids
+                .len(),
+            result.outcome.verdict,
+            execution.dispatches.len(),
+        )
+    });
+    assert_eq!(
+        verdicts,
+        [
+            (2, VerificationVerdict::Passed, 0),
+            (5, VerificationVerdict::Failed, 1),
+            (6, VerificationVerdict::Failed, 0),
+            (7, VerificationVerdict::Passed, 1),
+        ],
+        "only the verdict changes dispatch"
+    );
+    let history: Vec<GroupResultRow> =
+        Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT execution_id, result_id, verdict FROM vala.verification.results \
+                 WHERE binding_id = $1 ORDER BY ended_at",
+                &[QueryParam::String(refund.binding.to_string())],
+            )
+            .await
+            .expect("the executions read back");
+    assert_eq!(
+        history
+            .iter()
+            .map(|row| (row.execution_id.clone(), row.verdict.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (promised.execution_id.to_string(), "passed"),
+            (overdue.execution_id.to_string(), "failed"),
+            (unchanged.execution_id.to_string(), "failed"),
+            (recovered.execution_id.to_string(), "passed"),
+        ],
+        "every execution stays retained"
+    );
+    for (changed, previous, verdict, previous_verdict) in
+        [(1, 0, "failed", "passed"), (3, 2, "passed", "failed")]
+    {
+        let alert: serde_json::Value = tokio::time::timeout(WAIT, hooks.received.recv())
+            .await
+            .expect("the verdict change is delivered")
+            .expect("the hook is listening")
+            .body_json()
+            .expect("the alert is JSON");
+        assert_eq!(
+            alert,
+            json!({
+                "execution_id": history[changed].execution_id,
+                "result_id": history[changed].result_id,
+                "verdict": verdict,
+                "group_id": "order-1",
+                "previous_result_id": history[previous].result_id,
+                "previous_verdict": previous_verdict,
+            })
+        );
+    }
+    hooks.assert_quiet(Duration::from_secs(5)).await;
+    refund.state.shutdown().await.expect("Bifrost stops");
+    let refused = deployment
+        .cards()
+        .await
+        .register_from_path(&fixture("cards/verify_in_real_time/refund-on-failure.yaml"))
+        .await
+        .expect_err("on_failure on a group_end binding is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("verified_by[1].on_failure"),
+        "{refused}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
+/// The `coding-verifier` judge's statement, which every request of its
+/// `spans-reviewed` check carries.
+const LIVE_REVIEW: &str = "spans were reviewed live";
+
+/// The coding judge's Verdict once it read the spans: passed, citing the
+/// session's first trace ID in its original `traces` evidence.
+const REVIEWED: &str = r#"{"outcome":"passed","reason":"the spans were read","citations":[{"slot":"traces","locator":{"json_pointer":"/0"}}]}"#;
+
+/// What a Chat Completions request carrying tool results contains.
+const TOOL_TURN: &str = r#""role":"tool""#;
+
+/// Every request body the local `judge` received that contains `marker`,
+/// in arrival order.
+///
+/// # Panics
+/// Panics when the judge does not record requests.
+async fn judged_bodies(judge: &MockServer, marker: &str) -> Vec<String> {
+    judge
+        .received_requests()
+        .await
+        .expect("the judge records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains(marker))
+        .collect()
+}
+
+/// The coding review's tool-call answer, held on its first request until
+/// the test releases it.
+///
+/// The first request is reported on `asked` with its body, the evidence the
+/// group execution pinned, and is answered only once `release` fires; so the
+/// test observes the pinned trace IDs, publishes later spans, and only then
+/// lets the check run its live read. Every later request is answered at
+/// once. Holding blocks one judge server thread for that first request.
+struct HeldReview {
+    /// The answer every request receives.
+    response: ResponseTemplate,
+    /// Where the first request's body is reported.
+    asked: std::sync::mpsc::Sender<String>,
+    /// The signal the first answer waits for; taken by that request.
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl wiremock::Respond for HeldReview {
+    /// Report and hold the first request, then answer it and every later
+    /// one with `response`.
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let first = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(release) = first {
+            drop(
+                self.asked
+                    .send(String::from_utf8_lossy(&request.body).into_owned()),
+            );
+            release.recv().unwrap_or_default();
+        }
+        self.response.clone()
+    }
+}
+
+/// Script the `coding-judge` check Agent on the local judge: a request that
+/// already carries tool results passes with [`REVIEWED`]; any other asks for
+/// one `bifrost.query` of the span names stored for `trace`, the first such
+/// answer held as [`HeldReview`] describes.
+///
+/// Returns where the first review request's body arrives and the sender
+/// that releases its answer.
+async fn script_coding_judge(
+    judge: &MockServer,
+    trace: &str,
+) -> (
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Sender<()>,
+) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(LIVE_REVIEW))
+        .and(body_string_contains(TOOL_TURN))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": REVIEWED }),
+        ))
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    let query = tool_call(
+        "call-spans",
+        "bifrost.query",
+        &json!({
+            "sql": format!("SELECT name FROM vala.traces.spans WHERE trace_id = decode('{trace}', 'hex') ORDER BY name"),
+            "max_rows": 10,
+        }),
+    );
+    let (asked, first) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(LIVE_REVIEW))
+        .respond_with(HeldReview {
+            response: completion(
+                json!({ "role": "assistant", "content": null, "tool_calls": [query] }),
+            ),
+            asked,
+            release: std::sync::Mutex::new(Some(held)),
+        })
+        .with_priority(2)
+        .mount(judge)
+        .await;
+    (first, release)
+}
+
+/// A coding session's prompt, edit, and test calls are judged per turn, and
+/// once its `after` period expires the whole session is verified from only
+/// its declared sources:
+/// each call, its trace ID where one was recorded and null where none was,
+/// and each call's test outcome, failed one included. The trace slot carries
+/// the ID alone: the check Agent's first request names no span, and its
+/// `bifrost.query`, under the owning Service's ordinary tool and query
+/// grants, reads live a span exported only after the execution pinned and sent
+/// its trace IDs, which stay unchanged; once that grant
+/// is revoked, a later session's read is denied with nothing returned. An empty `each` selection is inconclusive `empty_selection`
+/// inline and after a step. Holding only one of the tool-invoke and query
+/// grants, a session's read is denied on the missing one. A child-field
+/// source, a source matching no or two bindings on its site, a source naming
+/// an undeclared slot, a source cycle, and a typed or source slot named
+/// `group_id` are refused at registration through the SDK and, for the
+/// reserved slot, over direct HTTP, leaving nothing registered; a source
+/// Verifier named by reference to its registered Card binds.
+///
+/// # Panics
+/// Panics when a step fails, the session is not verified in time, or a
+/// judgment, a judge request, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_coding_uses_declared_sources() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let coding = assistant
+        .grouped("cards/verify_in_real_time/coding.yaml")
+        .await;
+    deployment
+        .server()
+        .seed_role(
+            "live_reader",
+            &[
+                json!({ "resource": "tool", "action": "invoke", "scope": "all" }),
+                json!({ "resource": "bifrost_query", "action": "read", "scope": "all" }),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("principals connect");
+    let principal = assistant
+        .principal(&coding.receipt.root)
+        .await
+        .parse()
+        .expect("principal id");
+    principals
+        .grant_role(&principal, "live_reader")
+        .await
+        .expect("the Service may read spans live");
+    let group = GroupId::new("session-1").expect("group id");
+    let (dispatch, provider) = service_telemetry(&deployment.client(&coding.key));
+    let session = tracing::dispatcher::with_default(&dispatch, || {
+        let session = tracing::info_span!("session", otel.name = "coding-session");
+        tracing::info_span!(parent: &session, "edit", otel.name = "edit-file").in_scope(|| ());
+        session
+    });
+    let trace = session
+        .context()
+        .span()
+        .span_context()
+        .trace_id()
+        .to_string();
+    let (asked, release) = script_coding_judge(&assistant.judge, &trace).await;
+    let calls = [
+        json!({"call": "prompt", "tests": "passed"}),
+        json!({"call": "edit", "tests": "failed"}),
+        json!({"call": "test", "tests": "passed"}),
+    ];
+    let run = coding.state.run_for_card("agent").expect("agent run opens");
+    let mut verdicts = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        let mut inputs = vec![("call", Input::from(call.clone()))];
+        if index == 0 {
+            inputs.push(("trace", Input::from(json!(trace))));
+        }
+        let judged = run
+            .observe()
+            .group_id(group.clone())
+            .verify("coding-turn", Inputs::named(inputs))
+            .await
+            .expect("the call is judged");
+        verdicts.push(judged.outcome.verdict);
+    }
+    assert_eq!(
+        verdicts,
+        [
+            VerificationVerdict::Passed,
+            VerificationVerdict::Failed,
+            VerificationVerdict::Passed
+        ]
+    );
+    let empty = run
+        .observe()
+        .verify("empty-each", json!([]))
+        .await
+        .expect("the empty list is judged");
+    assert_eq!(empty.outcome.verdict, VerificationVerdict::Inconclusive);
+    let reasons: Vec<_> = empty
+        .outcome
+        .requirements
+        .iter()
+        .map(|requirement| {
+            (
+                requirement.id.as_str(),
+                requirement.outcome,
+                requirement.reason.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (
+                "listed-ok",
+                RequirementOutcome::Inconclusive,
+                "empty_selection"
+            ),
+            (
+                "items-ok",
+                RequirementOutcome::Inconclusive,
+                "empty_selection"
+            ),
+        ]
+    );
+    let pinned = tokio::task::block_in_place(|| asked.recv_timeout(WAIT))
+        .expect("the review asks before any later span exists");
+    assert!(pinned.contains(&trace), "the pinned trace ID: {pinned}");
+    tracing::dispatcher::with_default(&dispatch, || {
+        tracing::info_span!(parent: &session, "late", otel.name = "late-test-run").in_scope(|| ());
+    });
+    drop(session);
+    tokio::task::block_in_place(|| provider.force_flush()).expect("the spans export");
+    release.send(()).expect("the held review waits");
+
+    let judged = deployment
+        .group_execution(&coding.binding, None, WAIT)
+        .await;
+
+    let outcome = judged.result.expect("the result is visible").outcome;
+    let evidence = |slot: &str| {
+        serde_json::to_value(&outcome.evidence[&slot.parse().expect("slot name")])
+            .expect("evidence encodes")
+    };
+    assert_eq!(evidence("calls"), json!({"kind": "json", "value": calls}));
+    assert_eq!(
+        evidence("traces"),
+        json!({"kind": "json", "value": [trace, null, null]})
+    );
+    assert_eq!(
+        evidence("tests"),
+        json!({"kind": "json", "value": ["passed", "failed", "passed"]})
+    );
+    let judged_requirements: Vec<_> = outcome
+        .requirements
+        .iter()
+        .map(|requirement| (requirement.id.as_str(), requirement.outcome))
+        .collect();
+    assert_eq!(
+        judged_requirements,
+        [
+            ("every-call-tested", RequirementOutcome::Failed),
+            ("spans-reviewed", RequirementOutcome::Passed),
+        ],
+        "{:#?}",
+        outcome.requirements
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+    let (reads, asks): (Vec<_>, Vec<_>) = judged_bodies(&assistant.judge, LIVE_REVIEW)
+        .await
+        .into_iter()
+        .partition(|body| body.contains(TOOL_TURN));
+    let [ask] = &asks[..] else {
+        panic!("one review request before any tool result: {asks:?}");
+    };
+    assert!(
+        ask.contains(&trace) && !ask.contains("edit-file"),
+        "the trace slot carries its ID only: {ask}"
+    );
+    let [read] = &reads[..] else {
+        panic!("one review request carries the live read: {reads:?}");
+    };
+    assert!(
+        read.contains("edit-file") && read.contains("late-test-run"),
+        "the check reads the spans live: {read}"
+    );
+
+    let all = |resource: &str, action: &str| json!({ "resource": resource, "action": action, "scope": "all" });
+    deployment
+        .server()
+        .seed_role(
+            "verification_reader",
+            &[
+                all("cards", "read"),
+                all("verifier", "run"),
+                all("bifrost_table", "read"),
+                all("bifrost_table", "write"),
+                all("bifrost_record", "write"),
+                all("tool", "invoke"),
+                all("gateway", "invoke"),
+                json!({
+                    "resource": "bifrost_query",
+                    "action": "read",
+                    "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "verification" } } },
+                }),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let mut after = judged.execution_id;
+    for (granted, revoked, denial) in [
+        (None, "live_reader", "lacks Tool/Invoke"),
+        (
+            Some("verification_reader"),
+            "workload",
+            "WYRD_VALA_403_QUERY_FORBIDDEN",
+        ),
+    ] {
+        if let Some(role) = granted {
+            principals
+                .grant_role(&principal, role)
+                .await
+                .expect("the role is granted");
+        }
+        principals
+            .revoke_role(&principal, revoked)
+            .await
+            .expect("the role is revoked");
+        let later = GroupId::new(format!("session-{revoked}")).expect("group id");
+        run.observe()
+            .group_id(later.clone())
+            .verify(
+                "coding-turn",
+                Inputs::named([
+                    ("call", Input::from(calls[0].clone())),
+                    ("trace", Input::from(json!(trace))),
+                ]),
+            )
+            .await
+            .expect("the call is judged");
+        let execution = deployment
+            .group_execution(&coding.binding, Some(&after), WAIT)
+            .await;
+        after = execution.execution_id;
+        assert_eq!(execution.group_id.as_ref(), Some(&later));
+        let reads: Vec<_> = judged_bodies(&assistant.judge, LIVE_REVIEW)
+            .await
+            .into_iter()
+            .filter(|body| body.contains(TOOL_TURN))
+            .collect();
+        let read = reads.last().expect("the execution asked to read");
+        assert!(
+            read.contains(denial) && !read.contains("edit-file"),
+            "without {revoked}, the read is denied with nothing returned: {read}"
+        );
+    }
+
+    let cards = deployment.cards().await;
+    for (relative, kind, code, reason) in [
+        (
+            "invalid/coding-child",
+            CardKind::Verifier,
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "child fields",
+        ),
+        (
+            "cards/verify_in_real_time/coding-unbound",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 0 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-ambiguous",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "matches 2 bindings",
+        ),
+        (
+            "cards/verify_in_real_time/support-undeclared",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "does not declare",
+        ),
+        (
+            "cards/verify_in_real_time/coding-cycle",
+            CardKind::Service,
+            "WYRD_SPEC_400_VALIDATION",
+            "forms a source cycle",
+        ),
+        (
+            "invalid/reserved-typed",
+            CardKind::Verifier,
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+        (
+            "invalid/reserved-source",
+            CardKind::Verifier,
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "inputs.group_id",
+        ),
+    ] {
+        let name = relative
+            .rsplit('/')
+            .next()
+            .expect("a fixture path names its Card");
+        let refused = cards
+            .register_from_path(&fixture(&format!("{relative}.yaml")))
+            .await
+            .expect_err(relative);
+        assert_eq!(refused.code(), code, "{relative}: {refused}");
+        assert!(
+            format!("{refused:?}").contains(reason),
+            "{relative}: {refused:?}"
+        );
+        let absent = cards
+            .resolve_latest(
+                kind,
+                "default".parse().expect("space parses"),
+                name.parse().expect("name parses"),
+            )
+            .await
+            .expect_err("a refused Card is not registered");
+        assert_eq!(
+            absent.code(),
+            "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+            "{relative}"
+        );
+    }
+    cards
+        .register_from_path(&fixture("cards/verify_in_real_time/coding-external.yaml"))
+        .await
+        .expect("a registered source Verifier named by reference binds");
+    let token = deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    for (relative, slot) in [
+        ("reserved-typed", json!({"type": "json"})),
+        ("reserved-source", json!("verifiers.turn-check.inputs.turn")),
+    ] {
+        let card = json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Verifier",
+            "metadata": {"name": relative, "version": "1.0.0", "space": "default"},
+            "spec": {
+                "inputs": {"group_id": slot},
+                "requirements": [{
+                    "id": "present",
+                    "statement": "The slot is present",
+                    "check": {"kind": "assert", "path": "inputs.group_id", "operator": "is_not_null"},
+                }],
+            },
+            "artifacts": [],
+        });
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/cards",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header("Idempotency-Key", relative)
+            .json(&json!({ "submissions": [card] }))
+            .send()
+            .await
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        let refused: serde_json::Value = response.json().await.expect("the body is JSON");
+        assert_eq!(status, 400, "{relative}: {refused}");
+        assert_eq!(refused["code"], "WYRD_SPEC_400_VALIDATION", "{refused}");
+        assert!(refused.to_string().contains("inputs.group_id"), "{refused}");
+    }
+    coding.state.shutdown().await.expect("Bifrost stops");
+    assistant.deployment.shutdown().await;
+}
+
+/// The frame judge's Verdict for a frame showing a badge: passed, citing the
+/// frame, an image, as its one page.
+const BADGED: &str = r#"{"outcome":"passed","reason":"a badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+/// The frame judge's Verdict for the frame showing no badge.
+const NO_BADGE: &str = r#"{"outcome":"failed","reason":"no badge is visible","citations":[{"slot":"frame","locator":{"page":1}}]}"#;
+
+/// Text every `frame-verifier` judge request carries.
+const FRAME_CLAIM: &str = "Cite the frame.";
+
+/// The label of the one frame whose person wears no badge.
+const UNBADGED: &str = "no badge!";
+
+/// [`UNBADGED`] in base64, as the judge's image data URL carries it.
+const UNBADGED_BASE64: &str = "bm8gYmFkZ2Uh";
+
+/// The label of the frame running when the server dies.
+const SLOW: &str = "slow lens";
+
+/// [`SLOW`] in base64, as the judge's image data URL carries it.
+const SLOW_BASE64: &str = "c2xvdyBsZW5z";
+
+/// Write a PNG frame into `dir` carrying the nine-byte `label` right after
+/// the signature and a newline. Those nine bytes start the label on a base64
+/// boundary, so its base64 appears verbatim in the image data URL the judge
+/// receives.
+///
+/// # Panics
+/// Panics when `label` is not nine bytes or the file cannot be written.
+fn frame(dir: &TempDir, label: &str) -> std::path::PathBuf {
+    assert_eq!(label.len(), 9, "a frame label is nine bytes");
+    let path = dir.path().join(format!("{label}.png"));
+    std::fs::write(
+        &path,
+        [b"\x89PNG\r\n\x1a\n\n".as_slice(), label.as_bytes()].concat(),
+    )
+    .expect("the frame writes");
+    path
+}
+
+/// Script the `frame-judge` on the local judge: the [`UNBADGED`] frame fails,
+/// the first [`SLOW`] request answers only after the server has died, and
+/// every other frame passes with [`BADGED`].
+async fn script_frame_judge(judge: &MockServer) {
+    let verdict = |content: &str| completion(json!({ "role": "assistant", "content": content }));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(UNBADGED_BASE64))
+        .respond_with(verdict(NO_BADGE))
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(SLOW_BASE64))
+        .respond_with(verdict(BADGED).set_delay(Duration::from_secs(60)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(judge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(FRAME_CLAIM))
+        .respond_with(verdict(BADGED))
+        .with_priority(2)
+        .mount(judge)
+        .await;
+}
+
+/// Submit each frame at `paths` to `frame-verifier` in one Run of `state`'s
+/// `agent` under `group`, returning the queued executions in submission order.
+///
+/// # Panics
+/// Panics when the Run does not open or a submission is not queued.
+async fn submit_frames(
+    state: &WyrdState,
+    group: &GroupId,
+    paths: &[std::path::PathBuf],
+) -> Vec<Execution> {
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let mut executions = Vec::new();
+    for path in paths {
+        let Submission::Queued(queued) = run
+            .observe()
+            .group_id(group.clone())
+            .submit("frame-verifier", File::path(path))
+            .await
+            .expect("the frame is submitted")
+        else {
+            panic!("a frame submission queues an execution");
+        };
+        executions.push(queued);
+    }
+    executions
+}
+
+/// An application samples door events into PNG frames, submits each frame
+/// under the event id as `group_id`, and reports the event fact; once the
+/// event's `after` period expires `event-verifier` judges the whole frame list
+/// from the visible frame outcomes. Zero frames are inconclusive
+/// `empty_selection`; one unbadged frame of twenty fails the event, and
+/// frames another Service or an unauthorized caller submits never join it;
+/// twenty-one badged frames are judged like any other group and pass; and
+/// exactly twenty frames pass even when the server dies while one is
+/// running: ordinary per-item queue retry judges only that frame again, and
+/// it counts once.
+///
+/// # Panics
+/// Panics when a step fails, an event is not judged in time, or a judgment
+/// or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_sampled_frames_use_visible_outcomes() {
+    let assistant = Box::pin(Assistant::start_with(
+        WyrdTestServer::builder().with_shutdown_drain_for_test(Duration::from_secs(2)),
+        Duration::ZERO,
+    ))
+    .await;
+    script_frame_judge(&assistant.judge).await;
+    let deployment = &assistant.deployment;
+    let frames = assistant
+        .grouped("cards/verify_in_real_time/frames.yaml")
+        .await;
+    let cards = deployment.cards().await;
+    let other = register(&cards, "cards/verify_in_real_time/frames-other.yaml").await;
+    let other_bundle = hydrate(&cards, &other.root).await;
+    let other_state = WyrdState::from_path_with(
+        other_bundle.path().join("bundle"),
+        deployment.client(&deployment.service_key(&other.root).await),
+    )
+    .expect("bundle loads");
+    other_state.start_bifrost().await.expect("Bifrost starts");
+    let dir = TempDir::new().expect("frame directory");
+    let outcomes = "outcomes".parse().expect("slot name");
+    let event = "event".parse().expect("slot name");
+    let fact = |id: &str| json!({ "event_id": id, "detected": true });
+    let reason = |judged: &wyrd_spec::verification::execution::VerificationExecutionState| {
+        let result = judged.result.as_ref().expect("the result is visible");
+        (
+            result.outcome.verdict,
+            requirement(result, "every-frame-badged").reason.clone(),
+        )
+    };
+
+    let empty = GroupId::new("door-44").expect("group id");
+    frames.turn("event-fact", &empty, fact("door-44")).await;
+    let judged = deployment
+        .group_execution(&frames.binding, None, WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&empty));
+    assert_eq!(
+        reason(&judged),
+        (
+            VerificationVerdict::Inconclusive,
+            "empty_selection".to_owned()
+        )
+    );
+    let evidence = &judged
+        .result
+        .as_ref()
+        .expect("the result is visible")
+        .outcome
+        .evidence;
+    assert_eq!(
+        serde_json::to_value(&evidence[&outcomes]).expect("evidence encodes"),
+        json!({ "kind": "json", "value": [] }),
+    );
+
+    let failing = GroupId::new("door-43").expect("group id");
+    let mut paths: Vec<_> = (1..=19)
+        .map(|index| frame(&dir, &format!("door43-{index:02}")))
+        .collect();
+    paths.insert(7, frame(&dir, UNBADGED));
+    let executions = submit_frames(&frames.state, &failing, &paths).await;
+    for foreign in submit_frames(&other_state, &failing, &[frame(&dir, "other-001")]).await {
+        foreign
+            .wait(WAIT)
+            .await
+            .expect("the other Service's frame is judged");
+    }
+    let unauthorized = deployment
+        .verifier_key("frames_denied", &assistant.answer_check)
+        .await;
+    let denied = WyrdState::from_path_with(
+        frames.bundle.path().join("bundle"),
+        deployment.client(&unauthorized),
+    )
+    .expect("bundle loads")
+    .run_for_card("agent")
+    .expect("agent run opens")
+    .observe()
+    .group_id(failing.clone())
+    .submit("frame-verifier", File::path(frame(&dir, "denied-01")))
+    .await
+    .expect_err("verifier:run on another Verifier is no grant");
+    assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC", "{denied}");
+    frames.turn("event-fact", &failing, fact("door-43")).await;
+    for execution in &executions {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let judged = deployment
+        .group_execution(&frames.binding, Some(&judged.execution_id), WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&failing));
+    let snapshot = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    // Frames ingested in one batch share its ingest time, so their list
+    // order is by execution ID rather than by submission.
+    let listed = &snapshot.sources[&outcomes].execution_ids;
+    assert_eq!(listed.len(), 20);
+    assert_eq!(
+        listed.iter().collect::<BTreeSet<_>>(),
+        executions
+            .iter()
+            .map(Execution::id)
+            .collect::<BTreeSet<_>>(),
+        "only the Service's own frames"
+    );
+    assert_eq!(snapshot.sources[&event].execution_ids.len(), 1);
+    let unbadged = executions[7].id();
+    let expected: Vec<_> = listed
+        .iter()
+        .map(|id| if id == unbadged { "failed" } else { "passed" })
+        .collect();
+    let outcome = &judged
+        .result
+        .as_ref()
+        .expect("the result is visible")
+        .outcome;
+    assert_eq!(
+        serde_json::to_value(&outcome.evidence[&outcomes]).expect("evidence encodes"),
+        json!({ "kind": "json", "value": expected }),
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+
+    let many = GroupId::new("door-45").expect("group id");
+    let paths: Vec<_> = (1..=21)
+        .map(|index| frame(&dir, &format!("door45-{index:02}")))
+        .collect();
+    let executions = submit_frames(&frames.state, &many, &paths).await;
+    frames.turn("event-fact", &many, fact("door-45")).await;
+    for execution in &executions {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let judged = deployment
+        .group_execution(&frames.binding, Some(&judged.execution_id), WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&many));
+    let snapshot = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    assert_eq!(
+        snapshot.sources[&outcomes]
+            .execution_ids
+            .iter()
+            .collect::<BTreeSet<_>>(),
+        executions
+            .iter()
+            .map(Execution::id)
+            .collect::<BTreeSet<_>>()
+    );
+    let outcome = &judged
+        .result
+        .as_ref()
+        .expect("the result is visible")
+        .outcome;
+    assert_eq!(
+        serde_json::to_value(&outcome.evidence[&outcomes]).expect("evidence encodes"),
+        json!({ "kind": "json", "value": vec!["passed"; 21] }),
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+
+    let door = GroupId::new("door-42").expect("group id");
+    let mut paths: Vec<_> = (1..=19)
+        .map(|index| frame(&dir, &format!("door42-{index:02}")))
+        .collect();
+    paths.push(frame(&dir, SLOW));
+    let executions = submit_frames(&frames.state, &door, &paths).await;
+    frames.turn("event-fact", &door, fact("door-42")).await;
+    for execution in &executions[..19] {
+        execution.wait(WAIT).await.expect("the frame is judged");
+    }
+    let ids: Vec<_> = executions.iter().map(|execution| *execution.id()).collect();
+    let mut after = judged.execution_id;
+    frames.state.shutdown().await.expect("Bifrost stops");
+    other_state.shutdown().await.expect("Bifrost stops");
+    // Rows the dying process has not published are outbox loss; the
+    // positive variant publishes the 19 judged frames first.
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let Assistant {
+        deployment, judge, ..
+    } = assistant;
+    let deployment = deployment
+        .restart(on_judge(WyrdTestServer::builder(), &judge))
+        .await;
+    Execution::connect_with(ids[19], &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the running frame recovers and is judged");
+    let judged = loop {
+        let judged = deployment
+            .group_execution(&frames.binding, Some(&after), WAIT)
+            .await;
+        assert_eq!(judged.group_id.as_ref(), Some(&door));
+        if reason(&judged).0 == VerificationVerdict::Passed {
+            break judged;
+        }
+        // An earlier snapshot may pin the running frame's outcome null; the
+        // recovered result's acknowledgement makes the group due again.
+        after = judged.execution_id;
+    };
+    let snapshot = judged
+        .group
+        .as_ref()
+        .expect("the execution pins its snapshot");
+    assert_eq!(
+        snapshot.sources[&outcomes]
+            .execution_ids
+            .iter()
+            .collect::<BTreeSet<_>>(),
+        ids.iter().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            &judged
+                .result
+                .as_ref()
+                .expect("the result is visible")
+                .outcome
+                .evidence[&outcomes]
+        )
+        .expect("evidence encodes"),
+        json!({ "kind": "json", "value": vec!["passed"; 20] }),
+    );
+    assert_eq!(judged_bodies(&judge, SLOW_BASE64).await.len(), 2);
+    assert_eq!(
+        judged_bodies(&judge, FRAME_CLAIM).await.len(),
+        20 + 1 + 21 + 20 + 1,
+        "every frame is judged once, and only the running one again"
+    );
+    deployment.shutdown().await;
+}
+
+/// One retained result's persisted `group_id` column.
+#[derive(Debug, Deserialize, PartialEq)]
+struct Grouping {
+    /// The group the result belongs to, absent for an ungrouped turn.
+    group_id: Option<String>,
+}
+
+/// The executions of `binding`'s retained group executions, oldest first, read
+/// as the administrator after publishing every captured row.
+///
+/// # Panics
+/// Panics when a flush or the read fails.
+async fn group_executions(deployment: &Deployment, binding: &BindingId) -> Vec<ExecutionId> {
+    /// One `vala.verification.results` row's execution identity.
+    #[derive(Deserialize)]
+    struct Row {
+        /// The group execution the result settled.
+        execution_id: String,
+    }
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let rows: Vec<Row> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT execution_id FROM vala.verification.results \
+             WHERE binding_id = $1 ORDER BY ended_at",
+            &[QueryParam::String(binding.to_string())],
+        )
+        .await
+        .expect("the executions read back");
+    rows.into_iter()
+        .map(|row| {
+            row.execution_id
+                .parse()
+                .expect("the row names an execution")
+        })
+        .collect()
+}
+
+/// Assert `binding` retains exactly `expected` group executions for eight
+/// seconds while the scheduler keeps polling: a handed-off group with no new
+/// acknowledged activity is never judged again.
+///
+/// # Panics
+/// Panics when a further execution is retained.
+async fn assert_no_new_group_execution(
+    deployment: &Deployment,
+    binding: &BindingId,
+    expected: &[ExecutionId],
+) {
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < quiet {
+        assert_eq!(
+            group_executions(deployment, binding).await,
+            expected,
+            "no group is verified twice"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Two support conversations run at once beside a drift sample, an
+/// ungrouped turn, the same `group_id` in another tenant, and a turn judged
+/// by a newer `turn-check` registered after the binding pinned its source.
+/// Each conversation is verified once with only its own pinned turns, in
+/// call order, the ungrouped turn reads back with no group, the drift sample
+/// is recorded as usual, and later passes judge no group a second time.
+///
+/// # Panics
+/// Panics when a step fails, an execution is not judged in time, or an execution
+/// differs or repeats.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_conversations_coexist_with_drift() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let (a, b) = (
+        GroupId::new("conv-a").expect("group id"),
+        GroupId::new("conv-b").expect("group id"),
+    );
+    let turn = |answer: &str| json!({ "answer": answer });
+    let slot = "turns".parse().expect("slot name");
+
+    let drift = assistant.state().await;
+    let sampled = drift
+        .run_for_card("model")
+        .expect("model run opens")
+        .observe()
+        .submit("latency-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the drift sample is recorded");
+    assert!(matches!(sampled, Submission::Recorded), "{sampled:?}");
+    support.turn("turn-check", &a, turn("a1")).await;
+    support.turn("turn-check", &b, turn("b1")).await;
+    let Submission::Queued(queued) = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(a.clone())
+        .submit("turn-check", turn("a2"))
+        .await
+        .expect("the turn is submitted")
+    else {
+        panic!("a turn-check submission queues an execution");
+    };
+    support.turn("turn-check", &b, turn("")).await;
+    let ungrouped = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("turn-check", turn("solo"))
+        .await
+        .expect("an ungrouped turn is judged");
+    queued.wait(WAIT).await.expect("the queued turn is judged");
+
+    let cards = deployment.cards().await;
+    let newer = register(&cards, "cards/verify_in_real_time/turn-check-newer.yaml").await;
+    let late = support
+        .enqueue_over_http(
+            deployment,
+            "support-newer-turn",
+            &json!({
+                "verifier_card_uid": newer.root.uid,
+                "card_uid": registered(&support.receipt, "assistant-agent").uid,
+                "group_id": a,
+                "inputs": {"turn": {"kind": "json", "value": turn("newer")}},
+            }),
+        )
+        .await;
+    Execution::connect_with(late, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
+        .await
+        .expect("the newer Verifier judges the turn");
+
+    let tenant_b = deployment.client(&deployment.other_tenant_admin("tenant-b").await);
+    let b_cards = Cards::connect_with(&tenant_b)
+        .await
+        .expect("handle connects");
+    let b_support = register(&b_cards, "cards/verify_in_real_time/support.yaml").await;
+    let b_bundle = hydrate(&b_cards, &b_support.root).await;
+    let [kind, name, version, space] = coordinates(&b_support.root);
+    let b_key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(tenant_b))
+        .await
+        .expect("the CLI issues tenant B's Service key")
+        .key;
+    let b_state = WyrdState::from_path_with(
+        b_bundle.path().join("bundle"),
+        deployment.client(b_key.expose()),
+    )
+    .expect("bundle loads");
+    b_state.start_bifrost().await.expect("Bifrost starts");
+    b_state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(a.clone())
+        .verify("turn-check", turn("tenant b"))
+        .await
+        .expect("tenant B's turn is judged");
+    for state in [&support.state, &drift, &b_state] {
+        state.shutdown().await.expect("Bifrost stops");
+    }
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let executions = loop {
+        let executions = group_executions(deployment, &support.binding).await;
+        if executions.len() >= 2 {
+            break executions;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both conversations are verified within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let admin = deployment.admin();
+    let mut judged = Vec::new();
+    for id in &executions {
+        let state = Execution::connect_with(*id, &admin)
+            .await
+            .expect("the execution handle connects")
+            .status()
+            .await
+            .expect("the execution reads");
+        let result = state.result.expect("the result is visible");
+        judged.push((
+            state.group_id.expect("a group execution names its group"),
+            state
+                .group
+                .expect("the execution pins its snapshot")
+                .sources[&slot]
+                .execution_ids
+                .len(),
+            serde_json::to_value(&result.outcome.evidence[&slot]).expect("evidence encodes"),
+            result.outcome.verdict,
+        ));
+    }
+    judged.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    assert_eq!(
+        judged,
+        [
+            (
+                a,
+                2,
+                json!({"kind": "json", "value": [turn("a1"), turn("a2")]}),
+                VerificationVerdict::Passed,
+            ),
+            (
+                b,
+                2,
+                json!({"kind": "json", "value": [turn("b1"), turn("")]}),
+                VerificationVerdict::Failed,
+            ),
+        ],
+        "each conversation judges only its own pinned turns"
+    );
+    let solo: Vec<Grouping> = Bifrost::connect_with(&admin, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT group_id FROM vala.verification.results WHERE execution_id = $1",
+            &[QueryParam::String(ungrouped.execution_id.to_string())],
+        )
+        .await
+        .expect("the ungrouped result reads back");
+    assert_eq!(
+        solo,
+        [Grouping { group_id: None }],
+        "the turn joins no group"
+    );
+
+    assert_no_new_group_execution(deployment, &support.binding, &executions).await;
+    assistant.deployment.shutdown().await;
+}
+
+/// One evidence slot of `execution`'s result as JSON.
+///
+/// # Panics
+/// Panics when the execution has no result or no such slot.
+fn evidence(execution: &VerificationExecutionState, slot: &str) -> serde_json::Value {
+    let result = execution.result.as_ref().expect("the result is visible");
+    serde_json::to_value(&result.outcome.evidence[&slot.parse().expect("slot name")])
+        .expect("evidence encodes")
+}
+
+/// A judged conversation's execution is slow. Answers acknowledged while it
+/// runs reach exactly one next, overlapping execution, which pins a
+/// still-running answer's judgment as null; once that judgment lands, its
+/// acknowledged result reaches exactly one more execution. The first execution's
+/// snapshot is unchanged by later evidence, every execution stays retained,
+/// and nothing is verified again. Throughout, a neighbouring conversation
+/// bound under a one-year `after`, the longest a Trigger accepts, does not
+/// come due and never holds up the late group's progress.
+///
+/// # Panics
+/// Panics when a step fails, an execution is not judged in time, or an execution
+/// differs or repeats.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn grouped_executions_include_late_evidence() {
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    for (marker, delay, priority) in [("LATE-REVIEW", 6, 1), ("late answer", 15, 2)] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(
+                completion(json!({ "role": "assistant", "content": AGREES }))
+                    .set_delay(Duration::from_secs(delay)),
+            )
+            .with_priority(priority)
+            .mount(&assistant.judge)
+            .await;
+    }
+    let forever = assistant
+        .grouped("cards/verify_in_real_time/forever.yaml")
+        .await;
+    forever
+        .turn(
+            "turn-check",
+            &GroupId::new("endless").expect("group id"),
+            json!({ "answer": "still here" }),
+        )
+        .await;
+    let late = assistant
+        .grouped("cards/verify_in_real_time/late.yaml")
+        .await;
+    let group = GroupId::new("slow-1").expect("group id");
+    late.turn("answer-judged", &group, json!("first answer"))
+        .await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let first_id = loop {
+        deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        if let Some(id) = deployment
+            .binding_status(&late.binding)
+            .await
+            .last_execution_id
+        {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first execution is enqueued"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    late.turn("answer-judged", &group, json!("second answer"))
+        .await;
+    let Submission::Queued(pending) = late
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(group.clone())
+        .submit("answer-judged", json!("late answer"))
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("an answer-judged submission queues an execution");
+    };
+    let execution = Execution::connect_with(first_id, &deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    assert_ne!(
+        execution
+            .status()
+            .await
+            .expect("the execution reads")
+            .status,
+        VerificationExecutionStatus::Completed,
+        "both answers were recorded while the first execution ran"
+    );
+    execution
+        .wait(WAIT)
+        .await
+        .expect("the first execution completes");
+    let first = execution.status().await.expect("the execution reads");
+    assert_eq!(
+        evidence(&first, "answer"),
+        json!({"kind": "json", "value": ["first answer"]})
+    );
+
+    let next = deployment
+        .group_execution(&late.binding, Some(&first_id), WAIT)
+        .await;
+    assert_eq!(
+        evidence(&next, "answer"),
+        json!({"kind": "json", "value": ["first answer", "second answer", "late answer"]}),
+        "one next execution covers every answer recorded during the first"
+    );
+    assert_eq!(
+        evidence(&next, "agreed"),
+        json!({"kind": "json", "value": ["passed", "passed", null]}),
+        "the still-running judgment is pinned null"
+    );
+    pending.wait(WAIT).await.expect("the late answer is judged");
+    let settled = deployment
+        .group_execution(&late.binding, Some(&next.execution_id), WAIT)
+        .await;
+    assert_eq!(
+        evidence(&settled, "agreed"),
+        json!({"kind": "json", "value": ["passed", "passed", "passed"]}),
+        "the late judgment is judged by exactly one more execution"
+    );
+    late.state.shutdown().await.expect("Bifrost stops");
+    assert_eq!(
+        Execution::connect_with(first_id, &deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .status()
+            .await
+            .expect("the execution reads")
+            .group,
+        first.group,
+        "later evidence leaves the first snapshot unchanged"
+    );
+    assert_no_new_group_execution(
+        deployment,
+        &late.binding,
+        &[first_id, next.execution_id, settled.execution_id],
+    )
+    .await;
+    assert_eq!(
+        deployment
+            .binding_status(&forever.binding)
+            .await
+            .last_execution_id,
+        None,
+        "a conversation under a one-year after does not come due"
+    );
+    forever.state.shutdown().await.expect("Bifrost stops");
+    assistant.deployment.shutdown().await;
+}
+
+/// Scribe outbox capacity of the staging-pressure story: three quarters of
+/// it, four writes, is what two direct judgments reserve.
+const STAGING_CAPACITY: usize = 6;
+
+/// How long the slow judge of the staging-pressure story holds each call.
+const JUDGE_DELAY: Duration = Duration::from_secs(15);
+
+/// Stable code of a call refused for this server's staging capacity.
+const STAGING_FULL: &str = "WYRD_VERIFICATION_429_STAGING_FULL";
+
+/// The count of one tenant's `vala.verification.execution_inputs` rows.
+#[derive(Debug, Deserialize)]
+struct InputRows {
+    /// Rows the tenant has recorded.
+    rows: i64,
+}
+
+/// A tenant's slow judgments fill the server's reserved staging share while
+/// another tenant's submission is accepted and judged beside the first of
+/// them, the bursting tenant offering normal calls one at a time until the
+/// neighbor's execution completes; once the share is full, further verify and
+/// submit calls, grouped ones included, are refused with typed retryable
+/// pressure before staging anything. Once the burst drains, the identical
+/// refused call is accepted and judged once, the refused grouped turn is
+/// accepted and its group judged over exactly that one turn, and the
+/// bursting tenant holds exactly one inputs row per accepted call.
+///
+/// The normal calls hold at most one reserved slot at a time, so beside the
+/// first judgment's two the neighbor's execution always has its slot.
+///
+/// # Panics
+/// Panics when a refusal is missing or untyped, the neighbor's execution
+/// does not complete during the burst, the recovery fails, or the recorded
+/// inputs differ from the accepted calls.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn verification_staging_refuses_and_recovers() {
+    let assistant = Box::pin(Assistant::start_with(
+        WyrdTestServer::builder().with_scribe_outbox_capacity_for_test(STAGING_CAPACITY),
+        JUDGE_DELAY,
+    ))
+    .await;
+    let (neighbor, _neighbor_bundle) = assistant.in_tenant("burst-neighbor").await;
+    let state = assistant.state().await;
+    let support = assistant
+        .grouped("cards/verify_in_real_time/support.yaml")
+        .await;
+    let group = GroupId::new("pressured").expect("group id");
+    let server = assistant.deployment.server();
+    server.flush_bifrost().await.expect("setup settles");
+
+    let mut burst = Vec::new();
+    let mut offered = 0;
+    for in_flight in 1..=2 {
+        let judging = state.clone();
+        burst.push(tokio::spawn(async move {
+            judging
+                .run_for_card("agent")
+                .expect("agent run opens")
+                .observe()
+                .verify("answer-judged", json!("yes"))
+                .await
+        }));
+        assistant.await_judge_calls(in_flight).await;
+        if in_flight == 1 {
+            let Submission::Queued(accepted) = neighbor
+                .run_for_card("agent")
+                .expect("agent run opens")
+                .observe()
+                .submit("answer-check", json!("yes"))
+                .await
+                .expect("the neighbor's answer is accepted during the burst")
+            else {
+                panic!("Run evidence queues an execution");
+            };
+            let neighbor_waits = tokio::spawn(async move { accepted.wait(WAIT).await });
+            loop {
+                let Submission::Queued(normal) = state
+                    .run_for_card("agent")
+                    .expect("agent run opens")
+                    .observe()
+                    .submit("answer-check", json!("yes"))
+                    .await
+                    .expect("the bursting tenant's normal call is accepted beside the neighbor")
+                else {
+                    panic!("Run evidence queues an execution");
+                };
+                let normal = normal.wait(WAIT).await.expect("the normal call is judged");
+                assert_eq!(normal.outcome.verdict, VerificationVerdict::Passed);
+                offered += 1;
+                if neighbor_waits.is_finished() {
+                    break;
+                }
+            }
+            let neighbor_result = neighbor_waits
+                .await
+                .expect("the neighbor's wait joins")
+                .expect("the neighbor's accepted execution completes during the burst");
+            assert_eq!(neighbor_result.outcome.verdict, VerificationVerdict::Passed);
+            assert!(
+                !burst[0].is_finished(),
+                "the bursting tenant's judgment is still in flight"
+            );
+            server.flush_bifrost().await.expect("the neighbor settles");
+        }
+    }
+
+    let refused_run = state.run_for_card("agent").expect("agent run opens");
+    let refused_verify = refused_run
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect_err("a full server refuses the verify");
+    let refused_submit = refused_run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect_err("a full server refuses the submit after its own retries");
+    let grouped_run = support
+        .state
+        .run_for_card("agent")
+        .expect("agent run opens");
+    let refused_grouped = grouped_run
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", json!({"answer": "pressured"}))
+        .await
+        .expect_err("a full server refuses the grouped verify");
+    for refused in [&refused_verify, &refused_submit, &refused_grouped] {
+        assert_eq!(refused.code(), STAGING_FULL, "{refused}");
+        assert_eq!(refused.status(), 429);
+        assert_eq!(
+            refused.as_problem_json()["details"]["retry_after_seconds"],
+            json!(1)
+        );
+    }
+
+    assert!(
+        burst.iter().all(|judging| !judging.is_finished()),
+        "the bursting tenant's judgments are still in flight"
+    );
+
+    for judging in burst {
+        let judged = judging
+            .await
+            .expect("the judgment joins")
+            .expect("each accepted judgment completes");
+        assert_eq!(judged.outcome.verdict, VerificationVerdict::Passed);
+    }
+    server.flush_bifrost().await.expect("the burst drains");
+    let Submission::Queued(recovered) = refused_run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect("the identical call is accepted once the burst drains")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let recovered = recovered
+        .wait(WAIT)
+        .await
+        .expect("the recovered call is judged");
+    assert_eq!(recovered.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(recovered.run_id.as_ref(), Some(refused_run.run_id()));
+    grouped_run
+        .observe()
+        .group_id(group.clone())
+        .verify("turn-check", json!({"answer": "pressured"}))
+        .await
+        .expect("the identical grouped call is accepted once the burst drains");
+    support.state.shutdown().await.expect("Bifrost stops");
+    let judged = assistant
+        .deployment
+        .group_execution(&support.binding, None, WAIT)
+        .await;
+    assert_eq!(judged.group_id.as_ref(), Some(&group));
+    assert_eq!(
+        evidence(&judged, "turns"),
+        json!({"kind": "json", "value": [{"answer": "pressured"}]}),
+        "the refused grouped turn staged nothing"
+    );
+
+    server.flush_bifrost().await.expect("rows publish");
+    let recorded = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql_as::<InputRows>(
+            "SELECT count(*) AS rows FROM vala.verification.execution_inputs",
+            &[],
+        )
+        .await
+        .expect("the inputs rows count");
+    assert_eq!(
+        recorded.iter().map(|count| count.rows).collect::<Vec<_>>(),
+        [4 + offered],
+        "the burst judgments, the normal calls, and the recovered and grouped calls; nothing of the refused calls"
+    );
     assistant.deployment.shutdown().await;
 }

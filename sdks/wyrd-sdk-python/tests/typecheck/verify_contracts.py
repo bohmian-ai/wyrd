@@ -40,6 +40,7 @@ def the_actual_status_shape_is_accepted() -> ExecutionState:
     return {
         "execution_id": "0190b2a4-0000-7000-8000-000000000000",
         "status": "completed",
+        "dispatches": [],
         "result": {
             "execution_id": "0190b2a4-0000-7000-8000-000000000000",
             "verifier": {"kind": "Verifier", "name": "policy-review", "version": "1.0.0"},
@@ -146,10 +147,12 @@ def unknown_fixed_keys_and_values_are_rejected() -> tuple[object, ...]:
     status: ExecutionState = {
         "execution_id": "id",
         "status": "done",  # ty: ignore[invalid-argument-type]
+        "dispatches": [],
     }
     misspelled: ExecutionState = {
         "execution_id": "id",
         "status": "pending",
+        "dispatches": [],
         "eror": {"code": "c", "message": "m"},  # ty: ignore[invalid-key]
     }
     step: StepResult = {

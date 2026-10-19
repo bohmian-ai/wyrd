@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: cycle-b
+  version: 1.0.0
+  space: default
+spec:
+  description: Reads its own reader's slot, closing a source cycle.
+  inputs:
+    forth: verifiers.cycle-a.inputs.back
+  requirements:
+    - id: read
+      statement: Every value was read
+      check: {kind: assert, each: "inputs.forth[*]", operator: is_not_null}

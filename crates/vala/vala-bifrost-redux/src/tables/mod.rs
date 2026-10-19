@@ -1430,14 +1430,16 @@ mod tests {
                 name: "execution_inputs",
                 columns: vec![
                     utf8("execution_id", false),
+                    utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
+                    utf8("group_id", true),
                     boolean("queue_execution", false),
                     variant_field("inputs", false),
                     variant_field("activation", true),
                     ts_us_utc("recorded_at", false),
                 ],
-                blooms: &["execution_id"],
+                blooms: &["execution_id", "group_id"],
             },
             VerificationContract {
                 namespace: "drift",
@@ -1476,6 +1478,7 @@ mod tests {
                 utf8("owner_card_uid", true),
                 utf8("verifier_card_uid", false),
                 utf8("binding_id", true),
+                utf8("group_id", true),
                 utf8("trigger_identity", true),
                 ts_us_utc("window_start", true),
                 ts_us_utc("window_end", true),
@@ -1488,6 +1491,7 @@ mod tests {
                 "execution_id",
                 "verifier_card_uid",
                 "binding_id",
+                "group_id",
             ],
         }
     }

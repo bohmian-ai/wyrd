@@ -9,7 +9,9 @@
 //! with it and executed by the tenant SYSTEM principal; a scheduled window
 //! first scores its drift requirements through [`DriftEngine`]. Each attempt
 //! ends in exactly one fenced transition the runner applies itself. A
-//! completed outcome becomes one result payload, staged on the process
+//! completed outcome becomes one result payload, staged on an outbox slot
+//! reserved before the engine ran (a full reserved share defers the
+//! execution instead) on the process
 //! [`ScribeOutbox`] attributed to the execution's subject and SYSTEM inside
 //! the fenced transaction that completes the execution, so a visible
 //! completion always has its result staged; delivery belongs to the outbox
@@ -32,12 +34,14 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::{Empty, display};
 use vala_verify::blocks::{DriftChecks, EngineError};
+use wyrd_runtime::outbox::Reservation;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::operator::DriftCounts;
@@ -67,8 +71,12 @@ use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallSubject;
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
+
+/// A completed execution's result write and the outbox slot reserved for it
+/// before the engine ran.
+type StagedResult = (Reservation<ScribeSink>, ScribeWrite);
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -206,7 +214,8 @@ impl VerifierRunner {
     }
 
     /// Build a runner over `state`'s Wyrd Postgres owner, the operator pool,
-    /// and the hosted `blocks`.
+    /// and the hosted `blocks`, each running execution holding one permit of
+    /// `capacity`, the execution capacity group snapshot handoff shares.
     ///
     /// The runner carries no coordination clock: queue availability, claims,
     /// leases, renewals, retries, and settlements are decided and stamped by
@@ -220,11 +229,12 @@ impl VerifierRunner {
         operator: OperatorPool,
         queue: VerifierExecutionQueue,
         outbox: Arc<ScribeOutbox>,
+        capacity: Arc<Semaphore>,
         limits: RuntimeLimits,
     ) -> Self {
         let postgres = state.postgres.wyrd().clone();
         Self {
-            claims: ClaimLoop::new(postgres.clone(), None, &limits),
+            claims: ClaimLoop::new(postgres.clone(), None, capacity, &limits),
             renewal: Arc::new(LeaseRenewal::new(postgres.clone(), queue, limits.lease)),
             drift: DriftEngine::new(state.clone(), limits.execution_timeout),
             state,
@@ -328,8 +338,11 @@ impl VerifierRunner {
     /// Run the execution and map the attempt to a transition.
     ///
     /// An execution without a loadable Verifier or a SYSTEM principal
-    /// terminates; otherwise the engine runs within the execution deadline
-    /// and a completed outcome is built into its result write, which
+    /// terminates. One outbox slot is then reserved for its result; when the
+    /// reserved share is full the execution defers without spending an
+    /// attempt, so a full outbox backs claims off instead of losing results.
+    /// Otherwise the engine runs within the execution deadline and a
+    /// completed outcome is built into its result write, which
     /// [`settle`](Self::settle) stages inside the lease-fenced transaction
     /// that completes the execution. Never fails: every failure becomes the
     /// [`Transition`] it maps to.
@@ -339,7 +352,7 @@ impl VerifierRunner {
         run: &ClaimedExecution,
         verifier: Result<Arc<CachedVerifier>, VerificationError>,
         telemetry: &ExecutionTelemetry,
-    ) -> (Transition, Option<ScribeWrite>) {
+    ) -> (Transition, Option<StagedResult>) {
         let verifier = match verifier {
             Ok(verifier) => verifier,
             Err(error) => return (Transition::Terminate(TerminalStatus::Errored, error), None),
@@ -347,6 +360,15 @@ impl VerifierRunner {
         let system = match system_principal(run) {
             Ok(system) => system,
             Err(transition) => return (transition, None),
+        };
+        let Ok(slot) = self.outbox.reserve(1) else {
+            return (
+                Transition::Defer(failure(
+                    RUNTIME_BUSY,
+                    "the verification result staging share is full",
+                )),
+                None,
+            );
         };
         let started_at = Utc::now();
         let deadline = tokio::time::Instant::now() + self.limits.execution_timeout;
@@ -362,7 +384,10 @@ impl VerifierRunner {
             .await;
         let outcome = executed.unwrap_or_else(|_| timed_out());
         match outcome {
-            EngineOutcome::Completed(outcome) => result(run, &outcome, system, started_at),
+            EngineOutcome::Completed(outcome) => {
+                let (transition, write) = result(run, &outcome, system, started_at);
+                (transition, write.map(|write| (slot, write)))
+            }
             EngineOutcome::Retry(error) => (Transition::Retry(error), None),
             EngineOutcome::Deferred(error) => (Transition::Defer(error), None),
             EngineOutcome::Terminal(status, error) => (Transition::Terminate(status, error), None),
@@ -373,7 +398,8 @@ impl VerifierRunner {
     ///
     /// A scheduled window first scores every drift requirement as the
     /// tenant's SYSTEM read authority, then runs with no pinned evidence; a
-    /// submission runs over its pinned inputs and route overrides. The engine
+    /// submission runs over its pinned inputs and route overrides; a group
+    /// snapshot runs over its pinned source lists. The engine
     /// executes as the authority accepted with the execution, executed by
     /// `system`, with model calls attributed to the verified Card and the
     /// submission's application Run. Under `test-support` a scripted outcome,
@@ -395,10 +421,10 @@ impl VerifierRunner {
         }
         let (no_inputs, no_routes) = (BTreeMap::new(), BTreeMap::new());
         let (drift, evidence, routes, run_id) = match &run.input {
-            ExecutionInput::Scheduled { window, slots } => {
+            ExecutionInput::Scheduled { window } => {
                 match self
                     .drift
-                    .checks(tenant, run, spec, window, slots, telemetry)
+                    .checks(tenant, run, spec, window, telemetry)
                     .await
                 {
                     Ok(drift) => (drift, &no_inputs, &no_routes, None),
@@ -414,6 +440,12 @@ impl VerifierRunner {
                 inputs,
                 route_overrides,
                 run_id.clone(),
+            ),
+            ExecutionInput::Grouped { inputs, .. } => (
+                DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                inputs,
+                &no_routes,
+                None,
             ),
         };
         let caller = Caller::accepted(&run.authority, system);
@@ -454,7 +486,7 @@ impl VerifierRunner {
     /// Apply `transition` to `run` in one tenant transaction.
     ///
     /// When a [`Transition::Complete`] applies under this lease, the write in
-    /// `result` is taken and staged on the outbox before the transaction
+    /// `result` is taken and staged on its reserved slot before the transaction
     /// commits, so no reader sees the run `completed` before its result is
     /// pending. A stale lease stages nothing. If the commit then fails, the
     /// already-staged write keeps its result ID: a retried settlement under
@@ -474,7 +506,7 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         transition: Transition,
-        result: &Mutex<Option<ScribeWrite>>,
+        result: &Mutex<Option<StagedResult>>,
     ) -> Result<&'static str, SqlError> {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
@@ -493,10 +525,10 @@ impl VerifierRunner {
                     .complete(&mut conn, lease, result_id, verdict, &summary, drift)
                     .await?;
                 if settlement == Settlement::Applied
-                    && let Some(write) =
+                    && let Some((slot, write)) =
                         result.lock().unwrap_or_else(PoisonError::into_inner).take()
                 {
-                    self.outbox.stage(tenant, write);
+                    slot.stage(tenant, write);
                 }
                 settled(settlement, "completed")
             }
@@ -794,6 +826,7 @@ fn result(
     let (run_id, window) = match &run.input {
         ExecutionInput::Scheduled { window, .. } => (None, Some(window)),
         ExecutionInput::Submitted { run_id, .. } => (run_id.as_ref(), None),
+        ExecutionInput::Grouped { .. } => (None, None),
     };
     let built = ResultPayloadBuilder::new(
         ResultRun {
@@ -801,7 +834,11 @@ fn result(
             run_id,
             verifier_version: &run.verifier_version,
             card_uid: &run.card_uid,
-            owner_card_uid: run.owner_card_uid.as_ref(),
+            owner_card_uid: run
+                .owner_card_uid
+                .as_ref()
+                .or_else(|| run.authority.principal.owner_service_uid()),
+            group_id: run.group_id.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),
             window,

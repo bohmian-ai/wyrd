@@ -7,10 +7,11 @@ use wyrd_spec::card::data::{ArrowFormat, DataInterface};
 use wyrd_spec::card::drift::{DriftSignal, DriftSpec};
 use wyrd_spec::card::operator::OperatorSpec;
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
-use wyrd_spec::card::verifier::{InputSlot, VerificationBinding, VerifierSpec};
+use wyrd_spec::card::verifier::{InputSlot, SourceField, VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::graph::BindingSite;
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
@@ -25,33 +26,27 @@ use wyrd_sql::queries::verification::BindingSchedule;
 /// Identity key used to look up a resolved external reference.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 
-/// Reject a schedule binding whose Verifier judges no recorded samples, then
-/// check the binding's sample-slot mapping against the Verifier.
+/// Reject a schedule binding whose Verifier judges no recorded samples.
 ///
 /// A schedule occurrence supplies only recorded measurements for a window, so
-/// it can activate only a Verifier with a `samples` slot, and every required
-/// slot must be a mapped samples slot.
+/// it can activate only a Verifier with a `samples` slot; the Verifier's own
+/// samples declarations supply every such slot.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the Verifier has
-/// no samples slot, and the [`VerifierSpec::validate_schedule`] refusal for an
-/// incomplete or inexact `inputs` mapping.
-fn check_activation(
-    verifier: &VerifierSpec,
-    binding: &VerificationBinding,
-    field: &str,
-) -> Result<(), WyrdError> {
+/// no samples slot.
+fn check_activation(verifier: &VerifierSpec, field: &str) -> Result<(), WyrdError> {
     let samples = verifier
         .inputs
         .values()
         .any(|slot| matches!(slot, InputSlot::Samples { .. }));
-    if !samples {
-        return Err(WyrdError::SpecTriggerActivationMismatch {
-            message: format!("{field}.runs_on cannot activate a Verifier without a samples slot"),
-            details: serde_json::json!({ "field": format!("{field}.runs_on") }),
-        });
+    if samples {
+        return Ok(());
     }
-    verifier.validate_schedule(&binding.inputs)
+    Err(WyrdError::SpecTriggerActivationMismatch {
+        message: format!("{field}.runs_on cannot activate a Verifier without a samples slot"),
+        details: serde_json::json!({ "field": format!("{field}.runs_on") }),
+    })
 }
 
 /// Validate an Operator's shape and the exact connection authority it names.
@@ -96,6 +91,80 @@ async fn check_operator(
         ),
         details: serde_json::json!({ "field": field, "provider": provider, "connection": name }),
     })
+}
+
+/// Find the one binding of `site` whose Verifier reference is named `name`.
+///
+/// A group source resolves only within its own binding site, by the bound
+/// Verifier's `metadata.name` — the name its reference carries — so
+/// registration and binding projection pin the same source.
+///
+/// # Errors
+/// Returns the number of matching bindings when it is not exactly one.
+pub(super) fn source_binding<'a>(
+    site: &'a [VerificationBinding],
+    name: &CardName,
+) -> Result<&'a VerificationBinding, usize> {
+    let matches: Vec<_> = site
+        .iter()
+        .filter(|binding| {
+            binding
+                .verifier
+                .as_card_ref()
+                .is_some_and(|verifier| &verifier.name == name)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        _ => Err(matches.len()),
+    }
+}
+
+/// Each top-level binding site's subject Card identity, in
+/// [`Spec::binding_sites`] order.
+///
+/// The owner-level site is `None`; a component site is its component's Card
+/// reference identity, or `None` for an inline component.
+fn site_subjects(spec: &Spec) -> Vec<Option<CardRefIdentity>> {
+    let mut subjects = vec![None];
+    if let Spec::Service(service) = spec {
+        subjects.extend(
+            service
+                .components
+                .iter()
+                .map(|component| component.card_ref.as_card_ref().map(CardRef::identity_key)),
+        );
+    }
+    subjects
+}
+
+/// The owner's top-level binding sites seen from the one being validated.
+#[derive(Clone, Copy)]
+struct GroupSite<'s, 'a> {
+    /// Every top-level binding site of the owner spec.
+    sites: &'s [BindingSite<'a>],
+    /// Each site's subject identity, aligned with `sites`.
+    subjects: &'s [Option<CardRefIdentity>],
+    /// Index of the site holding the binding being validated.
+    site: usize,
+}
+
+impl GroupSite<'_, '_> {
+    /// Whether another site with the same subject Card also binds `source`'s
+    /// exact Verifier, making their recorded rows indistinguishable.
+    fn ambiguous(&self, source: &VerificationBinding) -> bool {
+        let Some(subject) = &self.subjects[self.site] else {
+            return false;
+        };
+        let identity = source.verifier.as_card_ref().map(CardRef::identity_key);
+        self.sites.iter().enumerate().any(|(index, site)| {
+            index != self.site
+                && self.subjects[index].as_ref() == Some(subject)
+                && site.bindings.iter().any(|other| {
+                    other.verifier.as_card_ref().map(CardRef::identity_key) == identity
+                })
+        })
+    }
 }
 
 /// Registration preflight: effective spec bodies for referenced targets,
@@ -223,8 +292,7 @@ impl EffectiveSpecs {
     ///
     /// # Errors
     /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the effective
-    /// Trigger cannot activate the effective Verifier, the schedule mapping
-    /// refusal of [`VerifierSpec::validate_schedule`],
+    /// Trigger cannot activate the effective Verifier,
     /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a `schedule` Trigger cannot
     /// be armed,
     /// the Operator shape and connection refusals of `check_operator`, and
@@ -238,35 +306,53 @@ impl EffectiveSpecs {
         for submission in submissions {
             let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-            for site in spec.binding_sites().iter().filter(|site| !site.nested) {
+            let sites: Vec<_> = spec
+                .binding_sites()
+                .into_iter()
+                .filter(|site| !site.nested)
+                .collect();
+            let subjects = site_subjects(&spec);
+            for (site_index, site) in sites.iter().enumerate() {
                 for (index, binding) in site.bindings.iter().enumerate() {
                     let field = format!("{}[{index}]", site.field);
-                    self.validate_binding(conn, binding, &field).await?;
+                    let group = GroupSite {
+                        sites: &sites,
+                        subjects: &subjects,
+                        site: site_index,
+                    };
+                    self.validate_binding(conn, binding, &field, group).await?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Check one binding's effective Trigger pairing, schedule, and `on_failure` actions.
+    /// Check one binding's effective Trigger pairing, schedule, group sources,
+    /// and reaction Operators.
     ///
     /// A binding without `runs_on` is explicit-only: it has no Trigger to pair,
-    /// so only its Verifier and `on_failure` actions are checked.
+    /// so only its Verifier and Operators are checked.
     ///
     /// A `schedule` Trigger must parse as a five-field cron in a known IANA
     /// zone with a future occurrence, because the projected binding arms its
-    /// cursor from that schedule on the owner's first machine exchange.
+    /// cursor from that schedule on the owner's first machine exchange. A
+    /// Verifier with source inputs is bound only by a `group_end` Trigger,
+    /// which reacts through `on_verdict_change` alone and resolves its sources
+    /// through [`Self::validate_sources`]; `on_verdict_change` belongs to a
+    /// `group_end` binding only.
     ///
     /// # Errors
     /// Returns the activation-mismatch and Operator refusals
     /// documented on [`EffectiveSpecs::validate_bindings`],
-    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unarmable schedule, plus
-    /// any registry read failure raised while loading a referenced body.
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unarmable schedule, the
+    /// source refusals of [`Self::validate_sources`], plus any registry read
+    /// failure raised while loading a referenced body.
     async fn validate_binding(
         &mut self,
         conn: &mut TenantConn<'_>,
         binding: &VerificationBinding,
         field: &str,
+        group: GroupSite<'_, '_>,
     ) -> Result<(), WyrdError> {
         let verifier = self.load(conn, Some(&binding.verifier)).await?;
         let trigger = match &binding.runs_on {
@@ -274,11 +360,50 @@ impl EffectiveSpecs {
             Some(InlineableRef::Inline(trigger)) => Some(Spec::Trigger((**trigger).clone())),
             Some(reference) => self.load(conn, reference.to_durable().as_ref()).await?,
         };
+        let group_end = matches!(
+            &trigger,
+            Some(Spec::Trigger(TriggerSpec {
+                activation: TriggerActivation::GroupEnd { .. },
+                ..
+            }))
+        );
+        let mismatch = |field: String, reason: &str| WyrdError::SpecTriggerActivationMismatch {
+            message: format!("{field} {reason}"),
+            details: json!({ "field": field }),
+        };
+        if group_end && !binding.on_failure.is_empty() {
+            return Err(mismatch(
+                format!("{field}.on_failure"),
+                "is not allowed on a group_end binding; react through on_verdict_change",
+            ));
+        }
+        if !group_end && !binding.on_verdict_change.is_empty() {
+            return Err(mismatch(
+                format!("{field}.on_verdict_change"),
+                "requires a group_end Trigger",
+            ));
+        }
+        if let Some(Spec::Verifier(verifier)) = &verifier {
+            let sources = verifier
+                .inputs
+                .values()
+                .any(|slot| matches!(slot, InputSlot::Source(_)));
+            if sources != group_end {
+                return Err(mismatch(
+                    format!("{field}.runs_on"),
+                    "must be a group_end Trigger exactly when the Verifier declares source inputs",
+                ));
+            }
+            if group_end {
+                self.validate_sources(conn, binding, verifier, field, group)
+                    .await?;
+            }
+        }
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)
             && matches!(trigger.activation, TriggerActivation::Schedule { .. })
         {
-            check_activation(verifier, binding, field)?;
+            check_activation(verifier, field)?;
         }
         if let Some(Spec::Trigger(TriggerSpec {
             activation: TriggerActivation::Schedule { cron, tz },
@@ -291,21 +416,138 @@ impl EffectiveSpecs {
                     WyrdError::registry_invalid_card_spec(format!("{field}.runs_on: {error}"))
                 })?;
         }
-        for (index, operator) in binding.on_failure.iter().enumerate() {
-            let operator = match operator {
-                InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
-                reference => self.load(conn, reference.to_durable().as_ref()).await?,
-            };
-            let field = format!("{field}.on_failure[{index}]");
-            if let Some(Spec::Operator(operator)) = operator {
-                let verifier = match &verifier {
-                    Some(Spec::Verifier(verifier)) => Some(verifier),
-                    _ => None,
+        for (list, operators) in binding.operator_lists() {
+            for (index, operator) in operators.iter().enumerate() {
+                let operator = match operator {
+                    InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
+                    reference => self.load(conn, reference.to_durable().as_ref()).await?,
                 };
-                check_operator(conn, &operator, &field, verifier).await?;
+                let field = format!("{field}.{list}[{index}]");
+                if let Some(Spec::Operator(operator)) = operator {
+                    let verifier = match &verifier {
+                        Some(Spec::Verifier(verifier)) => Some(verifier),
+                        _ => None,
+                    };
+                    check_operator(conn, &operator, &field, verifier).await?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Resolve and check every source input of a `group_end` binding's Verifier.
+    ///
+    /// Each `verifiers.<name>...` source resolves through [`source_binding`]
+    /// to exactly one binding of the same site, whose exact Verifier must
+    /// declare the referenced slot or requirement. Following sources from
+    /// there must never lead back to this binding's own Verifier. The matched
+    /// binding's recorded tuple (subject Card, Verifier) must also be unique
+    /// across the owner's sites, because recorded rows carry no occurrence
+    /// and could not be told apart. Only the bindings a group lookup uses are
+    /// checked.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VALIDATION` with rule `source` at the declaring input for
+    /// zero or several matching bindings, an absent slot or requirement, a
+    /// cycle, or an ambiguous recorded tuple, plus any registry read failure.
+    async fn validate_sources(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        binding: &VerificationBinding,
+        verifier: &VerifierSpec,
+        field: &str,
+        group: GroupSite<'_, '_>,
+    ) -> Result<(), WyrdError> {
+        let site = group.sites[group.site].bindings;
+        let own = binding.verifier.as_card_ref().map(|own| &own.name);
+        for (slot, input) in &verifier.inputs {
+            let InputSlot::Source(text) = input else {
+                continue;
+            };
+            let refuse = |reason: String| WyrdError::Validation {
+                message: format!("{field}: inputs.{slot} {reason}"),
+                details: json!({ "rule": "source", "path": format!("inputs.{slot}"), "field": field }),
+            };
+            let reference = text.parse().map_err(|error| refuse(error.to_string()))?;
+            let source = source_binding(site, &reference.verifier).map_err(|count| {
+                refuse(format!(
+                    "matches {count} bindings of Verifier {} on this site; exactly one is required",
+                    reference.verifier
+                ))
+            })?;
+            let Some(Spec::Verifier(target)) = self.load(conn, Some(&source.verifier)).await?
+            else {
+                return Err(refuse(format!(
+                    "names Verifier {} whose spec is not available",
+                    reference.verifier
+                )));
+            };
+            let declared = match &reference.field {
+                SourceField::Input(name) => target.inputs.contains_key(name),
+                SourceField::Outcome(id) => target.all_requirements().any(|r| &r.id == id),
+            };
+            if !declared {
+                return Err(refuse(format!(
+                    "names a slot or requirement Verifier {} does not declare",
+                    reference.verifier
+                )));
+            }
+            if Some(&reference.verifier) == own || self.reaches(conn, site, &target, own).await? {
+                return Err(refuse("forms a source cycle".to_owned()));
+            }
+            if group.ambiguous(source) {
+                return Err(refuse(format!(
+                    "names Verifier {} whose subject and version are bound on another site too",
+                    reference.verifier
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether following `start`'s sources within `site` reaches `target`.
+    ///
+    /// Each Verifier is visited once, so the walk ends after at most one load
+    /// per binding of the site. A source that does not resolve to exactly one
+    /// binding is that binding's own refusal and ends its branch.
+    ///
+    /// # Errors
+    /// Returns the registry error from loading a referenced Verifier.
+    async fn reaches(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        site: &[VerificationBinding],
+        start: &VerifierSpec,
+        target: Option<&CardName>,
+    ) -> Result<bool, WyrdError> {
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![start.clone()];
+        while let Some(verifier) = pending.pop() {
+            for input in verifier.inputs.values() {
+                let InputSlot::Source(text) = input else {
+                    continue;
+                };
+                let Ok(reference) = text.parse() else {
+                    continue;
+                };
+                if &reference.verifier == target {
+                    return Ok(true);
+                }
+                let Ok(source) = source_binding(site, &reference.verifier) else {
+                    continue;
+                };
+                if seen.insert(reference.verifier)
+                    && let Some(Spec::Verifier(next)) =
+                        self.load(conn, Some(&source.verifier)).await?
+                {
+                    pending.push(next);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Check every submitted PSI or SPC drift check against its effective

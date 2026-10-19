@@ -38,6 +38,45 @@ pub fn canonical_artifact_manifest_hash(
     Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
 }
 
+/// Refuse an artifact manifest that repeats a path or nests one path under
+/// another.
+///
+/// A publication cannot hold both `a` and `a/b`: the first is a file while
+/// the second needs it to be a directory. Registration enforces this at the
+/// server; the loader runs the same check for an earlier, source-aware
+/// diagnostic. Paths use `/` as their canonical separator, so each path's
+/// ancestors are its prefixes ending before a `/`, compared without
+/// platform path semantics.
+///
+/// # Errors
+///
+/// Returns [`crate::error::WyrdError::RegistryInvalidArtifactPath`] naming the
+/// first repeated or nested path.
+pub fn validate_artifact_manifest(
+    artifacts: &[ArtifactManifestEntry],
+) -> Result<(), crate::error::WyrdError> {
+    let conflict = |path: &str, with: &str| crate::error::WyrdError::RegistryInvalidArtifactPath {
+        message: format!("artifact path {path} conflicts with {with}"),
+        details: serde_json::json!({ "relative_path": path, "conflicts_with": with }),
+    };
+    let mut paths = std::collections::HashSet::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let path = artifact.relative_path.as_str();
+        if !paths.insert(path) {
+            return Err(conflict(path, path));
+        }
+    }
+    for path in &paths {
+        if let Some((end, _)) = path
+            .match_indices('/')
+            .find(|(end, _)| paths.contains(&path[..*end]))
+        {
+            return Err(conflict(path, &path[..end]));
+        }
+    }
+    Ok(())
+}
+
 /// One card submitted for registration.
 ///
 /// The server derives relationships, lifecycle status, resolved version, and
@@ -182,7 +221,7 @@ pub struct RegistrationReplaySeed {
 mod tests {
     use super::{
         ArtifactManifestEntry, CardSubmission, CreateCardRequest, CreateCardResponse,
-        RegistrationReceipt, canonical_artifact_manifest_hash,
+        RegistrationReceipt, canonical_artifact_manifest_hash, validate_artifact_manifest,
     };
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
@@ -210,6 +249,31 @@ mod tests {
             canonical_artifact_manifest_hash(&first).expect("first manifest hashes"),
             canonical_artifact_manifest_hash(&second).expect("second manifest hashes"),
         );
+    }
+
+    /// Refuse repeated and nested artifact paths while a sibling that only
+    /// shares a name prefix, such as `weights-v2` beside `weights/a.bin`,
+    /// is accepted.
+    ///
+    /// # Panics
+    /// Panics when a conflicting manifest is accepted or a valid one refused.
+    #[test]
+    fn validate_artifact_manifest_refuses_repeated_and_nested_paths() {
+        for paths in [
+            &["a.txt", "a.txt"][..],
+            &["weights", "weights-v2", "weights/a.bin"],
+        ] {
+            let manifest: Vec<_> = paths.iter().map(|path| artifact(path)).collect();
+            let refused =
+                validate_artifact_manifest(&manifest).expect_err("the manifest conflicts");
+            assert_eq!(refused.code(), "WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH");
+        }
+        let valid = [
+            artifact("weights-v2"),
+            artifact("weights/a.bin"),
+            artifact("weights/b/c.bin"),
+        ];
+        validate_artifact_manifest(&valid).expect("distinct paths are accepted");
     }
 
     fn submission() -> CardSubmission {

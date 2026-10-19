@@ -124,3 +124,70 @@ def test_path_only_operator_without_connection_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as raised:
         cards.register_from_path(FIXTURES / "invalid/operator-path-without-connection.yaml")
     assert raised.value.code == "WYRD_SPEC_400_INVALID_OPERATOR"
+
+
+@pytest.mark.parametrize(
+    "file,field,kind,name",
+    [
+        (
+            "scheduled-binding-empty-inputs.yaml",
+            "verified_by[0].inputs",
+            "Service",
+            "budget-with-empty-inputs",
+        ),
+        (
+            "scheduled-binding-exact-inputs.yaml",
+            "verified_by[0].inputs",
+            "Service",
+            "budget-with-exact-inputs",
+        ),
+        ("optional-samples-slot.yaml", "inputs.latency", "Verifier", "optional-latency"),
+    ],
+)
+def test_scheduled_binding_rejects_redundant_inputs(
+    cards: Cards, file: str, field: str, kind: str, name: str
+) -> None:
+    with pytest.raises(WyrdError) as raised:
+        cards.register_from_path(FIXTURES / "invalid" / file)
+    assert field in json.dumps(raised.value.details), raised.value.details
+    with pytest.raises(WyrdError) as absent:
+        cards.resolve_latest(kind, "default", name)
+    assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+
+@pytest.mark.parametrize(
+    "sample,verdict,outcomes",
+    [
+        (
+            {"latency": 120, "error_rate": 0.01},
+            "failed",
+            {"latency-within-budget": "failed", "error-rate-within-budget": "passed"},
+        ),
+        (
+            {"latency": 80},
+            "inconclusive",
+            {"latency-within-budget": "passed", "error-rate-within-budget": "inconclusive"},
+        ),
+    ],
+)
+def test_scheduled_binding_scores_every_requirement(
+    latency_budget: Watch, sample: dict[str, Any], verdict: str, outcomes: dict[str, str]
+) -> None:
+    observe = latency_budget.state.run().observe
+    for _ in range(10):
+        assert isinstance(observe.submit(latency_budget.verifier, **sample), verify.Recorded)
+    latency_budget.state.flush()
+    latency_budget.server.flush_bifrost()
+
+    result = scheduled_result(latency_budget.server, latency_budget.binding_id, WAIT_SECONDS)
+
+    assert result.verdict == verdict
+    assert result.subject == latency_budget.root
+    assert result.verifier.name == "latency-error-budget"
+    assert {
+        requirement["id"]: requirement["outcome"] for requirement in result.requirements
+    } == outcomes
+    for requirement in result.requirements:
+        assert requirement["provenance"]["kind"] == "drift"
+        window = requirement["provenance"]["window"]
+        assert window["start"] < window["end"], window

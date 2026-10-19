@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::ids::SlotName;
+use crate::ids::{CardName, SlotName};
 use crate::verification::TaskId;
 
 /// One parsed scope reference.
@@ -171,6 +171,175 @@ impl Reference {
             return Err(fail("only inputs and step outputs accept child selectors"));
         }
         Ok(Self { root, path })
+    }
+}
+
+/// A group Verifier's source declaration as authored: the text of one
+/// input slot declared as a string rather than a typed slot.
+///
+/// Decoding accepts any string so registration can refuse a malformed source
+/// at its own `inputs.<slot>` field; [`SourceText::parse`] yields the typed
+/// [`SourceReference`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceText(
+    /// The authored `verifiers.<name>...` text, kept verbatim so coverage
+    /// pins exactly what the author wrote.
+    String,
+);
+
+impl SourceText {
+    /// The authored text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse the authored text as a source reference.
+    ///
+    /// # Errors
+    /// As [`SourceReference::parse`].
+    pub fn parse(&self) -> Result<SourceReference, ReferenceError> {
+        SourceReference::parse(&self.0)
+    }
+}
+
+impl schemars::JsonSchema for SourceText {
+    /// Names the source schema in generated definitions.
+    fn schema_name() -> String {
+        "SourceText".to_owned()
+    }
+
+    /// Describes a source declaration as a string naming its two forms.
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, SchemaObject};
+
+        SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(SOURCE_DESCRIPTION.to_owned()),
+                ..Metadata::default()
+            })),
+            instance_type: Some(InstanceType::String.into()),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for SourceText {
+    /// Describes a source declaration as its authored string form.
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some(SOURCE_DESCRIPTION))
+            .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for SourceText {}
+
+/// Generated-schema description of a source declaration.
+const SOURCE_DESCRIPTION: &str = "Group source reference: verifiers.<name>.inputs.<slot> or \
+     verifiers.<name>.requirements.<requirement>.outcome, selecting one whole slot or \
+     requirement outcome per source execution.";
+
+/// One parsed group source reference: a whole input slot or one
+/// requirement's outcome of the same-owner Verifier named `verifier`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SourceReference {
+    /// The source Verifier Card's `metadata.name`.
+    pub verifier: CardName,
+    /// What each source execution contributes.
+    pub field: SourceField,
+}
+
+/// The value one source execution contributes to a group input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceField {
+    /// `inputs.<slot>`: the execution's whole supplied slot value.
+    Input(SlotName),
+    /// `requirements.<requirement>.outcome`: the requirement's outcome.
+    Outcome(TaskId),
+}
+
+impl SourceReference {
+    /// Parses `verifiers.<name>.inputs.<slot>` or
+    /// `verifiers.<name>.requirements.<requirement>.outcome`.
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] for another root, an invalid Verifier name,
+    /// slot or requirement ID, a `.reason` field, and any child field, index
+    /// or wildcard after the whole slot or outcome.
+    pub fn parse(text: &str) -> Result<Self, ReferenceError> {
+        let fail = |reason| ReferenceError {
+            reference: text.to_owned(),
+            reason,
+        };
+        let mut tokens = Tokens::new(text);
+        if tokens.name() != Some("verifiers") {
+            return Err(fail(
+                "a source must be verifiers.<name>.inputs.<slot> or verifiers.<name>.requirements.<id>.outcome",
+            ));
+        }
+        let verifier = tokens
+            .dotted()
+            .and_then(|name| CardName::new(name).ok())
+            .ok_or_else(|| fail("expected verifiers.<name> naming a Verifier Card"))?;
+        let field = match tokens.dotted() {
+            Some("inputs") => SourceField::Input(
+                tokens
+                    .dotted()
+                    .and_then(|slot| SlotName::new(slot).ok())
+                    .ok_or_else(|| fail("expected inputs.<slot>"))?,
+            ),
+            Some("requirements") => {
+                let requirement = tokens
+                    .dotted()
+                    .and_then(|id| TaskId::new(id).ok())
+                    .ok_or_else(|| fail("expected requirements.<id>"))?;
+                match tokens.dotted() {
+                    Some("outcome") => SourceField::Outcome(requirement),
+                    Some("reason") => {
+                        return Err(fail(
+                            "a source selects a requirement outcome only; .reason is not selectable",
+                        ));
+                    }
+                    _ => return Err(fail("expected requirements.<id>.outcome")),
+                }
+            }
+            _ => {
+                return Err(fail(
+                    "expected .inputs.<slot> or .requirements.<id>.outcome",
+                ));
+            }
+        };
+        if !tokens.rest.is_empty() {
+            return Err(fail(
+                "a source selects a whole slot or outcome; child fields, indexes and wildcards are refused",
+            ));
+        }
+        Ok(Self { verifier, field })
+    }
+}
+
+impl fmt::Display for SourceReference {
+    /// Writes the canonical source text, which [`SourceReference::parse`]
+    /// reads back to an equal value.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] when the formatter's underlying writer fails.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.field {
+            SourceField::Input(slot) => write!(f, "verifiers.{}.inputs.{slot}", self.verifier),
+            SourceField::Outcome(requirement) => write!(
+                f,
+                "verifiers.{}.requirements.{}.outcome",
+                self.verifier,
+                requirement.as_str()
+            ),
+        }
     }
 }
 
@@ -359,6 +528,34 @@ mod tests {
     //! Reference text parsing, printing, and serde refusals.
 
     use super::*;
+
+    /// Both source forms parse and print back; child selectors, `.reason`,
+    /// and other roots are refused.
+    ///
+    /// # Panics
+    /// Panics when a source form is classified incorrectly.
+    #[test]
+    fn source_reference_accepts_only_whole_slots_and_outcomes() {
+        for text in [
+            "verifiers.turn-verifier.inputs.turn",
+            "verifiers.refund-turn.requirements.valid-fact.outcome",
+        ] {
+            let parsed = SourceReference::parse(text).expect(text);
+            assert_eq!(parsed.to_string(), text);
+        }
+        for text in [
+            "verifiers.turn-verifier.inputs.turn.text",
+            "verifiers.turn-verifier.inputs.turn[0]",
+            "verifiers.turn-verifier.inputs.turn[*]",
+            "verifiers.refund-turn.requirements.valid-fact.reason",
+            "verifiers.refund-turn.requirements.valid-fact.outcome.x",
+            "verifiers.refund-turn.steps.a.output",
+            "verifiers.X.inputs.turn",
+            "inputs.turn",
+        ] {
+            assert!(SourceReference::parse(text).is_err(), "{text}");
+        }
+    }
 
     /// Every approved root and selector form parses and prints back unchanged.
     ///

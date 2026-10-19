@@ -54,7 +54,11 @@ quality failure, never a pass.
 
 ## Agent judges
 
-- A check-position Agent is tool-less and returns the closed Verdict schema
+- A check-position Agent is tool-less unless it explicitly declares
+  `bifrost.query`, its only permitted tool, which needs the ordinary
+  tool-invoke, query and payload permissions, has no workspace or mutating
+  tool, and reads live span data outside the pinned snapshot. It returns the
+  closed Verdict schema
   `{outcome: passed | failed | inconclusive, reason, citations}`; parsing or
   missing-evidence failure is `inconclusive`, never a negative judgment.
 - A pass needs at least one citation the server validates against pinned
@@ -65,8 +69,8 @@ quality failure, never a pass.
 - Test position, verbosity, reference, provider, and model-version sensitivity.
 - Keep bounded retries visible. A retry that changes a judgment is reliability
   evidence, not noise to discard.
-- Do not let a judge invoke tools, mutate the subject, retrieve
-  unrestricted context, or decide deployment solely from an opaque score.
+- Do not let a judge invoke any tool but a declared `bifrost.query`, mutate
+  the subject, retrieve unrestricted context, or decide deployment solely from an opaque score.
 
 Pairwise comparison is appropriate only with controlled ordering and a
 decision that is genuinely relative. Reference-based grading requires a valid

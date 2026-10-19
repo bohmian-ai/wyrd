@@ -9,5 +9,3 @@ spec:
   verified_by:
     - verifier: ./latency-control.yaml
       runs_on: ./daily.yaml
-      inputs:
-        latency: {features: [latency]}

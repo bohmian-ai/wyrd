@@ -85,3 +85,8 @@ state.get("agent").prompt();
 const notString: string = state.agent("agent").prompt();
 void unnarrowed;
 void notString;
+
+// An input slot is a typed slot object or a source reference string; there is no source object.
+expectTypeOf("verifiers.turn.inputs.message").toExtend<CardTypes.InputSlot>();
+expectTypeOf({ type: "trace" } as const).toExtend<CardTypes.InputSlot>();
+expectTypeOf({ type: "source" } as const).not.toExtend<CardTypes.InputSlot>();

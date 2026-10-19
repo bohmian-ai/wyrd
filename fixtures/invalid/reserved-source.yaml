@@ -1,0 +1,15 @@
+# A source slot may not take the reserved group_id name either.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: reserved-source
+  version: 1.0.0
+  space: default
+spec:
+  description: A conversation Verifier whose source slot takes the reserved group_id name.
+  inputs:
+    group_id: verifiers.turn-check.inputs.turn
+  requirements:
+    - id: present
+      statement: The conversation has turns
+      check: {kind: assert, path: inputs.group_id, operator: is_not_null}

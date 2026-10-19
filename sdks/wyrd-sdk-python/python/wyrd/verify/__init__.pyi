@@ -320,13 +320,46 @@ ExecutionStatus: TypeAlias = Literal[
     "pending", "running", "retrying", "completed", "cancelled", "timed_out", "errored"
 ]
 
+class FrozenUid(TypedDict):
+    """A dispatch's frozen Operator Card UID."""
+
+    uid: str
+
+class FrozenDigest(TypedDict):
+    """A dispatch's frozen inline Operator spec digest."""
+
+    digest: str
+
+class OperatorDispatchState(TypedDict):
+    """One Operator dispatch's independent delivery state."""
+
+    dispatch_id: str
+    operator: FrozenUid | FrozenDigest
+    status: Literal["pending", "running", "retrying", "delivered", "failed"]
+    error: VerificationError | None
+
+class GroupSourceSnapshot(TypedDict):
+    """One source slot's pinned selection: its declaration and source executions in list order."""
+
+    reference: str
+    execution_ids: list[str]
+
+class GroupSnapshot(TypedDict):
+    """The source snapshot a group execution judges."""
+
+    sources: dict[str, GroupSourceSnapshot]
+
 class ExecutionState(TypedDict):
-    """``Execution.status()``: the lifecycle, terminal error, and visible result."""
+    """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
     execution_id: str
     status: ExecutionStatus
     error: NotRequired[VerificationError]
     result: NotRequired[VerificationResultWire]
+    dispatches: list[OperatorDispatchState]
+    group_id: NotRequired[str]
+    owner_card_uid: NotRequired[str]
+    group: NotRequired[GroupSnapshot]
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.

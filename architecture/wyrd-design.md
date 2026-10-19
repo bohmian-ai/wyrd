@@ -1457,7 +1457,13 @@ restart; caller submission never switches to binding-owner or SYSTEM
 authority. A scheduled execution runs with its binding owner's accepted
 authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
-actor; SYSTEM is never a subject and authorizes nothing extra. Gateway spend
+actor; SYSTEM is never a subject and authorizes nothing extra. The runtime's
+own reads that prepare an execution never depend on owner credentials. These
+are scheduled Drift observation reads and a group's snapshot of its recorded
+verification inputs and results. They run as the tenant's credentialless,
+role-free internal read principal, which holds `bifrost_query:read` only on
+the tables that read needs, with owner and source filters in the statement.
+The owner's activity and authority are checked before such work starts. Gateway spend
 is charged to the subject.
 
 #### Agents, tools, and workspaces

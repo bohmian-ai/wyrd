@@ -1,6 +1,6 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 18
+revision: 19
 status: approved
 ---
 
@@ -42,6 +42,14 @@ records a terminal errored group execution and consumes pending atomically;
 `group_end.after` above one fixed year (365 days) is rejected at write time.
 These decisions supersede prior blanket-retention and unrestricted-duration
 instructions for this remediation; other grouping behavior/tradeoffs are unchanged.
+
+Revision 19 records the owner's explicit approval to separate the verification
+runtime's own reads from the owner's credentials. The owner check before a group starts is
+unchanged. The group snapshot read of Wyrd's verification inputs/results tables
+runs as the tenant's internal read principal, not under the owning Service's
+grants. Work the resulting execution performs keeps the owner's accepted
+authority. A removed or missing owner Bifrost grant can no longer block or
+error the snapshot read.
 
 Current implementation base: `ba92ac9b9` on
 `change/long-horizon-verification-task-001`. Extend the existing
@@ -351,9 +359,25 @@ capacity/configuration/database/query failures retain pending work and are trace
 no partial inputs or synthetic verdict are produced. Existing non-auth enqueue
 refusals remain blocked enqueue outcomes. Other replicas skip the locked item.
 
-Owner activity rejection (including inactive/retired owner or disabled/deleted
-owner principal) and genuine authorization rejection are terminal for that
-pending item. Log the actual reason, record one terminal errored group execution
+Before any snapshot read, the group loop checks the binding owner. Its stored
+Card-bound principal must exist and be active, and its accepted owner authority
+must resolve. The snapshot read itself runs as the tenant's internal read
+principal. This is the existing credentialless, role-free SYSTEM read authority
+used by scheduled Drift reads. It is never issued as a token, and for that tenant
+it holds only `bifrost_query:read` on the registered
+`vala.verification.execution_inputs` and `vala.verification.results` tables.
+The REQ-013 owner/subject/source-Verifier/group filter stays in the statement,
+so the read returns only that owner's eligible rows. Oracle authorizes and audits
+it like any other read. The owner Service needs no Bifrost query grant to have
+its groups verified, and no owner role change can block or refuse the snapshot
+read. Every action the resulting execution performs keeps the owner's accepted
+authority and existing sub/act attribution, including Agent check calls, their
+`bifrost.query` tool reads and gateway spend. A missing owner permission refuses
+that action under existing execution error handling.
+
+Owner activity or authority rejection is terminal for that pending item. This
+covers an inactive/retired owner, a disabled, deleted, expired or revoked owner
+principal, or owner authority that cannot be authenticated. Log the actual reason, record one terminal errored group execution
 and delete pending in the same tenant transaction. If error recording fails,
 roll back and retain pending. Run no Verifier/provider, create no verdict or
 result pointer and dispatch no Operator. A pre-admission error has binding/group/
@@ -362,8 +386,9 @@ actor, structured error and database settlement time; it asserts no accepted
 owner authority and has no source inputs/snapshot. Only this terminal shape may
 omit authority/pinned inputs; every runnable execution retains existing mandatory
 accepted authority and input contracts. No fabricated grant or empty snapshot.
-Missing infrastructure/attribution identities or issuer configuration is a Wyrd
-problem, not authorization rejection, and preserves pending work.
+Missing infrastructure/attribution identities, issuer configuration or any refusal
+of the internal snapshot read is a Wyrd problem, not owner rejection, and
+preserves pending work.
 
 Use existing binding status last_execution_id then execution status/SDK readback
 to expose the error, group ID and absent result/snapshot. Binding status exposes
@@ -543,7 +568,8 @@ new uploaded evidence kind. Bindings gain no activation `scope` and no
 input-selector mapping; group selection lives on the Verifier. REQ-012
 separately removes schedule-binding `inputs`.
 
-Existing authorization applies to invocation and every evidence read; a
+Existing authorization applies to invocation and every caller or Agent evidence
+read. The background group snapshot read is the REQ-004 internal read. A
 `group_id` grants no authority. A group reference cannot widen the accepted
 execution's permission to another Verifier, binding, table or payload. Reads
 of sensitive recorded inputs/results and trace spans require their existing
@@ -990,7 +1016,8 @@ is retired. REQ-015/AC-009 remain required subsequent opt-in benchmarking work;
 TASK-003a must leave its existing driver usable and scenarios configured with
 `after`, but neither implement new benchmark cases nor claim performance PASS.
 The owner explicitly accepted the tradeoffs above. No open material behavior
-decision remains for TASK-003a and its R1 remediation. Revision 18 amends failure
+decision remains for TASK-003a and its R1 remediation. Revision 19 moves the
+group snapshot read to the internal read principal. Revision 18 amends failure
 classification/visibility and write-time duration validation; revision 17's other
 pending-row, batching and capacity seams remain.
 
@@ -1017,6 +1044,7 @@ pending-row, batching and capacity seams remain.
 | 17 | approved | Owner approved explicit background group scheduling: one pending PostgreSQL row per tenant/binding/group, post-ACK due-time upsert, bounded due-row polling, one visible snapshot, transactional execution handoff and row consumption. No repeated Bifrost discovery. New arrivals reschedule; evidence is retained. Ordinary cron and group loops are independent; existing execution capacity also gates snapshots. ACK/query-visibility, SQL backlog and background retry limits are explicit. |
 
 | 18 | approved | Owner approved retaining pending only for blocked enqueue/retryable Wyrd problems; inactive/retired owner or auth rejection records one terminal errored execution and consumes pending atomically, without evaluation/verdict/Operator or fabricated accepted authority/snapshot. Error-write failure retains pending; existing latest-binding/execution status supplies visibility. Owner explicitly capped group_end.after at one year (365 fixed days), rejected at write time; accepted durations remain exact and the hidden SQL clamp is deleted. Other accepted limits unchanged. |
+| 19 | approved | Owner directed that core verification never rely on owner credentials an outside party can remove. The group snapshot read of verification inputs/results runs as the tenant's credentialless, role-free internal read principal: table-scoped `bifrost_query:read`, owner/source filter in the statement. The owner activity/authority check before kickoff and revision 18's terminal errored execution are unchanged. Execution work, including Agent actions/tool reads and gateway spend, keeps the owner's accepted authority and sub/act. The snapshot-read 403 path is removed. Owner explicitly approved this revision. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

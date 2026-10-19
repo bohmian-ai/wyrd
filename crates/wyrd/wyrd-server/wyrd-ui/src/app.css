@@ -39,3 +39,34 @@ body {
   outline: 2px solid var(--declare);
   outline-offset: 3px;
 }
+
+/* Plain state notice for the retained auth and settings pages; the word carries the state. */
+.app-problem {
+  border: 1px dashed var(--muted);
+  border-radius: var(--r);
+  background: var(--surface);
+  padding: 14px;
+  color: var(--text);
+  font: 12px/18px var(--font-sans);
+}
+.app-problem[data-state='error'] {
+  border-color: var(--danger);
+}
+.app-problem[data-state='unauthorized'] {
+  border-color: var(--warn);
+}
+.app-problem strong {
+  display: block;
+  font-size: 13px;
+  font-weight: var(--weight-strong);
+}
+.app-problem p,
+.app-problem code {
+  display: block;
+  margin: 6px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.app-problem code {
+  font: 10px var(--font-mono);
+}

@@ -1,9 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import { error } from '@sveltejs/kit';
-import type { SessionMetadata, Tenant, WyrdProblem } from '$lib/views';
-import { problem } from '../problem';
+import { problem, type WyrdProblem } from '../problem';
 
 export const sessionCookie = 'wyrd_session';
+export type Tenant = { key: string; name: string };
+/** Browser-safe projection of a signed-in session. */
+export type SessionMetadata = {
+  subject: { id: string; name: string };
+  tenants: Tenant[];
+  expiresAt: number;
+};
 export const sessionLifetime = 15 * 60_000;
 export type Membership = Tenant & {
   tenantId: string;

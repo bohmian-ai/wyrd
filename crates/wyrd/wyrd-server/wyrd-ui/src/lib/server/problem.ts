@@ -1,6 +1,16 @@
-import type { WyrdProblem } from '$lib/views';
 import { isHttpError } from '@sveltejs/kit';
 import examples from '../../../../../../wyrd-spec/schemas/ui_problem_examples.json';
+
+/** Safe BFF problem projection. Error authority remains in wyrd-spec. */
+export type WyrdProblem = {
+  type: string;
+  title: string;
+  status: number;
+  detail: string;
+  code: string;
+  details: unknown;
+  remediation: string;
+};
 
 /** Return a fresh safe example generated from the Rust WyrdError projection. */
 export function problem(kind: keyof typeof examples): WyrdProblem {

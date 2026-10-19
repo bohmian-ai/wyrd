@@ -1225,9 +1225,9 @@ description = "Establish this deployment's platform administrative root and prin
 run = "cargo run --locked -p wyrd-server -- init"
 
 [tasks."dev:frontend"]
-description = "Run the local UI on localhost:3000 with a global mock-data toggle"
+description = "Run the local UI on localhost:3000 with the development sign-in identity"
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
-run = "WYRD_UI_LOCAL_AUTH=${WYRD_UI_LOCAL_AUTH:-true} WYRD_UI_MOCK_DATA=${WYRD_UI_MOCK_DATA:-true} pnpm run dev --host 127.0.0.1 --port ${WYRD_UI_PORT:-3000}"
+run = "WYRD_UI_LOCAL_AUTH=${WYRD_UI_LOCAL_AUTH:-true} pnpm run dev --host 127.0.0.1 --port ${WYRD_UI_PORT:-3000}"
 
 [tasks."docs:install"]
 hide = true

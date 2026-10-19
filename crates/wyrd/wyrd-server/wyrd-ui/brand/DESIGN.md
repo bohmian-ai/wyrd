@@ -22,9 +22,7 @@ optimized for dense inspection, comparison, and action. They share identity, tok
 geometry, and state language; only density and layout composition differ.
 
 In the workbench there is **one** set of standardized pieces: a piece is "standardized" only
-when it exists as a contract entry, a real component in `src/lib/components`, and (for
-catalog pieces) a registry entry in `src/lib/registry.ts`, and they agree (enforced by
-`component-contracts.test.ts` and `registry.test.ts`). Contracts marked `status: "spec"` are
+when its contract entry and its real component agree. Contracts marked `status: "spec"` are
 designed but not yet built.
 
 ---
@@ -116,8 +114,7 @@ Two faces, both shipped with each application (`@fontsource/familjen-grotesk`,
 
 Fragment Mono is limited to genuinely machine-shaped values. Prose, labels, and headings are
 never set in mono for flavor. Strong text uses `--weight-strong` (700 light, 600 dark), never a
-literal bold weight. Workbench components reference the `--fm` (mono) / `--fh`
-(heading) shorthands set by `ModeProvider`.
+literal bold weight.
 
 ---
 
@@ -247,11 +244,8 @@ heterogeneous `value`.
 
 1. Add its contract to `components.json` with `status: "spec"` (anatomy, tokens, variants,
    altitude, rules).
-2. Build it in `src/lib/components` against the tokens (no hardcoded hex; 1px rules; 2px
-   radius; no elevation).
-3. Register it in `src/lib/registry.ts` when it is a catalog piece and flip its contract
-   `status` to `built`.
-4. Add it to `/styleguide` and write a test.
+2. Build it against the tokens (no hardcoded hex; 1px rules; 2px radius; no elevation).
+3. Flip its contract `status` to `built` and write a test.
 
 ---
 

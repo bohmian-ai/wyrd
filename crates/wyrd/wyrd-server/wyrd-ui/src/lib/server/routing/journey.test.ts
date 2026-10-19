@@ -13,7 +13,6 @@ beforeAll(async () => {
       env: {
         ...process.env,
         WYRD_UI_LOCAL_AUTH: 'true',
-        WYRD_UI_MOCK_DATA: 'true',
         NO_COLOR: '1'
       },
       stdio: ['ignore', 'pipe', 'pipe']
@@ -56,7 +55,7 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   const entryHtml = await entry.text();
   expect(entryHtml).toContain('Sign in with SSO');
   expect(entryHtml).not.toContain('Research');
-  expect(entryHtml).toContain('Mock data: On');
+  expect(entryHtml).toContain('DEV · Test login');
   const unauthenticated = await fetch(`${origin}/t/acme`, { redirect: 'manual' });
   expect(unauthenticated.status).toBe(303);
   expect(unauthenticated.headers.get('location')).toBe('/');
@@ -93,31 +92,10 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   const otherTab = await fetch(`${origin}/t/acme`, { headers: { cookie } });
   expect(otherTab.status).toBe(200);
   const home = await otherTab.text();
-  expect(home).toContain('Recent changes');
-  expect(home).toContain('Recently viewed Cards');
-  expect(home).toContain('Raise checkout ranking cutoff');
-  expect(home).toContain('checkout-api');
-  expect(home).toContain('Pick work back up');
-  const toggle = (enabled: string, requestOrigin = origin) =>
-    fetch(`${origin}/?/mockData`, {
-      method: 'POST',
-      headers: { accept: 'text/html', cookie, origin: requestOrigin },
-      body: new URLSearchParams({ enabled, returnTo: '/t/acme' }),
-      redirect: 'manual'
-    });
-  expect((await toggle('false', 'https://other.example')).status).toBe(403);
-  const off = await toggle('false');
-  expect(off.status).toBe(303);
-  expect(off.headers.get('location')).toBe('/t/acme');
-  const mockCookie = off.headers.get('set-cookie')!.split(';')[0];
-  const liveHome = await fetch(`${origin}/t/acme`, {
-    headers: { cookie: `${cookie}; ${mockCookie}` }
-  });
-  const liveHtml = await liveHome.text();
-  expect(liveHtml).toContain('Mock data: Off');
-  expect(liveHtml).toContain('server connection is not implemented yet');
-  expect(liveHtml).not.toContain('Raise checkout ranking cutoff');
-  expect((await toggle('true')).status).toBe(303);
+  expect(home).toMatch(/Signed in as <strong[^>]*>Jordan Reyes<\/strong>/);
+  expect(home).toContain('name="tenantKey" value="research"');
+  expect(home).toContain('Sign out');
+  expect(home).not.toMatch(/Recent changes|Recently viewed Cards|checkout/);
   const logoSource = home.match(/<img src="([^"]+)"/)![1];
   const logo = await fetch(new URL(logoSource, origin));
   expect(logo.ok).toBe(true);
@@ -128,12 +106,11 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   expect(icon.headers.get('content-type')).toContain('image/svg+xml');
   expect(await icon.text()).toContain('<svg');
   const research = await fetch(`${origin}/t/research`, { headers: { cookie } });
-  expect(await research.text()).toContain('Nothing needs you right now');
+  expect(await research.text()).toMatch(/<h1[^>]*>Research<\/h1>/);
   const denied = await fetch(`${origin}/t/unknown`, { headers: { cookie } });
   expect(denied.status).toBe(403);
   const deniedHtml = await denied.text();
   expect(deniedHtml).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
-  expect(deniedHtml).not.toContain('Raise checkout ranking cutoff');
   const logout = await fetch(`${origin}/?/logout`, {
     method: 'POST',
     headers: { accept: 'text/html', cookie, origin },
@@ -146,7 +123,7 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   expect(afterLogout.headers.get('location')).toBe('/');
 }, 30_000);
 
-test('mock SSO resolves configured organization and dev access scenarios without anonymous tenant discovery', async () => {
+test('development SSO resolves configured organization and dev access scenarios without anonymous tenant discovery', async () => {
   const post = (action: string, values: Record<string, string>, cookie = '') =>
     fetch(`${origin}/?/${action}`, {
       method: 'POST',
@@ -178,13 +155,5 @@ test('mock SSO resolves configured organization and dev access scenarios without
   const denied = await (await fetch(origin, { headers: { cookie: noAccessCookie } })).text();
   expect(denied).toContain('No tenant access');
   expect(denied).not.toContain('Research');
-  const disabled = await post('login', {}, 'wyrd_ui_mock_data=false');
-  expect(disabled.status).toBe(502);
-  expect(disabled.headers.get('set-cookie')).toBeNull();
-  const unavailable = await disabled.text();
-  expect(unavailable).toContain('SSO connection is not connected');
-  expect(unavailable).toContain('data-state="error"');
-  expect(unavailable).not.toContain('data-state="unauthorized"');
-  expect(unavailable).not.toContain('Continue to Wyrd');
   expect((await post('loginScenario', { scenario: 'arbitrary' })).status).toBe(403);
 });

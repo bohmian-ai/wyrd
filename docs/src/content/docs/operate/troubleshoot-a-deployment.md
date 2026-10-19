@@ -38,7 +38,7 @@ If the platform root exists but tenant creation failed, rerun `wyrd server dev` 
 
 A failed `server dev` stops its server, so recovery starts the installed server directly.
 
-1. Start the installed server with the same database URL. On macOS, also set `WYRD_BIFROST_MEMORY_LIMIT_BYTES` to the output of `sysctl -n hw.memsize`; `server dev` normally supplies it.
+1. Start the installed server with the same database URL.
 
    ```bash
    export WYRD_SERVER_BIND=127.0.0.1:8080

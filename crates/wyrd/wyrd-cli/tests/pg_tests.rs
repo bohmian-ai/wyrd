@@ -4,7 +4,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use wyrd_client::bifrost::BifrostOptions;
@@ -44,16 +44,20 @@ struct LocalDev {
     grpc: String,
     /// Isolated Bifrost peer listener used by the normal server.
     peer: String,
+    /// Isolated listener and public origin of the production UI's Node BFF.
+    ui: String,
 }
 
 impl LocalDev {
     /// Create a deployment with no migrations, root, tenant, or saved key.
-    /// The installer is already present, as on a later installed-CLI run;
+    /// The installer is already present, as on a later installed-CLI run,
+    /// with the checkout's built production UI as its `ui/` payload;
     /// signed-download behavior has its own release-service journeys.
     ///
     /// # Panics
-    /// Panics when the managed database, compiled binary, or fixture files
-    /// cannot be prepared. Build wyrd-server through mise before this target.
+    /// Panics when the managed database, compiled binary, UI build, or fixture
+    /// files cannot be prepared. Build wyrd-server and the UI through mise
+    /// before this target.
     async fn new() -> Self {
         let database = UnmigratedDatabase::create()
             .await
@@ -77,6 +81,7 @@ impl LocalDev {
             "build the production wyrd-server binary through mise first"
         );
         symlink(&binary, installed.join("wyrd-server")).expect("installed executable fixture");
+        symlink(ui_build(), installed.join("ui")).expect("installed UI fixture");
         symlink(format!("versions/{version}"), root.join("current")).expect("active version");
         Self {
             child: None,
@@ -88,6 +93,7 @@ impl LocalDev {
             bind: free_bind(),
             grpc: free_bind(),
             peer: free_bind(),
+            ui: free_bind(),
         }
     }
 
@@ -106,15 +112,18 @@ impl LocalDev {
             .env("WYRD_SERVER_BIND", &self.bind)
             .env("WYRD_GRPC_BIND", &self.grpc)
             .env("WYRD_BIFROST_PEER_BIND_ADDR", &self.peer)
+            .env("WYRD_UI_BIND", &self.ui)
             .env("WYRD_METRICS_BIND", "127.0.0.1:0");
         command
     }
 
-    /// Start local setup and wait for its explicit client-ready message.
+    /// Start local setup and wait for its explicit client-ready message,
+    /// which names the production UI's address.
     ///
     /// # Panics
-    /// Panics when startup fails, hangs beyond its readiness budget, or puts
-    /// credentials in stdout. An unsuccessful child is settled before panic.
+    /// Panics when startup fails, hangs beyond its readiness budget, omits
+    /// the UI, or puts credentials in stdout. An unsuccessful child is
+    /// settled before panic.
     async fn start(&mut self, hosts: &[&str]) {
         let mut command = self.command();
         command.args(["server", "dev", "--tenant", "local"]);
@@ -172,6 +181,10 @@ impl LocalDev {
             !printed.contains("wyrd_sk_") && !printed.contains("wyrd_global_"),
             "startup stdout carries no secrets"
         );
+        assert!(
+            printed.contains(&format!("http://{}", self.ui)),
+            "the ready message names the UI: {printed}"
+        );
         self.stdout = Some(tokio::spawn(async move {
             let mut remainder = String::new();
             stdout
@@ -185,12 +198,12 @@ impl LocalDev {
         self.child = Some(child);
     }
 
-    /// Interrupt only the CLI and prove it settles its owned server,
+    /// Interrupt only the CLI and prove it settles its owned server and UI,
     /// returning its captured stdout and stderr for further leak checks.
     ///
     /// # Panics
     /// Panics when interruption fails, the CLI reports a different status,
-    /// credentials reach output, or the server listener remains active.
+    /// credentials reach output, or the server or UI listener remains active.
     async fn stop(&mut self, signal: &str) -> String {
         let mut child = self.child.take().expect("running CLI");
         let pid = child.id().expect("live CLI pid");
@@ -233,7 +246,104 @@ impl LocalDev {
             TcpListener::bind(&self.bind).is_ok(),
             "the server's listener is closed after interrupting its CLI"
         );
+        assert!(
+            TcpListener::bind(&self.ui).is_ok(),
+            "the UI's listener is closed after interrupting its CLI"
+        );
         stdout + &stderr
+    }
+
+    /// Use the production UI at its own origin as a browser does: the
+    /// authorization server's browser pages answer there under that origin,
+    /// and API-key recovery sign-in with the saved key opens the tenant's page.
+    ///
+    /// # Panics
+    /// Panics when `/auth` is not forwarded to the server under the UI's
+    /// origin, the sign-in is refused or sets no session, or the signed-in
+    /// page does not load.
+    async fn sign_in_through_ui(&self) {
+        let origin = format!("http://{}", self.ui);
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("browser client");
+        let device = browser
+            .get(format!("{origin}/auth/device?tenant=local&user_code=ABCD-EFGH"))
+            .send()
+            .await
+            .expect("device page at the UI origin");
+        assert_eq!(device.status(), 200);
+        assert!(
+            device
+                .text()
+                .await
+                .expect("device page")
+                .contains("Approve a Wyrd CLI login"),
+            "the server's device page answered"
+        );
+        // The server accepts only a form posted from the origin it derives,
+        // so a code refusal rather than a cross-origin 403 proves the UI's
+        // origin reached it.
+        let unknown = browser
+            .post(format!("{origin}/auth/device"))
+            .header("origin", &origin)
+            .form(&[
+                ("tenant", "local"),
+                ("user_code", "ABCD-EFGH"),
+                ("decision", "approve"),
+            ])
+            .send()
+            .await
+            .expect("device approval at the UI origin");
+        assert_eq!(unknown.status(), 400);
+        let key = GlobalConfig::local_api_key(&self.environment())
+            .expect("protected key")
+            .expect("key saved");
+        let signed_in = browser
+            .post(format!("{origin}/t/local/login/api-key"))
+            .header("origin", &origin)
+            .header("accept", "text/html")
+            .form(&[("apiKey", key.expose_secret())])
+            .send()
+            .await
+            .expect("API-key sign-in");
+        if signed_in.status() != 303 {
+            panic!(
+                "API-key sign-in answered {}: {}",
+                signed_in.status(),
+                signed_in.text().await.unwrap_or_default()
+            );
+        }
+        assert_eq!(
+            signed_in
+                .headers()
+                .get("location")
+                .map(|value| value.as_bytes()),
+            Some(b"/t/local".as_slice())
+        );
+        let session = signed_in
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|cookie| cookie.to_str().ok()?.split(';').next())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(!session.is_empty(), "sign-in sets the session cookie");
+        let page = browser
+            .get(format!("{origin}/t/local"))
+            .header("cookie", session)
+            .send()
+            .await
+            .expect("signed-in tenant page");
+        assert_eq!(page.status(), 200);
+        assert!(
+            !page
+                .text()
+                .await
+                .expect("tenant page")
+                .contains(key.expose_secret()),
+            "the page carries no credential"
+        );
     }
 
     /// Run a fresh `wyrd <args>` that reads the saved local files, piping
@@ -279,6 +389,19 @@ impl LocalDev {
     }
 }
 
+/// The checkout's production UI build, installed as the release's `ui/`.
+///
+/// # Panics
+/// Panics when the UI has not been built through mise.
+fn ui_build() -> PathBuf {
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wyrd-server/wyrd-ui");
+    assert!(
+        ui.join("build/index.js").is_file(),
+        "build the production UI through mise first"
+    );
+    ui
+}
+
 /// Reserve one loopback address for a child listener through the shared
 /// test-port reserver, whose cross-process claim keeps every sibling test
 /// process, `WyrdTestServer` included, off the same port until this process
@@ -293,8 +416,8 @@ fn free_bind() -> String {
 }
 
 /// First use migrates an empty database, saves a private key and both
-/// endpoints, and supports fresh CLI writes and client reads outside the
-/// checkout. A stale saved gRPC destination is replaced by the selected
+/// endpoints, serves the production UI with its sign-in, and supports fresh
+/// CLI writes and client reads outside the checkout. A stale saved gRPC destination is replaced by the selected
 /// custom loopback listener, which also governs a non-loopback server-file
 /// setting, and a fresh saved client writes Bifrost rows over it.
 ///
@@ -328,6 +451,7 @@ async fn server_dev_first_run_is_client_ready() {
     )
     .expect("non-loopback server file");
     local.start(&[]).await;
+    local.sign_in_through_ui().await;
     let saved = GlobalConfig::load_in(&local.environment())
         .expect("saved config")
         .client;
@@ -430,9 +554,10 @@ async fn server_dev_first_run_is_client_ready() {
 }
 
 /// Reruns retain the active release and key; a failed one-time save does not
-/// turn a retry into another issuance. Missing input and a non-loopback
-/// public gRPC bind are refused before setup, and an explicit host selected
-/// on a later start is still connected.
+/// turn a retry into another issuance. Missing input, a non-loopback public
+/// gRPC bind, a missing or incompatible system Node, a release without the
+/// production UI, and an occupied UI listener are refused before setup, and
+/// an explicit host selected on a later start is still connected.
 ///
 /// # Panics
 /// Panics when a retry changes persisted identity or exposes credentials.
@@ -536,6 +661,65 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     assert!(!hardened.status.success());
     let errors = String::from_utf8_lossy(&hardened.stderr);
     assert!(errors.contains("readiness"), "{errors}");
+    assert!(TcpListener::bind(&local.bind).is_ok());
+    assert!(TcpListener::bind(&local.ui).is_ok());
+    let tools = tempfile::tempdir().expect("PATH without Node");
+    let refused_ui = |output: std::process::Output, expected: &str| {
+        assert!(!output.status.success());
+        let errors = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(errors.contains(expected), "{errors}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("Migrating"),
+            "refused before migration"
+        );
+    };
+    refused_ui(
+        local
+            .command()
+            .env("PATH", tools.path())
+            .args(["server", "dev", "--tenant", "local"])
+            .output()
+            .await
+            .expect("missing Node"),
+        "Node.js",
+    );
+    let old_node = tools.path().join("node");
+    fs::write(&old_node, "#!/bin/sh\necho v18.20.0\n").expect("incompatible Node");
+    fs::set_permissions(&old_node, fs::Permissions::from_mode(0o755)).expect("executable");
+    refused_ui(
+        local
+            .command()
+            .env("PATH", tools.path())
+            .args(["server", "dev", "--tenant", "local"])
+            .output()
+            .await
+            .expect("incompatible Node"),
+        "Node.js",
+    );
+    let payload = local.home.path().join("wyrd/server/current/ui");
+    fs::remove_file(&payload).expect("release without its UI");
+    refused_ui(
+        local
+            .command()
+            .args(["server", "dev", "--tenant", "local"])
+            .output()
+            .await
+            .expect("missing UI payload"),
+        "production UI",
+    );
+    symlink(ui_build(), &payload).expect("restore the UI payload");
+    let occupied = TcpListener::bind(&local.ui).expect("occupy the UI listener");
+    refused_ui(
+        local
+            .command()
+            .args(["server", "dev", "--tenant", "local"])
+            .output()
+            .await
+            .expect("occupied UI listener"),
+        "WYRD_UI_BIND",
+    );
+    drop(occupied);
+    assert!(!local.home.path().join("wyrd/credentials.toml").exists());
     assert!(TcpListener::bind(&local.bind).is_ok());
     local.start(&[]).await;
     local.stop("-INT").await;

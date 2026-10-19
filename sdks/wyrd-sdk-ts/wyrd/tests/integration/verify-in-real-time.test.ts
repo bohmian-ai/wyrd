@@ -1014,6 +1014,9 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
   });
   const registeredNeighbor = await registerAssistant(neighborClient);
   const neighbor = assistantAs(registeredNeighbor, WyrdClient.connect({ credential: registeredNeighbor.key }));
+  const support = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
+  const pressured = { answer: "pressured" };
+  const grouping = { positional: true, group_id: "pressured" };
   server.flushBifrost();
 
   const burst: Promise<VerificationResult>[] = [];
@@ -1055,24 +1058,36 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     status: 429,
     details: { retry_after_seconds: 1 },
   };
-  const grouping = { group_id: "pressured" };
+  const groupedRun = support.state.run("agent");
   await expect(refusedRun.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
   await expect(refusedRun.observe.submit("answer-check", { answer: "yes" })).rejects.toMatchObject(refusal);
-  await expect(refusedRun.observe.verify("answer-check", { answer: "yes" }, grouping)).rejects.toMatchObject(refusal);
-  await expect(refusedRun.observe.submit("answer-check", { answer: "yes" }, grouping)).rejects.toMatchObject(refusal);
+  await expect(groupedRun.observe.verify("turn-check", pressured, grouping)).rejects.toMatchObject(refusal);
+  await expect(groupedRun.observe.submit("turn-check", pressured, grouping)).rejects.toMatchObject(refusal);
   expect(finished, "the burst's judgments are still in flight").toEqual([]);
   for (const judged of await Promise.all(burst)) {
     expect(judged.outcome.verdict).toBe("passed");
   }
 
   server.flushBifrost();
-  const recovered = await refusedRun.observe.submit("answer-check", { answer: "yes" }, grouping);
+  const recovered = await refusedRun.observe.submit("answer-check", { answer: "yes" });
   if (recovered.kind !== "queued") {
     throw new Error("Run evidence queues an execution");
   }
   const judged = await recovered.execution.wait({ timeoutMs: WAIT_MS });
   expect(judged.outcome.verdict).toBe("passed");
   expect(judged.run_id).toBe(refusedRun.runId);
+  const turn = await groupedRun.observe.submit("turn-check", pressured, grouping);
+  if (turn.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  await turn.execution.wait({ timeoutMs: WAIT_MS });
+  await support.state.shutdown();
+  const group = await groupExecution(server, support.bindingId, WAIT_MS);
+  expect(
+    [group.group_id, group.group?.sources.turns.execution_ids],
+    "the refused grouped turns staged nothing",
+  ).toEqual(["pressured", [turn.execution.id]]);
+  expect(group.result?.outcome.evidence.turns).toEqual({ kind: "json", value: [pressured] });
 
   server.flushBifrost();
   const rows = await (await Bifrost.connect()).sql(
@@ -1080,18 +1095,5 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     [],
     z.object({ n: z.coerce.number() }),
   );
-  expect(rows).toEqual([{ n: 3 + offered }]);
-
-  const support = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
-  const turn = await support.state
-    .run("agent")
-    .observe.submit("turn-check", { answer: "after drain" }, { positional: true, group_id: "pressured" });
-  if (turn.kind !== "queued") {
-    throw new Error("Run evidence queues an execution");
-  }
-  await turn.execution.wait({ timeoutMs: WAIT_MS });
-  await support.state.shutdown();
-  const group = await groupExecution(server, support.bindingId, WAIT_MS);
-  expect([group.group_id, group.group?.sources.turns.execution_ids]).toEqual(["pressured", [turn.execution.id]]);
-  expect(group.result?.outcome.verdict).toBe("passed");
+  expect(rows).toEqual([{ n: 4 + offered }]);
 });

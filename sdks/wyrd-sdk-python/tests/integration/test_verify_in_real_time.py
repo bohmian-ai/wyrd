@@ -1024,6 +1024,16 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             registered_assistant(neighbor_client, tmp_path / "neighbor"),
             client_of(server, service_key("assistant", neighbor_client)),
         )
+        cards = Cards(WyrdClient())
+        registered = register(cards, "cards/verify_in_real_time/support.yaml")
+        binding_id = group_binding(server, cards, registered["support"])
+        support = WyrdState.from_path(
+            download(cards, "support", tmp_path / "support"),
+            WyrdClient(credential=service_key("support")),
+        )
+        support.start_bifrost()
+        group = f"pressured-{secrets.token_hex(4)}"
+        pressured = {"answer": "pressured"}
         server.flush_bifrost()
 
         offered = 0
@@ -1050,9 +1060,15 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
                     server.flush_bifrost()
 
             refused_run = state.run("agent")
-            for call in (refused_run.observe.verify, refused_run.observe.submit):
+            grouped_run = support.run("agent")
+            for call in (
+                lambda: refused_run.observe.verify("answer-check", "yes"),
+                lambda: refused_run.observe.submit("answer-check", "yes"),
+                lambda: grouped_run.observe.verify("turn-check", pressured, group_id=group),
+                lambda: grouped_run.observe.submit("turn-check", pressured, group_id=group),
+            ):
                 with pytest.raises(WyrdError) as refused:
-                    call("answer-check", "yes", group_id="staged")
+                    call()
                 assert refused.value.code == STAGING_FULL
                 assert refused.value.status == 429
                 assert refused.value.details["retry_after_seconds"] == 1
@@ -1060,28 +1076,21 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             assert [judging.result().verdict for judging in burst] == ["passed", "passed"]
 
         server.flush_bifrost()
-        recovered = refused_run.observe.submit("answer-check", "yes", group_id="staged")
+        recovered = refused_run.observe.submit("answer-check", "yes")
         assert isinstance(recovered, verify.Execution)
         judged = recovered.wait(WAIT_SECONDS)
         assert (judged.verdict, judged.run_id) == ("passed", refused_run.run_id)
+        grouped_run.observe.verify("turn-check", pressured, group_id=group)
+        support.shutdown()
+        grouped = group_execution(server, binding_id, WAIT_SECONDS)
+        assert grouped["group_id"] == group
+        assert grouped["result"]["outcome"]["evidence"]["turns"] == {
+            "kind": "json",
+            "value": [pressured],
+        }, "the refused grouped turn staged nothing"
 
         server.flush_bifrost()
         rows = Bifrost(client=client_of(server)).sql(
             "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
         )
-        assert [row.n for row in rows] == [3 + offered]
-
-        cards = Cards(WyrdClient())
-        registered = register(cards, "cards/verify_in_real_time/support.yaml")
-        binding_id = group_binding(server, cards, registered["support"])
-        support = WyrdState.from_path(
-            download(cards, "support", tmp_path / "support"),
-            WyrdClient(credential=service_key("support")),
-        )
-        support.start_bifrost()
-        group = f"staged-{secrets.token_hex(4)}"
-        support.run("agent").observe.verify("turn-check", {"answer": "yes"}, group_id=group)
-        support.shutdown()
-        grouped = group_execution(server, binding_id, WAIT_SECONDS)
-        assert grouped["group_id"] == group
-        assert grouped["result"]["outcome"]["verdict"] == "passed"
+        assert [row.n for row in rows] == [4 + offered]

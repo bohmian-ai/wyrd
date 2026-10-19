@@ -35,8 +35,8 @@ const test = serverTest().extend<{ desk: DeclarationReceipt }>({
   ],
 });
 
-test("installed wyrd executable applies the graph", async ({ desk }) => {
-  const { stdout } = await promisify(execFile)(process.execPath, [WYRD_BIN, "apply", DESK, "--format", "json"]);
+test("installed wyrd executable declares the graph", async ({ desk }) => {
+  const { stdout } = await promisify(execFile)(process.execPath, [WYRD_BIN, "declare", DESK, "--format", "json"]);
 
   expect(JSON.parse(stdout)).toMatchObject({ root: desk.root });
 });

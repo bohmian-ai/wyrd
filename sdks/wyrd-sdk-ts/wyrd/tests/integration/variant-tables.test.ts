@@ -147,6 +147,6 @@ test("refuses a model allowing extra keys", () => {
     },
   });
   expect((error as WyrdError).remediation).toBe(
-    "Correct the column type or the row value so it satisfies the table's registered DataTypeSpec; declare a Variant field for open data.",
+    "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data.",
   );
 });

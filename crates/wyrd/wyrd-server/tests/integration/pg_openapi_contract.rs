@@ -1500,6 +1500,98 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
     server.shutdown().await.expect("server shuts down");
 }
 
+/// The served verification contract carries grouping end to end: both
+/// invocation bodies accept an optional `group_id`, execution state echoes
+/// it beside the owner and the pinned source snapshot, and a binding's status
+/// publishes its frozen `group_end` settings with each source slot's exact
+/// binding tuple. No alternate spelling of `group_id` is served.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when a grouped field,
+/// its optionality, or its schema shape differs.
+#[tokio::test]
+async fn grouped_verification_contract_is_served() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let properties = |schema: &Value| -> BTreeSet<String> {
+        resolve_schema(&document, schema)["properties"]
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let required = |name: &str| -> BTreeSet<String> {
+        schemas[name]["required"]
+            .as_array()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let request = &schemas["VerificationRequest"];
+    assert!(properties(request).contains("group_id"), "{request}");
+    assert!(!required("VerificationRequest").contains("group_id"));
+    let state = &schemas["VerificationExecutionState"];
+    for field in ["group_id", "owner_card_uid", "group"] {
+        assert!(properties(state).contains(field), "{field}: {state}");
+        assert!(!required("VerificationExecutionState").contains(field));
+    }
+    let group = &state["properties"]["group"];
+    assert_eq!(
+        properties(group),
+        BTreeSet::from(["sources"].map(str::to_owned))
+    );
+    let snapshot =
+        &resolve_schema(&document, group)["properties"]["sources"]["additionalProperties"];
+    assert_eq!(
+        properties(snapshot),
+        BTreeSet::from(["reference", "execution_ids"].map(str::to_owned))
+    );
+    let status = &schemas["VerificationBindingStatus"];
+    assert!(!required("VerificationBindingStatus").contains("group_end"));
+    let settings = &status["properties"]["group_end"];
+    assert_eq!(
+        properties(settings),
+        BTreeSet::from(["after", "sources"].map(str::to_owned))
+    );
+    let source =
+        &resolve_schema(&document, settings)["properties"]["sources"]["additionalProperties"];
+    assert_eq!(
+        properties(source),
+        BTreeSet::from(
+            [
+                "reference",
+                "subject_occurrence_key",
+                "card_uid",
+                "verifier_card_uid"
+            ]
+            .map(str::to_owned)
+        )
+    );
+    let served = document.to_string();
+    for alias in [
+        "\"groupId\"",
+        "\"group\":{\"type\":\"string\"",
+        "\"conversation_id\"",
+    ] {
+        assert!(
+            !served.contains(alias),
+            "no alternate group spelling: {alias}"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// Operator connection management publishes exactly its five typed
 /// operations: the provider-tagged create and update bodies, the redacted
 /// view, and a UUID `connection_id` path parameter.

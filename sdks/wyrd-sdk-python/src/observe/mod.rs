@@ -327,25 +327,28 @@ impl PyObserveHandle {
     /// Execute the bound Verifier `verifier` on this view's subject now.
     ///
     /// Pass one positional value for a single-slot Verifier or one keyword
-    /// per slot. The shared client projects each value by its slot, hashes
+    /// per slot; the keyword-only `group_id` names the caller group the
+    /// execution belongs to and is never a slot. The shared client projects each value by its slot, hashes
     /// and uploads `File` values during the call, and returns the result;
     /// a `failed` verdict returns normally. Blocks with the GIL released.
     ///
     /// # Errors
-    /// Raises `WYRD_SDK_404_UNKNOWN_VERIFIER`,
+    /// Raises `WYRD_SPEC_400_VALIDATION` for an invalid `group_id`,
+    /// `WYRD_SDK_404_UNKNOWN_VERIFIER`,
     /// `WYRD_VERIFICATION_400_INPUT_INVALID` or `413_INPUT_TOO_LARGE` before
     /// the execution request, `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` for
     /// a scheduled-window Verifier, and otherwise the server's refusal.
-    #[pyo3(signature = (verifier, /, *value, **named))]
+    #[pyo3(signature = (verifier, /, *value, group_id=None, **named))]
     fn verify(
         &self,
         py: Python<'_>,
         verifier: &str,
         value: &Bound<'_, PyTuple>,
+        group_id: Option<&str>,
         named: Option<&Bound<'_, PyDict>>,
     ) -> WyrdPyResult<PyVerificationResult> {
         let inputs = inputs(py, value, named)?;
-        let observe = self.observe();
+        let observe = self.observe().grouped(group_id)?;
         crate::trace::block_on(py, observe.verify(verifier, inputs))
             .map(PyVerificationResult)
             .map_err(WyrdPyError::from)
@@ -363,16 +366,17 @@ impl PyObserveHandle {
     /// As [`PyObserveHandle::verify`] for Run evidence; for window samples,
     /// `WYRD_SDK_400_BIFROST_NOT_STARTED`, `WYRD_SDK_409_BIFROST_CLOSED`, or
     /// `WYRD_CLIENT_429_QUEUE_FULL`.
-    #[pyo3(signature = (verifier, /, *value, **named))]
+    #[pyo3(signature = (verifier, /, *value, group_id=None, **named))]
     fn submit(
         &self,
         py: Python<'_>,
         verifier: &str,
         value: &Bound<'_, PyTuple>,
+        group_id: Option<&str>,
         named: Option<&Bound<'_, PyDict>>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let inputs = inputs(py, value, named)?;
-        let observe = self.observe();
+        let observe = self.observe().grouped(group_id)?;
         match crate::trace::traced(|| crate::trace::block_on(py, observe.submit(verifier, inputs)))?
         {
             Submission::Recorded => Ok(Py::new(py, PyRecorded)?.into_any()),

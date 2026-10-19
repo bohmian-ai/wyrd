@@ -196,6 +196,24 @@ impl Principal {
         }
     }
 
+    /// The UID of the owner Service Card this principal is deployed as, when
+    /// one is available without IO.
+    ///
+    /// Only a Card-bound Service principal whose bound Card is a resolved
+    /// `Service` names an owner. An Agent's Card is never widened to a parent
+    /// Service, and Card-free, human, administrator and SYSTEM principals have
+    /// none, so their verifications record a null owner.
+    #[must_use]
+    pub fn owner_service_uid(&self) -> Option<&wyrd_spec::ids::CardUid> {
+        match &self.kind {
+            PrincipalKind::Service {
+                card_ref: Some(card_ref),
+                ..
+            } if card_ref.kind == wyrd_spec::envelope::CardKind::Service => card_ref.uid.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Returns the card scope for card-carrying machine principals.
     ///
     /// A Card-free service still reports its (empty) scope, so callers can
@@ -358,6 +376,52 @@ mod tests {
         };
 
         assert_eq!(principal.card_ref(), Some(&card_ref));
+    }
+
+    /// Only a Card-bound Service principal with a resolved Service UID names
+    /// an owner; an unresolved Service ref and an Agent record none.
+    ///
+    /// # Panics
+    /// Panics when an owner is reported for the wrong principal kind.
+    #[test]
+    fn owner_service_uid_copies_only_a_resolved_service_card() {
+        let principal = |kind| Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind,
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+            credential_id: None,
+        };
+        let uid = wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID");
+        let resolved = CardRef {
+            uid: Some(uid.clone()),
+            ..service_card_ref()
+        };
+        let service = |card_ref: CardRef| PrincipalKind::Service {
+            card_ref_scope: CardRefScope::own(&card_ref),
+            card_ref: Some(card_ref),
+        };
+        assert_eq!(
+            principal(service(resolved.clone())).owner_service_uid(),
+            Some(&uid)
+        );
+        assert_eq!(
+            principal(service(service_card_ref())).owner_service_uid(),
+            None
+        );
+        let agent = CardRef {
+            kind: CardKind::Agent,
+            ..resolved
+        };
+        assert_eq!(
+            principal(PrincipalKind::Agent {
+                card_ref_scope: CardRefScope::own(&agent),
+                card_ref: agent,
+            })
+            .owner_service_uid(),
+            None
+        );
     }
 
     #[test]

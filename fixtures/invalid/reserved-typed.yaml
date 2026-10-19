@@ -1,0 +1,15 @@
+# group_id is the verify/submit argument, never a slot.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: reserved-typed
+  version: 1.0.0
+  space: default
+spec:
+  description: A turn check whose slot takes the reserved group_id name.
+  inputs:
+    group_id: {type: json}
+  requirements:
+    - id: present
+      statement: The turn is present
+      check: {kind: assert, path: inputs.group_id, operator: is_not_null}

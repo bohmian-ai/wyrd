@@ -19,6 +19,6 @@ pub use reads::{
 pub use submission::{
     ArtifactManifestEntry, CardDeclarationOutcome, CardSubmission, CardUploadPlan,
     DeclarationReceipt, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
-    canonical_artifact_manifest_hash,
+    canonical_artifact_manifest_hash, validate_artifact_manifest,
 };
 pub use upload::CardUploadEntry;

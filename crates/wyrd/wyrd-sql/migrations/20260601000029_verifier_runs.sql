@@ -65,7 +65,7 @@ CREATE TABLE wyrd.verifier_runs (
     verifier_version          TEXT        NOT NULL,
     card_uid                  UUID        NOT NULL,
     origin                    TEXT        NOT NULL
-        CHECK (origin IN ('schedule','manual','observation')),
+        CHECK (origin IN ('schedule','manual','observation','group')),
     owner_card_uid            UUID,
     binding_id                UUID,
     trigger_uid               UUID,

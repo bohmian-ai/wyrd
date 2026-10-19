@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: refund-on-failure
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./refund-turn.yaml
+        - verifier: ./refund-verifier.yaml
+          runs_on: {kind: group_end, after: 3s}
+          on_failure:
+            - ./refund-alert.yaml

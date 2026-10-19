@@ -579,8 +579,9 @@ async fn dependents_wait_for_upstream_step_requirements() {
     assert_eq!(outcome.verdict, VerificationVerdict::Passed);
 }
 
-/// Each selector compares every wildcard match of a step output; an empty
-/// selection passes, and a failing element fails the requirement.
+/// Each selector compares every wildcard match of a step output or input; an
+/// empty selection is inconclusive `empty_selection` in step and inline
+/// requirements alike, and a failing element fails the requirement.
 ///
 /// # Panics
 /// Panics when an `each` outcome differs.
@@ -589,6 +590,7 @@ async fn each_assertion_compares_every_wildcard_match() {
     let each = |id: &str| json!({"id": format!("{id}-ok"), "statement": "No cell errors", "check": {"kind": "assert", "each": format!("steps.{id}.output.sheets[*].cells[*].error"), "operator": "is_null"}});
     let spec = verifier(json!({
         "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "inline-ok", "statement": "No item errors", "check": {"kind": "assert", "each": "inputs.answer.items[*].error", "operator": "is_null"}}],
         "steps": [
             {"id": "clean", "action": code_action(json!({"x": "inputs.answer"})), "requirements": [each("clean")]},
             {"id": "broken", "action": code_action(json!({"x": "inputs.answer"})), "requirements": [each("broken")]},
@@ -622,18 +624,22 @@ async fn each_assertion_compares_every_wildcard_match() {
     let outcome = run(
         &engine(&script, InMemoryTraceSource::new(), 4),
         &spec,
-        json!({"answer": 1}),
+        json!({"answer": {"items": []}}),
     )
     .await
     .expect("outcome");
     assert_eq!(
         outcomes(&outcome),
         BTreeMap::from([
+            ("inline-ok", RequirementOutcome::Inconclusive),
             ("clean-ok", RequirementOutcome::Passed),
             ("broken-ok", RequirementOutcome::Failed),
-            ("empty-ok", RequirementOutcome::Passed),
+            ("empty-ok", RequirementOutcome::Inconclusive),
         ])
     );
+    for id in ["inline-ok", "empty-ok"] {
+        assert_eq!(requirement(&outcome, id).reason, "empty_selection");
+    }
 }
 
 /// Intentional skips are not applicable through dependent steps, failures

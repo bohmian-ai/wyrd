@@ -137,7 +137,7 @@ def test_verify_refuses_an_unbound_verifier_before_any_network_call(state: WyrdS
     ids=["positional-and-keyword", "two-positional", "nan", "unrepresentable"],
 )
 def test_verify_and_submit_refuse_unconvertible_inputs_before_any_lookup(
-    state: WyrdState, args: tuple[object, ...], kwargs: dict[str, object]
+    state: WyrdState, args: tuple[object, ...], kwargs: dict[str, Any]
 ) -> None:
     """Python values convert before the Verifier is resolved, so even an unbound name
     reports the input refusal."""

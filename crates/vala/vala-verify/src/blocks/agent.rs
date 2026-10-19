@@ -22,6 +22,7 @@ use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use skald_spec::{MediaRef, ResponseType};
+use tokio::time::Instant;
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
 use wyrd_spec::ids::SlotName;
@@ -286,8 +287,10 @@ impl AgentExecutor {
 
     /// Run one Agent call and return its raw run plus provenance.
     ///
-    /// Check calls must declare neither tools nor a workspace. Step calls get
-    /// exactly their declared built-ins from the toolset, which holds the
+    /// A `check` call may declare only the `bifrost.query` built-in and no
+    /// workspace, so a check reads live evidence through the ordinary tool
+    /// authorization and never edits files or runs code. Calls get exactly
+    /// their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
     /// process capacity ends the invocation busy at once: the loop is raced
     /// against the session's refusal and dropped with any sibling tool calls
@@ -306,7 +309,9 @@ impl AgentExecutor {
         id: &TaskId,
         call: &AgentCall,
         inputs: &BTreeMap<String, CallInput>,
-        step: Option<&BlockCall<'_, Action>>,
+        workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
+        check: bool,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
@@ -322,21 +327,27 @@ impl AgentExecutor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let records = Arc::new(Mutex::new(Vec::new()));
-        let session = match step {
-            None if !declared.is_empty() || !call.workspace.is_empty() => {
-                return Err(terminal("check Agents have no tools or workspace"));
-            }
-            Some(_) if declared.is_empty() && !call.workspace.is_empty() => {
-                return Err(terminal("a workspace needs a filesystem or code tool"));
-            }
-            Some(block) if !declared.is_empty() => {
-                let toolset = self
-                    .toolset
-                    .as_ref()
-                    .ok_or_else(|| terminal("this host provides no built-in tools"))?;
-                Some(toolset.open(block, &declared).await?)
-            }
-            _ => None,
+        if check
+            && (!call.workspace.is_empty()
+                || declared
+                    .iter()
+                    .any(|tool| *tool != BuiltinTool::BifrostQuery))
+        {
+            return Err(terminal(
+                "check Agents may declare only bifrost.query and no workspace",
+            ));
+        }
+        if declared.is_empty() && !call.workspace.is_empty() {
+            return Err(terminal("a workspace needs a filesystem or code tool"));
+        }
+        let session = if declared.is_empty() {
+            None
+        } else {
+            let toolset = self
+                .toolset
+                .as_ref()
+                .ok_or_else(|| terminal("this host provides no built-in tools"))?;
+            Some(toolset.open(id, workspace, deadline, &declared).await?)
         };
         let tools = match &session {
             Some(session) => session.resolve(&declared, &records)?,
@@ -404,7 +415,14 @@ impl ActionExecutor for AgentExecutor {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
         let invoked = self
-            .invoke(call.id, agent, &call.inputs, Some(&call))
+            .invoke(
+                call.id,
+                agent,
+                &call.inputs,
+                &call.workspace,
+                call.deadline,
+                false,
+            )
             .await?;
         let output = match (&invoked.prompt.native().response_type, invoked.structured) {
             (ResponseType::JsonSchema { schema, .. }, Some(map)) => {
@@ -441,7 +459,16 @@ impl CheckExecutor for AgentExecutor {
         if call.position == Position::Step {
             return Err(terminal("an Agent check cannot run in step position"));
         }
-        let invoked = self.invoke(call.id, agent, &call.inputs, None).await?;
+        let invoked = self
+            .invoke(
+                call.id,
+                agent,
+                &call.inputs,
+                &call.workspace,
+                call.deadline,
+                true,
+            )
+            .await?;
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;

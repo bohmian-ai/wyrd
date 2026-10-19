@@ -24,7 +24,7 @@ use arrow_schema::DataType;
 use serde::Serialize;
 use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::ids::SessionId;
@@ -162,7 +162,10 @@ impl Run {
     /// The emit surface for this view.
     #[must_use]
     pub fn observe(&self) -> Observe<'_> {
-        Observe { run: self }
+        Observe {
+            run: self,
+            group_id: None,
+        }
     }
 
     /// This view's row correlation: the subject Card's UID plus invocation.
@@ -196,6 +199,9 @@ impl Run {
 pub struct Observe<'a> {
     /// The view whose subject and invocation every emit correlates to.
     run: &'a Run,
+    /// The caller group every `verify`/`submit` execution from this surface
+    /// carries; `None` keeps executions ungrouped.
+    group_id: Option<GroupId>,
 }
 
 impl Observe<'_> {
@@ -286,6 +292,42 @@ impl Observe<'_> {
 }
 
 impl Observe<'_> {
+    /// Carry `group_id` on every execution `verify` and `submit` start from
+    /// this surface.
+    ///
+    /// The value is the caller's own opaque group, such as a conversation or
+    /// order ID, scoped by the server to the tenant and authenticated owner
+    /// Service. It performs no IO: grouped Verifier bindings discover
+    /// executions sharing it later. Window samples carry no group.
+    ///
+    /// # Arguments
+    /// * `group_id` - The caller group the executions belong to.
+    #[must_use]
+    pub fn group_id(mut self, group_id: GroupId) -> Self {
+        self.group_id = Some(group_id);
+        self
+    }
+
+    /// Carry the foreign-runtime caller's optional `group_id` text, validated
+    /// as a [`GroupId`]; `None` leaves the surface ungrouped.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_VALIDATION` naming `group_id` when the text is
+    /// empty, longer than 256 bytes, or holds whitespace or a control
+    /// character.
+    #[cfg(feature = "internal")]
+    pub fn grouped(self, group_id: Option<&str>) -> Result<Self, WyrdError> {
+        let Some(group_id) = group_id else {
+            return Ok(self);
+        };
+        GroupId::new(group_id)
+            .map(|group_id| self.group_id(group_id))
+            .map_err(|error| WyrdError::Validation {
+                message: format!("group_id is invalid: {error}"),
+                details: json!({ "field": "group_id", "reason": error.to_string() }),
+            })
+    }
+
     /// Execute the Verifier named `verifier` on this view's subject now and
     /// return its attributable result.
     ///
@@ -400,6 +442,7 @@ impl Observe<'_> {
         match self.target(&bound).project(inputs.into())? {
             Projected::Run(evidence) => Ok(Some(StagedRun {
                 verifier: verifier.to_owned(),
+                group_id: self.group_id.clone(),
                 evidence,
             })),
             Projected::Window(features) => {
@@ -432,9 +475,9 @@ impl Observe<'_> {
     async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
         let state = &self.run.state;
         let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
-        self.target(&bound)
-            .enqueue(state.client()?, staged.evidence)
-            .await
+        let mut target = self.target(&bound);
+        target.group_id = staged.group_id;
+        target.enqueue(state.client()?, staged.evidence).await
     }
 
     /// The execution target of `bound` for this view's Run.
@@ -444,6 +487,7 @@ impl Observe<'_> {
             verifier_card_uid: bound.verifier_card_uid.clone(),
             card_uid: bound.card_uid.clone(),
             run_id: self.run.run_id.clone(),
+            group_id: self.group_id.clone(),
         }
     }
 }
@@ -453,6 +497,8 @@ impl Observe<'_> {
 pub struct StagedRun {
     /// The bound Verifier's `metadata.name`, resolved again on enqueue.
     verifier: String,
+    /// The caller group captured when the evidence was staged.
+    group_id: Option<GroupId>,
     /// The projected evidence, before its files are pinned.
     evidence: RunEvidence,
 }

@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: conversation-verifier
+  version: 1.0.0
+  space: default
+spec:
+  description: A whole support conversation answered every turn.
+  inputs:
+    turns: verifiers.turn-check.inputs.turn
+    answered: verifiers.turn-check.requirements.answered.outcome
+  requirements:
+    - id: every-turn-answered
+      statement: Every turn of the conversation was answered
+      check: {kind: assert, each: "inputs.answered[*]", operator: equals, expected: passed}

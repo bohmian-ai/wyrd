@@ -11,6 +11,7 @@ import {
   type DeclarationReceipt,
   type VerificationResult,
   WyrdClient,
+  type WyrdError,
   WyrdState,
 } from "wyrd-ai";
 import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
@@ -32,7 +33,8 @@ const QUIET_MS = 5_000;
 /**
  * Create the `on-call-hooks` connection that gives a path-only Operator an
  * origin, register the baseline and the story's `service` Card after it, and
- * wait for the real fitter to fit its scheduled `verifier`'s baseline.
+ * unless `fitted` is false (a Custom Verifier has no baseline) wait for the
+ * real fitter to fit its scheduled `verifier`'s baseline.
  */
 async function startWatch(
   server: NativeWyrdTestServer,
@@ -40,6 +42,7 @@ async function startWatch(
   cards: Cards,
   service: string,
   verifier: string,
+  fitted = true,
 ): Promise<DeclarationReceipt> {
   await (await OperatorConnections.connect()).create({
     provider: "http",
@@ -49,7 +52,9 @@ async function startWatch(
   });
   await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
   const watch = await cards.declareFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
-  server.waitForBaseline(declared(watch, verifier).uid, WAIT_MS);
+  if (fitted) {
+    server.waitForBaseline(declared(watch, verifier).uid, WAIT_MS);
+  }
   return watch;
 }
 
@@ -74,10 +79,7 @@ const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
     use(await startWatch(server, hooks, cards, "latency-watch.yaml", "latency-shift")),
 });
 
-/**
- * Submit every latency to `verifier` as the Service, assert each was recorded
- * for the schedule rather than judged, and drain the samples.
- */
+/** Submit every latency to `verifier` as the Service through {@link record}. */
 async function submit(
   server: NativeWyrdTestServer,
   cards: Cards,
@@ -85,14 +87,35 @@ async function submit(
   latencies: number[],
   verifier = "latency-shift",
 ) {
+  await record(
+    server,
+    cards,
+    watch,
+    latencies.map((latency) => ({ latency })),
+    verifier,
+  );
+}
+
+/**
+ * Submit every sample, a map of slot to value, to `verifier` as the Service,
+ * assert each was recorded for the schedule rather than judged, and drain
+ * the samples.
+ */
+async function record(
+  server: NativeWyrdTestServer,
+  cards: Cards,
+  watch: DeclarationReceipt,
+  samples: Record<string, number>[],
+  verifier: string,
+) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
   await cards.pull(watch.root, bundle);
   const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();
   const run = state.run();
-  for (const latency of latencies) {
-    expect(await run.observe.submit(verifier, { latency })).toEqual({ kind: "recorded" });
+  for (const sample of samples) {
+    expect(await run.observe.submit(verifier, sample)).toEqual({ kind: "recorded" });
   }
   await state.shutdown();
   server.flushBifrost();
@@ -202,3 +225,51 @@ test("path only operator without connection is refused", async ({ server: _ }) =
     code: "WYRD_SPEC_400_INVALID_OPERATOR",
   });
 });
+
+test.for([
+  ["scheduled-binding-empty-inputs.yaml", "verified_by[0].inputs", "Service", "budget-with-empty-inputs"],
+  ["scheduled-binding-exact-inputs.yaml", "verified_by[0].inputs", "Service", "budget-with-exact-inputs"],
+  ["optional-samples-slot.yaml", "inputs.latency", "Verifier", "optional-latency"],
+])("scheduled binding rejects redundant inputs (%s)", async ([file, field, kind, name], { cards }) => {
+  const refused: unknown = await cards.declareFromPath(fixture(`invalid/${file}`)).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(JSON.stringify((refused as WyrdError | undefined)?.details)).toContain(field);
+  await expect(cards.resolveLatest(kind, "default", name)).rejects.toMatchObject({
+    code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+  });
+});
+
+test.for([
+  [
+    { latency: 120, error_rate: 0.01 },
+    "failed",
+    { "latency-within-budget": "failed", "error-rate-within-budget": "passed" },
+  ],
+  [{ latency: 80 }, "inconclusive", { "latency-within-budget": "passed", "error-rate-within-budget": "inconclusive" }],
+] as const)(
+  "scheduled binding scores every requirement (%o)",
+  async ([sample, verdict, outcomes], { server, hooks, cards }) => {
+    const budget = await startWatch(server, hooks, cards, "latency-budget.yaml", "latency-error-budget", false);
+    await record(
+      server,
+      cards,
+      budget,
+      Array.from({ length: 10 }, () => ({ ...sample })),
+      "latency-error-budget",
+    );
+
+    const result = await judge(server, cards, budget);
+
+    expect(result.outcome.verdict).toBe(verdict);
+    expect(result.subject).toEqual(budget.root);
+    expect(result.verifier.name).toBe("latency-error-budget");
+    expect(
+      Object.fromEntries(result.outcome.requirements.map((requirement) => [requirement.id, requirement.outcome])),
+    ).toEqual(outcomes);
+    for (const requirement of result.outcome.requirements) {
+      expect(requirement.provenance).toMatchObject({ kind: "drift", window: { start: expect.any(String) } });
+    }
+  },
+);

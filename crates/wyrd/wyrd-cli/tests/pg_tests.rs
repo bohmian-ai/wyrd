@@ -23,6 +23,7 @@ use wyrd_dev_fixtures::pg::UnmigratedDatabase;
 use wyrd_spec::auth::{SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::TenantSlug;
+use wyrd_testing::reserve_loopback_addr;
 
 use crate::mcp_journey::{list_tables_through_proxy, wyrd};
 
@@ -323,18 +324,16 @@ impl LocalDev {
     }
 }
 
-/// Select an isolated loopback address for one child listener.
-///
-/// The operating system assigns a free loopback port, which is released
-/// before return: the CLI and the server bind it themselves, so the fixture
-/// cannot hold it across runs.
+/// Reserve one loopback address for a child listener through the shared
+/// test-port reserver, whose cross-process claim keeps every sibling test
+/// process, `WyrdTestServer` included, off the same port until this process
+/// exits.
 ///
 /// # Panics
-/// Panics if no loopback port can be bound.
+/// Panics when no loopback port can be reserved.
 fn free_bind() -> String {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("a free loopback port")
+    reserve_loopback_addr()
+        .expect("a free loopback port is reserved")
         .to_string()
 }
 

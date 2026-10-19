@@ -51,7 +51,7 @@ None of these bindings has `runs_on`, so nothing runs them on its own. Your code
 
 ## Bind a Verifier to a schedule
 
-A schedule judges samples your service recorded over time, such as request latency, instead of one request. Add `runs_on` with a Trigger, `inputs` to say which recorded features fill the Verifier's `samples` slot, and optionally `on_failure` with the Operators to run when it fails:
+A schedule judges samples your service recorded over time, such as request latency, instead of one request. Add `runs_on` with a Trigger and optionally `on_failure` with the Operators to run when it fails:
 
 <Tabs>
 <Tab label="latency-watch.yaml">
@@ -84,7 +84,6 @@ Every day at midnight UTC, the server compares the day's `latency` samples with 
 | --- | --- | --- |
 | `verifier` | Yes | A path to the Verifier's Card file, or a declared Verifier |
 | `runs_on` | No | A Trigger, as a path, a declared Card, or inline. Absent, only your code runs the Verifier |
-| `inputs` | No | For a scheduled Verifier, each `samples` slot's recorded `features` |
 | `on_failure` | No | Operators to run after a `failed` verdict, as paths, declared Cards, or inline |
 
 A Trigger is `{kind: schedule, cron: "<cron>", tz: <zone>}`, with `tz` defaulting to UTC. Schedules only judge recorded samples: binding `runs_on` to a Verifier with other inputs fails declaration. A binding has no other fields, and an unknown field such as `when` is rejected.

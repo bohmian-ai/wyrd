@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: refund-alert
+  version: 1.0.0
+  space: default
+spec:
+  description: Tell the refunds desk when an order conversation's group execution changes verdict.
+  kind: http
+  method: post
+  url: /hooks/refund-verification
+  auth:
+    scheme: bearer
+    connection: refund-hooks
+  body:
+    execution_id: "{{execution_id}}"
+    result_id: "{{result_id}}"
+    verdict: "{{verdict}}"
+    group_id: "{{group.group_id}}"
+    previous_result_id: "{{group.previous_result_id}}"
+    previous_verdict: "{{group.previous_verdict}}"

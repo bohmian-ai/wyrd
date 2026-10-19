@@ -228,6 +228,7 @@ A Verifier with `samples` slots and `drift` checks judges a scheduled window, so
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | A file is larger than its slot's `max_bytes` or the deployment limit | Send a smaller file, or raise `max_bytes` up to the deployment limit |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | The Verifier judges a scheduled window | Use `submit` |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks `verifier:run` on this Verifier, or read access to an Artifact or trace it names | Grant a role that includes it |
+| `WYRD_VERIFICATION_429_STAGING_FULL` | The server is staging more verification work than it holds | Nothing was staged. `submit` retries it for you; retry `verify` after `details.retry_after_seconds` |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The execution took longer than 60 seconds, usually a slow Agent step | Decide your fallback in code, or use `submit`. The SDK does not retry `verify` |
 
 A missing required input is not an error: the requirements that need it come back `inconclusive`. For when to check in real time versus in the background, see [How verification works](/understand/how-verification-works/).

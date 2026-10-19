@@ -1,6 +1,6 @@
 //! Card declaration service orchestration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -17,7 +17,9 @@ use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::trigger::TriggerActivation;
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus};
+use wyrd_spec::card::verifier::{
+    InputSlot, OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus,
+};
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
@@ -25,7 +27,7 @@ use wyrd_spec::graph::{
     relationships_from_spec, spec_binding_errors, topo_sort, validate_composition,
 };
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid, SlotName, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
@@ -33,11 +35,12 @@ use wyrd_spec::registry::{
     CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, DeclarationOperationId,
     DeclarationOutcomeKind, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
     DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
-    RelativeArtifactPath, canonical_artifact_manifest_hash,
+    RelativeArtifactPath, canonical_artifact_manifest_hash, validate_artifact_manifest,
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::RegisterTableRequest;
+use wyrd_spec::verification::{GroupEndSettings, GroupSource};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -61,7 +64,7 @@ use wyrd_sql::queries::cards::{
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
 use wyrd_sql::queries::verification::{
-    FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
+    BindingActivation, FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
 };
 use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
 use wyrd_storage::StorageError;
@@ -74,7 +77,9 @@ use crate::components::auth::Caller;
 use crate::components::cards::mapping::{
     existing_row_to_response, lifecycle_status, outcome_row_to_response,
 };
-use crate::components::cards::resolve::{EffectiveSpecs, ResolvedRefs, bind_card_references};
+use crate::components::cards::resolve::{
+    EffectiveSpecs, ResolvedRefs, bind_card_references, source_binding,
+};
 use crate::components::storage::routes::storage_caller;
 use crate::state::{AppState, registry_db_error};
 
@@ -1324,7 +1329,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 let Some(runs_on) = &binding.runs_on else {
                     continue;
                 };
-                let (trigger, TriggerActivation::Schedule { cron, tz }) = match runs_on {
+                let (trigger, activation) = match runs_on {
                     InlineableRef::Inline(trigger) => {
                         let body = Spec::Trigger((**trigger).clone());
                         (inline_digest(&body)?, trigger.activation.clone())
@@ -1339,9 +1344,26 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                         (FrozenTarget::Uid(uid), trigger.activation)
                     }
                 };
+                let verifier_card_uid = pinned_uid(binding.verifier.as_card_ref())?;
+                let activation = match activation {
+                    TriggerActivation::Schedule { cron, tz } => {
+                        BindingActivation::Schedule { cron, tz }
+                    }
+                    TriggerActivation::GroupEnd { after } => {
+                        BindingActivation::GroupEnd(GroupEndSettings {
+                            after,
+                            sources: self
+                                .group_sources(occurrence, &subject, site, &verifier_card_uid)
+                                .await?,
+                        })
+                    }
+                };
+                // Registration admits only the list its activation reacts
+                // through, so chaining both freezes exactly that one.
                 let operators = binding
-                    .on_failure
-                    .iter()
+                    .operator_lists()
+                    .into_iter()
+                    .flat_map(|(_, operators)| operators)
                     .map(|operator| match operator {
                         InlineableRef::Inline(body) => {
                             inline_digest(&Spec::Operator((**body).clone()))
@@ -1352,16 +1374,62 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 bindings.push(NewBinding {
                     subject_occurrence_key: occurrence.to_owned(),
                     card_uid: subject.clone(),
-                    verifier_card_uid: pinned_uid(binding.verifier.as_card_ref())?,
+                    verifier_card_uid,
                     trigger,
                     operators,
-                    cron,
-                    tz,
-                    inputs: binding.inputs.clone(),
+                    activation,
                 });
             }
         }
         Ok(bindings)
+    }
+
+    /// Pin each source input of a `group_end` binding's Verifier to the exact
+    /// source binding it reads.
+    ///
+    /// The Verifier is read back by UID inside this transaction; each source
+    /// resolves within the same `site` through [`source_binding`], which
+    /// registration preflight already proved unique, so the pinned identity
+    /// is this site's occurrence and subject with the source's exact Verifier.
+    ///
+    /// # Errors
+    /// Returns `WYRD_INTERNAL` when the Verifier UID names another kind, a
+    /// source no longer resolves to one binding, or a source ref is unpinned,
+    /// and the registry error from reading the Verifier.
+    async fn group_sources(
+        &mut self,
+        occurrence: &str,
+        subject: &CardUid,
+        site: &[VerificationBinding],
+        verifier: &CardUid,
+    ) -> Result<BTreeMap<SlotName, GroupSource>, WyrdError> {
+        let Spec::Verifier(verifier) = sql_get_card_by_uid(self.conn, verifier).await?.spec else {
+            return Err(WyrdError::internal(
+                "bound Verifier UID is not a Verifier Card",
+            ));
+        };
+        let mut sources = BTreeMap::new();
+        for (slot, input) in verifier.inputs {
+            let InputSlot::Source(reference) = input else {
+                continue;
+            };
+            let name = reference
+                .parse()
+                .map_err(|error| WyrdError::internal(error.to_string()))?
+                .verifier;
+            let source = source_binding(site, &name)
+                .map_err(|_| WyrdError::internal("group source does not resolve to one binding"))?;
+            sources.insert(
+                slot,
+                GroupSource {
+                    reference,
+                    subject_occurrence_key: occurrence.to_owned(),
+                    card_uid: subject.clone(),
+                    verifier_card_uid: pinned_uid(source.verifier.as_card_ref())?,
+                },
+            );
+        }
+        Ok(sources)
     }
 }
 
@@ -1472,6 +1540,18 @@ async fn resolve_existing(
 }
 
 /// Enforce request-wide invariants before database access.
+///
+/// The server is the authority for every registration rule; the loader's
+/// checks only report the same refusals earlier. Each submission must be
+/// `wyrd/v1`, decode as its kind, bind validly, publish distinct non-nested
+/// artifact paths, match its declared artifact hash, and, as a Verifier, pass
+/// [`VerifierSpec::validate`](wyrd_spec::card::verifier::VerifierSpec::validate).
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*` for a multi-card artifact request, a wrong
+/// apiVersion, an undecodable spec, a repeated or nested artifact path or a
+/// manifest hash mismatch, and the binding or Verifier
+/// `WYRD_SPEC_400_VALIDATION` refusal otherwise.
 fn validate_request(request: &DeclareCardRequest) -> Result<(), WyrdError> {
     if request.submissions.len() > 1
         && request
@@ -1497,6 +1577,10 @@ fn validate_request(request: &DeclareCardRequest) -> Result<(), WyrdError> {
         if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
             return Err(error);
         }
+        if let Spec::Verifier(verifier) = &spec {
+            verifier.validate()?;
+        }
+        validate_artifact_manifest(&submission.artifacts)?;
         let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()
             && submission.metadata.artifact_hash.is_some()

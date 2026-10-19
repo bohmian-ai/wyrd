@@ -133,6 +133,11 @@ id_type!(
     "Name of one Verifier input slot, addressed as `inputs.<slot>`.",
     validate_identifier
 );
+id_type!(
+    GroupId,
+    "Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.",
+    validate_group_id
+);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
@@ -481,6 +486,23 @@ fn validate_model_id(value: &str) -> Result<(), IdError> {
     Ok(())
 }
 
+/// Accepts a caller group identity of 1..=256 UTF-8 bytes without whitespace
+/// or control characters; slashes and other punctuation are allowed.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidGroupId`] for an empty, over-long, whitespace- or
+/// control-character-bearing value.
+fn validate_group_id(value: &str) -> Result<(), IdError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(IdError::InvalidGroupId);
+    }
+    Ok(())
+}
+
 fn validate_opaque(value: &str) -> Result<(), IdError> {
     if value.len() < 8 || value.len() > 256 || value.chars().any(char::is_whitespace) {
         return Err(IdError::InvalidOpaque);
@@ -509,6 +531,10 @@ pub enum IdError {
     /// Identifier did not match `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
     #[error("identifier must match [a-zA-Z_][a-zA-Z0-9_]{{0,63}}")]
     InvalidIdentifier,
+    /// Group identity was empty, longer than 256 bytes, or held whitespace or
+    /// a control character.
+    #[error("group_id must be 1..=256 UTF-8 bytes without whitespace or control characters")]
+    InvalidGroupId,
 }
 
 #[cfg(test)]
@@ -531,6 +557,21 @@ mod tests {
             assert!(SlotName::new(invalid).is_err(), "{invalid}");
         }
         assert!(serde_json::from_str::<SlotName>("\"a.b\"").is_err());
+    }
+
+    /// Group identities accept caller-chosen opaque values and refuse empty,
+    /// over-long or whitespace-bearing ones.
+    ///
+    /// # Panics
+    /// Panics when the group grammar accepts or refuses the wrong values.
+    #[test]
+    fn group_id_accepts_opaque_caller_values() {
+        for valid in ["door-42", "order-123/chat-7", "x", &"g".repeat(256)] {
+            GroupId::new(valid).expect(valid);
+        }
+        for invalid in ["", "a b", "a\nb", &"g".repeat(257)] {
+            assert!(GroupId::new(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     /// Execution identities are server-minted `UUIDv7` values.

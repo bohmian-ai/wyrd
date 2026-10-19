@@ -57,6 +57,8 @@ jsonschema = { workspace = true }
 sqlx = { workspace = true }
 # The local judge provider the trace-continuity journey's Verifier calls.
 wiremock = { workspace = true }
+# Content-addresses the frames the grouped media journey uploads.
+sha2 = { workspace = true }
 wyrd-telemetry = { workspace = true, features = ["test-support"] }
 
 [lints]

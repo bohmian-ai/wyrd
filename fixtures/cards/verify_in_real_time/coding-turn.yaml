@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: coding-turn
+  version: 1.0.0
+  space: default
+spec:
+  description: One coding turn's prompt, tool, edit, test, or diff call left its tests passing.
+  inputs:
+    call: {type: json}
+    trace: {type: trace, required: false}
+  requirements:
+    - id: tests-pass
+      statement: The call left the tests passing
+      check: {kind: assert, path: inputs.call.tests, operator: equals, expected: passed}

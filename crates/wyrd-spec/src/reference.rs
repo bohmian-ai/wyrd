@@ -4,7 +4,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{CardKind, Spec};
 use crate::ids::{CardName, CardUid, SpaceName};
@@ -118,7 +119,7 @@ impl From<CardRef> for Ref {
 /// Loaders rewrite `Path` values to `Sibling` values before submitting a request;
 /// the server rejects unresolved paths at the wire boundary. `Inline`
 /// bodies are authored, not synthesized by the loader.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum InlineableRef<T> {
@@ -134,6 +135,38 @@ pub enum InlineableRef<T> {
     /// A local authored path awaiting loader resolution.
     #[cfg_attr(feature = "server", schema(value_type = String))]
     Path(PathBuf),
+}
+
+/// Decode the authored forms in declaration order, as `untagged` does, but
+/// report a value that is no reference, sibling, or path by the embedded
+/// spec's own error, so an invalid inline field such as an over-long
+/// `group_end.after` names its cause instead of "did not match any variant".
+impl<'de, T: DeserializeOwned> Deserialize<'de> for InlineableRef<T> {
+    /// Buffer the value, then try a reference, a sibling, and the inline
+    /// spec; a string the spec refuses is a path.
+    ///
+    /// # Errors
+    /// Returns the inline spec's decode error when no form matches.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The wire shape of [`InlineableRef::Sibling`].
+        #[derive(Deserialize)]
+        struct Sibling {
+            /// Exact identity of the sibling submission.
+            sibling: CardRef,
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Ok(card_ref) = CardRef::deserialize(&value) {
+            return Ok(Self::Ref(card_ref));
+        }
+        if let Ok(Sibling { sibling }) = Sibling::deserialize(&value) {
+            return Ok(Self::Sibling { sibling });
+        }
+        match (T::deserialize(&value), value) {
+            (Ok(body), _) => Ok(Self::Inline(Box::new(body))),
+            (Err(_), serde_json::Value::String(path)) => Ok(Self::Path(path.into())),
+            (Err(error), _) => Err(D::Error::custom(error)),
+        }
+    }
 }
 
 impl<T> InlineableRef<T> {
@@ -860,7 +893,7 @@ mod tests {
             on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
                 "{dir}/operator.yaml"
             )))],
-            inputs: BTreeMap::new(),
+            on_verdict_change: Vec::new(),
         }
     }
 
@@ -1045,5 +1078,45 @@ mod tests {
 
         assert!(registration_only_sibling_refs(&Spec::Service(service)).is_empty());
         assert!(registration_only_sibling_refs(&judge).is_empty());
+    }
+
+    /// Every authored form of an inline position decodes to its variant, and
+    /// an object that is neither a reference nor a sibling is reported by the
+    /// embedded spec's own error, so an invalid inline field names its cause.
+    ///
+    /// # Panics
+    /// Panics when a form decodes to another variant or the inline refusal
+    /// loses the embedded spec's message.
+    #[test]
+    fn inlineable_ref_reports_the_inline_spec_error() {
+        use crate::card::trigger::TriggerSpec;
+        let decode =
+            |value: serde_json::Value| serde_json::from_value::<InlineableRef<TriggerSpec>>(value);
+        let card_ref = serde_json::to_value(sample_ref()).expect("ref encodes");
+
+        assert_eq!(
+            decode(card_ref.clone()).expect("ref decodes").as_card_ref(),
+            Some(&sample_ref())
+        );
+        assert_eq!(
+            decode(serde_json::json!({ "sibling": card_ref }))
+                .expect("sibling decodes")
+                .as_sibling(),
+            Some(&sample_ref())
+        );
+        assert!(
+            decode(serde_json::json!({ "kind": "group_end", "after": "365d" }))
+                .expect("inline decodes")
+                .as_inline()
+                .is_some()
+        );
+        assert!(matches!(
+            decode(serde_json::json!("./trigger.yaml")).expect("path decodes"),
+            InlineableRef::Path(_)
+        ));
+        let refused = decode(serde_json::json!({ "kind": "group_end", "after": "366d" }))
+            .expect_err("over a year is refused")
+            .to_string();
+        assert!(refused.contains("365d"), "{refused}");
     }
 }

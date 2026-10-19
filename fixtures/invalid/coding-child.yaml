@@ -1,0 +1,15 @@
+# A source may not select a child field of a slot.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: coding-child
+  version: 1.0.0
+  space: default
+spec:
+  description: Reads one field of each coding call.
+  inputs:
+    diffs: verifiers.coding-turn.inputs.call.diff
+  requirements:
+    - id: diffed
+      statement: Every call produced a diff
+      check: {kind: assert, each: "inputs.diffs[*]", operator: is_not_null}

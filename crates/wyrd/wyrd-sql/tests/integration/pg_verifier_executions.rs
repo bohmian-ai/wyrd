@@ -18,18 +18,17 @@ use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, ScheduledInput};
+use wyrd_spec::card::trigger::TriggerDuration;
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{
-    BindingId, CardUid, ExecutionId, FeatureName, SlotName, VerificationResultId,
-};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
-    DriftWindow, OperatorDispatchStatus, VerificationError, VerificationExecutionStatus,
-    VerificationVerdict, VerifierReadiness,
+    DriftWindow, GroupEndSettings, GroupSource, OperatorDispatchStatus, VerificationError,
+    VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::provision_system_principal;
@@ -39,13 +38,13 @@ use wyrd_sql::queries::cards::{
 };
 use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
-    FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
+    BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
-    ExecutionOrigin, ExecutionStatus, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
-    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    ExecutionOrigin, ExecutionStatus, GroupActivity, GroupSelection, PinnedGroup, QueueCounts,
+    RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, Settlement, Submission,
+    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -227,17 +226,6 @@ async fn register_verifier(
     card_uid
 }
 
-/// The scheduled samples selector every test binding stores.
-///
-/// # Panics
-/// Never in practice: the literals match the slot and feature grammars.
-fn scheduled_inputs() -> BTreeMap<SlotName, ScheduledInput> {
-    BTreeMap::from([(
-        SlotName::new("current").expect("valid slot name"),
-        ScheduledInput::Metric(FeatureName::new("latency_ms").expect("valid feature name")),
-    )])
-}
-
 /// Project one owner-level daily-at-02:00-UTC binding of `verifier` on
 /// `owner` with `operators`.
 ///
@@ -259,9 +247,10 @@ async fn bind(
             verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators,
-            cron: "0 2 * * *".to_owned(),
-            tz: None,
-            inputs: scheduled_inputs(),
+            activation: BindingActivation::Schedule {
+                cron: "0 2 * * *".to_owned(),
+                tz: None,
+            },
         }],
     )
     .await
@@ -505,6 +494,7 @@ fn request(verifier: &CardUid, subject: &CardUid) -> VerificationRequest {
         verifier_card_uid: verifier.clone(),
         card_uid: subject.clone(),
         run_id: None,
+        group_id: None,
         inputs: BTreeMap::from([(
             SlotName::new("answer").expect("valid slot name"),
             InputDeclaration::Json {
@@ -646,10 +636,7 @@ async fn scheduled_and_submitted_executions_freeze_their_inputs() {
     assert_eq!(bound_claim.card_uid, owner);
     assert_eq!(
         bound_claim.input,
-        ExecutionInput::Scheduled {
-            window: window(),
-            slots: scheduled_inputs(),
-        }
+        ExecutionInput::Scheduled { window: window() }
     );
     assert_eq!((bound_claim.attempt, bound_claim.max_attempts), (1, 3));
 
@@ -1164,21 +1151,12 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         claimed.authority,
         owner_authority(fixture.data_tenant_id(), principal)
     );
-    let ExecutionInput::Scheduled {
-        window: occurrence,
-        slots,
-    } = claimed.input
-    else {
+    let ExecutionInput::Scheduled { window: occurrence } = claimed.input else {
         panic!(
             "a scheduled execution analyzes a window, got {:?}",
             claimed.input
         );
     };
-    assert_eq!(
-        slots,
-        scheduled_inputs(),
-        "the binding's selectors are frozen"
-    );
     assert_eq!(
         occurrence.end, due,
         "the occurrence closes at its due instant"
@@ -2548,4 +2526,532 @@ async fn expired_dispatch_deadline_fails_without_a_claim() {
         dispatch.status == OperatorDispatchStatus::Failed
             && dispatch.error.as_ref().map(|e| e.code.as_str()) == Some("deadline_exceeded")
     }));
+}
+
+/// One pinned snapshot of `group` for `binding` whose one `turns` list
+/// holds `executions` with their selected results.
+///
+/// # Panics
+/// Never in practice: the literals match the slot, group, and source grammars.
+fn pinned(
+    binding: BindingId,
+    group: &str,
+    executions: &[(ExecutionId, Option<VerificationResultId>)],
+) -> PinnedGroup {
+    let slot = SlotName::new("turns").expect("valid slot name");
+    let values: Vec<Value> = executions
+        .iter()
+        .map(|(_, result)| result.map_or(Value::Null, |_| json!("passed")))
+        .collect();
+    PinnedGroup::new(
+        binding,
+        GroupId::new(group).expect("valid group id"),
+        BTreeMap::from([(
+            slot.clone(),
+            InputDeclaration::Json {
+                value: Value::Array(values),
+            },
+        )]),
+        BTreeMap::from([(
+            slot,
+            GroupSelection {
+                reference: source_text(),
+                executions: executions.to_vec(),
+            },
+        )]),
+    )
+    .expect("snapshot pins")
+}
+
+/// The authored source declaration every test group slot reads.
+///
+/// # Panics
+/// Never in practice: the literal matches the source grammar.
+fn source_text() -> SourceText {
+    serde_json::from_value(json!("verifiers.turn.requirements.promise.outcome"))
+        .expect("source text decodes")
+}
+
+/// Acknowledged source activity schedules one pending row per matching
+/// binding and group, due exactly `after` past database time — a one-year
+/// `after` included, and `1d` equal to `24h` across a session time zone's
+/// daylight-time change — and consumed by its claim; the same snapshot content
+/// enqueues once whatever its status, while distinct snapshots overlap;
+/// group verdicts are compared in settlement order — baseline, unchanged,
+/// changed — and a replay never recompares. A group refused before
+/// admission is one terminal errored execution with no authority, inputs,
+/// snapshot, or result, which is never claimed; the database rejects any
+/// runnable status, input, window, record, or snapshot field on it.
+///
+/// # Panics
+/// Panics when scheduling, snapshot identity, the pinned input,
+/// verdict-change dispatch, or the refused shape differs.
+#[tokio::test]
+async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
+    let verifier = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
+    let yearly = register_verifier(&mut conn, &actor, "yearly", custom_drift()).await;
+    let daily = register_verifier(&mut conn, &actor, "daily", custom_drift()).await;
+    let hourly = register_verifier(&mut conn, &actor, "hourly", custom_drift()).await;
+    let slot = SlotName::new("turns").expect("valid slot name");
+    let settings = GroupEndSettings {
+        after: TriggerDuration::parse("1h").expect("valid duration"),
+        sources: BTreeMap::from([(
+            slot,
+            GroupSource {
+                reference: source_text(),
+                subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                card_uid: owner.clone(),
+                verifier_card_uid: source.clone(),
+            },
+        )]),
+    };
+    let operator = FrozenTarget::Digest("sha256:operator".to_owned());
+    let lasting = |verifier: &CardUid, after: &str| NewBinding {
+        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+        card_uid: owner.clone(),
+        verifier_card_uid: verifier.clone(),
+        trigger: FrozenTarget::Digest(format!("sha256:{after}")),
+        operators: Vec::new(),
+        activation: BindingActivation::GroupEnd(GroupEndSettings {
+            after: TriggerDuration::parse(after).expect("accepted duration"),
+            ..settings.clone()
+        }),
+    };
+    let bindings = project_bindings(
+        &mut conn,
+        &owner,
+        &CardKind::Service,
+        &[
+            NewBinding {
+                subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                card_uid: owner.clone(),
+                verifier_card_uid: verifier.clone(),
+                trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+                operators: vec![operator],
+                activation: BindingActivation::GroupEnd(settings.clone()),
+            },
+            lasting(&yearly, "365d"),
+            lasting(&daily, "1d"),
+            lasting(&hourly, "24h"),
+        ],
+    )
+    .await
+    .expect("bindings project");
+    let (binding, year, day, hours) = (bindings[0], bindings[1], bindings[2], bindings[3]);
+    record_machine_authentication(&mut conn, principal)
+        .await
+        .expect("owner activates");
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        None,
+        "group_end has no cursor"
+    );
+
+    let group = GroupId::new("order-1").expect("valid group id");
+    let activity = |verifier: &CardUid| GroupActivity {
+        owner_card_uid: owner.clone(),
+        card_uid: owner.clone(),
+        verifier_card_uid: verifier.clone(),
+        group_id: group.clone(),
+    };
+    queue
+        .record_group_activity(
+            &mut conn,
+            &[activity(&source), activity(&source), activity(&verifier)],
+        )
+        .await
+        .expect("activity records");
+    queue
+        .record_group_activity(&mut conn, &[activity(&source)])
+        .await
+        .expect("repeated activity moves the row");
+    let pending: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT binding_id, group_id,
+                due_at BETWEEN statement_timestamp() + INTERVAL '59 minutes'
+                           AND statement_timestamp() + INTERVAL '61 minutes'
+           FROM wyrd.verification_group_pending WHERE binding_id = $1",
+    )
+    .bind(binding.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("pending rows read");
+    assert_eq!(
+        pending,
+        vec![(binding.as_uuid(), "order-1".to_owned(), true)],
+        "one row per binding and group, due after the quiet period"
+    );
+    let apart: bool = sqlx::query_scalar(
+        "SELECT y.due_at - h.due_at = INTERVAL '365 days' - INTERVAL '1 hour'
+           FROM wyrd.verification_group_pending h, wyrd.verification_group_pending y
+          WHERE h.binding_id = $1 AND y.binding_id = $2",
+    )
+    .bind(binding.as_uuid())
+    .bind(year.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("both rows read");
+    assert!(
+        apart,
+        "one statement schedules both, each exactly its own after"
+    );
+    // A session zone whose daylight time starts within the next hour, so a
+    // calendar day from now lasts 23 hours: accepted `1d` still waits the
+    // same 86,400 elapsed seconds as `24h`.
+    sqlx::query(
+        "SELECT set_config('TimeZone', format('XST0XDT,%s/%s,%s/%s', d, h + 1, d, h + 49), true)
+           FROM (SELECT extract(doy FROM statement_timestamp() AT TIME ZONE 'UTC')::int - 1 AS d,
+                        extract(hour FROM statement_timestamp() AT TIME ZONE 'UTC')::int AS h) t",
+    )
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("session zone sets");
+    let crosses: bool = sqlx::query_scalar(
+        "SELECT statement_timestamp() + INTERVAL '1 day'
+              = statement_timestamp() + INTERVAL '23 hours'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("calendar day reads");
+    assert!(crosses, "a calendar day in this session is 23 hours");
+    queue
+        .record_group_activity(&mut conn, &[activity(&source)])
+        .await
+        .expect("activity records across daylight time");
+    let elapsed: (bool, bool) = sqlx::query_as(
+        "SELECT d.due_at = c.due_at, d.due_at - h.due_at = INTERVAL '23 hours'
+           FROM wyrd.verification_group_pending h, wyrd.verification_group_pending d,
+                wyrd.verification_group_pending c
+          WHERE h.binding_id = $1 AND d.binding_id = $2 AND c.binding_id = $3",
+    )
+    .bind(binding.as_uuid())
+    .bind(day.as_uuid())
+    .bind(hours.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("rows read");
+    assert_eq!(
+        elapsed,
+        (true, true),
+        "1d and 24h are both exactly 86,400 seconds past the activity"
+    );
+    sqlx::query("RESET TimeZone")
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("session zone resets");
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("claim")
+            .is_none()
+    );
+    let expire = "UPDATE wyrd.verification_group_pending
+                     SET due_at = statement_timestamp() - INTERVAL '1 second'
+                   WHERE binding_id = $1";
+    sqlx::query(expire)
+        .bind(binding.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("row expires");
+    let due = queue
+        .claim_due_group(&mut conn)
+        .await
+        .expect("claim")
+        .expect("an expired group is due");
+    assert_eq!(
+        (
+            due.binding_id,
+            &due.group_id,
+            &due.settings,
+            due.owner,
+            due.active
+        ),
+        (binding, &group, &settings, Some(principal), true)
+    );
+    queue
+        .consume_group(&mut conn, &due)
+        .await
+        .expect("row consumed");
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("claim")
+            .is_none()
+    );
+
+    let authority = background(&mut conn, principal).await;
+    let (one, two) = (ExecutionId::new_v7(), ExecutionId::new_v7());
+    let first = pinned(binding, "order-1", &[(one, None)]);
+    let enqueue = async |conn: &mut TenantConn<'_>, pinned: &PinnedGroup| {
+        queue
+            .enqueue_group(conn, binding, pinned, &authority)
+            .await
+            .expect("group enqueue answers")
+    };
+    let EnqueueOutcome::Enqueued(earlier) = enqueue(&mut conn, &first).await else {
+        panic!("the first snapshot enqueues");
+    };
+    assert_eq!(
+        enqueue(&mut conn, &pinned(binding, "order-1", &[(one, None)])).await,
+        EnqueueOutcome::AlreadyEnqueued(earlier),
+        "unchanged content is the same execution"
+    );
+    let result = VerificationResultId::new_v7();
+    let later = pinned(binding, "order-1", &[(one, Some(result)), (two, None)]);
+    assert_ne!(later.digest(), first.digest());
+    assert_ne!(
+        pinned(
+            binding,
+            "order-1",
+            &[(one, Some(VerificationResultId::new_v7()))]
+        )
+        .digest(),
+        pinned(binding, "order-1", &[(one, Some(result))]).digest(),
+        "a different visible result is different content"
+    );
+    let EnqueueOutcome::Enqueued(overlapping) = enqueue(&mut conn, &later).await else {
+        panic!("a distinct snapshot enqueues while the first is outstanding");
+    };
+
+    let claimed_earlier = claim(&queue, &mut conn).await;
+    let claimed_later = claim(&queue, &mut conn).await;
+    assert_eq!(claimed_earlier.lease.execution_id, earlier);
+    assert_eq!(claimed_later.lease.execution_id, overlapping);
+    assert_eq!(claimed_earlier.origin, ExecutionOrigin::Group);
+    assert_eq!(claimed_earlier.group_id.as_ref(), Some(&group));
+    assert_eq!(
+        claimed_earlier.input,
+        ExecutionInput::Grouped {
+            inputs: first.inputs.clone(),
+            snapshot: first.snapshot.clone(),
+        }
+    );
+    let complete =
+        async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution, result, verdict| {
+            queue
+                .complete(conn, claimed.lease, result, verdict, "verification", None)
+                .await
+                .expect("group settles")
+        };
+    // The later snapshot settles first, so it is the baseline.
+    let (baseline, preceding) = (
+        VerificationResultId::new_v7(),
+        VerificationResultId::new_v7(),
+    );
+    complete(
+        &mut conn,
+        &claimed_later,
+        baseline,
+        VerificationVerdict::Failed,
+    )
+    .await;
+    complete(
+        &mut conn,
+        &claimed_earlier,
+        preceding,
+        VerificationVerdict::Failed,
+    )
+    .await;
+    let third = pinned(
+        binding,
+        "order-1",
+        &[(one, Some(result)), (two, Some(result))],
+    );
+    enqueue(&mut conn, &third).await;
+    let changed = claim(&queue, &mut conn).await;
+    let current = VerificationResultId::new_v7();
+    for _ in 0..2 {
+        complete(&mut conn, &changed, current, VerificationVerdict::Passed).await;
+    }
+    complete(
+        &mut conn,
+        &claimed_later,
+        baseline,
+        VerificationVerdict::Failed,
+    )
+    .await;
+
+    for execution in [earlier, overlapping] {
+        let status = queue
+            .execution_status(&mut conn, execution)
+            .await
+            .expect("status reads")
+            .expect("execution exists");
+        assert!(
+            status.state.dispatches.is_empty(),
+            "baseline, unchanged, and replayed verdicts do not react"
+        );
+    }
+    let status = queue
+        .execution_status(&mut conn, changed.lease.execution_id)
+        .await
+        .expect("status reads")
+        .expect("execution exists");
+    assert_eq!(status.state.group_id.as_ref(), Some(&group));
+    assert_eq!(status.state.owner_card_uid.as_ref(), Some(&owner));
+    assert_eq!(status.state.group.as_ref(), Some(&third.snapshot));
+    assert_eq!(status.state.dispatches.len(), 1);
+    let contexts: Vec<Value> = sqlx::query_scalar(
+        "SELECT failure_context FROM wyrd.operator_dispatches WHERE execution_id = $1",
+    )
+    .bind(changed.lease.execution_id.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("contexts read");
+    let context: OperatorFailureContext =
+        serde_json::from_value(contexts[0].clone()).expect("context is the closed shape");
+    assert_eq!(context.result_id, current);
+    assert_eq!(context.verdict, VerificationVerdict::Passed);
+    let change = context.group.clone().expect("a group change context");
+    assert_eq!(change.group_id, group);
+    assert_eq!(change.previous_verdict, VerificationVerdict::Failed);
+    assert_eq!(
+        change.previous_result_id, preceding,
+        "compared with the latest settled result, not the latest admitted"
+    );
+    assert_ne!(change.previous_result_id, baseline);
+    assert_eq!(
+        context.render("{{group.previous_verdict}}->{{verdict}}"),
+        Ok("failed->passed".to_owned())
+    );
+
+    let refused_group = GroupId::new("refused-1").expect("valid group id");
+    queue
+        .record_group_activity(
+            &mut conn,
+            &[GroupActivity {
+                group_id: refused_group.clone(),
+                ..activity(&source)
+            }],
+        )
+        .await
+        .expect("activity records");
+    sqlx::query(expire)
+        .bind(binding.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("row expires");
+    let due = queue
+        .claim_due_group(&mut conn)
+        .await
+        .expect("claim")
+        .expect("the refused group is due");
+    assert_eq!(due.group_id, refused_group);
+    let system = authority.attribution().act_principal_id;
+    let error = VerificationError {
+        code: "WYRD_AUTH_401_CREDENTIAL_REVOKED".to_owned(),
+        message: "the binding owner is not runtime-active".to_owned(),
+    };
+    let refused = queue
+        .refuse_group(&mut conn, &due, principal, system, &error)
+        .await
+        .expect("the refusal records");
+    queue
+        .consume_group(&mut conn, &due)
+        .await
+        .expect("row consumed");
+    let shape: (String, bool, bool, bool, bool, bool, bool, bool, i32) = sqlx::query_as(
+        "SELECT status, authority IS NULL, inputs IS NULL, group_snapshot_sha256 IS NULL,
+                group_sources IS NULL, result_id IS NULL, settled_at IS NOT NULL,
+                lease_token IS NULL AND next_attempt_at IS NULL, attempts
+           FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(refused.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the refusal reads");
+    assert_eq!(
+        shape,
+        (
+            "errored".to_owned(),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            0
+        ),
+        "terminal, authority-free, unpinned, and unleased"
+    );
+    let status = queue
+        .execution_status(&mut conn, refused)
+        .await
+        .expect("status reads")
+        .expect("the refusal exists");
+    assert_eq!(status.state.status, VerificationExecutionStatus::Errored);
+    assert_eq!(status.state.error.as_ref(), Some(&error));
+    assert_eq!(status.state.group_id.as_ref(), Some(&refused_group));
+    assert_eq!(status.state.owner_card_uid.as_ref(), Some(&owner));
+    assert_eq!(status.state.group, None);
+    assert!(status.state.dispatches.is_empty(), "no Operator reacts");
+    assert_eq!(
+        status.attribution,
+        Attribution::new(principal, system),
+        "the owner's stored principal, recorded by SYSTEM"
+    );
+    assert!(
+        queue
+            .claim(&mut conn, Duration::minutes(5))
+            .await
+            .expect("claim runs")
+            .is_none(),
+        "a refusal is never claimed"
+    );
+    assert!(
+        queue
+            .claim_due_group(&mut conn)
+            .await
+            .expect("claim")
+            .is_none(),
+        "the refusal consumed its group"
+    );
+    // An otherwise valid refusal admits no runnable status or any input,
+    // window, record, or snapshot field, malformed or not.
+    for change in [
+        "UPDATE wyrd.verifier_executions
+            SET status = 'pending', error = NULL, settled_at = NULL,
+                next_attempt_at = statement_timestamp()
+          WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET inputs = '{}', route_overrides = '{}' WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET window_start = statement_timestamp() - INTERVAL '1 hour',
+                window_end = statement_timestamp()
+          WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET input_record_id = 'record', input_event_time = statement_timestamp()
+          WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET group_snapshot_sha256 = '\\x00' WHERE execution_id = $1",
+        "UPDATE wyrd.verifier_executions
+            SET group_sources = '[]' WHERE execution_id = $1",
+    ] {
+        let mut attempt = sqlx::Connection::begin(&mut **conn.transaction())
+            .await
+            .expect("nested transaction begins");
+        let error = sqlx::query(change)
+            .bind(refused.as_uuid())
+            .execute(&mut *attempt)
+            .await
+            .expect_err("the refused shape rejects the change");
+        assert!(
+            error
+                .to_string()
+                .contains("verifier_executions_refused_shape"),
+            "{change}: {error}"
+        );
+        attempt
+            .rollback()
+            .await
+            .expect("nested transaction rolls back");
+    }
 }

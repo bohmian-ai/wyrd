@@ -18,9 +18,6 @@ spec:
           runs_on:
             kind: schedule
             cron: "0 * * * *"
-          inputs:
-            current:
-              features: [feature]
     - alias: model_shadow
       ref:
         kind: Model

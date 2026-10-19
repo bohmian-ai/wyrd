@@ -1,0 +1,16 @@
+# coding-verifier's source is the coding-turn Card registered earlier, named by reference.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: coding-external
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: {kind: Verifier, name: coding-turn, version: 1.0.0, space: default}
+        - verifier: ./coding-verifier.yaml
+          runs_on: {kind: group_end, after: 3s}

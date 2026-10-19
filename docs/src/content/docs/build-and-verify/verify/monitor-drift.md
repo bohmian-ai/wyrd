@@ -84,7 +84,7 @@ Declaration refuses a Verifier that mixes `samples` slots or `drift` checks with
 
 ## 3. Bind it to a schedule and declare
 
-List the model as a component of a Service and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
+List the model as a component of a Service and bind the Verifier to it. The schedule reads each `samples` slot's own `features` and judges every drift requirement in the Verifier:
 
 ```yaml title="service/churn-service.yaml"
 apiVersion: wyrd/v1
@@ -98,11 +98,9 @@ spec:
       verified_by:
         - verifier: ./churn-input-drift.yaml
           runs_on: {kind: schedule, cron: "0 * * * *"}
-          inputs:
-            current: {features: [tenure_months, monthly_spend]}
 ```
 
-A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
+Every `samples` slot is required; a requirement whose slot recorded nothing in the window is `inconclusive`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ```bash
 wyrd declare service/churn-service.yaml
@@ -273,7 +271,7 @@ const rows = await bifrost.sql(
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
 | Declaration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
-| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or an `inputs` entry missing or naming other measurements than its slot | Bind with `runs_on: { kind: schedule, ... }` and one `inputs` entry per `samples` slot |
+| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or a binding with `inputs` | Bind with `runs_on: { kind: schedule, ... }` and no `inputs` |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | `verify` on a window Verifier | Use `submit` |
 | Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and declare a new version |
 | No results on schedule | The Service has not authenticated in 24 hours, or no samples landed in the window | Deploy the Service; submit on the bound component's alias |

@@ -1,6 +1,6 @@
 //! The server's built-in Agent tools.
 //!
-//! [`HostedTools`] is the server [`AgentToolset`]: for each Agent step
+//! [`HostedTools`] is the server [`AgentToolset`]: for each Agent step or check
 //! attempt it materializes the declared workspace when a filesystem or code
 //! tool needs one, then registers one [`Builtin`] per declared tool bound to
 //! that invocation's accepted caller, workspace, deadline, and Python budget.
@@ -26,10 +26,9 @@ use serde_json::{Value, json};
 use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use vala_verify::blocks::{AgentToolset, BlockCall, BlockError, ToolSession};
+use vala_verify::blocks::{AgentToolset, BlockError, CallInput, ToolSession};
 use wyrd_runtime::Permission;
 use wyrd_spec::card::agent::BuiltinTool;
-use wyrd_spec::card::verifier::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
 use wyrd_spec::verification::TaskId;
@@ -114,22 +113,22 @@ impl AgentToolset for HostedTools {
     /// declared without a workspace, plus [`Workspaces::open`] failures.
     async fn open(
         &self,
-        call: &BlockCall<'_, Action>,
+        id: &TaskId,
+        workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
         tools: &[BuiltinTool],
     ) -> Result<ToolSession, BlockError> {
         let workspace = if tools
             .iter()
             .any(|tool| tool.is_filesystem() || *tool == BuiltinTool::CodeRun)
         {
-            if call.workspace.is_empty() {
+            if workspace.is_empty() {
                 return Err(BlockError::Terminal {
                     reason: "filesystem and code tools need a declared workspace".to_owned(),
                 });
             }
             Some(Arc::new(
-                self.workspaces
-                    .open(&call.workspace, &self.evidence)
-                    .await?,
+                self.workspaces.open(workspace, &self.evidence).await?,
             ))
         } else {
             None
@@ -139,8 +138,8 @@ impl AgentToolset for HostedTools {
             caller: self.caller.clone(),
             workspace,
             sandbox: Arc::clone(&self.sandbox),
-            deadline: call.deadline,
-            code_budget: self.code_budget(call.id),
+            deadline,
+            code_budget: self.code_budget(id),
             limits: self.limits,
         });
         let registry = ToolRegistry::new();

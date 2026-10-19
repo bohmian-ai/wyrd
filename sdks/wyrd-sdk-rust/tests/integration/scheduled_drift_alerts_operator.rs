@@ -11,21 +11,15 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-use wyrd_ai::cards::DeclarationReceipt;
-use wyrd_ai::operator_connections::{
-    ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
-    OperatorConnections, SecretBearer,
-};
+use wyrd_ai::cards::{CardKind, DeclarationReceipt};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::Submission;
+use wyrd_ai::verify::{Inputs, Submission};
 use wyrd_ai::{
     CallProvenance, RequirementDetail, RequirementOutcome, VerificationResult, VerificationVerdict,
 };
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, declare, declared, fixture, pull};
+use crate::support::{Deployment, Hooks, declare, declared, fixture, pull};
 
 /// The bearer token the `on-call-hooks` connection sends to the hook.
 const ON_CALL_TOKEN: &str = "on-call-hook-token";
@@ -37,29 +31,14 @@ const WAIT: Duration = Duration::from_secs(90);
 /// How long the story listens for an alert that must not arrive.
 const QUIET: Duration = Duration::from_secs(5);
 
-/// The local on-call hook: answers 200 and hands every request it receives
-/// to the story.
-struct Hook(UnboundedSender<Request>);
-
-impl Respond for Hook {
-    /// Forward `request` to the story and acknowledge it.
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        // The story may have finished and dropped its receiver.
-        let _ = self.0.send(request.clone());
-        ResponseTemplate::new(200)
-    }
-}
-
 /// The `latency-watch` deployment: the on-call hook, a verification-capable
 /// server whose `on-call-hooks` connection points at the hook, and the
 /// registered Service with its fitted baseline.
 struct Watch {
     /// The deployment.
     deployment: Deployment,
-    /// The local hook; kept so it keeps listening.
-    _hook: MockServer,
-    /// Every request the hook receives.
-    alerts: UnboundedReceiver<Request>,
+    /// The local on-call hook the connection points at.
+    hooks: Hooks,
     /// The Service registration.
     service: DeclarationReceipt,
     /// The scheduled Verifier every sample is submitted to.
@@ -75,45 +54,18 @@ impl Watch {
         Self::start_with("latency-watch.yaml", "latency-shift").await
     }
 
-    /// Start the hook and the server, create the connection, register the
-    /// baseline and the story's `service` Card, and wait for the real fitter
-    /// to fit its scheduled `verifier`'s baseline.
+    /// Start the story's `service` Card with [`Self::deploy`] and wait for the
+    /// real fitter to fit its scheduled `verifier`'s baseline.
     ///
     /// # Panics
     /// Panics when a setup step fails or the baseline does not fit in time.
     async fn start_with(service: &str, verifier: &'static str) -> Self {
-        let hook = MockServer::start().await;
-        let (sender, alerts) = unbounded_channel();
-        Mock::given(wiremock::matchers::any())
-            .respond_with(Hook(sender))
-            .mount(&hook)
-            .await;
-        let deployment =
-            Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
-                .await;
-        OperatorConnections::connect_with(&deployment.admin())
-            .await
-            .expect("handle connects")
-            .create(&CreateOperatorConnectionRequest::Http {
-                name: ConnectionName::new("on-call-hooks").expect("connection name"),
-                origin: HttpsOrigin::parse(&hook.uri()).expect("hook origin parses"),
-                auth: HttpConnectionAuth::Bearer {
-                    token: SecretBearer::new(ON_CALL_TOKEN.to_owned()),
-                },
-            })
-            .await
-            .expect("connection creates");
-        let cards = deployment.cards().await;
-        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-        let watch = declare(
-            &cards,
-            &format!("cards/scheduled_drift_alerts_operator/{service}"),
-        )
-        .await;
-        deployment
+        let watch = Self::deploy(service, verifier).await;
+        watch
+            .deployment
             .server()
             .wait_for_baseline(
-                declared(&watch, verifier)
+                declared(&watch.service, verifier)
                     .uid
                     .as_ref()
                     .expect("registered Verifier has a UID"),
@@ -121,22 +73,51 @@ impl Watch {
             )
             .await
             .expect("the latency baseline fits");
+        watch
+    }
+
+    /// Start the hook and the server, create the connection, and register the
+    /// baseline and the story's `service` Card scheduling `verifier`.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn deploy(service: &str, verifier: &'static str) -> Self {
+        let deployment =
+            Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+                .await;
+        let hooks = deployment.hooks("on-call-hooks", ON_CALL_TOKEN).await;
+        let cards = deployment.cards().await;
+        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        let watch = declare(
+            &cards,
+            &format!("cards/scheduled_drift_alerts_operator/{service}"),
+        )
+        .await;
         Self {
             deployment,
-            _hook: hook,
-            alerts,
+            hooks,
             service: watch,
             verifier,
         }
     }
 
-    /// Submit every latency in `latencies` as the Service, assert each was
-    /// recorded for the schedule rather than judged, and drain the samples.
+    /// Submit every latency in `latencies` as the Service through
+    /// [`Self::record`].
+    ///
+    /// # Panics
+    /// Panics when [`Self::record`] does.
+    async fn submit(&self, latencies: impl IntoIterator<Item = u32>) {
+        self.record(latencies.into_iter().map(|latency| json!(latency).into()))
+            .await;
+    }
+
+    /// Submit every sample in `samples` as the Service, assert each was recorded for the schedule rather than judged,
+    /// and drain the samples.
     ///
     /// # Panics
     /// Panics when hydration, loading, a submission, or the drain fails, or
     /// a submission queued an execution.
-    async fn submit(&self, latencies: impl IntoIterator<Item = u32>) {
+    async fn record(&self, samples: impl IntoIterator<Item = Inputs>) {
         let cards = self.deployment.cards().await;
         let bundle = pull(&cards, &self.service.root).await;
         let watcher = self
@@ -146,10 +127,10 @@ impl Watch {
             WyrdState::from_path_with(bundle.path().join("bundle"), watcher).expect("bundle loads");
         state.start_bifrost().await.expect("Bifrost starts");
         let run = state.run();
-        for latency in latencies {
+        for sample in samples {
             let submitted = run
                 .observe()
-                .submit(self.verifier, json!({ "latency": latency }))
+                .submit(self.verifier, sample)
                 .await
                 .expect("the sample is submitted");
             assert!(matches!(submitted, Submission::Recorded), "{submitted:?}");
@@ -176,16 +157,6 @@ impl Watch {
             .expect("the binding comes due");
         self.deployment.scheduled_result(&binding, WAIT).await
     }
-
-    /// Assert the hook receives nothing for [`QUIET`].
-    ///
-    /// # Panics
-    /// Panics when an alert arrives.
-    async fn assert_quiet(&mut self) {
-        if let Ok(Some(alert)) = tokio::time::timeout(QUIET, self.alerts.recv()).await {
-            panic!("no alert is due: {} {}", alert.method, alert.url);
-        }
-    }
 }
 
 /// A shifted window of submitted latencies is recorded without judging, then
@@ -203,7 +174,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
     let mut watch = Watch::start().await;
     watch.submit(std::iter::repeat_n(99, 100)).await;
     assert!(
-        watch.alerts.try_recv().is_err(),
+        watch.hooks.received.try_recv().is_err(),
         "submitting alone runs no check and alerts no one"
     );
 
@@ -247,7 +218,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         "{latency:?}"
     );
 
-    let alert = tokio::time::timeout(WAIT, watch.alerts.recv())
+    let alert = tokio::time::timeout(WAIT, watch.hooks.received.recv())
         .await
         .expect("an alert arrives in time")
         .expect("the hook is still listening");
@@ -267,7 +238,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         body.to_string().contains(&result.execution_id.to_string()),
         "the alert names the failed execution: {body}"
     );
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 
@@ -285,7 +256,7 @@ async fn passing_window_alerts_no_one() {
     let result = watch.judge().await;
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 
@@ -305,7 +276,7 @@ async fn empty_window_is_inconclusive_and_alerts_no_one() {
     let result = watch.judge().await;
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
-    watch.assert_quiet().await;
+    watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }
 
@@ -387,4 +358,194 @@ async fn path_only_operator_without_connection_is_refused() {
 
     assert_eq!(refused.code(), "WYRD_SPEC_400_INVALID_OPERATOR");
     deployment.shutdown().await;
+}
+
+/// A schedule binding with an `inputs` map, empty or repeating the Verifier's
+/// own samples features, and a samples slot with `required: false` are each
+/// refused at that field, locally by the SDK and by the server over raw HTTP,
+/// and none of the refused Cards persists.
+///
+/// # Panics
+/// Panics when a refused shape registers, a refusal does not name its field,
+/// or a refused Card is readable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn scheduled_binding_rejects_redundant_inputs() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    for (file, field) in [
+        (
+            "scheduled-binding-empty-inputs.yaml",
+            "verified_by[0].inputs",
+        ),
+        (
+            "scheduled-binding-exact-inputs.yaml",
+            "verified_by[0].inputs",
+        ),
+        ("optional-samples-slot.yaml", "inputs.latency"),
+    ] {
+        let refused = cards
+            .declare_from_path(&fixture(&format!("invalid/{file}")))
+            .await
+            .expect_err("a removed scheduled-samples field is refused");
+        assert!(
+            format!("{refused:?}").contains(field),
+            "{file}: {refused:?}"
+        );
+    }
+
+    let token = deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("the administrator token mints");
+    let budget = json!({
+        "verifier": { "kind": "Verifier", "name": "latency-error-budget",
+                      "version": "1.0.0", "space": "default" },
+        "runs_on": { "kind": "schedule", "cron": "0 0 * * *" },
+    });
+    let mut exact = budget.clone();
+    exact["inputs"] = json!({ "latency": { "features": ["latency"] } });
+    let mut empty = budget;
+    empty["inputs"] = json!({});
+    let optional = json!({
+        "inputs": { "latency": { "type": "samples", "features": ["latency"], "required": false } },
+        "requirements": [{
+            "id": "latency-within-budget",
+            "statement": "Mean request latency stays at or below 100 ms",
+            "check": {
+                "kind": "drift", "on": "inputs.latency", "method": "Custom",
+                "signal": { "kind": "Metric", "name": "latency" },
+                "condition": { "kind": "Statistical" },
+                "profile": { "kind": "Custom", "metric_name": "latency",
+                             "baseline_value": 0.0, "alert_threshold": 100.0 }
+            }
+        }]
+    });
+    for (kind, name, spec, field) in [
+        (
+            "Service",
+            "raw-empty-inputs",
+            json!({ "verified_by": [empty] }),
+            "verified_by[0].inputs",
+        ),
+        (
+            "Service",
+            "raw-exact-inputs",
+            json!({ "verified_by": [exact] }),
+            "verified_by[0].inputs",
+        ),
+        (
+            "Verifier",
+            "raw-optional-samples",
+            optional,
+            "inputs.latency",
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/cards",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .header("idempotency-key", name)
+            .json(&json!({ "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": kind,
+                "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+                "spec": spec,
+            }] }))
+            .send()
+            .await
+            .expect("the server answers");
+        assert_eq!(response.status(), 400, "{name}");
+        let problem: Value = response.json().await.expect("the refusal is problem JSON");
+        assert_eq!(
+            problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            "{problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(field)),
+            "{name}: {problem}"
+        );
+        let kind = if kind == "Service" {
+            CardKind::Service
+        } else {
+            CardKind::Verifier
+        };
+        let absent = cards
+            .resolve_latest(
+                kind,
+                "default".parse().expect("space parses"),
+                name.parse().expect("name parses"),
+            )
+            .await
+            .expect_err("a refused Card does not persist");
+        assert_eq!(absent.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    }
+    deployment.shutdown().await;
+}
+
+/// One binding with no `inputs` judges every drift requirement its Verifier
+/// declares: 120 ms latency and a 0.01 error rate fail latency and pass the
+/// error rate, so the window fails; 80 ms latency with no error-rate samples
+/// passes latency and leaves the error rate inconclusive, so the window is
+/// inconclusive rather than a pass over latency alone.
+///
+/// # Panics
+/// Panics when a step fails or a requirement is missing or differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn scheduled_binding_scores_every_requirement() {
+    for (sample, verdict, outcomes) in [
+        (
+            Inputs::named([("latency", json!(120)), ("error_rate", json!(0.01))]),
+            VerificationVerdict::Failed,
+            [RequirementOutcome::Failed, RequirementOutcome::Passed],
+        ),
+        (
+            Inputs::named([("latency", json!(80))]),
+            VerificationVerdict::Inconclusive,
+            [RequirementOutcome::Passed, RequirementOutcome::Inconclusive],
+        ),
+    ] {
+        let watch = Watch::deploy("latency-budget.yaml", "latency-error-budget").await;
+        watch.record(std::iter::repeat_n(sample, 10)).await;
+
+        let result = watch.judge().await;
+
+        assert_eq!(result.outcome.verdict, verdict);
+        assert_eq!(result.subject, watch.service.root);
+        assert_eq!(result.verifier.name.as_str(), "latency-error-budget");
+        let mut judged: Vec<_> = result
+            .outcome
+            .requirements
+            .iter()
+            .map(|requirement| {
+                assert!(
+                    matches!(
+                        &requirement.provenance,
+                        Some(CallProvenance::Drift { window: Some(window) }) if window.start < window.end
+                    ),
+                    "{:?}",
+                    requirement.provenance
+                );
+                (requirement.id.as_str(), requirement.outcome)
+            })
+            .collect();
+        judged.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            judged,
+            [
+                ("error-rate-within-budget", outcomes[1]),
+                ("latency-within-budget", outcomes[0]),
+            ]
+        );
+        watch.deployment.shutdown().await;
+    }
 }

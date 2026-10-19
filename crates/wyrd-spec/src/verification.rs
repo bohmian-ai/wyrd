@@ -20,7 +20,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::card::drift::DriftMethod;
-use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId};
+use crate::card::trigger::TriggerDuration;
+use crate::card::verifier::SourceText;
+use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId, SlotName};
 
 pub use ids::{JsonPath, TaskId};
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
@@ -227,6 +229,60 @@ pub struct VerificationBindingStatus {
     /// retries do not create a new admission. Read its status, result, and
     /// dispatches through execution status.
     pub last_execution_id: Option<ExecutionId>,
+    /// Pinned end timing and source bindings of a `group_end` binding; null
+    /// for any other binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_end: Option<GroupEndSettings>,
+}
+
+/// The settings a `group_end` binding was registered with, frozen on the
+/// binding so later Trigger or Verifier registrations never change them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupEndSettings {
+    /// Quiet period after a group's latest acknowledged source input or
+    /// result before it is judged.
+    pub after: TriggerDuration,
+    /// The exact source binding each source slot of the group Verifier reads.
+    pub sources: BTreeMap<SlotName, GroupSource>,
+}
+
+/// One source slot's pinned binding: the recorded owner/subject/Verifier
+/// tuple whose grouped executions fill the slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupSource {
+    /// The authored source declaration.
+    pub reference: SourceText,
+    /// Component alias, or `$owner`, of the source binding on the owner.
+    pub subject_occurrence_key: String,
+    /// Exact Card the source binding verifies.
+    pub card_uid: CardUid,
+    /// Exact source Verifier Card version.
+    pub verifier_card_uid: CardUid,
+}
+
+/// The source evidence one group execution pinned when it was enqueued.
+///
+/// Every retry of the execution judges exactly this snapshot; later source
+/// evidence only ever reaches a later group execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupSnapshot {
+    /// The pinned selection of each source slot.
+    pub sources: BTreeMap<SlotName, GroupSourceSnapshot>,
+}
+
+/// One source slot's pinned selection within a [`GroupSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GroupSourceSnapshot {
+    /// The authored source declaration.
+    pub reference: SourceText,
+    /// The source executions the slot's list holds one value for, in list
+    /// order: earliest input ingest time (earliest result ingest time for a
+    /// result-only execution), then execution ID.
+    pub execution_ids: Vec<ExecutionId>,
 }
 
 /// Current state of one Operator dispatch in an execution status response.

@@ -1,4 +1,4 @@
-//! The tool seam an Agent step action uses.
+//! The tool seam an Agent step action or check uses.
 //!
 //! The host binds executable built-ins to one invocation's authority,
 //! deadline, and workspace and hands them over as a [`ToolSession`]: a Skald
@@ -14,6 +14,7 @@
 //! invocations.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -21,12 +22,13 @@ use serde_json::Value;
 use skald_agent::{BeforeModelFn, CallbackOutcome};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
-use wyrd_spec::card::verifier::Action;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::ToolCallRecord;
 
-use super::{BlockCall, BlockError};
+use super::{BlockError, CallInput};
 
 /// Binds declared built-ins to one Agent step invocation.
 ///
@@ -36,10 +38,11 @@ use super::{BlockCall, BlockError};
 /// tools fails rather than running without them.
 #[async_trait]
 pub trait AgentToolset: Send + Sync {
-    /// Open the tool session for `tools` in `call`'s workspace.
+    /// Open the tool session for `tools` of the Agent call `id`, in its
+    /// resolved `workspace` and cancelled at `deadline`.
     ///
-    /// Called once per Agent step attempt, before the first model call. The
-    /// returned session lives exactly as long as that attempt.
+    /// Called once per Agent step or check attempt, before the first model
+    /// call. The returned session lives exactly as long as that attempt.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] when a tool needs a workspace the call
@@ -48,7 +51,9 @@ pub trait AgentToolset: Send + Sync {
     /// [`BlockError::Busy`] when the process has no workspace to admit.
     async fn open(
         &self,
-        call: &BlockCall<'_, Action>,
+        id: &TaskId,
+        workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
         tools: &[BuiltinTool],
     ) -> Result<ToolSession, BlockError>;
 }

@@ -28,6 +28,18 @@ BASELINE_TIMEOUT_SECONDS = 90.0
 ON_CALL_TOKEN = "on-call-bearer-token"
 """The bearer secret the ``on-call-hooks`` connection presents to the receiver."""
 
+LIVE_REVIEW = "spans were reviewed live"
+"""The ``coding-verifier`` statement every request of its ``spans-reviewed`` check carries."""
+
+FRAME_CLAIM = "Cite the frame."
+"""Text every ``frame-verifier`` judge request carries."""
+
+UNBADGED = "no badge!"
+"""The nine-byte label of the one frame whose person wears no badge."""
+
+UNBADGED_BASE64 = "bm8gYmFkZ2Uh"
+"""``UNBADGED`` in base64, as the judge's image data URL carries it."""
+
 
 @dataclass
 class Delivery:
@@ -141,9 +153,11 @@ def pull(cards: Cards, service: str, destination: Path) -> Path:
     return cards.pull(ref, destination).destination
 
 
-def service_key(service: str) -> str:
-    """Issue the registered ``service``'s own key; it holds only the default Card Role."""
-    return cli.issue_key(kind="Service", name=service, version="1.0.0", space="default").key
+def service_key(service: str, client: WyrdClient | None = None) -> str:
+    """Issue the registered ``service``'s own key as ``client``; it holds only the default Card Role."""
+    return cli.issue_key(
+        kind="Service", name=service, version="1.0.0", space="default", client=client
+    ).key
 
 
 def hydrated(bundle: Path, client: WyrdClient | None = None) -> WyrdState:
@@ -159,6 +173,16 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
     # Status and its verification block stay empty until the server derives them.
     assert status is not None and status.get("verification") is not None
     return status["verification"]["binding_ids"]
+
+
+def group_binding(server: WyrdTestServer, cards: Cards, ref: CardRef) -> str:
+    """The one ``group_end`` binding the server derived for ``ref``."""
+    [binding_id] = [
+        binding
+        for binding in binding_ids(cards, ref)
+        if binding_status(server, binding).get("group_end") is not None
+    ]
+    return binding_id
 
 
 def binding_status(server: WyrdTestServer, binding_id: str) -> dict[str, Any]:
@@ -205,6 +229,29 @@ def scheduled_result(
         time.sleep(0.5)
     [execution_id] = new
     return verify.Execution.connect(execution_id, admin).wait(timeout)
+
+
+def group_execution(
+    server: WyrdTestServer, binding_id: str, timeout: float, after: str | None = None
+) -> verify.ExecutionState:
+    """The newest completed execution of group ``binding_id`` other than ``after``.
+
+    Rows are published so the group poller discovers them, then the binding's
+    ``last_execution_id`` is read until that execution completes with a result.
+    """
+    admin = client_of(server)
+    deadline = time.monotonic() + timeout
+    while True:
+        server.flush_bifrost()
+        latest = binding_status(server, binding_id).get("last_execution_id")
+        if latest is not None and latest != after:
+            state = verify.Execution.connect(latest, admin).status()
+            if state["status"] == "completed" and "result" in state:
+                return state
+        assert time.monotonic() < deadline, (
+            f"group binding {binding_id} completed no new execution in {timeout} s"
+        )
+        time.sleep(0.5)
 
 
 @dataclass

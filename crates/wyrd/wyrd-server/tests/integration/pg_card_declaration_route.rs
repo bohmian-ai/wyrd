@@ -52,7 +52,7 @@ fn assertion_verifier_spec() -> Value {
 /// A Custom Drift Verifier spec over the `latency_ms` metric samples.
 ///
 /// It needs no fitted baseline, and its one `samples` slot lets a schedule
-/// Trigger activate it through [`latency_inputs`].
+/// Trigger activate it.
 fn latency_drift_spec() -> Value {
     json!({
         "inputs": { "samples": { "type": "samples", "features": ["latency_ms"] } },
@@ -68,12 +68,6 @@ fn latency_drift_spec() -> Value {
             }
         }]
     })
-}
-
-/// The schedule binding `inputs` mapping that fills [`latency_drift_spec`]'s
-/// `samples` slot from the recorded `latency_ms` metric.
-fn latency_inputs() -> Value {
-    json!({ "samples": { "metric": "latency_ms" } })
 }
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
@@ -958,7 +952,8 @@ fn bound_agent_request(
 /// bootstrap returns a non-user principal, when any fixture row fails to
 /// insert, when the route fails to respond, or when any refusal does not
 /// produce its exact status, stable error code, and absence of durable
-/// declaration state.
+/// registration state, or when the activation-mismatch remediation directs the
+/// caller to binding `inputs` instead of a recorded-samples Verifier.
 #[tokio::test(flavor = "current_thread")]
 async fn referenced_binding_refusals_leave_no_writes() {
     let server = WyrdTestServer::start_in_process()
@@ -1073,9 +1068,12 @@ async fn referenced_binding_refusals_leave_no_writes() {
         .await
         .expect("activation-mismatch registration responds");
     assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response_json(mismatch).await["code"],
-        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    let problem = response_json(mismatch).await;
+    assert_eq!(problem["code"], "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH");
+    let remediation = problem["remediation"].as_str().unwrap_or_default();
+    assert!(
+        remediation.contains("samples") && !remediation.contains("binding inputs"),
+        "remediation must point at samples Verifiers, never binding inputs: {problem}"
     );
     assert_no_declaration_writes(
         &server,
@@ -1359,7 +1357,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         assert_no_declaration_writes(&server, &operation, &name).await;
     }
 
-    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure, "inputs": latency_inputs() });
+    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure });
     let drift = card_ref("Verifier", "vc-drift-verifier");
     let trigger = card_ref("Trigger", "vc-schedule-trigger");
     let hook = card_ref("Operator", "vc-hook");
@@ -1585,7 +1583,59 @@ async fn composite_with_manifest_rejects_before_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Concurrent identical declarations persist one operation and one card.
+/// Refuse a manifest that repeats an artifact path or nests one under
+/// another, so a request sent past the loader cannot publish a file `a`
+/// beside `a/b`.
+///
+/// # Panics
+/// Panics when the test server or bootstrap fails, bootstrap returns a non-user principal, or an assertion fails.
+#[tokio::test(flavor = "current_thread")]
+async fn conflicting_artifact_paths_are_refused() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-path-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    for (key, paths) in [
+        ("artifact-paths-repeat", ["prompt.txt", "prompt.txt"]),
+        ("artifact-paths-nested", ["weights", "weights/a.bin"]),
+    ] {
+        let artifacts: Vec<_> = paths
+            .iter()
+            .map(|path| json!({ "relative_path": path, "sha256": "YQ==", "size_bytes": 1 }))
+            .collect();
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                request_with_body(
+                    key,
+                    json!({ "submissions": [{
+                        "apiVersion": "wyrd/v1", "kind": "Prompt",
+                        "metadata": { "name": key, "version": "1.0.0", "space": "default" },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
+                        "artifacts": artifacts
+                    }] }),
+                ),
+            )
+            .await
+            .expect("conflicting manifest responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+        assert_eq!(
+            response_json(response).await["code"],
+            "WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH",
+            "{key}"
+        );
+    }
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Concurrent identical registrations persist one operation and one card.
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_same_key_resolves_to_one_declaration() {
     let server = WyrdTestServer::start_in_process()
@@ -1881,7 +1931,13 @@ async fn heavy_declaration_initializes_upload_after_commit() {
 }
 
 /// The production reconciler retries a missing artifact and activates the Card
-/// after the object becomes available.
+/// after the object becomes available; the client's upload completion,
+/// arriving after that activation already completed the upload, still
+/// succeeds.
+///
+/// # Panics
+/// Panics when registration, the object write, reconciliation, or the late
+/// completion fails.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_recovers_after_storage_retry() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -1916,6 +1972,10 @@ async fn card_reconciler_recovers_after_storage_retry() {
     let upload_url = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
         .as_str()
         .expect("local upload plan contains a URL");
+    let upload_id = body["upload_plans"][0]["entries"][0]["upload_id"]
+        .as_str()
+        .expect("upload entry names its upload")
+        .to_owned();
 
     wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
 
@@ -1951,6 +2011,21 @@ async fn card_reconciler_recovers_after_storage_retry() {
         .expect("card state reads");
         conn.commit().await.expect("card state read commits");
         if state == ("active".to_owned(), "idle".to_owned(), 0) {
+            let complete = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/cards/upload/{upload_id}/complete"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"protocol": "single_put", "data": {}}).to_string(),
+                ))
+                .expect("upload completion request builds");
+            let response = server
+                .oneshot_authenticated(&jwt, complete)
+                .await
+                .expect("late upload completion responds");
+            let status = response.status();
+            let body = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
             server.shutdown().await.expect("test server shuts down");
             return;
         }
@@ -2665,8 +2740,7 @@ fn schedule_trigger_ref() -> Value {
 /// The Service-level binding runs the drift Verifier on `runs_on` (a
 /// referenced or inline `schedule` Trigger) and dispatches one inline HTTP
 /// Operator on failure; the `assistant` component binding runs the same
-/// Verifier on an inline daily `schedule` Trigger. Both bindings map the
-/// Verifier's samples slot through [`latency_inputs`]. `second_alias` adds a
+/// Verifier on an inline daily `schedule` Trigger. `second_alias` adds a
 /// second component occurrence under that alias so the alias-uniqueness
 /// refusal can reuse the builder.
 fn bound_service_request(
@@ -2696,8 +2770,7 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
             "verifier": {
                 "kind": "Verifier", "name": "vb-drift", "version": "1.0.0", "space": "default"
             },
-            "runs_on": { "kind": "schedule", "cron": "0 3 * * *" },
-            "inputs": latency_inputs()
+            "runs_on": { "kind": "schedule", "cron": "0 3 * * *" }
         }]
     })];
     if let Some(alias) = second_alias {
@@ -2715,7 +2788,6 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
                             "version": "1.0.0", "space": "default"
                         },
                         "runs_on": runs_on,
-                        "inputs": latency_inputs(),
                         "on_failure": [{
                             "kind": "http", "method": "post",
                             "url": "https://hooks.example.test/verification-failed"
@@ -3789,7 +3861,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
             Some(owner) => authority
                 .resolve(&mut conn, owner)
                 .await
-                .expect("owner authority resolves"),
+                .expect("owner authority resolves")
+                .ok(),
             None => None,
         };
         let tick = queue

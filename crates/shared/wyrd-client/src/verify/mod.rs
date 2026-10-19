@@ -23,7 +23,7 @@ use skald_spec::MediaFormat;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{InputSlot, VerifierSpec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::ids::{CardUid, GroupId, SlotName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_spec::verification::EXECUTION_DEADLINE;
@@ -279,6 +279,8 @@ pub(crate) struct Target<'a> {
     pub(crate) card_uid: CardUid,
     /// The application Run the execution belongs to.
     pub(crate) run_id: RunId,
+    /// The caller group the execution belongs to, when grouped.
+    pub(crate) group_id: Option<GroupId>,
 }
 
 /// The evidence one call carries, projected from the caller's values.
@@ -456,6 +458,7 @@ impl Target<'_> {
             verifier_card_uid: self.verifier_card_uid.clone(),
             card_uid: self.card_uid.clone(),
             run_id: Some(self.run_id.clone()),
+            group_id: self.group_id.clone(),
             inputs,
             execution_route_overrides: BTreeMap::new(),
         }
@@ -584,6 +587,7 @@ fn slot_type(slot: &InputSlot) -> &'static str {
         InputSlot::Media { .. } => "media",
         InputSlot::Trace { .. } => "trace",
         InputSlot::Samples { .. } => "samples",
+        InputSlot::Source(_) => "source",
     }
 }
 

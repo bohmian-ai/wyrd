@@ -1052,7 +1052,9 @@ mod pg_tests {
         suspend_service_account_principal, suspend_user_principal,
     };
 
-    use wyrd_sql::queries::verification::{FrozenTarget, NewBinding, project_bindings};
+    use wyrd_sql::queries::verification::{
+        BindingActivation, FrozenTarget, NewBinding, project_bindings,
+    };
     use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
@@ -1315,9 +1317,10 @@ mod pg_tests {
                 verifier_card_uid: verifier,
                 trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
                 operators: Vec::new(),
-                cron: "0 2 * * *".to_owned(),
-                tz: None,
-                inputs: std::collections::BTreeMap::new(),
+                activation: BindingActivation::Schedule {
+                    cron: "0 2 * * *".to_owned(),
+                    tz: None,
+                },
             }],
         )
         .await

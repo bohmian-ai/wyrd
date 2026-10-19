@@ -1,0 +1,20 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: optional-latency
+  version: 1.0.0
+  space: default
+spec:
+  description: A samples slot is always required; required false is refused.
+  inputs:
+    latency: {type: samples, features: [latency], required: false}
+  requirements:
+    - id: latency-within-budget
+      statement: Mean request latency stays at or below 100 ms
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 0.0, alert_threshold: 100.0}

@@ -1998,6 +1998,37 @@ export interface GatewayPriceRate {
 }
 
 /**
+ * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
+ */
+export type GroupId = string;
+
+/**
+ * The source evidence one group execution pinned when it was enqueued.
+ *
+ * Every retry of the execution judges exactly this snapshot; later source evidence only ever reaches a later group execution.
+ */
+export interface GroupSnapshot {
+  /**
+   * The pinned selection of each source slot.
+   */
+  readonly sources: Readonly<Record<string, GroupSourceSnapshot>>;
+}
+
+/**
+ * One source slot's pinned selection within a [`GroupSnapshot`].
+ */
+export interface GroupSourceSnapshot {
+  /**
+   * The source executions the slot's list holds one value for, in list order: earliest input ingest time (earliest result ingest time for a result-only execution), then execution ID.
+   */
+  readonly execution_ids: readonly string[];
+  /**
+   * The authored source declaration.
+   */
+  readonly reference: SourceText;
+}
+
+/**
  * Credential authority of an HTTP action, bound to a tenant `http` connection.
  *
  * The scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.
@@ -2339,67 +2370,7 @@ export interface InputDeclarationTrace {
 /**
  * One named evidence slot. Slots are required unless `required: false`.
  */
-export type InputSlot = InputSlotJson | InputSlotMedia | InputSlotTrace | InputSlotSamples;
-
-/**
- * A JSON value, optionally constrained by JSON Schema.
- */
-export interface InputSlotJson {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  /**
-   * JSON Schema the value must satisfy.
-   */
-  readonly schema?: JsonValue;
-  readonly type: "json";
-}
-
-/**
- * A pinned file in one of the accepted formats.
- */
-export interface InputSlotMedia {
-  /**
-   * Accepted formats.
-   */
-  readonly formats: readonly MediaFormat[];
-  /**
-   * Lower size bound than the deployment limit.
-   */
-  readonly max_bytes?: number | null;
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "media";
-}
-
-/**
- * Feature measurements or metric samples recorded for a scheduled window.
- */
-export interface InputSlotSamples {
-  /**
-   * Measurement names, including metric names.
-   */
-  readonly features: readonly FeatureName[];
-  /**
-   * Whether the schedule binding must fill the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "samples";
-}
-
-/**
- * A trace resolved through tenant-scoped trace reads.
- */
-export interface InputSlotTrace {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
-  readonly type: "trace";
-}
+export type InputSlot = TypedInputSlot | SourceText;
 
 /**
  * OTel-canonical instrumentation scope.
@@ -4749,25 +4720,6 @@ export interface SampleInput {
 export type SampleInputKind = "Pandas" | "Polars" | "Arrow" | "Numpy" | "Torch" | "Tf" | "Dict" | "List" | "Tuple" | "Str" | "None";
 
 /**
- * One scheduled-evidence source selector in a binding's `inputs` map.
- */
-export type ScheduledInput = ScheduledInputFeatures | ScheduledInputMetric;
-
-/**
- * Recorded feature measurements.
- */
-export interface ScheduledInputFeatures {
-  readonly features: readonly FeatureName[];
-}
-
-/**
- * One recorded metric.
- */
-export interface ScheduledInputMetric {
-  readonly metric: FeatureName;
-}
-
-/**
  * Operator-configured external secret backend identity.
  */
 export type SecretBackendName = string;
@@ -4998,6 +4950,11 @@ export interface SourceCompletion {
  * Completion state for one source tier.
  */
 export type SourceCompletionOutcome = "complete" | "unavailable";
+
+/**
+ * Group source reference: verifiers.<name>.inputs.<slot> or verifiers.<name>.requirements.<requirement>.outcome, selecting one whole slot or requirement outcome per source execution.
+ */
+export type SourceText = string;
 
 /**
  * Human-visible namespace for Cards and Runs.
@@ -5521,9 +5478,29 @@ export type TorchSaveFormat2 = "Safetensors" | "Pickle";
 export type TraceId = string;
 
 /**
+ * Positive whole duration <n><unit> with unit s, m, h, or d, such as 30m or 24h, at most one year: 365d = 8760h = 525600m = 31536000s.
+ */
+export type TriggerDuration = string;
+
+/**
  * Declarative activation for a bound Verifier.
  */
-export type TriggerSpec = TriggerSpecSchedule;
+export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
+
+/**
+ * Activate once per `group_id` group of source executions this long after its latest acknowledged source evidence; new evidence postpones it and, once judged, schedules a later group execution.
+ */
+export interface TriggerSpecGroupEnd {
+  /**
+   * Quiet period after the latest acknowledged source input or result.
+   */
+  readonly after: TriggerDuration;
+  /**
+   * Optional human-readable purpose.
+   */
+  readonly description?: string | null;
+  readonly kind: "group_end";
+}
 
 /**
  * Activate on each due occurrence of a cron schedule.
@@ -5548,6 +5525,69 @@ export interface TriggerSpecSchedule {
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
 export type TypedCardKind = "Data" | "Model" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
+
+/**
+ * One named evidence slot. Slots are required unless `required: false`; samples and source slots are always required.
+ */
+export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
+
+/**
+ * A JSON value, optionally constrained by JSON Schema.
+ */
+export interface TypedInputSlotJson {
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  /**
+   * JSON Schema the value must satisfy.
+   */
+  readonly schema?: JsonValue;
+  readonly type: "json";
+}
+
+/**
+ * A pinned file in one of the accepted formats.
+ */
+export interface TypedInputSlotMedia {
+  /**
+   * Accepted formats.
+   */
+  readonly formats: readonly MediaFormat[];
+  /**
+   * Lower size bound than the deployment limit.
+   */
+  readonly max_bytes?: number | null;
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  readonly type: "media";
+}
+
+/**
+ * Feature measurements or metric samples recorded for a scheduled window.
+ *
+ * Always required: a schedule binding supplies every samples slot of its Verifier from the subject's recorded measurements, so the slot has no `required` field and no drift check can be omitted by configuration.
+ */
+export interface TypedInputSlotSamples {
+  /**
+   * Measurement names, including metric names.
+   */
+  readonly features: readonly FeatureName[];
+  readonly type: "samples";
+}
+
+/**
+ * A trace resolved through tenant-scoped trace reads.
+ */
+export interface TypedInputSlotTrace {
+  /**
+   * Whether a caller must supply the slot.
+   */
+  readonly required?: boolean;
+  readonly type: "trace";
+}
 
 /**
  * Admission of a call whose cost cannot be bounded.
@@ -5621,17 +5661,17 @@ export interface UpdateOperatorConnectionRequestSlack {
  */
 export interface VerificationBinding {
   /**
-   * Scheduled evidence: the recorded measurements filling each samples slot of the Verifier within the subject's schedule window.
-   *
-   * Checked against the Verifier with [`VerifierSpec::validate_schedule`]; names are never inferred.
-   */
-  readonly inputs?: Readonly<Record<string, ScheduledInput>>;
-  /**
    * Operators dispatched independently after a `failed` verdict.
    *
-   * Empty means a failed result stays durable with no reaction.
+   * Empty means a failed result stays durable with no reaction. A `group_end` binding refuses this list; it reacts through [`Self::on_verdict_change`] instead.
    */
   readonly on_failure?: readonly InlineableRef_for_OperatorSpec[];
+  /**
+   * Operators dispatched independently when a settled group judgment's verdict differs from the preceding settled judgment of the same binding and group.
+   *
+   * Valid only on a `group_end` binding. The first judgment of a group is the baseline and dispatches nothing; an unchanged verdict dispatches nothing.
+   */
+  readonly on_verdict_change?: readonly InlineableRef_for_OperatorSpec[];
   /**
    * When the bound Verifier runs, inline or as a referenced Trigger Card.
    *
@@ -5665,7 +5705,7 @@ export interface VerificationError {
  */
 export interface VerificationExecutionState {
   /**
-   * Every Operator dispatch of a failed background binding execution, in identity order; empty otherwise. Delivery completes independently of the execution and never changes its verdict.
+   * Every Operator dispatch of a failed background binding execution or a changed group verdict, in identity order; empty otherwise. Delivery completes independently of the execution and never changes its verdict.
    */
   readonly dispatches: readonly OperatorDispatchState[];
   /**
@@ -5676,6 +5716,18 @@ export interface VerificationExecutionState {
    * The execution.
    */
   readonly execution_id: string;
+  /**
+   * The source snapshot a group execution judges.
+   */
+  readonly group?: GroupSnapshot | null;
+  /**
+   * Caller group the execution belongs to, or the group a group execution judges.
+   */
+  readonly group_id?: GroupId | null;
+  /**
+   * Binding owner of a background execution.
+   */
+  readonly owner_card_uid?: CardUid | null;
   /**
    * The result once completed and visible.
    */

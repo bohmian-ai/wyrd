@@ -730,7 +730,7 @@ impl NativeRun {
     }
 
     /// Executes a bound Verifier now on slot values and returns its
-    /// result.
+    /// result, carrying the caller's optional `group_id`.
     ///
     /// # Errors
     ///
@@ -743,11 +743,14 @@ impl NativeRun {
         env: &'env Env,
         verifier: String,
         inputs: Vec<NativeVerifierInput>,
+        group_id: Option<String>,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
-            let result = match crate::verification::inputs(inputs) {
-                Ok(inputs) => Box::pin(run.observe().verify(&verifier, inputs)).await,
+            let prepared = crate::verification::inputs(inputs)
+                .and_then(|inputs| Ok((inputs, run.observe().grouped(group_id.as_deref())?)));
+            let result = match prepared {
+                Ok((inputs, observe)) => Box::pin(observe.verify(&verifier, inputs)).await,
                 Err(error) => Err(error),
             };
             NativeLifecycleResult::outcome(result)
@@ -757,7 +760,7 @@ impl NativeRun {
     /// Submits slot values: Window samples are recorded now on the
     /// JavaScript thread, so each queued sample write records its
     /// `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
-    /// queued for one execution.
+    /// queued for one execution carrying the caller's optional `group_id`.
     ///
     /// # Errors
     ///
@@ -769,10 +772,12 @@ impl NativeRun {
         env: &'env Env,
         verifier: String,
         inputs: Vec<NativeVerifierInput>,
+        group_id: Option<String>,
     ) -> napi::Result<PromiseRaw<'env, NativeSubmission>> {
         let run = self.run.clone();
         let staged = crate::verification::inputs(inputs).and_then(|inputs| {
-            crate::trace::traced(*env, || run.observe().stage(&verifier, inputs))
+            let observe = run.observe().grouped(group_id.as_deref())?;
+            crate::trace::traced(*env, || observe.stage(&verifier, inputs))
         });
         crate::trace::spawn(env, async move {
             let result = match staged {

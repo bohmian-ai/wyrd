@@ -71,9 +71,12 @@ Overload is bounded and explicit:
   protected resource floor.
 - Postgres and external dependencies use bounded pools, timeouts, and
   backpressure. An exhausted dependency does not trigger unbounded retries or
-  queue growth, with one deliberate exception: the Scribe outbox queue is
-  unbounded and resubmits a retryable failure as the identical slice, because
-  holding a write in memory is preferred to dropping it.
+  queue growth. The Scribe outbox admits a finite capacity covering queued,
+  waiting, retrying, and in-flight writes and resubmits a retryable failure as
+  the identical admitted slice. Past capacity, verification submissions are
+  refused with a retryable error before anything is staged, while audit, span,
+  and capture writes are counted lost and logged without blocking or failing
+  their operation.
 
 When a protected floor, durable volume, or safety invariant is
 exhausted, the responsible surface rejects new work. It does not borrow across

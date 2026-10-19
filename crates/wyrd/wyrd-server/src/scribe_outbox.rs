@@ -26,13 +26,22 @@
 //! write that holds it returns with the row acknowledged, the sink stages the
 //! submission on the [`SubmissionOutbox`] that accepts it into the durable
 //! queue, so no execution is queued before its inputs are durable.
+//!
+//! A sink given the Wyrd Postgres owner also schedules grouped verification:
+//! once a slice's frames are acknowledged, every grouped inputs or result row
+//! that was not lost records its group's activity in one tenant transaction
+//! through [`VerifierExecutionQueue::record_group_activity`], before any
+//! submission is handed off. A failed transaction fails the write, so the
+//! outbox retries the identical slice. Activity acknowledged by Scribe but
+//! not yet recorded when the process dies is lost with the rest of the
+//! outbox.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array as _, AsArray as _, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
@@ -52,13 +61,15 @@ use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, SpansTable,
 };
-use wyrd_runtime::outbox::{Outbox, OutboxSink, count_lost};
+use wyrd_runtime::outbox::{Outbox, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL};
+use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
-use wyrd_sql::queries::verifier_executions::Submission;
+use wyrd_sql::WyrdPostgres;
+use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
@@ -67,13 +78,19 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerS
 
 use crate::components::gateway::{CallCapture, CaptureDrop};
 use crate::verification::results::{ResultBatch, ResultPayload};
-use crate::verification::submissions::SubmissionOutbox;
+use crate::verification::submissions::SubmissionSink;
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
 
 /// Most tenants whose slices are written at once.
 const SCRIBE_WRITERS: usize = 4;
+
+/// Default of `scribe.outbox_capacity`: the most writes the process Scribe
+/// outbox admits at once, queued, retrying, or in flight. Every write's rows
+/// are bounded by its producer's input limits, so this also bounds the
+/// outbox's memory.
+pub(crate) const SCRIBE_CAPACITY: usize = 65_536;
 
 /// Longest a peer Scribe may take to acknowledge one frame.
 ///
@@ -122,9 +139,10 @@ pub enum ScribeWrite {
         row: ResultBatch,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
-        /// A submitted execution and the outbox that queues it once Scribe
-        /// acknowledges the row; `None` for a direct execution.
-        queued: Option<(Arc<SubmissionOutbox>, Box<Submission>)>,
+        /// A submitted execution and its reserved slot on the outbox that
+        /// queues it once Scribe acknowledges the row, so the handoff is never
+        /// refused; `None` for a direct execution.
+        queued: Option<(Reservation<SubmissionSink>, Box<Submission>)>,
     },
     /// One server span's tenant copy, attributed to the operation that
     /// emitted it.
@@ -249,6 +267,32 @@ impl ScribeWrite {
             }]),
         }
     }
+
+    /// The grouped source activity this write records: the owner, subject,
+    /// Verifier, and group of an inputs row or a result's summary row, or
+    /// `None` when the write is no grouped Verifier evidence or names no
+    /// owner.
+    fn group_activity(&self) -> Option<GroupActivity> {
+        let batch = match self {
+            Self::ExecutionInputs { row, .. } => &row.batch,
+            Self::Result { payload, .. } => payload
+                .batches()
+                .iter()
+                .find(|batch| ScribeTable::from_fqn(&batch.table) == Some(ScribeTable::Results))
+                .map(|batch| &batch.batch)?,
+            Self::Audit { .. } | Self::Capture(_) | Self::ServerSpans { .. } => return None,
+        };
+        let cell = |name: &str| {
+            let column = batch.column_by_name(name)?.as_string_opt::<i32>()?;
+            (batch.num_rows() > 0 && column.is_valid(0)).then(|| column.value(0))
+        };
+        Some(GroupActivity {
+            owner_card_uid: CardUid::new(cell("owner_card_uid")?).ok()?,
+            card_uid: CardUid::new(cell("card_uid")?).ok()?,
+            verifier_card_uid: CardUid::new(cell("verifier_card_uid")?).ok()?,
+            group_id: GroupId::new(cell("group_id")?).ok()?,
+        })
+    }
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
@@ -335,6 +379,10 @@ pub enum ScribeRefusal {
     /// Scribe refused the frame terminally, for example as malformed.
     #[error("scribe rejected the frame")]
     Rejected,
+    /// Scribe acknowledged every frame, but recording grouped activity
+    /// failed; the slice is retried.
+    #[error("group scheduling failed")]
+    Scheduling,
 }
 
 impl ScribeRefusal {
@@ -344,6 +392,7 @@ impl ScribeRefusal {
             Self::Saturated => "saturated",
             Self::Unavailable => "unavailable",
             Self::Rejected => "rejected",
+            Self::Scheduling => "scheduling",
         }
     }
 
@@ -580,9 +629,10 @@ impl ScribeRoute {
 
 /// Most tenant span copies one process holds unwritten at once.
 ///
-/// The outbox queue itself is unbounded; this caps only the span producer, so
-/// a sustained Scribe outage cannot grow the heap without limit while audit,
-/// capture, and result writes keep their own semantics.
+/// The outbox admits at most [`SCRIBE_CAPACITY`] writes, a quarter of them
+/// unreserved; this smaller cap on the span producer keeps a sustained Scribe
+/// outage's span copies from filling that unreserved share ahead of audit and
+/// capture writes.
 const TENANT_SPAN_PERMITS: usize = 2_048;
 
 /// Stages the tenant copies of server spans on the process Scribe outbox.
@@ -638,36 +688,113 @@ pub struct ScribeSink {
     /// Largest rows, in memory and encoded, one frame carries; see
     /// [`frame_budget`].
     frame_budget: usize,
+    /// Wyrd Postgres owner recording acknowledged grouped activity; `None`
+    /// schedules no group.
+    groups: Option<WyrdPostgres>,
 }
 
 impl ScribeSink {
     /// Starts an outbox submitting along `route`, or dropping every write
-    /// when `route` is `None`.
+    /// when `route` is `None`, at the default capacity.
     ///
     /// `request_bytes` is the deployment's configured Scribe request ceiling
     /// (`scribe.ingest_request_bytes`), which every Scribe a frame can reach
     /// enforces.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
+        Self::bounded_outbox(route, request_bytes, SCRIBE_CAPACITY, None)
+    }
+
+    /// Starts an outbox like [`Self::outbox`] admitting at most `capacity`
+    /// writes (`scribe.outbox_capacity`) and recording acknowledged grouped
+    /// activity through `groups`, when given.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
+    #[must_use]
+    pub(crate) fn bounded_outbox(
+        route: Option<ScribeRoute>,
+        request_bytes: usize,
+        capacity: usize,
+        groups: Option<WyrdPostgres>,
+    ) -> Arc<ScribeOutbox> {
         Outbox::new(
             Self {
                 route,
                 attempts: AtomicUsize::new(0),
                 frame_budget: frame_budget(request_bytes),
+                groups,
             },
             SCRIBE_WRITERS,
+            capacity,
         )
     }
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
-    /// pod's own Scribe at the default request ceiling.
+    /// pod's own Scribe at the default request ceiling, and recording
+    /// acknowledged grouped activity through `groups`, when given.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn local_outbox(scribe: Arc<dyn Scribe>) -> Arc<ScribeOutbox> {
-        Self::outbox(
+    pub fn local_outbox(
+        scribe: Arc<dyn Scribe>,
+        groups: Option<WyrdPostgres>,
+    ) -> Arc<ScribeOutbox> {
+        Self::bounded_outbox(
             Some(ScribeRoute::Local(scribe)),
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            SCRIBE_CAPACITY,
+            groups,
         )
+    }
+
+    /// Record the grouped activity of every acknowledged, not lost write of
+    /// `items` in one `tenant` transaction.
+    ///
+    /// Issues nothing when no write is grouped evidence or no Postgres owner
+    /// was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeRefusal::Scheduling`] when the transaction fails, so
+    /// the outbox retries the slice; Scribe's batch-id fence absorbs its
+    /// resubmitted frames.
+    async fn schedule_groups(
+        &self,
+        tenant: DataTenantId,
+        items: &[ScribeWrite],
+        lost: &BTreeSet<usize>,
+    ) -> Result<(), ScribeRefusal> {
+        let Some(postgres) = &self.groups else {
+            return Ok(());
+        };
+        let activity: Vec<GroupActivity> = items
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !lost.contains(index))
+            .filter_map(|(_, item)| item.group_activity())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if activity.is_empty() {
+            return Ok(());
+        }
+        let recorded = async {
+            let mut conn = postgres.tenant_conn(tenant).await?;
+            VerifierExecutionQueue::default()
+                .record_group_activity(&mut conn, &activity)
+                .await?;
+            conn.commit().await?;
+            Ok::<_, wyrd_sql::SqlError>(())
+        };
+        recorded.await.map_err(|error| {
+            tracing::warn!(outbox = Self::NAME, %tenant, %error, "grouped activity could not be recorded; the slice will be retried");
+            ScribeRefusal::Scheduling
+        })
     }
 
     /// Whether this sink reaches any Scribe, in-process or over the peer plane.
@@ -871,8 +998,11 @@ impl OutboxSink for ScribeSink {
     /// Writes that were projected away or whose frame was refused terminally
     /// are counted lost once the slice completes, never on a retried
     /// attempt. A process that reaches no Scribe drops the whole slice.
-    /// Once the slice completes, every submission whose inputs row was not
+    /// Once the slice completes, the grouped activity of every write that was
+    /// not lost is recorded, then every submission whose inputs row was not
     /// lost is staged on its [`SubmissionOutbox`]; a lost row queues nothing.
+    /// A failed activity transaction retries the slice before any loss is
+    /// counted or reservation consumed.
     ///
     /// # Errors
     ///
@@ -917,15 +1047,16 @@ impl OutboxSink for ScribeSink {
                 }
             }
         }
+        self.schedule_groups(tenant, items, &lost).await?;
         count_lost::<Self>(lost.len());
         for (index, item) in items.iter().enumerate() {
             if let ScribeWrite::ExecutionInputs {
-                queued: Some((outbox, submission)),
+                queued: Some((reserved, submission)),
                 ..
             } = item
                 && !lost.contains(&index)
             {
-                outbox.stage(tenant, (**submission).clone());
+                reserved.stage(tenant, (**submission).clone());
             }
         }
         Ok(())
@@ -977,8 +1108,8 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
+        Outbox, SCRIBE_CAPACITY, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal,
+        ScribeRoute, ScribeSink, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -1091,6 +1222,7 @@ mod tests {
                 verifier_version: "1.0.0",
                 card_uid: subject,
                 owner_card_uid: None,
+                group_id: None,
                 binding_id: None,
                 trigger: None,
                 window: Some(&window),
@@ -1129,7 +1261,7 @@ mod tests {
     #[tokio::test]
     async fn writes_group_by_destination_under_their_attribution() {
         let scribe = Arc::new(RecordingScribe::default());
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
         let attribution = background();
         let subjects = [uid(), uid(), uid()];
@@ -1200,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn audit_decisions_frame_under_the_platform_audit_principal() {
         let scribe = Arc::new(RecordingScribe::default());
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let audit: &dyn AuditStage = &*outbox;
         let tenant = DataTenantId::new_v7();
         audit.stage(tenant, decision("bifrost.query.read_decision"));
@@ -1238,7 +1370,7 @@ mod tests {
         scribe.refuse_next(ScribeError::IngestBusy {
             table: "vala.gateway.calls".to_owned(),
         });
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
         outbox.stage(tenant, capture(tenant));
         settle(&outbox).await;
@@ -1265,7 +1397,7 @@ mod tests {
     async fn a_terminal_rejection_never_blocks_later_writes() {
         let scribe = Arc::new(RecordingScribe::default());
         scribe.refuse_next(ScribeError::InvalidFrame);
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
         outbox.stage(tenant, capture(tenant));
         settle(&outbox).await;
@@ -1417,7 +1549,7 @@ mod tests {
         assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
 
         let scribe = Arc::new(RecordingScribe::default());
-        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let spans = ServerSpanSink::new(Arc::clone(&outbox));
         let (route, copy) = span_copy(tenant);
         spans.stage(route, copy);
@@ -1445,8 +1577,10 @@ mod tests {
                 route: Some(route),
                 attempts: AtomicUsize::new(0),
                 frame_budget: frame_budget(request_bytes),
+                groups: None,
             },
             SCRIBE_WRITERS,
+            SCRIBE_CAPACITY,
         )
     }
 

@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: turn-check
+  version: 1.0.0
+  space: default
+spec:
+  description: Each support turn carries an answer.
+  inputs:
+    turn: {type: json}
+  requirements:
+    - id: answered
+      statement: The turn has a non-empty answer
+      check: {kind: assert, path: inputs.turn.answer, operator: not_equals, expected: ""}

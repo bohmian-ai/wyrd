@@ -12,10 +12,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::card::verifier::VerifierSpec;
+use crate::card::verifier::{InputSlot, VerifierSpec};
 use crate::error::WyrdError;
 use crate::ids::{
-    BindingId, CardUid, ConnectionName, ExecutionId, OperatorDispatchId, VerificationResultId,
+    BindingId, CardUid, ConnectionName, ExecutionId, GroupId, OperatorDispatchId,
+    VerificationResultId,
 };
 use crate::operator_connection::{
     HttpAuthScheme, HttpsOrigin, OperatorConnectionConfig, OperatorProvider,
@@ -392,8 +393,9 @@ pub struct OperatorBudget {
 
 /// The bounded, immutable context every Operator invocation renders from.
 ///
-/// Frozen on the dispatch row when a failed binding-created run settles, so
-/// every retry renders the same payload. It carries identities, the verdict,
+/// Frozen on the dispatch row when a failed binding-created run, or a group
+/// execution whose verdict changed, settles, so every retry renders the same
+/// payload. It carries identities, the verdict,
 /// completion time, and a bounded summary only: no verification context, media, Drift
 /// feature rows, result detail, or secret material. Template placeholder names
 /// are exactly [`OperatorFailureContext::FIELDS`].
@@ -417,7 +419,8 @@ pub struct OperatorFailureContext {
     pub subject_uid: CardUid,
     /// Exact subject identity as `space/name@version`.
     pub subject_ref: String,
-    /// Always `failed`.
+    /// `failed` for an `on_failure` dispatch; the new verdict of a group
+    /// `on_verdict_change` dispatch.
     pub verdict: VerificationVerdict,
     /// When the execution settled.
     pub completed_at: DateTime<Utc>,
@@ -426,6 +429,38 @@ pub struct OperatorFailureContext {
     /// Counts of the Verifier's one drift check, when it has exactly one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<DriftCounts>,
+    /// The verdict change of a group execution's `on_verdict_change` dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupChange>,
+}
+
+/// The settled group verdict change one `on_verdict_change` dispatch reacts
+/// to: the group and the preceding settled group result it differs from.
+///
+/// Templates reach it as `group.*` fields, which apply only to a group
+/// Verifier, one with source inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GroupChange {
+    /// The judged group.
+    pub group_id: GroupId,
+    /// The preceding settled group result.
+    pub previous_result_id: VerificationResultId,
+    /// That result's verdict.
+    pub previous_verdict: VerificationVerdict,
+}
+
+impl GroupChange {
+    /// The rendered value of one `group.*` field, or `None` when unknown.
+    fn field(&self, name: &str) -> Option<String> {
+        Some(match name {
+            "group.group_id" => self.group_id.to_string(),
+            "group.previous_result_id" => self.previous_result_id.to_string(),
+            "group.previous_verdict" => <&'static str>::from(self.previous_verdict).to_owned(),
+            _ => return None,
+        })
+    }
 }
 
 /// Count-only numbers of a failed execution's one drift check.
@@ -460,14 +495,25 @@ impl DriftCounts {
 /// `verifier`; every field applies to a standalone Operator (`None`).
 ///
 /// `drift.*` fields apply only to a Verifier with exactly one drift check, so
-/// counts are never guessed across several checks.
+/// counts are never guessed across several checks; `group.*` fields apply
+/// only to a group Verifier, whose bindings react to verdict changes.
 fn field_applies(name: &str, verifier: Option<&VerifierSpec>) -> bool {
-    !name.starts_with("drift.") || verifier.is_none_or(|spec| spec.drift_checks().count() == 1)
+    if name.starts_with("drift.") {
+        return verifier.is_none_or(|spec| spec.drift_checks().count() == 1);
+    }
+    if name.starts_with("group.") {
+        return verifier.is_none_or(|spec| {
+            spec.inputs
+                .values()
+                .any(|slot| matches!(slot, InputSlot::Source(_)))
+        });
+    }
+    true
 }
 
 impl OperatorFailureContext {
     /// Every placeholder name a template may reference.
-    pub const FIELDS: [&'static str; 13] = [
+    pub const FIELDS: [&'static str; 16] = [
         "dispatch_id",
         "execution_id",
         "result_id",
@@ -481,6 +527,9 @@ impl OperatorFailureContext {
         "summary",
         "drift.drifted_features",
         "drift.total_features",
+        "group.group_id",
+        "group.previous_result_id",
+        "group.previous_verdict",
     ];
 
     /// The rendered value of one placeholder, or `None` for an unknown name
@@ -499,6 +548,7 @@ impl OperatorFailureContext {
             "verdict" => <&'static str>::from(self.verdict).to_owned(),
             "completed_at" => self.completed_at.to_rfc3339(),
             "summary" => self.summary.clone(),
+            _ if name.starts_with("group.") => return self.group.as_ref()?.field(name),
             _ => return self.drift?.field(name).map(|count| count.to_string()),
         })
     }

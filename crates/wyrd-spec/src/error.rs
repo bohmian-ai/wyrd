@@ -1927,6 +1927,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// A group snapshot still saw a source result without that execution's
+    /// input more than five minutes past the group's due time; the group is
+    /// consumed with this error instead of judging partial evidence.
+    #[error("[WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE",
+        status = 409,
+        title = "Verification snapshot incomplete",
+        remediation = "Check Bifrost publication for the named source executions, then submit a new turn to the group."
+    )]
+    VerificationSnapshotIncomplete {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the source executions.
+        details: Value,
+    },
     /// Supplied input lacks a feature the Verifier needs or carries the wrong value type.
     #[error("[WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE] {message}")]
     #[wyrd_error(
@@ -1978,6 +1994,23 @@ pub enum WyrdError {
         remediation = "Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds."
     )]
     VerificationExecutionTimedOut {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// This server process has no staging capacity for a verification now.
+    ///
+    /// Admission is refused before anything is staged, so no source row of
+    /// the refused call exists and the identical call may be retried whole.
+    #[error("[WYRD_VERIFICATION_429_STAGING_FULL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_429_STAGING_FULL",
+        status = 429,
+        title = "Verification staging is full",
+        remediation = "Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate."
+    )]
+    VerificationStagingFull {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2073,7 +2106,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit."
+        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.
@@ -3771,10 +3804,12 @@ impl WyrdError {
             | Self::VerificationTargetNotFound { message, details }
             | Self::VerificationBaselineNotReady { message, details }
             | Self::VerificationBaselineLegacy { message, details }
+            | Self::VerificationSnapshotIncomplete { message, details }
             | Self::VerificationInputIncompatible { message, details }
             | Self::VerificationInputUnsupported { message, details }
             | Self::VerificationDependencyFailed { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
+            | Self::VerificationStagingFull { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
             | Self::OperatorConnectionNotFound { message, details }

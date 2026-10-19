@@ -1,0 +1,212 @@
+<title>Group Verification Scenarios</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap">
+<style>
+/* Layout: one reading column; code blocks scroll on their own. */
+:root {
+  --bg: #f6f7f8; --surface: #ffffff; --fg: #1d242b; --muted: #5a6670; --line: #d9dee3;
+  --accent: #0f6e77; --new-bg: #fde9c4; --new-fg: #6b3d00; --code-bg: #f0f2f4;
+  --display: "Newsreader", Georgia, serif;
+  --body: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12171c; --surface: #1a2027; --fg: #e3e8ec; --muted: #9aa7b1; --line: #2c353e;
+  --accent: #5cc3cc; --new-bg: #4a3410; --new-fg: #ffd796; --code-bg: #161c22; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12171c; --surface: #1a2027; --fg: #e3e8ec; --muted: #9aa7b1; --line: #2c353e;
+  --accent: #5cc3cc; --new-bg: #4a3410; --new-fg: #ffd796; --code-bg: #161c22; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); }
+.wrap { max-width: 960px; margin: 0 auto; padding-inline: 16px; padding-block: 32px 64px; display: grid; gap: 28px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: 2.1rem; }
+h2 { font-size: 1.7rem; padding-top: 12px; border-top: 2px solid var(--fg); }
+p, li { max-width: 72ch; }
+p { margin: 0; }
+section { display: grid; gap: 16px; min-width: 0; }
+.lede { color: var(--muted); font-size: 1.05rem; }
+nav { display: flex; flex-wrap: wrap; gap: 8px 20px; font-weight: 500; }
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.n { background: var(--new-bg); color: var(--new-fg); }
+.file { display: grid; min-width: 0; }
+.file .name { font: 600 .82rem/1.3 var(--mono); color: var(--muted); padding: 8px 12px; background: var(--surface); border: 1px solid var(--line); border-bottom: none; border-radius: 4px 4px 0 0; }
+pre { margin: 0; padding: 12px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 0 0 4px 4px; overflow-x: auto; font: 13px/1.55 var(--mono); }
+p code, li code, td code { font-family: var(--mono); font-size: .9em; background: var(--code-bg); padding: 1px 4px; border-radius: 3px; }
+.table { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; color: var(--muted); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }
+tr:last-child td { border-bottom: none; }
+ol, ul { margin: 0; padding-left: 22px; display: grid; gap: 8px; }
+ol li::marker { font: 600 .9rem var(--mono); color: var(--accent); }
+.box { display: grid; gap: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 14px 16px; min-width: 0; }
+</style>
+
+<div class="wrap">
+
+<header style="display:grid;gap:14px">
+  <h1>Group verification scenarios</h1>
+  <p class="lede">Four scenarios written as the Card YAML and SDK code a team would author, matching spec revision 12. <span class="n">&nbsp;Highlighted&nbsp;</span> code is proposed; everything else is Wyrd today.</p>
+  <div class="box">
+    <strong>Three new primitives. Each one exists because the server does something with it.</strong>
+    <div class="table"><table>
+    <thead><tr><th>Primitive</th><th>The user writes</th><th>The server uses it to</th></tr></thead>
+    <tbody>
+    <tr><td><span class="n">group_id=</span> on <code>verify</code> / <code>submit</code></td><td>Their own ID for the unit of work: a conversation, order, issue or detection event.</td><td>Write it, plus the caller's owner Service <code>card_uid</code> (copied from the token, no lookup), into nullable columns on the existing <code>execution_inputs</code> and <code>results</code> rows. No Postgres write on the hot path.</td></tr>
+    <tr><td>Input <span class="n">verifiers.&lt;name&gt;.inputs.&lt;slot&gt;</span> or <span class="n">verifiers.&lt;name&gt;.requirements.&lt;id&gt;.outcome</span></td><td>Exactly which recorded data the group Verifier receives.</td><td>At group end, read that Verifier's executions in the group, but only those recorded under its binding on the same Service. Each reference becomes an ordered list, one element per execution. Unbound and other-Service calls are filtered out.</td></tr>
+    <tr><td>Trigger <span class="n">kind: group_end</span> with <code>idle</code>, <code>max_age</code>, <code>finality</code></td><td>When a group counts as over.</td><td>The existing scheduler polls the binding on its cursor and queries Bifrost. A group is due when its newest row is older than <code>idle</code> or its first row is older than <code>max_age</code>. New rows after a result make it due again (the next revision) until <code>finality</code>.</td></tr>
+    </tbody></table></div>
+    <p>Two fixes ride along: an assert <code>each</code> over an empty list is <code>inconclusive</code> (today it passes), and a reference over more source executions than the deployment ceiling is <code>inconclusive</code> with <code>source_execution_limit_exceeded</code>. Group bindings react with <code>on_verdict_change</code>; the first result is the baseline.</p>
+  </div>
+  <nav><a href="#chatbot">Customer chatbot</a><a href="#refund">Refund three days later</a><a href="#coding">Coding agent</a><a href="#frames">Sampled frames</a><a href="#unchanged">What stays the same</a></nav>
+</header>
+
+<section id="chatbot">
+<h2>Customer chatbot</h2>
+<p>A storefront assistant answers shoppers and can hand off to a human. Each turn is checked as it happens. Once the conversation goes quiet, the whole conversation is judged once.</p>
+
+<div class="file"><div class="name">turn-verifier.yaml (today's syntax)</div><pre>apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: turn-verifier, version: 1.0.0, space: storefront}
+spec:
+  inputs:
+    turn:  {type: json}
+    trace: {type: trace}
+  requirements:
+    - id: on-topic
+      statement: The reply stays on the shopper's order
+      check: {kind: agent, agent: {ref: topic-judge@1.0.0}, inputs: {turn: inputs.turn}}</pre></div>
+
+<div class="file"><div class="name">conversation-review.yaml</div><pre>apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: conversation-review, version: 1.0.0, space: storefront}
+spec:
+  inputs:
+<span class="n">    turns: verifiers.turn-verifier.inputs.turn                    # every turn, in order
+    topic: verifiers.turn-verifier.requirements.on-topic.outcome  # every turn's verdict</span>
+  requirements:
+    - id: resolved
+      statement: The shopper's problem was resolved
+      check: {kind: agent, agent: {ref: resolution-judge@1.0.0}, inputs: {turns: inputs.turns}}
+    - id: every-turn-on-topic
+      statement: No turn went off topic
+      check: {kind: assert, each: inputs.topic[*], operator: eq, expected: passed}</pre></div>
+
+<div class="file"><div class="name">storefront-chat.yaml (Service)</div><pre>apiVersion: wyrd/v1
+kind: Service
+metadata: {name: storefront-chat, version: 1.0.0, space: storefront}
+spec:
+  components:
+    - alias: agent
+      ref: ./chat-agent.yaml
+      verified_by:
+        - verifier: ./turn-verifier.yaml            # run directly by verify/submit
+        - verifier: ./conversation-review.yaml
+          runs_on:
+<span class="n">            kind: group_end
+            idle: 30m
+            max_age: 24h
+            finality: 30d
+          on_verdict_change:</span>
+            - ./notify-support-lead.yaml</pre></div>
+
+<div class="file"><div class="name">chat backend (Python); the human console and order service pass the same group_id</div><pre>run = state.run()
+with run:
+    reply, trace_id = agent.answer(message)
+    run.for_card("agent").observe.verify(
+        "turn-verifier",
+        turn={"role": "assistant", "text": reply},
+        trace=trace_id,
+<span class="n">        group_id=f"{order_id}/chat",</span>
+    )</pre></div>
+<ol>
+  <li>Each turn's <code>verify</code> returns its <code>on-topic</code> verdict immediately.</li>
+  <li>The shopper leaves and returns within 30 minutes. The console and the order service add turns with the same <code>group_id</code>. Nobody coordinates a Wyrd ID.</li>
+  <li>30 minutes after the newest row, the scheduler finds the group due and queues one <code>conversation-review</code> with every turn in recorded order.</li>
+  <li>A direct <code>verify</code> of <code>turn-verifier</code> by a principal with no binding still runs, but its row is left out of <code>turns</code>.</li>
+</ol>
+</section>
+
+<section id="refund">
+<h2>Refund three days later</h2>
+<p>An agent promises a refund on day 0 and the group passes. On day 3 the payment service reports the refund never went out.</p>
+<div class="file"><div class="name">payment service, day 3</div><pre>run.for_card("agent").observe.submit(
+    "refund-turn",
+    fact={"kind": "refund_overdue", "order": "456"},
+<span class="n">    group_id="order-456/refund",</span>
+)</pre></div>
+<ol>
+  <li>Day 0: the group result R1 is <code>passed</code>. As the first result it is the baseline, so no Operator fires.</li>
+  <li>Day 3: the new row arrives after R1 and within <code>finality: 90d</code>, so the group is due again. <code>max_age</code> has already passed, so it does not wait another <code>idle</code>.</li>
+  <li><code>refund-review</code> runs over all facts, old and new, and returns R2 <code>failed</code>. R1 stays as history.</li>
+  <li><code>passed → failed</code> dispatches <code>on_verdict_change</code> once. Another <code>failed</code> later dispatches nothing.</li>
+</ol>
+</section>
+
+<section id="coding">
+<h2>Coding agent</h2>
+<p>A coding agent works an issue: prompts, tool calls, edits, test runs and a final diff. The producer may not use tracing at all.</p>
+<div class="file"><div class="name">coding-review.yaml</div><pre>spec:
+  inputs:
+<span class="n">    turns:     verifiers.coding-turn.inputs.turn
+    secrets:   verifiers.coding-turn.requirements.no-secrets.outcome
+    trace_ids: verifiers.coding-turn.inputs.trace     # recorded trace ids only</span>
+  requirements:
+    - id: no-secrets-anywhere
+      statement: No turn wrote a secret
+      check: {kind: assert, each: inputs.secrets[*], operator: eq, expected: passed}
+    - id: task-done
+      statement: The issue is fixed and the tests pass
+      check:
+        kind: agent
+        agent: {ref: task-judge@1.0.0}        # declares the bifrost.query tool
+        inputs: {turns: inputs.turns, trace_ids: inputs.trace_ids}</pre></div>
+<ul>
+  <li>Each turn is a <code>verify</code> or <code>submit</code> to <code>coding-turn</code> with <code>group_id="issue-812/attempt-1"</code>. A secret written in one turn fails that turn right away.</li>
+  <li>A trace reference gives the group Verifier trace ids, never spans. The judge Agent reads spans itself with the existing <code>bifrost.query</code> tool when it needs them, under the caller's <code>bifrost:query:read</code>. Spans are read live, not frozen in the snapshot.</li>
+  <li>A test run still queued at <code>max_age</code> appears as <code>null</code> in its position. When its result lands within <code>finality</code>, the group is judged again.</li>
+</ul>
+</section>
+
+<section id="frames">
+<h2>Sampled frames from a detection system</h2>
+<p>The user's own system detects a person at <code>door-42</code> and samples 20 frames. Wyrd does not detect, sample or receive video; it verifies what it is sent. This is fan-out: N ordinary calls sharing one <code>group_id</code>.</p>
+<div class="file"><div class="name">detector (Python)</div><pre>camera = run.for_card("camera").observe
+camera.verify("event-fact", event={"event_id": event_id, "detected": True}, <span class="n">group_id=event_id</span>)
+for frame in sampled_frames:                                   # the app picks how many
+    camera.submit("frame-verifier", frame=verify.File(frame, filename="f.jpg"), <span class="n">group_id=event_id</span>)</pre></div>
+<div class="file"><div class="name">event-review.yaml</div><pre>spec:
+  inputs:
+<span class="n">    outcomes: verifiers.frame-verifier.requirements.person-wearing-badge.outcome
+    event:    verifiers.event-fact.inputs.event</span>
+  requirements:
+    - id: badge-in-every-frame
+      statement: The person wears a badge in every sampled frame
+      check: {kind: assert, each: inputs.outcomes[*], operator: eq, expected: passed}
+# bound with runs_on: {kind: group_end, idle: 2m, max_age: 30m, finality: 30d}</pre></div>
+<div class="table"><table>
+<thead><tr><th>Case</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>20 frames, all pass</td><td><code>passed</code></td></tr>
+<tr><td>One frame fails</td><td><code>failed</code>; the failed frame stays in the list</td></tr>
+<tr><td>Event sent, zero frames</td><td><code>inconclusive</code>, <code>empty_selection</code></td></tr>
+<tr><td>Worker dies mid-frame</td><td>The existing queue retries that one frame; the other 19 are not redone</td></tr>
+<tr><td>Another Service sends frames with the same <code>group_id</code></td><td>Excluded</td></tr>
+<tr><td>Ceiling set to 20, 21 frames arrive</td><td><code>inconclusive</code>, <code>source_execution_limit_exceeded</code>; never a judgment on the first 20</td></tr>
+</tbody></table></div>
+<p>The event-fact call matters: with zero frames and no other row, there is nothing to discover, so no group exists.</p>
+</section>
+
+<section id="unchanged">
+<h2>What stays the same</h2>
+<ul>
+  <li><code>verify</code> runs now; <code>submit</code> queues. Neither gains a Postgres write. A drift <code>submit</code> still records a sample.</li>
+  <li>Anyone with <code>verifier:run</code> can still invoke any Verifier. Binding only decides what reaches a group Verifier.</li>
+  <li>Cross-conversation trends stay on today's drift Verifiers and <code>schedule</code> Triggers. Schedule bindings lose their duplicate <code>inputs</code> map; the Verifier's slots own the features.</li>
+  <li>No session Card, append verb, step-level fan-out, checkpoints, video segmentation or budget system.</li>
+  <li>Capacity: <code>bench:capacity</code> gains five cases and a target of p99 &lt; 1 ms engine overhead for an assertion-only synchronous <code>verify</code>.</li>
+</ul>
+</section>
+
+</div>

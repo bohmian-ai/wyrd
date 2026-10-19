@@ -1,0 +1,35 @@
+# Judges one sampled frame and cites it as its first page.
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: frame-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  messages:
+  - role: user
+    content:
+    - {type: image, source: "${media:frame}"}
+    - {type: text, text: "Claim: {{claim}}. Cite the frame."}
+  response_format:
+    type: object
+    properties:
+      outcome: {type: string, enum: [passed, failed, inconclusive]}
+      reason: {type: string}
+      citations:
+        type: array
+        items:
+          type: object
+          properties:
+            slot: {type: string}
+            locator:
+              type: object
+              properties: {page: {type: integer}}
+              required: [page]
+              additionalProperties: false
+          required: [slot, locator]
+          additionalProperties: false
+    required: [outcome, reason, citations]
+    additionalProperties: false

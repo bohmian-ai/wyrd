@@ -57,7 +57,7 @@ In `follows-policy`, the caller uploads one file: the refund decision letter the
 
 | Part | Holds |
 | --- | --- |
-| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false` |
+| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false`; `samples` slots are always required |
 | `steps` | Optional preparation. Each step runs one action and produces data |
 | `requirements` | Each has a unique `id`, a `statement`, and one `check`, and produces one verdict. Attach them to a step or to the whole Verifier |
 | `decide` | How requirement verdicts combine: `all` (the default) or `{ pass_rate: { threshold } }` |
@@ -99,7 +99,7 @@ An Agent step has two input channels. `inputs` values are injected into the mode
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | PSI, SPC, or Custom over a `samples` slot (`on`), with full statistics |
 
-Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no tools and no workspace; registration refuses one that does.
+Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no workspace and may declare only the `bifrost.query` tool, for example to read the spans of trace IDs it was given; registration refuses any other tool. That query reads live data under the ordinary tool and query permissions, so its results are not part of the pinned evidence.
 
 A citation names an original input `slot` and a locator: `page`, `slide`, `lines`, `json_pointer`, or `region`. A step can return citations in its ordinary output, and a downstream judge can reuse them through its input bindings. The server checks that every cited location exists in the pinned evidence. An `agent` check that says `passed` without a valid citation becomes `inconclusive`.
 
@@ -160,11 +160,26 @@ The subject is the component the binding sits under; you can also bind on the Se
 | Field | Holds | If you leave it out |
 | --- | --- | --- |
 | `verifier` | A Verifier Card, by path or exact reference | Required |
-| `runs_on` | A `schedule` Trigger | The server never runs this binding on its own |
-| `inputs` | For a scheduled Verifier, the source of each `samples` slot: `{ features: [...] }` or `{ metric: <name> }` | Required for every required slot of a scheduled Verifier |
+| `runs_on` | A `schedule` or `group_end` Trigger | The server never runs this binding on its own |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
-`schedule` is the only automatic Trigger. [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
+[Bind a Verifier](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
+
+`group_end` judges a whole caller group, such as one conversation or one event, once its evidence goes quiet. The bound Verifier reads source slots such as `verifiers.turn-check.inputs.turn`, and callers pass the same `group_id` on every `verify` or `submit` of that group:
+
+```yaml
+runs_on: {kind: group_end, after: 30m}
+```
+
+`after` is at most one year (`365d`, `8760h`, `525600m` or `31536000s`); registration refuses a longer duration, standalone or inline, before anything is stored.
+
+Each time Scribe acknowledges a grouped source input or result, the group becomes due `after` from then; new evidence moves that time later. Once it is due, one group execution judges every source input and result visible at that moment, listed in arrival order, with `null` for an outcome not yet visible. Later evidence makes the group due again and produces a new execution; earlier executions keep the evidence they judged. `on_verdict_change` Operators run when a group's verdict differs from its previous one.
+
+Three limits apply. Steady activity postpones the judgment for as long as it continues. A judgment uses what is visible when it reads, and evidence that becomes visible later without new activity does not schedule another. If the server dies after Scribe acknowledges evidence but before it records the due time, that activity schedules nothing; the next grouped evidence does.
+
+When a group comes due while its binding owner is inactive or retired, or the owner's authority is refused, the server records one `errored` group execution with the reason in `error` and drops the due group. Nothing is evaluated, no verdict or result is written and no Operator runs. The binding status's `last_execution_id` names that execution, but only until a later execution replaces it; there is no list of earlier failures. Reactivating the owner does not bring the dropped group back; the group's next evidence schedules it again. A transient server, database or query failure instead keeps the group due and retries it on a later pass.
+
+A source execution whose result is visible but whose input is not yet visible means the read caught evidence mid-publication. An input without a result is normal and judged with a `null` outcome, as is an absent value inside a visible input; a missing whole input is not. The group then pins nothing and stays due, retrying on later passes. If the input is still missing more than five minutes past the group's due time, by the database clock, the server records one `errored` group execution with `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` and drops the due group in the same step. The execution IDs missing their inputs are named in the error message. Nothing is evaluated, no verdict or result is written and no Operator runs. The group's next evidence schedules it again as usual.
 
 ## Run evidence and window evidence
 

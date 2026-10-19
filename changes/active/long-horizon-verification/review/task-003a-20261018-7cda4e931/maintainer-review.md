@@ -1,0 +1,39 @@
+# Maintainer review
+
+Overall result: **PASS** for the maintainer scope. No material maintenance finding.
+
+## Immutable subject and authority
+
+Reviewed `22335c2c40a5ad24c27bfa0d4686f4da49f922c5...7cda4e93159ab328de2a74068d5e1978a2590818`, the original approved TASK-003a at the base, revision-17 specification, and the candidate task's verification appendix. HEAD remained the recorded candidate. Only this report was written.
+
+Applied `AGENTS.md` §§3–9, 11, 15–16, `architecture/agent-rules.md`, `architecture/references/languages/maintainer-style.md`, the spec-driven-development reference, applicable Rust/Python/TypeScript guidance, Wyrd design's grouped verification/Trigger/clock boundaries, doctrine, and Bifrost's query, visibility, and outbox contracts. The task-review materiality threshold and explicitly accepted revision-17 limits govern this result. Superseded review packets and other discovery reports were not used.
+
+## Changed-surface coverage
+
+| Surface | Owning symbols, callers, and proof inspected | Maintainer assessment |
+|---|---|---|
+| Pure contracts and declarations | `TriggerActivation::GroupEnd`, `GroupEndSettings`, `GroupSnapshot`, `GroupSourceSnapshot`, `VerificationExecutionState`; registration `BindingProjector`; authored Python verify stub; generated TS `card-types.ts`; served OpenAPI assertion | One after field and one source provenance shape flow through existing owners. Removed coverage/ceiling fields are removed from these projections together. Rust derives remain the wire/schema authority; no new language-owned durable behavior. |
+| Acknowledgement-to-scheduling handoff | `ScribeWrite::group_activity`, `ScribeSink::{bounded_outbox,local_outbox,schedule_groups,write}`, boot composition, publication fault, gateway recording and peer-audit callers; outbox unit tests and server integration staging | Scheduling extends the one existing writer and SQL queue owner. Activity extraction is beside the write variants; fallible scheduling precedes reservation consumption. The module and method documentation describe acknowledgement, replay, and accepted crash loss. Test-only callers explicitly omit scheduling or retain the real Postgres owner as appropriate. |
+| Pending scheduling and persistence | Pending migration, existing binding/execution migration changes, `record_group_activity`, `claim_due_group`, `consume_group`, `tenants_with_due_groups`; authentication arming changes; scheduler callers and SQL integration test | Database workflow stays on `VerifierExecutionQueue`; existing tenant/operator connection capabilities remain visible in signatures. No competing clock, lifecycle owner, ledger, queue, recovery protocol, or durable evidence model was introduced. |
+| Snapshot selection and identity | Full `groups.rs` owner and helper bodies: `GroupPoller`, `Reader`, `Sources`, `SourceSlot`, `Earliest`, `Visible`, `Payloads`; `PinnedGroup::new`, `GroupSelection`; scheduler, queue, pure selection/value tests, and server snapshot test | Reader delegates ordinary authorization/stream behavior to `ScheduledQueryCaller`; local helpers own distinct decoding, logical-row selection, alignment, and pinning stages. Two real logical-row maps use `Earliest::keep`. Snapshot identity is separate from the public provenance projection without adding a new product noun. |
+| Runtime composition and shared capacity | `VerificationRuntimeBuilder::build`, `VerificationScheduler::{run,cron_loop,group_loop,pass,group_pass,hand_off_groups}`, `ClaimLoop::{new,run,claim_round}`, `VerifierRunner::{new,execute}`, `OperatorWorker::new`; all construction/call sites | Existing scheduler and claim-loop owners retain lifecycle and resource responsibility. The shared semaphore replaces the runner's independent active count; snapshot work releases its permit at handoff. Ordinary cron remains separately discoverable on the same scheduler owner. Operator capacity adaptation uses the existing loop rather than another implementation. |
+| Settlement and state reads | `VerifierExecutionQueue::{enqueue_group,complete,execution_status}`, `ClaimedRow::into_claimed`, SQL constants and `SettledRow`; runner settlement callers; idempotence/settlement-order SQL integration test | Pinned inputs, digest conflict lookup, settlement comparison, and dispatch creation remain with the existing queue owner. Documentation explains baseline, equal verdicts, changed verdicts, replay and settlement ordering. Removed reconciliation/coverage machinery is deleted rather than retained behind compatibility paths. |
+| Removed source ceiling | `HostedLimits`, verification env configuration and test, runner grouped branch, `engines::summary`, removed synthetic outcome helper, `test_verification_blocks`, runtime limits documentation | The removed setting and fabricated verdict do not leave an alternative execution branch or public field in these changed owners. |
+| Test-support query and publication seams | `ScheduledQueryCaller::run_with`, `PublicationFault::outbox`, real query-fault caller pattern, group integration `Support` helpers and both new tests; testing runtime's straddled-result outbox caller | Changes use the existing fault/harness mechanisms and real owners. Test setup retains meaningful server state; no one-branch harness or parallel query implementation was added. |
+| SDK and MCP journeys | Full cumulative changes in Rust/Python/TS verify-in-real-time tests and MCP verification tests; support, refund, coding, sampled media, coexistence, late evidence, and pressure helper/caller relationships | Tests continue using public SDK/MCP paths and shared fixtures. Selection assertions use execution identities and aligned evidence; changed refund assertions include recovery and previous-result context. Language-specific test orchestration remains in its owning runtime. |
+| Fixtures, product docs and evidence | Every changed verify-in-real-time YAML fixture, latest-fact refund step, errors documentation, runtime limits, how-verification-works, design change, and task evidence | Authored examples now use after; refund's latest-fact step expresses the required correction behavior locally. The docs explain quiet-period postponement, visible-evidence limits, and post-ACK signal loss. Benchmarking remains explicitly deferred. |
+
+Call-site checks included every use of `PinnedGroup::new`, `GroupSelection`, the four pending/group queue transitions, `with_groups`, `VerifierRunner::new`, `ClaimLoop::new`, and all Scribe outbox constructors. CodeGraph was used first for code navigation, followed by direct source/diff and caller inspection.
+
+## Material findings
+
+None within this review's scope. No recommendation to redesign the approved pending-row model, add recovery machinery, reinstate source ceilings, serialize executions, or introduce a new abstraction.
+
+## Non-blocking calibration notes
+
+- The task explicitly requested replacing grouping's `review` terminology. Fixture paths and helper/local names such as `group_reviews` remain; the evidence records this as skipped naming churn. This is a task-acceptance discrepancy for the implementation review, but does not independently create a maintenance/public-contract failure under this specialist's naming threshold.
+- `how-verification-works.md` still says that schedule is the only automatic Trigger immediately before its newly added group-end explanation. Removing that sentence would eliminate a local documentation contradiction. This is a wording note, not an independent reason to fail this maintainer pass.
+
+## Verification limits
+
+This was a static maintainer review. No builds or tests were run, and no performance qualification was attempted. Candidate evidence reports focused C1–C13 and owner/type/codegen checks; those claims are not substituted for source inspection or independently rerun here. Behavioral acceptance, concurrency/durability, and security verdicts belong to their independent reviewers.

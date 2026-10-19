@@ -11,7 +11,6 @@
 //! transaction under forced RLS and never commits.
 // raw-query grep allowlist: verification tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -20,13 +19,12 @@ use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_spec::card::verifier::ScheduledInput;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{BindingId, CardUid, SlotName};
-use wyrd_spec::verification::DriftWindow;
+use wyrd_spec::ids::{BindingId, CardUid};
 /// The frozen Trigger/Operator identity is the wire contract's own type, so
 /// stored JSON, dispatch rows, and Run GET share one shape.
 pub use wyrd_spec::verification::FrozenTarget;
+use wyrd_spec::verification::{DriftWindow, GroupEndSettings};
 
 use crate::TenantConn;
 
@@ -43,8 +41,8 @@ const PROJECT_BINDING_SQL: &str = r"
         binding_id, data_tenant_id, owner_card_uid, owner_card_kind,
         subject_occurrence_key, card_uid, verifier_card_uid,
         trigger_uid, trigger_digest, operators, activation,
-        schedule_cron, schedule_tz, inputs
-    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, 'schedule', $10, $11, $12)
+        schedule_cron, schedule_tz, group_end
+    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     ON CONFLICT ON CONSTRAINT verification_bindings_natural_key
     DO UPDATE SET binding_id = wyrd.verification_bindings.binding_id
     RETURNING binding_id
@@ -76,7 +74,7 @@ const RECORD_AUTHENTICATION_SQL: &str = r"
     RETURNING card_uid, statement_timestamp()
 ";
 
-/// Lock and list one owner's `schedule` bindings whose cursor is still null.
+/// Lock and list one owner's schedule bindings whose cursor is still null.
 const UNARMED_SCHEDULES_SQL: &str = r"
     SELECT binding_id, schedule_cron, schedule_tz
       FROM wyrd.verification_bindings
@@ -293,16 +291,43 @@ pub struct NewBinding {
     pub verifier_card_uid: CardUid,
     /// Effective Trigger.
     pub trigger: FrozenTarget,
-    /// Effective `on_failure` Operators in authored order.
+    /// Effective reaction Operators in authored order: `on_failure` for a
+    /// schedule binding, `on_verdict_change` for a group_end binding.
     pub operators: Vec<FrozenTarget>,
-    /// Authored cron expression of the effective schedule, already validated
-    /// by [`BindingSchedule`]; its cursor stays null until the owner activates.
-    pub cron: String,
-    /// Authored IANA timezone of the schedule; absent means UTC.
-    pub tz: Option<String>,
-    /// Recorded measurements filling each samples slot of the Verifier for
-    /// every scheduled window.
-    pub inputs: BTreeMap<SlotName, ScheduledInput>,
+    /// How the binding activates; its cursor stays null until the owner
+    /// activates.
+    pub activation: BindingActivation,
+}
+
+/// How a projected binding activates, frozen from its effective Trigger.
+#[derive(Debug, Clone)]
+pub enum BindingActivation {
+    /// A `schedule` Trigger, already validated by [`BindingSchedule`].
+    Schedule {
+        /// Authored five-field cron expression.
+        cron: String,
+        /// Authored IANA timezone; absent means UTC.
+        tz: Option<String>,
+    },
+    /// A `group_end` Trigger's pinned duration and exact source bindings.
+    GroupEnd(GroupEndSettings),
+}
+
+impl BindingActivation {
+    /// The stored `activation` value and its schedule and group columns.
+    fn columns(
+        &self,
+    ) -> (
+        &'static str,
+        Option<&str>,
+        Option<&str>,
+        Option<Json<&GroupEndSettings>>,
+    ) {
+        match self {
+            Self::Schedule { cron, tz } => ("schedule", Some(cron.as_str()), tz.as_deref(), None),
+            Self::GroupEnd(settings) => ("group_end", None, None, Some(Json(settings))),
+        }
+    }
 }
 
 /// Project an owner Card version's effective bindings.
@@ -331,6 +356,7 @@ pub async fn project_bindings(
             FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
             FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
         };
+        let (activation, cron, tz, group_end) = binding.activation.columns();
         let id: Uuid = sqlx::query_scalar(PROJECT_BINDING_SQL)
             .bind(BindingId::new_v7().as_uuid())
             .bind(owner_card_uid.as_uuid())
@@ -341,9 +367,10 @@ pub async fn project_bindings(
             .bind(trigger_uid)
             .bind(trigger_digest)
             .bind(Json(&binding.operators))
-            .bind(binding.cron.as_str())
-            .bind(binding.tz.as_deref())
-            .bind(Json(&binding.inputs))
+            .bind(activation)
+            .bind(cron)
+            .bind(tz)
+            .bind(group_end)
             .fetch_one(&mut **conn.transaction())
             .await?;
         ids.push(stored_binding_id(id)?);

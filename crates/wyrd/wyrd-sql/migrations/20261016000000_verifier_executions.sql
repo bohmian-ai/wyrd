@@ -30,10 +30,22 @@ ALTER TABLE wyrd.verifier_executions RENAME COLUMN run_id TO execution_id;
 ALTER TABLE wyrd.verifier_executions
     ADD COLUMN run_id          TEXT,
     ADD COLUMN inputs          JSONB,
-    ADD COLUMN route_overrides JSONB;
+    ADD COLUMN route_overrides JSONB,
+    ADD COLUMN group_id        TEXT
+        CHECK (group_id IS NULL OR octet_length(group_id) BETWEEN 1 AND 256),
+    ADD COLUMN group_snapshot_sha256 BYTEA,
+    ADD COLUMN group_sources   JSONB,
+    ADD COLUMN group_verdict   TEXT
+        CHECK (group_verdict IS NULL OR group_verdict IN ('passed', 'failed', 'inconclusive'));
 
 -- Exactly one frozen input: a Drift window, a historical Eval record, or a
--- caller submission's input declarations and route overrides.
+-- caller submission's or group snapshot's input declarations and route
+-- overrides. A submitted execution keeps its opaque caller `group_id`; a
+-- `group` execution judges one pinned snapshot of its binding's group, where
+-- `group_snapshot_sha256` is the content identity of that snapshot,
+-- `group_sources` names each source slot's selected executions, and
+-- `group_verdict` is the settled verdict later group results are compared
+-- with for `on_verdict_change`.
 ALTER TABLE wyrd.verifier_executions DROP CONSTRAINT verifier_runs_check4;
 ALTER TABLE wyrd.verifier_executions
     ADD CONSTRAINT verifier_executions_input_shape CHECK (
@@ -45,16 +57,29 @@ ALTER TABLE wyrd.verifier_executions
             AND inputs IS NULL AND route_overrides IS NULL)
         OR (window_start IS NULL AND window_end IS NULL
             AND input_record_id IS NULL AND input_event_time IS NULL
-            AND origin = 'manual'
+            AND origin IN ('manual', 'group')
             AND jsonb_typeof(inputs) = 'object'
             AND jsonb_typeof(route_overrides) = 'object')
     ),
     ADD CONSTRAINT verifier_executions_run_shape CHECK (
         run_id IS NULL OR (origin = 'manual' AND inputs IS NOT NULL)
     ),
+    ADD CONSTRAINT verifier_executions_group_shape CHECK (
+        (origin = 'group') = (octet_length(group_snapshot_sha256) IS NOT DISTINCT FROM 32)
+        AND (origin = 'group') = (jsonb_typeof(group_sources) IS NOT DISTINCT FROM 'object')
+        AND (origin <> 'group' OR group_id IS NOT NULL)
+        AND (group_verdict IS NULL OR (origin = 'group' AND status = 'completed'))
+    ),
     ADD CONSTRAINT verifier_executions_live_origin CHECK (
-        origin IN ('schedule', 'manual')
+        origin IN ('schedule', 'manual', 'group')
     ) NOT VALID;
+
+-- One group execution per binding, group, and snapshot content, whatever its
+-- status, so re-reading unchanged evidence enqueues nothing while distinct
+-- snapshots may overlap.
+CREATE UNIQUE INDEX verifier_executions_group_snapshot
+    ON wyrd.verifier_executions (data_tenant_id, binding_id, group_id, group_snapshot_sha256)
+    WHERE origin = 'group';
 
 ALTER TABLE wyrd.operator_dispatches RENAME COLUMN run_id TO execution_id;
 
@@ -77,7 +102,7 @@ ALTER TABLE wyrd.verification_bindings
     ADD COLUMN inputs JSONB NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(inputs) = 'object'),
     ADD CONSTRAINT verification_bindings_live_activation CHECK (
-        activation = 'schedule'
+        activation IN ('schedule', 'group_end')
     ) NOT VALID;
 
 -- Fitted state is keyed by the drift check's requirement. Baselines fitted

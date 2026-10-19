@@ -299,7 +299,7 @@ mod tests {
             error
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("duplicate artifact path"))
+                .any(|diagnostic| diagnostic.code == "WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH")
         );
     }
 

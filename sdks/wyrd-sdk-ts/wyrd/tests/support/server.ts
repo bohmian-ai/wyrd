@@ -10,7 +10,9 @@ import {
   type DeclarationReceipt,
   type SpanRecord,
   verify,
+  type VerificationExecutionState,
   type VerificationResult,
+  WyrdClient,
 } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -107,6 +109,39 @@ export async function scheduledResult(
   }
 }
 
+/**
+ * The newest completed execution of group `bindingId` other than `after`, read
+ * as the administrator: publish captured rows so the group poller discovers
+ * them, then read the binding's `last_execution_id` until that execution
+ * completes with a result.
+ */
+export async function groupExecution(
+  server: { flushBifrost(): void; readonly baseUrl: string },
+  bindingId: string,
+  timeoutMs: number,
+  after?: string,
+): Promise<VerificationExecutionState> {
+  const token = await WyrdClient.connect().accessToken();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    server.flushBifrost();
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${bindingId}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    const { last_execution_id: latest } = (await response.json()) as { last_execution_id: string | null };
+    if (latest !== null && latest !== after) {
+      const state = await (await verify.Execution.connect(latest)).status();
+      if (state.status === "completed" && state.result) {
+        return state;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`group binding ${bindingId} completed no new execution within ${timeoutMs} ms`);
+    }
+    await sleep(500);
+  }
+}
+
 /** How a story file starts its server. */
 export interface ServerOptions {
   /** Answers the Gateway adapters and Verifier Agents send to the server's provider upstream. */
@@ -115,6 +150,8 @@ export interface ServerOptions {
   readonly verificationRuntime?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
   readonly accessTtlSeconds?: number;
+  /** Scribe outbox capacity in items; the production capacity by default. */
+  readonly scribeOutboxCapacity?: number;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -138,7 +175,8 @@ function deploy(server: NativeWyrdTestServer): void {
  * `test` with one real Wyrd server per story file, started with `options`.
  *
  * `provider` is the local upstream the server calls, started before the
- * server; with `options.provider` set, its address is the server's provider
+ * server and scoped like it, since Vitest shares a file-scoped fixture by
+ * name across every `serverTest` in the file; with `options.provider` set, its address is the server's provider
  * base URL, and without it the server keeps its default upstreams. Each test starts
  * from the deployment environment, so a test that removes the ambient
  * credential with `vi.stubEnv` leaves the next test unaffected.
@@ -151,7 +189,7 @@ export function serverTest(options: ServerOptions = {}) {
         await use(provider);
         await provider.close();
       },
-      { scope: "file" },
+      { scope: options.perTest ? "test" : "file" },
     ],
     server: [
       async ({ provider }, use) => {
@@ -159,6 +197,7 @@ export function serverTest(options: ServerOptions = {}) {
           providerBaseUrl: options.provider && provider.url,
           verificationRuntime: options.verificationRuntime,
           accessTtlSeconds: options.accessTtlSeconds,
+          scribeOutboxCapacity: options.scribeOutboxCapacity,
         });
         deploy(server);
         await use(server);

@@ -2683,6 +2683,46 @@ mod verifier_card_tests {
         }
     }
 
+    /// Refuse a schedule binding `inputs` map, even an empty one, and an
+    /// optional samples slot, each at the authored field path.
+    ///
+    /// # Panics
+    /// Panics when a removed scheduled-samples field decodes or its refusal
+    /// does not name the field's path.
+    #[test]
+    fn removed_scheduled_samples_fields_fail_at_their_path() {
+        let binding = |inputs: serde_json::Value| {
+            serde_json::json!({"verified_by": [{
+                "verifier": "./drift.yaml",
+                "runs_on": "./daily.yaml",
+                "inputs": inputs,
+            }]})
+        };
+        for spec in [
+            binding(serde_json::json!({})),
+            binding(serde_json::json!({"current": {"features": ["dti"]}})),
+        ] {
+            let error = Spec::from_kind_and_value(&CardKind::Service, spec)
+                .expect_err("schedule binding inputs are refused");
+            assert!(
+                error
+                    .message
+                    .starts_with("verified_by[0].inputs: unknown field"),
+                "{error}"
+            );
+        }
+        let card: serde_json::Value = serde_yaml::from_str(&DRIFT_VERIFIER_YAML.replace(
+            "      features: [tenure_months, monthly_spend]\n  requirements",
+            "      features: [tenure_months, monthly_spend]\n      required: false\n  requirements",
+        ))
+        .unwrap();
+        let error = Spec::from_kind_and_value(&CardKind::Verifier, card["spec"].clone())
+            .expect_err("optional samples slots are refused")
+            .message;
+        assert!(error.contains("inputs.current"), "{error}");
+        assert!(error.contains("unknown field `required`"), "{error}");
+    }
+
     /// Reject `kind: Drift` and `kind: Eval` envelopes; neither is a Card kind.
     ///
     /// # Panics

@@ -214,9 +214,12 @@ const RECORD_GROUP_ACTIVITY_SQL: &str = r"
 ";
 
 /// Lock the earliest expired pending group no other scheduler holds; forced
-/// RLS confines it to the caller's tenant.
+/// RLS confines it to the caller's tenant. `overdue` reports, by
+/// PostgreSQL's clock, whether the group is more than five minutes past due,
+/// the bound on retrying an incomplete snapshot.
 const DUE_GROUP_SQL: &str = r"
-    SELECT binding_id, group_id
+    SELECT binding_id, group_id,
+           statement_timestamp() - due_at > INTERVAL '5 minutes' AS overdue
       FROM wyrd.verification_group_pending
      WHERE due_at <= statement_timestamp()
      ORDER BY due_at, binding_id, group_id
@@ -1011,6 +1014,9 @@ pub struct DueGroup {
     pub owner: Option<PrincipalId>,
     /// Whether the owner is runtime-active, so its group may be admitted.
     pub active: bool,
+    /// Whether the group is more than five minutes past due by PostgreSQL's
+    /// statement time, so an incomplete snapshot stops retrying and errors.
+    pub overdue: bool,
 }
 
 /// One acknowledged grouped source input or result: the recorded
@@ -1749,7 +1755,8 @@ impl VerifierExecutionQueue {
     ///
     /// Locks one row whose due time PostgreSQL's statement time has reached
     /// with `FOR UPDATE SKIP LOCKED`, so concurrent schedulers never take the
-    /// same group, and reads its binding's frozen targets and owner activity.
+    /// same group, and reads its binding's frozen targets, owner activity,
+    /// and whether the group is more than five minutes past due.
     /// The caller pins a snapshot, enqueues it through
     /// [`Self::enqueue_group`], consumes the row with
     /// [`Self::consume_group`], and commits; rolling back leaves the group
@@ -1763,10 +1770,10 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueGroup>, SqlxError> {
-        let due: Option<(Uuid, String)> = sqlx::query_as(DUE_GROUP_SQL)
+        let due: Option<(Uuid, String, bool)> = sqlx::query_as(DUE_GROUP_SQL)
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        let Some((binding_id, group_id)) = due else {
+        let Some((binding_id, group_id, overdue)) = due else {
             return Ok(None);
         };
         let (owner, Json(settings)): (Uuid, Json<GroupEndSettings>) =
@@ -1783,6 +1790,7 @@ impl VerifierExecutionQueue {
             settings,
             owner: activity.as_ref().and_then(|activity| activity.principal_id),
             active: activity.is_some_and(|activity| activity.active),
+            overdue,
         }))
     }
 

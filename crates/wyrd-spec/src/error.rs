@@ -1927,6 +1927,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// A group snapshot still saw a source result without that execution's
+    /// input more than five minutes past the group's due time; the group is
+    /// consumed with this error instead of judging partial evidence.
+    #[error("[WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE",
+        status = 409,
+        title = "Verification snapshot incomplete",
+        remediation = "Check Bifrost publication for the named source executions, then submit a new turn to the group."
+    )]
+    VerificationSnapshotIncomplete {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the source executions.
+        details: Value,
+    },
     /// Supplied input lacks a feature the Verifier needs or carries the wrong value type.
     #[error("[WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE] {message}")]
     #[wyrd_error(
@@ -3788,6 +3804,7 @@ impl WyrdError {
             | Self::VerificationTargetNotFound { message, details }
             | Self::VerificationBaselineNotReady { message, details }
             | Self::VerificationBaselineLegacy { message, details }
+            | Self::VerificationSnapshotIncomplete { message, details }
             | Self::VerificationInputIncompatible { message, details }
             | Self::VerificationInputUnsupported { message, details }
             | Self::VerificationDependencyFailed { message, details }

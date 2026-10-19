@@ -10,7 +10,9 @@
 //! `(wyrd_ingested_at, result_id)`. Per source slot one list holds every
 //! source execution with a visible input or result, ordered by earliest
 //! input ingest time, else earliest result ingest time, then execution ID;
-//! an absent value is null. The pinned snapshot's content digest makes an
+//! an absent value is null. Inputs are staged before results, so a visible
+//! result without its input means the read caught rows mid-publication; that
+//! read pins nothing and the group is retried. The pinned snapshot's content digest makes an
 //! unchanged re-read enqueue nothing. Every row time is Bifrost's managed
 //! `wyrd_ingested_at`, stamped from PostgreSQL. Every read runs as the
 //! tenant's internal read principal ([`SystemReadAuthority`]), granted only
@@ -60,6 +62,11 @@ pub enum GroupPollError {
     /// caller rolls back so the group stays pending.
     #[error("group snapshot read failed: {0}")]
     Read(String),
+    /// The read saw results of these source executions without their
+    /// inputs, which are staged first, so it caught rows mid-publication;
+    /// nothing was pinned and a later read sees them.
+    #[error("group snapshot saw results without inputs: {0:?}")]
+    Incomplete(Vec<ExecutionId>),
 }
 
 impl From<WyrdError> for GroupPollError {
@@ -98,13 +105,15 @@ impl GroupPoller {
     /// play no part in the read. A tenant without a results table is read
     /// from inputs alone. An unchanged snapshot answers with its existing
     /// execution, and the enqueued execution keeps `authority` for its work.
+    /// A read showing a result without its execution's input pins nothing.
     /// The caller consumes the pending row and commits.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Sql`] when a Postgres statement fails and
     /// [`GroupPollError::Read`] when the read authority cannot be built, the
     /// read fails, is refused or degraded, or a stored declaration or row is
-    /// malformed.
+    /// malformed, and [`GroupPollError::Incomplete`] naming the executions
+    /// whose results were visible without their inputs.
     pub async fn poll(
         &self,
         conn: &mut TenantConn<'_>,
@@ -144,10 +153,12 @@ impl GroupPoller {
             }
             batches => batches?,
         };
-        let pinned = sources
-            .decode(&batches)?
-            .pin(&sources, due)
-            .map_err(GroupPollError::Sql)?;
+        let visible = sources.decode(&batches)?;
+        let missing = visible.missing_inputs();
+        if !missing.is_empty() {
+            return Err(GroupPollError::Incomplete(missing));
+        }
+        let pinned = visible.pin(&sources, due).map_err(GroupPollError::Sql)?;
         Ok(queue
             .enqueue_group(conn, due.binding_id, &pinned, authority)
             .await?)
@@ -420,6 +431,21 @@ impl Visible {
         value: Value,
     ) {
         Earliest::keep(&mut self.results, result, (tuple, execution), at, value);
+    }
+
+    /// Source executions with a visible result but no visible input, in ID
+    /// order. Inputs are staged before results, so any such execution means
+    /// the read missed rows still being published.
+    fn missing_inputs(&self) -> Vec<ExecutionId> {
+        let mut missing: Vec<_> = self
+            .results
+            .values()
+            .map(|((_, execution), _)| *execution)
+            .filter(|execution| !self.inputs.contains_key(execution))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
     }
 
     /// Each execution of `tuple` in list order with its selected result:

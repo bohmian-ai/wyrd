@@ -412,10 +412,14 @@ impl VerificationScheduler {
     /// SYSTEM principal. An inactive owner or a rejected owner authority is
     /// recorded through [`VerifierExecutionQueue::refuse_group`] as one
     /// terminal errored execution, serving the owner's stored principal and
-    /// recorded by SYSTEM. Everything else is a Wyrd-side blockage that is
+    /// recorded by SYSTEM, as is a snapshot still incomplete (a result
+    /// visible without its input) more than five minutes past due, with
+    /// `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` naming the executions.
+    /// Everything else is a Wyrd-side blockage that is
     /// traced and leaves the group pending: an owner with no Card-bound
     /// principal, a tenant without SYSTEM, unavailable authority, a non-auth
-    /// enqueue refusal, or a failed, refused or degraded read.
+    /// enqueue refusal, a failed, refused or degraded read, or an
+    /// incomplete snapshot not yet five minutes past due.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a statement fails, including the refusal's
@@ -472,7 +476,20 @@ impl VerificationScheduler {
                     return Ok(pending(&format!("{refusal:?}")));
                 }
                 Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
-                Err(error @ GroupPollError::Read(_)) => return Ok(pending(&error)),
+                Err(GroupPollError::Incomplete(executions)) if due.overdue => {
+                    let ids: Vec<_> = executions.iter().map(ToString::to_string).collect();
+                    break 'refusal WyrdError::VerificationSnapshotIncomplete {
+                        message: format!(
+                            "group snapshot still saw results without their inputs more than \
+                             five minutes past due for executions {}",
+                            ids.join(", ")
+                        ),
+                        details: serde_json::json!({ "execution_ids": executions }),
+                    };
+                }
+                Err(error @ (GroupPollError::Read(_) | GroupPollError::Incomplete(_))) => {
+                    return Ok(pending(&error));
+                }
             }
         };
         let execution = self
@@ -492,7 +509,7 @@ impl VerificationScheduler {
             group_id = %due.group_id,
             %execution,
             reason = %refusal,
-            "group owner refused; recorded a terminal errored execution"
+            "group refused; recorded a terminal errored execution"
         );
         Ok(Some(GroupHandoff::Errored(execution)))
     }

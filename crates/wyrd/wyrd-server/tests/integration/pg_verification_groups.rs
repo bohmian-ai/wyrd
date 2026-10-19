@@ -630,6 +630,92 @@ async fn available_rows_form_expiring_group_snapshots() {
     );
 }
 
+/// A snapshot whose read shows a source result without that execution's
+/// input caught rows mid-publication: it pins nothing and the group stays
+/// pending, retried on later passes. Still incomplete more than five minutes
+/// past its due time, it records one terminal errored execution with
+/// `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` naming the execution whose
+/// input never appeared, and consumes the group.
+///
+/// # Panics
+/// Panics when setup fails or a pass hands off anything but the expected
+/// retry or error.
+#[tokio::test]
+async fn incomplete_snapshots_retry_then_error() {
+    let support = Support::start().await;
+    let group = GroupId::new("partial").expect("a valid group");
+    support.turn("partial", "yes", None).await;
+    let source = support.claim().await;
+    let judged = support.execute("yes").await;
+    let orphan = ExecutionId::new_v7();
+    let payload = ResultPayloadBuilder::new(
+        ResultRun {
+            execution_id: orphan,
+            run_id: None,
+            verifier_version: &source.verifier_version,
+            card_uid: &source.card_uid,
+            owner_card_uid: source.authority.principal.owner_service_uid(),
+            group_id: Some(&group),
+            binding_id: None,
+            trigger: None,
+            window: None,
+        },
+        &source.verifier_card_uid,
+        chrono::DateTime::UNIX_EPOCH,
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .build(&judged.outcome)
+    .expect("the result builds");
+    let state = support.server.state();
+    state
+        .scribe_outbox
+        .stage(support.server.data_tenant_id(), result(&source, payload));
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let capacity = Arc::new(Semaphore::new(4));
+    let scheduler = support.scheduler(&capacity);
+    let stop = CancellationToken::new();
+
+    support.make_due().await;
+    let retried = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(
+        retried.is_empty(),
+        "an incomplete read pins nothing: {retried:?}"
+    );
+    assert!(
+        support.pending("partial").await.is_some(),
+        "it stays pending"
+    );
+    assert!(
+        support.errored("partial").await.is_empty(),
+        "nothing errors yet"
+    );
+
+    support
+        .exec(
+            "UPDATE wyrd.verification_group_pending
+                SET due_at = statement_timestamp() - INTERVAL '301 seconds'",
+        )
+        .await;
+    let expired = scheduler.group_pass(&stop).await.expect("the pass runs");
+    let [GroupHandoff::Errored(errored)] = expired.as_slice() else {
+        panic!("an expired incomplete group records one error: {expired:?}");
+    };
+    assert!(support.pending("partial").await.is_none(), "it is consumed");
+    assert_eq!(
+        support.errored("partial").await,
+        [("WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE".to_owned(), true)]
+    );
+    let readback = support.execution(*errored).await;
+    assert!(
+        readback["error"].to_string().contains(&orphan.to_string()),
+        "the error names the execution missing its input: {readback}"
+    );
+}
+
 /// Pending groups debounce on acknowledged activity and stop after handoff:
 /// a later ACK moves the one due time; a full capacity pool and a pass with
 /// nothing due issue no Bifrost read, which a query fault armed before them

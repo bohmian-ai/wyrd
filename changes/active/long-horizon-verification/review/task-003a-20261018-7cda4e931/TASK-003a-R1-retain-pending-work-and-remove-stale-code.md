@@ -350,3 +350,126 @@ distinction. No additional overkill or material implementation choice was found.
 Artifact: [owner-amendment readiness review](../../../../../.dev/review/task003a-r1-owner-amendment/review.md).
 This is plan readiness only; implementation, focused tests and later cumulative
 task acceptance still remain.
+
+## Implementation evidence
+
+Candidate: `c2009cf16..4984fdadf` on `change/long-horizon-verification-task-001`
+(base `7cda4e931`). Commits: `c2009cf16` (revision 18 and review packet),
+`cd405bd36` (one-year cap and refusal shape), `77a23b3d3` (scheduler/authority/
+groups retain blockage and record refused owners), `1f2d6b301` (C13 refusal,
+retained blockage, concurrent scheduling), `af3898082` (inline Card decode
+error), `6df5085d1` (C1 three-runtime conversation, duration and owner
+refusals), `496477ab3` (typed input slot decode error), `ba6553d6f` (fixture,
+helper and webhook renames; negatives moved out of the valid corpus),
+`4984fdadf` (Python/TS C11 bound-group pressure and recovery).
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-003a-1 | `wyrd-server/src/verification/scheduler.rs` (handoff classifies retryable blockage vs owner/auth refusal; refusal goes through `refuse_group`), `authority.rs`, `groups.rs`; `wyrd-sql/src/queries/verifier_executions.rs` `VerifierExecutionQueue::refuse_group` (one errored group execution + pending delete in the caller transaction); migration `20261018000000_verification_group_pending.sql` | P1, P2, P3 (revoked Service owner → `Errored`, `WYRD_AUTH_401_CREDENTIAL_REVOKED`, group `conv-2`, no result/group/dispatches) | PASS |
+| FIND-TASK-003a-2 | `wyrd-spec/src/card/trigger.rs` `TriggerDuration::parse` rejects > 365d; SQL clamp deleted; `wyrd-spec/src/reference.rs` manual `InlineableRef` decode surfaces the inline error | P7 (`card::trigger::tests::group_end_decodes_its_duration`, `reference::tests::inlineable_ref_reports_the_inline_spec_error`), P2, P3 (raw HTTP 366d/8761h → 400 with `365d`, Card absent; 365d/31536000s accepted), P4, P8 | PASS |
+| FIND-TASK-003a-3 | `sdks/wyrd-sdk-rust/tests/integration/verify_in_real_time.rs` `Grouped::foreign_turn` spawns real Python (`uv run --no-sync python`) and Node (`wyrd-ai`) clients against the same server/tenant/Service key/group; turn 1 Rust, 2 Python, 3 TypeScript | P3 (six-fact evidence, replay, conflict, ownerless/denied, pinned readback retained) | PASS |
+| FIND-TASK-003a-4 | `wyrd-server/tests/integration/pg_verification_groups.rs` C13: real cron admission while a snapshot is held, observed query activity idle/at capacity, real source ACK during handoff leaves fresh pending | P1 | PASS |
+| FIND-TASK-003a-5 | Python `test_verification_staging_refuses_and_recovers` and TS C11 pressure the bound `support` source on group `pressured`, retry after drain, read the group execution (`[pressured]` evidence once) and count `4 + offered` rows | P5, P6 | PASS |
+| FIND-TASK-003a-6 | Rustdoc with `# Errors`/`# Panics` on every changed item in scheduler, authority, groups, `verifier_executions.rs`, trigger, reference, verifier `InputSlot`/`TypedInputSlot`, C1/C13/MCP tests | Inspection; `fmt:check`, `lints` | PASS |
+| HUMAN-CLEANUP 1 | `DueGroup` loses `due_at`, `card_uid`, `verifier_card_uid`; `claim_due_group` SQL projects only binding, group, owner, settings, principal, active. Persisted `due_at`, source identity (`GroupActivity`), admission and cron fields retained | P1, P2; `git grep` callers of `DueGroup` | PASS |
+| HUMAN-CLEANUP 2 | `runner.rs`, `docs/understand/how-verification-works.md`, MCP `verification.rs` docs and `# Panics`, `card-types.ts` describe current behavior; retired ceiling/coverage and only-automatic-Trigger claims removed | `docs:check`, `ts:typecheck`, `fmt:check`, source comparison | PASS |
+| HUMAN-CLEANUP 3 | Renames below, applied atomically with all YAML refs, `metadata.name`, webhook path and Rust/Python/TS/MCP helpers | C2 Py/TS, C3, C5, C10, P3, P4, P5, P6; active-reference search empty | PASS |
+
+### Renames (HUMAN-CLEANUP 3)
+
+| Old | New |
+|---|---|
+| `conversation-review`, `coding-review`, `event-review`, `late-review`, `refund-review`, `undeclared-review` | `conversation-verifier`, `coding-verifier`, `event-verifier`, `late-verifier`, `refund-verifier`, `undeclared-verifier` |
+| `/hooks/refund-review` | `/hooks/refund-verification` |
+| `group_reviews` / `groupReviews` (row struct) | `group_executions` / `groupExecutions` (`Row`) |
+| `assert_no_new_review` | `assert_no_new_group_execution` |
+| MCP `group_review`, `review_id` | `group_execution`, `group_execution_id` |
+
+`git grep -nE "(conversation|coding|event|late|refund|undeclared)-review\b|group_reviews|groupReviews|assert_no_new_review|hooks/refund-review" -- ':!changes' ':!.dev'`
+returns nothing. Live-test names `HeldReview`, `REVIEWED`, `LIVE_REVIEW`,
+`spans-reviewed` and `LATE-REVIEW` belong to non-grouping review behavior and
+are kept.
+
+### Focused commands, counts and results (final candidate unless noted)
+
+| Proof | Selector | Result |
+|---|---|---|
+| P1 | `WYRD_LOG=info,wyrd_server::verification=debug mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test integration -E "test(=pg_verification_groups::pending_groups_debounce_and_stop_after_handoff)"'` | 1 passed, 275 skipped |
+| P2 | `... -p wyrd-sql --test integration -E "test(=pg_verifier_executions::group_snapshots_are_idempotent_and_react_in_settlement_order)"` | 1 passed |
+| P3 | `... -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(=verify_in_real_time::grouped_support_resumes)"` | 1 passed (14.4s) |
+| P4 | `... -E "test(=verify_in_real_time::grouped_executions_include_late_evidence)"` | 1 passed (40.7s) |
+| P5 | Python `test_verify_in_real_time.py::test_verification_staging_refuses_and_recovers` | 1 passed |
+| P6 | TS `verify-in-real-time.test.ts` C11 exact `-t` | 1 passed |
+| P7 | `mise exec -- cargo nextest run --locked -p wyrd-spec` (crate, after decode fixes); exact `card::trigger::tests::group_end_decodes_its_duration` rerun on final HEAD | 768/768; 1/1 |
+| P8 | `pg_openapi_contract` `grouped_verification_contract_is_served` | 1 passed |
+| C2 | Python and TS `grouped refund changes verdict` | 1 passed each |
+| C3 / C5 | `grouped_coding_uses_declared_sources` / `grouped_conversations_coexist_with_drift` | 1 passed each |
+| C10 | `wyrd-mcp --test mcp verification::pg_tests::grouped_frames_use_visible_outcomes` | 1 passed |
+| Static | `codegen:regen` + `codegen:check` (no diff), `fmt:check`, `lints`, `check:tenant-isolation`, `py:lints`, `py:typecheck`, `ts:format:check`, `ts:lints`, `ts:typecheck`, `docs:check`, `git diff --check 7cda4e931..HEAD` | all exit 0 |
+
+Native artifacts were rebuilt (`py:setup`, `ts:build`, `ts:build:testing`) before P5/P6/C2.
+
+### RED/GREEN
+
+- FIND-1/FIND-2 production: at `7cda4e931` the refusal API, the pending
+  constraint and the one-year check were absent; P7 RED observed (366d accepted),
+  then GREEN.
+- Inline refs: `reference::tests::inlineable_ref_reports_the_inline_spec_error`
+  RED with `data did not match any variant of untagged enum InlineableRef`, GREEN
+  after the manual decode.
+- Input slots: the existing `card::verifier_card_tests::removed_scheduled_samples_fields_fail_at_their_path` was RED and turned GREEN.
+- FIND-3/4/5 are verification-only test strengthening; each new assertion was
+  observed against the implemented behavior.
+
+### Diagnoses
+
+1. **Inline duration message.** *Symptom:* an inline `runs_on` with 366d failed
+   with a generic untagged-enum error, not the `365d` limit. *Evidence:* serde's
+   untagged `InlineableRef` discards variant errors. *Cause:* derived untagged
+   `Deserialize`. *Fix site:* `wyrd-spec/src/reference.rs`, the shared owner for
+   every inline Card ref. The manual decode tries ref, then sibling, then inline,
+   then path, and returns the inline body's own error. Outside the listed write
+   set, but needed for FIND-2's write-time message on the inline path.
+2. **InputSlot regression.** *Symptom:* `removed_scheduled_samples_fields_fail_at_their_path`
+   failed in wyrd-spec. *Evidence:* the fresh diagnostician traced it to the
+   untagged `Source` variant added in `a835c53aa`, which masks the tagged
+   variant's `deny_unknown_fields` error. *Cause:* untagged fallback. *Fix site:*
+   `wyrd-spec/src/card/verifier/mod.rs`. A visitor dispatches strings to
+   `SourceText` and maps to a `#[serde(remote = "InputSlot")]` tagged mirror.
+3. **Fixture sweep.** *Symptom:* the wyrd-spec fixture sweep failed on a varying
+   Card. *Evidence:* the diagnostician found intentionally invalid
+   `reserved-typed`, `reserved-source` and `coding-child` under
+   `fixtures/cards/`, in HashMap order. *Cause:* negatives sat in the valid corpus.
+   *Fix site:* moved them to `fixtures/invalid/`, following the existing
+   precedent. *Side finding:* all three journeys listed `coding-child` as kind
+   `Service`, which made its absence assertion vacuous. They now use `Verifier`.
+4. **Concurrent Postgres lanes.** *Symptom:* `role wyrd_platform already exists`
+   and EOF/SSLRequest errors when C10 and the C2 lanes ran together. *Cause:* the
+   with-test-postgres lanes contended when run at the same time. They are
+   infrastructure, not product code. *Fix:* the lanes were rerun one at a time and
+   all passed. No code changed.
+
+Diagnostician report (fresh read-only agent; given the failing command, trace
+and diff): the cause of 2 is the untagged `InputSlot::Source` from `a835c53aa`;
+the cause of 3 is the negative fixtures in the swept valid directory; the fix
+sites are as recorded above. Its affected-callers list was every consumer of
+`InputSlot` and of the `fixtures/cards` sweep.
+
+### Diff and non-goal audit
+
+- Tracked diff is limited to the R1 surfaces above plus the two shared-owner
+  decode fixes in `wyrd-spec`, which were needed for correct error reporting. The
+  tree is clean, with no untracked files.
+- Accepted limits and non-goals are unchanged: no new kinds or routes, no
+  fabricated authority or snapshot, and no platform-specific code.
+- REQ-015/AC-009 remain pending.
+- Material risk: decode errors for inline refs and input slots now report the
+  inner error instead of the generic untagged message. This is an improvement
+  in text, and the wire shape is unchanged. Negative fixtures moved to
+  `fixtures/invalid/`.
+
+Disposition: **IMPLEMENTED**. The cumulative candidate goes to
+`$wyrd-task-review`. This task neither approves the integrated change nor claims
+benchmark readiness.

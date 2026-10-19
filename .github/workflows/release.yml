@@ -459,7 +459,9 @@ jobs:
   # One bundle per local-server target `wyrd server install` selects by
   # `wyrd-server-<target>.tar.gz`; the Linux bundles also feed the images.
   # Linux bundles build on the oldest glibc their images run: ubuntu-22.04
-  # for the ubuntu and debian images, rockylinux:9 for rocky.
+  # for the ubuntu and debian images, rockylinux:9 for rocky. The arm runner
+  # cannot finish the fat LTO link of wyrd-server even with swap: it thrashes
+  # until the runner loses contact with GitHub, so arm links with thin LTO.
   build-server:
     name: server - ${{ matrix.bundle }}
     strategy:
@@ -473,6 +475,7 @@ jobs:
             bundle: x86_64-unknown-linux-gnu-rocky
           - os: ubuntu-22.04-arm
             bundle: aarch64-unknown-linux-gnu
+            lto: thin
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     env:
@@ -501,8 +504,8 @@ jobs:
         with:
           key: ${{ matrix.bundle }}
 
-      # The dist profile's fat LTO link of wyrd-server outgrows the arm
-      # runner's memory, which kills the runner mid-link; swap carries it.
+      # Even the thin LTO link of wyrd-server presses the arm runner's
+      # memory; swap keeps it from being killed mid-link.
       - name: Add swap for the LTO link
         if: runner.os == 'Linux' && runner.arch == 'ARM64'
         run: |

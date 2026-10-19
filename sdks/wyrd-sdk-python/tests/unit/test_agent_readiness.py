@@ -24,6 +24,7 @@ from tests.agent_readiness.live import (
     Redactor,
     StageFailed,
     agent_environment,
+    keep_login,
     preflight,
     run,
     run_agent,
@@ -98,15 +99,17 @@ def test_redactor_hides_credentials_and_wyrd_keys() -> None:
     assert shown == "[redacted] [redacted] [redacted] [redacted] /home/x"
 
 
-def test_preflight_names_every_missing_prerequisite() -> None:
-    missing = preflight(list(AGENTS.values()), {}, which=lambda binary: None)
+def test_preflight_names_every_missing_prerequisite(tmp_path: Path) -> None:
+    missing = preflight(
+        list(AGENTS.values()), {"CODEX_HOME": str(tmp_path)}, which=lambda binary: None
+    )
 
     assert "test Postgres" in missing["harness"] and "pnpm" in missing["harness"]
     assert (
         missing["claude"]
         == "missing `claude` on PATH; ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
     )
-    assert missing["codex"] == "missing `codex` on PATH; CODEX_API_KEY"
+    assert missing["codex"] == "missing `codex` on PATH; a `codex login` (auth.json)"
 
 
 def test_missing_prerequisites_block_every_agent_instead_of_skipping(
@@ -115,6 +118,7 @@ def test_missing_prerequisites_block_every_agent_instead_of_skipping(
     for agent in AGENTS.values():
         for name in agent.credentials:
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "logged-out"))
 
     outcomes = run(list(AGENTS.values()), tmp_path, 1.0, threading.Event())
 
@@ -122,7 +126,22 @@ def test_missing_prerequisites_block_every_agent_instead_of_skipping(
         ("claude", "blocked", "preflight"),
         ("codex", "blocked", "preflight"),
     ]
-    assert all("API_KEY" in each.detail for each in outcomes)
+    assert "API_KEY" in outcomes[0].detail and "codex login" in outcomes[1].detail
+
+
+def test_linked_login_replaced_by_the_agent_is_copied_back(tmp_path: Path) -> None:
+    original = tmp_path / "owner" / "auth.json"
+    original.parent.mkdir()
+    original.write_text("old")
+    link = tmp_path / "auth.json"
+    link.symlink_to(original)
+
+    assert keep_login(link, original) is None
+    link.unlink()
+    link.write_text("refreshed")
+
+    assert keep_login(link, original) is not None
+    assert original.read_text() == "refreshed"
 
 
 def test_agent_environment_carries_only_its_own_credential(tmp_path: Path) -> None:

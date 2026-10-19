@@ -391,9 +391,10 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:agent-readiness:smoke:live"]
 description = """Opt-in live coding-agent readiness: Claude Code and Codex each build and run a Wyrd-verified Python
 application from this checkout's locally served docs and connected MCP, against a foreground `wyrd server dev` the
-harness owns for that agent alone. Only authorized server evidence decides each outcome. Calls paid agents. Reads
-ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and CODEX_API_KEY, from the environment, normally an untracked
-mise.local.toml; a missing one blocks that agent. Transcripts, apps, and report.json land in
+harness owns for that agent alone. Only authorized server evidence decides each outcome. Calls paid agents. Claude
+Code reads ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`), normally from an untracked
+mise.local.toml; Codex uses the owner's existing `codex login` through a linked auth.json. A missing one blocks that
+agent. Transcripts, apps, and report.json land in
 target/agent-readiness/<UTC time>/. Deliberately outside the CI gate."""
 depends = ["py:setup", "docs:install"]
 run = [

@@ -12,9 +12,12 @@ application directory and home. Both agents receive the same objective and
 run concurrently. ``observe`` then judges each agent from its own server;
 the transcript, exit status, and files are diagnostics only.
 
-Agent credentials come from the environment, normally an untracked
-``mise.local.toml``: ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` for
-Claude Code, ``CODEX_API_KEY`` for Codex. An agent only ever sees its own.
+Claude Code's credential comes from the environment, normally an untracked
+``mise.local.toml``: ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN``
+(``claude setup-token``). Codex uses the owner's existing login: its empty
+``CODEX_HOME`` links only ``auth.json`` from the owner's, so no instructions,
+plugins, memories, or configuration come along. An agent never sees another's
+credential.
 Every artifact lands under ``target/agent-readiness/<UTC time>/``, with
 ``report.json`` holding each agent's outcome, failure point, and evidence IDs.
 Exit status is 0 only when both agents pass.
@@ -102,6 +105,8 @@ class Agent:
     host: str
     credentials: tuple[str, ...]
     command: tuple[str, ...]
+    login: str | None = None
+    """A login file shared by link from the owner's ``CODEX_HOME``, in place of ``credentials``."""
 
 
 AGENTS = {
@@ -126,7 +131,8 @@ AGENTS = {
         name="codex",
         binary="codex",
         host="codex",
-        credentials=("CODEX_API_KEY",),
+        credentials=(),
+        login="auth.json",
         command=(
             "exec",
             "--json",
@@ -151,6 +157,7 @@ class Outcome:
     transcript: str | None = None
     app: str | None = None
     evidence: dict[str, Any] | None = None
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -168,7 +175,8 @@ class Redactor:
             for name, value in environ.items()
             if len(value) >= 8 and (name in names or name.endswith(("_KEY", "_TOKEN", "_SECRET")))
         ]
-        return cls(sorted(secrets, key=len, reverse=True))
+        secrets.sort(key=len, reverse=True)
+        return cls(secrets)
 
     def __call__(self, text: str) -> str:
         """``text`` with every secret replaced by ``[redacted]``."""
@@ -183,7 +191,8 @@ def preflight(
     """Every missing prerequisite by owner: an agent name or ``harness``.
 
     The harness needs the built CLI and server, pnpm, and the repository
-    test Postgres; each agent needs its binary and one credential variable.
+    test Postgres; each agent needs its binary and one credential variable, or
+    for Codex the owner's existing login.
     Nothing is skipped: a missing prerequisite is a blocked outcome.
     """
     missing: dict[str, str] = {}
@@ -202,11 +211,68 @@ def preflight(
         problems = []
         if resolve(agent.binary, which) is None:
             problems.append(f"`{agent.binary}` on PATH")
-        if not any(environ.get(name) for name in agent.credentials):
+        if agent.login is not None:
+            if not (owner_codex_home(environ) / agent.login).is_file():
+                problems.append(f"a `{agent.binary} login` ({agent.login})")
+        elif not any(environ.get(name) for name in agent.credentials):
             problems.append(" or ".join(agent.credentials))
         if problems:
             missing[agent.name] = "missing " + "; ".join(problems)
     return missing
+
+
+def owner_codex_home(environ: Mapping[str, str]) -> Path:
+    """The owner's own ``CODEX_HOME``, where an existing Codex login lives."""
+    return Path(environ.get("CODEX_HOME") or Path(environ.get("HOME", "~")).expanduser() / ".codex")
+
+
+def login_secrets(login: Path) -> list[str]:
+    """Every long string value in a JSON login file, for redaction."""
+    found: list[str] = []
+    pending: list[Any] = [json.loads(login.read_text())]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str) and len(value) >= 20:
+            found.append(value)
+    return found
+
+
+def keep_login(link: Path, original: Path) -> str | None:
+    """Keep the owner's login valid after an agent ran on a linked copy.
+
+    Codex refreshing its token through the link keeps one file. If it
+    replaced the link with a refreshed file instead, the owner's original may
+    hold a rotated-out token, so the refreshed file is copied back over it.
+    Returns a note when that happened.
+    """
+    if link.is_symlink() or not link.is_file():
+        return None
+    shutil.copy2(link, original)
+    return f"the agent replaced its linked login; the refreshed one was copied back to {original}"
+
+
+@contextmanager
+def shared_login(agent: Agent, codex_home: Path, notes: list[str]) -> Iterator[list[str]]:
+    """Link the owner's login into the agent's ``CODEX_HOME`` for the block.
+
+    Yields the login's secret values for redaction; afterwards ``keep_login``
+    guards the owner's file and any note lands in ``notes``.
+    """
+    if agent.login is None:
+        yield []
+        return
+    original = owner_codex_home(os.environ) / agent.login
+    link = codex_home / agent.login
+    link.symlink_to(original)
+    try:
+        yield login_secrets(original)
+    finally:
+        if note := keep_login(link, original):
+            notes.append(note)
 
 
 def free_port() -> int:
@@ -431,8 +497,10 @@ def agent_environment(
     for name in ("LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"):
         if name in environ:
             env[name] = environ[name]
-    credential = next(name for name in agent.credentials if environ.get(name))
-    env[credential] = environ[credential]
+    for credential in agent.credentials:
+        if environ.get(credential):
+            env[credential] = environ[credential]
+            break
     return env
 
 
@@ -465,7 +533,11 @@ def exercise(
             config = home / "wyrd"
             (home / ".claude").mkdir()
             server_env = {**server_env, "HOME": str(home), "CODEX_HOME": str(home / "codex")}
-            with wyrd_served(cli, agent.name, home, server_env, workdir / "server.log", cancel):
+            with (
+                shared_login(agent, home / "codex", outcome.notes) as login,
+                wyrd_served(cli, agent.name, home, server_env, workdir / "server.log", cancel),
+            ):
+                redact = Redactor([*login, *redact.secrets])
                 env = agent_environment(agent, home, config, bin_dir, wheels, os.environ)
                 installed = subprocess.run(
                     [str(cli), "mcp", "install", "--host", agent.host, "--format", "json"],
@@ -603,7 +675,7 @@ def run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the lane, write ``report.json``, print a summary, and exit 0 only when every agent passed."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description="Run the live coding-agent readiness lane.")
     parser.add_argument("--agent", action="append", choices=sorted(AGENTS), dest="agents")
     parser.add_argument("--timeout", type=float, default=3600.0, help="seconds per agent")
     parser.add_argument("--artifacts", type=Path)

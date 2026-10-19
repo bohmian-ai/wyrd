@@ -1,0 +1,321 @@
+{
+ "v": 3,
+ "attachments": {},
+ "boards": {
+  "Agent.dc.html": {
+   "expand": "fill",
+   "h": 1400,
+   "title": "Agent Card: composition, invoke_agent spans and gateway calls attributed to it, bound Verifiers",
+   "w": 1440,
+   "x": 1520,
+   "y": 1900
+  },
+  "ChangeDetail.dc.html": {
+   "expand": "fill",
+   "h": 1720,
+   "title": "Change Request Overview: the existing GitHub-like mock, Verifiers panel, revisions with their cause",
+   "w": 1440,
+   "x": 1520,
+   "y": 8040
+  },
+  "ChangeVerification.dc.html": {
+   "expand": "fill",
+   "h": 1500,
+   "title": "Change Request Verification tab: one row per Verifier for the current revision",
+   "w": 1440,
+   "x": 3040,
+   "y": 8040
+  },
+  "Changes.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Change Requests: a PR-style list with revision and verification state",
+   "w": 1440,
+   "x": 0,
+   "y": 8040
+  },
+  "Data.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Data Card: schema from the spec, spec.stats, drift per column from bound drift checks",
+   "w": 1440,
+   "x": 6080,
+   "y": 1900
+  },
+  "Home.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Home \u2014 attention from failed verification, Services health, live Observe summary",
+   "w": 1440,
+   "x": 0,
+   "y": 1900
+  },
+  "Logs.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Logs \u2014 same toolbar and timeline, severity-stacked",
+   "w": 1440,
+   "x": 1520,
+   "y": 0
+  },
+  "Main.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Traces: one row per trace, live with pause, Traces | Spans modes, filters folded",
+   "w": 1440,
+   "x": 0,
+   "y": 0
+  },
+  "Metrics.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Metrics \u2014 one chart, group-by and legend instead of top-4",
+   "w": 1440,
+   "x": 3040,
+   "y": 0
+  },
+  "Model.dc.html": {
+   "expand": "fill",
+   "h": 1100,
+   "title": "Model Card: interface, artifacts, attributed telemetry when present, drift",
+   "w": 1440,
+   "x": 4560,
+   "y": 1900
+  },
+  "Prompt.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Prompt Card: the prompt is the page; spec only, no telemetry",
+   "w": 1440,
+   "x": 3040,
+   "y": 1900
+  },
+  "Query.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Query \u2014 catalog, editor, results table joined across the warehouse",
+   "w": 1440,
+   "x": 0,
+   "y": 3740
+  },
+  "QueryChart.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Query \u2014 chart view of the same result",
+   "w": 1440,
+   "x": 1520,
+   "y": 3740
+  },
+  "Repos.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Repositories: webhook health, wyrd.toml, the Verifiers folder",
+   "w": 1440,
+   "x": 4560,
+   "y": 8040
+  },
+  "Service.dc.html": {
+   "expand": "fill",
+   "h": 1360,
+   "title": "Service Overview: signals by service_card_uid, broken down by component card_uid",
+   "w": 1440,
+   "x": 7600,
+   "y": 1900
+  },
+  "ServiceCharts.dc.html": {
+   "expand": "fill",
+   "h": 1180,
+   "title": "Service Charts: built-in verification, drift, gateway and signal charts, plus custom charts from ServiceSpec.charts",
+   "w": 1440,
+   "x": 7600,
+   "y": 3740
+  },
+  "Spans.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Spans mode: every matching span, filters open, trace id opens the drawer",
+   "w": 1440,
+   "x": 6720,
+   "y": 0
+  },
+  "TimePicker.dc.html": {
+   "h": 600,
+   "title": "Time picker, open",
+   "w": 520,
+   "x": 0,
+   "y": 1120
+  },
+  "TraceDrawer.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Trace drawer: opens over the list, waterfall on top, span details below",
+   "w": 1440,
+   "x": 5200,
+   "y": 0
+  },
+  "Verifier.dc.html": {
+   "expand": "fill",
+   "h": 627,
+   "title": "Verifier Card: the Verifier graph from the spec; results live in Verify",
+   "w": 1440,
+   "x": 4560,
+   "y": 5140
+  },
+  "Verify.dc.html": {
+   "expand": "fill",
+   "h": 1012,
+   "title": "Verify: Traces-style list of recorded results; a run result open in the drawer on the Verifier graph",
+   "w": 1440,
+   "x": 0,
+   "y": 5140
+  },
+  "VerifyDrift.dc.html": {
+   "expand": "fill",
+   "h": 1000,
+   "title": "Verify: a drift result in the drawer, one row per feature with recorded score, threshold, verdict",
+   "w": 1440,
+   "x": 3040,
+   "y": 5140
+  },
+  "VerifySession.dc.html": {
+   "expand": "fill",
+   "x": 1520,
+   "y": 5140,
+   "w": 1440,
+   "h": 1012,
+   "title": "Verify grouped by session: the session verdict heads its member runs; session result in the drawer"
+  }
+ },
+ "createdOnFiles": {
+  "at": "2026-10-13T20:10:00Z",
+  "v": 1
+ },
+ "designSystems": [],
+ "launch": {
+  "view": "canvas"
+ },
+ "notes": {
+  "cardsfix": {
+   "size": 24,
+   "text": "Card pages, shared shape:\n\u2022 Header: name, kind, version, status, one-line description; uid shortened with copy.\n\u2022 Kind-specific hero: Agent = composition graph, Prompt = the messages, Model = interface + artifacts.\n\u2022 Vitals only from real sources (Revision 15): invoke_agent spans and vala.gateway.calls with this card_uid; otherwise an empty state naming what fills it. Prompt has no vitals.\n\u2022 Verification table: the Verifiers bound to it, with trend and latest.\n\u2022 Right rail: relationships with kind pills, compact metadata.\n\u2022 Tabs: Overview \u00b7 Versions \u00b7 YAML (raw).\nGone: one box per spec field, \"Declared empty.\" boxes, full hashes, \"read-only projection of server truth\".\n\nRevision 12: Data (schema + stats), Service (components with their own verification) and Verifier (pipeline + bindings) join Agent, Prompt and Model. The other kinds keep the generic page.",
+   "w": 560,
+   "x": 1200,
+   "y": 1120
+  },
+  "changesnote": {
+   "size": 24,
+   "text": "Change Request (proposal, not on main yet). Revision 15: pages follow the existing GitHub-like mock in features/changes; Override and Claims removed.\n\u2022 A server-owned record, not a Card. Any update makes a new immutable revision.\n\u2022 Subjects: one or more repo + base\u2026head (+ PR). Many PRs and repos can belong to one CR; a PR opens a CR when none is linked.\n\u2022 The repo's wyrd.toml names a folder of Verifier Cards and which are required. Their requirements are what the change must meet.\n\u2022 A user or process submits inputs/evidence to a revision; Verifiers judge that evidence against their requirements. A Verifier whose inputs are missing shows 'waiting on evidence'.\n\u2022 Anyone can request another Verifier on a revision.\n\u2022 Results land in vala.verification.results, so Verify, Query and Card pages show them.\n\u2022 Verifier definitions load from the default branch, never from the PR under review.",
+   "w": 600,
+   "x": 6080,
+   "y": 8040
+  },
+  "fix": {
+   "size": 24,
+   "text": "What changes, by your four points:\n1. One aligned toolbar row: SQL bar (plain text = name/trace-id match), zoom \u2212/+, reset, time picker, Live. The separate search box, SORT and duration rows go: sort lives in column headers, duration is a facet + SQL.\n2. Time picker button opens presets (5m \u2192 30d) with custom range inside it.\n3. Zooming shows a 'Zoomed \u2026 \u2715' chip and the \u21ba button returns to the preset you came from.\n4. The from/to row you saw is the absolute-range editor that appears after a zoom; it moves into the picker.\nRevision 2: amber removed from charts (lime is the secondary series; amber stays only on the WARN label). Traces lead with three linked charts: spans/min, errors, duration p50/p95.",
+   "w": 520,
+   "x": 640,
+   "y": 1120
+  },
+  "provenance": {
+   "size": 24,
+   "text": "Revision 15 rules (spec REQ-021\u2013REQ-030):\n\u2022 No invented data: every number is a query on a named table or a spec value; every chart has Open in Query; empty states name the attribute or binding that fills them.\n\u2022 Services: new service_card_uid column on spans, logs, metrics and gateway calls, from resource attribute wyrd.service.card_uid (OTEL_RESOURCE_ATTRIBUTES), scope-checked; defaults from a credential bound to one Service. card_uid stays the producing component.\n\u2022 Custom charts live in ServiceSpec.charts (sql or sql_file; $1/$2 range, $3 bucket; shape rules per type; validated at registration).\n\u2022 Verifier pages follow VerifierSpec: one check per requirement, step-scoped and Verifier-level requirements, decide; mode inferred.\n\u2022 Missing on main: service_card_uid, ServiceSpec.charts, Change Requests, listing in-flight executions.",
+   "w": 1400,
+   "x": 6000,
+   "y": 1120
+  },
+  "querynote": {
+   "size": 24,
+   "text": "Query (extends foundation Q-01):\n\u2022 Same toolbar row: time range applies to each table's time column; limit; Copy SQL; CSV; Run \u2318\u21b5 / Cancel.\n\u2022 Catalog of real vala tables; correlation columns (card_uid, run_id) highlighted \u2014 they join any table.\n\u2022 Starter queries show the joins (spans \u22c8 verification.results on run_id).\n\u2022 Results: Table \u00b7 Chart (line/bar/area/number, x/y/group from result columns) \u00b7 Details (query id, status, time, rows, bytes, error) \u00b7 History.\n\u2022 card_uid values render as their Card.\n\u2022 Bounds shown are Oracle's real ones: one read-only SELECT, SQL \u2264 64 KiB, 2 h default deadline; the page's Limit bounds rows.",
+   "w": 520,
+   "x": 3040,
+   "y": 3740
+  },
+  "shellnote": {
+   "size": 24,
+   "text": "Revision 12: left rail on every page, matching Shell.svelte in code.\n\u2022 Order: Home \u00b7 Cards | Observe \u00b7 Verify \u00b7 Query | Changes; Settings and the user are pinned to the bottom.\n\u2022 \u2318K moves into the rail (find a Card, run a saved view, or ask for one).\n\u2022 The top bar keeps only the breadcrumb and page-level controls (time picker, Live).\n\u2022 Drift is no longer an Observe tab: drift is a Verifier requirement, so it lives in Verify.",
+   "w": 520,
+   "x": 4560,
+   "y": 0
+  },
+  "title": {
+   "kind": "title1",
+   "maxW": 8000,
+   "text": "Observe: one toolbar, one timeline, one time picker",
+   "w": 240,
+   "x": 0,
+   "y": -320
+  },
+  "title2": {
+   "kind": "title1",
+   "maxW": 8000,
+   "text": "Home and Card pages: each kind leads with what it is, then how it is behaving",
+   "w": 240,
+   "x": 0,
+   "y": 1580
+  },
+  "title3": {
+   "kind": "title1",
+   "maxW": 3000,
+   "text": "Query: explore the warehouse in SQL \u2014 table, chart, details, history",
+   "w": 240,
+   "x": 0,
+   "y": 3440
+  },
+  "title4": {
+   "kind": "title1",
+   "maxW": 4480,
+   "text": "Verify: one workbench, then the Verifier (Results \u00b7 Definition)",
+   "w": 240,
+   "x": 0,
+   "y": 4920
+  },
+  "title5": {
+   "kind": "title1",
+   "maxW": 4480,
+   "text": "Changes: one Change Request above many PRs, judged by the same Verifiers",
+   "w": 240,
+   "x": 0,
+   "y": 7740
+  },
+  "tracenote": {
+   "size": 24,
+   "text": "Revision 14, the Traces page (observability only):\n\u2022 Traces mode: one row per trace (its root span): start, name, service, duration, spans, errors, status. Agent runs add model/tool calls, tokens, cost. Counts load only for rows on screen.\n\u2022 Spans mode: every matching span, flat and sortable. Same toolbar, time range and WHERE.\n\u2022 Live: new traces arrive at the top; scrolling, hovering or opening a trace pauses it; '\u2191 N new' resumes. Running traces fill in place.\n\u2022 Click a trace: a drawer opens over the list (not beside it) and loads only that trace. Waterfall collapsed below 2 levels with pinned parents; span details below with Messages for LLM spans. Esc closes; Expand makes it a page; the URL is shareable.\n\u2022 Filters (Service, Status, Duration, http.route, Root span, + any field) are open by default and can be hidden; clicking a value writes it into WHERE, which is always the real filter.\n\u2022 Revision 15: Service filter is service_card_uid; Card filter is card_uid.",
+   "w": 640,
+   "x": 5200,
+   "y": 1120
+  },
+  "verifynote": {
+   "text": "Revision 18 (spec REQ-026/027): Verify is the one results list, shaped like Traces. A row opens a drawer over the list (Expand for a full page). One Verifier graph, built from the spec, is the Card's definition and, coloured by recorded outcomes, the result view. The Card has no Results tab.\n\nThe UI never decides pass or fail: it renders recorded results.\n\nOpen: non-sensitive per-requirement outcomes; group_by close rule; session vs member results sharing group_id; multi-feature drift pass rule.\n\nIllustrative: the session-resolution Verifier and drift scores are invented; no fixture exists yet.",
+   "w": 720,
+   "x": 0,
+   "y": 6340
+  }
+ },
+ "order": [
+  "Main.dc.html",
+  "Logs.dc.html",
+  "Metrics.dc.html",
+  "Spans.dc.html",
+  "TraceDrawer.dc.html",
+  "TimePicker.dc.html",
+  "Home.dc.html",
+  "Agent.dc.html",
+  "Prompt.dc.html",
+  "Model.dc.html",
+  "Query.dc.html",
+  "QueryChart.dc.html",
+  "Verify.dc.html",
+  "VerifySession.dc.html",
+  "VerifyDrift.dc.html",
+  "Data.dc.html",
+  "Service.dc.html",
+  "Verifier.dc.html",
+  "Changes.dc.html",
+  "ChangeDetail.dc.html",
+  "Repos.dc.html",
+  "ServiceCharts.dc.html",
+  "ChangeVerification.dc.html"
+ ],
+ "pages": [],
+ "title": "Wyrd Observe redesign"
+}

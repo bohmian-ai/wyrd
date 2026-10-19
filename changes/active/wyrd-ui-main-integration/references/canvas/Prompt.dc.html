@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Prompt Card</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 12px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#1f2230}
+.btn.primary{background:#7a8cff;border-color:#7a8cff;color:#0b0c12;font-weight:600}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.panel{background:#12141c;border:1px solid #252838;border-radius:2px}
+.ph{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #252838}
+.pb{padding:14px 16px}
+.kind{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;background:#1a2040;border:1px solid #3a4170;color:#c7cdff;font:11px "Fragment Mono",monospace;letter-spacing:.04em;text-transform:uppercase;border-radius:2px}
+.ok{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3dbe5a;color:#3dbe5a;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.bad{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #e2484d;color:#e2484d;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.neutral{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3a3d4f;color:#8f92a5;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px;font:12px "Fragment Mono",monospace}
+.kv dt{color:#8f92a5}.kv dd{margin:0;color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab{padding:10px 2px;margin-right:22px;color:#8f92a5;font:13px "Familjen Grotesk",sans-serif}
+.tab[aria-current]{color:#e6e4da;box-shadow:inset 0 -2px 0 #7a8cff}
+.vital{padding:14px 16px;display:flex;flex-direction:column;gap:4px;border-right:1px solid #252838;min-width:0}
+.vital:last-child{border-right:0}
+.vv{font:600 22px "Familjen Grotesk",sans-serif;color:#e6e4da}
+.vs{font:11px "Fragment Mono",monospace;color:#8f92a5}
+table{width:100%;border-collapse:collapse;font:12px "Fragment Mono",monospace}
+th{text-align:left;font-weight:400;color:#8f92a5;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:8px 16px;border-bottom:1px solid #252838}
+td{padding:9px 16px;border-bottom:1px solid #1c1f2c;color:#e6e4da}
+tr:last-child td{border-bottom:0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;background:#1a1d28;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;color:#e6e4da;white-space:nowrap}
+.node{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#12141c;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;min-width:0}
+.node small{color:#8f92a5;font-size:10.5px}
+.node.self{border:2px solid #7a8cff;background:#141933}
+.edge{font:10.5px "Fragment Mono",monospace;color:#8f92a5;display:flex;align-items:center;gap:6px;white-space:nowrap}
+
+.src{display:flex;align-items:center;gap:10px;padding:8px 16px;border-top:1px solid #1c1f2c;font:11px "Fragment Mono",monospace;color:#6f7288}
+.src code{color:#8f92a5;font:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.src a{margin-left:auto;white-space:nowrap}
+.empty{padding:22px 16px;display:flex;flex-direction:column;gap:8px;border:1px dashed #303347;margin:14px 16px;font:12px "Fragment Mono",monospace;color:#8f92a5}
+.empty b{color:#e6e4da;font:600 13px "Familjen Grotesk",sans-serif}
+.empty pre{margin:0;color:#c9c7be;font:inherit;white-space:pre-wrap}
+.code{font:12px/1.7 "Fragment Mono",monospace;background:#0e1017;border:1px solid #252838;padding:12px 14px;margin:0;color:#e6e4da;white-space:pre;overflow-x:auto}
+.sub{color:#8f92a5;font-size:11px}
+</style>
+</helmet>
+<div style="display:flex;flex-wrap:wrap;background:#0b0c12"><aside aria-label="Primary" style="flex:0 0 212px;box-sizing:border-box;background:#0e1017;border-right:1px solid #252838;display:flex;flex-direction:column;gap:2px;padding:14px 10px"><div style="display:flex;align-items:center;justify-content:space-between;padding:0 6px 12px"><span style="font:600 11px 'Fragment Mono',monospace;padding:3px 8px;background:#7a8cff;color:#0b0c12">WYRD</span><button aria-label="Collapse navigation" style="background:transparent;border:0;color:#8f92a5;cursor:pointer;width:28px;height:28px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path></svg></button></div><button style="display:flex;align-items:center;gap:8px;height:32px;margin-bottom:10px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#8f92a5;font:12px 'Fragment Mono',monospace;cursor:pointer">⌕ Find or ask… <kbd style="margin-left:auto;color:#8f92a5">⌘K</kbd></button><a href="Home.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 11l9-7 9 7v9h-6v-6H9v6H3z"></path></svg>Home</a><a href="Service.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#e6e4da;background:#1a2040;box-shadow:inset 2px 0 0 #7a8cff"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16"></rect><path d="M4 9h16"></path></svg>Cards</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"></path></svg>Observe</a><a href="Verify.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12l5 5L20 7"></path></svg>Verify</a><a href="Query.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"></ellipse><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"></path></svg>Query</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Changes.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="6" r="2"></circle><circle cx="6" cy="18" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 8v8M8 6h3a5 5 0 0 1 5 5"></path></svg>Changes<span style="margin-left:auto;font:11px 'Fragment Mono',monospace;padding:0 6px;border:1px solid #3a4170;color:#c7cdff">2</span></a><div style="margin-top:auto;display:flex;flex-direction:column;gap:2px"><a href="Repos.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9L7 7M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"></path></svg>Settings</a><div style="display:flex;align-items:center;gap:8px;padding:10px 10px 0;border-top:1px solid #1c1f2c;margin-top:8px;font:12px 'Fragment Mono',monospace;color:#e6e4da"><span style="width:22px;height:22px;border-radius:50%;background:#1a2040;display:inline-flex;align-items:center;justify-content:center;color:#c7cdff">a</span><span style="display:flex;flex-direction:column"><span>alice</span><span style="color:#8f92a5;font-size:11px">ui-live ▾</span></span></div></div></aside><div style="flex:999 1 560px;min-width:0">
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif;">
+  <header style="display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid #252838; background: #0e1017; min-height: 34px;">
+    <span class="mono" style="font-size: 12px; color: #8f92a5;">Cards / Prompt / support-prompt</span>
+  </header>
+  <section style="padding: 22px 24px 0; border-bottom: 1px solid #252838; background: linear-gradient(180deg, #10121a 0%, #0b0c12 100%);">
+    <div style="display: flex; align-items: flex-start; gap: 16px;">
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <h1 style="margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.01em;">support-prompt</h1>
+          <span class="kind">● Prompt</span><span class="chip">v1.0.0 · current ▾</span><span class="ok">✓ ACTIVE</span>
+        </div>
+        
+        <div class="mono" style="font-size: 11.5px; color: #8f92a5; display: flex; gap: 14px; flex-wrap: wrap;"><span>default / support-prompt@1.0.0</span><span>uid 01a2f7c1…9e0d1 ⧉</span><span>registered 2h ago by alice</span></div>
+      </div>
+      <div style="display: flex; gap: 8px;"><button class="btn">⧉ Copy ref</button><a class="btn primary" href="Agent.dc.html">Open support-agent</a></div>
+    </div>
+    <nav aria-label="Card" style="display: flex; margin-top: 16px;"><a class="tab" href="#" aria-current="page">Overview</a><a class="tab" href="#">Versions 1</a><a class="tab" href="#">YAML</a></nav>
+  </section>  <div style="display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; padding: 20px 24px 32px;">
+    <div style="display: flex; flex-direction: column; gap: 20px; min-width: 0;"><div class="panel"><div class="ph"><span class="h">Prompt</span><span class="vs">exactly what the provider receives</span></div><div class="pb" style="display:flex;flex-direction:column;gap:14px"><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="chip">provider openai</span><span class="chip">model gpt-4o</span><span class="chip">response · text</span></div><div style="display:grid;grid-template-columns:84px minmax(0,1fr);gap:10px;align-items:start"><span class="mono" style="font-size:11px;color:#8f92a5;padding-top:10px">1 · USER</span><div style="background:#1a1d28;border:1px solid #252838;border-left:3px solid #7a8cff;padding:12px 14px;font-size:15px;line-height:1.5">Answer the customer: <span class="mono" style="background:#1a2040;color:#c7cdff;padding:1px 5px">{{question}}</span></div></div><div class="mono" style="font-size:11.5px;color:#8f92a5;border-top:1px dashed #252838;padding-top:10px">No system message.</div></div></div><div class="panel"><div class="ph"><span class="h">Variables</span><span class="vs">derived from the messages</span></div><table><tr><th>Name</th><th>Kind</th><th>Used in</th></tr><tr><td>question</td><td class="sub">text</td><td class="sub">message 1 · user</td></tr></table></div><div class="panel"><div class="ph"><span class="h">Used by</span><span class="vs">Agents whose spec.prompt references this Card</span></div><table><tr><th>Agent</th><th>Route</th><th>Service</th></tr><tr><td><a href="Agent.dc.html">support-agent@1.0.0</a></td><td class="sub">wyrd_gateway · openai</td><td><a href="Service.dc.html">support-desk</a></td></tr></table></div><div class="panel"><div class="ph"><span class="h">Changes from the previous version</span><span class="vs">Versions tab compares any two</span></div><div class="empty"><b>Only version 1.0.0 is registered.</b>Registering a new version shows its message, variable and response-format diff here.</div></div></div>
+    <aside style="display:flex;flex-direction:column;gap:16px"><div class="panel"><div class="ph"><span class="h">Relationships</span><span class="vs">server-derived</span></div><a href="Agent.dc.html" style="display:flex;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid #1c1f2c;font:12px 'Fragment Mono',monospace"><span class="edge" style="width:96px">used by</span><span class="kind" style="font-size:10px;padding:1px 6px">Agent</span><span style="color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">support-agent@1.0.0</span></a><a href="Service.dc.html" style="display:flex;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid #1c1f2c;font:12px 'Fragment Mono',monospace"><span class="edge" style="width:96px">component of</span><span class="kind" style="font-size:10px;padding:1px 6px">Service</span><span style="color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">support-desk@1.0.0</span></a></div><div class="panel"><div class="ph"><span class="h">Metadata</span><span class="vs">server-managed</span></div><div class="pb"><dl class="kv" style="margin:0"><dt>space</dt><dd>default</dd><dt>labels</dt><dd><span style="color:#8f92a5">none</span></dd><dt>spec hash</dt><dd>7c02e9aa…31d0 ⧉</dd><dt>updated</dt><dd>today 19:41 UTC</dd></dl></div></div></aside>
+  </div>
+</div>
+</div></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

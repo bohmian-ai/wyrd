@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spans</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;min-width:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#1f2230}
+.seg{height:30px;padding:0 14px;background:#12141c;border:1px solid #252838;color:#8f92a5;font:13px "Familjen Grotesk",sans-serif;cursor:pointer}
+.seg[aria-pressed="true"]{background:#1a2040;border-color:#3a4170;color:#e6e4da}
+.pill{display:inline-block;padding:1px 8px;border:1px solid #2c3a5c;background:#141b2e;color:#9fb0ff;border-radius:2px;font:11px "Fragment Mono",monospace;white-space:nowrap}
+.tab{padding:8px 14px;color:#8f92a5;font:12px "Fragment Mono",monospace}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.facet{display:flex;justify-content:space-between;padding:4px 0;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.facet span:last-child{color:#8f92a5}
+.sub{color:#8f92a5;font-size:11px}
+.ok{color:#3dbe5a}.err{color:#e2484d}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:0 6px;border:1px solid currentColor;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.tr{display:grid;grid-template-columns:84px minmax(0,1.6fr) 132px minmax(140px,1fr) 56px 56px 72px;align-items:center;gap:12px;padding:0 14px;min-height:40px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.tr:hover{background:#1a1d28}
+.sr{display:grid;grid-template-columns:84px minmax(0,1.3fr) 120px 92px minmax(0,1fr) 110px 70px 64px;align-items:center;gap:12px;padding:0 14px;height:34px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.wf{display:grid;grid-template-columns:minmax(0,300px) 110px minmax(0,1fr) 64px;align-items:center;gap:10px;padding:0 16px;height:28px;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.wf:hover{background:#1a1d28}
+.bar{position:relative;height:6px;background:#1a1d28;display:block}
+.bar span{position:absolute;top:0;bottom:0}
+.kv{display:grid;grid-template-columns:180px minmax(0,1fr);gap:6px 14px;font:12px "Fragment Mono",monospace;margin:0}
+.kv dt{color:#8f92a5}.kv dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg{border:1px solid #252838;background:#0e1017;padding:10px 12px;font:13px/1.5 "Familjen Grotesk",sans-serif;color:#c9c7be}
+</style>
+</helmet>
+<div style="display:flex;flex-wrap:wrap;background:#0b0c12"><aside aria-label="Primary" style="flex:0 0 212px;box-sizing:border-box;background:#0e1017;border-right:1px solid #252838;display:flex;flex-direction:column;gap:2px;padding:14px 10px"><div style="display:flex;align-items:center;justify-content:space-between;padding:0 6px 12px"><span style="font:600 11px 'Fragment Mono',monospace;padding:3px 8px;background:#7a8cff;color:#0b0c12">WYRD</span><button aria-label="Collapse navigation" style="background:transparent;border:0;color:#8f92a5;cursor:pointer;width:28px;height:28px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path></svg></button></div><button style="display:flex;align-items:center;gap:8px;height:32px;margin-bottom:10px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#8f92a5;font:12px 'Fragment Mono',monospace;cursor:pointer">⌕ Find or ask… <kbd style="margin-left:auto;color:#8f92a5">⌘K</kbd></button><a href="Home.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 11l9-7 9 7v9h-6v-6H9v6H3z"></path></svg>Home</a><a href="Service.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16"></rect><path d="M4 9h16"></path></svg>Cards</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Main.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#e6e4da;background:#1a2040;box-shadow:inset 2px 0 0 #7a8cff"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"></path></svg>Observe</a><a href="Verify.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12l5 5L20 7"></path></svg>Verify</a><a href="Query.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"></ellipse><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"></path></svg>Query</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Changes.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="6" r="2"></circle><circle cx="6" cy="18" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 8v8M8 6h3a5 5 0 0 1 5 5"></path></svg>Changes<span style="margin-left:auto;font:11px 'Fragment Mono',monospace;padding:0 6px;border:1px solid #3a4170;color:#c7cdff">2</span></a><div style="margin-top:auto;display:flex;flex-direction:column;gap:2px"><a href="Repos.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9L7 7M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"></path></svg>Settings</a><div style="display:flex;align-items:center;gap:8px;padding:10px 10px 0;border-top:1px solid #1c1f2c;margin-top:8px;font:12px 'Fragment Mono',monospace;color:#e6e4da"><span style="width:22px;height:22px;border-radius:50%;background:#1a2040;display:inline-flex;align-items:center;justify-content:center;color:#c7cdff">a</span><span style="display:flex;flex-direction:column"><span>alice</span><span style="color:#8f92a5;font-size:11px">ui-live ▾</span></span></div></div></aside><div style="flex:999 1 560px;min-width:0">
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif; display: flex; flex-direction: column; position: relative;">
+  <header style="display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid #252838;">
+    <span class="mono" style="font-size: 12px; color: #8f92a5;">ui-live / Observe /</span>
+    <span class="mono" style="font-size: 12px;">Traces</span>
+    <nav aria-label="Observe" style="display: flex; margin-left: 24px;">
+      <a class="tab" href="#">Overview</a><a class="tab" href="Logs.dc.html">Logs</a><a class="tab" href="Metrics.dc.html">Metrics</a>
+      <a class="tab" href="#" aria-current="page" style="color: #e6e4da; box-shadow: inset 0 -2px 0 #7a8cff;">Traces</a>
+      <a class="tab" href="#">GenAI</a>
+    </nav>
+  </header>
+  <section aria-label="Query" style="padding: 16px 24px 0; display: flex; flex-direction: column; gap: 10px;">
+    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <label style="flex: 1 1 520px; min-width: 0; height: 34px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 0 10px; background: #12141c; border: 1px solid #3a4170; border-radius: 2px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8f92a5" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+        <span class="mono" style="font-size: 12px; color: #8f92a5;">WHERE</span>
+        <input class="mono" aria-label="Filter spans with SQL" value="name = 'llm.chat' AND duration > 1s" style="flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: #e6e4da; font-size: 12px;">
+        <kbd class="mono" style="font-size: 11px; color: #8f92a5; border: 1px solid #252838; padding: 0 5px;">/</kbd>
+      </label>
+      <div role="group" aria-label="Zoom" style="display: inline-flex;">
+        <button class="btn" aria-label="Zoom out" style="border-right: 0;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14"></path></svg></button>
+        <button class="btn" aria-label="Zoom in"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M12 5v14"></path></svg></button>
+      </div>
+      <button class="btn" aria-label="Reset zoom to Last 1h"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path></svg></button>
+      <a class="btn" href="TimePicker.dc.html" style="min-width: 176px; justify-content: space-between;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="16"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
+        <span>Last 1 hour</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg>
+      </a>
+      <button class="btn" aria-pressed="true" style="gap: 8px;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #3dbe5a; box-shadow: 0 0 0 3px #3dbe5a33;"></span>Live</button>
+    </div>
+
+    <div style="background: #12141c; border: 1px solid #252838; border-radius: 2px; padding: 10px 14px 6px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <span class="h">Drag across any chart to zoom all three</span>
+        <span class="mono" style="font-size: 11px; display: inline-flex; align-items: center; gap: 8px; padding: 2px 8px; background: #1a2040; border: 1px solid #3a4170; color: #c7cdff;">Zoomed 19:02:10 – 19:14:40 <a href="#" aria-label="Back to Last 1 hour" style="color: #c7cdff;">✕</a></span>
+      </div>
+      <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px;">
+        <div>
+          <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;"><span class="h">Spans / min</span><span class="mono" style="font-size: 15px;">32.4</span><span class="mono" style="font-size: 11px; color: #8f92a5;">194 traces</span></div>
+          <div style="position: relative; height: 56px; display: flex; align-items: flex-end; gap: 2px;">
+            <sc-for list="{{bars}}" as="b" hint-placeholder-count="60"><div style="flex: 1; height: {{b.ok}}px; background: #4d5ef0;"></div></sc-for>
+            <div aria-hidden="true" style="position: absolute; left: 33%; width: 21%; top: 0; bottom: 0; background: #7a8cff22; border-left: 2px solid #7a8cff; border-right: 2px solid #7a8cff;"></div>
+          </div>
+        </div>
+        <div>
+          <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;"><span class="h">Errors</span><span class="mono" style="font-size: 15px; color: #e2484d;">6</span><span class="mono" style="font-size: 11px; color: #8f92a5;">3.1% of traces</span></div>
+          <div style="position: relative; height: 56px; display: flex; align-items: flex-end; gap: 2px; border-bottom: 1px solid #252838;">
+            <sc-for list="{{bars}}" as="b" hint-placeholder-count="60"><div style="flex: 1; height: {{b.err}}px; background: #e2484d;"></div></sc-for>
+            <div aria-hidden="true" style="position: absolute; left: 33%; width: 21%; top: 0; bottom: 0; background: #7a8cff22; border-left: 2px solid #7a8cff; border-right: 2px solid #7a8cff;"></div>
+          </div>
+        </div>
+        <div>
+          <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;"><span class="h">Duration</span><span class="mono" style="font-size: 15px;">p95 1.69s</span><span class="mono" style="font-size: 11px; color: #8f92a5;"><span style="color: #c5f23b;">━</span> p95 <span style="color: #7a8cff;">━</span> p50</span></div>
+          <div style="position: relative; height: 56px;">
+            <svg width="100%" height="56" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="Duration p50 and p95">
+              <path d="M0 40 L25 38 L50 41 L75 36 L100 39 L125 37 L150 40 L175 38 L200 39 L225 37 L250 40 L275 38 L300 39" fill="none" stroke="#7a8cff" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <path d="M0 22 L25 18 L50 24 L75 10 L100 8 L125 14 L150 20 L175 12 L200 18 L225 9 L250 16 L275 20 L300 14" fill="none" stroke="#c5f23b" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+            </svg>
+            <div aria-hidden="true" style="position: absolute; left: 33%; width: 21%; top: 0; bottom: 0; background: #7a8cff22; border-left: 2px solid #7a8cff; border-right: 2px solid #7a8cff;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: #8f92a5; padding-top: 4px;"><span>18:27</span><span>18:42</span><span>18:57</span><span>19:12</span><span>Now</span></div>
+    </div>
+  </section>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 24px 10px">
+    <div role="group" aria-label="View" style="display:inline-flex"><button class="seg" aria-pressed="false">Traces</button><button class="seg" aria-pressed="true" style="border-left:0">Spans</button></div>
+    <button class="btn" aria-expanded="true" style="background:#1a2040;border-color:#3a4170"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4 2v-8z"></path></svg>Filters · 2</button>
+    <span class="mono" style="font-size:12px;color:#8f92a5">38 spans match · p95 1.21s</span>
+    <span style="margin-left:auto;display:flex;gap:6px"><button class="btn">Columns</button><button class="btn">↧ CSV</button></span>
+  </div>  <div style="display:flex;flex-wrap:wrap;gap:16px;padding:0 24px 24px;flex:1">
+    <aside aria-label="Filters" style="flex:0 0 220px;display:flex;flex-direction:column;gap:14px">
+      <span class="sub">Click a value to add it to WHERE</span>
+      <div><div class="h" style="margin-bottom:6px">Span name</div><div class="facet"><span style="color:#a9b4ff">✓ llm.chat</span><span>212</span></div><div class="facet"><span>tool.call</span><span>148</span></div><div class="facet"><span>agent.invoke</span><span>96</span></div><div class="facet"><span>prompt.render</span><span>96</span></div></div>
+      <div><div class="h" style="margin-bottom:6px">gen_ai.request.model</div><div class="facet"><span>claude-sonnet-5</span><span>164</span></div><div class="facet"><span>gpt-4o</span><span>48</span></div></div>
+      <div><div class="h" style="margin-bottom:6px" title="service_card_uid · the deployed Service Card">Service</div><div class="facet"><span>support-desk</span><span>214</span></div><div class="facet"><span>checkout-api</span><span>63</span></div><div class="facet"><span style="color:#8f92a5">not set</span><span>48</span></div></div>
+      <div><div class="h" style="margin-bottom:6px" title="card_uid · the producing Card">Card</div><div class="facet"><span>support-agent</span><span>162</span></div><div class="facet"><span>support-answer</span><span>52</span></div><div class="facet"><span style="color:#8f92a5">not set</span><span>111</span></div></div>
+      <div><div class="h" style="margin-bottom:6px">service.name</div><div class="facet"><span>gateway</span><span>212</span></div><div class="facet"><span>support-desk</span><span>301</span></div></div>
+      <div><div class="h" style="margin-bottom:6px">Status</div><div class="facet"><span>ok</span><span>205</span></div><div class="facet"><span style="color:#e2484d">error</span><span>7</span></div></div>
+      <div><div class="h" style="margin-bottom:6px">Duration</div><div class="facet"><span>&lt; 100ms</span><span>301</span></div><div class="facet"><span>100–500ms</span><span>164</span></div><div class="facet"><span>500ms–1s</span><span>53</span></div><div class="facet"><span style="color:#a9b4ff">✓ &gt; 1s</span><span>38</span></div></div>
+      <div><div class="h" style="margin-bottom:6px">http.route</div><div class="facet"><span>/answer</span><span>212</span></div><div class="facet"><span>/search</span><span>88</span></div><div class="facet"><span>/summarize</span><span>71</span></div></div>
+      <a class="mono" href="#" style="font-size:11px">+ Add a field</a>
+    </aside>
+    <section aria-label="Spans" style="flex:999 1 560px;min-width:0;background:#12141c;border:1px solid #252838;border-radius:2px;overflow-x:auto">
+      <div class="sr h" style="height:30px;color:#8f92a5"><span>Start</span><span>Span</span><span>Service</span><span>Trace</span><span>Parent</span><span>Duration ↓</span><span style="text-align:right">Tokens</span><span style="text-align:right">Status</span></div><div class="sr"><span class="sub" style="font-size:12px">19:13:21</span><span style="color:#f3b3b5">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">9c41…e07a</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:100%;background:#e2484d"></span></span>1.40s</span><span style="text-align:right">1,912</span><span style="text-align:right"><span class="badge err">error</span></span></div><div class="sr"><span class="sub" style="font-size:12px">19:12:02</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">51ab…07d2</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:88%;background:#c5f23b"></span></span>1.24s</span><span style="text-align:right">2,206</span><span style="text-align:right"><span class="badge ok">ok</span></span></div><div class="sr"><span class="sub" style="font-size:12px">19:09:44</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">0e7f…c311</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:81%;background:#c5f23b"></span></span>1.13s</span><span style="text-align:right">1,540</span><span style="text-align:right"><span class="badge ok">ok</span></span></div><div class="sr"><span class="sub" style="font-size:12px">19:07:30</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">b2d0…9a4e</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:79%;background:#c5f23b"></span></span>1.11s</span><span style="text-align:right">1,688</span><span style="text-align:right"><span class="badge ok">ok</span></span></div><div class="sr"><span class="sub" style="font-size:12px">19:05:11</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">7a13…e2c0</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:77%;background:#c5f23b"></span></span>1.08s</span><span style="text-align:right">2,950</span><span style="text-align:right"><span class="badge ok">ok</span></span></div><div class="sr"><span class="sub" style="font-size:12px">19:02:47</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">c9e4…1b75</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:74%;background:#c5f23b"></span></span>1.04s</span><span style="text-align:right">1,212</span><span style="text-align:right"><span class="badge ok">ok</span></span></div><div class="sr"><span class="sub" style="font-size:12px">18:58:03</span><span style="color:#e6e4da">llm.chat · claude-sonnet-5</span><span><span class="pill">gateway</span></span><a href="TraceDrawer.dc.html">44f1…a0d9</a><span class="sub" style="font-size:12px">agent.invoke</span><span style="display:flex;align-items:center;gap:8px"><span class="bar" style="flex:1"><span style="left:0;width:72%;background:#c5f23b"></span></span>1.01s</span><span style="text-align:right">1,877</span><span style="text-align:right"><span class="badge ok">ok</span></span></div>
+      <div class="mono" style="padding:10px 14px;font-size:12px;color:#8f92a5;border-top:1px solid #252838">Showing 7 of 38 · a trace id opens that trace</div>
+    </section>
+  </div>
+</div>
+</div></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const bars = [];
+    for (let i = 0; i < 60; i++) {
+      const ok = 12 + Math.round(16 * Math.abs(Math.sin(i * 0.7)) + (i % 7) * 2);
+      bars.push({ ok: ok, err: [9, 22, 31, 40, 47, 53].indexOf(i) >= 0 ? 18 : 0 });
+    }
+    return { bars: bars };
+  }
+}
+</script>
+</body>
+</html>

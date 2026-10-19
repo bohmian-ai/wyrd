@@ -1,0 +1,263 @@
+{
+  "source_commit": "8651b96fd0c049ab5e63b0606c98326af1fc8848",
+  "approved_spec_revision": 9,
+  "gate": "Plan",
+  "files": [
+    {
+      "path": "spec.md",
+      "sha256": "fda2fc3a441be45c85f02d32ce8873dcccfd1734ce43deb040d3eeca135c10d1"
+    },
+    {
+      "path": "plan.md",
+      "sha256": "0a0c30d4d76c6d89f5aec12c69c5343bdf021242b48b03ba9c49f3d7429a1849"
+    },
+    {
+      "path": "references/verification.md",
+      "sha256": "9f651ac00e086ea0f8c97205889e6a61478e5ae75df5e0eb709754bd165a4c30"
+    },
+    {
+      "path": "tasks/TASK-001-production-ui-distribution.md",
+      "sha256": "923ba34fbf96952d0200fa144aa0cba8cb3d2eb355472a0a47e0685058c006ea"
+    },
+    {
+      "path": "tasks/TASK-002-delete-stale-ui.md",
+      "sha256": "026e5c63782d8cdbf3835619a8a8525b2b6c936919f9e66860dcfbbe24406b1d"
+    },
+    {
+      "path": "tasks/TASK-003-renderable-ui-foundation.md",
+      "sha256": "2370e5529f7aefb323fd26e924d7abbb8931d24c39c24ec89f61ec1aa8fb760b"
+    },
+    {
+      "path": "tasks/TASK-004-four-host-data-foundation.md",
+      "sha256": "e6a300cc68ae210fb5e903d24bd9ff31dcd343562af2d1292884bdea01d99f76"
+    },
+    {
+      "path": "tasks/TASK-005-presentation-primitives.md",
+      "sha256": "f40400734c5f04799c4e404600a81c06209dab94b48c89322c9cc5b01ce52805"
+    },
+    {
+      "path": "tasks/TASK-006-stat-strip.md",
+      "sha256": "7b0bdec28fdbd3ce9d244b2765ef6f124f0dd2bdb4fb52883635b2927f19f7ce"
+    },
+    {
+      "path": "tasks/TASK-007-facet-rail.md",
+      "sha256": "796a43ea74d707043090e29c94488b38df69563e79efe87a89f851aa7921be1f"
+    },
+    {
+      "path": "tasks/TASK-008-record-table.md",
+      "sha256": "7e4d89609675e2bba939a1b82a5f3338b9d144a17ac40b42b4157896db24c212"
+    },
+    {
+      "path": "tasks/TASK-009-trace-waterfall.md",
+      "sha256": "4a66c214698201f70485bdde3d31e78c7bc7649ca855043303d715feac0ca26e"
+    },
+    {
+      "path": "tasks/TASK-010-record-detail.md",
+      "sha256": "1c5020701bafd81f59a3d8402c370c0923a8dfe32fb5fad80dcb37ab87d6e2e7"
+    },
+    {
+      "path": "tasks/TASK-011-card-context.md",
+      "sha256": "fa99abfa018a324fc21dd1bff637459201581fb3ba65eebfb4625486808ec9e8"
+    },
+    {
+      "path": "tasks/TASK-012-composition-graph.md",
+      "sha256": "b21596fbf5cf52a4e537805976add1d2bcdec0e2a82cfc502f2b9fba567207df"
+    },
+    {
+      "path": "tasks/TASK-013-prompt-content.md",
+      "sha256": "898c104c8a0a0351c14a16317194b15a1483bb0c3cfa1cea18320b339f4acb54"
+    },
+    {
+      "path": "tasks/TASK-014-used-by.md",
+      "sha256": "268b45bc8bb059c8d0673aa94565ef3c348dd411e0bfc0f4050846a5866cf8ab"
+    },
+    {
+      "path": "tasks/TASK-015-version-diff.md",
+      "sha256": "d9ae845309cef01a71e298a51e1aebdb4558f223a66969ab541e3327befedcf3"
+    },
+    {
+      "path": "tasks/TASK-016-model-interface.md",
+      "sha256": "b2f940289e0c52c8556cfc0326a609205e94c88a160b74a63b5332ca6d207a0c"
+    },
+    {
+      "path": "tasks/TASK-017-artifact-table.md",
+      "sha256": "876c0de71c8ad133e814ff4bad3c2f3a28ce6c2a48b3c9993ef042e825d36b3b"
+    },
+    {
+      "path": "tasks/TASK-018-verification-bindings.md",
+      "sha256": "eb57d0d4b13727dbf25a1951ad7647ac57b321491ea528cd984f071c75d47edc"
+    },
+    {
+      "path": "tasks/TASK-019-attention-list.md",
+      "sha256": "b4aa7ad050e605ae1b90c46ab230300d06cce45d93b9974f2342702c6d4b6c28"
+    },
+    {
+      "path": "tasks/TASK-020-signal-breakdown.md",
+      "sha256": "83fdf384b3ca8ae310ebefe8da6df5318c9a6d8e6c41a215bfdb38446a293519"
+    },
+    {
+      "path": "tasks/TASK-021-card-inventory.md",
+      "sha256": "eb67710488d5e44fbfb979e8a020efbcb28e740d72a9f64bd67cef1547c6de05"
+    },
+    {
+      "path": "tasks/TASK-022-verifier-graph.md",
+      "sha256": "0e867186fb6176a0d51c959596c2f63e59cb7a6d0de70e4a6e1000b6eb64c2a6"
+    },
+    {
+      "path": "tasks/TASK-023-requirement-detail.md",
+      "sha256": "752b819940a405a24384d4d5717f93e9f14de91bd70d156a9062dbe6f9c2277e"
+    },
+    {
+      "path": "tasks/TASK-024-verification-result.md",
+      "sha256": "65f7550f2483327249c971b2e6d0d7c6473cb3bdde1fc0c71599e22179943036"
+    },
+    {
+      "path": "tasks/TASK-025-drift-feature-table.md",
+      "sha256": "b1f9fd7acc5d63a6641333073cd7151cf8020e74d8caa5a801c163837bd3a59a"
+    },
+    {
+      "path": "tasks/TASK-026-query-editor.md",
+      "sha256": "e256582c97a68171427fe76ab55dd3e91ece1ffe9e9219792af558e54460668c"
+    },
+    {
+      "path": "tasks/TASK-027-table-catalog.md",
+      "sha256": "13a9f09fbee118c767b803d8f005be6bbd1d40e14eb0f1ffa2ced269adb93036"
+    },
+    {
+      "path": "tasks/TASK-028-query-details.md",
+      "sha256": "94d4317f8b2c00912ba2dc93faf2e842576c4f97342b2908dead61586c31c165"
+    },
+    {
+      "path": "tasks/TASK-029-chart-editor.md",
+      "sha256": "ed4e833ace7c61ca945d43fad9bf643de21dfbb404996bed6b0ce449e59e4443"
+    },
+    {
+      "path": "tasks/TASK-030-change-request-list.md",
+      "sha256": "059df13e01abfcf9453eb64dc0e18ad918820a719454fbbc41c6ee659a4e0030"
+    },
+    {
+      "path": "tasks/TASK-031-change-context.md",
+      "sha256": "009a8794b2bfd4452f0d74c8ef9427fb4886772b06889643acc7e9efc69b82e4"
+    },
+    {
+      "path": "tasks/TASK-032-change-history.md",
+      "sha256": "4a7f32e09471bd2bbb6bdd177044526838d5aa20641925784c3885c96e573a1f"
+    },
+    {
+      "path": "tasks/TASK-033-change-verification.md",
+      "sha256": "7be96100cdfbc0a5f9093a4bd40b7746c895696c0a1a96d6a83ded3640107c8e"
+    },
+    {
+      "path": "tasks/TASK-034-change-review.md",
+      "sha256": "82697268c57fffb7b303bfc82ffa4e524f420d8708abac30d2281748f0938101"
+    },
+    {
+      "path": "tasks/TASK-035-repository-list.md",
+      "sha256": "d14f0cd7f5128e08b69e860d8f8229381f78ef5b0ba9f71d97263969bf14d54c"
+    },
+    {
+      "path": "tasks/TASK-036-repository-configuration.md",
+      "sha256": "c88b6e901a6ce5d6cb431d463854603084904960348a0ad57033f56efa012f6d"
+    },
+    {
+      "path": "tasks/TASK-037-ask-panel.md",
+      "sha256": "e7d13e51a39726026abb1ce960d29a9176d321c6641990efd4756c5c94a1f680"
+    },
+    {
+      "path": "tasks/TASK-038-mcp-app.md",
+      "sha256": "a3dfc72e4b5ab3345be9f3678d1fcbea58de8f83ae1957998b946bdba506af2b"
+    },
+    {
+      "path": "tasks/TASK-039-canvas-shell.md",
+      "sha256": "01f4106a21d211d0dea36fd0b2f1177f62fe8dfbef741a03c90c7a48fb043cb8"
+    },
+    {
+      "path": "tasks/TASK-040-query-page.md",
+      "sha256": "212e60226a521853f5e72ec4a52f0255775e8befff37db05f4f4a98ab7bff97e"
+    },
+    {
+      "path": "tasks/TASK-041-cards-page.md",
+      "sha256": "9be43fa09d3a6e2a6a58ebb437d0f39ae7e0b3a31623fbe8fb5691230ad6f76f"
+    },
+    {
+      "path": "tasks/TASK-042-exact-card-page.md",
+      "sha256": "fd30e50d84c043509ab40c40e2b36304a1b9c93a824c2548881c181a4355b955"
+    },
+    {
+      "path": "tasks/TASK-043-agent-page.md",
+      "sha256": "b4a5c2455f13723fc91864013dc6868c95fc203439d8f575b2b338f9058e678d"
+    },
+    {
+      "path": "tasks/TASK-044-prompt-page.md",
+      "sha256": "154a06a9c40e208acada646b0386d35ba548c05d2547bc3ac7fd71ab51311da5"
+    },
+    {
+      "path": "tasks/TASK-045-model-page.md",
+      "sha256": "cdabe7b4711690176dc922d42f9ecd3d479502748586e3c94639846bd00bbda6"
+    },
+    {
+      "path": "tasks/TASK-046-data-page.md",
+      "sha256": "afb34c24ced03f31be9cd0c0d6e25191cff44ec8f8072657de0862d25bbd7b3f"
+    },
+    {
+      "path": "tasks/TASK-047-service-page.md",
+      "sha256": "f10714570543a0a261cda237c210281e37684b98d9b550146cf3ae3143b9176b"
+    },
+    {
+      "path": "tasks/TASK-048-service-charts-page.md",
+      "sha256": "02d4c1303fe9809d31a27232159e7ec27788b3703b5b326315c2dedcc9e1dadc"
+    },
+    {
+      "path": "tasks/TASK-049-verifier-card-page.md",
+      "sha256": "10760062ae6c53059989777e6b8dde3b700425acd7deaf7abea82b3d3d356501"
+    },
+    {
+      "path": "tasks/TASK-050-traces-page.md",
+      "sha256": "62d817da0700ea5025c57aed611acd509ab47db55b6cdd5558209f0b9d8e47b8"
+    },
+    {
+      "path": "tasks/TASK-051-logs-page.md",
+      "sha256": "5e592fa6615b140106876b049fae879e1986cb70d62512d50645c8a4bd364454"
+    },
+    {
+      "path": "tasks/TASK-052-metrics-page.md",
+      "sha256": "b2bbefd6133ae03855d528d8c80e7811af05350650cfac18312f061a92e1d0bb"
+    },
+    {
+      "path": "tasks/TASK-053-verify-page.md",
+      "sha256": "4be9fac260dedf3b3e0ca7c51309fd59ebdf04b9267c6c0018c48b3402fcf5f0"
+    },
+    {
+      "path": "tasks/TASK-054-verify-drift-page.md",
+      "sha256": "96c0eb47d99456da062cee7a65147a493c8624148f1e8ae418d772cf2daf4ea0"
+    },
+    {
+      "path": "tasks/TASK-055-verify-group-page.md",
+      "sha256": "f5652101178538e85283fd1c02048f32fe9bb0429b9e76f6c83f6a98153bb5a9"
+    },
+    {
+      "path": "tasks/TASK-056-home-page.md",
+      "sha256": "27129755f5cea4726cd3728c8b7983bbf959d21d676b1326fe50e98192ac2216"
+    },
+    {
+      "path": "tasks/TASK-057-changes-list-page.md",
+      "sha256": "a24becce9122c165d40f3aa2b1cf6518a069c2eacaab9d83519d999feeb1ba0e"
+    },
+    {
+      "path": "tasks/TASK-058-change-detail-page.md",
+      "sha256": "5539bde62bc5b55de39fdcbc94e932e6422e259d9ddbe5b36c0079337e3b9d6e"
+    },
+    {
+      "path": "tasks/TASK-059-change-verification-page.md",
+      "sha256": "03003ff02c7a07d13e271ab3dfaa60d69b18901be24a2ef7ae8678440bb82afb"
+    },
+    {
+      "path": "tasks/TASK-060-repos-page.md",
+      "sha256": "51ca3d6c555114634655b25e0760553d6d40a4ba80028001c22c00d1b18df7eb"
+    },
+    {
+      "path": "tasks/TASK-061-ask-and-saved-views.md",
+      "sha256": "e1384bd806761929fc60e40e3f745c56d80a593c0c26a386a24d70497c39d32e"
+    }
+  ]
+}

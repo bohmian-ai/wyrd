@@ -1,0 +1,102 @@
+[
+  {
+    "path": "archive/invalid-draft/spec.md",
+    "sha256": "3905473c89be095aecc413187ddfd933ac8076226079d2f3f1d55b1f87b80443"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-001-production-ui-host.md",
+    "sha256": "9e28f8108fb12121a921aaacebaac889db5dbd17d9cca3f5c84e2c7ef252d48f"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-002-compact-shell.md",
+    "sha256": "fbd453859fb592ca1c707fc64ddaea9f06f00edfe35d82dba7815313c1e1a5d6"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-003-live-card-inventory.md",
+    "sha256": "de3f7e7e9a0ac5c99587e0a30e167b29818731acb3871e389539ed820b5438f9"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-004-exact-card-detail.md",
+    "sha256": "c68493b0b8ef52d0e0392d706f45f1433ec7244c65a828a010b2e43dcce4dd2e"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-005-earned-card-workspaces.md",
+    "sha256": "da2094f7c9b7ba735e6db34b78036053f3c54f9a9a2fd918dfc9607bd3ab0a8c"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-006-query-workbench.md",
+    "sha256": "ff27c84d58fa54240c8e7bdbe587404d1cee07faa2ac07f6fbfa09341fa87539"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-007-observe-signals.md",
+    "sha256": "67cd0355c776996768b890cf2119b452ce96b7bef9754f8265828711ff859bd5"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-008-generic-verify.md",
+    "sha256": "b534f12cdefc83d713d2b59d4c56a6c4c57269a1815c3d56417c51cd14e0e035"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-009-canonical-summaries.md",
+    "sha256": "d95f235c9daf120b5ade42fc72dc59e4900508c8a0c4768aeb50e8978fc08d7d"
+  },
+  {
+    "path": "archive/invalid-draft/tasks/TASK-010-integrated-review-environment.md",
+    "sha256": "299ddbd5836fd67e023c4627a8d445409d663890015bd5bf2564e3610e8c3986"
+  },
+  {
+    "path": "references/canvas/archive/Agent.dc.html",
+    "sha256": "fc149ba35b1ba88455ea9ccd1f14d38540c7254e4aa66b5bc0af9211bce3ff8f"
+  },
+  {
+    "path": "references/canvas/archive/Home.dc.html",
+    "sha256": "511d37e1ffc93f1d5e9c6bc376ab44ffdae2b7ef89292ff024d6e37631176239"
+  },
+  {
+    "path": "references/canvas/archive/Logs.dc.html",
+    "sha256": "4f06dda2cf9b2b3bdd9b59d3004e846f2e182e1adcabe983b8f1ea5a446fbb21"
+  },
+  {
+    "path": "references/canvas/archive/Main.dc.html",
+    "sha256": "955c4deae01cade4e598b41c6592ef7008547bef697cd7884968905d822b0dcc"
+  },
+  {
+    "path": "references/canvas/archive/Metrics.dc.html",
+    "sha256": "9a562f90c0e39b868d34032455d923f89d525ba412eec1378199b491224aaa68"
+  },
+  {
+    "path": "references/canvas/archive/Model.dc.html",
+    "sha256": "15ce0b8461ee2f9b2af79c620380860f685889fe96f8005aaeecf60b08613173"
+  },
+  {
+    "path": "references/canvas/archive/Prompt.dc.html",
+    "sha256": "320639bfb507d89faf9a7f94fa7fa20d72f481d46c208189f9c374003bfc4ec6"
+  },
+  {
+    "path": "references/canvas/archive/Query.dc.html",
+    "sha256": "92d89b05fe1e145f6df2b2cb0c6cc07530d3ba757208c2fa50c196c140ae75a4"
+  },
+  {
+    "path": "references/canvas/archive/QueryChart.dc.html",
+    "sha256": "e96c9db8b1afe0c2a28587de63e5d394b3f4a8f10b63fc8ff8ce2f6c97336d64"
+  },
+  {
+    "path": "references/canvas/archive/TimePicker.dc.html",
+    "sha256": "5b49b766859618943aba9aeca50c3393d7dd1c1e4b9c0a155625e0d9089f1648"
+  },
+  {
+    "path": "references/canvas/archive/Verify.dc.html",
+    "sha256": "6ade3bda9d1f61c1578f9d71735b1fdd0693561c7369e2e95cdde9c1d2e29df1"
+  },
+  {
+    "path": "references/canvas/archive/VerifyDrift.dc.html",
+    "sha256": "a6fbd4152f50d55c5229b09fa48e54afda35cb3d7927de9235a4898260636494"
+  },
+  {
+    "path": "references/canvas/archive/VerifyResult.dc.html",
+    "sha256": "c190ce889fbe000436c0e2a34c6b180bbb65c5cd55708ab8339c51bf05a473b6"
+  },
+  {
+    "path": "references/canvas/archive/canvas.json",
+    "sha256": "b5097f71e6408b0b80834bfc0c671152db0a5b93e6de051580f351ada7f94c97"
+  }
+]

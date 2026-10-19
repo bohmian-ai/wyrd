@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Logs</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;min-width:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer}
+.btn:hover{background:#1f2230}
+.pill{display:inline-block;padding:1px 8px;border:1px solid #2c3a5c;background:#141b2e;color:#9fb0ff;border-radius:2px;font:11px "Fragment Mono",monospace;white-space:nowrap}
+.tab{padding:8px 14px;color:#8f92a5;font:12px "Fragment Mono",monospace}
+.facet{display:flex;justify-content:space-between;padding:4px 0;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.facet span:last-child{color:#8f92a5}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.row{display:grid;grid-template-columns:96px 58px 132px minmax(0,1fr) 72px;align-items:center;gap:10px;padding:0 14px;height:30px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.row:hover{background:#1a1d28}
+</style>
+</helmet>
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif; display: flex; flex-direction: column;">
+  <header style="display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid #252838;">
+    <span class="mono" style="font-size: 12px; color: #8f92a5;">ui-live / Observe /</span>
+    <span class="mono" style="font-size: 12px;">Logs</span>
+    <nav aria-label="Observe" style="display: flex; margin-left: 24px;">
+      <a class="tab" href="#">Overview</a>
+      <a class="tab" href="#" aria-current="page" style="color: #e6e4da; box-shadow: inset 0 -2px 0 #7a8cff;">Logs</a>
+      <a class="tab" href="Metrics.dc.html">Metrics</a><a class="tab" href="Main.dc.html">Traces</a>
+      <a class="tab" href="#">GenAI</a>
+    </nav>
+  </header>
+
+  <section aria-label="Query" style="padding: 16px 24px 0; display: flex; flex-direction: column; gap: 10px;">
+    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <label style="flex: 1 1 520px; min-width: 0; height: 34px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 0 10px; background: #12141c; border: 1px solid #3a4170; border-radius: 2px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8f92a5" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+        <span class="mono" style="font-size: 12px; color: #8f92a5;">WHERE</span>
+        <input class="mono" aria-label="Filter log records with SQL" value="level &gt;= 'warn' AND body LIKE '%slow%'" style="flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: #e6e4da; font-size: 12px;">
+        <kbd class="mono" style="font-size: 11px; color: #8f92a5; border: 1px solid #252838; padding: 0 5px;">/</kbd>
+      </label>
+      <div role="group" aria-label="Zoom" style="display: inline-flex;">
+        <button class="btn" aria-label="Zoom out" style="border-right: 0;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14"></path></svg></button>
+        <button class="btn" aria-label="Zoom in"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M12 5v14"></path></svg></button>
+      </div>
+      <button class="btn" aria-label="Reset zoom" disabled style="opacity: .45;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path></svg></button>
+      <a class="btn" href="TimePicker.dc.html" style="min-width: 176px; justify-content: space-between;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="16"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
+        <span>Last 6 hours</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg>
+      </a>
+      <button class="btn" aria-pressed="false"><span style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid #8f92a5;"></span>Live</button>
+    </div>
+
+    <div style="background: #12141c; border: 1px solid #252838; border-radius: 2px; padding: 10px 14px 6px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <span class="h">Records per 6 minutes · drag to zoom</span>
+        <span class="mono" style="font-size: 11px; display: inline-flex; gap: 12px; color: #8f92a5;"><span><span style="display: inline-block; width: 8px; height: 8px; background: #3a4170;"></span> info</span><span><span style="display: inline-block; width: 8px; height: 8px; background: #f0a13c;"></span> warn</span><span><span style="display: inline-block; width: 8px; height: 8px; background: #e2484d;"></span> error</span></span>
+      </div>
+      <div style="height: 64px; display: flex; align-items: flex-end; gap: 3px;">
+        <sc-for list="{{bars}}" as="b" hint-placeholder-count="60">
+          <div style="flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 64px;">
+            <div style="height: {{b.err}}px; background: #e2484d;"></div>
+            <div style="height: {{b.warn}}px; background: #f0a13c;"></div>
+            <div style="height: {{b.info}}px; background: #3a4170;"></div>
+          </div>
+        </sc-for>
+      </div>
+      <div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: #8f92a5; padding-top: 4px;"><span>13:27</span><span>14:57</span><span>16:27</span><span>17:57</span><span>Now</span></div>
+    </div>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 16px; padding: 16px 24px 24px; flex: 1;">
+    <aside aria-label="Fields" style="flex: 0 0 220px; display: flex; flex-direction: column; gap: 14px;">
+      <div><div class="h" style="margin-bottom: 6px;">Level</div>
+        <div class="facet"><span>info</span><span>810</span></div><div class="facet"><span style="color: #f0a13c;">warn</span><span>352</span></div><div class="facet"><span style="color: #e2484d;">error</span><span>38</span></div></div>
+      <div><div class="h" style="margin-bottom: 6px;">Service</div>
+        <div class="facet"><span>sim-slow-1</span><span>100</span></div><div class="facet"><span>sim-slow-6</span><span>100</span></div><div class="facet"><span>sim-flaky-2</span><span>100</span></div><a class="mono" href="#" style="font-size: 11px;">+ 9 more</a></div>
+      <div><div class="h" style="margin-bottom: 6px;">http.route</div>
+        <div class="facet"><span>/answer</span><span>412</span></div><div class="facet"><span>/search</span><span>395</span></div><div class="facet"><span>/summarize</span><span>393</span></div></div>
+    </aside>
+
+    <section aria-label="Records" style="flex: 999 1 560px; min-width: 0; background: #12141c; border: 1px solid #252838; border-radius: 2px; display: flex; flex-direction: column;">
+      <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #252838;">
+        <span class="mono" style="font-size: 12px;">352 records · newest first</span>
+        <div style="display: flex; gap: 6px;"><button class="btn" style="height: 28px; font-size: 12px;">Wrap lines</button><button class="btn" style="height: 28px; font-size: 12px;">Columns</button></div>
+      </div>
+      <div class="row h" style="height: 28px; color: #8f92a5;"><span>Time ↓</span><span>Level</span><span>Service</span><span>Message</span><span style="text-align: right;">Trace</span></div>
+      <sc-for list="{{rows}}" as="r" hint-placeholder-count="14">
+        <div class="row" style="background: {{r.bg}};">
+          <span style="color: #8f92a5;">{{r.t}}</span>
+          <span style="color: {{r.lc}};">{{r.lv}}</span>
+          <span><span class="pill">{{r.svc}}</span></span>
+          <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{r.msg}}</span>
+          <a href="Main.dc.html" style="text-align: right;">{{r.tr}}</a>
+        </div>
+      </sc-for>
+      <nav aria-label="Pages" class="mono" style="margin-top: auto; display: flex; align-items: center; gap: 12px; padding: 10px 14px; font-size: 12px; color: #8f92a5; border-top: 1px solid #252838;">
+        <a href="#">‹</a><span style="color: #e6e4da; text-decoration: underline;">1</span><a href="#">2</a><span>…</span><a href="#">8</a><a href="#">›</a>
+        <span style="margin-left: auto;">50 per page ▾</span>
+      </nav>
+    </section>
+
+    <aside aria-label="Selected record" style="flex: 1 1 360px; max-width: 400px; background: #12141c; border: 1px solid #252838; border-radius: 2px; padding: 14px; display: flex; flex-direction: column; gap: 6px;">
+      <div style="display: flex; justify-content: space-between; align-items: center;"><span class="mono" style="font-size: 12px; color: #f0a13c;">WARN</span><span class="mono" style="font-size: 11px; color: #8f92a5;">19:12:40.518 UTC</span></div>
+      <div class="mono" style="font-size: 13px; background: #0f1118; border: 1px solid #252838; padding: 10px; line-height: 1.5;">sim-slow-6 /search slow in 1412ms</div>
+      <div class="h" style="margin: 10px 0 4px;">Attributes</div>
+      <div class="facet"><span style="color: #8f92a5;">service.name</span><span style="color: #e6e4da;">sim-slow-6</span></div>
+      <div class="facet"><span style="color: #8f92a5;">http.route</span><span style="color: #e6e4da;">/search</span></div>
+      <div class="facet"><span style="color: #8f92a5;">latency_ms</span><span style="color: #e6e4da;">1412</span></div>
+      <div class="facet"><span style="color: #8f92a5;">user.tier</span><span style="color: #e6e4da;">enterprise</span></div>
+      <div style="display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap;"><button class="btn" style="height: 28px; font-size: 12px;">Filter = sim-slow-6</button><button class="btn" style="height: 28px; font-size: 12px;">Exclude</button><a class="btn" href="Main.dc.html" style="height: 28px; font-size: 12px;">Open trace ↗</a></div>
+    </aside>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const bars = [];
+    for (let i = 0; i < 60; i++) {
+      bars.push({ info: 18 + (i * 7) % 13, warn: 6 + (i * 5) % 9, err: i % 11 === 3 ? 6 : 0 });
+    }
+    const W = { lv: 'WARN', lc: '#f0a13c', bg: 'transparent' };
+    const E = { lv: 'ERROR', lc: '#e2484d', bg: '#1a1012' };
+    const row = (lvl, t, svc, msg, tr) => Object.assign({}, lvl, { t: t, svc: svc, msg: msg, tr: tr });
+    const rows = [
+      row(W, '19:14:31.022', 'sim-slow-6', 'sim-slow-6 /answer slow in 1930ms', '7f2a…'),
+      row(W, '19:12:40.518', 'sim-slow-6', 'sim-slow-6 /search slow in 1412ms', '3b91…'),
+      row(E, '19:11:53.090', 'sim-flaky-2', 'sim-flaky-2 /answer failed in 880ms', '9c41…'),
+      row(W, '19:09:18.404', 'sim-slow-1', 'sim-slow-1 /summarize slow in 1188ms', 'a06e…'),
+      row(W, '19:05:31.377', 'sim-slow-11', 'sim-slow-11 /answer slow in 1180ms', '51d4…'),
+      row(W, '19:01:02.911', 'sim-slow-1', 'sim-slow-1 /search slow in 973ms', 'c2f8…'),
+      row(E, '18:58:47.630', 'sim-flaky-7', 'sim-flaky-7 /search failed in 212ms', 'e17b…'),
+      row(W, '18:55:12.115', 'sim-slow-6', 'sim-slow-6 /summarize slow in 1655ms', '0bd3…'),
+      row(W, '18:51:40.006', 'sim-drifting-9', 'sim-drifting-9 /answer slow in 512ms', '6a90…'),
+      row(W, '18:47:22.871', 'sim-slow-11', 'sim-slow-11 /search slow in 744ms', 'f4c1…'),
+      row(W, '18:44:09.300', 'sim-slow-1', 'sim-slow-1 /answer slow in 1301ms', '28e7…'),
+      row(E, '18:40:55.452', 'sim-flaky-2', 'sim-flaky-2 /summarize failed in 301ms', 'd85a…'),
+      row(W, '18:37:16.788', 'sim-slow-6', 'sim-slow-6 /answer slow in 892ms', '4e2c…'),
+      row(W, '18:33:01.240', 'sim-slow-11', 'sim-slow-11 /summarize slow in 1022ms', 'b7f0…')
+    ];
+    return { bars: bars, rows: rows };
+  }
+}
+</script>
+</body>
+</html>

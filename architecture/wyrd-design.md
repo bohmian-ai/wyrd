@@ -1321,7 +1321,16 @@ handoff. Release the transaction and preparation permit before Verifier/provider
 execution. With no new activity, there is no pending row and no further Bifrost
 read for that group. Distinct later snapshots may overlap earlier executions.
 
-Source lists share execution ordering, with null for missing inputs/outcomes.
+Source lists share execution ordering, with null for a missing outcome or an
+absent selected value. A visible result whose execution's input is not visible
+is a read caught mid-publication: the snapshot pins nothing and the pending row
+remains for retry. More than five minutes past the current due time, by
+PostgreSQL's `statement_timestamp()`, the scheduler instead records one terminal
+`WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` group execution through the refusal
+path and consumes the pending row in the same transaction: no accepted
+authority, inputs, snapshot, evaluation, verdict, result or Operator dispatch.
+The stored error message names the missing execution IDs; no persisted details
+object exists. New matching source activity schedules the group again normally.
 Physical identity duplicates count once; distinct executions remain distinct.
 When an execution has multiple visible results, select the latest by ingest time,
 then result ID. Grouping does not consult PostgreSQL submission acceptance or

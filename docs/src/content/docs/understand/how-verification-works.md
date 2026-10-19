@@ -179,6 +179,8 @@ Three limits apply. Steady activity postpones the judgment for as long as it con
 
 When a group comes due while its binding owner is inactive or retired, or the owner's authority is refused, the server records one `errored` group execution with the reason in `error` and drops the due group. Nothing is evaluated, no verdict or result is written and no Operator runs. The binding status's `last_execution_id` names that execution, but only until a later execution replaces it; there is no list of earlier failures. Reactivating the owner does not bring the dropped group back; the group's next evidence schedules it again. A transient server, database or query failure instead keeps the group due and retries it on a later pass.
 
+A source execution whose result is visible but whose input is not yet visible means the read caught evidence mid-publication. An input without a result is normal and judged with a `null` outcome, as is an absent value inside a visible input; a missing whole input is not. The group then pins nothing and stays due, retrying on later passes. If the input is still missing more than five minutes past the group's due time, by the database clock, the server records one `errored` group execution with `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` and drops the due group in the same step. The execution IDs missing their inputs are named in the error message. Nothing is evaluated, no verdict or result is written and no Operator runs. The group's next evidence schedules it again as usual.
+
 ## Run evidence and window evidence
 
 The check kinds decide how evidence arrives. Registration refuses a Verifier that mixes the two, or mixes `samples` with other slot types.

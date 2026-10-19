@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuideTopic {
+    /// Onboarding an unfamiliar coding agent to Declare, Observe, and Verify
+    /// for an application it owns, across the CLI, SDKs, docs, and MCP.
+    Start,
     /// Discovery and entry points across the shipped tool catalog.
     Overview,
     /// Card selection and exact relationship navigation.

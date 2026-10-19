@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{BUILTIN_PROVIDER_IDS, GatewayContractError, GatewayOperation};
+use super::{
+    BUILTIN_PROVIDER_IDS, GatewayContractError, GatewayOperation, ProviderCredentialView,
+    ProviderCredentialWrite,
+};
 use crate::auth::AbsoluteUrl;
 use crate::ids::{ModelId, ProviderCredentialName, ProviderDeploymentName, ProviderId};
 
@@ -380,9 +383,100 @@ impl ProviderDeployment {
     }
 }
 
+/// `POST /v1/admin/gateway/provider-deployments` body: credentials and the
+/// deployments that use them, committed together or not at all.
+///
+/// Every named resource is upserted; resources absent from the body are
+/// untouched. A deployment may reference a submitted credential or one the
+/// tenant already holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDeploymentsApply {
+    /// Credentials to create or rotate; every one must be referenced by a
+    /// submitted deployment. Omitted means none.
+    #[serde(default)]
+    pub credentials: Vec<ProviderCredentialWrite>,
+    /// Deployments to create or replace, in response order; nonempty.
+    pub deployments: Vec<ProviderDeployment>,
+}
+
+impl ProviderDeploymentsApply {
+    /// Rejects a document whose shape cannot be applied as one unit.
+    ///
+    /// `deployments` must be nonempty, credential and deployment names unique,
+    /// every deployment individually [valid](ProviderDeployment::validate), and
+    /// every submitted credential referenced by a submitted deployment.
+    /// Credential existence, sources, and provider matching are enforced by
+    /// the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayContractError`] naming the offending `deployments[i]`
+    /// or `credentials[i]` field.
+    pub fn validate(&self) -> Result<(), GatewayContractError> {
+        if self.deployments.is_empty() {
+            return Err(GatewayContractError::new(
+                "deployments",
+                "must list at least one deployment",
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for (index, deployment) in self.deployments.iter().enumerate() {
+            if !names.insert(&deployment.name) {
+                return Err(GatewayContractError::new(
+                    format!("deployments[{index}].name"),
+                    "repeats an earlier deployment name",
+                ));
+            }
+            deployment.validate().map_err(|error| {
+                GatewayContractError::new(
+                    format!("deployments[{index}].{}", error.field),
+                    error.reason,
+                )
+            })?;
+        }
+        let referenced: BTreeSet<_> = self
+            .deployments
+            .iter()
+            .filter_map(|deployment| deployment.auth.credential())
+            .collect();
+        let mut names = BTreeSet::new();
+        for (index, credential) in self.credentials.iter().enumerate() {
+            if !names.insert(&credential.name) {
+                return Err(GatewayContractError::new(
+                    format!("credentials[{index}].name"),
+                    "repeats an earlier credential name",
+                ));
+            }
+            if !referenced.contains(&credential.name) {
+                return Err(GatewayContractError::new(
+                    format!("credentials[{index}].name"),
+                    "is not referenced by a submitted deployment",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `POST /v1/admin/gateway/provider-deployments` response: the committed
+/// resources, never secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDeploymentsApplied {
+    /// Redacted views of the submitted credentials, in request order.
+    pub credentials: Vec<ProviderCredentialView>,
+    /// Submitted deployments, in request order.
+    pub deployments: Vec<ProviderDeployment>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DeploymentAccess, ProviderAuthHeader, ProviderDeployment};
+    use super::{
+        DeploymentAccess, ProviderAuthHeader, ProviderDeployment, ProviderDeploymentsApply,
+    };
     use crate::gateway::GatewayOperation;
     use crate::ids::{ModelId, ProviderId};
     use serde_json::json;
@@ -543,5 +637,64 @@ mod tests {
         for reserved in ["openai", "jev", "gemini"] {
             assert!(!compatible.accepts_credential_provider(&provider(reserved)));
         }
+    }
+
+    /// Proves an apply document refuses an empty deployment list, repeated
+    /// names, an invalid deployment, and an unreferenced credential, and
+    /// accepts deployments referencing submitted or existing credentials.
+    ///
+    /// # Panics
+    /// Panics when a document decodes unexpectedly or validation disagrees.
+    #[test]
+    fn apply_document_requires_unique_referenced_resources() {
+        let credential = json!({
+            "name": "openai-key", "provider": "openai",
+            "source": {"managed_secret": {"secret": "sk-test"}},
+        });
+        let deployment = |name: &str, credential: &str| json!({"name": name, "adapter": "openai", "auth": {"bearer": {"credential": credential}}});
+        let field = |value: serde_json::Value| {
+            serde_json::from_value::<ProviderDeploymentsApply>(value)
+                .expect("apply decodes")
+                .validate()
+                .map_err(|error| error.field)
+        };
+        assert_eq!(
+            field(
+                json!({"credentials": [credential], "deployments": [deployment("openai", "openai-key"), deployment("other", "existing-key")]})
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            field(json!({"deployments": [deployment("openai", "existing-key")]})),
+            Ok(())
+        );
+        assert_eq!(
+            field(json!({"deployments": []})),
+            Err("deployments".to_owned())
+        );
+        assert_eq!(
+            field(
+                json!({"deployments": [deployment("openai", "key-one"), deployment("openai", "key-two")]})
+            ),
+            Err("deployments[1].name".to_owned())
+        );
+        assert_eq!(
+            field(
+                json!({"deployments": [{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "key-one"}}, "models": []}]})
+            ),
+            Err("deployments[0].models".to_owned())
+        );
+        assert_eq!(
+            field(
+                json!({"credentials": [credential], "deployments": [deployment("openai", "existing-key")]})
+            ),
+            Err("credentials[0].name".to_owned())
+        );
+        assert_eq!(
+            field(
+                json!({"credentials": [credential, credential], "deployments": [deployment("openai", "openai-key")]})
+            ),
+            Err("credentials[1].name".to_owned())
+        );
     }
 }

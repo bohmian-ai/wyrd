@@ -403,7 +403,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_403_CARD_UNRESOLVED",
         status = 403,
         title = "Card reference unresolved",
-        remediation = "Use a card_ref that resolves to a registered card in the current tenant."
+        remediation = "Use a card_ref that resolves to a declared card in the current tenant."
     )]
     CardUnresolved {
         /// Canonical card reference that could not be resolved.

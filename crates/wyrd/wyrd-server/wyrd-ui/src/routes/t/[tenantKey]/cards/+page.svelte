@@ -24,7 +24,7 @@
 <div class="cards">
   <h1>Cards</h1>
   <p class="muted">
-    Everything registered in this tenant — filters are URL parameters, restorable from a pasted
+    Everything declared in this tenant — filters are URL parameters, restorable from a pasted
     link.
   </p>
   {#if data.problem}
@@ -40,8 +40,8 @@
     {#if !data.view.total}
       <StateBlock
         state="empty"
-        title="No Cards registered in this tenant"
-        detail="Registration is API-first: Cards enter through the SDKs, CLI or MCP."
+        title="No Cards declared in this tenant"
+        detail="Declaration is API-first: Cards enter through the SDKs or CLI; MCP inspects and verifies them."
       />
     {:else}
       <form class="filters row" method="GET" data-sveltekit-noscroll data-sveltekit-keepfocus>
@@ -98,7 +98,7 @@
             </Panel>
           {/if}
           <p class="muted">
-            Registration is API-first: Cards enter through the SDKs, CLI or MCP — this inventory is
+            Declaration is API-first: Cards enter through the SDKs or CLI, and MCP inspects them — this inventory is
             a read surface.
           </p>
         </div>

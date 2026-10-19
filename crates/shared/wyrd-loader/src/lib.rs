@@ -29,20 +29,20 @@ pub use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 /// `submissions` contains only wire-safe card data. `artifact_sources` is
 /// local provenance for upload execution and never crosses the API boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RegistrationInput {
+pub struct DeclarationInput {
     /// Cards in dependency-first order.
     pub submissions: Vec<CardSubmission>,
     /// Local source files keyed by their validated manifest paths.
     pub artifact_sources: BTreeMap<RelativeArtifactPath, PathBuf>,
 }
 
-impl RegistrationInput {
+impl DeclarationInput {
     /// Project the wire-safe portion into the composite registration
     /// request. Local artifact provenance remains available to the upload
     /// phase and never enters the request body.
     #[must_use]
-    pub fn to_create_card_request(&self) -> wyrd_spec::registry::CreateCardRequest {
-        wyrd_spec::registry::CreateCardRequest {
+    pub fn to_declare_card_request(&self) -> wyrd_spec::registry::DeclareCardRequest {
+        wyrd_spec::registry::DeclareCardRequest {
             submissions: self.submissions.clone(),
         }
     }
@@ -167,7 +167,7 @@ pub fn build_submissions(tree: LoadedTree) -> Result<Vec<CardSubmission>, LoadEr
 ///
 /// # Errors
 /// Returns the collected loader diagnostics when the tree is invalid.
-pub fn build_registration_input(tree: LoadedTree) -> Result<RegistrationInput, LoadError> {
+pub fn build_declaration_input(tree: LoadedTree) -> Result<DeclarationInput, LoadError> {
     if tree
         .diagnostics
         .iter()
@@ -200,7 +200,7 @@ pub fn build_registration_input(tree: LoadedTree) -> Result<RegistrationInput, L
         submissions.push(card.submission);
     }
 
-    Ok(RegistrationInput {
+    Ok(DeclarationInput {
         submissions,
         artifact_sources,
     })
@@ -208,7 +208,7 @@ pub fn build_registration_input(tree: LoadedTree) -> Result<RegistrationInput, L
 
 #[cfg(test)]
 mod tests {
-    use super::{build_registration_input, load};
+    use super::{build_declaration_input, load};
     use std::path::Path;
     use tempfile::TempDir;
     use wyrd_spec::envelope::Spec;
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_input_maps_artifact_provenance_without_serializing_paths() {
+    fn declaration_input_maps_artifact_provenance_without_serializing_paths() {
         let temp = TempDir::new().expect("temp directory creates");
         let source = temp.path().join("model.yaml");
         std::fs::write(
@@ -255,12 +255,12 @@ mod tests {
         .expect("model writes");
         std::fs::write(temp.path().join("weights.bin"), b"data").expect("artifact writes");
 
-        let input = build_registration_input(load(&source).expect("model loads"))
+        let input = build_declaration_input(load(&source).expect("model loads"))
             .expect("registration input builds");
         assert_eq!(input.submissions.len(), 1);
         assert_eq!(input.artifact_sources.len(), 1);
         assert_eq!(
-            input.to_create_card_request().submissions,
+            input.to_declare_card_request().submissions,
             input.submissions
         );
         let path = input
@@ -314,17 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn registration_input_rejects_missing_and_nonregular_artifacts() {
+    fn declaration_input_rejects_missing_and_nonregular_artifacts() {
         let temp = TempDir::new().expect("temp directory creates");
         let source = temp.path().join("model.yaml");
         model_with_artifact(&source, "weights.bin");
 
-        let missing = build_registration_input(load(&source).expect("model loads"))
+        let missing = build_declaration_input(load(&source).expect("model loads"))
             .expect_err("missing artifact must fail before upload");
         assert_eq!(missing.diagnostics[0].code, "WYRD_LOADER_400_IO");
 
         std::fs::create_dir(temp.path().join("weights.bin")).expect("artifact directory creates");
-        let nonregular = build_registration_input(load(&source).expect("model loads"))
+        let nonregular = build_declaration_input(load(&source).expect("model loads"))
             .expect_err("nonregular artifact must fail before upload");
         assert_eq!(
             nonregular.diagnostics[0].code,
@@ -334,7 +334,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn registration_input_rejects_artifact_symlink_outside_workspace() {
+    fn declaration_input_rejects_artifact_symlink_outside_workspace() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp directory creates");
@@ -345,7 +345,7 @@ mod tests {
         model_with_artifact(&source, "weights.bin");
         symlink(&outside_file, temp.path().join("weights.bin")).expect("artifact symlink creates");
 
-        let error = build_registration_input(load(&source).expect("model loads"))
+        let error = build_declaration_input(load(&source).expect("model loads"))
             .expect_err("artifact symlink must remain contained");
         assert_eq!(error.diagnostics[0].code, "WYRD_LOADER_400_PATH_ESCAPE");
     }

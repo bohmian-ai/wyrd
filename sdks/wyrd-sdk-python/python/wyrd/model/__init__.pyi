@@ -730,13 +730,11 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
     ```python
     cards = Cards()
-    card = cards.model.get(
-        space="ml", name="fraud-model", interface=MyModelInterface, eager_load=True
-    )
+    card = cards.model.get(space="ml", name="fraud-model", interface=MyModelInterface)
     ```
 
-    ``get`` returns the validated envelope without model bytes unless
-    ``eager_load=True``, which downloads the artifacts and calls ``load``.
+    ``get`` returns the validated envelope without model bytes. Pull a
+    Service bundle and open it with ``WyrdState.from_path`` to load models.
     ``model``, ``preprocessor``, and ``processor`` read through to the held
     interface and are ``None`` until it holds them. Setting ``metadata``
     re-validates the spec.
@@ -759,9 +757,9 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
     @property
     def artifact_hash(self) -> str | None:
-        """The registered Card's artifact manifest hash, read from its envelope.
+        """The declared Card's artifact manifest hash, read from its envelope.
 
-        The registry derives it at registration; it is never computed
+        The registry derives it at declaration; it is never computed
         locally. Pass it as ``WyrdState.from_path(trusted_artifact_hashes=...)``
         to load an executable model. ``None`` for a locally authored card.
         """
@@ -851,7 +849,7 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
         Validates the spec, has the interface write its files, and records the
         updated interface metadata. Local only: nothing is uploaded or
-        registered, and ``card_refs`` is not changed.
+        declared, and ``card_refs`` is not changed.
 
         Args:
             path: local card directory.
@@ -866,21 +864,18 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
     def load(
         self,
-        path: PathLike | None = ...,
+        path: PathLike,
         load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> None:
         """Read model artifacts into the held interface from a local directory.
 
         Args:
-            path: local card directory. Omit it only to reload a card
-                returned by ``Cards.model.get(eager_load=True)``, which
-                reuses the artifacts that call downloaded.
+            path: local card directory.
             load_kwargs: options forwarded to the interface's ``load``.
 
         Raises:
-            WyrdError: ``WYRD_MODEL_400_VALIDATION`` if ``path`` is omitted
-                without eager-loaded artifacts or no interface is attached,
-                or the errors of the interface's ``load``.
+            WyrdError: ``WYRD_MODEL_400_VALIDATION`` if no interface is
+                attached, or the errors of the interface's ``load``.
         """
         ...
 

@@ -8,7 +8,7 @@ import type {
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
-  CardRegistrationOutcome,
+  CardDeclarationOutcome,
   CardSummary,
   CompactionTypeWire as CompactionType,
   CreateOperatorConnectionRequest,
@@ -63,7 +63,7 @@ import type {
   RegisteredPromptCard,
   RegisteredServiceCard,
   RegisteredVerifierCard,
-  RegistrationReceipt,
+  DeclarationReceipt,
   RevokePrincipalRequest,
   RoleAssignment,
   RoleAssignmentChange,
@@ -138,7 +138,7 @@ export interface CancelRunningQueryResult {
 export type { WyrdErrorCode } from "./error-codes.js";
 /** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
 export type {
-  CardRegistrationOutcome,
+  CardDeclarationOutcome,
   CardSummary,
   CompactionType,
   CreateOperatorConnectionRequest,
@@ -185,7 +185,7 @@ export type {
   ProviderDeployment,
   QueryParam,
   QueryTerminal,
-  RegistrationReceipt,
+  DeclarationReceipt,
   RevokePrincipalRequest,
   RoleAssignment,
   RoleAssignmentChange,
@@ -1376,7 +1376,7 @@ export class Bifrost {
 }
 
 /** Machine-readable result of a published hydration. */
-export interface HydrationSummary {
+export interface PullSummary {
   readonly root: CardRef;
   readonly destination: string;
   readonly mode: "complete" | "metadata";
@@ -1612,19 +1612,19 @@ export class Cards {
   }
 
   /**
-   * Load a Card file or a bundle directory and register it as one composite.
+   * Load a Card file or a bundle directory and declare it as one composite.
    *
    * @param path - A Card file, or a directory of Card files.
    * @returns The graph root and each Card's dependency-first outcome.
    * @throws {@link WyrdError} for a file that does not load or validate, or
    * the registry's refusal.
    */
-  async registerFromPath(path: string): Promise<RegistrationReceipt> {
-    return lifecycleValue<RegistrationReceipt>(await this.#native.registerFromPath(path));
+  async declareFromPath(path: string): Promise<DeclarationReceipt> {
+    return lifecycleValue<DeclarationReceipt>(await this.#native.declareFromPath(path));
   }
 
   /**
-   * Fetch one registered Card envelope by exact reference.
+   * Fetch one declared Card envelope by exact reference, without artifacts.
    *
    * The envelope is discriminated by `kind`: `spec` and `status` are typed for
    * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
@@ -1632,7 +1632,7 @@ export class Cards {
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
    * @param ref - A Card reference, or its `space/Kind/name@version` text.
-   * @returns The registered envelope.
+   * @returns The declared envelope.
    * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
    * a transport or authorization failure.
    */
@@ -1668,10 +1668,10 @@ export class Cards {
   }
 
   /**
-   * Download a registered Card's reachable graph as a local bundle for
+   * Pull a declared Card's reachable graph into a local bundle for
    * {@link WyrdState}.
    *
-   * Publication is atomic: a failed hydration leaves any prior bundle intact.
+   * Publication is atomic: a failed pull leaves any prior bundle intact.
    *
    * @param ref - The root Card's reference, or its text form.
    * @param destination - The bundle directory to publish.
@@ -1681,13 +1681,13 @@ export class Cards {
    * graph, an invalid destination, or an artifact that cannot be downloaded
    * or verified.
    */
-  async hydrate(
+  async pull(
     ref: CardRef | string,
     destination: string,
     options: { readonly metadataOnly?: boolean } = {},
-  ): Promise<HydrationSummary> {
-    return lifecycleValue<HydrationSummary>(
-      await this.#native.hydrate(cardRefText(ref), destination, options.metadataOnly ?? false),
+  ): Promise<PullSummary> {
+    return lifecycleValue<PullSummary>(
+      await this.#native.pull(cardRefText(ref), destination, options.metadataOnly ?? false),
     );
   }
 
@@ -2709,9 +2709,9 @@ export class WyrdState {
   }
 
   /**
-   * Load and validate one hydrated bundle.
+   * Load and validate one Card bundle.
    *
-   * @param path - The bundle directory {@link Cards.hydrate} published.
+   * @param path - The bundle directory {@link Cards.pull} published.
    * @param options - `client`, whose principal every server call of this
    * state runs as; omitted, the ambient client is resolved once, at the first
    * server call, and kept.

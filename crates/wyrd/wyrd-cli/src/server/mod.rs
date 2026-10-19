@@ -8,11 +8,12 @@ mod install;
 
 use std::process::ExitCode;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 pub use dev::DevArgs;
 pub use install::{InstalledServer, ServerInstaller};
 
+use crate::card::{OutputFormat, print_json};
 use crate::error::WyrdCliError;
 
 /// `wyrd server` subcommands.
@@ -20,10 +21,18 @@ use crate::error::WyrdCliError;
 pub enum ServerCommand {
     /// Install, or update to, the newest stable official server release for
     /// this host after verifying its signature and digest.
-    Install,
+    Install(InstallArgs),
     /// Migrate, start, and configure an installed local server; keep it in
     /// the foreground until interrupted. PostgreSQL is supplied externally.
     Dev(DevArgs),
+}
+
+/// Arguments for `wyrd server install`.
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// Output encoding; `json` prints the installed `version` and `dir`.
+    #[arg(long, default_value_t)]
+    format: OutputFormat,
 }
 
 impl ServerCommand {
@@ -31,7 +40,7 @@ impl ServerCommand {
     ///
     /// `install` resolves the official release service and signing key,
     /// installs the newest compatible stable release, and prints its version
-    /// and location.
+    /// and location as a line or, with `--format json`, one JSON object.
     ///
     /// # Errors
     /// Returns the installer's [`WyrdCliError`] when the host is unsupported,
@@ -41,13 +50,16 @@ impl ServerCommand {
     pub async fn dispatch(self) -> Result<ExitCode, WyrdCliError> {
         match self {
             Self::Dev(args) => args.run().await,
-            Self::Install => {
+            Self::Install(args) => {
                 let installed = ServerInstaller::official()?.install().await?;
-                println!(
-                    "wyrd-server {} installed at {}",
-                    installed.version,
-                    installed.dir.display()
-                );
+                match args.format {
+                    OutputFormat::Text => println!(
+                        "wyrd-server {} installed at {}",
+                        installed.version,
+                        installed.dir.display()
+                    ),
+                    OutputFormat::Json => print_json(&installed)?,
+                }
                 Ok(ExitCode::SUCCESS)
             }
         }

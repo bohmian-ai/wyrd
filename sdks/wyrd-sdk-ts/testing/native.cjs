@@ -573,13 +573,13 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.NativeWyrdTestServer = nativeBinding.NativeWyrdTestServer
-module.exports.cliApply = nativeBinding.cliApply
+module.exports.cliDeclare = nativeBinding.cliDeclare
+module.exports.cliDeclareCheck = nativeBinding.cliDeclareCheck
 module.exports.cliDeleteProviderCredential = nativeBinding.cliDeleteProviderCredential
 module.exports.cliGet = nativeBinding.cliGet
 module.exports.cliIssueKey = nativeBinding.cliIssueKey
-module.exports.cliLoad = nativeBinding.cliLoad
 module.exports.cliMcpInstall = nativeBinding.cliMcpInstall
-module.exports.cliPlan = nativeBinding.cliPlan
+module.exports.cliPull = nativeBinding.cliPull
 module.exports.cliPutProviderCredential = nativeBinding.cliPutProviderCredential
 module.exports.cliRevokeProviderCredential = nativeBinding.cliRevokeProviderCredential
 module.exports.startTestServer = nativeBinding.startTestServer

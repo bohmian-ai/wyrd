@@ -5,12 +5,10 @@ typed calls::
 
     cards = Cards()
     card = cards.model.get(space="risk", name="fraud-model")
-    card.load()
 
-``get`` retrieves the persisted Card envelope. ``DataCard.load`` and
-``ModelCard.load`` download the registered artifacts when the returned holder
-needs its data or model in memory; ``get(..., eager_load=True)`` does both in
-one call.
+``get`` retrieves the persisted Card envelope without downloading artifacts.
+``pull`` publishes a Service graph bundle that ``WyrdState.from_path`` loads
+into runtime objects.
 """
 
 from .._wyrd.cards import (
@@ -22,13 +20,13 @@ from .._wyrd.cards import (
     DataCardRegistry,
     DataLoadArgs,
     DataSaveArgs,
-    HydrationSummary,
+    DeclarationOutcome,
+    DeclarationReceipt,
     ModelCardRegistry,
     ModelLoadArgs,
     ModelSaveArgs,
     PromptCardRegistry,
-    RegistrationOutcome,
-    RegistrationReceipt,
+    PullSummary,
     VersionBump,
 )
 from .._wyrd.cards.agent import AgentCard
@@ -50,7 +48,7 @@ __all__ = [
     "PromptCardRegistry",
     "CardSummary",
     "CardList",
-    "RegistrationOutcome",
-    "RegistrationReceipt",
-    "HydrationSummary",
+    "DeclarationOutcome",
+    "DeclarationReceipt",
+    "PullSummary",
 ]

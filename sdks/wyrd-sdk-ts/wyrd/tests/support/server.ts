@@ -7,7 +7,7 @@ import {
   Bifrost,
   type CardRef,
   type Cards,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   type SpanRecord,
   verify,
   type VerificationExecutionState,
@@ -56,17 +56,17 @@ export function columnValues(column: { toJSON(): unknown } | null): unknown {
 }
 
 /** A Card reference the registry resolved, so it always carries the Card's `uid`. */
-export type RegisteredRef = CardRef & { readonly uid: string };
+export type DeclaredRef = CardRef & { readonly uid: string };
 
 /**
- * The registered reference of the Card named `name` in `receipt`, the root by
- * default. Throws when the receipt registered no such Card, so a story never
+ * The declared reference of the Card named `name` in `receipt`, the root by
+ * default. Throws when the receipt declared no such Card, so a story never
  * proceeds with a missing reference.
  */
-export function registered(receipt: RegistrationReceipt, name: string = receipt.root.name): RegisteredRef {
+export function declared(receipt: DeclarationReceipt, name: string = receipt.root.name): DeclaredRef {
   const ref = receipt.outcomes.find((outcome) => outcome.card_ref.name === name)?.card_ref;
   if (!ref?.uid) {
-    throw new Error(`the receipt registered no Card named ${name}`);
+    throw new Error(`the receipt declared no Card named ${name}`);
   }
   return { ...ref, uid: ref.uid };
 }

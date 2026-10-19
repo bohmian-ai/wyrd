@@ -545,7 +545,7 @@ async fn activated_principals(srv: &WyrdTestServer) -> Vec<Uuid> {
 ///
 /// # Panics
 /// Panics when the route fails to respond, refuses the Card, or returns no UID.
-async fn register_service(srv: &WyrdTestServer, jwt: &str, name: &str, space: &str) -> Uuid {
+async fn declare_service(srv: &WyrdTestServer, jwt: &str, name: &str, space: &str) -> Uuid {
     let body = serde_json::json!({ "submissions": [{
         "apiVersion": "wyrd/v1", "kind": "Service",
         "metadata": { "name": name, "version": "1.0.0", "space": space },
@@ -642,8 +642,8 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
     else {
         panic!("user bootstrap returned a non-user principal");
     };
-    let prod = register_service(&srv, &jwt, "wyrd-workload-live", "prod").await;
-    let staging = register_service(&srv, &jwt, "wyrd-workload-live", "staging").await;
+    let prod = declare_service(&srv, &jwt, "wyrd-workload-live", "prod").await;
+    let staging = declare_service(&srv, &jwt, "wyrd-workload-live", "staging").await;
     assert_eq!(owner_last_authenticated(&srv, prod).await, None);
 
     let first = post_jwt_bearer(&srv, &assertion).await;

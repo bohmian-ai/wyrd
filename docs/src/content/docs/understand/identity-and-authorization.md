@@ -33,12 +33,12 @@ A principal is an identity Wyrd can authorize and attribute. Each has a kind:
 | --- | --- | --- |
 | `tenant_admin` | The tenant's administrator | When the tenant is created |
 | `user` | A person | On first sign-in through the tenant's identity provider |
-| `service` | A deployed Service, or an automation such as a CI job | Registering a Service Card, or creating an automation principal |
-| `agent` | A deployed Agent | Registering an Agent Card |
+| `service` | A deployed Service, or an automation such as a CI job | Declaring a Service Card, or creating an automation principal |
+| `agent` | A deployed Agent | Declaring an Agent Card |
 
-Registering a Card is what gives a deployed workload its identity. When `wyrd apply` registers `support-desk`, Wyrd creates a `service` principal bound to that Card and grants it the `workload` role. Re-registering the Card keeps the same principal and never grants the role again, so an administrator's later change stands.
+Declaring a Card is what gives a deployed workload its identity. When `wyrd declare` declares `support-desk`, Wyrd creates a `service` principal bound to that Card and grants it the `workload` role. Re-declaring the Card keeps the same principal and never grants the role again, so an administrator's later change stands.
 
-An automation principal, such as a CI runner that registers Cards, is a `service` principal with no Card. An administrator creates it directly.
+An automation principal, such as a CI runner that declares Cards, is a `service` principal with no Card. An administrator creates it directly.
 
 ## How a caller proves who it is
 
@@ -95,7 +95,7 @@ A principal with no Card, such as a person or an automation principal, may attri
 
 Wyrd has no per-Card owner. Who may change or delete a Card is decided by role alone: any principal with `cards:write` may change any Card in the tenant. Each Card records the principal that created it, for provenance, not for access.
 
-The one ownership relationship Wyrd enforces is between a Service or Agent and its verification bindings: the bindings in a Card's `verified_by` belong to that Card and change only when it is re-registered.
+The one ownership relationship Wyrd enforces is between a Service or Agent and its verification bindings: the bindings in a Card's `verified_by` belong to that Card and change only when it is re-declared.
 
 ## Acting on behalf of someone
 

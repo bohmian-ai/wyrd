@@ -31,9 +31,7 @@ use wyrd_spec::reference::{
 use wyrd_spec::registry::{
     ArtifactManifestEntry, RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
-use wyrd_spec::registry::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
-};
+use wyrd_spec::registry::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
 
 /// One verified artifact payload in a local `WyrdState` bundle.
 #[derive(Debug, Clone)]
@@ -469,13 +467,13 @@ pub struct WyrdState {
     client: Arc<OnceLock<WyrdClient>>,
 }
 
-/// Private filesystem reader for one confined hydrated-bundle root.
+/// Private filesystem reader for one confined Card bundle root.
 ///
 /// `WyrdState` owns the published immutable graph. This reader owns only the
 /// synchronous filesystem assembly context so no bundle path leaks into the
 /// public state API or into declarative Card values.
 #[derive(Debug)]
-struct HydratedBundleReader<'a> {
+struct BundleReader<'a> {
     /// Original root supplied by the caller for structured hydration failures.
     requested_root: &'a Path,
     /// Canonical directory that confines every bundle projection and payload.
@@ -483,8 +481,8 @@ struct HydratedBundleReader<'a> {
 }
 
 /// Establishes the canonical filesystem confinement boundary.
-impl<'a> HydratedBundleReader<'a> {
-    /// Construct a reader for one canonical hydrated-bundle root.
+impl<'a> BundleReader<'a> {
+    /// Construct a reader for one canonical Card bundle root.
     ///
     /// # Errors
     ///
@@ -504,14 +502,14 @@ impl<'a> HydratedBundleReader<'a> {
     ///
     /// Returns the same stable hydration errors as `WyrdState::from_path` when
     /// metadata is absent, escapes the root, or cannot be decoded.
-    fn read_manifest(&self) -> Result<HydratedBundleManifest, WyrdError> {
+    fn read_manifest(&self) -> Result<BundleManifest, WyrdError> {
         let metadata_path = self.root.join("metadata.yaml");
         let metadata = fs::symlink_metadata(&metadata_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                unhydrated_error(&metadata_path, "hydrated bundle metadata.yaml is absent")
+                unhydrated_error(&metadata_path, "Card bundle metadata.yaml is absent")
             } else {
                 state_bundle_error(
-                    "hydrated bundle metadata.yaml cannot be read",
+                    "Card bundle metadata.yaml cannot be read",
                     json!({ "path": metadata_path, "source": error.to_string() }),
                 )
             }
@@ -519,7 +517,7 @@ impl<'a> HydratedBundleReader<'a> {
         if !metadata.file_type().is_symlink() && !metadata.is_file() {
             return Err(unhydrated_error(
                 &metadata_path,
-                "hydrated bundle metadata.yaml is not a regular file",
+                "Card bundle metadata.yaml is not a regular file",
             ));
         }
         let metadata_path = confined_existing_file(&self.root, "metadata.yaml")?;
@@ -528,14 +526,14 @@ impl<'a> HydratedBundleReader<'a> {
 }
 
 impl WyrdState {
-    /// Load and validate a complete hydrated bundle without contacting Wyrd.
+    /// Load and validate a complete Card bundle without contacting Wyrd.
     ///
     /// The state has no client yet: its first server call resolves one from
     /// the ambient configuration, as [`WyrdClient::from_global`] does, and keeps
     /// it, so later environment changes do not change its principal.
     ///
     /// # Arguments
-    /// * `path` - The hydrated bundle directory, as [`crate::cards::Cards::hydrate`]
+    /// * `path` - The Card bundle directory, as [`crate::cards::Cards::pull`]
     ///   publishes it.
     ///
     /// # Errors
@@ -544,7 +542,7 @@ impl WyrdState {
     /// internally inconsistent, contains an unconfined path, or preserves a
     /// registration-only sibling reference.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
-        let reader = HydratedBundleReader::new(path.as_ref())?;
+        let reader = BundleReader::new(path.as_ref())?;
         let manifest = reader.read_manifest()?;
         reader.validate_manifest_header(&manifest)?;
         let index = reader.load_index(manifest)?;
@@ -555,7 +553,7 @@ impl WyrdState {
         })
     }
 
-    /// Load and validate a complete hydrated bundle whose server calls run as
+    /// Load and validate a complete Card bundle whose server calls run as
     /// `client`.
     ///
     /// Identical to [`Self::from_path`], except that the state's identity is
@@ -563,7 +561,7 @@ impl WyrdState {
     /// `client`, and the ambient configuration is never read.
     ///
     /// # Arguments
-    /// * `path` - The hydrated bundle directory.
+    /// * `path` - The Card bundle directory.
     /// * `client` - The client every server call of this state and its clones
     ///   is sent through, as its principal.
     ///
@@ -1210,24 +1208,24 @@ impl WyrdState {
 }
 
 /// Validates bundle metadata and assembles its exact Card graph.
-impl HydratedBundleReader<'_> {
+impl BundleReader<'_> {
     /// Validate bundle-level hydration mode, counts, and Service root identity.
     ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error for unsupported headers, count
     /// mismatches, non-Service roots, or roots without exact identity.
-    fn validate_manifest_header(&self, manifest: &HydratedBundleManifest) -> Result<(), WyrdError> {
-        if manifest.api_version != "wyrd/hydrated-bundle/v1" {
+    fn validate_manifest_header(&self, manifest: &BundleManifest) -> Result<(), WyrdError> {
+        if manifest.api_version != "wyrd/bundle/v1" {
             return Err(state_bundle_error(
-                "unsupported hydrated bundle apiVersion",
+                "unsupported Card bundle apiVersion",
                 json!({ "path": self.requested_root, "api_version": manifest.api_version }),
             ));
         }
-        if manifest.hydration == HydrationMode::MetadataOnly {
+        if manifest.mode == BundleMode::MetadataOnly {
             return Err(unhydrated_error(
                 self.requested_root,
-                "hydrated bundle contains metadata only and cannot be used as runtime state",
+                "Card bundle contains metadata only and cannot be used as runtime state",
             ));
         }
         if manifest.cards.is_empty()
@@ -1241,7 +1239,7 @@ impl HydratedBundleReader<'_> {
             || manifest.downloaded_artifact_count != manifest.artifact_count
         {
             return Err(state_bundle_error(
-                "hydrated bundle manifest counts are inconsistent",
+                "Card bundle manifest counts are inconsistent",
                 json!({
                     "path": self.requested_root,
                     "card_count": manifest.card_count,
@@ -1253,13 +1251,13 @@ impl HydratedBundleReader<'_> {
         }
         if manifest.root.kind != CardKind::Service {
             return Err(state_bundle_error(
-                "hydrated bundle root must be a Service Card",
+                "Card bundle root must be a Service Card",
                 json!({ "root": manifest.root }),
             ));
         }
         if manifest.root.space.is_none() || manifest.root.uid.is_none() {
             return Err(state_bundle_error(
-                "hydrated bundle root must have an exact space and UID",
+                "Card bundle root must have an exact space and UID",
                 json!({ "root": manifest.root }),
             ));
         }
@@ -1276,10 +1274,7 @@ impl HydratedBundleReader<'_> {
     ///
     /// Returns an invalid-state-bundle or unhydrated-artifact error when any
     /// Card projection, reference, relationship, artifact, or root is invalid.
-    fn load_index(
-        &self,
-        manifest: HydratedBundleManifest,
-    ) -> Result<HydratedStateIndex, WyrdError> {
+    fn load_index(&self, manifest: BundleManifest) -> Result<HydratedStateIndex, WyrdError> {
         let mut loaded = Vec::with_capacity(manifest.cards.len());
         let mut known = BTreeSet::new();
         let mut aliases = BTreeMap::new();
@@ -1315,7 +1310,7 @@ impl HydratedBundleReader<'_> {
     /// projection is missing, mismatched, malformed, unconfined, or unverifiable.
     fn load_manifest_card(
         &self,
-        entry: &HydratedCardManifest,
+        entry: &BundleCardManifest,
     ) -> Result<LoadedManifestCard, WyrdError> {
         let card_path = confined_existing_file(&self.root, &entry.card_path)?;
         let relationships_path = confined_existing_file(&self.root, &entry.relationships_path)?;
@@ -1328,7 +1323,7 @@ impl HydratedBundleReader<'_> {
             ));
         }
         let relationships: Relationships = read_yaml(&relationships_path)?;
-        let inventory: Vec<HydratedArtifactManifest> = read_yaml(&inventory_path)?;
+        let inventory: Vec<BundleArtifactManifest> = read_yaml(&inventory_path)?;
         if relationships != card.relationships {
             return Err(state_bundle_error(
                 "hydrated relationship projection does not match its Card envelope",
@@ -1515,7 +1510,7 @@ impl HydratedBundleReader<'_> {
     /// or digest validation fails.
     fn validate_artifact(
         &self,
-        entry: &HydratedArtifactManifest,
+        entry: &BundleArtifactManifest,
     ) -> Result<HydratedArtifact, WyrdError> {
         validate_artifact_path(&entry.relative_path)?;
         let local_path = entry.local_path.as_deref().ok_or_else(|| {
@@ -1652,7 +1647,7 @@ fn typed_map_invariant(alias: &str, key: &str, expected: &CardKind) -> WyrdError
 }
 
 /// Validates exact root identity and persisted relationship projections.
-impl HydratedBundleReader<'_> {
+impl BundleReader<'_> {
     /// Confirm that the manifest root is an exact, loaded Service Card.
     ///
     /// # Errors
@@ -1662,13 +1657,13 @@ impl HydratedBundleReader<'_> {
     fn validate_root(root: &CardRef, loaded: &[LoadedManifestCard]) -> Result<(), WyrdError> {
         let Some(item) = loaded.iter().find(|item| item.key == root.to_string()) else {
             return Err(state_bundle_error(
-                "hydrated bundle root is not present in its Card set",
+                "Card bundle root is not present in its Card set",
                 json!({ "root": root }),
             ));
         };
         if item.card_ref != *root || item.card.kind != CardKind::Service {
             return Err(state_bundle_error(
-                "hydrated bundle root identity or kind does not match its manifest",
+                "Card bundle root identity or kind does not match its manifest",
                 json!({ "root": root, "actual": item.card_ref, "actual_kind": item.card.kind }),
             ));
         }
@@ -1722,7 +1717,7 @@ impl HydratedBundleReader<'_> {
                 .copied()
                 .collect::<Vec<_>>();
             return Err(state_bundle_error(
-                "hydrated bundle contains Cards unreachable from its root",
+                "Card bundle contains Cards unreachable from its root",
                 json!({ "root": root, "unreachable": unreachable }),
             ));
         }
@@ -1773,19 +1768,19 @@ fn exact_card_ref(card: &Card, path: &Path) -> Result<CardRef, WyrdError> {
 fn absolute_bundle(bundle: &Path) -> Result<PathBuf, WyrdError> {
     let metadata = fs::symlink_metadata(bundle).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle directory cannot be read",
+            "Card bundle directory cannot be read",
             json!({ "path": bundle, "source": error.to_string() }),
         )
     })?;
     if !metadata.is_dir() {
         return Err(state_bundle_error(
-            "hydrated bundle path is not a directory",
+            "Card bundle path is not a directory",
             json!({ "path": bundle }),
         ));
     }
     fs::canonicalize(bundle).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle directory cannot be canonicalized",
+            "Card bundle directory cannot be canonicalized",
             json!({ "path": bundle, "source": error.to_string() }),
         )
     })
@@ -1800,7 +1795,7 @@ fn absolute_bundle(bundle: &Path) -> Result<PathBuf, WyrdError> {
 fn confined_path(root: &Path, relative: &str) -> Result<PathBuf, WyrdError> {
     if relative.is_empty() {
         return Err(state_bundle_error(
-            "hydrated bundle path is empty",
+            "Card bundle path is empty",
             json!({ "path": relative }),
         ));
     }
@@ -1814,7 +1809,7 @@ fn confined_path(root: &Path, relative: &str) -> Result<PathBuf, WyrdError> {
         })
     {
         return Err(state_bundle_error(
-            "hydrated bundle path escapes its root",
+            "Card bundle path escapes its root",
             json!({ "path": relative, "root": root }),
         ));
     }
@@ -1832,25 +1827,25 @@ fn confined_existing_file(root: &Path, relative: &str) -> Result<PathBuf, WyrdEr
     let path = confined_path(&root, relative)?;
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle file cannot be read",
+            "Card bundle file cannot be read",
             json!({ "path": path, "source": error.to_string() }),
         )
     })?;
     if !metadata.is_file() {
         return Err(state_bundle_error(
-            "hydrated bundle projection is not a regular file",
+            "Card bundle projection is not a regular file",
             json!({ "path": path }),
         ));
     }
     let canonical = fs::canonicalize(&path).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle file cannot be canonicalized",
+            "Card bundle file cannot be canonicalized",
             json!({ "path": path, "source": error.to_string() }),
         )
     })?;
     if !canonical.starts_with(&root) {
         return Err(state_bundle_error(
-            "hydrated bundle path escapes its root",
+            "Card bundle path escapes its root",
             json!({ "path": path, "root": root }),
         ));
     }
@@ -1910,7 +1905,7 @@ fn validate_alias(alias: &str) -> Result<(), WyrdError> {
         )
     {
         return Err(state_bundle_error(
-            "hydrated bundle contains an unsafe alias",
+            "Card bundle contains an unsafe alias",
             json!({ "alias": alias }),
         ));
     }
@@ -1937,7 +1932,7 @@ fn validate_artifact_path(path: &str) -> Result<(), WyrdError> {
         })
     {
         return Err(state_bundle_error(
-            "artifact path is not confined to the hydrated bundle",
+            "artifact path is not confined to the Card bundle",
             json!({ "relative_path": path }),
         ));
     }
@@ -1983,13 +1978,13 @@ fn sha256_base64(path: &Path) -> Result<String, WyrdError> {
 fn read_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, WyrdError> {
     let contents = fs::read(path).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle file cannot be read",
+            "Card bundle file cannot be read",
             json!({ "path": path, "source": error.to_string() }),
         )
     })?;
     serde_yaml::from_slice(&contents).map_err(|error| {
         state_bundle_error(
-            "hydrated bundle YAML is invalid",
+            "Card bundle YAML is invalid",
             json!({ "path": path, "source": error.to_string() }),
         )
     })
@@ -2027,7 +2022,7 @@ fn exact_card_ref_for_error(card: &Card) -> Value {
 #[must_use]
 fn invalid_duplicate_ref(card_ref: &CardRef) -> WyrdError {
     state_bundle_error(
-        "hydrated bundle contains a duplicate CardRef",
+        "Card bundle contains a duplicate CardRef",
         json!({ "card_ref": card_ref }),
     )
 }
@@ -2036,7 +2031,7 @@ fn invalid_duplicate_ref(card_ref: &CardRef) -> WyrdError {
 #[must_use]
 fn conflicting_alias(alias: &str, existing: &str, incoming: &str) -> WyrdError {
     state_bundle_error(
-        "hydrated bundle contains a conflicting alias",
+        "Card bundle contains a conflicting alias",
         json!({ "alias": alias, "existing_card_ref_key": existing, "incoming_card_ref_key": incoming }),
     )
 }
@@ -2050,7 +2045,7 @@ fn unhydrated_error(path: &Path, message: &str) -> WyrdError {
     }
 }
 
-/// One Card from a hydrated bundle manifest after its envelope, identity,
+/// One Card from a Card bundle manifest after its envelope, identity,
 /// aliases, and artifacts have been validated against disk.
 ///
 /// Produced per manifest entry while loading a local bundle and then indexed
@@ -2169,7 +2164,7 @@ impl TelemetryFlushFailure {
 }
 
 #[cfg(test)]
-/// Exercises local hydrated-bundle loading, typed Card projections, reference
+/// Exercises local Card bundle loading, typed Card projections, reference
 /// closure, alias identity, and artifact confinement without network access.
 pub(crate) mod tests {
     use std::cell::RefCell;
@@ -2200,7 +2195,7 @@ pub(crate) mod tests {
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
     use wyrd_spec::registry::{
-        HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+        BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
     };
 
     use super::{HydratedCard, WyrdState};
@@ -2218,14 +2213,14 @@ pub(crate) mod tests {
         content_type: Option<String>,
     }
 
-    /// Owns a complete temporary hydrated bundle and the in-memory values used
+    /// Owns a complete temporary Card bundle and the in-memory values used
     /// to rewrite projections while testing validation failures.
     pub(crate) struct TestBundle {
         /// Temporary directory containing metadata, Card projections, aliases,
         /// and verified artifact payloads.
         root: TempDir,
-        /// Mutable hydrated-bundle manifest serialized by [`Self::write`].
-        manifest: HydratedBundleManifest,
+        /// Mutable Card bundle manifest serialized by [`Self::write`].
+        manifest: BundleManifest,
         /// Card envelopes keyed by their exact canonical `CardRef` string.
         cards: RefCell<BTreeMap<String, Card>>,
         /// Artifact bytes keyed by exact `CardRef` and relative payload path.
@@ -2265,9 +2260,9 @@ pub(crate) mod tests {
             };
             let mut bundle = Self {
                 root: tempdir().expect("test bundle tempdir is available"),
-                manifest: HydratedBundleManifest {
-                    api_version: "wyrd/hydrated-bundle/v1".to_owned(),
-                    hydration: HydrationMode::Complete,
+                manifest: BundleManifest {
+                    api_version: "wyrd/bundle/v1".to_owned(),
+                    mode: BundleMode::Complete,
                     root: root_ref.clone(),
                     cards: Vec::new(),
                     card_count: 0,
@@ -2337,7 +2332,7 @@ pub(crate) mod tests {
                 (model_ref.to_string(), artifact.relative_path.clone()),
                 artifact.bytes.clone(),
             );
-            entry.artifacts.push(HydratedArtifactManifest {
+            entry.artifacts.push(BundleArtifactManifest {
                 relative_path: artifact.relative_path.clone(),
                 sha256: digest(&artifact.bytes),
                 size_bytes: i64::try_from(artifact.bytes.len()).expect("fixture size fits"),
@@ -2504,7 +2499,7 @@ pub(crate) mod tests {
                         (key.clone(), artifact.relative_path.clone()),
                         artifact.bytes.clone(),
                     );
-                    HydratedArtifactManifest {
+                    BundleArtifactManifest {
                         relative_path: artifact.relative_path.clone(),
                         sha256: digest(&artifact.bytes),
                         size_bytes: i64::try_from(artifact.bytes.len()).expect("fixture size fits"),
@@ -2516,7 +2511,7 @@ pub(crate) mod tests {
                     }
                 })
                 .collect::<Vec<_>>();
-            self.manifest.cards.push(HydratedCardManifest {
+            self.manifest.cards.push(BundleCardManifest {
                 aliases: vec![alias.to_owned()],
                 card_ref: card_ref.clone(),
                 card_path: format!("cards/{alias}/card.yaml"),
@@ -2612,7 +2607,7 @@ pub(crate) mod tests {
         ///
         /// # Panics
         /// Panics if updated projections cannot be serialized or written.
-        fn rewrite_manifest(&mut self, f: impl FnOnce(&mut HydratedBundleManifest)) {
+        fn rewrite_manifest(&mut self, f: impl FnOnce(&mut BundleManifest)) {
             f(&mut self.manifest);
             write_yaml(&self.root.path().join("metadata.yaml"), &self.manifest);
             for entry in &self.manifest.cards {
@@ -2946,6 +2941,22 @@ pub(crate) mod tests {
             !problem_details(&error)[field].is_null(),
             "missing detail field {field}: {}",
             problem_details(&error)
+        );
+    }
+
+    /// Assert that a rejected bundle's recovery prescribes a complete pull into
+    /// an explicit directory, never the envelope-only `get`.
+    ///
+    /// # Panics
+    /// Panics if the bundle loads or the remediation names another recovery.
+    fn assert_pull_recovery(result: Result<WyrdState, WyrdError>) {
+        let error = result.expect_err("bundle fixture must be rejected");
+        let remediation = error.remediation();
+        assert!(
+            remediation.contains("wyrd pull")
+                && remediation.contains("--output-dir")
+                && !remediation.contains("wyrd get"),
+            "{remediation}"
         );
     }
 
@@ -3372,18 +3383,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// Rejects metadata-only bundles because `WyrdState` requires complete hydration.
+    /// Rejects metadata-only bundles because `WyrdState` requires complete
+    /// hydration, and prescribes a complete pull as the recovery.
     ///
     /// # Panics
-    /// Panics if fixture rewriting fails or the expected unhydrated error is not returned.
+    /// Panics if fixture rewriting fails, the expected unhydrated error is not
+    /// returned, or its remediation does not prescribe a complete pull.
     fn rejects_metadata_only_bundle_as_unhydrated() {
         let mut bundle = TestBundle::complete_service();
-        bundle.rewrite_manifest(|manifest| manifest.hydration = HydrationMode::MetadataOnly);
+        bundle.rewrite_manifest(|manifest| manifest.mode = BundleMode::MetadataOnly);
         assert_error(
             WyrdState::from_path(bundle.path()),
             "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
             "path",
         );
+        assert_pull_recovery(WyrdState::from_path(bundle.path()));
+    }
+
+    #[test]
+    /// Rejects the retired `wyrd/hydrated-bundle/v1` header: no compatibility
+    /// reader exists, and the recovery is a fresh complete pull.
+    ///
+    /// # Panics
+    /// Panics if fixture rewriting fails, the retired header is accepted, or
+    /// the remediation does not prescribe a complete pull.
+    fn rejects_retired_bundle_api_version() {
+        let mut bundle = TestBundle::complete_service();
+        bundle.rewrite_manifest(|manifest| {
+            manifest.api_version = "wyrd/hydrated-bundle/v1".to_owned();
+        });
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "api_version",
+        );
+        assert_pull_recovery(WyrdState::from_path(bundle.path()));
     }
 
     #[test]
@@ -3402,7 +3436,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// Rejects a hydrated bundle whose manifest root is not a Service Card.
+    /// Rejects a Card bundle whose manifest root is not a Service Card.
     ///
     /// # Panics
     /// Panics if fixture mutation fails or root-kind validation accepts the malformed bundle.
@@ -3571,7 +3605,7 @@ pub(crate) mod tests {
         let bundle = TestBundle::with_artifact();
         write_yaml(
             &bundle.path().join("cards/model/artifacts.yaml"),
-            &Vec::<HydratedArtifactManifest>::new(),
+            &Vec::<BundleArtifactManifest>::new(),
         );
         assert_error(
             WyrdState::from_path(bundle.path()),
@@ -3693,7 +3727,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// Rejects manifest Card paths that escape the hydrated bundle root.
+    /// Rejects manifest Card paths that escape the Card bundle root.
     ///
     /// # Panics
     /// Panics if fixture mutation fails or path confinement accepts the escaping path.
@@ -3797,7 +3831,7 @@ pub(crate) mod tests {
         let bundle = TestBundle::complete_service();
         let external = tempdir().expect("external fixture tempdir is available");
         let target = external.path().join("metadata.yaml");
-        fs::write(&target, "apiVersion: wyrd/hydrated-bundle/v1\n")
+        fs::write(&target, "apiVersion: wyrd/bundle/v1\n")
             .expect("external metadata fixture writes");
         fs::remove_file(bundle.path().join("metadata.yaml"))
             .expect("bundle metadata fixture exists");

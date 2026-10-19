@@ -13,12 +13,45 @@ from typing import TYPE_CHECKING
 from wyrd._wyrd.testing import cli as _native  # ty: ignore[unresolved-import]
 
 if TYPE_CHECKING:
-    from wyrd.cards import HydrationSummary
+    from wyrd.cards import PullSummary
     from wyrd.client import WyrdClient
-    from wyrd.testing.cli import IssueKeyResponse, LoadOutput
+    from wyrd.state import CardEnvelope
+    from wyrd.testing.cli import IssueKeyResponse
 
 
 def get(
+    *,
+    kind: str | None = None,
+    space: str | None = None,
+    name: str | None = None,
+    version: str | None = None,
+    uid: str | None = None,
+    client: WyrdClient | None = None,
+) -> CardEnvelope:
+    """Read one Card envelope without downloading artifacts (``wyrd get``).
+
+    Select by ``uid`` (with ``kind``) or by ``kind``, ``space``, and ``name``;
+    ``version`` narrows either.
+
+    Args:
+        kind: The Card kind.
+        space: The Card space for a named selector, or a UID assertion.
+        name: The Card name for a named selector, or a UID assertion.
+        version: The exact Card version.
+        uid: The exact Card UID.
+        client: The principal to act as. Omitted, the ambient chain.
+
+    Returns:
+        The complete Card envelope.
+
+    Raises:
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid selector, or the
+            client or server error.
+    """
+    return _native.get((kind, space, name, version, uid), client)
+
+
+def pull(
     *,
     output_dir: str | PathLike[str],
     kind: str | None = None,
@@ -28,8 +61,8 @@ def get(
     uid: str | None = None,
     metadata_only: bool = False,
     client: WyrdClient | None = None,
-) -> HydrationSummary:
-    """Hydrate a Card's reachable graph into ``output_dir`` (``wyrd get``).
+) -> PullSummary:
+    """Pull a Card's reachable graph into ``output_dir`` (``wyrd pull``).
 
     Select by ``uid`` (with ``kind``) or by ``kind``, ``space``, and ``name``;
     ``version`` narrows either. ``metadata_only`` writes an inspectable,
@@ -52,39 +85,7 @@ def get(
         WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid selector, or the
             client or server error.
     """
-    return _native.get(output_dir, (kind, space, name, version, uid), metadata_only, client)
-
-
-def load(
-    *,
-    kind: str | None = None,
-    space: str | None = None,
-    name: str | None = None,
-    version: str | None = None,
-    uid: str | None = None,
-    path: str | PathLike[str] | None = None,
-    client: WyrdClient | None = None,
-) -> LoadOutput:
-    """Load one Card and materialize its artifacts (``wyrd load``).
-
-    Args:
-        kind: The Card kind.
-        space: The Card space for a named selector, or a UID assertion.
-        name: The Card name for a named selector, or a UID assertion.
-        version: The exact Card version.
-        uid: The exact Card UID.
-        path: The directory that receives the artifacts. Omitted, a managed
-            temporary directory.
-        client: The principal to act as. Omitted, the ambient chain.
-
-    Returns:
-        The exact Card the selector resolved to.
-
-    Raises:
-        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid selector, or the
-            client or server error.
-    """
-    return _native.load((kind, space, name, version, uid), path, client)
+    return _native.pull(output_dir, (kind, space, name, version, uid), metadata_only, client)
 
 
 def issue_key(

@@ -11,7 +11,7 @@ use napi::Env;
 use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
-use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
+use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
 use wyrd_client::verify::Submission;
@@ -74,7 +74,7 @@ impl NativeWyrdClient {
         })
     }
 
-    /// Loads and validates one hydrated bundle whose server calls run as this
+    /// Loads and validates one Card bundle whose server calls run as this
     /// client.
     ///
     /// The state's identity is fixed here: Bifrost startup and every verify
@@ -82,7 +82,7 @@ impl NativeWyrdClient {
     ///
     /// # Arguments
     ///
-    /// * `path` - The hydrated bundle directory.
+    /// * `path` - The Card bundle directory.
     #[napi]
     pub fn open_wyrd_state(&self, path: String) -> NativeWyrdState {
         NativeWyrdState {
@@ -93,14 +93,14 @@ impl NativeWyrdClient {
 
 #[napi]
 impl NativeCards {
-    /// Loads one Card tree from disk and registers it as a composite.
+    /// Loads one Card tree from disk and declares it as a composite.
     ///
     /// # Errors
     ///
     /// Returns a napi error only when the receipt cannot be serialized; load,
     /// validation, and registry failures are returned in the result.
     #[napi]
-    pub fn register_from_path<'env>(
+    pub fn declare_from_path<'env>(
         &self,
         env: &'env Env,
         path: String,
@@ -108,7 +108,7 @@ impl NativeCards {
         let cards = self.cards.clone();
         crate::trace::spawn(env, async move {
             NativeLifecycleResult::outcome(
-                Box::pin(cards.register_from_path(Path::new(&path))).await,
+                Box::pin(cards.declare_from_path(Path::new(&path))).await,
             )
         })
     }
@@ -202,9 +202,9 @@ impl NativeCards {
         })
     }
 
-    /// Hydrates one Card graph into a published local bundle.
+    /// Pulls one Card graph into a published local bundle.
     ///
-    /// `metadata_only` skips artifact payload downloads. A failed hydration
+    /// `metadata_only` skips artifact payload downloads. A failed pull
     /// never publishes a partial bundle.
     ///
     /// # Errors
@@ -212,7 +212,7 @@ impl NativeCards {
     /// Returns a napi error only when the summary cannot be serialized; graph,
     /// destination, and transfer failures are returned in the result.
     #[napi]
-    pub fn hydrate<'env>(
+    pub fn pull<'env>(
         &self,
         env: &'env Env,
         card_ref: String,
@@ -222,13 +222,13 @@ impl NativeCards {
         let cards = self.cards.clone();
         crate::trace::spawn(env, async move {
             let mode = if metadata_only {
-                HydrationMode::MetadataOnly
+                BundleMode::MetadataOnly
             } else {
-                HydrationMode::Complete
+                BundleMode::Complete
             };
             let result = match parse_card_ref(&card_ref) {
                 Ok(card_ref) => {
-                    Box::pin(cards.hydrate(CardSelector::exact(card_ref), &destination, mode)).await
+                    Box::pin(cards.pull(CardSelector::exact(card_ref), &destination, mode)).await
                 }
                 Err(error) => Err(error),
             };
@@ -259,7 +259,7 @@ impl NativeCards {
     }
 }
 
-/// Offline hydrated-bundle view over the shared `wyrd_client` `WyrdState`.
+/// Offline Card bundle view over the shared `wyrd_client` `WyrdState`.
 ///
 /// The open result is retained so an invalid bundle surfaces its catalog error
 /// on the first read instead of as an untyped constructor failure.
@@ -269,7 +269,7 @@ pub struct NativeWyrdState {
     state: StdResult<WyrdState, WyrdError>,
 }
 
-/// Loads and validates one hydrated bundle without contacting Wyrd.
+/// Loads and validates one Card bundle without contacting Wyrd.
 ///
 /// The state resolves the ambient client once, at its first server call, and
 /// keeps it; [`NativeWyrdClient::open_wyrd_state`] fixes the client instead.
@@ -335,7 +335,7 @@ impl NativeWyrdState {
         self.read(|state| NativeLifecycleResult::outcome(Ok(state.root_ref())))
     }
 
-    /// Returns the stored envelope of the root Card the bundle was hydrated
+    /// Returns the stored envelope of the root Card the bundle was pulled
     /// from.
     ///
     /// # Errors

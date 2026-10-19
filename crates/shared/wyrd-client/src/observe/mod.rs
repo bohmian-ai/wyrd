@@ -180,7 +180,7 @@ impl Run {
     /// `card_uid` correlation and the `wyrd.card_uid` its spans carry.
     ///
     /// # Panics
-    /// Never for a loaded [`WyrdState`]: a hydrated bundle refuses any Card
+    /// Never for a loaded [`WyrdState`]: a Card bundle refuses any Card
     /// without a UID at load, and every subject is resolved from that bundle.
     #[must_use]
     pub fn subject_uid(&self) -> &CardUid {

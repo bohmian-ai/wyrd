@@ -262,6 +262,10 @@ release, refuses one outside the CLI's caret-compatible version line, and
 verifies the signature and bundle digest before extracting into a staging
 directory that becomes runnable only by an atomic rename and link swap.
 Rotating the signing key requires a CLI release that embeds the new key.
+`wyrd server dev` runs the installed bundle with inputs resolved as argument,
+environment, saved `[dev]` setting, then prompt, saves them before any tenant
+key is issued, and pins storage and Bifrost data to absolute paths so a restart
+from any directory reuses the same tenant, key, and data.
 
 ## Release evidence
 

@@ -300,15 +300,6 @@ def test_custom_interface_round_trips_through_a_saved_card(tmp_path: Path) -> No
     assert card.data == {"x": 1}
 
 
-def test_load_without_path_requires_registry_configuration() -> None:
-    card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
-
-    with pytest.raises(WyrdError) as error:
-        card.load()
-
-    assert error.value.code == "WYRD_DATA_400_VALIDATION"
-
-
 def test_save_does_not_create_artifact_cards_or_card_refs(tmp_path: Path) -> None:
     DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))).save(tmp_path)
 

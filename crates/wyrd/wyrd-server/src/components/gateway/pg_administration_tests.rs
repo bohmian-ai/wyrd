@@ -24,6 +24,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
     GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayFallbackPolicy, GatewayGovernancePolicy,
     GatewayPayloadField, ProviderCredentialState, ProviderCredentialWrite, ProviderDeployment,
+    ProviderDeploymentsApply,
 };
 use wyrd_spec::ids::{
     CredentialBindingName, ProviderCredentialName, ProviderDeploymentName, ProviderId,
@@ -31,7 +32,9 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::SecretRef;
-use wyrd_sql::queries::gateway::{GatewayAccountingEntryWrite, append_gateway_accounting_entry};
+use wyrd_sql::queries::gateway::{
+    GatewayAccountingEntryWrite, append_gateway_accounting_entry, revoke_gateway_credential,
+};
 use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::recording::RecordingScribe;
@@ -1450,4 +1453,316 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
         governance
     );
     settle_audit(&state).await;
+}
+
+/// `(credential names, deployment names)` the tenant of `admin` holds.
+///
+/// # Panics
+/// Panics when either listing fails.
+async fn resource_names(
+    gateway: &GatewayAdministration<'_>,
+    admin: &Caller,
+) -> (Vec<String>, Vec<String>) {
+    let credentials = gateway.credentials(admin).await.expect("credentials list");
+    let deployments = gateway.deployments(admin).await.expect("deployments list");
+    (
+        credentials
+            .into_iter()
+            .map(|view| view.name.to_string())
+            .collect(),
+        deployments
+            .into_iter()
+            .map(|deployment| deployment.name.to_string())
+            .collect(),
+    )
+}
+
+/// Decodes a composite apply document from its wire JSON.
+///
+/// # Panics
+/// Panics when `value` is not a valid composite apply document.
+fn apply_document(value: Value) -> ProviderDeploymentsApply {
+    serde_json::from_value(value).expect("apply document decodes")
+}
+
+/// Proves the composite apply commits every named credential and deployment
+/// or none: a later invalid deployment, a missing sealing key, a denied
+/// caller, another tenant's reference, and a concurrently revoked credential
+/// each leave the earlier resources exactly as they were, a later SQL
+/// foreign-key refusal rolls back an earlier rotation of an existing managed
+/// secret, which still opens to its original value, while a valid
+/// document commits managed and operator-sourced credentials together with
+/// deployments referencing them and answers only with redacted views.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
+#[tokio::test]
+async fn gateway_apply_is_atomic_and_tenant_scoped() {
+    /// Managed-secret value submitted inline, which no answer may repeat.
+    const SUBMITTED: &str = "sk-live-apply-submission";
+    /// Replacement managed secret of a document the database aborts, which
+    /// must never replace the committed value.
+    const ROTATED: &str = "sk-live-apply-rotation";
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let other = fixture
+        .seed_additional_tenant("gateway-apply-other")
+        .await
+        .expect("tenant b");
+    let keyless = test_state(&fixture).await;
+    let (mut state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
+    state.auth.sealing_key = Some(sealing_keyring(2));
+    let admin_of = admin;
+    let admin = admin_of(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    let managed = json!({
+        "name": "managed-key", "provider": "openai",
+        "source": {"managed_secret": {"secret": SUBMITTED}},
+    });
+    let bearer = |name: &str, credential: &str| {
+        serde_json::to_value(deployment(name, credential)).expect("encode")
+    };
+
+    gateway
+        .put_credential(
+            &admin,
+            &credential_name("shared"),
+            credential(
+                "shared",
+                "openai",
+                json!({"environment": {"binding": "openai-env"}}),
+            ),
+        )
+        .await
+        .expect("seed shared credential");
+    gateway
+        .put_deployment(
+            &admin,
+            &deployment_name("untouched"),
+            deployment("untouched", "shared"),
+        )
+        .await
+        .expect("seed unrelated deployment");
+    let revoked = credential(
+        "revoked",
+        "openai",
+        json!({"environment": {"binding": "openai-env"}}),
+    );
+    gateway
+        .put_credential(&admin, &credential_name("revoked"), revoked)
+        .await
+        .expect("seed revoked credential");
+    gateway
+        .revoke_credential(&admin, &credential_name("revoked"))
+        .await
+        .expect("revoke");
+    let baseline = resource_names(&gateway, &admin).await;
+
+    // A later deployment naming a revoked credential rolls back the earlier
+    // credential and deployment writes of the same document.
+    let rejected = gateway
+        .apply_deployments(
+            &admin,
+            apply_document(json!({
+                "credentials": [managed],
+                "deployments": [bearer("primary", "managed-key"), bearer("broken", "revoked")],
+            })),
+        )
+        .await
+        .expect_err("revoked reference");
+    assert_invalid(&rejected, "auth.credential");
+    assert_eq!(
+        resource_names(&gateway, &admin).await,
+        baseline,
+        "nothing from the refused document committed"
+    );
+
+    // A keyless deployment refuses the managed secret and stores nothing.
+    let refused = GatewayAdministration::new(&keyless)
+        .apply_deployments(
+            &admin,
+            apply_document(json!({
+                "credentials": [managed], "deployments": [bearer("primary", "managed-key")],
+            })),
+        )
+        .await
+        .expect_err("no sealing key");
+    assert!(
+        matches!(refused, WyrdError::ServiceUnavailable { .. }),
+        "{refused:?}"
+    );
+    assert!(!format!("{refused:?}").contains(SUBMITTED));
+    assert_eq!(resource_names(&gateway, &admin).await, baseline);
+
+    // A caller without gateway:write is refused before any work.
+    let reader = caller(tenant, [Permission::gateway_read()]);
+    assert!(matches!(
+        gateway
+            .apply_deployments(
+                &reader,
+                apply_document(json!({
+                    "deployments": [bearer("primary", "shared")],
+                }))
+            )
+            .await,
+        Err(WyrdError::PermissionDeniedRbac { .. })
+    ));
+
+    // Another tenant cannot reference this tenant's credential.
+    let foreign = gateway
+        .apply_deployments(
+            &admin_of(other),
+            apply_document(json!({
+                "deployments": [bearer("primary", "shared")],
+            })),
+        )
+        .await
+        .expect_err("foreign reference");
+    assert_invalid(&foreign, "auth.credential");
+    assert_eq!(resource_names(&gateway, &admin).await, baseline);
+
+    // A valid document commits all of its resources together.
+    let applied = gateway
+        .apply_deployments(
+            &admin,
+            apply_document(json!({
+                "credentials": [managed],
+                "deployments": [bearer("primary", "managed-key"), bearer("secondary", "shared")],
+            })),
+        )
+        .await
+        .expect("apply commits");
+    let rendered = serde_json::to_string(&applied).expect("response encodes");
+    assert!(!rendered.contains(SUBMITTED) && !format!("{applied:?}").contains(SUBMITTED));
+    assert_eq!(applied.credentials[0].name.as_str(), "managed-key");
+    assert_eq!(
+        applied
+            .deployments
+            .iter()
+            .map(|deployment| deployment.name.as_str())
+            .collect::<Vec<_>>(),
+        ["primary", "secondary"]
+    );
+    let (row, ciphertext) = stored_credential(&fixture, tenant, "managed-key").await;
+    assert!(
+        !row.contains(SUBMITTED) && ciphertext.is_some(),
+        "only the sealed envelope is stored"
+    );
+    assert_eq!(
+        resource_names(&gateway, &admin).await,
+        (
+            vec![
+                "managed-key".to_owned(),
+                "revoked".to_owned(),
+                "shared".to_owned()
+            ],
+            vec![
+                "primary".to_owned(),
+                "secondary".to_owned(),
+                "untouched".to_owned()
+            ],
+        )
+    );
+
+    // A database-aborted document rolls back its earlier rotation: the
+    // existing managed secret is rotated first, then moving the referenced
+    // `shared` credential to another provider trips the deployments' foreign
+    // key, so the whole transaction, rotation included, is discarded.
+    let committed_row = stored_credential(&fixture, tenant, "managed-key").await;
+    let referenced = stored_credential(&fixture, tenant, "shared").await;
+    let deployments = gateway.deployments(&admin).await.expect("deployments");
+    let rotate = |name: &str, provider: &str| {
+        json!({
+            "name": name, "provider": provider,
+            "source": {"managed_secret": {"secret": ROTATED}},
+        })
+    };
+    let aborted = gateway
+        .apply_deployments(
+            &admin,
+            apply_document(json!({
+                "credentials": [rotate("managed-key", "openai"), rotate("shared", "anthropic")],
+                "deployments": [bearer("primary", "managed-key"), bearer("secondary", "shared")],
+            })),
+        )
+        .await
+        .expect_err("the foreign key refuses the provider change");
+    assert!(
+        matches!(aborted, WyrdError::GatewayResourceConflict { .. }),
+        "{aborted:?}"
+    );
+    assert!(!format!("{aborted:?}").contains(ROTATED));
+    assert_eq!(
+        stored_credential(&fixture, tenant, "managed-key").await,
+        committed_row,
+        "the earlier rotation's envelope and metadata rolled back"
+    );
+    assert_eq!(
+        stored_credential(&fixture, tenant, "shared").await,
+        referenced
+    );
+    assert_eq!(
+        gateway.deployments(&admin).await.expect("deployments"),
+        deployments
+    );
+    let snapshot = gateway.snapshot(tenant).await.expect("snapshot");
+    let original = snapshot
+        .credential(&credential_name("managed-key"))
+        .expect("admitted");
+    let GatewayCredentialSource::ManagedSecret { sealed } = &original.source else {
+        panic!("managed source");
+    };
+    assert_eq!(
+        ManagedSecretBinding {
+            tenant,
+            name: &original.name,
+            provider: &original.provider,
+        }
+        .open(state.auth.sealing_key.as_ref().expect("keyring"), sealed)
+        .expect("the original envelope opens")
+        .expose_secret(),
+        SUBMITTED
+    );
+
+    // A revoke that commits while the apply waits on the credential row is
+    // observed by the apply, which then refuses instead of committing a
+    // deployment that names a revoked credential.
+    let mut holder = fixture.tenant_conn_for(tenant).await.expect("holder");
+    revoke_gateway_credential(&mut holder, "shared")
+        .await
+        .expect("revoke held");
+    let waiting = tokio::spawn({
+        let (state, admin) = (state.clone(), admin.clone());
+        let document = apply_document(json!({"deployments": [bearer("tertiary", "shared")]}));
+        async move {
+            GatewayAdministration::new(&state)
+                .apply_deployments(&admin, document)
+                .await
+        }
+    });
+    await_lock_waiters(&fixture, 1).await;
+    holder.commit().await.expect("revoke commits");
+    let raced = waiting
+        .await
+        .expect("apply joins")
+        .expect_err("revoked during apply");
+    assert_invalid(&raced, "auth.credential");
+    assert!(matches!(
+        gateway
+            .deployment(&admin, &deployment_name("tertiary"))
+            .await,
+        Err(WyrdError::GatewayResourceNotFound { .. })
+    ));
+
+    settle_audit(&state).await;
+    settle_audit(&keyless).await;
+    let applies = audit_decisions(&scribe, tenant)
+        .into_iter()
+        .filter(|(operation, _)| operation == "gateway.provider_deployments.apply")
+        .map(|(_, outcome)| outcome)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applies,
+        ["allowed", "denied", "allowed", "allowed", "allowed"]
+    );
 }

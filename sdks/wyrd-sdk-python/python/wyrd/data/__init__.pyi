@@ -727,12 +727,11 @@ class DataCard(Generic[_DataInterfaceT]):
 
     ```python
     cards = Cards()
-    card = cards.data.get(space="ml", name="training-data", eager_load=True)
-    frame = card.data
+    card = cards.data.get(space="ml", name="training-data")
     ```
 
-    ``get`` returns the validated envelope without data bytes unless
-    ``eager_load=True``, which downloads the artifacts and calls ``load``.
+    ``get`` returns the validated envelope without data bytes. Pull a
+    Service bundle and open it with ``WyrdState.from_path`` to load data.
 
     Identity fields are validated when the card is serialized
     (``save``, ``model_dump``, ``as_card_ref``), not at construction.
@@ -982,7 +981,7 @@ class DataCard(Generic[_DataInterfaceT]):
         """Write the data artifacts and ``card.json`` to a local directory.
 
         Updates the interface metadata and ``stats`` from the write. Local
-        only: nothing is uploaded or registered, and no Artifact cards are
+        only: nothing is uploaded or declared, and no Artifact cards are
         created.
 
         Args:
@@ -1000,22 +999,19 @@ class DataCard(Generic[_DataInterfaceT]):
 
     def load(
         self,
-        path: PathLike | None = ...,
+        path: PathLike,
         load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> None:
         """Read data into the held interface from a local card directory.
 
         Args:
-            path: local card directory. Omit it only to reload a card
-                returned by ``Cards.data.get(eager_load=True)``, which reuses
-                the artifacts that call downloaded.
+            path: local card directory.
             load_kwargs: options forwarded to the interface's ``load``; see
                 ``DataInterface.load``.
 
         Raises:
-            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``path`` is omitted
-                without eager-loaded artifacts or no interface is attached,
-                or the errors of the interface's ``load``.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if no interface is
+                attached, or the errors of the interface's ``load``.
         """
         ...
 

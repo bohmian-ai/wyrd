@@ -56,7 +56,7 @@ impl PlatformEndpoint {
     /// `WYRD_PLATFORM_CREDENTIAL` is unset or empty, and
     /// [`WyrdCliError::Server`] when the credential is refused or the platform
     /// plane is not configured on this deployment.
-    pub(super) async fn connect(&self) -> Result<Platform, WyrdCliError> {
+    pub(crate) async fn connect(&self) -> Result<Platform, WyrdCliError> {
         let credential = std::env::var(PLATFORM_CREDENTIAL_ENV)
             .ok()
             .filter(|value| !value.is_empty())

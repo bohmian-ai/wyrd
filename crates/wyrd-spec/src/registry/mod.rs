@@ -1,26 +1,24 @@
-//! Card registration wire contracts.
+//! Card declaration wire contracts.
 
+/// Offline Card bundle wire projections.
+mod bundle;
 mod enums;
-/// Offline hydrated-bundle wire projections.
-mod hydrated;
 mod ids;
 mod reads;
 mod submission;
 mod upload;
 
 pub use crate::reference::{InlineableRef, Ref};
-pub use enums::{CardLifecycleStatus, RegistrationOutcomeKind};
-pub use hydrated::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
-};
-pub use ids::{PathValidationError, RegistrationOperationId, RelativeArtifactPath};
+pub use bundle::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
+pub use enums::{CardLifecycleStatus, DeclarationOutcomeKind};
+pub use ids::{DeclarationOperationId, PathValidationError, RelativeArtifactPath};
 pub use reads::{
     ArtifactInventoryResponse, CardLocator, CardSummary, DeleteCardResponse, GetCardResponse,
     ListCardsRequest, ListCardsResponse, ListVersionsResponse, StoredArtifactEntry,
 };
 pub use submission::{
-    ArtifactManifestEntry, CardRegistrationOutcome, CardSubmission, CardUploadPlan,
-    CreateCardRequest, CreateCardResponse, RegistrationReceipt, RegistrationReplaySeed,
+    ArtifactManifestEntry, CardDeclarationOutcome, CardSubmission, CardUploadPlan,
+    DeclarationReceipt, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
     canonical_artifact_manifest_hash, validate_artifact_manifest,
 };
 pub use upload::CardUploadEntry;

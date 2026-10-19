@@ -27,10 +27,12 @@ from desk import Desk
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    # ANCHOR: lifespan
     app.state.desk = Desk()
     yield
     # Flush buffered tickets and spans to Wyrd before exiting.
     app.state.desk.state.shutdown()
+    # ANCHOR_END: lifespan
 
 
 app = FastAPI(title="support-desk", lifespan=lifespan)

@@ -1,17 +1,17 @@
-//! Projections from registry rows into composite registration responses.
+//! Projections from registry rows into composite declaration responses.
 
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
-use wyrd_sql::queries::cards::RegisteredCardRow;
+use wyrd_spec::registry::{CardDeclarationOutcome, CardLifecycleStatus, DeclarationOutcomeKind};
+use wyrd_sql::queries::cards::DeclaredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
 /// Project one durable card row and write classification onto the wire.
 #[must_use]
 pub fn outcome_row_to_response(
-    row: &RegisteredCardRow,
-    outcome: RegistrationOutcomeKind,
-) -> CardRegistrationOutcome {
-    CardRegistrationOutcome {
+    row: &DeclaredCardRow,
+    outcome: DeclarationOutcomeKind,
+) -> CardDeclarationOutcome {
+    CardDeclarationOutcome {
         card_ref: CardRef {
             kind: row.kind.clone(),
             name: row.name.clone(),
@@ -31,9 +31,9 @@ pub fn outcome_row_to_response(
 #[must_use]
 pub fn existing_row_to_response(
     row: &ParsedCardRow,
-    outcome: RegistrationOutcomeKind,
-) -> CardRegistrationOutcome {
-    CardRegistrationOutcome {
+    outcome: DeclarationOutcomeKind,
+) -> CardDeclarationOutcome {
+    CardDeclarationOutcome {
         card_ref: CardRef {
             kind: row.kind.clone(),
             name: row.name.clone(),
@@ -74,9 +74,9 @@ mod tests {
     use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::registry::{
-        CardLifecycleStatus, RegistrationOperationId, RegistrationOutcomeKind,
+        CardLifecycleStatus, DeclarationOperationId, DeclarationOutcomeKind,
     };
-    use wyrd_sql::queries::cards::RegisteredCardRow;
+    use wyrd_sql::queries::cards::DeclaredCardRow;
     use wyrd_sql::row_types::cards::CardStatus;
 
     use super::outcome_row_to_response;
@@ -117,8 +117,8 @@ mod tests {
     }
 
     /// Build one deterministic durable row for response projection tests.
-    fn row(status: CardStatus) -> RegisteredCardRow {
-        RegisteredCardRow {
+    fn row(status: CardStatus) -> DeclaredCardRow {
+        DeclaredCardRow {
             card_uid: CardUid::from_uuid(Uuid::now_v7())
                 .expect("test_setup: UUIDv7 is a valid card UID"),
             kind: CardKind::Prompt,
@@ -130,7 +130,7 @@ mod tests {
             status,
             created_at: Utc::now(),
             attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
-            operation_id: RegistrationOperationId::new(Uuid::now_v7()),
+            operation_id: DeclarationOperationId::new(Uuid::now_v7()),
         }
     }
 
@@ -145,21 +145,20 @@ mod tests {
             (CardStatus::Failed, CardLifecycleStatus::Failed),
             (CardStatus::Expired, CardLifecycleStatus::Expired),
         ] {
-            let outcome =
-                outcome_row_to_response(&row(stored), RegistrationOutcomeKind::Registered);
+            let outcome = outcome_row_to_response(&row(stored), DeclarationOutcomeKind::Declared);
             assert_eq!(outcome.status, expected);
         }
     }
 
-    /// Preserve UID-bearing card identity and registration classification.
+    /// Preserve UID-bearing card identity and declaration classification.
     #[test]
     fn outcome_projects_registered_identity() {
         let row = row(CardStatus::Pending);
-        let projected = outcome_row_to_response(&row, RegistrationOutcomeKind::Registered);
+        let projected = outcome_row_to_response(&row, DeclarationOutcomeKind::Declared);
 
         assert_eq!(projected.card_ref.uid.as_ref(), Some(&row.card_uid));
         assert_eq!(projected.spec_hash, row.spec_hash);
-        assert_eq!(projected.outcome, RegistrationOutcomeKind::Registered);
+        assert_eq!(projected.outcome, DeclarationOutcomeKind::Declared);
         assert_eq!(projected.status, CardLifecycleStatus::Pending);
     }
 }

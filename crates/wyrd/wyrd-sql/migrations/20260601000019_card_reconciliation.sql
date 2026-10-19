@@ -1,12 +1,12 @@
 -- Durable, bounded reconciliation state for Card lifecycle side effects.
 --
--- The state lives on the tenant-owned card row so a registration operation
+-- The state lives on the tenant-owned card row so a declaration operation
 -- containing several cards cannot make one card's storage failure hide another's
 -- recovery state. Claims are made through the audited platform-admin pool and
 -- all lifecycle transitions remain tenant-scoped.
 
 ALTER TABLE wyrd.cards
-    ADD COLUMN reconcile_kind TEXT NOT NULL DEFAULT 'registration',
+    ADD COLUMN reconcile_kind TEXT NOT NULL DEFAULT 'declaration',
     ADD COLUMN reconcile_status TEXT NOT NULL DEFAULT 'idle',
     ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN reconcile_next_attempt_at TIMESTAMPTZ,
@@ -18,7 +18,7 @@ ALTER TABLE wyrd.cards
 
 ALTER TABLE wyrd.cards
     ADD CONSTRAINT cards_reconcile_kind_check CHECK (
-        reconcile_kind IN ('registration', 'blob', 'finalization', 'cleanup')
+        reconcile_kind IN ('declaration', 'blob', 'finalization', 'cleanup')
     ),
     ADD CONSTRAINT cards_reconcile_status_check CHECK (
         reconcile_status IN ('idle', 'pending', 'leased', 'dead_lettered')

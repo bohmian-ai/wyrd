@@ -27,7 +27,7 @@ async function issue(): Promise<{ principal: string; key: string }> {
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */
 async function author(key: string): Promise<unknown> {
-  return (await Cards.connect({ client: WyrdClient.connect({ credential: key }) })).registerFromPath(AUTHORED);
+  return (await Cards.connect({ client: WyrdClient.connect({ credential: key }) })).declareFromPath(AUTHORED);
 }
 
 test("granted editor reaches the next token until revoked", async ({ bundle: _ }) => {

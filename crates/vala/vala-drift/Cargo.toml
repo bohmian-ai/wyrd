@@ -6,7 +6,6 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "In-memory drift baseline fit and target scoring for PSI, SPC, and Custom methods."
 
 [lib]

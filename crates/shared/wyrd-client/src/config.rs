@@ -330,6 +330,7 @@ mod tests {
                 tenant: Some("file-tenant".to_owned()),
                 token_cache: None,
             },
+            ..GlobalConfig::default()
         };
 
         let resolved = ClientConfig::from_environment(environment, &config, None, None);

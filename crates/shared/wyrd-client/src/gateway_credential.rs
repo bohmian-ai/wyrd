@@ -24,11 +24,14 @@ use reqwest::Method;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite};
+use wyrd_spec::gateway::{
+    ProviderCredentialView, ProviderCredentialWrite, ProviderDeploymentsApplied,
+    ProviderDeploymentsApply,
+};
 use wyrd_spec::ids::ProviderCredentialName;
 
 use crate::WyrdClient;
-use crate::gateway::credential_path;
+use crate::gateway::{DEPLOYMENTS, credential_path};
 
 /// Mutates provider credentials over one shared [`WyrdClient`].
 ///
@@ -69,6 +72,26 @@ impl CredentialWriter {
     ) -> Result<ProviderCredentialView, WyrdError> {
         self.send(Method::PUT, &credential_path(&write.name), Some(write))
             .await
+    }
+
+    /// Creates or rotates credentials and creates or replaces the deployments
+    /// using them in one server transaction, returning redacted views.
+    ///
+    /// It lives here, not on the SDK handle, because the document can carry
+    /// managed secrets. Reapplying converges through named upserts.
+    ///
+    /// # Arguments
+    /// * `apply` - Credentials and deployments to commit together.
+    ///
+    /// # Errors
+    /// Returns the server's stable permission, invalid-configuration,
+    /// conflict, or availability error; on any error nothing was applied
+    /// unless the response was lost after commit.
+    pub async fn apply_deployments(
+        &self,
+        apply: &ProviderDeploymentsApply,
+    ) -> Result<ProviderDeploymentsApplied, WyrdError> {
+        self.send(Method::POST, DEPLOYMENTS, Some(apply)).await
     }
 
     /// Terminally revokes a provider credential; repeating is harmless.

@@ -40,8 +40,8 @@ from .support import (
     FIXTURES,
     Receiver,
     client_of,
-    download,
-    register,
+    declare,
+    pull,
     service_key,
     timeline,
 )
@@ -64,7 +64,7 @@ CONFORMING = "Refunds follow our policy."
 ANSWER_TEXT = [{"slot": "answer", "locator": {"json_pointer": "/text"}}]
 """The citation of the answer's text, which every cited Verdict of the story names."""
 
-TOOLS = ("cards.get_by_ref", "bifrost.query", "code.run")
+TOOLS = ("cards.get", "bifrost.query", "code.run")
 """The three built-ins the investigator calls, in call order."""
 
 DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -123,8 +123,8 @@ def policy_desk_bundle(
 ) -> Path:
     """The ``policy-desk`` Service, registered and downloaded, with ``openai`` deployed."""
     configure_gateway(WyrdClient())
-    register(cards, "cards/verifier_building_blocks/policy-desk.yaml")
-    return download(cards, "policy-desk", tmp_path_factory.mktemp("policy-desk"))
+    declare(cards, "cards/verifier_building_blocks/policy-desk.yaml")
+    return pull(cards, "policy-desk", tmp_path_factory.mktemp("policy-desk"))
 
 
 @pytest.fixture(scope="module")
@@ -153,8 +153,8 @@ def isolated_desk(receiver: Receiver, tmp_path: Path) -> Iterator[WyrdState]:
     with WyrdTestServer(verification_runtime=True, provider_base_url=receiver.url):
         cards = Cards()
         configure_gateway(WyrdClient())
-        register(cards, "cards/verifier_building_blocks/policy-desk.yaml")
-        bundle = download(cards, "policy-desk", tmp_path)
+        declare(cards, "cards/verifier_building_blocks/policy-desk.yaml")
+        bundle = pull(cards, "policy-desk", tmp_path)
         state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("policy-desk")))
         state.start_bifrost()
         yield state

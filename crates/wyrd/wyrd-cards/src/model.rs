@@ -133,11 +133,6 @@ pub struct ModelCard {
     #[cfg(feature = "python")]
     #[serde(skip)]
     pub interface: Option<Py<PyAny>>,
-    /// Temporary verified workspace retained while an eager registry load owns
-    /// interface paths beneath it.
-    #[cfg(feature = "python")]
-    #[serde(skip)]
-    pub artifact_workspace: Option<tempfile::TempDir>,
 }
 
 impl ModelCard {
@@ -352,8 +347,6 @@ impl ModelCard {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         })
     }
 
@@ -461,7 +454,6 @@ impl ModelCard {
             created_at: utc_now(),
             is_card: true,
             interface: Some(handle.into_py_any(py)?),
-            artifact_workspace: None,
         };
         card.to_model_spec_from_metadata().validate()?;
         Ok(card)
@@ -714,41 +706,25 @@ impl ModelCard {
 
     /// Load model artifacts through the held interface.
     ///
-    /// Pass `path` to load an existing local materialization. Without a path,
-    /// call this only on a `ModelCard` returned by
-    /// `Cards.model.get(eager_load=True)`; Wyrd reuses the verified artifact
-    /// workspace retained by that eager operation.
-    ///
-    /// This method is the explicit boundary where model bytes enter memory.
+    /// Pass `path` to load an existing local materialization; `WyrdState`
+    /// loads pulled bundles through this local-only holder operation. This
+    /// method is the explicit boundary where model bytes enter memory.
     ///
     /// # Arguments
-    /// * `path` - Optional local materialization directory. Omit it only when
-    ///   reloading a holder returned by `Cards.model.get(eager_load=True)`.
+    /// * `path` - Local materialization directory.
     /// * `load_kwargs` - Optional `ModelLoadArgs` or JSON-compatible mapping
     ///   forwarded to the model interface.
     ///
     /// # Errors
-    /// Returns a Wyrd error when neither a local path nor retained server
-    /// artifacts are available, no interface is attached, or interface load
+    /// Returns a Wyrd error when no interface is attached or interface load
     /// fails.
-    #[pyo3(signature = (path=None, load_kwargs=None))]
+    #[pyo3(signature = (path, load_kwargs=None))]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: Option<PathBuf>,
+        path: PathBuf,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
-        let path = path
-            .or_else(|| {
-                self.artifact_workspace
-                    .as_ref()
-                    .map(|workspace| workspace.path().join("artifacts"))
-            })
-            .ok_or_else(|| {
-                WyrdPyError::model_validation(
-                    "ModelCard.load requires path for a holder without server artifacts",
-                )
-            })?;
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::model_validation("ModelCard interface is required for local load")
@@ -841,7 +817,7 @@ impl ModelCard {
         let mut card = Self::from_path(&path)?;
         card.hydrate_interface(py, interface)?;
         if path.is_dir() {
-            card.load(py, Some(path), load_kwargs)?;
+            card.load(py, path, load_kwargs)?;
         }
         Ok(card)
     }
@@ -1224,8 +1200,6 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         }
     }
 

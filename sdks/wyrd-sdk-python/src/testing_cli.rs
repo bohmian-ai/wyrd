@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_cli::commands::{
-    self, LoadOutput, McpHostReport, McpInstallReport, PlanCard, PlanReport, SelectorArgs,
+    self, CheckCard, CheckReport, McpHostReport, McpInstallReport, SelectorArgs,
 };
 use wyrd_cli::{Diagnostic, Severity};
 use wyrd_client::WyrdClient;
@@ -29,7 +29,7 @@ use wyrd_utils::py::WyrdPyResult;
 
 use crate::client::PyWyrdClient;
 use crate::gateway::{PyGateway, decode};
-use crate::state::{PyHydrationSummary, PyRegistrationReceipt};
+use crate::state::{PyCardEnvelope, PyDeclarationReceipt, PyPullSummary};
 
 /// Run one shared command future on the Wyrd runtime with the GIL released.
 ///
@@ -48,15 +48,15 @@ fn rust_client(client: Option<&Bound<'_, PyWyrdClient>>) -> Option<WyrdClient> {
     client.map(|client| client.get().inner().clone())
 }
 
-/// One Card a [`PyPlanReport`] would register, identified as authored.
-#[pyclass(module = "wyrd.testing.cli", name = "PlanCard", frozen)]
-pub struct PyPlanCard {
-    /// Authored identity from the shared planner.
-    inner: PlanCard,
+/// One Card a [`PyCheckReport`] would declare, identified as authored.
+#[pyclass(module = "wyrd.testing.cli", name = "CheckCard", frozen)]
+pub struct PyCheckCard {
+    /// Authored identity from the shared local check.
+    inner: CheckCard,
 }
 
 #[pymethods]
-impl PyPlanCard {
+impl PyCheckCard {
     /// Card kind wire name, such as `Service`.
     #[getter]
     fn kind(&self) -> &str {
@@ -82,15 +82,15 @@ impl PyPlanCard {
     }
 }
 
-/// One non-fatal loader diagnostic in a [`PyPlanReport`].
-#[pyclass(module = "wyrd.testing.cli", name = "PlanDiagnostic", frozen)]
-pub struct PyPlanDiagnostic {
+/// One non-fatal loader diagnostic in a [`PyCheckReport`].
+#[pyclass(module = "wyrd.testing.cli", name = "CheckDiagnostic", frozen)]
+pub struct PyCheckDiagnostic {
     /// Diagnostic from the shared loader.
     inner: Diagnostic,
 }
 
 #[pymethods]
-impl PyPlanDiagnostic {
+impl PyCheckDiagnostic {
     /// Stable catalog code.
     #[getter]
     const fn code(&self) -> &'static str {
@@ -119,62 +119,40 @@ impl PyPlanDiagnostic {
     }
 }
 
-/// Deterministic local registration plan returned by `plan`.
-#[pyclass(module = "wyrd.testing.cli", name = "PlanReport")]
-pub struct PyPlanReport {
+/// Deterministic local check report returned by `declare_check`.
+#[pyclass(module = "wyrd.testing.cli", name = "CheckReport")]
+pub struct PyCheckReport {
     /// Whether the tree loaded and resolved; always `True` when returned.
     #[pyo3(get)]
     ok: bool,
-    /// Cards the tree would register, in registration order.
+    /// Cards the tree would declare, in declaration order.
     #[pyo3(get)]
-    cards: Vec<Py<PyPlanCard>>,
+    cards: Vec<Py<PyCheckCard>>,
     /// Non-fatal loader diagnostics.
     #[pyo3(get)]
-    diagnostics: Vec<Py<PyPlanDiagnostic>>,
+    diagnostics: Vec<Py<PyCheckDiagnostic>>,
 }
 
-impl PyPlanReport {
+impl PyCheckReport {
     /// Move the shared report into Python-owned items.
     ///
     /// # Errors
     ///
     /// Returns a Python error when an item cannot be allocated.
-    fn new(py: Python<'_>, report: PlanReport) -> PyResult<Self> {
+    fn new(py: Python<'_>, report: CheckReport) -> PyResult<Self> {
         Ok(Self {
             ok: report.ok,
             cards: report
                 .cards
                 .into_iter()
-                .map(|inner| Py::new(py, PyPlanCard { inner }))
+                .map(|inner| Py::new(py, PyCheckCard { inner }))
                 .collect::<PyResult<_>>()?,
             diagnostics: report
                 .diagnostics
                 .into_iter()
-                .map(|inner| Py::new(py, PyPlanDiagnostic { inner }))
+                .map(|inner| Py::new(py, PyCheckDiagnostic { inner }))
                 .collect::<PyResult<_>>()?,
         })
-    }
-}
-
-/// Result of `load`: the exact Card the selector resolved to.
-#[pyclass(module = "wyrd.testing.cli", name = "LoadOutput", frozen)]
-pub struct PyLoadOutput {
-    /// Output from the shared load command.
-    inner: LoadOutput,
-}
-
-#[pymethods]
-impl PyLoadOutput {
-    /// Exact reference of the loaded Card.
-    #[getter]
-    fn card_ref(&self) -> CardRefPy {
-        CardRefPy(self.inner.card_ref.clone())
-    }
-
-    /// Whether the artifacts were materialized; always `True` when returned.
-    #[getter]
-    const fn materialized(&self) -> bool {
-        self.inner.materialized
     }
 }
 
@@ -291,7 +269,7 @@ impl PyMcpInstallReport {
     }
 }
 
-/// Validate a local Card tree without contacting a server (`wyrd plan`).
+/// Validate a local Card tree without contacting a server (`wyrd declare --check`).
 ///
 /// # Errors
 ///
@@ -299,12 +277,12 @@ impl PyMcpInstallReport {
 /// `details`, when the tree cannot be loaded or resolved.
 #[pyfunction]
 #[pyo3(signature = (path))]
-fn plan(py: Python<'_>, path: PathBuf) -> WyrdPyResult<PyPlanReport> {
-    let report = py.detach(|| commands::plan(&path))?;
-    Ok(PyPlanReport::new(py, report)?)
+fn declare_check(py: Python<'_>, path: PathBuf) -> WyrdPyResult<PyCheckReport> {
+    let report = py.detach(|| commands::declare_check(&path))?;
+    Ok(PyCheckReport::new(py, report)?)
 }
 
-/// Register a local Card tree and return its receipt (`wyrd apply`).
+/// Declare a local Card tree and return its receipt (`wyrd declare`).
 ///
 /// # Errors
 ///
@@ -312,13 +290,13 @@ fn plan(py: Python<'_>, path: PathBuf) -> WyrdPyResult<PyPlanReport> {
 /// endpoint, or the server's refusal.
 #[pyfunction]
 #[pyo3(signature = (path, *, client=None))]
-fn apply(
+fn declare(
     py: Python<'_>,
     path: PathBuf,
     client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyRegistrationReceipt> {
+) -> WyrdPyResult<PyDeclarationReceipt> {
     let client = rust_client(client);
-    Ok(block_on(py, commands::apply(&path, client))?.into())
+    Ok(block_on(py, commands::declare(&path, client))?.into())
 }
 
 /// Card selector fields in `(kind, space, name, version, uid)` order.
@@ -344,48 +322,47 @@ fn selector((kind, space, name, version, uid): SelectorFields) -> SelectorArgs {
     }
 }
 
-/// Hydrate a Card's reachable graph into `output_dir` (`wyrd get`).
+/// Read one Card envelope without downloading artifacts (`wyrd get`).
 ///
 /// # Errors
 ///
 /// Raises `WyrdError` for an invalid selector, a missing credential or bad
-/// endpoint, or a failed read or hydration.
+/// endpoint, or a failed read.
+#[pyfunction]
+#[pyo3(signature = (fields, client))]
+fn get(
+    py: Python<'_>,
+    fields: SelectorFields,
+    client: Option<&Bound<'_, PyWyrdClient>>,
+) -> WyrdPyResult<PyCardEnvelope> {
+    let selector = selector(fields);
+    let client = rust_client(client);
+    let card = block_on(py, commands::get(&selector, client))?;
+    Ok(PyCardEnvelope::from_registry_card(card)?)
+}
+
+/// Pull a Card's reachable graph into `output_dir` (`wyrd pull`).
+///
+/// # Errors
+///
+/// Raises `WyrdError` for an invalid selector, a missing credential or bad
+/// endpoint, or a failed read, download, or bundle publication.
 #[pyfunction]
 #[pyo3(signature = (output_dir, fields, metadata_only, client))]
-fn get(
+fn pull(
     py: Python<'_>,
     output_dir: PathBuf,
     fields: SelectorFields,
     metadata_only: bool,
     client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyHydrationSummary> {
+) -> WyrdPyResult<PyPullSummary> {
     let selector = selector(fields);
     let client = rust_client(client);
     let inner = block_on(
         py,
-        commands::get(&selector, &output_dir, metadata_only, client),
+        commands::pull(&selector, &output_dir, metadata_only, client),
     )?;
-    Ok(PyHydrationSummary::from(inner))
-}
-
-/// Load one Card and materialize its artifacts (`wyrd load`).
-///
-/// # Errors
-///
-/// Raises `WyrdError` for an invalid selector, a missing credential or bad
-/// endpoint, or a failed load or artifact transfer.
-#[pyfunction]
-#[pyo3(signature = (fields, path, client))]
-fn load(
-    py: Python<'_>,
-    fields: SelectorFields,
-    path: Option<PathBuf>,
-    client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyLoadOutput> {
-    let selector = selector(fields);
-    let client = rust_client(client);
-    let inner = block_on(py, commands::load(&selector, path.as_deref(), client))?;
-    Ok(PyLoadOutput { inner })
+    Ok(PyPullSummary::from(inner))
 }
 
 /// Issue an API key bound to one exact Card (`wyrd auth issue-key`).
@@ -509,17 +486,16 @@ fn mcp_install(
 ///
 /// Returns a Python error when an item cannot be installed on `module`.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyPlanCard>()?;
-    module.add_class::<PyPlanDiagnostic>()?;
-    module.add_class::<PyPlanReport>()?;
-    module.add_class::<PyLoadOutput>()?;
+    module.add_class::<PyCheckCard>()?;
+    module.add_class::<PyCheckDiagnostic>()?;
+    module.add_class::<PyCheckReport>()?;
     module.add_class::<PyIssueKeyResponse>()?;
     module.add_class::<PyMcpHostReport>()?;
     module.add_class::<PyMcpInstallReport>()?;
-    module.add_function(wrap_pyfunction!(plan, module)?)?;
-    module.add_function(wrap_pyfunction!(apply, module)?)?;
+    module.add_function(wrap_pyfunction!(declare_check, module)?)?;
+    module.add_function(wrap_pyfunction!(declare, module)?)?;
     module.add_function(wrap_pyfunction!(get, module)?)?;
-    module.add_function(wrap_pyfunction!(load, module)?)?;
+    module.add_function(wrap_pyfunction!(pull, module)?)?;
     module.add_function(wrap_pyfunction!(issue_key, module)?)?;
     module.add_function(wrap_pyfunction!(mcp_install, module)?)?;
     module.add_function(wrap_pyfunction!(put_provider_credential, module)?)?;

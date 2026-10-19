@@ -84,9 +84,9 @@ The URL is stored in that agent's entry; open the file from the table above to s
 
 ## 4. Check the connection
 
-Ask the agent to list its MCP tools, then call `wyrd.guide` with `{"topic":"overview"}`. The guide returns `topic`, ordered `steps`, and `examples` containing tool names and argument objects. Its other topics are `cards`, `verification`, and `bifrost_sql`.
+Ask the agent to list its MCP tools, then call `wyrd.guide` with `{"topic":"overview"}`. The guide returns `topic`, ordered `steps`, and `examples` containing tool names and argument objects. Its other topics are `start`, `cards`, `verification`, and `bifrost_sql`. A coding agent new to Wyrd starts with `{"topic":"start"}`, which the server's initialization instructions name: it teaches the whole Declare → Observe → Verify workflow, including the CLI and SDK steps that MCP does not perform.
 
-Try a question about a Service you registered:
+Try a question about a Service you declared:
 
 ```text
 Analyze service support-desk in space default. Discover its exact version, follow its component
@@ -94,7 +94,7 @@ references, and explain what the retained evidence supports. State missing
 evidence and permission refusals explicitly.
 ```
 
-The agent should discover versions with `cards.list`, read one with `cards.get_by_ref`, and follow the exact references in `card.relationships.outbound_refs` and `inbound_refs`. Each edge stores its identity under `ref`. It should discover and describe Bifrost tables before querying evidence.
+The agent should discover versions with `cards.list`, read one with `cards.get` and its `card_ref`, and follow the exact references in `card.relationships.outbound_refs` and `inbound_refs`. Each edge stores its identity under `ref`. It should discover and describe Bifrost tables before querying evidence.
 
 Read the [MCP tool reference](/reference/mcp-tools/) for every shipped capability and its permissions. For complete procedures, see [Write and query custom data with Bifrost](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/) and [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/).
 

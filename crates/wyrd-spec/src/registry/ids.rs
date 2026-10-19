@@ -1,4 +1,4 @@
-//! Registration identity and path types.
+//! Declaration identity and path types.
 
 use std::fmt;
 
@@ -180,13 +180,13 @@ mod tests {
     }
 }
 
-/// Opaque server handle for an in-flight registration operation.
+/// Opaque server handle for an in-flight declaration operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(transparent)]
-pub struct RegistrationOperationId(Uuid);
+pub struct DeclarationOperationId(Uuid);
 
-impl RegistrationOperationId {
+impl DeclarationOperationId {
     /// Construct an operation id from a UUID.
     #[must_use]
     pub const fn new(value: Uuid) -> Self {

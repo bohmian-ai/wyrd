@@ -24,6 +24,7 @@ use wyrd_spec::gateway::{
     GatewayFallbackPolicy, GatewayGovernancePolicy, GatewayModelPricing,
     ProviderCredentialSourceView, ProviderCredentialState, ProviderCredentialView,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
+    ProviderDeploymentsApplied, ProviderDeploymentsApply,
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_sql::queries::gateway::{
@@ -106,28 +107,7 @@ impl<'a> GatewayAdministration<'a> {
             &resource,
             |mut conn| async move {
                 require_path_name(name.as_str(), write.name.as_str())?;
-                let view = ProviderCredentialSourceView::from(&write.source);
-                self.validate_source(caller.data_tenant_id, &write.provider, &view)?;
-                let sealed = self.seal(caller.data_tenant_id, name, &write)?;
-                let source = encode(&view)?;
-                let row = upsert_gateway_credential(
-                    &mut conn,
-                    GatewayCredentialWrite {
-                        name: name.as_str(),
-                        provider: write.provider.as_str(),
-                        source: &source,
-                        secret: sealed.as_deref(),
-                    },
-                )
-                .await
-                .map_err(|error| referenced_conflict(error, "credential", name.as_str()))?
-                .ok_or_else(|| {
-                    conflict(
-                        "provider credential is revoked and cannot be replaced",
-                        name.as_str(),
-                    )
-                })?;
-                let view = credential_view(row)?;
+                let view = self.write_credential(&mut conn, caller, &write).await?;
                 conn.commit().await.map_err(unavailable)?;
                 Ok(view)
             },
@@ -277,62 +257,8 @@ impl<'a> GatewayAdministration<'a> {
             &resource,
             |mut conn| async move {
                 require_path_name(name.as_str(), deployment.name.as_str())?;
-                deployment.validate().map_err(invalid)?;
-                let mut credential_provider = None;
-                if let Some(credential) = deployment.auth.credential() {
-                    let row = gateway_credential_for_share(&mut conn, credential.as_str())
-                        .await
-                        .map_err(unavailable)?;
-                    let reason = match row {
-                        None => Some("does not name a provider credential in this tenant"),
-                        Some(row) if row.state != "active" => {
-                            Some("names a revoked provider credential")
-                        }
-                        Some(row) => match ProviderId::new(&row.provider) {
-                            Ok(provider) if deployment.adapter.accepts_credential_provider(&provider) => {
-                                let source: ProviderCredentialSourceView = decode(row.source)?;
-                                // A managed secret is the tenant's own value, so
-                                // it carries no operator assignment to confine.
-                                let assigned = matches!(
-                                    source,
-                                    ProviderCredentialSourceView::ManagedSecret
-                                ) || self.config.assignment(&source).is_some_and(|assignment| {
-                                    assignment.permits(
-                                        caller.data_tenant_id,
-                                        &provider,
-                                        Some(&deployment.adapter),
-                                    )
-                                });
-                                credential_provider = Some(row.provider);
-                                (!assigned).then_some(
-                                    "names a credential not assigned to this tenant, provider, and endpoint host",
-                                )
-                            }
-                            _ => Some("names a credential for a provider this adapter does not serve"),
-                        },
-                    };
-                    if let Some(reason) = reason {
-                        return Err(invalid(GatewayContractError::new(
-                            "auth.credential",
-                            reason,
-                        )));
-                    }
-                }
-                let document = encode(&deployment)?;
-                upsert_gateway_deployment(
-                    &mut conn,
-                    GatewayDeploymentWrite {
-                        name: name.as_str(),
-                        credential_name: deployment
-                            .auth
-                            .credential()
-                            .map(ProviderCredentialName::as_str),
-                        credential_provider: credential_provider.as_deref(),
-                        deployment: &document,
-                    },
-                )
-                .await
-                .map_err(unavailable)?;
+                self.write_deployment(&mut conn, caller, &deployment)
+                    .await?;
                 conn.commit().await.map_err(unavailable)?;
                 Ok(deployment)
             },
@@ -416,6 +342,52 @@ impl<'a> GatewayAdministration<'a> {
                     .await
                     .map_err(unavailable)?;
                 conn.commit().await.map_err(unavailable)
+            },
+        )
+        .await
+    }
+
+    /// Creates or replaces credentials and the deployments using them in one
+    /// tenant transaction.
+    ///
+    /// The document is validated whole first, then each credential and each
+    /// deployment runs the same validation, sealing, and reference checks as
+    /// [`Self::put_credential`] and [`Self::put_deployment`] on one shared
+    /// connection, so a deployment observes the submitted credentials and
+    /// share-locks every referenced row until commit. Any refusal drops the
+    /// transaction, leaving every named resource as it was; names absent from
+    /// the document are untouched.
+    ///
+    /// # Errors
+    /// Returns a permission error without `gateway:write`,
+    /// `GatewayInvalidConfiguration` for an invalid document, source, or
+    /// credential reference, `GatewayResourceConflict` for a revoked
+    /// credential name or orphaning provider change, and `ServiceUnavailable`
+    /// when sealing or storage fails.
+    pub async fn apply_deployments(
+        &self,
+        caller: &Caller,
+        apply: ProviderDeploymentsApply,
+    ) -> Result<ProviderDeploymentsApplied, WyrdError> {
+        self.audited(
+            caller,
+            &Permission::gateway_write(),
+            "gateway.provider_deployments.apply",
+            "gateway_provider_deployments",
+            |mut conn| async move {
+                apply.validate().map_err(invalid)?;
+                let mut credentials = Vec::with_capacity(apply.credentials.len());
+                for write in &apply.credentials {
+                    credentials.push(self.write_credential(&mut conn, caller, write).await?);
+                }
+                for deployment in &apply.deployments {
+                    self.write_deployment(&mut conn, caller, deployment).await?;
+                }
+                conn.commit().await.map_err(unavailable)?;
+                Ok(ProviderDeploymentsApplied {
+                    credentials,
+                    deployments: apply.deployments,
+                })
             },
         )
         .await
@@ -705,6 +677,112 @@ impl<'a> GatewayAdministration<'a> {
             .await
             .map_err(unavailable)?;
         work(conn).await
+    }
+
+    /// Validates, seals, and upserts one credential on the caller's open
+    /// transaction, returning its redacted view; the caller commits.
+    ///
+    /// # Errors
+    /// Returns the source, sealing, revoked-name, and storage errors of
+    /// [`Self::put_credential`].
+    async fn write_credential(
+        &self,
+        conn: &mut TenantConn<'_>,
+        caller: &Caller,
+        write: &ProviderCredentialWrite,
+    ) -> Result<ProviderCredentialView, WyrdError> {
+        let name = write.name.as_str();
+        let view = ProviderCredentialSourceView::from(&write.source);
+        self.validate_source(caller.data_tenant_id, &write.provider, &view)?;
+        let sealed = self.seal(caller.data_tenant_id, &write.name, write)?;
+        let source = encode(&view)?;
+        let row = upsert_gateway_credential(
+            conn,
+            GatewayCredentialWrite {
+                name,
+                provider: write.provider.as_str(),
+                source: &source,
+                secret: sealed.as_deref(),
+            },
+        )
+        .await
+        .map_err(|error| referenced_conflict(error, "credential", name))?
+        .ok_or_else(|| {
+            conflict(
+                "provider credential is revoked and cannot be replaced",
+                name,
+            )
+        })?;
+        credential_view(row)
+    }
+
+    /// Validates one deployment and its credential reference, share-locking
+    /// the credential, and upserts it on the caller's open transaction; the
+    /// caller commits.
+    ///
+    /// # Errors
+    /// Returns the document, reference, and storage errors of
+    /// [`Self::put_deployment`].
+    async fn write_deployment(
+        &self,
+        conn: &mut TenantConn<'_>,
+        caller: &Caller,
+        deployment: &ProviderDeployment,
+    ) -> Result<(), WyrdError> {
+        deployment.validate().map_err(invalid)?;
+        let mut credential_provider = None;
+        if let Some(credential) = deployment.auth.credential() {
+            let row = gateway_credential_for_share(conn, credential.as_str())
+                .await
+                .map_err(unavailable)?;
+            let reason = match row {
+                None => Some("does not name a provider credential in this tenant"),
+                Some(row) if row.state != "active" => Some("names a revoked provider credential"),
+                Some(row) => match ProviderId::new(&row.provider) {
+                    Ok(provider) if deployment.adapter.accepts_credential_provider(&provider) => {
+                        let source: ProviderCredentialSourceView = decode(row.source)?;
+                        // A managed secret is the tenant's own value, so
+                        // it carries no operator assignment to confine.
+                        let assigned =
+                            matches!(source, ProviderCredentialSourceView::ManagedSecret)
+                                || self.config.assignment(&source).is_some_and(|assignment| {
+                                    assignment.permits(
+                                        caller.data_tenant_id,
+                                        &provider,
+                                        Some(&deployment.adapter),
+                                    )
+                                });
+                        credential_provider = Some(row.provider);
+                        (!assigned).then_some(
+                            "names a credential not assigned to this tenant, provider, and endpoint host",
+                        )
+                    }
+                    _ => Some("names a credential for a provider this adapter does not serve"),
+                },
+            };
+            if let Some(reason) = reason {
+                return Err(invalid(GatewayContractError::new(
+                    "auth.credential",
+                    reason,
+                )));
+            }
+        }
+        let document = encode(deployment)?;
+        upsert_gateway_deployment(
+            conn,
+            GatewayDeploymentWrite {
+                name: deployment.name.as_str(),
+                credential_name: deployment
+                    .auth
+                    .credential()
+                    .map(ProviderCredentialName::as_str),
+                credential_provider: credential_provider.as_deref(),
+                deployment: &document,
+            },
+        )
+        .await
+        .map_err(unavailable)?;
+        Ok(())
     }
 
     /// Checks that a credential source lies within an operator assignment for

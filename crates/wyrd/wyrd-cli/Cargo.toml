@@ -64,6 +64,7 @@ wyrd-mcp = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-utils = { workspace = true }
 wyrd-tls = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -83,6 +84,9 @@ wyrd-server = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-testing = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }
 
 [lints]
 workspace = true

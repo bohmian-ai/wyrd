@@ -151,7 +151,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     let conflict = deployment
         .cards()
         .await
-        .register_from_path(&fixture("cards/support_desk/conflicting-desk.yaml"))
+        .declare_from_path(&fixture("cards/support_desk/conflicting-desk.yaml"))
         .await
         .expect_err("a conflicting tickets schema is refused");
     assert_eq!(

@@ -13,7 +13,7 @@ use crate::OperatorPool;
 use crate::tenant_conn::TenantConn;
 
 /// Registration side effects that can be retried by the lifecycle worker.
-pub const RECONCILE_KIND_REGISTRATION: &str = "registration";
+pub const RECONCILE_KIND_DECLARATION: &str = "declaration";
 /// Immutable Card blob persistence side effects that can be retried.
 pub const RECONCILE_KIND_BLOB: &str = "blob";
 /// Manifest verification and Card activation side effects that can be retried.
@@ -32,7 +32,7 @@ pub struct CardReconcileClaim {
     /// Tenant that owns the Card.
     pub data_tenant_id: Uuid,
     /// Registration operation that created the Card, when present.
-    pub registration_operation_id: Option<Uuid>,
+    pub declaration_operation_id: Option<Uuid>,
     /// Lifecycle side-effect category.
     pub reconcile_kind: String,
     /// Attempt number assigned by the claim transaction.
@@ -105,7 +105,7 @@ pub async fn claim_card_reconciliation(
                AND card.data_tenant_id = candidates.data_tenant_id
          RETURNING card.card_uid,
                    card.data_tenant_id,
-                   card.registration_operation_id,
+                   card.declaration_operation_id,
                    card.reconcile_kind,
                    card.reconcile_attempts,
                    card.reconcile_lease_owner,
@@ -256,7 +256,7 @@ pub async fn mark_card_reconciliation_succeeded(
         Some(lease_owner) => {
             sqlx::query(
                 r"UPDATE wyrd.cards
-                  SET reconcile_kind = 'registration',
+                  SET reconcile_kind = 'declaration',
                       reconcile_status = 'idle',
                       reconcile_attempts = 0,
                       reconcile_next_attempt_at = NULL,
@@ -279,7 +279,7 @@ pub async fn mark_card_reconciliation_succeeded(
         None => {
             sqlx::query(
                 r"UPDATE wyrd.cards
-                  SET reconcile_kind = 'registration',
+                  SET reconcile_kind = 'declaration',
                       reconcile_status = 'idle',
                       reconcile_attempts = 0,
                       reconcile_next_attempt_at = NULL,

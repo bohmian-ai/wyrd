@@ -8,7 +8,7 @@ import { expect, vi } from "vitest";
 import {
   Cards,
   OperatorConnections,
-  type RegistrationReceipt,
+  type DeclarationReceipt,
   type VerificationResult,
   WyrdClient,
   type WyrdError,
@@ -17,7 +17,7 @@ import {
 import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
 
 import { Receiver } from "../support/http-receiver.js";
-import { binding, fixture, registered, scheduledResult, serverTest } from "../support/server.js";
+import { binding, fixture, declared, scheduledResult, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 240_000 });
 
@@ -43,31 +43,31 @@ async function startWatch(
   service: string,
   verifier: string,
   fitted = true,
-): Promise<RegistrationReceipt> {
+): Promise<DeclarationReceipt> {
   await (await OperatorConnections.connect()).create({
     provider: "http",
     name: "on-call-hooks",
     origin: hooks.url,
     auth: { scheme: "bearer", token: ON_CALL_TOKEN },
   });
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  const watch = await cards.registerFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  const watch = await cards.declareFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
   if (fitted) {
-    server.waitForBaseline(registered(watch, verifier).uid, WAIT_MS);
+    server.waitForBaseline(declared(watch, verifier).uid, WAIT_MS);
   }
   return watch;
 }
 
 /**
  * The latency watch Service on a fresh server per test, so each window is
- * judged alone, registered after its baseline and after the `on-call-hooks`
+ * judged alone, declared after its baseline and after the `on-call-hooks`
  * connection, with the `latency-shift` baseline already fitted by the real
  * fitter.
  */
 const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
   hooks: Receiver;
   cards: Cards;
-  watch: RegistrationReceipt;
+  watch: DeclarationReceipt;
 }>({
   hooks: async ({}, use) => {
     const hooks = await Receiver.start(() => ({ status: 200 }));
@@ -83,7 +83,7 @@ const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
 async function submit(
   server: NativeWyrdTestServer,
   cards: Cards,
-  watch: RegistrationReceipt,
+  watch: DeclarationReceipt,
   latencies: number[],
   verifier = "latency-shift",
 ) {
@@ -104,12 +104,12 @@ async function submit(
 async function record(
   server: NativeWyrdTestServer,
   cards: Cards,
-  watch: RegistrationReceipt,
+  watch: DeclarationReceipt,
   samples: Record<string, number>[],
   verifier: string,
 ) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
-  await cards.hydrate(watch.root, bundle);
+  await cards.pull(watch.root, bundle);
   const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();
@@ -125,7 +125,7 @@ async function record(
 async function judge(
   server: NativeWyrdTestServer,
   cards: Cards,
-  watch: RegistrationReceipt,
+  watch: DeclarationReceipt,
 ): Promise<VerificationResult> {
   const id = await binding(cards, watch.root);
   server.makeBindingDue(id);
@@ -221,7 +221,7 @@ test("ready spc baseline charts a scheduled window", async ({ server, hooks, car
 
 test("path only operator without connection is refused", async ({ server: _ }) => {
   const cards = await Cards.connect();
-  await expect(cards.registerFromPath(fixture("invalid/operator-path-without-connection.yaml"))).rejects.toMatchObject({
+  await expect(cards.declareFromPath(fixture("invalid/operator-path-without-connection.yaml"))).rejects.toMatchObject({
     code: "WYRD_SPEC_400_INVALID_OPERATOR",
   });
 });
@@ -231,7 +231,7 @@ test.for([
   ["scheduled-binding-exact-inputs.yaml", "verified_by[0].inputs", "Service", "budget-with-exact-inputs"],
   ["optional-samples-slot.yaml", "inputs.latency", "Verifier", "optional-latency"],
 ])("scheduled binding rejects redundant inputs (%s)", async ([file, field, kind, name], { cards }) => {
-  const refused: unknown = await cards.registerFromPath(fixture(`invalid/${file}`)).then(
+  const refused: unknown = await cards.declareFromPath(fixture(`invalid/${file}`)).then(
     () => undefined,
     (error: unknown) => error,
   );

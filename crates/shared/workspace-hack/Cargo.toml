@@ -293,7 +293,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -313,7 +313,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 spin = { version = "0.9" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -333,7 +333,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
@@ -352,7 +352,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
@@ -375,7 +375,7 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 nom = { version = "7" }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 security-framework-sys = { version = "2" }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -399,7 +399,7 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 nom = { version = "7" }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
-rustix = { version = "1", features = ["fs", "process", "termios", "time"] }
+rustix = { version = "1", features = ["process", "pty", "termios", "time"] }
 security-framework-sys = { version = "2" }
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon", "public_imp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }

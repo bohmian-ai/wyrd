@@ -2,7 +2,9 @@ name: release
 
 # push to main = build every deliverable on every supported platform; publish
 # nothing.
-# release published = the same builds, then the publish jobs.
+# release published = the publish jobs, over the bytes the commit's successful
+# push run already built and tested; the builds rerun here only when no such
+# run's artifacts remain (see locate-build).
 # Each build job records the SHA-256 of its outputs after
 # its package checks pass; publication verifies those exact bytes, attests
 # their provenance for this commit, and fails closed on a missing record,
@@ -55,10 +57,43 @@ jobs:
           echo "tag $TAG -> $tag_commit, built $GITHUB_SHA"
           test "$tag_commit" = "$GITHUB_SHA"
 
+  # A release reuses the commit's successful push run of this workflow when
+  # every one of its artifacts is still retained; otherwise run_id is empty and
+  # this run builds. A push run cancelled by a newer push, a failed one, or
+  # one whose one-day artifacts expired therefore rebuilds rather than fails.
+  # Attestations still name this release run, for the same commit and workflow.
+  locate-build:
+    name: locate build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run_id: ${{ steps.locate.outputs.run_id }}
+    steps:
+      - id: locate
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run_id="$(gh run list --workflow release.yml --commit "$GITHUB_SHA" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -n "$run_id" ]; then
+            read -r total expired < <(gh api "repos/$GH_REPO/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '"\(.total_count) \([.artifacts[] | select(.expired)] | length)"')
+            echo "push run $run_id: $total artifacts, $expired expired"
+            if [ "$total" -eq 0 ] || [ "$expired" -ne 0 ]; then run_id=""; fi
+          fi
+          echo "reusing run: ${run_id:-none, building here}"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
   # ── Python SDK ─────────────────────────────────────────────────────────────
 
   build-sdist:
     name: python sdist
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -99,6 +134,8 @@ jobs:
 
   build-linux:
     name: python - ${{ matrix.target }}
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -165,6 +202,8 @@ jobs:
 
   build-macos:
     name: python - ${{ matrix.target }}
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -256,14 +295,21 @@ jobs:
 
   publish-pypi:
     name: publish python
-    if: github.event_name == 'release'
-    needs: [release-commit, test-wheels]
+    # A build or smoke job skipped because locate-build found a reusable run
+    # is not a failure; in a building run every need must have succeeded.
+    if: &publish-if >-
+      !cancelled() && github.event_name == 'release'
+      && needs.release-commit.result == 'success'
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      && (needs.locate-build.outputs.run_id != '' || !contains(needs.*.result, 'skipped'))
+    needs: [release-commit, locate-build, test-wheels]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
       attestations: write
+      actions: read     # artifacts of a reused push run
     steps:
       - uses: actions/checkout@v7
 
@@ -287,6 +333,8 @@ jobs:
           pattern: pypi_*
           merge-multiple: true
           path: dist
+          run-id: ${{ needs.locate-build.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify the tested package bytes
         run: bash .github/scripts/verify-release-artifacts.sh dist
@@ -309,6 +357,8 @@ jobs:
 
   build-typescript:
     name: typescript - ${{ matrix.target }}
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -410,14 +460,15 @@ jobs:
   # after the four platform addons it optionally depends on.
   publish-npm:
     name: publish typescript
-    if: github.event_name == 'release'
-    needs: [release-commit, build-typescript]
+    if: *publish-if
+    needs: [release-commit, locate-build, build-typescript]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
       attestations: write
+      actions: read     # artifacts of a reused push run
     steps:
       - uses: actions/checkout@v7
 
@@ -433,6 +484,8 @@ jobs:
         with:
           pattern: typescript-*
           path: dist
+          run-id: ${{ needs.locate-build.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify the tested package bytes
         run: for dir in dist/typescript-*; do bash .github/scripts/verify-release-artifacts.sh "$dir"; done
@@ -464,6 +517,8 @@ jobs:
   # until the runner loses contact with GitHub, so arm links with thin LTO.
   build-server:
     name: server - ${{ matrix.bundle }}
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -537,6 +592,8 @@ jobs:
   # three hours; thin LTO keeps this local-development bundle near an hour.
   build-server-macos:
     name: server - ${{ matrix.bundle }}
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     strategy:
       matrix:
         include:
@@ -554,14 +611,15 @@ jobs:
   # on an arm runner, not under emulation.
   publish-docker:
     name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
-    if: github.event_name == 'release'
-    needs: [release-commit, build-server]
+    if: *publish-if
+    needs: [release-commit, locate-build, build-server]
     runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
       contents: read
       id-token: write
       attestations: write
+      actions: read     # artifacts of a reused push run
     strategy:
       fail-fast: false
       matrix:
@@ -597,6 +655,8 @@ jobs:
         with:
           name: wyrd-server-${{ matrix.bundle }}
           path: ./artifacts
+          run-id: ${{ needs.locate-build.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify the tested server bundle
         run: bash .github/scripts/verify-release-artifacts.sh artifacts
@@ -645,7 +705,7 @@ jobs:
   # distro, and the ubuntu image as the bare version and latest.
   publish-docker-manifests:
     name: docker manifests
-    if: github.event_name == 'release'
+    if: ${{ !cancelled() && github.event_name == 'release' && needs.publish-docker.result == 'success' }}
     needs: publish-docker
     runs-on: ubuntu-24.04
     environment: release
@@ -675,14 +735,15 @@ jobs:
 
   publish-binaries:
     name: publish binaries
-    if: github.event_name == 'release'
-    needs: [release-commit, build-server, build-server-macos]
+    if: *publish-if
+    needs: [release-commit, locate-build, build-server, build-server-macos]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write   # gh release upload
       id-token: write
       attestations: write
+      actions: read     # artifacts of a reused push run
     steps:
       - uses: actions/checkout@v7
 
@@ -691,6 +752,8 @@ jobs:
           pattern: wyrd-server-*
           merge-multiple: true
           path: dist
+          run-id: ${{ needs.locate-build.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify the tested server bundles
         run: |
@@ -729,6 +792,8 @@ jobs:
 
   package-crates:
     name: rust crate package
+    needs: locate-build
+    if: needs.locate-build.outputs.run_id == ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -754,14 +819,15 @@ jobs:
 
   publish-crates:
     name: publish rust crates
-    if: github.event_name == 'release'
-    needs: [release-commit, package-crates, test-wheels, build-server]
+    if: *publish-if
+    needs: [release-commit, locate-build, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: write   # release-plz
       id-token: write
       attestations: write
+      actions: read     # artifacts of a reused push run
     steps:
       - uses: actions/checkout@v7
         with:
@@ -783,6 +849,8 @@ jobs:
         with:
           name: rust-crates
           path: dist
+          run-id: ${{ needs.locate-build.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       # release-plz packages again at publish time; cargo's .crate archives
       # are reproducible, so the repackaged bytes must equal the tested ones.

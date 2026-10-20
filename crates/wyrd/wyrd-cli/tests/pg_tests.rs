@@ -492,6 +492,7 @@ async fn tenant_slugs(dsn: &SecretString) -> Vec<String> {
 /// Panics when bootstrap, the public write/read, or process cleanup fails,
 /// or when the stale destination receives a connection.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn server_dev_first_run_is_client_ready() {
     let mut local = LocalDev::new().await;
     let stale = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -731,6 +732,7 @@ fn json_failure(output: &std::process::Output) -> serde_json::Value {
 /// # Panics
 /// Panics when a retry changes persisted identity or exposes credentials.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let mut local = LocalDev::new().await;
     let current = local.home.path().join("wyrd/server/current");
@@ -1228,6 +1230,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
 /// # Panics
 /// Panics when the restart changes identity or data, or a refusal has effects.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn server_dev_saved_settings_survive_working_directory_change() {
     let mut local = LocalDev::new().await;
     let fresh = local
@@ -1351,6 +1354,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
 /// # Panics
 /// Panics when host installation, discovery, or the authenticated read fails.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn server_dev_selected_mcp_host_reads() {
     let mut local = LocalDev::new().await;
     let codex = local.home.path().join(".codex");
@@ -1388,6 +1392,7 @@ const SUPPLIED_SEALING_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
 /// Panics when setup, the credential or deployment write, either gateway
 /// call, the retained key, the refusal, or a leak check fails.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn server_dev_keeps_the_gateway_managed_secret_key() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

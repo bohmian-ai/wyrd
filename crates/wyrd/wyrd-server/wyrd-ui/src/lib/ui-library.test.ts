@@ -65,6 +65,8 @@ import {
 import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, type ChartInput } from 'wyrd-ai-ui/loaders';
 import { mountView, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
+import { nodeExecutor } from 'wyrd-ai-ui/node';
+import { Bifrost, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 
@@ -480,6 +482,46 @@ test('TASK-003: Dependent loads and safe actions', async () => {
     { name: 'bifrost.list_tables', arguments: {} }
   ]);
   expect(callServerTool.mock.calls[0][1]).toEqual({ signal: abort.signal });
+});
+
+test('Node query acquisition cancellation', async () => {
+  const query = [{ op: 'bifrost.query', sql: 'SELECT 1' }] as const;
+  const close = vi.fn(async () => ({ done: true as const, value: undefined }));
+  let collected: (result: QueryResult) => void = () => {};
+  const collect = vi.fn(() => new Promise<QueryResult>((resolve) => (collected = resolve)));
+  let started: ((stream: unknown) => void) | undefined;
+  const begin = vi.fn(() => new Promise((resolve) => (started = resolve)));
+  const connect = vi.spyOn(Bifrost, 'connect').mockResolvedValue({ stream: begin } as never);
+  try {
+    // Cancelled while the stream starts: it is closed once, never read, and the read never succeeds.
+    const starting = new AbortController();
+    const run = nodeExecutor({} as WyrdClient).run(query, starting.signal);
+    await vi.waitFor(() => expect(started).toBeDefined());
+    starting.abort();
+    started!({ return: close, collect });
+    await expect(run).rejects.toThrow();
+    expect(close).toHaveBeenCalledOnce();
+    expect(collect).not.toHaveBeenCalled();
+
+    // Cancelled while collecting: closed once, and rows arriving after cancellation are not a success.
+    started = undefined;
+    const collecting = new AbortController();
+    const running = nodeExecutor({} as WyrdClient).run(query, collecting.signal);
+    await vi.waitFor(() => expect(started).toBeDefined());
+    started!({ return: close, collect });
+    await vi.waitFor(() => expect(collect).toHaveBeenCalledOnce());
+    collecting.abort();
+    collected(series);
+    await expect(running).rejects.toThrow();
+    expect(close).toHaveBeenCalledTimes(2);
+
+    // Already cancelled: no stream starts.
+    begin.mockClear();
+    await expect(nodeExecutor({} as WyrdClient).run(query, AbortSignal.abort())).rejects.toThrow();
+    expect(begin).not.toHaveBeenCalled();
+  } finally {
+    connect.mockRestore();
+  }
 });
 
 /** A view document over Chart panels with the given layouts; `undefined` leaves a panel unplaced. */

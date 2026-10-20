@@ -29,9 +29,15 @@ export function nodeExecutor(client: WyrdClient): Executor {
       case 'bifrost.query': {
         const stream = await (await bifrost()).stream(request.sql, request.params ?? [], { deadlineMs: request.deadline_ms });
         const abort = () => void stream.return();
+        // Cancelled while the stream started: close it before reading anything.
+        if (signal?.aborted) abort();
+        signal?.throwIfAborted();
         signal?.addEventListener('abort', abort, { once: true });
         try {
-          return await stream.collect({ maxRows: request.max_rows, maxBytes: request.max_bytes });
+          const result = await stream.collect({ maxRows: request.max_rows, maxBytes: request.max_bytes });
+          // Rows that arrive after cancellation are never a result.
+          signal?.throwIfAborted();
+          return result;
         } finally {
           signal?.removeEventListener('abort', abort);
         }

@@ -266,10 +266,14 @@ pub(crate) async fn signed_in(
     ))
 }
 
-/// The callback response for a refused browser sign-in whose login state was
-/// consumed: the login-transaction cookie is cleared and the browser
-/// redirected (`303`) to the tenant's sign-in page with `login=failed`. The
-/// refusal itself was audited by the exchange and is only logged here.
+/// The callback response for a browser sign-in that failed after its login
+/// state was consumed. The login-transaction cookie is always cleared. A
+/// server-side failure (a `5xx` catalog error such as an unavailable store or
+/// provider) is answered as that error itself, `no-store`, so the browser sees
+/// an outage rather than a credential refusal and can begin a new sign-in. A
+/// refusal redirects (`303`) to the tenant's sign-in page with
+/// `login=failed`. The exchange already audited the failure; it is only
+/// logged here.
 ///
 /// # Errors
 /// Returns `error` itself when the tenant has left the directory, and
@@ -280,6 +284,15 @@ pub(crate) async fn login_refused(
     tenant_id: DataTenantId,
     error: WyrdError,
 ) -> Result<Response, WyrdErrorResponse> {
+    let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if status.is_server_error() {
+        tracing::warn!(code = error.code(), "browser sign-in failed on the server");
+        return Ok(with_cookies(
+            status,
+            vec![clear_login_cookie(origin)],
+            WyrdErrorResponse::from(error),
+        ));
+    }
     tracing::info!(code = error.code(), "browser sign-in refused");
     let (tenant, _) = state
         .postgres
@@ -623,6 +636,7 @@ mod pg_tests {
     use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_spec::auth::{BrowserLoginResponse, Sha256Hex};
+    use wyrd_spec::error::WyrdError;
     use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::components::auth::ServerAuth;
@@ -824,5 +838,88 @@ mod pg_tests {
         assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
         assert!(unknown.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(state_rows(&fixture).await, 0);
+    }
+
+    /// A consumed browser sign-in that failed for a backend reason keeps that
+    /// error's status and code, even when the tenant directory read that
+    /// follows succeeds; only a genuine credential refusal redirects to the
+    /// sign-in page. Every answer is `no-store`, sets no session cookie and
+    /// clears the spent login-transaction cookie.
+    ///
+    /// # Panics
+    /// Panics when a failure is classified, cached or cookied wrongly.
+    #[tokio::test]
+    async fn callback_failures_preserve_unavailable_classification() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let state = login_state(&fixture, &provider).await;
+        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
+        let refuse = |error| super::login_refused(&state, &origin, fixture.data_tenant_id(), error);
+        let unavailable = [
+            WyrdError::AuthVerifyUnavailable {
+                message: "auth backend unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::DiscoveryUnavailable {
+                message: "identity provider could not be reached".to_owned(),
+                details: serde_json::json!({}),
+            },
+        ];
+        for error in unavailable {
+            let code = error.code();
+            let response = refuse(error).await.expect("the adapter answers");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{code}");
+            assert!(response.headers().get(header::LOCATION).is_none(), "{code}");
+            assert_spent(&response);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body reads");
+            let problem: serde_json::Value =
+                serde_json::from_slice(&body).expect("problem decodes");
+            assert_eq!(problem["code"], code);
+        }
+
+        let refused = refuse(WyrdError::InvalidToken {
+            message: "the provider refused the sign-in".to_owned(),
+            details: serde_json::json!({}),
+        })
+        .await
+        .expect("the adapter answers");
+        assert_eq!(refused.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            refused
+                .headers()
+                .get(header::LOCATION)
+                .map(|value| value.to_str().ok()),
+            Some(Some(
+                format!("/t/{}/login?login=failed", fixture.tenant_slug()).as_str()
+            ))
+        );
+        assert_spent(&refused);
+    }
+
+    /// Assert `response` is `no-store`, sets no session cookie and clears the
+    /// login-transaction cookie.
+    ///
+    /// # Panics
+    /// Panics when any of those differ.
+    fn assert_spent(response: &Response) {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|value| value.as_bytes()),
+            Some(&b"no-store"[..])
+        );
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("ascii"))
+            .collect();
+        assert_eq!(
+            cookies,
+            ["wyrd_login=; Path=/auth/callback; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        );
     }
 }

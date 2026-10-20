@@ -8,6 +8,7 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod browser_sessions;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod login_state;
@@ -26,6 +27,10 @@ pub mod workload_bindings;
 
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
+};
+pub use browser_sessions::{
+    BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
+    revoke_browser_session,
 };
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,

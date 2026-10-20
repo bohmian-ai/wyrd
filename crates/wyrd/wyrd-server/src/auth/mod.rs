@@ -1,6 +1,7 @@
 //! Authentication extractors for Wyrd HTTP handlers.
 
 pub mod authorize;
+pub mod browser;
 pub mod callback;
 pub mod cli_login;
 pub mod jwt_bearer;

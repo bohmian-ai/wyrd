@@ -128,6 +128,16 @@ pub enum TenantGrant {
         /// The API-key row the holder presented.
         credential_id: Uuid,
     },
+    /// A live browser session created with this API key, re-resolved on one
+    /// request.
+    ///
+    /// Confers exactly the authority the key's own exchange would, but the
+    /// session's request is not the key's runtime activity, so resolving it
+    /// writes nothing.
+    BrowserRecovery {
+        /// The API-key row the session was created with.
+        credential_id: Uuid,
+    },
     /// A verified federated OIDC login.
     OidcLogin,
     /// A consumed human refresh token.
@@ -174,7 +184,9 @@ impl TenantGrant {
     /// The stored credential the token is attributed to, when there is one.
     fn credential_id(&self) -> Option<Uuid> {
         match self {
-            Self::ApiKey { credential_id } => Some(*credential_id),
+            Self::ApiKey { credential_id } | Self::BrowserRecovery { credential_id } => {
+                Some(*credential_id)
+            }
             Self::Refresh { consumed } => Some(*consumed),
             Self::OidcLogin | Self::JwtBearer | Self::Delegation { .. } => None,
         }
@@ -197,7 +209,10 @@ impl TenantGrant {
             Self::JwtBearer => Some(MINT_KIND_JWT_BEARER),
             // The subject's Card scope was minted with its own token; the
             // exchange confers no new emit authority.
-            Self::OidcLogin | Self::Refresh { .. } | Self::Delegation { .. } => None,
+            Self::OidcLogin
+            | Self::Refresh { .. }
+            | Self::Delegation { .. }
+            | Self::BrowserRecovery { .. } => None,
         }
     }
 

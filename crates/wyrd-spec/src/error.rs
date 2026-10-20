@@ -574,6 +574,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A browser-session-authenticated mutation, login, recovery or logout
+    /// carried no `Origin` header, or one that is not the deployment's
+    /// public origin.
+    #[error("[WYRD_AUTH_403_ORIGIN_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_ORIGIN_REFUSED",
+        status = 403,
+        title = "Request origin refused",
+        remediation = "Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused."
+    )]
+    OriginRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// OIDC ID token nonce did not match the stored login nonce.
     #[error("[WYRD_AUTH_400_INVALID_NONCE] {message}")]
     #[wyrd_error(
@@ -3649,6 +3665,7 @@ impl WyrdError {
             | Self::BadTokenFormat { message, details }
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
+            | Self::OriginRefused { message, details }
             | Self::DeviceAuthorization { message, details }
             | Self::InvalidNonce { message, details }
             | Self::RefreshReused { message, details }
@@ -4519,6 +4536,10 @@ mod tests {
             WyrdError::DeviceAuthorization {
                 message: "the person has not approved this device code yet".to_owned(),
                 details: serde_json::json!({ "error": "authorization_pending" }),
+            },
+            WyrdError::OriginRefused {
+                message: "browser request origin refused".to_owned(),
+                details: serde_json::json!({}),
             },
             WyrdError::InvalidNonce {
                 message: "id token nonce mismatch".to_owned(),

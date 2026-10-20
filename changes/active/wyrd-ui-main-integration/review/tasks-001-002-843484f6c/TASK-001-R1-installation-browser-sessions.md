@@ -444,3 +444,41 @@ Not started. Record criterion → implementation → exact command/result with
 PASS/FAIL/UNVERIFIED, diagnosis and remaining human/runtime gates here during
 execution. The review's FIND IDs retain their identities; REQ-033 remains the
 separate caller-directed obligation.
+
+### Scenarios 2–6 evidence (REQ-033, FIND-TASK-001-2)
+
+Branch `worktree-agent-a5ce389536e249f6b` over `deadf39af`; commits `428a54c19`
+(S2), `b219af951` (S3), `23a349001` (S4), `4d0781ec7` (S5), `8f2364e75` (S6),
+`79dc86b74` and `4a31d0793` (gate corrections). Scenario 1 (installer) is owned
+by a parallel task and is not touched here.
+
+| Criterion | Implementation | Command | Result |
+|---|---|---|---|
+| S2 digest-only, tenant-bound, revocable sessions; API-key recovery; immediate logout leaving the key usable; store outage distinct | `wyrd-sql` migration `20261020000000_auth_browser_sessions.sql` (RLS, SHA-256 digest only, `statement_timestamp()` 12 h absolute expiry, 5 min login state); `wyrd-auth::browser_sessions`; server `auth/browser.rs` (`/auth/browser/{login,api-key,session,logout}`) | Scenario 2 exact selector (`test(=pg_browser_sessions::browser_session_authority_is_tenant_bound_and_revocable)`) | PASS |
+| S3 cookie only on protected tenant `/v1`; exactly one cookie; explicit bearer wins without fallback; exact Origin on mutations; OTLP and gateway inference stay bearer-only; reads never slide expiry | `http/middleware/authenticate.rs` at the existing tenant principal boundary; `WYRD_AUTH_403_ORIGIN_REFUSED` in the `wyrd-spec` catalog | Scenario 3 exact selector (`test(=pg_browser_sessions::browser_session_requests_enforce_origin_and_bearer_precedence)`) | PASS |
+| S4 Rust-owned SSO callback (303 `/t/{slug}`), chooser/switch/settings/recovery/logout, two Rust and Node replicas plus a fresh BFF, replay/state/binding/revision refusals, old JSON credential cookies cleared, no secrets in cookies or page data | `wyrd-auth::callback`/`login` bound login state; UI `browser-sessions.ts` forwards only the selected session; `upstream.ts` forwards only `wyrd_login` on `/auth/*`; UI `/login/callback` route, server `auth/authorize.rs` and the UI OAuth client (`openid-client`, `jose`) deleted; provider lifecycle factored once into `scripts/identity/with-identity-providers.sh` | `mise run test:identity:ui` | PASS (vitest 4/4 browser-driver tests; nextest 1 passed) |
+| S4 retained identity siblings (CLI/device/provider tests) | `identity_e2e` updated for the retired `/auth/authorize` (status equals an unrouted `/auth/*` path) | identity_e2e + pg_openapi_contract exact set | PASS 54/54 |
+| S5 served OpenAPI documents `wyrdBrowserSession` (cookie `wyrd_session_{tenant}`) as an alternative only on routes that read it; refusals documented; dead-cookie probes match declared security | `http/openapi.rs` `BrowserSessionAddon`; `router.rs` collects tenant and Bifrost group paths | The three Scenario 5 `pg_openapi_contract` selectors | PASS 3/3 |
+| S5 served-document lane | `identity_connection_operations_publish_their_contract` and `local_transfer_operations_publish_their_binary_contract` now assert the exact `[accessToken, browserSession]` alternative instead of inherited security | `mise run test:principals:integration` | PASS (OpenAPI slice 28/28; every slice green) |
+| S6 official-image nginx provider login, callback, replay refusal, cookie settings/API use, foreign-Origin 403, app and forwarder restart continuity, logout refusal | `identity_ui_e2e::production_ui_nginx_journey`; `scripts/server/test-startup-identity.sh` reusing `startup-common.sh`; `mise run test:identity:ui:container` | `mise run test:identity:ui:container` | UNVERIFIED: refused on this macOS host by the existing image owner, `scripts/build.sh image` exit 1, "an image copies a Linux bundle; build it on Linux (CI's image job)". No image ID or public origin recorded. |
+| Test registration | New and extended names | `mise exec -- cargo nextest list --locked -p wyrd-server --test integration --run-ignored=all -E …` | 4 selected: both `pg_browser_sessions` tests, `production_ui_bff_journey`, `production_ui_nginx_journey` |
+| UI checks | — | UI `check`; `vitest run` on the 5 named files; UI `build` | PASS: 0 errors; 22/22; build OK |
+| CLI refresh regressions | `wyrd-auth::refresh` keeps OAuth refresh separate from browser sessions | The task's exact refresh command | PASS 2/2 (wyrd-auth lib 123/123; wyrd-server auth lib 62/62) |
+| SQL owners | `pg_login_state` and `pg_migration` updated | `mise run test:sql` | PASS (197 + 7 + 79) |
+| Gates | — | `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check`, `docs:check`; `git diff --check` | PASS after `79dc86b74` (two clippy `redundant_closure_for_method_calls`; regenerated TS `error-codes.ts`) and `4a31d0793` (regenerated `docs/src/content/docs/api/errors.md`) |
+| No new env, secret, service or dependency | UI `openid-client` and `jose` removed; lockfile changed only by those removals | `pnpm install --frozen-lockfile --offline` | PASS |
+| Human visual checkpoint (native and nginx origins; desktop/mobile, light/dark, keyboard/focus, touch) | — | — | UNVERIFIED |
+| Debian amd64/arm64 and Rocky amd64 image/runtime evidence | — | — | UNVERIFIED (macOS host) |
+
+Diagnoses (each traced with `WYRD_LOG`): the `browser::pg_tests` 503
+`DISCOVERY_UNAVAILABLE` was a missing JWKS mock in the fixture; the identity
+journey's `NotFound` was the runner not building the `wyrd-cli` binaries before
+the journey (now built first); the retired `/auth/authorize` answers the same 401
+as any unrouted `/auth/*` path, so the assertion compares with that fallback; the
+two principals-lane OpenAPI failures were assertions still expecting inherited
+bearer-only security on routes that now intentionally offer the cookie alternative.
+
+Gaps: RED runs were not captured as separate logs before GREEN. The native journey
+proves continuity across a second Rust replica and a fresh Node BFF, not a restart
+of the same Rust process; the unverified nginx journey covers a container restart.
+Browser OAuth clients of the retired UI flow are refused by design.

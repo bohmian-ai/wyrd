@@ -712,8 +712,7 @@ async fn published_origin(app: &str) -> String {
 #[ignore = "requires the official image; run via `mise run test:identity:ui:container`"]
 async fn production_ui_nginx_journey() {
     let fixture: Value = serde_json::from_str(
-        &std::env::var("WYRD_UI_JOURNEY")
-            .expect("run via `mise run test:identity:ui:container`"),
+        &std::env::var("WYRD_UI_JOURNEY").expect("run via `mise run test:identity:ui:container`"),
     )
     .expect("the fixture is JSON");
     let field = |name: &str| {

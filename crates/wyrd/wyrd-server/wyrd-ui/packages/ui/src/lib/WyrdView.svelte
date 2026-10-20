@@ -6,6 +6,7 @@
 -->
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { fmtInstant, parseInstant } from './format.js';
   import { failed, type ActionIntent, type ActionState, type Executor, type Problem } from './contract.js';
   import {
     inputProblem,
@@ -145,7 +146,7 @@
     {#if parsed.data.title}<h2>{parsed.data.title}</h2>{/if}
     {#if brushed}
       <p class="range">
-        Range <time datetime={brushed.from}>{brushed.from}</time> – <time datetime={brushed.to}>{brushed.to}</time>
+        Range <time datetime={brushed.from}>{fmtInstant(parseInstant(brushed.from))}</time> – <time datetime={brushed.to}>{fmtInstant(parseInstant(brushed.to))}</time>
         <ActionButton label="Reset range" onclick={() => (brushed = undefined)} />
       </p>
     {/if}

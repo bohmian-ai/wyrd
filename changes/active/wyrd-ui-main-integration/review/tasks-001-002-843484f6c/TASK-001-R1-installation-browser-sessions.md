@@ -549,3 +549,18 @@ Gaps: RED runs were not captured as separate logs before GREEN. The native journ
 proves continuity across a second Rust replica and a fresh Node BFF, not a restart
 of the same Rust process; the unverified nginx journey covers a container restart.
 Browser OAuth clients of the retired UI flow are refused by design.
+
+### Integrated candidate checks
+
+Merge `9655b8ecf` combines Scenario 1 (`7caccc662`), the CLI journey prerequisite fix
+`cb360a3a5` (`test:cli:journey` now builds `wyrd-server` and the production UI
+before its `server_dev_*` cases), and Scenarios 2–6 (`79874c6cf`). The only
+conflict was this evidence section. The checks below ran on the merged tree:
+
+| Check | Result |
+|---|---|
+| `mise run fmt` | PASS |
+| `mise run lints` | PASS |
+| `mise run codegen:check` | PASS |
+| `mise run test:cli:journey` | PASS: 45 passed, 0 failed, 3 ignored |
+| `mise run test:identity:ui:container`, Linux images (Debian amd64/arm64, Rocky amd64), human visual checkpoint | UNVERIFIED: the macOS host refuses the official image build. These still need a Linux runner and a human inspection |

@@ -1,0 +1,9 @@
+# The subject: a Service verified by refund-limit.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-reply
+  space: default
+spec:
+  verified_by:
+    - verifier: ./refund-limit.yaml

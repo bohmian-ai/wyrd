@@ -1,9 +1,9 @@
-"""The docsite Quickstart's two files, run as a reader runs them.
+"""The docsite Quickstart, run as a reader runs them.
 
-``examples/quickstart`` holds one YAML file declaring a Service and the
-assertion Verifier bound to it, and one script that declares them, pulls the
-bundle, and verifies a passing and a failing refund. The journey copies both
-files to an empty directory and runs the script against a real server, twice.
+``examples/quickstart`` holds a Verifier, the Service that references it, and
+one script that declares them, pulls the bundle, and verifies a passing and a
+failing refund. The journey copies the files to an empty directory and runs
+the script against a real server, twice.
 """
 
 from __future__ import annotations
@@ -56,25 +56,34 @@ def server(reader: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WyrdTestSe
 
 
 def test_docsite_quickstart_verifies_and_repeats(reader: Path, server: WyrdTestServer) -> None:
+    identities = set()
     for _ in range(2):
         script, printed = run_quickstart(reader)
-        passed, failed = script["results"]
+        subject, verifier = script["state"].root_ref, script["result"].verifier
 
-        assert (passed.verdict, failed.verdict) == ("passed", "failed")
-        for result in (passed, failed):
-            assert (result.subject.kind.name, result.subject.name) == ("Service", "support-reply")
-            assert (result.verifier.name, str(result.verifier.version)) == ("refund-limit", "1.0.0")
-            assert result.subject.uid is not None and result.verifier.uid is not None
-            assert str(result.subject) in printed and str(result.verifier) in printed
-        [kept], [broken] = passed.requirements, failed.requirements
-        assert (kept["id"], kept["outcome"]) == ("within-limit", "passed")
+        assert (subject.kind.name, subject.name, subject.uid is not None) == (
+            "Service",
+            "support-reply",
+            True,
+        )
+        assert (verifier.name, str(verifier.version), verifier.uid is not None) == (
+            "refund-limit",
+            "1.0.0",
+            True,
+        )
+        assert printed == (
+            f"passed: the comparison held\n  subject:  {subject}\n  verifier: {verifier}\n"
+            f"failed: operator LessThanOrEquals returned false\n"
+            f"  subject:  {subject}\n  verifier: {verifier}\n"
+        )
+        [broken] = script["result"].requirements
         assert (broken["id"], broken["outcome"], broken["actual"]) == (
             "within-limit",
             "failed",
             250,
         )
-        assert f"passed: {kept['reason']}" in printed
-        assert f"failed: {broken['reason']}" in printed
+        identities.add((str(subject), str(verifier)))
+    assert len(identities) == 1, "the rerun declares nothing new"
 
 
 def test_docsite_quickstart_refuses_insufficient_authority(

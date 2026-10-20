@@ -306,9 +306,11 @@ impl BrowserSessions {
     /// `tenant_route_key` selects, immediately and only that session; the API
     /// key or connection it was created through is untouched.
     ///
-    /// The value's tenant prefix must be the tenant the route key resolves to
-    /// before any revocation opens, so a value relabeled under another
-    /// tenant's cookie revokes nothing. A malformed, unknown, mismatching or
+    /// The value's tenant must be the one the tenant directory names
+    /// `tenant_route_key` before any revocation opens, so a value relabeled
+    /// under another tenant's cookie revokes nothing. The directory read is
+    /// status-independent and grants no admission: a suspended tenant's
+    /// session is still revoked, so it stays dead when the tenant resumes. A malformed, unknown, mismatching or
     /// already revoked value revokes nothing and is not an error, so logout
     /// always clears the browser's cookie. Revocation commits before the
     /// cleared cookie reaches the browser; when that response is lost, the
@@ -326,11 +328,11 @@ impl BrowserSessions {
             return Ok(());
         };
         let postgres = self.connections.postgres();
-        let routed = postgres
-            .resolve_tenant_slug(tenant_route_key)
+        let named = postgres
+            .tenant_directory_entry(tenant)
             .await
             .map_err(store_error)?;
-        if routed != Some(tenant) {
+        if named.is_none_or(|(slug, _)| &slug != tenant_route_key) {
             tracing::info!("logout cookie does not belong to the selected tenant");
             return Ok(());
         }

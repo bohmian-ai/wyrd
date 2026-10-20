@@ -443,6 +443,12 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
         StatusCode::OK,
         "Acme's own session survives"
     );
+    let beta_control = vec![(
+        cookie_name("beta"),
+        recover(&server, "beta", beta_key.expose_secret(), Some(ORIGIN))
+            .await
+            .cookie_value(&cookie_name("beta")),
+    )];
     superuser(
         &server,
         "UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1",
@@ -450,8 +456,44 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
     )
     .await;
     assert_eq!(
-        read(&server, "", beta_cookie).await.status,
+        read(&server, "", beta_cookie.clone()).await.status,
         StatusCode::UNAUTHORIZED
+    );
+    // Logout while the tenant is suspended still revokes the selected
+    // session, so it stays dead once the tenant resumes; the untouched
+    // control session resumes with the tenant.
+    let suspended_logout = send(
+        &server,
+        BrowserRequest {
+            method: Method::POST,
+            uri: "/auth/browser/logout",
+            origin: Some(ORIGIN),
+            cookies: beta_cookie.clone(),
+            body: Some(json!({ "tenant": "beta" })),
+        },
+    )
+    .await;
+    assert_eq!(suspended_logout.status, StatusCode::NO_CONTENT);
+    assert!(
+        suspended_logout
+            .set_cookie(&cookie_name("beta"))
+            .is_some_and(|cleared| cleared.contains("Max-Age=0"))
+    );
+    superuser(
+        &server,
+        "UPDATE platform.tenants SET status = 'active' WHERE data_tenant_id = $1",
+        beta_id.as_uuid(),
+    )
+    .await;
+    assert_eq!(
+        read(&server, "", beta_control).await.status,
+        StatusCode::OK,
+        "the control session resumes with its tenant"
+    );
+    assert_eq!(
+        read(&server, "", beta_cookie).await.status,
+        StatusCode::UNAUTHORIZED,
+        "a session logged out while suspended stays revoked after resume"
     );
 
     // Logout ends only its own session, immediately, and keeps the key.

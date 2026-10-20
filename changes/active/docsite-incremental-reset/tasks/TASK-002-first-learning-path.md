@@ -13,7 +13,7 @@ remediates: []
 ## Outcome and Value
 
 Introduction → Setup → Quickstart is a complete, short learning path: understand
-Wyrd, start it once, and run the proven two-file YAML/Python example. The pages
+Wyrd, start it once, and run the proven YAML/Python example. The pages
 teach the actual released workflow established by TASK-001, with complete code
 and visible results rather than excerpts from an application.
 

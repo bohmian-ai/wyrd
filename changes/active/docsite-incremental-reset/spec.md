@@ -1,6 +1,6 @@
 ---
 id: SPEC-docsite-incremental-reset
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -145,9 +145,10 @@ verification response, distinct from a refused or broken request. Explain
 that supplied evidence demonstrates judging declared criteria; it does not
 claim to have measured a model or application that was never executed.
 
-The tutorial uses YAML for declarations and Python for execution. Its two
-authored files are one YAML file containing the minimum subject and Verifier
-declarations, and one complete Python script with all imports. After starting
+The tutorial uses YAML for declarations and Python for execution. Its
+authored files are one YAML file per Card (the Verifier, and the subject that
+references it by relative path) and one complete Python script with all
+imports. After starting
 the server once, a reader runs that script to declare, load through the
 existing SDK, and verify the supplied evidence; no separate deployment script
 or manual bundle preparation is required. Repeating the script works without
@@ -257,6 +258,10 @@ artifacts blocks publication and must be reported.
 
 ## Revision history and authority
 
+- **Revision 3 — 2026-10-20 — directed by the user:** Author the subject and
+  Verifier as two YAML files joined by a relative path reference instead of
+  one multi-document file, whose only working link is the loader-internal
+  `sibling` form.
 - **Revision 2 — 2026-10-20 — approved by the user:** Record the agreed
   developer experience: start the server once, then run a complete local
   YAML-and-Python example, including declaration and a clean rerun. The user

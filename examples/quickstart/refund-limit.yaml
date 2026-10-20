@@ -1,0 +1,17 @@
+# The Verifier: the refund in a reply is at most 100 dollars.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: refund-limit
+  space: default
+spec:
+  inputs:
+    reply: { type: json }
+  requirements:
+    - id: within-limit
+      statement: The refund is at most 100 dollars
+      check:
+        kind: assert
+        path: inputs.reply.refund
+        operator: less_than_or_equals
+        expected: 100

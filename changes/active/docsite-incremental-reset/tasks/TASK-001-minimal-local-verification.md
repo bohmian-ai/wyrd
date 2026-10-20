@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-docsite-incremental-reset
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-002, REQ-003, REQ-004, INV-002, INV-003, INV-004, INV-005, AC-002, AC-003]
 depends_on: []
 parent_task:
@@ -13,15 +13,15 @@ remediates: []
 ## Outcome and Value
 
 After starting a released local Wyrd server once, a developer runs a complete
-Python script beside one YAML declaration file and sees attributable passing
+Python script beside two YAML declaration files and sees attributable passing
 and failing verification results. The same script can run again without
 manual cleanup. This delivers the executable source and installation evidence
 that TASK-002 teaches; it does not publish unfinished instructions.
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Use `$wyrd-implement`. The example and its tests are Wyrd-owned. Keep the two
-authored files small: YAML holds the minimum subject and assertion Verifier;
+Use `$wyrd-implement`. The example and its tests are Wyrd-owned. Keep the
+authored files small: one YAML file holds the assertion Verifier and one the subject referencing it;
 Python declares, performs required SDK loading, supplies JSON, and prints the
 result. Generated bundles are permissible, but cannot become extra authored
 prerequisites or require a separate deployment script.
@@ -128,7 +128,7 @@ sample/test code while both exact commands stay green.
 
 ## Acceptance Criteria
 
-- The reader authors only one YAML file and one complete Python script; the
+- The reader authors only two YAML files and one complete Python script; the
   script declares and performs required loading without manual deployment.
 - Both returned judgments expose exact identities, verdict, and reason; the
   failing judgment is an ordinary successful response.
@@ -206,23 +206,21 @@ Result: `IMPLEMENTED` with one publication blocker (macOS arm64 startup, below).
 
 ### Sample and capability reuse
 
-- `examples/quickstart/quickstart.yaml`: one assertion Verifier (`refund-limit`)
-  and one Service (`support-reply`) whose Service-level `verified_by` binds it.
-  The binding uses `{sibling: {kind, name, version}}` because an authored
-  `{kind, name, version}` ref is an external registry reference and is refused
-  for a Card first declared in the same request
-  (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`, observed on 0.2.0), and a `./path`
-  ref may not target a multi-document file (`wyrd-loader/src/resolve.rs`).
-  `sibling` is the existing wire form (`wyrd-spec/src/reference.rs` `Ref::Sibling`);
-  no contract changed. The conventional alternative is two YAML files joined by
-  `./path` refs, as in `examples/readme`; the approved one-file constraint
-  selects `sibling`.
-- `examples/quickstart/quickstart.py`: `Cards.declare_from_path` →
+- `examples/quickstart/refund-limit.yaml`: one assertion Verifier.
+  `examples/quickstart/support-reply.yaml`: the Service subject, bound to it
+  with `verifier: ./refund-limit.yaml`, the loader's ordinary path reference
+  (as in `examples/readme`). A single multi-document file was tried first; a
+  by-name ref to a Card in the same request is refused
+  (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`) and a path may not target a
+  multi-Card file, leaving only the loader-internal `sibling` form, so the
+  user directed spec revision 3: one file per Card.
+- `examples/quickstart/quickstart.py`: `Cards.declare_from_path("support-reply.yaml")` →
   `Cards.pull(receipt.root, ".wyrd-bundle")` → `WyrdState.from_path` →
-  `run().observe.verify` twice, printing verdict, requirement reason, and the
+  `run().observe.verify` in a loop, printing verdict, requirement reason, and the
   exact subject and Verifier refs. No new SDK, server, or CLI code.
 - Journey: `sdks/wyrd-sdk-python/tests/integration/test_docsite_quickstart.py`
-  copies the two files into an empty directory and runs them with `runpy`.
+  copies the files into an empty directory, runs the script with `runpy`, and
+  asserts its exact printed output.
 
 ### Released set (checked 2026-10-20)
 
@@ -297,7 +295,7 @@ Commands and observed results on the macOS walkthrough (with the workaround):
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| One YAML + one complete script; script declares and loads | `examples/quickstart/` | Scenario 1; macOS and Linux walkthroughs | PASS |
+| Two YAML files + one complete script; script declares and loads | `examples/quickstart/` | Scenario 1; macOS and Linux walkthroughs | PASS |
 | Both judgments expose identities, verdict, reason; failure is ordinary | `quickstart.py` prints; test asserts | `test_docsite_quickstart_verifies_and_repeats` | PASS |
 | Second execution works | Same script, no cleanup | Scenario 2 loop; walkthrough reruns | PASS |
 | Insufficient authority refused | Viewer key on the pulled bundle | `test_docsite_quickstart_refuses_insufficient_authority` | PASS |
@@ -314,6 +312,7 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/w
 mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_docsite_quickstart.py::test_docsite_quickstart_refuses_insufficient_authority → 1 passed
 WYRD_LOG=info mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_docsite_quickstart.py → 2 passed
 uv run --directory sdks/wyrd-sdk-python ruff format --config pyproject.toml ../../examples/quickstart → unchanged
+Revision 3 (two YAML files): focused module → 2 passed; released 0.2.0 macOS walkthrough (with the memory workaround) → both verdicts, rerun with identical UIDs
 uv run --directory sdks/wyrd-sdk-python ruff check --config pyproject.toml ../../examples/quickstart → All checks passed
 mise run py:format → clean; mise run py:lints → All checks passed, stubs valid
 git diff --check → clean

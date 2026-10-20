@@ -1,180 +1,516 @@
-//! The per-process cache of parsed Verifier Cards.
+//! The one resolution of a verification target, shared by direct verify,
+//! submission acceptance, and the queued runner.
 //!
-//! A Card's spec never changes under its UID, so a cached entry needs no
-//! content invalidation: the claim transaction reports whether the Card still
-//! exists, and only on a miss reads its spec, so loading a Verifier never
-//! opens its own connection. Entries are keyed by tenant and Card UID and are
-//! never shared across tenants. The cache is bounded by total bytes with
-//! least-recently-used eviction, because every Wyrd-owned buffer is bounded.
+//! Every Verifier execution first resolves its target: the exact Verifier and
+//! its spec, the exact subject, and the tenant's SYSTEM principal, or the
+//! [`EnqueueRefusal`] that keeps it from running. [`VerifierCardCache::resolve`]
+//! is the only way any path does that. It reads `wyrd.verification_target`,
+//! whose `wyrd.verifier_readiness` is the one rule deciding whether a Verifier
+//! can run, and caches each resolved target by tenant, Verifier, and subject.
+//! Entries are never shared across tenants and are bounded by total bytes
+//! with least-recently-used eviction, because every Wyrd-owned buffer is
+//! bounded. Refusals are never cached, so a Card registered after one is seen
+//! at once.
+//!
+//! A cached target is served only while this node hears every change to what
+//! it was resolved from. Triggers on `wyrd.cards` (a status, version, or spec
+//! hash change, or a delete), on `wyrd.drift_baselines` (a state change), and
+//! on `wyrd.auth_service_accounts` (any SYSTEM row write) send a
+//! [`TARGET_CHANNEL`] notification from inside the committing transaction, so
+//! it is delivered only if the write commits. A Card or baseline notification
+//! forgets every target naming that Card; a principal notification forgets
+//! every target of the tenant. Like Oracle's cut cache, the listener's absence
+//! or any lost connection forgets everything, so every resolution then reads
+//! Postgres. A notification is delivered after its commit, so a resolution
+//! racing a Card deletion or deprecation can still serve the old target for
+//! that delivery latency.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use lru::LruCache;
+use sqlx::PgConnection;
+use sqlx::postgres::PgListener;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::verification::VerifierReadiness;
+use wyrd_sql::queries::verification_target::{VerificationTarget, VerificationTargets};
+use wyrd_sql::queries::verifier_executions::EnqueueRefusal;
+use wyrd_sql::{CardRow, ParsedCardRow, SqlError, WyrdPostgres};
 
-/// Total bytes of parsed Verifier Cards one process keeps.
+/// Postgres channel the target triggers notify on.
+pub(crate) const TARGET_CHANNEL: &str = "wyrd_verification_target";
+
+/// Total bytes of cached targets one process keeps.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// One parsed Verifier Card's spec.
+/// Pause before reconnecting after the listener fails to connect or listen.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Cache key: tenant, Verifier Card UID, and subject Card UID.
+type TargetKey = (DataTenantId, Uuid, Uuid);
+
+/// The exact Verifier and subject an execution resolved.
 #[derive(Debug)]
-pub(crate) struct CachedVerifier {
-    /// The spec the execution runs, shared with each engine run.
+pub(crate) struct Target {
+    /// Exact Verifier reference.
+    pub(crate) verifier: CardRef,
+    /// The Verifier's building-block spec.
     pub(crate) spec: Arc<VerifierSpec>,
-    /// The entry's charge against [`CACHE_BYTES`]: its serialized size.
-    bytes: usize,
+    /// Exact subject reference.
+    pub(crate) subject: CardRef,
+    /// The tenant's active SYSTEM principal, which executes the Verifier;
+    /// `None` when the tenant has none, which each caller refuses its own way.
+    pub(crate) system_principal: Option<PrincipalId>,
 }
 
-impl CachedVerifier {
-    /// Build an entry charged at the serialized size of `spec`.
-    pub(crate) fn new(spec: VerifierSpec) -> Self {
-        let bytes = serde_json::to_vec(&spec).map_or(0, |json| json.len());
-        Self {
-            spec: Arc::new(spec),
-            bytes,
+impl Target {
+    /// Decide what one `wyrd.verification_target` read resolves to.
+    ///
+    /// The database decided readiness and which Cards are not deleted, and
+    /// [`VerificationTarget::refusal`] applies that answer, so this only
+    /// parses what it resolved. A stored Card that does not parse
+    /// is a row Wyrd never writes; it is logged and refused as unavailable
+    /// rather than failing every execution that names it. Pure: no IO.
+    fn resolved(read: VerificationTarget) -> Result<Self, EnqueueRefusal> {
+        let unavailable = EnqueueRefusal::NotReady(VerifierReadiness::VerifierUnavailable);
+        if let Some(refusal) = read.refusal() {
+            return Err(refusal);
         }
+        let (Some(verifier), Some(subject)) = (read.verifier, read.subject) else {
+            return Err(unavailable);
+        };
+        let verifier = Self::parse(verifier).ok_or(unavailable)?;
+        let subject = Self::parse(subject).ok_or(EnqueueRefusal::SubjectUnavailable)?;
+        let reference = exact_ref(&verifier);
+        let Spec::Verifier(spec) = verifier.spec else {
+            return Err(unavailable);
+        };
+        Ok(Self {
+            verifier: reference,
+            spec: Arc::new(spec),
+            subject: exact_ref(&subject),
+            system_principal: read.system_principal.map(PrincipalId::new),
+        })
+    }
+
+    /// Parse a stored Card row, logging and discarding one that does not.
+    fn parse(row: CardRow) -> Option<ParsedCardRow> {
+        let uid = row.card_uid;
+        ParsedCardRow::try_from(row)
+            .inspect_err(
+                |error| tracing::warn!(card_uid = %uid, %error, "a stored Card does not parse"),
+            )
+            .ok()
     }
 }
 
-/// Least-recently-used entries and the bytes they hold.
-struct Entries {
-    /// Parsed Cards by tenant and UID, most recently used last.
-    cards: LruCache<(DataTenantId, CardUid), Arc<CachedVerifier>>,
-    /// Sum of every held entry's charge.
+/// The exact reference of a stored Card row.
+pub(crate) fn exact_ref(row: &ParsedCardRow) -> CardRef {
+    CardRef {
+        kind: row.kind.clone(),
+        name: row.name.clone(),
+        version: row.version.clone(),
+        space: Some(row.space.clone()),
+        uid: Some(row.card_uid.clone()),
+    }
+}
+
+/// Where a cache miss reads its target.
+pub(crate) enum Db<'a> {
+    /// A plain app-pool connection, acquired only on a miss; the read is one
+    /// autocommit statement. Direct verify resolves this way.
+    Pool(&'a WyrdPostgres),
+    /// The caller's open transaction, bound to the same tenant, so the read
+    /// sees what that transaction sees. Acceptance and the runner's claim
+    /// resolve this way.
+    Conn(&'a mut PgConnection),
+}
+
+/// One cached target and its charge against [`CACHE_BYTES`].
+struct CachedTarget {
+    /// The resolved target.
+    target: Arc<Target>,
+    /// The entry's charge: its spec's serialized size.
     bytes: usize,
 }
 
-/// Byte-bounded, tenant-keyed cache of parsed Verifier Cards.
-pub(crate) struct VerifierCache {
+/// The cache state guarded by one lock, so a fill and an invalidation are
+/// ordered by it.
+struct Entries {
+    /// Cached targets, most recently used last.
+    targets: LruCache<TargetKey, CachedTarget>,
+    /// Sum of every held target's charge.
+    bytes: usize,
+    /// Bumped by every invalidation; a fill that began under an older value
+    /// is not cached.
+    generation: u64,
+    /// Whether this node is currently listening for invalidations.
+    live: bool,
+}
+
+/// Byte-bounded, tenant-keyed cache of resolved verification targets; see
+/// the module docs for when it serves.
+pub struct VerifierCardCache {
     /// Entries behind one short synchronous lock; no await happens under it.
     entries: Mutex<Entries>,
     /// Byte ceiling, [`CACHE_BYTES`] in production.
     capacity: usize,
 }
 
-impl Default for VerifierCache {
-    /// An empty cache bounded at 64 MiB.
+impl Default for VerifierCardCache {
+    /// An empty, not yet listening cache bounded at 64 MiB.
     fn default() -> Self {
         Self::with_capacity(CACHE_BYTES)
     }
 }
 
-impl VerifierCache {
-    /// An empty cache holding at most `capacity` bytes.
+impl VerifierCardCache {
+    /// An empty, not yet listening cache holding at most `capacity` bytes.
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Mutex::new(Entries {
-                cards: LruCache::unbounded(),
+                targets: LruCache::unbounded(),
                 bytes: 0,
+                generation: 0,
+                live: false,
             }),
             capacity,
         }
     }
 
-    /// The cached Verifier `uid` of `tenant`, marked most recently used.
-    ///
-    /// # Panics
-    /// Panics when the cache lock is poisoned, which no holder can cause
-    /// because nothing under it panics.
-    pub(crate) fn get(&self, tenant: DataTenantId, uid: &CardUid) -> Option<Arc<CachedVerifier>> {
-        let mut entries = self.entries.lock().expect("verifier cache lock");
-        entries.cards.get(&(tenant, uid.clone())).map(Arc::clone)
+    /// Locks the entries; a poisoned lock is recovered, because every holder
+    /// leaves them consistent before anything under it could panic.
+    fn entries(&self) -> MutexGuard<'_, Entries> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Cache `verifier` as `uid` of `tenant` and return it.
+    /// Resolve `verifier` on `subject` in `tenant`: the one read route of
+    /// every Verifier execution.
     ///
-    /// Evicts least-recently-used entries until the total fits the byte
-    /// ceiling; an entry larger than the whole ceiling is returned but not
-    /// kept.
+    /// A target cached while listening is returned with no IO. Otherwise
+    /// `wyrd.verification_target` reads it from `db` in one statement and
+    /// [`Target::resolved`] applies the database's answer; a resolved target
+    /// is cached unless an invalidation or lost listener raced the read.
     ///
-    /// # Panics
-    /// Panics when the cache lock is poisoned.
-    pub(crate) fn insert(
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when a [`Db::Pool`] miss cannot get a
+    /// connection and [`SqlError::Query`] when the read fails or its
+    /// readiness does not decode. A refusal is `Ok(Err(_))`.
+    pub(crate) async fn resolve(
         &self,
+        db: Db<'_>,
         tenant: DataTenantId,
-        uid: CardUid,
-        verifier: CachedVerifier,
-    ) -> Arc<CachedVerifier> {
-        let verifier = Arc::new(verifier);
-        let mut entries = self.entries.lock().expect("verifier cache lock");
-        entries.bytes += verifier.bytes;
-        if let Some((_, replaced)) = entries.cards.push((tenant, uid), Arc::clone(&verifier)) {
+        verifier: &CardUid,
+        subject: &CardUid,
+    ) -> Result<Result<Arc<Target>, EnqueueRefusal>, SqlError> {
+        let key = (tenant, verifier.as_uuid(), subject.as_uuid());
+        if let Some(target) = self.cached(&key) {
+            return Ok(Ok(target));
+        }
+        tracing::debug!("verification target cache miss");
+        let generation = self.fill_generation();
+        let read = match db {
+            Db::Pool(postgres) => {
+                let mut conn = postgres.conn().await?;
+                VerificationTargets::new(&mut conn, tenant)
+                    .read(verifier, subject)
+                    .await
+            }
+            Db::Conn(conn) => {
+                VerificationTargets::new(conn, tenant)
+                    .read(verifier, subject)
+                    .await
+            }
+        }
+        .map_err(SqlError::Query)?;
+        Ok(Target::resolved(read).map(|target| self.insert(key, generation, target)))
+    }
+
+    /// The target cached for `key`, marked most recently used, served only
+    /// while listening.
+    fn cached(&self, key: &TargetKey) -> Option<Arc<Target>> {
+        let mut entries = self.entries();
+        if !entries.live {
+            return None;
+        }
+        entries
+            .targets
+            .get(key)
+            .map(|cached| Arc::clone(&cached.target))
+    }
+
+    /// The generation a read must start under for its target to be cached,
+    /// or `None` when the node is not listening.
+    fn fill_generation(&self) -> Option<u64> {
+        let entries = self.entries();
+        entries.live.then_some(entries.generation)
+    }
+
+    /// Caches `target` for `key` when `generation` is the current one while
+    /// listening, and returns it either way.
+    ///
+    /// A read that raced an invalidation is returned but not cached. Evicts
+    /// least-recently-used targets until the total fits the byte ceiling; a
+    /// target larger than the whole ceiling is not kept.
+    fn insert(&self, key: TargetKey, generation: Option<u64>, target: Target) -> Arc<Target> {
+        let target = Arc::new(target);
+        let bytes = serde_json::to_vec(&*target.spec).map_or(0, |json| json.len());
+        let mut entries = self.entries();
+        if !entries.live || generation != Some(entries.generation) {
+            return target;
+        }
+        entries.bytes += bytes;
+        let cached = CachedTarget {
+            target: Arc::clone(&target),
+            bytes,
+        };
+        if let Some((_, replaced)) = entries.targets.push(key, cached) {
             entries.bytes -= replaced.bytes;
         }
         while entries.bytes > self.capacity {
-            let Some((_, evicted)) = entries.cards.pop_lru() else {
+            let Some((_, evicted)) = entries.targets.pop_lru() else {
                 break;
             };
             entries.bytes -= evicted.bytes;
         }
-        verifier
+        target
+    }
+
+    /// Forgets what a notification names: every target naming the Card for
+    /// `tenant|card_uid`, every target of the tenant for `tenant`, or every
+    /// target for any other payload.
+    fn invalidate(&self, payload: &str) {
+        tracing::debug!(payload, "verification target invalidated");
+        let mut entries = self.entries();
+        entries.generation = entries.generation.wrapping_add(1);
+        let mut parts = payload.splitn(2, '|');
+        let tenant = parts
+            .next()
+            .and_then(|tenant| Uuid::parse_str(tenant).ok())
+            .and_then(|tenant| DataTenantId::new(tenant).ok());
+        let card = match (tenant, parts.next().map(Uuid::parse_str)) {
+            (Some(_), None) => None,
+            (Some(_), Some(Ok(card))) => Some(card),
+            _ => {
+                entries.targets.clear();
+                entries.bytes = 0;
+                return;
+            }
+        };
+        // ponytail: scans every cached target per notification; Card writes are
+        // rare next to resolutions. Index targets by Card if invalidation shows up in profiles.
+        let stale: Vec<TargetKey> = entries
+            .targets
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|(owner, verifier, subject)| {
+                Some(*owner) == tenant
+                    && card.is_none_or(|card| *verifier == card || *subject == card)
+            })
+            .collect();
+        for key in stale {
+            if let Some(evicted) = entries.targets.pop(&key) {
+                entries.bytes -= evicted.bytes;
+            }
+        }
+    }
+
+    /// How many invalidations and listener resets this cache has applied, so
+    /// a test can wait until a committed write's notification has arrived
+    /// instead of sleeping.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn invalidations(&self) -> u64 {
+        self.entries().generation
+    }
+
+    /// Forgets every target and records whether the node is now listening.
+    fn reset(&self, live: bool) {
+        let mut entries = self.entries();
+        entries.generation = entries.generation.wrapping_add(1);
+        entries.targets.clear();
+        entries.bytes = 0;
+        entries.live = live;
+    }
+
+    /// Listens for target invalidations on `pool` until `shutdown`.
+    ///
+    /// Holds one pool connection for the listener. Targets serve only
+    /// between a successful `LISTEN` and the next lost connection; each loss
+    /// forgets them, and sqlx reconnects and re-listens before reporting the
+    /// loss, so serving resumes from fresh reads. A failed connect or
+    /// `LISTEN` leaves serving off and retries after [`RECONNECT_DELAY`].
+    pub async fn watch(&self, pool: &sqlx::PgPool, shutdown: CancellationToken) {
+        while !shutdown.is_cancelled() {
+            let listener = async {
+                let mut listener = PgListener::connect_with(pool).await?;
+                listener.listen(TARGET_CHANNEL).await?;
+                Ok::<_, sqlx::Error>(listener)
+            };
+            let mut listener = match listener.await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::warn!(%error, "verification target cache listener could not start; targets read Postgres");
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(RECONNECT_DELAY) => continue,
+                    }
+                }
+            };
+            self.reset(true);
+            loop {
+                let received = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    received = listener.try_recv() => received,
+                };
+                match received {
+                    Ok(Some(notification)) => self.invalidate(notification.payload()),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "verification target cache listener reconnected; targets forgotten"
+                        );
+                        self.reset(true);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "verification target cache listener failed; targets read Postgres");
+                        break;
+                    }
+                }
+            }
+            self.reset(false);
+        }
+        self.reset(false);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use uuid::Uuid;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::card::verifier::VerifierSpec;
-    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::reference::CardRef;
 
-    use super::{CachedVerifier, VerifierCache};
+    use super::{Target, TargetKey, VerifierCardCache};
 
-    /// A fresh `UUIDv7` Card UID.
+    /// A static Card reference of `kind`.
     ///
     /// # Panics
-    /// Panics when a `UUIDv7` is not a valid Card UID.
-    fn uid() -> CardUid {
-        CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a UUIDv7 is a valid Card UID")
+    /// Panics when the static reference is invalid.
+    fn reference(kind: &str) -> CardRef {
+        serde_json::from_value(serde_json::json!({
+            "kind": kind, "name": "drift", "version": "1.0.0",
+        }))
+        .expect("static Card reference")
     }
 
-    /// A parsed one-assertion Verifier.
+    /// A one-assertion target.
     ///
     /// # Panics
-    /// Panics when the static spec is invalid.
-    fn verifier() -> CachedVerifier {
-        CachedVerifier::new(
-            serde_json::from_value::<VerifierSpec>(serde_json::json!({
-                "requirements": [{
-                    "id": "valid",
-                    "statement": "The input is true.",
-                    "check": {"kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true}
-                }]
-            }))
-            .expect("static Verifier spec"),
-        )
+    /// Panics when the static spec or reference is invalid.
+    fn target() -> Target {
+        Target {
+            verifier: reference("Verifier"),
+            spec: Arc::new(
+                serde_json::from_value::<VerifierSpec>(serde_json::json!({
+                    "requirements": [{
+                        "id": "valid",
+                        "statement": "The input is true.",
+                        "check": {"kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true}
+                    }]
+                }))
+                .expect("static Verifier spec"),
+            ),
+            subject: reference("Service"),
+            system_principal: None,
+        }
     }
 
-    /// Entries are per tenant, the byte ceiling evicts the least recently
-    /// used entry first, and an entry larger than the ceiling is not kept.
+    /// A fresh key in `tenant`.
+    fn key(tenant: DataTenantId) -> TargetKey {
+        (tenant, Uuid::now_v7(), Uuid::now_v7())
+    }
+
+    /// Caches a target for `key` as one read under the current generation
+    /// would.
+    fn fill(cache: &VerifierCardCache, key: TargetKey) {
+        cache.insert(key, cache.fill_generation(), target());
+    }
+
+    /// Targets serve only while listening and within their key; a raced fill
+    /// is not cached; a Card notification forgets targets naming that Card
+    /// as Verifier or subject, a tenant notification every target of the
+    /// tenant, a malformed one and a lost listener everything.
     #[test]
-    fn entries_are_tenant_scoped_and_evicted_least_recently_used_by_bytes() {
-        let size = verifier().bytes;
-        let cache = VerifierCache::with_capacity(2 * size);
+    fn targets_serve_only_while_listening_and_until_invalidated() {
+        let cache = VerifierCardCache::default();
         let (tenant, other) = (DataTenantId::new_v7(), DataTenantId::new_v7());
-        let (a, b, c) = (uid(), uid(), uid());
-        cache.insert(tenant, a.clone(), verifier());
-        assert!(
-            cache.get(other, &a).is_none(),
-            "never shared across tenants"
-        );
-        cache.insert(tenant, b.clone(), verifier());
-        assert!(cache.get(tenant, &a).is_some(), "a is now most recent");
-        cache.insert(tenant, c.clone(), verifier());
-        assert!(cache.get(tenant, &b).is_none(), "b was least recently used");
-        assert!(cache.get(tenant, &a).is_some() && cache.get(tenant, &c).is_some());
+        let (a, b) = (key(tenant), key(tenant));
 
-        let tiny = VerifierCache::with_capacity(size - 1);
-        assert_eq!(
-            tiny.insert(tenant, a.clone(), verifier())
-                .spec
-                .requirements
-                .len(),
-            1
-        );
+        fill(&cache, a);
+        assert!(cache.cached(&a).is_none(), "not listening");
+
+        cache.reset(true);
+        fill(&cache, a);
+        fill(&cache, b);
+        assert!(cache.cached(&a).is_some());
         assert!(
-            tiny.get(tenant, &a).is_none(),
-            "an oversized entry is not kept"
+            cache.cached(&(other, a.1, a.2)).is_none(),
+            "never across tenants"
         );
+
+        cache.invalidate(&format!("{}|{}", tenant.as_uuid(), a.2));
+        assert!(cache.cached(&a).is_none(), "a's subject changed");
+        assert!(cache.cached(&b).is_some(), "b names neither Card");
+        cache.invalidate(&format!("{}|{}", other.as_uuid(), b.1));
+        assert!(cache.cached(&b).is_some(), "another tenant's Card");
+        cache.invalidate(&format!("{}|{}", tenant.as_uuid(), b.1));
+        assert!(cache.cached(&b).is_none(), "b's Verifier changed");
+
+        fill(&cache, a);
+        cache.invalidate(&tenant.as_uuid().to_string());
+        assert!(cache.cached(&a).is_none(), "the tenant's principal changed");
+
+        let stale = cache.fill_generation();
+        cache.invalidate("malformed");
+        cache.insert(a, stale, target());
+        assert!(cache.cached(&a).is_none(), "a raced fill is not cached");
+
+        fill(&cache, a);
+        cache.reset(false);
+        cache.reset(true);
+        assert!(cache.cached(&a).is_none(), "a lost listener forgets");
+    }
+
+    /// The byte ceiling evicts the least recently used target first, and a
+    /// target larger than the whole ceiling is returned but not kept.
+    #[test]
+    fn targets_are_evicted_least_recently_used_by_bytes() {
+        let tenant = DataTenantId::new_v7();
+        let size = serde_json::to_vec(&*target().spec)
+            .expect("the spec serializes")
+            .len();
+        let cache = VerifierCardCache::with_capacity(2 * size);
+        cache.reset(true);
+        let (a, b, c) = (key(tenant), key(tenant), key(tenant));
+        fill(&cache, a);
+        fill(&cache, b);
+        assert!(cache.cached(&a).is_some(), "a is now most recent");
+        fill(&cache, c);
+        assert!(cache.cached(&b).is_none(), "b was least recently used");
+        assert!(cache.cached(&a).is_some() && cache.cached(&c).is_some());
+
+        let tiny = VerifierCardCache::with_capacity(size - 1);
+        tiny.reset(true);
+        tiny.insert(a, tiny.fill_generation(), target());
+        assert!(tiny.cached(&a).is_none(), "an oversized target is not kept");
     }
 }

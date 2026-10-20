@@ -28,10 +28,18 @@ const BIFROST_DURATION_BUCKETS: &[f64] = &[
 ];
 
 /// Verification execution, queue, phase, and overhead buckets (seconds),
-/// resolving sub-millisecond preparation and the 10 ms scoring objective.
+/// resolving sub-millisecond preparation, the 1 ms direct-overhead p99
+/// objective (a p99 in the `le="0.001"` bucket cannot prove it is below
+/// 1 ms, so finer bounds sit under it), and the 10 ms scoring objective.
 const VERIFICATION_DURATION_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-    10.0, 30.0, 60.0, 300.0,
+    0.0001, 0.00025, 0.0005, 0.00075, 0.0009, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025,
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0,
+];
+
+/// Source executions pinned by one group snapshot, from a single execution to
+/// a large end-of-group fan-in.
+const VERIFICATION_GROUP_SOURCE_BUCKETS: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
 ];
 
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
@@ -59,6 +67,9 @@ pub const BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS: &str =
 pub const BIFROST_SCRIBE_WAL_APPEND_SECONDS: &str = "bifrost_scribe_wal_append_seconds";
 /// Scribe physical WAL fsync latency.
 pub const BIFROST_SCRIBE_WAL_FSYNC_SECONDS: &str = "bifrost_scribe_wal_fsync_seconds";
+/// One outbox write, from dispatch to settlement, labelled by `outbox`: the
+/// drain step of a tenant's backlog, since a tenant has one write in flight.
+pub const OUTBOX_WRITE_SECONDS: &str = "outbox_write_seconds";
 /// Wyrd PostgreSQL tenant-pool acquisition latency.
 pub const WYRD_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "wyrd_postgres_pool_acquire_seconds";
 /// Vala PostgreSQL tenant-pool acquisition latency.
@@ -88,11 +99,37 @@ pub const VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS: &str =
 /// Overlapping phases of one execution, by `mode` and `phase`
 /// (`load`, `input_read`, `prepare`, `engine`, `settlement`).
 pub const VERIFICATION_PHASE_DURATION_SECONDS: &str = "wyrd_verification_phase_duration_seconds";
-/// Engine elapsed time less the union of its measured waits, by
-/// `mode` and `outcome`; wall time, not CPU.
-pub const VERIFICATION_ENGINE_OVERHEAD_SECONDS: &str = "wyrd_verification_engine_overhead_seconds";
+/// The runtime's overhead of one execution: the whole execution (a direct
+/// request from its HTTP arrival, a queued attempt from its claim) less the
+/// union of the Verifier's own blocks, by `mode` and `outcome`; wall time.
+pub const VERIFICATION_OVERHEAD_SECONDS: &str = "wyrd_verification_overhead_seconds";
+/// The Verifier's own execution: the union of the actions and checks it ran
+/// in one execution, by `mode` and `outcome`; wall time.
+pub const VERIFICATION_VERIFIER_SECONDS: &str = "wyrd_verification_verifier_seconds";
+/// One background submission from its HTTP arrival until it is staged or
+/// refused, by `outcome`; wall time.
+pub const VERIFICATION_SUBMIT_SECONDS: &str = "wyrd_verification_submit_seconds";
 /// Scheduler occurrences processed, by `outcome`.
 pub const VERIFICATION_SCHEDULE_TICKS_TOTAL: &str = "wyrd_verification_schedule_ticks_total";
+/// One Verifier block attempt inside the engine, by `block` (`action`,
+/// `check`), `kind`, and `outcome` (`ok`, `error`); excludes permit waits.
+pub const VERIFICATION_BLOCK_DURATION_SECONDS: &str = vala_verify::blocks::BLOCK_DURATION_SECONDS;
+/// One verification queue or group-scheduling SQL operation, by `op` and
+/// `outcome` (`ok`, `error`).
+pub const VERIFICATION_STORE_DURATION_SECONDS: &str =
+    wyrd_sql::queries::verifier_executions::VERIFICATION_STORE_DURATION_SECONDS;
+/// One scheduler pass or group handoff, by `pass` (`cron`, `group`,
+/// `group_handoff`) and `outcome` (`ok`, `error`).
+pub const VERIFICATION_SCHEDULE_PASS_SECONDS: &str = "wyrd_verification_schedule_pass_seconds";
+/// The Bifrost read pinning one group snapshot, by `outcome` (`ok`, `error`).
+pub const VERIFICATION_GROUP_SNAPSHOT_SECONDS: &str = "wyrd_verification_group_snapshot_seconds";
+/// Source executions pinned by one complete group snapshot.
+pub const VERIFICATION_GROUP_SNAPSHOT_SOURCES: &str = "wyrd_verification_group_snapshot_sources";
+/// Group handoffs left pending by a Wyrd-side blockage, by `reason`
+/// (`no_owner_principal`, `no_system_principal`, `authority_unavailable`,
+/// `enqueue_refused`, `snapshot_read`, `snapshot_incomplete`).
+pub const VERIFICATION_GROUP_HANDOFFS_BLOCKED_TOTAL: &str =
+    "wyrd_verification_group_handoffs_blocked_total";
 /// Whether each verification runtime capability task is running, by `capability`.
 pub const VERIFICATION_CAPABILITY_UP: &str = "wyrd_verification_capability_up";
 /// Unexpected verification capability exits that were restarted, by `capability`.
@@ -111,7 +148,13 @@ const VERIFICATION_DURATION_FAMILIES: &[&str] = &[
     VERIFICATION_QUEUE_WAIT_SECONDS,
     VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS,
     VERIFICATION_PHASE_DURATION_SECONDS,
-    VERIFICATION_ENGINE_OVERHEAD_SECONDS,
+    VERIFICATION_OVERHEAD_SECONDS,
+    VERIFICATION_VERIFIER_SECONDS,
+    VERIFICATION_SUBMIT_SECONDS,
+    VERIFICATION_BLOCK_DURATION_SECONDS,
+    VERIFICATION_STORE_DURATION_SECONDS,
+    VERIFICATION_SCHEDULE_PASS_SECONDS,
+    VERIFICATION_GROUP_SNAPSHOT_SECONDS,
 ];
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
@@ -124,6 +167,7 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS,
     BIFROST_SCRIBE_WAL_APPEND_SECONDS,
     BIFROST_SCRIBE_WAL_FSYNC_SECONDS,
+    OUTBOX_WRITE_SECONDS,
     BIFROST_FORGE_TASK_DURATION_SECONDS,
     "oracle_admission_queue_duration_seconds",
     "oracle_query_duration_seconds",
@@ -233,6 +277,11 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         .set_buckets_for_metric(
             Matcher::Full(OPERATOR_DISPATCH_DURATION_SECONDS.to_owned()),
             BIFROST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(VERIFICATION_GROUP_SNAPSHOT_SOURCES.to_owned()),
+            VERIFICATION_GROUP_SOURCE_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?;
     for family in VERIFICATION_DURATION_FAMILIES {

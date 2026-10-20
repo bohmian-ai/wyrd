@@ -10,11 +10,12 @@
 //! `verifier_card_uid`) and `run_id` (the application Run judged, null when
 //! none, as for scheduled drift).
 
+use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
@@ -75,6 +76,29 @@ pub enum ResultPayloadError {
 /// The name, not the position, binds the values to the destination table's
 /// field, so a reordered table declaration cannot relabel evidence.
 type NamedColumn = (&'static str, ArrayRef);
+
+/// The one schema every row of each result table shares: the table's fields
+/// followed by `card_uid` and `run_id`, keyed by its table type.
+///
+/// Each result row is its own batch until the Scribe outbox concatenates a
+/// slice of them, so one shared schema lets the outbox group rows by pointer
+/// and spares every row its own field allocations.
+static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
+    /// `T`'s fields followed by the correlation columns, keyed by `T`.
+    fn schema<T: DomainTable + 'static>() -> (TypeId, SchemaRef) {
+        let mut fields = T::arrow_fields();
+        fields.extend([
+            Field::new(CARD_UID, DataType::Utf8, true),
+            Field::new(RUN_ID, DataType::Utf8, true),
+        ]);
+        (TypeId::of::<T>(), Arc::new(Schema::new(fields)))
+    }
+    [
+        schema::<ResultsTable>(),
+        schema::<ResultFeaturesTable>(),
+        schema::<ExecutionInputsTable>(),
+    ]
+});
 
 /// One sealed-ready batch and the table it is written to.
 #[derive(Debug, Clone)]
@@ -247,6 +271,10 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Author the named columns of the one `vala.verification.results` row
     /// identified by `result_id`.
     ///
+    /// The outcome is serialized straight to JSON text for the one Variant
+    /// walker, never through an intermediate `serde_json::Value`; every
+    /// direct verify pays this on its request.
+    ///
     /// # Errors
     /// Returns a JSON error when the Trigger or outcome cannot be encoded and
     /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
@@ -258,7 +286,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
         let verdict: &'static str = outcome.verdict.into();
-        let outcome = serde_json::to_value(outcome)?;
+        let outcome = serde_json::to_string(outcome)?;
         let window = self.run.window;
         Ok(vec![
             ("result_id", text([Some(result_id.to_string())])),
@@ -286,7 +314,11 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("ended_at", timestamps([Some(self.ended_at)])),
             (
                 OUTCOME,
-                VariantColumnBuilder::encode(OUTCOME, [Some(&outcome)], EncodedVariant::from_json)?,
+                VariantColumnBuilder::encode(
+                    OUTCOME,
+                    [Some(outcome.as_str())],
+                    EncodedVariant::from_json_text,
+                )?,
             ),
         ])
     }
@@ -310,7 +342,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     ) -> Result<ResultBatch, ResultPayloadError> {
         let activation = submission
             .map(|submission| {
-                serde_json::to_value(Activation {
+                serde_json::to_string(&Activation {
                     route_overrides: &submission.request.execution_route_overrides,
                     idempotency_key: submission.key.as_ref().map(|key| key.key.as_str()),
                     request_sha256: submission
@@ -321,7 +353,7 @@ impl<'a> ResultPayloadBuilder<'a> {
                 })
             })
             .transpose()?;
-        let inputs = serde_json::to_value(inputs)?;
+        let inputs = serde_json::to_string(inputs)?;
         self.finish::<ExecutionInputsTable>(vec![
             (
                 "execution_id",
@@ -340,14 +372,18 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 INPUTS,
-                VariantColumnBuilder::encode(INPUTS, [Some(&inputs)], EncodedVariant::from_json)?,
+                VariantColumnBuilder::encode(
+                    INPUTS,
+                    [Some(inputs.as_str())],
+                    EncodedVariant::from_json_text,
+                )?,
             ),
             (
                 ACTIVATION,
                 VariantColumnBuilder::encode(
                     ACTIVATION,
-                    [activation.as_ref()],
-                    EncodedVariant::from_json,
+                    [activation.as_deref()],
+                    EncodedVariant::from_json_text,
                 )?,
             ),
             ("recorded_at", timestamps([Some(self.started_at)])),
@@ -458,30 +494,41 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Assemble table `T`'s batch from its named authored columns.
     ///
     /// `T::arrow_fields()` is the only schema authority: the columns are
-    /// ordered by its field names (see [`Self::assemble`]) and the batch is
-    /// addressed to the table's fully qualified name.
+    /// ordered by its field names (see [`Self::assemble`]) under `T`'s shared
+    /// schema in [`SCHEMAS`], and the batch is addressed to the table's fully
+    /// qualified name.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] when the columns do not
     /// name each field exactly once, or an Arrow error when a column does not
     /// match its field.
-    fn finish<T: DomainTable>(
+    ///
+    /// # Panics
+    /// Panics when `T` is not one of the result tables [`SCHEMAS`] holds,
+    /// which every caller in this module rules out.
+    fn finish<T: DomainTable + 'static>(
         &self,
         columns: Vec<NamedColumn>,
     ) -> Result<ResultBatch, ResultPayloadError> {
+        let schema = SCHEMAS
+            .iter()
+            .find(|(table, _)| *table == TypeId::of::<T>())
+            .map(|(_, schema)| Arc::clone(schema))
+            .expect("every result table has a shared schema");
         Ok(ResultBatch {
             table: format!("vala.{}.{}", T::NAMESPACE, T::NAME),
-            batch: self.assemble(T::arrow_fields(), columns)?,
+            batch: self.assemble(schema, columns)?,
         })
     }
 
-    /// Order named columns by `fields`, then append the correlation columns.
+    /// Order named columns by `schema`'s table fields, then append the
+    /// correlation columns.
     ///
-    /// Every authored column must fill exactly one of `fields` by name; the
-    /// arrays are placed in the order of `fields`, never in authoring order,
-    /// so a reordered declaration keeps each value under its own name. The
-    /// schema is `fields` followed by `card_uid` and `run_id`, each repeated
-    /// for the authored row count.
+    /// `schema` is a table's fields followed by `card_uid` and `run_id`.
+    /// Every authored column must fill exactly one table field by name; the
+    /// arrays are placed in field order, never in authoring order, so a
+    /// reordered declaration keeps each value under its own name. The
+    /// correlation columns repeat for the authored row count.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
@@ -490,7 +537,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Arrow error when a column does not match its field's type or length.
     fn assemble(
         &self,
-        mut fields: Vec<Field>,
+        schema: SchemaRef,
         columns: Vec<NamedColumn>,
     ) -> Result<RecordBatch, ResultPayloadError> {
         let rows = columns.first().map_or(0, |(_, array)| array.len());
@@ -503,8 +550,9 @@ impl<'a> ResultPayloadBuilder<'a> {
                 });
             }
         }
-        let mut arrays = Vec::with_capacity(fields.len() + 2);
-        for field in &fields {
+        let fields = schema.fields();
+        let mut arrays = Vec::with_capacity(fields.len());
+        for field in &fields[..fields.len().saturating_sub(2)] {
             let array = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
                     column: field.name().clone(),
@@ -519,10 +567,6 @@ impl<'a> ResultPayloadBuilder<'a> {
                 problem: "unexpected",
             });
         }
-        fields.extend([
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(RUN_ID, DataType::Utf8, true),
-        ]);
         arrays.push(text(std::iter::repeat_n(
             Some(self.run.card_uid.as_str()),
             rows,
@@ -531,7 +575,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             self.run.run_id.map(RunId::as_str),
             rows,
         )));
-        Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+        Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
     /// The binding owner Card UID, null for an execution with no binding.
@@ -831,8 +875,9 @@ mod tests {
     /// never be read in place of the winning one.
     ///
     /// # Panics
-    /// Panics when the two payloads share a result identity or name
-    /// different executions.
+    /// Panics when the two payloads share a result identity, name different
+    /// executions, or build their rows under separate schemas, which would
+    /// cost the Scribe outbox a deep schema comparison per row.
     #[test]
     fn each_built_payload_mints_its_own_result_identity() {
         let run = TestRun::new();
@@ -846,6 +891,41 @@ mod tests {
         };
         assert_eq!(execution(&first), Some(run.execution_id.to_string()));
         assert_eq!(execution(&first), execution(&second));
+        for (ours, theirs) in first.batches().iter().zip(second.batches()) {
+            assert!(Arc::ptr_eq(
+                ours.batch.schema_ref(),
+                theirs.batch.schema_ref()
+            ));
+        }
+    }
+
+    /// Encoding a value's serialized text yields the same Variant bytes as
+    /// encoding it through `serde_json::Value`, which the payload builder no
+    /// longer does: object keys keep their serialization order, a
+    /// non-finite score is null, and integers and doubles keep their exact
+    /// text.
+    ///
+    /// # Panics
+    /// Panics when the two encodings of the outcome or of the open JSON
+    /// value differ.
+    #[test]
+    fn variants_encode_alike_from_text_and_from_values() {
+        let open = serde_json::json!({
+            "zeta": [1, -2, 18_446_744_073_709_551_615_u64, 0.1, 1e300, -0.0],
+            "alpha": {"nested": {"z": null, "a": true}, "text": "\u{e9}\u{1f600}\"q\""},
+            "mid": [[], {}, [{"b": 2, "a": 1}]],
+        });
+        let outcome = outcome();
+        let via_value = |value: Value| EncodedVariant::from_json(&value).expect("value encodes");
+        let via_text = |text: String| EncodedVariant::from_json_text(&text).expect("text encodes");
+        assert_eq!(
+            via_value(serde_json::to_value(&outcome).expect("outcome serializes")),
+            via_text(serde_json::to_string(&outcome).expect("outcome serializes")),
+        );
+        assert_eq!(
+            via_value(open.clone()),
+            via_text(serde_json::to_string(&open).expect("value serializes")),
+        );
     }
 
     /// One refusal case: the expected problem, the mutation applied to valid

@@ -7,6 +7,10 @@
 //! evidence, so interleaved executions never share authority, evidence, or a
 //! workspace. Direct verification and the queued runner both build their
 //! engine here, which keeps one execution path for every caller.
+//!
+//! The engine records every block's run interval on the execution's
+//! [`BlockClock`], so `wyrd_verification_verifier_seconds` holds the
+//! Verifier's own work and `wyrd_verification_overhead_seconds` the rest.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -17,8 +21,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use monty_pool::PoolError;
 use vala_verify::blocks::{
-    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockError,
-    CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
+    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
+    BlockError, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
     VerificationEngine,
 };
 use wyrd_spec::card::agent::ExecutionRoute;
@@ -69,6 +73,9 @@ pub struct Execution<'a> {
     pub accepted_at: DateTime<Utc>,
     /// The resolved drift evidence of a scheduled window.
     pub drift: DriftChecks,
+    /// The execution's block clock (`ExecutionTelemetry::clock`), on which
+    /// the engine records every block's run interval.
+    pub clock: BlockClock,
 }
 
 impl HostedBlocks {
@@ -96,7 +103,8 @@ impl HostedBlocks {
     ///
     /// The evidence reader, registry, code executor, built-in tools, and
     /// gateway caller are all bound to `execution.caller`; the evidence
-    /// reader also admits the pinned evidence before any block runs; Agent and Prompt
+    /// reader also admits the pinned evidence before any block runs, and
+    /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
     /// Cards resolve through the caller's audited `card:read`, and every
     /// model call goes through the in-process gateway as that caller,
     /// attributed to `execution.subject`.
@@ -149,7 +157,8 @@ impl HostedBlocks {
             STEP_CONCURRENCY,
         )
         .with_drift(execution.drift)
-        .with_evidence(evidence))
+        .with_evidence(evidence)
+        .with_clock(execution.clock))
     }
 }
 
@@ -191,5 +200,103 @@ impl CheckExecutor for Blocks {
             Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
             _ => CheckExecutor::execute(&self.agent, call).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Proof that hosted executor time is Verifier time, not overhead.
+
+    use std::time::Duration;
+
+    use super::*;
+    use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
+
+    /// A code action that takes 50 ms of external time.
+    struct Slow;
+
+    #[async_trait]
+    impl ActionExecutor for Slow {
+        /// Sleep 50 ms, then output `{}`.
+        ///
+        /// # Errors
+        /// Never fails.
+        async fn execute(&self, _call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ActionOutput {
+                output: serde_json::json!({}),
+                provenance: None,
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CheckExecutor for Slow {
+        /// Never called: the Verifier has no executor check.
+        ///
+        /// # Errors
+        /// Always refuses.
+        async fn execute(&self, _call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
+            Err(BlockError::Terminal {
+                reason: "unexpected check".to_owned(),
+            })
+        }
+    }
+
+    /// An engine on the execution's clock spends a 50 ms action as Verifier
+    /// time: the engine phase and Verifier time hold it and the overhead
+    /// does not.
+    ///
+    /// # Panics
+    /// Panics when the run fails or the overhead absorbs the action.
+    #[tokio::test]
+    async fn executor_time_is_verifier_time_not_overhead() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, None);
+        let blocks = Arc::new(Slow);
+        let engine = VerificationEngine::new(
+            Arc::clone(&blocks) as Arc<dyn ActionExecutor>,
+            blocks,
+            Arc::new(vala_verify::InMemoryTraceSource::new()),
+            STEP_CONCURRENCY,
+        )
+        .with_clock(telemetry.clock());
+        let spec: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(serde_json::json!({
+            "steps": [{"id": "work", "action": {"kind": "code", "entrypoint": "run", "source": {"inline": "def run(): pass"}, "inputs": {}}}],
+            "requirements": [{"id": "done", "statement": "Work ran", "check": {"kind": "assert", "path": "steps.work.status", "operator": "equals", "expected": "succeeded"}}]
+        }))
+        .expect("Verifier");
+        telemetry
+            .phase(
+                Phase::Engine,
+                engine.run(
+                    Arc::new(spec),
+                    BTreeMap::new(),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                ),
+            )
+            .await
+            .expect("outcome");
+        telemetry.finish("completed", false);
+        let text = handle.render();
+        let sum = |series: &str| -> f64 {
+            text.lines()
+                .find(|line| line.starts_with(series))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let engine =
+            sum(r#"wyrd_verification_phase_duration_seconds_sum{mode="direct",phase="engine"}"#);
+        let verifier =
+            sum(r#"wyrd_verification_verifier_seconds_sum{mode="direct",outcome="completed"}"#);
+        let overhead =
+            sum(r#"wyrd_verification_overhead_seconds_sum{mode="direct",outcome="completed"}"#);
+        assert!(engine >= 0.05, "{text}");
+        assert!(verifier >= 0.05, "{text}");
+        assert!(overhead < 0.025, "{text}");
     }
 }

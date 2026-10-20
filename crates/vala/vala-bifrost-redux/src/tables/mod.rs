@@ -2145,8 +2145,6 @@ mod tests {
     /// refuses a limit of twice its actual size.
     #[test]
     fn otlp_projectors_refuse_running_output_above_limit() {
-        use crate::scribe::material_plan::retained_slice_bytes;
-
         let project = |label: &str, limit: usize| match label {
             "spans" => crate::tables::traces::project_resource_spans(&span_fixture(), None, limit)
                 .map(|(batch, _)| batch),
@@ -2156,9 +2154,10 @@ mod tests {
                 .map(|(batch, _)| batch),
         };
         for label in ["spans", "logs", "points"] {
-            let actual =
-                retained_slice_bytes(&project(label, usize::MAX).expect("unbounded projection"))
-                    .expect("retained bytes");
+            let actual = wyrd_queue::retained_bytes(
+                &project(label, usize::MAX).expect("unbounded projection"),
+            )
+            .expect("retained bytes");
             assert!(
                 matches!(
                     project(label, actual / 2),

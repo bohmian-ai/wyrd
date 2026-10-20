@@ -20,7 +20,24 @@ use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::client_queue::Result;
 use crate::client_queue::step::FEATURES;
-use crate::fixture::drift_verifier_yaml;
+
+/// The Window Verifier whose `samples` slot records the model's Drift
+/// observations through `observe.submit`.
+pub const DRIFT_VERIFIER: &str = "capacity-ingest";
+
+/// The Card YAML of [`DRIFT_VERIFIER`]: one `samples` slot declaring
+/// `f0` through `f{features - 1}` and one Custom drift requirement over `f0`,
+/// so the client routes an observation of every declared feature to the
+/// Drift observation path. It is bound without a schedule, so it never runs.
+pub fn drift_verifier_yaml(features: usize) -> String {
+    let names = (0..features)
+        .map(|feature| format!("f{feature}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {DRIFT_VERIFIER}\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    samples: {{type: samples, features: [{names}]}}\n  requirements:\n    - id: f0-bounded\n      statement: f0 stays bounded.\n      check: {{kind: drift, on: inputs.samples, method: Custom, signal: {{kind: Metric, name: f0}}, condition: {{kind: Above, limit: 1000.0}}}}\n"
+    )
+}
 
 /// The Model Card whose Drift observations the benchmark emits.
 const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: ingest-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";

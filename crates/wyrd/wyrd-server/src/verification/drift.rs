@@ -48,6 +48,7 @@ use vala_drift::{
 };
 use vala_verify::blocks::DriftChecks;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
@@ -60,7 +61,7 @@ use wyrd_sql::queries::verifier_executions::{ClaimedExecution, TerminalStatus};
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::EngineOutcome;
-use super::telemetry::{ExecutionTelemetry, Phase, StreamWaits};
+use super::telemetry::{ExecutionTelemetry, Phase};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -679,8 +680,7 @@ impl DriftEngine {
     /// unscorable window, including one with too few samples, is the
     /// method's unscored report, which the engine judges inconclusive.
     /// Baseline decoding and statement construction are the `prepare` phase,
-    /// each streaming read is `input_read`, and the read authority and gaps
-    /// between streamed batches are waits on `telemetry`.
+    /// and each streaming read is `input_read` on `telemetry`.
     ///
     /// # Errors
     /// Returns the terminal or retry [`EngineOutcome`] of the first
@@ -690,46 +690,98 @@ impl DriftEngine {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
+        system: PrincipalId,
         spec: &VerifierSpec,
         window: &DriftWindow,
         telemetry: &ExecutionTelemetry,
     ) -> Result<DriftChecks, EngineOutcome> {
+        let reader = Reader {
+            engine: self,
+            tenant,
+            system,
+            run,
+            telemetry,
+        };
         let mut checks = DriftChecks::new(Some(*window), BTreeMap::new(), BTreeMap::new());
         for (requirement, check) in spec.drift_checks() {
-            let report = self
-                .score(tenant, run, requirement, &check.spec, window, telemetry)
+            let report = reader
+                .score(requirement, &check.spec, window)
                 .await?
-                .unwrap_or_else(|| DriftReport::unscored(check.spec.method));
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        requirement = requirement.as_str(),
+                        "drift requirement unscorable for this window"
+                    );
+                    DriftReport::unscored(check.spec.method)
+                });
             checks = checks.with_report(requirement.clone(), report);
         }
         Ok(checks)
     }
+}
 
+/// Decode a stored fitted baseline, `None` when none is ready.
+///
+/// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
+/// under earlier semantics and is refused before decoding; it is never
+/// rescored or migrated.
+///
+/// # Errors
+/// Terminates with [`BASELINE_NOT_READY`] when no baseline is ready,
+/// [`BASELINE_LEGACY`] for an earlier format, and [`DRIFT_INVALID`] when the
+/// stored profile does not decode.
+pub fn decode_baseline(fitted: Option<serde_json::Value>) -> Result<FittedBaseline, EngineOutcome> {
+    let fitted =
+        fitted.ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
+    let format = fitted
+        .as_object()
+        .and_then(|method| method.values().next())
+        .and_then(|profile| profile.get("format"))
+        .and_then(serde_json::Value::as_u64);
+    if format != Some(u64::from(FITTED_FORMAT)) {
+        return Err(terminal(
+            BASELINE_LEGACY,
+            "the Drift baseline was fitted before the conventional PSI/SPC semantics; \
+             register a new Verifier version to refit it",
+        ));
+    }
+    serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
+}
+
+/// The SYSTEM observation read of one execution: its tenant and claim.
+struct Reader<'a> {
+    /// Engine owning the server state.
+    engine: &'a DriftEngine,
+    /// Run tenant every read is authorized in.
+    tenant: DataTenantId,
+    /// The tenant's SYSTEM principal the execution's target resolved, which
+    /// authorizes every read.
+    system: PrincipalId,
+    /// The claimed execution.
+    run: &'a ClaimedExecution,
+    /// The execution whose input-read phase this reader records.
+    telemetry: &'a ExecutionTelemetry,
+}
+
+impl Reader<'_> {
     /// Score one drift requirement, returning `None` when unscorable.
     ///
     /// # Errors
     /// Returns the terminal or retry outcome of the first failure.
     async fn score(
         &self,
-        tenant: DataTenantId,
-        run: &ClaimedExecution,
         requirement: &TaskId,
         spec: &DriftSpec,
         window: &DriftWindow,
-        telemetry: &ExecutionTelemetry,
     ) -> Result<Option<DriftReport>, EngineOutcome> {
+        let (run, telemetry) = (self.run, self.telemetry);
         let window = ObservationWindow::new(&run.card_uid, window);
         let invalid = |message: String| terminal(DRIFT_INVALID, message);
         let scored = |result: Result<DriftReport, DriftScoreError>| {
             result.map(Some).map_err(|error| invalid(error.to_string()))
         };
         let fitted = || decode_baseline(run.fitted_baselines.get(requirement).cloned());
-        let reader = Reader {
-            engine: self,
-            tenant,
-            run,
-            telemetry,
-        };
+        let reader = self;
         match spec.profile.as_ref() {
             Some(DriftProfile::Custom(profile)) => {
                 let sql = telemetry
@@ -782,49 +834,7 @@ impl DriftEngine {
             None => Err(invalid("the drift check has no profile".to_owned())),
         }
     }
-}
 
-/// Decode a stored fitted baseline, `None` when none is ready.
-///
-/// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
-/// under earlier semantics and is refused before decoding; it is never
-/// rescored or migrated.
-///
-/// # Errors
-/// Terminates with [`BASELINE_NOT_READY`] when no baseline is ready,
-/// [`BASELINE_LEGACY`] for an earlier format, and [`DRIFT_INVALID`] when the
-/// stored profile does not decode.
-pub fn decode_baseline(fitted: Option<serde_json::Value>) -> Result<FittedBaseline, EngineOutcome> {
-    let fitted =
-        fitted.ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
-    let format = fitted
-        .as_object()
-        .and_then(|method| method.values().next())
-        .and_then(|profile| profile.get("format"))
-        .and_then(serde_json::Value::as_u64);
-    if format != Some(u64::from(FITTED_FORMAT)) {
-        return Err(terminal(
-            BASELINE_LEGACY,
-            "the Drift baseline was fitted before the conventional PSI/SPC semantics; \
-             register a new Verifier version to refit it",
-        ));
-    }
-    serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
-}
-
-/// The SYSTEM observation read of one execution: its tenant and claim.
-struct Reader<'a> {
-    /// Engine owning the server state.
-    engine: &'a DriftEngine,
-    /// Run tenant every read is authorized in.
-    tenant: DataTenantId,
-    /// The claimed execution, carrying the tenant's SYSTEM principal.
-    run: &'a ClaimedExecution,
-    /// The execution whose input-read phase and waits this reader records.
-    telemetry: &'a ExecutionTelemetry,
-}
-
-impl Reader<'_> {
     /// Authorize the run's SYSTEM principal to read the observation table.
     ///
     /// Returns `Ok(None)` when the tenant has never registered the observation
@@ -837,10 +847,11 @@ impl Reader<'_> {
         let authority = SystemReadAuthority::resolve(
             &self.engine.state,
             self.tenant,
-            self.run.system_principal,
+            Some(self.system),
             &[TableRef::new(BifrostNamespace::Drift, "observations")],
         )
         .await
+        .inspect_err(|error| tracing::warn!(%error, "drift read authority unavailable"))
         .map_err(|error| match error {
             SystemReadAuthorityError::SystemPrincipalMissing => {
                 terminal(super::runner::SYSTEM_PRINCIPAL_MISSING, error.to_string())
@@ -861,8 +872,7 @@ impl Reader<'_> {
     /// A tenant with no observation table reads nothing and `fold` is never
     /// called. The stream is consumed and settled by the shared scheduled
     /// consumer; a batch `fold` refuses terminates the run as invalid. The
-    /// whole read is the `input_read` phase; the authority and the gaps
-    /// between streamed batches are waits, while folding stays local work.
+    /// whole read, authority included, is the `input_read` phase.
     ///
     /// # Errors
     /// Retries an authority, admission, query, or stream failure; terminates
@@ -889,10 +899,14 @@ impl Reader<'_> {
     where
         F: FnMut(&RecordBatch) -> Result<(), String>,
     {
-        let Some(authority) = self.telemetry.wait(self.authority()).await? else {
+        let Some(authority) = self.authority().await? else {
+            tracing::debug!("no drift observation table is readable; the window reads nothing");
             return Ok(());
         };
-        let failed = |error: WyrdError| retry(DRIFT_QUERY_FAILED, error.to_string());
+        let failed = |error: WyrdError| {
+            tracing::warn!(%error, "drift evidence read failed; the run retries");
+            retry(DRIFT_QUERY_FAILED, error.to_string())
+        };
         let query = ScheduledQueryCaller::new(
             self.engine.state.clone(),
             authority.into_context(),
@@ -906,20 +920,16 @@ impl Reader<'_> {
             ),
         };
         let mut malformed = None;
-        let mut waits = StreamWaits::open(self.telemetry);
         let settled = query
             .run_with(request, |batch| {
-                waits.folding();
-                let folded = fold(&batch).map_err(|message| {
+                fold(&batch).map_err(|message| {
                     malformed = Some(message);
                     WyrdError::from(BifrostError::QueryStreamProtocol)
-                });
-                waits.folded();
-                folded
+                })
             })
             .await;
-        waits.close();
         if let Some(message) = malformed {
+            tracing::warn!(%message, "drift aggregate malformed; the run terminates invalid");
             return Err(terminal(DRIFT_INVALID, message));
         }
         settled.map(drop).map_err(failed)

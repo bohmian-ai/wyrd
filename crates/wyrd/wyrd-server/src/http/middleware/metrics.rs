@@ -12,14 +12,33 @@ use crate::app::metrics::{HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL};
 /// random paths would otherwise blow up Prometheus label cardinality.
 const UNMATCHED_PATH: &str = "__unmatched__";
 
+/// When a request reached this server, as the outermost timing middleware
+/// saw it.
+///
+/// [`track_metrics`] inserts it into every request's extensions, so a
+/// handler's per-unit profile (such as a verification execution's) starts
+/// at arrival and accounts for the middleware and body decode before the
+/// handler too.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestArrival(Instant);
+
+impl RequestArrival {
+    /// The arrival instant.
+    pub(crate) const fn instant(self) -> Instant {
+        self.0
+    }
+}
+
 /// Record request count and latency labelled by method, matched route, status.
 ///
 /// Uses `MatchedPath` (the route template, e.g. `/v1/storage/{id}`) rather than
 /// the raw URI so label cardinality stays bounded. When no route matched, uses
 /// the fixed `__unmatched__` label — NOT the raw URI path — so unmatched/404
-/// traffic cannot create unbounded distinct label values.
-pub async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
+/// traffic cannot create unbounded distinct label values. Inserts the
+/// request's [`RequestArrival`] before the rest of the stack runs.
+pub async fn track_metrics(mut req: Request, next: Next) -> impl IntoResponse {
     let start = Instant::now();
+    req.extensions_mut().insert(RequestArrival(start));
     let path = req
         .extensions()
         .get::<MatchedPath>()

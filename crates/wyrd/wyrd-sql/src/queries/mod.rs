@@ -17,4 +17,5 @@ pub mod operator_dispatches;
 pub mod platform;
 pub mod storage;
 pub mod verification;
+pub mod verification_target;
 pub mod verifier_executions;

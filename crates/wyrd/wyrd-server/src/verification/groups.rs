@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::util::display::array_value_to_string;
@@ -114,6 +114,22 @@ impl GroupPoller {
     /// read fails, is refused or degraded, or a stored declaration or row is
     /// malformed, and [`GroupPollError::Incomplete`] naming the executions
     /// whose results were visible without their inputs.
+    ///
+    /// The `verification.group.snapshot` span carries the tenant, binding,
+    /// group, rows read, and source executions pinned; the Bifrost read is
+    /// timed into the group snapshot histogram by outcome and the pinned
+    /// source count into the snapshot sources histogram.
+    #[tracing::instrument(
+        name = "verification.group.snapshot",
+        skip_all,
+        fields(
+            tenant = %conn.data_tenant_id(),
+            binding_id = %due.binding_id,
+            group_id = %due.group_id,
+            rows = tracing::field::Empty,
+            sources = tracing::field::Empty,
+        )
+    )]
     pub async fn poll(
         &self,
         conn: &mut TenantConn<'_>,
@@ -142,22 +158,37 @@ impl GroupPoller {
             "group_id = {}",
             ObservationWindow::text(due.group_id.as_str())
         );
+        let started = Instant::now();
         let batches = match reader.run(&sources.read(&group, true)).await {
             Err(GroupPollError::Read(error)) if error.contains(TABLE_NOT_FOUND) => {
                 match reader.run(&sources.read(&group, false)).await {
                     Err(GroupPollError::Read(error)) if error.contains(TABLE_NOT_FOUND) => {
-                        Vec::new()
+                        Ok(Vec::new())
                     }
-                    batches => batches?,
+                    batches => batches,
                 }
             }
-            batches => batches?,
+            batches => batches,
         };
+        metrics::histogram!(
+            crate::app::metrics::VERIFICATION_GROUP_SNAPSHOT_SECONDS,
+            "outcome" => if batches.is_ok() { "ok" } else { "error" }
+        )
+        .record(started.elapsed().as_secs_f64());
+        let batches = batches?;
+        let span = tracing::Span::current();
+        span.record(
+            "rows",
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        );
         let visible = sources.decode(&batches)?;
         let missing = visible.missing_inputs();
         if !missing.is_empty() {
             return Err(GroupPollError::Incomplete(missing));
         }
+        span.record("sources", visible.inputs.len());
+        metrics::histogram!(crate::app::metrics::VERIFICATION_GROUP_SNAPSHOT_SOURCES)
+            .record(u32::try_from(visible.inputs.len()).map_or(f64::from(u32::MAX), f64::from));
         let pinned = visible.pin(&sources, due).map_err(GroupPollError::Sql)?;
         Ok(queue
             .enqueue_group(conn, due.binding_id, &pinned, authority)

@@ -2,6 +2,7 @@
 
 use secrecy::ExposeSecret;
 use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
 use sqlx::types::Uuid;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::{DataTenantId, TenantSlug};
@@ -160,6 +161,24 @@ impl WyrdPostgres {
     #[must_use]
     pub fn operator_pool(&self) -> Option<OperatorPool> {
         self.platform_admin.clone().map(OperatorPool::from)
+    }
+
+    /// Acquire one plain connection from the app pool.
+    ///
+    /// For a tenant statement that binds its own tenant, such as
+    /// [`crate::queries::verification_target::VerificationTargets`], and so
+    /// runs as one autocommit round trip with no transaction. The acquisition
+    /// is observed like [`Self::tenant_conn`]'s.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when the pool cannot supply a connection.
+    pub async fn conn(&self) -> Result<PoolConnection<sqlx::Postgres>, SqlError> {
+        let mut lifecycle = PoolAcquireLifecycle::begin(&self.app);
+        let result = Box::pin(self.app.acquire())
+            .await
+            .map_err(SqlError::Connect);
+        lifecycle.finish(&result);
+        result
     }
 
     /// Open a tenant-scoped transaction on the app pool.

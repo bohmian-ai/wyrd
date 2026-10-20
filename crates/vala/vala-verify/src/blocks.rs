@@ -41,7 +41,7 @@ mod engine;
 mod scope;
 
 pub use drift::DriftChecks;
-pub use engine::{EngineError, VerificationEngine};
+pub use engine::{BLOCK_DURATION_SECONDS, BlockClock, EngineError, VerificationEngine};
 
 /// Where a block sits in the Verifier, which fixes what it may read and do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

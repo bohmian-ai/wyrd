@@ -19,6 +19,7 @@
     type ComponentProps
   } from './loaders.js';
   import { ViewDocumentSchema, type AbsoluteRange } from './schemas.js';
+  import ActionButton from './components/ActionButton.svelte';
   import CardHeader from './components/CardHeader.svelte';
   import Chart from './components/Chart.svelte';
   import EmptyState from './components/EmptyState.svelte';
@@ -145,7 +146,7 @@
     {#if brushed}
       <p class="range">
         Range <time datetime={brushed.from}>{brushed.from}</time> – <time datetime={brushed.to}>{brushed.to}</time>
-        <button type="button" onclick={() => (brushed = undefined)}>Reset range</button>
+        <ActionButton label="Reset range" onclick={() => (brushed = undefined)} />
       </p>
     {/if}
     <div class="panels">
@@ -187,13 +188,6 @@
     gap: 8px;
     margin: 0;
     font: 12px var(--font-mono);
-  }
-  .range button {
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--surface);
-    color: var(--text);
-    cursor: pointer;
   }
   .panels {
     display: grid;

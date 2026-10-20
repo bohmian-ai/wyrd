@@ -67,6 +67,7 @@
       <div class="grid">
         <Chart input={timeseries} executed={{ sql: timeseries.sql, params: [] }} result={{ state: 'populated', data: day }} {actions} {onaction} />
         <Chart input={{ type: 'bar', title: 'Runs by model', sql: 'SELECT model, runs FROM t', x: 'model', y: ['p95'] }} result={{ state: 'populated', data: { ...series, columns: [series.columns[1], series.columns[2]], rows: [['a', 120], ['b', 80]] } }} {actions} {onaction} />
+        <Chart input={{ type: 'bar', title: 'p95 by hour', sql: 'SELECT at, p95 FROM t', x: 'at', y: ['p95'] }} result={{ state: 'populated', data: { ...day, columns: [day.columns[0], day.columns[2]], rows: day.rows.filter((_, index) => index % 2 === 0).map((row) => [row[0], row[2]]) } }} {actions} {onaction} />
         <Chart input={{ type: 'stat', title: 'Runs today', sql: 'SELECT count(*) FROM t', unit: 'runs' }} result={{ state: 'populated', data: { columns: [series.columns[2]], rows: [[12400]], terminal: terminal(1) } }} />
         <Chart input={{ type: 'table', title: 'Partial table', sql: 'SELECT * FROM t' }} result={{ state: 'populated', data: table }} {actions} {onaction} />
         <Chart input={timeseries} result={{ state: 'empty', data: { ...series, rows: [] }, reason: 'The SQL returned no rows for p95 in this range.' }} {actions} {onaction} />

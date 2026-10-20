@@ -11,13 +11,15 @@
     state?: ActionState;
     /** `primary` is the one strong action on a surface; `link` sits in a panel head. */
     variant?: 'primary' | 'secondary' | 'link';
+    /** A decorative glyph before the label, such as ⧉ for copy; hidden from assistive tech. */
+    lead?: string;
     /** A decorative glyph after the label, such as ↗ for navigation away; hidden from assistive tech. */
     icon?: string;
     disabled?: boolean;
     onclick: () => void;
   }
 
-  let { label, state, variant = 'secondary', icon, disabled = false, onclick }: Props = $props();
+  let { label, state, variant = 'secondary', lead, icon, disabled = false, onclick }: Props = $props();
 
   const blocked = $derived(disabled || state?.state === 'pending' || state?.state === 'unavailable');
   const note = $derived.by(() => {
@@ -37,7 +39,7 @@
 
 <span class="action">
   <button type="button" class={variant} disabled={blocked} aria-busy={state?.state === 'pending' ? 'true' : undefined} {onclick}>
-    {state?.state === 'pending' ? `${label}…` : label}{#if icon}<span class="icon" aria-hidden="true">{icon}</span>{/if}
+    {#if lead}<span class="lead" aria-hidden="true">{lead}</span>{/if}{state?.state === 'pending' ? `${label}…` : label}{#if icon}<span class="icon" aria-hidden="true">{icon}</span>{/if}
   </button>
   {#if note}<span class="note" data-state={state?.state} role={state?.state === 'success' ? 'status' : 'alert'}>{note}</span>{/if}
 </span>
@@ -76,6 +78,9 @@
   .primary:hover:not(:disabled) {
     border-color: color-mix(in srgb, var(--declare) 82%, var(--text));
     background: color-mix(in srgb, var(--declare) 82%, var(--text));
+  }
+  .lead {
+    margin-right: 8px;
   }
   .icon {
     margin-left: 6px;

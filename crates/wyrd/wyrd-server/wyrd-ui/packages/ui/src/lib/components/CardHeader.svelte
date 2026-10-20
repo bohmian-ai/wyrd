@@ -89,7 +89,7 @@
         </p>
       </div>
       <div class="actions">
-        <button type="button" class="secondary" onclick={() => copy(fmtCardRef(ref))}><span aria-hidden="true">⧉</span> Copy ref</button>
+        <ActionButton label="Copy ref" lead="⧉" onclick={() => copy(fmtCardRef(ref))} />
         <ActionButton
           variant="primary"
           label="Open in Observe"
@@ -234,23 +234,6 @@
     justify-content: flex-end;
     gap: 8px;
     margin-left: auto;
-  }
-  .secondary {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    height: 34px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    padding: 0 12px;
-    background: var(--surface-2);
-    color: var(--text);
-    font: 13px var(--font-sans);
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .secondary:hover {
-    background: var(--surface-hover);
   }
   nav {
     display: flex;

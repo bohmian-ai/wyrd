@@ -18,7 +18,7 @@
     type ActionState
   } from 'wyrd-ai-ui';
   import { WyrdView } from 'wyrd-ai-ui/view';
-  import { card, denied, fixtureExecutor, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
+  import { card, day, denied, fixtureExecutor, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 
   let drawer = $state(false);
   let actions = $state<Record<string, ActionState>>({});
@@ -65,14 +65,14 @@
 
       <h2>Chart</h2>
       <div class="grid">
-        <Chart input={timeseries} executed={{ sql: timeseries.sql, params: [] }} result={{ state: 'populated', data: series }} {actions} {onaction} />
-        <Chart input={{ type: 'bar', title: 'Runs by model', sql: 'SELECT model, runs FROM t', x: 'model', y: ['p95'] }} result={{ state: 'populated', data: { ...series, columns: [series.columns[1], series.columns[2]], rows: [['a', 120], ['b', 80]] } }} />
+        <Chart input={timeseries} executed={{ sql: timeseries.sql, params: [] }} result={{ state: 'populated', data: day }} {actions} {onaction} />
+        <Chart input={{ type: 'bar', title: 'Runs by model', sql: 'SELECT model, runs FROM t', x: 'model', y: ['p95'] }} result={{ state: 'populated', data: { ...series, columns: [series.columns[1], series.columns[2]], rows: [['a', 120], ['b', 80]] } }} {actions} {onaction} />
         <Chart input={{ type: 'stat', title: 'Runs today', sql: 'SELECT count(*) FROM t', unit: 'runs' }} result={{ state: 'populated', data: { columns: [series.columns[2]], rows: [[12400]], terminal: terminal(1) } }} />
-        <Chart input={{ type: 'table', title: 'Partial table', sql: 'SELECT * FROM t' }} result={{ state: 'populated', data: table }} />
-        <Chart input={timeseries} result={{ state: 'empty', data: { ...series, rows: [] }, reason: 'The SQL returned no rows for p95 in this range.' }} />
-        <Chart input={timeseries} result={{ state: 'loading' }} />
-        <Chart input={timeseries} result={{ state: 'denied', problem: denied }} />
-        <Chart input={timeseries} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} />
+        <Chart input={{ type: 'table', title: 'Partial table', sql: 'SELECT * FROM t' }} result={{ state: 'populated', data: table }} {actions} {onaction} />
+        <Chart input={timeseries} result={{ state: 'empty', data: { ...series, rows: [] }, reason: 'The SQL returned no rows for p95 in this range.' }} {actions} {onaction} />
+        <Chart input={timeseries} result={{ state: 'loading' }} {actions} {onaction} />
+        <Chart input={timeseries} result={{ state: 'denied', problem: denied }} {actions} {onaction} />
+        <Chart input={timeseries} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} {actions} {onaction} />
       </div>
 
       <h2>Primitives</h2>
@@ -91,7 +91,7 @@
         <EmptyState state="denied" problem={denied} />
         <EmptyState state="error" problem={{ code: 'WYRD_SPEC_500_INTERNAL', title: 'Internal error' }} />
       </div>
-      <button type="button" onclick={() => (drawer = true)}>Open drawer</button>
+      <button type="button" class="open" onclick={() => (drawer = true)}>Open drawer</button>
 
       <h2>View document</h2>
       <WyrdView {doc} executor={fixtureExecutor} {onaction} />
@@ -103,14 +103,13 @@
 <style>
   main {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 640px), 1fr));
   }
   .board {
     display: grid;
     gap: 12px;
     align-content: start;
     min-width: 0;
-    padding: 16px;
+    padding: 24px;
     background: var(--bg);
     color: var(--text);
   }
@@ -122,8 +121,22 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
     gap: 12px;
+  }
+  .open {
+    justify-self: start;
+    height: 34px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 0 12px;
+    background: var(--surface-2);
+    color: var(--text);
+    font: 13px var(--font-sans);
+    cursor: pointer;
+  }
+  .open:hover {
+    background: var(--surface-hover);
   }
   .row {
     display: flex;

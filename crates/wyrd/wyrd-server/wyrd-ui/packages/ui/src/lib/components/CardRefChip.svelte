@@ -20,10 +20,10 @@
     gap: 6px;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    padding: 1px 6px;
-    background: var(--surface);
+    padding: 3px 9px;
+    background: var(--surface-2);
     color: var(--text);
-    font: 11px/16px var(--font-mono);
+    font: 12px var(--font-mono);
     text-decoration: none;
   }
   a.chip:hover {

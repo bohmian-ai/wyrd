@@ -6,7 +6,7 @@
 <script lang="ts">
   import type { ActionProps, CardRef } from '../contract.js';
   import type { CardHeaderProps } from '../loaders.js';
-  import { fmtCardRef } from '../format.js';
+  import { fmtCardRef, fmtInstant, parseInstant } from '../format.js';
   import ActionButton from './ActionButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
@@ -27,9 +27,10 @@
   const ref = $derived<CardRef | undefined>(
     card && { kind: card.kind, name: card.metadata.name, version: input.cardRef.version, space: card.metadata.space ?? input.cardRef.space }
   );
-  const current = $derived(
-    versions?.state === 'populated' ? versions.data.items.find((item) => item.version === input.cardRef.version) : undefined
-  );
+  const items = $derived(versions?.state === 'populated' ? versions.data.items : []);
+  const current = $derived(items.find((item) => item.version === input.cardRef.version));
+  /** The newest listed version; the select marks it `current`. */
+  const newest = $derived(items[0]?.version);
   const unavailable = { state: 'unavailable', reason: 'This host offers no navigation' } as const;
 
   /** Local clipboard feedback; copying is not a host action. */
@@ -46,50 +47,57 @@
 
 {#if result.state === 'populated' && card && ref}
   <header class="card-header">
-    <div class="title">
-      <h2>{card.metadata.name}</h2>
-      <StatusPill label={card.kind} />
-      {#if current}<StatusPill tone={TONES[current.status]} label={current.status} />{/if}
-      <label class="version">
-        <span>Version</span>
-        <select
-          disabled={!onaction || versions?.state !== 'populated'}
-          value={input.cardRef.version}
-          onchange={(event) => onaction?.({ name: 'card.version', input: { card_ref: { ...ref, version: event.currentTarget.value } } })}
-        >
-          {#if versions?.state === 'populated'}
-            {#each versions.data.items as item (item.version)}<option value={item.version}>{item.version}</option>{/each}
-            {#if !versions.data.items.some((item) => item.version === input.cardRef.version)}
-              <option value={input.cardRef.version}>{input.cardRef.version}</option>
-            {/if}
-          {:else}
-            <option value={input.cardRef.version}>{input.cardRef.version}</option>
+    <div class="top">
+      <div class="identity">
+        <div class="title">
+          <h2>{card.metadata.name}</h2>
+          <span class="kind"><span aria-hidden="true">●</span> {card.kind}</span>
+          <label class="version">
+            <span class="visually-hidden">Version</span>
+            <select
+              disabled={!onaction || versions?.state !== 'populated'}
+              value={input.cardRef.version}
+              onchange={(event) => onaction?.({ name: 'card.version', input: { card_ref: { ...ref, version: event.currentTarget.value } } })}
+            >
+              {#each items as item (item.version)}
+                <option value={item.version}>v{item.version}{item.version === newest ? ' · current' : ''}</option>
+              {/each}
+              {#if !items.some((item) => item.version === input.cardRef.version)}
+                <option value={input.cardRef.version}>v{input.cardRef.version}</option>
+              {/if}
+            </select>
+          </label>
+          {#if current}<span class="status"><StatusPill tone={TONES[current.status]} label={current.status} /></span>{/if}
+        </div>
+        <p class="meta">
+          <span>{ref.space ? `${ref.space} / ` : ''}{ref.name}@{ref.version}</span>
+          {#if card.metadata.uid}
+            <span>
+              uid {card.metadata.uid}
+              <button type="button" class="icon" aria-label="Copy uid" onclick={() => copy(card.metadata.uid ?? '')}>⧉</button>
+            </span>
           {/if}
-        </select>
-      </label>
-      {#if versions?.state === 'populated' && versions.data.truncated}
-        <span class="note">Showing the newest {versions.data.items.length} versions</span>
-      {:else if versions?.state === 'denied' || versions?.state === 'error'}
-        <span class="note" role="note">Versions unavailable: {versions.problem.title} ({versions.problem.code})</span>
-      {/if}
-    </div>
-
-    <div class="identity">
-      <code>{fmtCardRef(ref)}</code>
-      <button type="button" onclick={() => copy(fmtCardRef(ref))}>Copy ref</button>
-      {#if card.metadata.uid}
-        <code title="Card uid">{card.metadata.uid}</code>
-        <button type="button" onclick={() => copy(card.metadata.uid ?? '')}>Copy uid</button>
-      {/if}
-      {#if copied}<span class="note" role="status">{copied}</span>{/if}
-      <span class="primary">
+          {#if current}
+            <span>registered <time datetime={current.created_at}>{fmtInstant(parseInstant(current.created_at))}</time></span>
+          {/if}
+          {#if versions?.state === 'populated' && versions.data.truncated}
+            <span>showing the newest {items.length} versions</span>
+          {:else if versions?.state === 'denied' || versions?.state === 'error'}
+            <span class="problem" role="note">versions unavailable: {versions.problem.title} ({versions.problem.code})</span>
+          {/if}
+          {#if copied}<span role="status">{copied}</span>{/if}
+        </p>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" onclick={() => copy(fmtCardRef(ref))}><span aria-hidden="true">⧉</span> Copy ref</button>
         <ActionButton
-          primary
+          variant="primary"
           label="Open in Observe"
+          icon="↗"
           state={onaction ? actions['card.open_in_observe'] : unavailable}
           onclick={() => onaction?.({ name: 'card.open_in_observe', input: { card_ref: ref } })}
         />
-      </span>
+      </div>
     </div>
 
     {#if input.tabs?.length}
@@ -113,73 +121,170 @@
 
 <style>
   .card-header {
-    display: grid;
-    gap: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
     min-width: 0;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 10px;
     color: var(--text);
     font-family: var(--font-sans);
   }
-  .title,
+  .top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 12px 16px;
+  }
   .identity {
+    display: flex;
+    flex: 1 1 320px;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  .title {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     min-width: 0;
   }
   h2 {
     margin: 0;
-    font: var(--weight-strong) 20px/1.2 var(--font-sans);
+    min-width: 0;
+    font: 600 28px/1.15 var(--font-sans);
+    letter-spacing: -0.01em;
     overflow-wrap: anywhere;
   }
-  .version {
+  .kind {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    color: var(--muted);
-    font-size: 12px;
+    border: 1px solid color-mix(in srgb, var(--declare) 45%, var(--border));
+    border-radius: var(--r);
+    padding: 2px 8px;
+    background: var(--declare-soft);
+    color: var(--declare);
+    font: 11px var(--font-mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
-  select,
-  button {
+  .version {
+    position: relative;
+    display: inline-flex;
+  }
+  .version::after {
+    content: '▾';
+    position: absolute;
+    top: 50%;
+    right: 9px;
+    color: var(--muted);
+    font-size: 10px;
+    pointer-events: none;
+    transform: translateY(-50%);
+  }
+  select {
+    appearance: none;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    padding: 3px 8px;
-    background: var(--surface);
+    padding: 3px 24px 3px 9px;
+    background: var(--surface-2);
     color: var(--text);
     font: 12px var(--font-mono);
   }
-  button {
+  select:enabled {
     cursor: pointer;
-    font-family: var(--font-sans);
   }
-  button:hover:not(:disabled) {
+  select:enabled:hover {
     background: var(--surface-hover);
+  }
+  .status :global(.pill) {
+    text-transform: uppercase;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 14px;
+    margin: 0;
+    color: var(--muted);
+    font: 11.5px var(--font-mono);
+  }
+  .meta span {
+    overflow-wrap: anywhere;
+  }
+  .problem {
+    color: var(--warn);
+  }
+  .icon {
+    border: 0;
+    padding: 0 2px;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    cursor: pointer;
+  }
+  .icon:hover {
+    color: var(--declare);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 34px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 0 12px;
+    background: var(--surface-2);
+    color: var(--text);
+    font: 13px var(--font-sans);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .secondary:hover {
+    background: var(--surface-hover);
+  }
+  nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 22px;
+  }
+  nav button {
+    border: 0;
+    padding: 10px 2px;
+    background: none;
+    color: var(--muted);
+    font: 13px var(--font-sans);
+    cursor: pointer;
+  }
+  nav button:enabled:hover {
+    color: var(--text);
+  }
+  nav button[aria-current='page'] {
+    color: var(--text);
+    box-shadow: inset 0 -2px 0 var(--declare);
+  }
+  nav button:disabled {
+    cursor: default;
   }
   :is(select, button):focus-visible {
     outline: 2px solid var(--declare);
     outline-offset: 2px;
   }
-  code {
-    min-width: 0;
-    overflow-wrap: anywhere;
-    font: 12px var(--font-mono);
-  }
-  .note {
-    color: var(--muted);
-    font-size: 12px;
-  }
-  .primary {
-    margin-left: auto;
-  }
-  nav {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  nav button[aria-current='page'] {
-    border-color: var(--declare);
-    background: var(--declare-soft);
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 </style>

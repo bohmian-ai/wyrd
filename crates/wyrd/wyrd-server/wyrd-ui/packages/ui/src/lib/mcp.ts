@@ -45,7 +45,7 @@ export function mcpExecutor(app: Pick<App, 'callServerTool'>): Executor {
   }
 
   return {
-    run(requests, signal) {
+    async run(requests, signal) {
       signal?.throwIfAborted();
       return Promise.all(requests.map((request) => read(request, signal))) as never;
     }

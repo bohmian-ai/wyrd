@@ -131,13 +131,22 @@ impl WyrdClient {
     /// transport error when `/auth/token` cannot be reached.
     pub(crate) async fn connected(&self) -> Result<Self, WyrdError> {
         // A browser session is presented as itself; it has no exchange to complete.
-        if !matches!(
-            self.auth.credential(),
-            ResolvedCredential::BrowserSession(_)
-        ) {
+        if !self.is_browser_session() {
             self.access_token().await?;
         }
         Ok(self.clone())
+    }
+
+    /// Whether this client acts as a forwarded browser session.
+    ///
+    /// Such a client reaches the tenant `/v1` HTTP surface only, so handles
+    /// that would otherwise open a bearer-only channel, such as Bifrost's gRPC
+    /// ingest, skip it.
+    pub(crate) fn is_browser_session(&self) -> bool {
+        matches!(
+            self.auth.credential(),
+            ResolvedCredential::BrowserSession(_)
+        )
     }
 
     /// Build a client that acts as one forwarded browser session.
@@ -814,6 +823,23 @@ mod tests {
             !format!("{first:?}").contains("gateway-bearer"),
             "Debug must redact the bearer"
         );
+    }
+
+    /// A browser session's Bifrost handle is query-only: connecting dials no
+    /// gRPC ingest channel, which would refuse a session that is not a
+    /// bearer. Nothing listens on the derived gRPC port, so a dial would fail.
+    #[tokio::test]
+    async fn browser_session_bifrost_connects_without_an_ingest_channel() {
+        let session = BrowserSession::new(
+            "wyrd_session_acme=opaque.1".to_owned().into(),
+            "https://ui.example.com",
+        )
+        .expect("a well-formed session");
+        let client =
+            WyrdClient::for_browser_session("http://127.0.0.1:1", session).expect("client builds");
+        crate::bifrost::Bifrost::connect_with(&client, crate::bifrost::BifrostOptions::default())
+            .await
+            .expect("a browser session connects without dialling ingest");
     }
 
     /// A browser-session client presents exactly the forwarded session cookie

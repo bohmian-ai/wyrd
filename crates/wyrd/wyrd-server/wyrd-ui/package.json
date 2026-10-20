@@ -32,7 +32,8 @@
     "typescript": "^5.9.0",
     "vite": "latest",
     "vitest": "latest",
-    "wyrd-ai-ui": "workspace:*"
+    "wyrd-ai-ui": "workspace:*",
+    "zod": "4.5.4"
   },
   "dependencies": {
     "@fontsource/familjen-grotesk": "5.3.0",

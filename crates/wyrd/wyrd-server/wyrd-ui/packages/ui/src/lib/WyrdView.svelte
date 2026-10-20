@@ -112,7 +112,15 @@
   const layouts = $derived(
     parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (kept[panel.id] ?? panel.layout))) : []
   );
-  const placements = $derived(new Map(parsed.success ? place(layouts).map((at, index) => [parsed.data.panels[index].id, at]) : []));
+  /** Rendered panel heights in px; an unplaced panel occupies the rows its content needs. */
+  let heights = $state<Record<string, number>>({});
+  const placements = $derived(
+    new Map(
+      parsed.success
+        ? place(layouts, parsed.data.panels.map((panel) => heights[panel.id] ?? 0)).map((at, index) => [parsed.data.panels[index].id, at])
+        : []
+    )
+  );
   /** Panels in reading order: document order on the grid, `(y, x)` when stacked. */
   const ordered = $derived(
     narrow ? panels.toSorted((a, b) => { const [p, q] = [placements.get(a.id)!, placements.get(b.id)!]; return p.y - q.y || p.x - q.x; }) : panels
@@ -123,15 +131,15 @@
     if (!at) return '';
     const column = narrow ? '1 / -1' : `${at.x + 1} / span ${at.w}`;
     const row = narrow ? '' : `grid-row: ${at.y + 1} / span ${at.h};`;
-    return `grid-column: ${column}; ${row}${at.auto ? '' : ` height: ${rowsHeight(at.h)};`}`;
+    // An unplaced panel keeps its content height inside the rows it occupies.
+    return `grid-column: ${column}; ${row}${at.auto ? ' align-self: start;' : ` height: ${rowsHeight(at.h)};`}`;
   }
 
-  /** The layout an edit of `id` starts from; an unplaced panel starts from its measured height. */
-  function current(id: string, element: HTMLElement): Layout {
+  /** The layout an edit of `id` starts from; an unplaced panel starts from the rows its content occupies. */
+  function current(id: string): Layout {
     if (draft?.id === id) return draft.layout;
-    const { x, y, w, h, auto } = placements.get(id)!;
-    const height = element.closest<HTMLElement>('.panel')?.offsetHeight ?? 0;
-    return { x, y, w, h: auto ? Math.min(48, Math.max(1, Math.round((height + GAP) / (ROW + GAP)))) : h };
+    const { x, y, w, h } = placements.get(id)!;
+    return { x, y, w, h: Math.min(48, h) };
   }
 
   /**
@@ -160,7 +168,7 @@
     const step = KEYS[event.key];
     if (step) {
       event.preventDefault();
-      draft = { id, layout: edit(current(id, event.currentTarget as HTMLElement), step[0], step[1], event.shiftKey) };
+      draft = { id, layout: edit(current(id), step[0], step[1], event.shiftKey) };
     } else if (event.key === 'Enter') {
       event.preventDefault();
       commit();
@@ -179,7 +187,7 @@
     event.preventDefault();
     cancel();
     const target = event.currentTarget as HTMLElement;
-    const from = current(id, target);
+    const from = current(id);
     const column = (width + GAP) / COLUMNS;
     const [pointer, startX, startY] = [event.pointerId, event.clientX, event.clientY];
     target.setPointerCapture(pointer);
@@ -275,9 +283,17 @@
         <ActionButton label="Reset range" onclick={() => (brushed = undefined)} />
       </p>
     {/if}
-    <div class="panels">
+    <div class="panels" class:narrow>
       {#each ordered as panel (panel.id)}
-        <div class="panel" class:editable class:editing={draft?.id === panel.id} data-panel={panel.id} data-component={panel.component} style={boxStyle(panel.id)}>
+        <div
+          class="panel"
+          class:editable
+          class:editing={draft?.id === panel.id}
+          data-panel={panel.id}
+          data-component={panel.component}
+          style={boxStyle(panel.id)}
+          bind:offsetHeight={heights[panel.id]}
+        >
           {#if editable}
             <button
               type="button"
@@ -331,12 +347,15 @@
     margin: 0;
     font: 12px var(--font-mono);
   }
-  /* Keep in step with COLUMNS, ROW and GAP in layout.ts. */
+  /* Keep in step with COLUMNS, ROW and GAP in layout.ts. Rows hold a fixed pitch; stacked panels take their own height. */
   .panels {
     display: grid;
     grid-template-columns: repeat(12, minmax(0, 1fr));
-    grid-auto-rows: minmax(40px, auto);
+    grid-auto-rows: 40px;
     gap: 12px;
+  }
+  .panels.narrow {
+    grid-auto-rows: auto;
   }
   .panel {
     position: relative;

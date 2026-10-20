@@ -71,6 +71,7 @@ import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
+import { place as placeAll } from '../../packages/ui/src/lib/layout';
 import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 
 /** An executor answering each read with `answer` and recording every request and signal. */
@@ -615,6 +616,27 @@ test('TASK-027: Grid placement', async () => {
   expect([panel(plain.container, 'a').style.gridRow, panel(plain.container, 'b').style.gridRow]).toEqual(['1 / span 1', '2 / span 1']);
   expect(panel(plain.container, 'b').style.gridColumn).toBe('1 / span 12');
   plain.unmount();
+
+  // An unplaced panel occupies the whole rows its content needs; rows keep their fixed pitch.
+  const fixed = { x: 0, y: 4, w: 12, h: 4 };
+  expect(placeAll([undefined, fixed], [72.1875])).toEqual([{ x: 0, y: 0, w: 12, h: 2, auto: true }, { ...fixed, auto: false }]);
+  expect(placeAll([undefined, fixed], [294])).toEqual([{ x: 0, y: 0, w: 12, h: 6, auto: true }, { ...fixed, y: 6, auto: false }]);
+  expect(placeAll([undefined, undefined], [0, 2000])).toEqual([{ x: 0, y: 0, w: 12, h: 1, auto: true }, { x: 0, y: 1, w: 12, h: 39, auto: true }]);
+  // The renderer measures that content and places from it, without stretching the panel or writing the document.
+  const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    return this.dataset.panel === 'tall' ? 294 : 0;
+  });
+  try {
+    const mixed = laidOut({ tall: undefined, after: fixed });
+    const kept = structuredClone(mixed);
+    const measured = render(WyrdView, { doc: mixed, executor: chart.executor });
+    expect([panel(measured.container, 'tall').style.gridRow, panel(measured.container, 'after').style.gridRow]).toEqual(['1 / span 6', '7 / span 4']);
+    expect(panel(measured.container, 'tall').style.height).toBe('');
+    expect(mixed).toEqual(kept);
+    measured.unmount();
+  } finally {
+    height.mockRestore();
+  }
 });
 
 test('TASK-027: Layout editing', async () => {

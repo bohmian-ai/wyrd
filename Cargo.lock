@@ -254,7 +254,7 @@ dependencies = [
  "base64ct",
  "blake2 0.10.6",
  "cpufeatures 0.2.17",
- "password-hash 0.5.0",
+ "password-hash",
 ]
 
 [[package]]
@@ -964,7 +964,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq 0.4.2",
+ "constant_time_eq",
  "cpufeatures 0.3.0",
 ]
 
@@ -1172,31 +1172,11 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "bzip2"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdb116a6ef3f6c3698828873ad02c3014b3c85cadb88496095628e3ef1e347f8"
-dependencies = [
- "bzip2-sys",
- "libc",
-]
-
-[[package]]
-name = "bzip2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
 dependencies = [
  "libbz2-rs-sys",
-]
-
-[[package]]
-name = "bzip2-sys"
-version = "0.1.13+1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
-dependencies = [
- "cc",
- "pkg-config",
 ]
 
 [[package]]
@@ -1213,7 +1193,7 @@ dependencies = [
  "log",
  "quick-xml",
  "serde",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -1564,7 +1544,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
  "brotli 8.0.4",
- "bzip2 0.6.1",
+ "bzip2",
  "compression-core",
  "flate2",
  "liblzma",
@@ -1643,12 +1623,6 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
-
-[[package]]
-name = "constant_time_eq"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 
 [[package]]
 name = "constant_time_eq"
@@ -2116,7 +2090,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
- "bzip2 0.6.1",
+ "bzip2",
  "chrono",
  "datafusion-catalog",
  "datafusion-catalog-listing",
@@ -2254,7 +2228,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "bytes",
- "bzip2 0.6.1",
+ "bzip2",
  "chrono",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -3630,7 +3604,6 @@ dependencies = [
  "compact_str",
  "get-size-derive2",
  "hashbrown 0.17.1",
- "indexmap 2.14.2",
  "ordermap",
  "smallvec",
  "thin-vec",
@@ -3776,10 +3749,6 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
- "allocator-api2",
-]
 
 [[package]]
 name = "hashbrown"
@@ -5208,6 +5177,7 @@ name = "monty-type-checking"
 version = "1.1.0"
 dependencies = [
  "monty-types",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -5922,17 +5892,6 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7676374caaee8a325c9e7a2ae557f216c5563a171d6997b0ef8a65af35147700"
-dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
-]
-
-[[package]]
-name = "password-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
@@ -5953,18 +5912,6 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
-name = "pbkdf2"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a0692ec44e4cf1ef28ca317f14f8f07da2d95ec3fa01f86e4467b725e60917"
-dependencies = [
- "digest 0.10.7",
- "hmac 0.12.1",
- "password-hash 0.4.2",
- "sha2 0.10.9",
-]
 
 [[package]]
 name = "pem"
@@ -7234,10 +7181,8 @@ version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed11e9366de40e79707c0e575afd8beffad58ec94c253577d516b8679cf98308"
 dependencies = [
- "get-size2",
  "memchr",
  "ruff_text_size",
- "serde",
 ]
 
 [[package]]
@@ -7247,7 +7192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965"
 dependencies = [
  "get-size2",
- "serde",
 ]
 
 [[package]]
@@ -9910,7 +9854,6 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "base64 0.23.1",
- "base64ct",
  "bigdecimal",
  "bit-set",
  "bit-vec 0.8.0",
@@ -9922,7 +9865,6 @@ dependencies = [
  "chrono",
  "clap",
  "clap_builder",
- "compact_str",
  "compression-codecs",
  "console",
  "crossbeam-epoch",
@@ -9944,7 +9886,6 @@ dependencies = [
  "futures-task",
  "futures-util",
  "generic-array",
- "get-size2",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -9961,6 +9902,7 @@ dependencies = [
  "idna",
  "indexmap 2.14.2",
  "itertools 0.13.0",
+ "jiff",
  "lazy_static",
  "lexical-parse-float",
  "lexical-parse-integer",
@@ -9973,7 +9915,7 @@ dependencies = [
  "md-5",
  "memchr",
  "moka",
- "nom 7.1.3",
+ "monty-types",
  "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
@@ -9984,7 +9926,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
- "ordermap",
  "percent-encoding",
  "petgraph 0.8.3",
  "phf_shared 0.11.3",
@@ -10003,8 +9944,6 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rmcp",
- "ruff_source_file",
- "ruff_text_size",
  "rustix",
  "rustls",
  "secrecy",
@@ -10022,13 +9961,14 @@ dependencies = [
  "slab",
  "smallvec",
  "spin 0.9.8",
+ "sqlx",
  "sqlx-core",
+ "sqlx-postgres",
  "subtle",
  "syn 2.0.118",
  "syn 3.0.5",
  "sync_wrapper",
  "temp-env",
- "thin-vec",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -10047,13 +9987,13 @@ dependencies = [
  "typenum",
  "url",
  "uuid",
+ "windows-sys 0.52.0",
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",
- "zip 0.6.6",
- "zip 8.6.0",
  "zstd 0.13.3",
  "zstd-safe 7.2.4",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -10769,7 +10709,7 @@ dependencies = [
  "wyrd-utils",
  "wyrd-vault",
  "zeroize",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -11341,26 +11281,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
-dependencies = [
- "aes 0.8.4",
- "byteorder",
- "bzip2 0.4.4",
- "constant_time_eq 0.1.5",
- "crc32fast",
- "crossbeam-utils",
- "flate2",
- "hmac 0.12.1",
- "pbkdf2",
- "sha1 0.10.7",
- "time",
- "zstd 0.11.2+zstd.1.5.2",
-]
-
-[[package]]
-name = "zip"
 version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
@@ -11399,15 +11319,6 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.11.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20cc960326ece64f010d2d2107537f26dc589a6573a316bd5b1dba685fa5fde4"
-dependencies = [
- "zstd-safe 5.0.2+zstd.1.5.2",
-]
-
-[[package]]
-name = "zstd"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
@@ -11422,16 +11333,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
 dependencies = [
  "zstd-safe 8.0.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "5.0.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
-dependencies = [
- "libc",
- "zstd-sys",
 ]
 
 [[package]]

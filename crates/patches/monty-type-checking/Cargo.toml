@@ -11,6 +11,7 @@ description = "Wyrd's type-checker-free stand-in for monty-type-checking"
 
 [dependencies]
 monty-types = { workspace = true }
+workspace-hack.workspace = true
 
 [lints]
 workspace = true

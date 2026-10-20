@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -10,15 +10,21 @@ status: approved
 
 Carry useful historical UI work onto current Wyrd in increments that a human can
 run and inspect before the next dependent increment. First make the existing
-production UI installable and reachable with its existing login. Then migrate
-the implemented domain screens, reconciling their data against current contracts.
+production UI installable and reachable, with browser sessions owned by the Rust
+server. Then migrate the implemented domain screens, reconciling their data
+against current contracts.
 
 This revision replaces an invalid draft that claimed revision 1 approval. That
 claim is not carried forward. The caller approved revision 5 on 2026-10-19;
 revision 9 incorporates the subsequent main update, full-library completion
 requirement, replacement readiness reviewer, and the caller's loader/action/SQL
 and read-parity decisions. Independent spec readiness review returned `Approve`;
-the caller explicitly approved revision 9 and requested `$wyrd-plan` on 2026-10-19.
+the caller explicitly approved revision 9 and requested `$wyrd-plan` on
+2026-10-19. Revision 10 records the caller's explicit instruction to revise this spec
+with Rust-owned opaque browser sessions and write the remediation task after
+rejecting additional UI deployment secrets and environment variables. This is
+approval of that decision and its necessary implementation/task scope; it is
+not a claim that revision-9 implementation or visual acceptance passed.
 
 Original baseline: `d3ce50626a8e380475c0561d8d53144c212e8603`. On the caller's
 instruction, destination branch `wyrd-ui-main-integration` was fast-forwarded
@@ -59,8 +65,11 @@ packet's archived draft.
   the existing browser `/auth/*` interactions to the configured Rust upstream,
   retaining the browser origin, methods, bodies, path/query, redirects, cookies,
   and error responses. It must not follow the provider redirect server-side.
-  Preserve the server's exact `{public origin}/login/callback` validation and
-  provider callback derivation. Forwarding targets the configured server, never
+  Preserve exact public-origin validation and the existing Rust provider
+  callback at `/auth/callback`. REQ-033 replaces the Node OAuth-code completion
+  at `/login/callback`; it does not weaken provider state/callback checks or
+  change machine-client callback contracts. Forwarding targets the configured
+  server, never
   a browser-supplied destination; public-origin headers are established at the
   trusted boundary, not copied blindly from an incoming forwarded-header chain.
 - **REQ-005 — Official containers.** Reconcile historical official-container
@@ -73,15 +82,105 @@ packet's archived draft.
   Linux only: Debian on x86_64 and aarch64, and Rocky on x86_64 only. Reconcile the existing
   release matrix with these outputs; Ubuntu images are outside the selected
   distribution matrix.
-- **REQ-006 — Existing auth exercised.** Reuse `BrowserSessions`,
-  `BrowserSession`, hooks, login/callback/logout routes, the configured confidential
-  OAuth client, API-key recovery sign-in, and existing session protection.
-  Verify real login through the native public UI path and the container public
-  path using repository-owned identity fixtures. Preserve tenant/platform
-  separation, PKCE, issuer/state checks, callback validation, refresh, revocation,
-  HttpOnly/encrypted cookie behavior, and production HTTPS requirements.
-  A mock login or a harness that routes `/auth/*` around the deployed path is
-  insufficient evidence for the new topology.
+- **REQ-006 — Server-owned login exercised.** Extend the existing Rust login,
+  identity, permission and session-lifecycle owners for REQ-033. Preserve the
+  user workflows: tenant SSO, API-key recovery, chooser, tenant switching,
+  signed-in identity, settings and logout. Node owns rendering and trusted
+  forwarding, not OAuth code redemption, refresh, credential storage or session
+  authority. Verify actual native and official-nginx public paths using the
+  repository identity fixtures. Preserve existing platform, CLI/device, SDK,
+  workload and provider-connection-test behavior; adding a platform browser UI
+  or changing machine bearer authentication is outside this revision.
+- **REQ-033 — Rust-owned opaque browser sessions.** Use ordinary server-side
+  sessions in the existing Postgres database. This replaces the confidential
+  `wyrd-ui` OAuth client/encrypted credential-cookie decision, not the external
+  provider's own client authentication or Wyrd's CLI/SDK OAuth contracts.
+  - **Ownership and persistence.** Rust alone creates, resolves, expires and
+    revokes browser sessions. A high-entropy random session identifier is
+    generated per successful login, carried only in a host-only HttpOnly cookie,
+    and stored only by digest. The durable record binds one tenant and
+    principal, creation and absolute expiry, revocation, and either the exact
+    human connection revision or the originating API-key credential identity.
+    No recoverable API key, provider token, access token or refresh token is
+    stored in that record or cookie. Use the existing auth/SQL owners with
+    tenant RLS; existing OAuth refresh rows are not a generic session store.
+    Expiry and coordinated database times are Postgres-owned. Expired records
+    use existing auth maintenance/retention ownership, not a new scheduler.
+  - **Login and lifetime.** Extend the existing provider login transaction and
+    callback owners for a browser-session completion. Preserve browser
+    correlation, state, nonce, provider-side PKCE, exact issuer/connection/
+    callback validation and one-use completion. Any temporary browser cookie
+    is also an opaque, expiring transaction binding; Node never holds a PKCE
+    verifier or performs the second OAuth code exchange. Login transactions
+    expire after five minutes and sessions after twelve absolute hours,
+    without sliding extension or a browser refresh-token grant. An existing
+    session identifier is never adopted for a new login.
+  - **Browser HTTP boundary.** Rust provides typed, documented browser
+    operations under `/auth/browser`: `POST /login` starts tenant SSO;
+    `POST /api-key` verifies a recovery key and creates a session;
+    `GET /session` resolves safe tenant/principal/permissions/expiry metadata
+    (optionally filtered by tenant route key); `POST /logout` revokes the
+    selected tenant session and clears its cookie. Login and recovery accept
+    only a tenant route key plus the applicable recovery input, not a caller-
+    supplied principal or permissions. The key itself establishes its tenant;
+    a mismatching route key is refused. The shared `/auth/callback` completes
+    provider login and redirects to that tenant's fixed signed-in route; no
+    caller-controlled return URL or public Node OAuth callback is needed.
+    An unfiltered session read enumerates only live sessions proved by the
+    presented tenant cookies, never by readable cookie labels alone. Discard
+    and clear invalid or expired cookies during enumeration, returning only
+    live per-tenant metadata without merging principals or permissions across
+    tenants. If none remain, or an explicitly selected tenant has no valid
+    session, refuse authentication instead of falling back to another tenant.
+    Store unavailability still fails the request. No
+    operation returns a session identifier, OAuth token or key in page data,
+    URLs, JSON metadata or logs. Session/credential responses are `no-store`.
+  - **Authenticated API use.** The Node server forwards only the selected
+    tenant session cookie and trusted public-origin context to existing Rust
+    HTTP APIs; it receives the existing response shapes, not newly minted
+    credentials. Rust resolves the browser session into the existing principal,
+    credential attribution, permission and non-blocking audit boundary. Cookie
+    authentication is supported for the existing protected tenant `/v1` HTTP
+    surface, not platform, MCP, OTLP, gateway or gRPC authentication. That API
+    path requires exactly one selected tenant-session cookie; ambiguous multiple
+    session cookies are refused rather than selecting the first. The metadata
+    enumeration operation alone accepts multiple tenant-session cookies. An explicit
+    `X-Wyrd-Access-Token` always takes the existing bearer path; a refused bearer
+    must never fall back to a cookie. Cookie-only mutations, including login,
+    recovery and logout, require an exact trusted public Origin; absence or
+    mismatch is refused. The provider callback uses its bound one-use login
+    transaction instead. Node checks inbound action origin before forwarding
+    and cannot launder an untrusted or absent browser Origin into trusted
+    mutation authority. Ordinary GETs never perform settings writes, logout
+    or other authenticated mutations. Keep SvelteKit form checks as an
+    additional boundary. Document this cookie alternative in served OpenAPI;
+    do not make every existing protocol accept ambient browser cookies.
+  - **Current authority and revocation.** Resolve current tenant/principal
+    state and permissions on each browser-session request through existing
+    authority owners. Human sessions require the exact Active connection
+    revision. Recovery sessions require their originating credential to remain
+    valid and retain its restrictions; they do not widen into the principal's
+    full grants. Logout immediately revokes only that tenant browser session,
+    not the API key, other sessions or the external IdP session. Store outage
+    is an unavailable error, distinct from invalid/expired/revoked authority;
+    neither is successful anonymous, cached or mock fallback. Existing tenant
+    bearer tokens retain their five-minute snapshot semantics.
+  - **Deployment and transition.** Use the existing database and deployment
+    authentication configuration. No new operator-managed secret, shared Node
+    key, environment variable, secret bootstrap step, session service, Redis,
+    sticky routing or per-process session authority is added. Replicas resolve
+    the same durable session; replacing Rust or Node does not lose it.
+    Production cookies are Secure and SameSite=Lax; the existing loopback-only
+    development HTTP exception remains local and explicit. Session and login
+    cookies are host-only, HttpOnly and path-scoped to the application. Native
+    and nginx forwarding preserve separate Set-Cookie headers and public origin.
+    Old credential-bearing UI cookies are cleared and require sign-in again;
+    no plaintext-cookie fallback or browser refresh compatibility is retained.
+    Stop issuance/acceptance of the retired UI-only OAuth profile after its
+    callers move, without deleting historical auth records or changing live
+    CLI/SDK, device, platform, workload or provider-test contracts. Remove only
+    UI-specific machinery whose consumer is gone; reuse existing issuer,
+    provider, authorization, SQL and audit owners rather than duplicating them.
 
 ### Remaining migration
 
@@ -117,7 +216,10 @@ implementor never sees two versions of anything.
     `WYRD_UI_MOCK_DATA` and `WYRD_UI_MOCK_TENANT` settings, `locals.mockData`
     and `locals.wyrd` in `src/hooks.server.ts` and `src/app.d.ts`. No page may
     show mock domain data after this task.
-  - Keep, unchanged in behavior: `src/lib/server/auth/`,
+  - Keep the user workflows and source owners below. Revision 10's REQ-033
+    deliberately changes session ownership in the TASK-001 remediation; this
+    keep list does not freeze credential-bearing cookies or Node OAuth logic.
+    Outside that explicit change, keep unchanged in behavior: `src/lib/server/auth/`,
     `src/lib/server/problem.ts`, `src/lib/server/upstream.ts`,
     `src/lib/server/routing/`, `localAuthEnabled` and the login-scenario
     helpers in `development.ts`, `src/hooks.server.ts` (minus the mock and
@@ -552,11 +654,15 @@ not protocol authority.
   never an empty or mock success. A valid degraded query remains a degraded
   result with its warnings, following the query-results contract above.
   - Node executor (`wyrd-ai-ui/node`): built from a `wyrd-ai` `WyrdClient`. Use
-    case 1 builds it in the BFF from the browser session's credential; use
-    case 2 builds it in the user's server from their credential
-    (`WYRD_API_KEY`, workload token, or saved login). If `wyrd-ai` cannot be
-    constructed from a per-request browser-session bearer, adding that to
-    `wyrd-ai` is part of the foundation task.
+    case 1 uses the request-scoped Rust-owned browser session from REQ-033,
+    forwarding its selected cookie and trusted origin through the shared client
+    HTTP transport, without Node minting, caching or renewing OAuth credentials;
+    use case 2 builds it in the user's server from their credential
+    (`WYRD_API_KEY`, workload token, or saved login). If the shared client cannot
+    project that request-scoped session transport, its smallest HTTP extension
+    and TypeScript projection belong to foundation, not a second UI client or
+    session authority. Session cookies remain server-only and are not promoted
+    to a general SDK credential or gRPC/MCP authentication mode.
   - MCP executor (`wyrd-ai-ui/mcp`): calls the MCP tools above through the
     ext-apps `App.callServerTool`, so reads run as the MCP caller with that
     caller's scopes. It makes no network request of its own.
@@ -827,9 +933,12 @@ not protocol authority.
   generic verification Card; drift belongs within its check model. No legacy routes,
   compatibility aliases, per-kind verification models, or replacement contracts.
 - **INV-002 — Server and credential boundary.** Rust retains durable behavior,
-  authorization, tenant isolation, storage, policy, and audit. BFF credentials
-  stay server-side; never emit token/API-key material in page data, browser
-  storage, logs, URLs, screenshots, or fixtures. A failed or denied live request
+  authorization, tenant isolation, storage, policy, audit and browser-session
+  authority. Node retains only the request-scoped opaque cookie required for
+  server-side forwarding. Never emit token/API-key material in browser cookies,
+  page data, browser storage, logs, URLs, screenshots, or fixtures; session
+  identifiers appear only in their protected cookie and transport. A failed
+  or denied live request
   never falls back to mock success or another tenant's data.
 - **INV-003 — One build owner.** `scripts/build.sh` remains the sole authoritative
   build implementation. Existing mise and CI owners may invoke it; do not
@@ -847,7 +956,10 @@ not protocol authority.
   `WYRD_IDENTITY_TARGET`, `WYRD_IDENTITY_FILTER`, or `WYRD_STARTUP_FILTER`.
   Existing legitimate settings may be reused only for demonstrated consumers.
 - **INV-005 — TASK-001 exclusions.** TASK-001 ends at packaged/installed/launched
-  UI, official container routing, lifecycle, and real existing login proof.
+  UI, official container routing, lifecycle, REQ-033 server-owned browser
+  sessions, and real login proof. Revision 10 authorizes the necessary auth,
+  SQL, wire-contract, metadata/OpenAPI and retained UI-consumer closure; it
+  does not authorize a domain client or analytical SDK integration.
   It must not onboard Cards, Bifrost, Query, Observe, verification results,
   generated HTTP clients, or analytical native addons. It proves login and
   session with the authenticated surfaces REQ-032 keeps (`t/[tenantKey]/`
@@ -856,7 +968,9 @@ not protocol authority.
   client to prove auth.
 - **INV-006 — Useful migration only.** No whole-branch merge, redesign of Wyrd,
   new Workflow Card, general mock system, or new feature inferred solely from a
-  canvas. The Data workspace and Change Request UI are caller-requested
+  canvas. REQ-033 is the explicit caller-approved browser-session ownership
+  correction, not permission to redesign unrelated auth or machine protocols.
+  The Data workspace and Change Request UI are caller-requested
   (REQ-024, REQ-029); Change Requests become live only with their server
   contract. Mock-only evaluation functions are reference material, not promised
   live capabilities. Generated
@@ -882,6 +996,9 @@ not protocol authority.
 3. The existing installer, `DevServer`, build script, release workflow, official
    Dockerfiles/entrypoint/nginx, and auth/session owners retain their behavior.
    Extend them for the actual UI consumer; no second lifecycle controller.
+   REQ-033 replaces Node session authority with Rust-owned persisted browser
+   sessions. This uses the existing database, not additional deployment secrets
+   or infrastructure; the provider/CLI/SDK authentication owners remain.
 4. Main's existing production identity journey is reused and extended where its
    synthetic `/auth/*` routing currently bypasses production routing. Native
    installation/lifecycle and Linux image routing have separate proof owners.
@@ -900,7 +1017,7 @@ not protocol authority.
 |---|---|---|
 | AC-001 | A verified native install launches the production BFF and Rust server without a source checkout on each supported OS/architecture; missing/incompatible Node and malformed packages fail usefully and preserve a working install | Existing build/release and installer owners, package contents/runtime smoke, native release matrix evidence; no Node executable bundled |
 | AC-002 | `wyrd server dev` reaches UI readiness and handles first/repeat runs, conflict, partial startup, interruption, and child death without abandoned owned processes or data loss | Existing local-dev journey/installed CLI owners, focused process regressions, public UI smoke |
-| AC-003 | Existing tenant and platform login, callback, session/refresh and logout work at native browser origin; origin/state/issuer/tenant failures remain refused and no secret reaches the browser | Repository Keycloak/Dex and production-BFF identity owners extended through the actual public routing |
+| AC-003 | Tenant browser SSO/recovery, callback, chooser, switching, settings and logout work at native public origin with REQ-033; existing platform and machine flows remain unchanged; invalid origin/state/issuer/tenant remain refused and no API key or OAuth token reaches browser state | Existing Keycloak/Dex and production UI journey through actual routing; focused platform/CLI regressions |
 | AC-004 | Official images serve UI/BFF and existing Rust HTTP/gRPC surfaces through nginx at the intended public origin, with correct readiness, errors, and three-process cleanup | Existing Linux startup dev/prod owners against pinned image ID and source revision; production identity exercise through nginx |
 | AC-005 | TASK-001 imports no deferred domain/client/native analytical integration and adds no prohibited build/test configuration | Actual diff/manifest review and relevant existing dependency checks |
 | AC-006 | Card inventory and exact detail show current tenant data, exact versions, correct links and current kinds with honest empty/denied/error states | Focused BFF/UI tests and real registry journey plus separate inventory/detail visual checkpoints |
@@ -909,10 +1026,11 @@ not protocol authority.
 | AC-009 | Verification screens show generic requirements/verdicts/evidence and correct subject/Verifier/execution identities; summaries agree with those retained facts | Real generic verification-to-UI journey and focused projection tests; separate verification and summary checkpoints |
 | AC-010 | All original draft/reference bytes remain available with provenance; every task is self-contained, source-backed, narrowly verified, and visually inspectable; independent task readiness findings are resolved or surfaced | Preservation hashes, evidence inventory, obligation/task map and independent plan-readiness-reviewer findings/dispositions |
 | AC-011 | Every inventory component is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
+| AC-012 | Rust-owned opaque sessions support SSO and recovery, reject tampering/expiry/revocation/tenant mismatch and CSRF, preserve safe metadata/settings/chooser/logout, continue across two replicas/restarts, and require no additional deploy secret/env/service; old credential cookies require re-login | Real two-replica native and nginx browser journey, SQL/session negative tests, served cookie-auth contract, source/config audit and unchanged bearer/device/platform regressions |
 
 Task planning must choose exact focused commands from inspected current owners;
 the evidence document identifies known commands and coverage gaps. No build,
-test, or runtime success is claimed by this draft. Final integrated review owns
+test, or runtime success is claimed by this specification. Final integrated review owns
 combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
@@ -950,6 +1068,17 @@ Native origin topology and ordinary fixture/private implementation mechanics
 remain unchanged. The caller explicitly approved revision 9 on 2026-10-19;
 `$wyrd-plan` may derive the replacement tasks. Approval of planning does not
 authorize implementation.
+
+Revision 10 supersedes only the browser-session architecture and its necessary
+contract/consumer closure, plus the recorded TASK-001 remediation. The caller
+explicitly approved this direction by instructing: “Revise the spec with this
+decision” and “Write the remediation task to fix the known issues and add
+server-owned sessions.” No product/security/deployment decision is left open
+for that task; reversible internal types, schema layout and helpers remain
+implementation-owned. Revision-9 readiness and task-review reports retain their
+original subject and verdict, not an inferred approval of revision 10. The new
+remediation and its independent review are still required; no implementation,
+platform/runtime pass or human visual acceptance is claimed by this edit.
 
 ## Revision history and authorities
 
@@ -1001,6 +1130,17 @@ authorize implementation.
   degraded/error/limit behavior and requires independent spec readiness review.
   Spec re-review approved; caller explicitly approved revision 9 on 2026-10-19
   and requested task planning. No implementation authorized.
+
+- Revision 10 (2026-10-19): caller approves Rust-owned opaque browser sessions
+  in the existing Postgres database, with Node rendering/forwarding and no new
+  deploy secrets, environment variables or session infrastructure. Replaces
+  REQ-006's nonexistent confidential-client/encrypted-cookie premise with
+  REQ-033, updates REQ-004/032 and the future Node executor seam, and adds AC-012.
+  Reconciles the owning design/security/deployment text. The TASK-001 review at
+  `843484f6c` stays immutable; its two validated findings and this separate
+  human-directed change are assigned to one remediation task. Approved by the
+  caller's explicit instruction to revise the spec and write that task; no
+  implementation or review PASS is claimed.
 
 Authorities: `AGENTS.md`; `architecture/agent-rules.md`;
 `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;

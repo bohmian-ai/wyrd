@@ -1,8 +1,13 @@
 # TASK-003 — Reusable UI foundation across the four hosts
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed.  
+Spec: [revision 10, approved](../spec.md). Status: Proposed.
 Dependencies: [TASK-002](TASK-002-remove-old-ui.md).  
 Mapped obligations: REQ-030, REQ-020, AC-006, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+
+Revision-10 clarification: REQ-033 and TASK-001-R1 supersede the original
+browser-bearer premise only. Consume the Rust-owned session boundary after
+remediation; no new Node client secret/cookie key or credential-bearing cookie.
+Other scope and task dependencies remain unchanged.
 
 ## Outcome and Value
 
@@ -18,7 +23,7 @@ Use committed main `8651b96fd`, the approved spec and current canvas. Historical
 |---|---|---|---|---|---|
 | Exact Card reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Cards.get`, `Cards.list`; server `src/mcp/cards.rs::GET_BY_REF` | `sdks/wyrd-sdk-ts/wyrd/tests/support/server.ts::registered`; current Card envelopes | No portable UI projection | Extend the approved component loaders over these reads | No new registry, identity lookup or lineage owner |
 | Bounded analytical reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Bifrost.stream`; `crates/wyrd/wyrd-server/src/query/collect.rs::BoundedQuery` | `sdks/wyrd-sdk-ts/wyrd/tests/integration/query-bifrost.test.ts`, `query-results.test.ts`; MCP `bifrost.rs::query_tool` | UI props and host parity missing | Consume foundation normalization and shared query owner | No second query service or transport |
-| Session-bound SDK | `crates/wyrd/wyrd-server/wyrd-ui/src/lib/server/auth/browser-sessions.ts::BrowserSession.api` retains a private bearer; `sdks/wyrd-sdk-ts/wyrd/src/index.ts::WyrdClient.connect` already accepts credential | UI hooks/session tests; SDK client instantiation tests | No safe session-to-SDK construction path in BFF | Extend existing session boundary to construct per-request SDK clients without browser serialization | No duplicate auth/session store or token field in props |
+| Session-bound SDK | Existing `BrowserSession.api` request boundary and shared `wyrd-client`/TypeScript client transport; REQ-033 transfers authority to Rust in TASK-001-R1 | UI hooks/session and SDK client construction consumers; revalidate against completed remediation | Request-scoped opaque browser-session transport is not currently projected into the SDK | Extend only the shared HTTP transport/TypeScript projection when needed to forward the selected session cookie and trusted origin; keep user-server credential flows unchanged | No Node OAuth mint/refresh, duplicate client/session store, browser token or domain integration in TASK-001-R1 |
 | Component test/build ownership | UI package scripts, vite.config.ts, vitest-setup.ts; `scripts/gen_ts_types.py::WIRE_ROOTS`; mise codegen:check | SDK tests/support/server.ts::serverTest and @wyrd/testing startTestServer | No shared package, catalog, renderer or T1–T5 harness | Add approved component infrastructure under current workspace/build/test owners | Package/renderer/executors expressly required for four real hosts; no extra framework |
 
 Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.

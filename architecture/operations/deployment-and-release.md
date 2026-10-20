@@ -92,6 +92,25 @@ Unsuffixed `WYRD_DB_*` variables tune the tenant pool. `_MIGRATOR` and
 pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
+## Browser-session deployment
+
+First-party UI sessions are Rust-owned and persisted by digest in the existing
+Postgres database. Node forwards the selected tenant's opaque cookie and public
+origin; it needs no separate OAuth client credential or cookie-encryption key.
+No UI-specific environment variable, secret file, bootstrap step, session
+service, Redis instance or sticky routing is required. This does not remove
+existing server signing/sealing keys, database credentials or external-provider
+client configuration.
+
+Every replica uses the existing database authority. Replacing either a Rust or
+Node container, or restarting a native installation, preserves unexpired,
+unrevoked sessions without sharing new Node secrets. Expiry and revocation are
+checked server-side; unavailable Postgres produces an unavailable response,
+never an anonymous or cached success. Headless server, CLI and SDK deployments
+require no UI-session configuration. Production TLS and host-only Secure/
+HttpOnly/SameSite cookies remain required; the existing loopback-only native
+development exception does not authorize public plaintext deployment.
+
 ## Database logins and connection budget
 
 | Login | Lifetime | Purpose |

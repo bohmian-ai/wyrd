@@ -3,6 +3,24 @@
 This is a planning reference, not another test/build framework. Source is committed
 main `8651b96fd`; scripts/commands below were inspected, not executed in planning.
 
+## Revision-10 remediation proof
+
+The current assignment is
+[TASK-001-R1](../review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md).
+The setup described below is not currently a standalone identity prerequisite:
+`test:identity:journey:inner` owns provider recreate/seed/cleanup and then all
+journeys. Remediation must factor that existing lifecycle once so the original
+full lane and a focused command use the same owner and cleanup. It must not
+copy provisioning into a second script, add a test selector environment
+variable, or require the full suite for each task iteration.
+
+Native identity and real nginx identity remain distinct proof paths. Existing
+startup-common builds Debian only, so dev/prod startup commands alone do not
+establish the selected Debian amd64/arm64 and Rocky amd64 matrix. Record exact
+image/source identity and native bundle digest/runtime per runner. Missing
+Linux or human evidence remains unverified; it is not permission to weaken a
+check or claim another platform passed.
+
 ## Existing owners and setup
 
 - UI `package.json` owns `check`, `test` (`vitest run`), and `build`. `vite.config.ts`
@@ -40,7 +58,7 @@ main `8651b96fd`; scripts/commands below were inspected, not executed in plannin
 
 ```bash
 mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes)'
-mise exec -- cargo nextest run --locked -p wyrd-cli --test server_install -E 'test(=server_install_preserves_previous_on_failure)'
+mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_preserves_previous_on_failure)'
 mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready)'
 ```
 

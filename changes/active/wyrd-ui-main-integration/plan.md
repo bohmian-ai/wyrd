@@ -1,7 +1,8 @@
 # UI migration task order
 
-Approved authority: [spec revision 9](spec.md), committed baseline `8651b96fd`.
-Planning only; no implementation or task execution is approved by this packet.
+Approved authority: [spec revision 10](spec.md), committed baseline `8651b96fd`.
+Revision 10 approves the browser-session decision and this remediation scope;
+this documentation edit does not execute or accept an implementation.
 
 TASK-001 is the independent distribution/login outcome. TASK-002 deletes the old
 UI before component work. TASK-003 establishes the reusable foundation with
@@ -13,6 +14,7 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | Task | Observable outcome | Real task dependencies | External completion dependency |
 |---|---|---|---|
 | [TASK-001](tasks/TASK-001-distribution-login.md) | Installed and container UI with existing login | None | None |
+| [TASK-001-R1](review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md) | Correct installation eligibility, implement Rust-owned opaque browser sessions and prove official nginx login | TASK-001 and TASK-002 integrated at `843484f6c`; approved revision 10 | Supported native/Linux image runtime and human inspection remain required acceptance evidence |
 | [TASK-002](tasks/TASK-002-remove-old-ui.md) | Remove obsolete UI while retaining login | None | None |
 | [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts | TASK-002 | None |
 | [TASK-004](tasks/TASK-004-observe-components.md) | Observe component family | TASK-003 | REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. |
@@ -38,6 +40,24 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-012, TASK-005, TASK-007, TASK-008, TASK-004 | REQ-023 and applicable REQ-029 attention contracts; all supporting library tasks complete. |
 | [TASK-025](tasks/TASK-025-change-pages.md) | Change Request collaboration pages | TASK-012, TASK-009 | REQ-029 platform contract and TASK-009 production-complete, including actual read/write host projections. |
 | [TASK-026](tasks/TASK-026-repositories-page.md) | Repository connections page | TASK-012, TASK-009 | REQ-029 repository/webhook/configuration platform contract and TASK-009 production-complete. |
+
+## Active remediation and revision authority
+
+The immutable [TASK-001/002 review](review/tasks-001-002-843484f6c/verdict.md)
+reviewed revision 9 at `843484f6c`. It returned SPEC_REVISION_REQUIRED for
+TASK-001, retained FIND-TASK-001-1 and FIND-TASK-001-2, and found no implementation
+defect in TASK-002 (human acceptance still pending). Do not rewrite that review
+or treat revision 10 as retroactive PASS.
+
+[TASK-001-R1](review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md)
+is the single current assignment for both bounded findings and the caller's
+separate REQ-033 server-session decision. It supersedes TASK-001's confidential-
+client/encrypted-cookie premise and TASK-002's session-owner keep constraint
+only where revision 10 explicitly changes them. Preserve original task/evidence
+files as history. Unchanged obligations and dependency edges of TASK-003–026
+remain; TASK-003's request-scoped session seam is corrected for REQ-033 and must
+use the remediated boundary once implemented, without onboarding domain clients
+in remediation. Existing human checkpoints still govern dependent execution.
 
 ## Dependency and completion rules
 
@@ -69,7 +89,7 @@ TASK-012–026 cannot start simply because one family has finished.
 
 | Spec obligations | Delivery owner and proof |
 |---|---|
-| REQ-001–006; AC-001–005; INV-003/005 | TASK-001: signed native package/install/lifecycle, public auth and Linux routing; distinct native and image runner evidence |
+| REQ-001–006/033; AC-001–005/012; INV-003/005 | TASK-001 plus TASK-001-R1: signed install/lifecycle, Rust-owned browser sessions and native/nginx auth; distinct native and image runner evidence |
 | REQ-032 | TASK-002: exact delete/keep inventory, removed imports/settings, retained login regression |
 | REQ-030; AC-011 | TASK-003 foundation; TASK-004–010 all inventory families; TASK-011 production MCP and package/custom-app regression |
 | REQ-007/021 | TASK-012: canvas shell controls and navigation |

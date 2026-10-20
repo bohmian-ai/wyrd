@@ -818,6 +818,25 @@ jobs:
           cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           mkdir -p dist
           cp target/package/*.crate dist/
+
+      # crates.io resolves a published crate's dev-dependencies, but release-plz
+      # orders publishing by normal dependencies only, so a versioned
+      # dev-dependency on a sibling stops the publish halfway. Workspace
+      # dev-dependencies must be path-only so cargo strips them.
+      - name: Check no workspace crate is a published dev-dependency
+        run: |
+          python3 - <<'EOF'
+          import glob, json, subprocess, sys, tarfile, tomllib
+          members = {p["name"] for p in json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))["packages"]}
+          found = []
+          for path in glob.glob("dist/*.crate"):
+              with tarfile.open(path) as crate:
+                  manifest = tomllib.load(crate.extractfile(next(m for m in crate.getmembers() if m.name.count("/") == 1 and m.name.endswith("/Cargo.toml"))))
+              tables = [manifest.get("dev-dependencies", {})] + [t.get("dev-dependencies", {}) for t in manifest.get("target", {}).values()]
+              found += [f"{path}: {key}" for table in tables for key, spec in table.items() if (spec.get("package", key) if isinstance(spec, dict) else key) in members]
+          if found:
+              sys.exit("versioned workspace dev-dependencies; make them path-only:\n" + "\n".join(found))
+          EOF
           (cd dist && shasum -a 256 ./*.crate | sed 's|  \./|  |' > SHA256SUMS.rust-crates)
 
       - uses: actions/upload-artifact@v7

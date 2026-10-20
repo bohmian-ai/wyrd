@@ -27,7 +27,8 @@ export function numeric(value: unknown): number {
 /**
  * Build time series: one per `y` column, or per `series` value × `y` when a
  * series column is bound. Past {@link MAX_SERIES}, the largest totals keep
- * their own line and the rest are summed per instant as "other".
+ * their own line and the rest are summed per instant as "other", qualified
+ * when an authored series already has that caption.
  */
 export function timeSeries(result: QueryResult, x: string, ys: readonly string[], series?: string): Series[] {
   const xi = columnIndex(result, x);
@@ -51,7 +52,11 @@ export function timeSeries(result: QueryResult, x: string, ys: readonly string[]
     const other = new Map<number, number>();
     for (const [, points] of entries.slice(MAX_SERIES - 1))
       for (const [at, value] of points) other.set(at, (other.get(at) ?? 0) + value);
-    entries = [...entries.slice(0, MAX_SERIES - 1), ['other', other]];
+    const kept = entries.slice(0, MAX_SERIES - 1);
+    // An authored series may already be called "other"; the aggregate's caption must still name only itself.
+    let label = 'other';
+    for (let n = 1; kept.some(([each]) => each === label); n++) label = n === 1 ? 'other (aggregate)' : `other (aggregate ${n})`;
+    entries = [...kept, [label, other]];
   }
   return entries.map(([label, points]) => ({
     label,

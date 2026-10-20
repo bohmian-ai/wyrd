@@ -82,20 +82,28 @@ class Browser {
   async go(
     replica: 0 | 1 | string,
     path: string,
-    options: { form?: Record<string, string>; origin?: string } = {}
+    options: { form?: Record<string, string>; json?: unknown; origin?: string } = {}
   ): Promise<Response> {
     const headers = new Headers({ accept: 'text/html', ...hostileForwarding });
     if (this.cookies.size)
       headers.set('cookie', [...this.cookies].map(([k, v]) => `${k}=${v}`).join('; '));
-    if (options.form) {
-      headers.set('content-type', 'application/x-www-form-urlencoded');
+    const posted = options.form !== undefined || options.json !== undefined;
+    if (posted) {
+      headers.set(
+        'content-type',
+        options.form ? 'application/x-www-form-urlencoded' : 'application/json'
+      );
       headers.set('origin', options.origin ?? journey.origin);
     }
     const base = typeof replica === 'string' ? replica : journey.bffs[replica];
     const response = await fetch(base + path, {
-      method: options.form ? 'POST' : 'GET',
+      method: posted ? 'POST' : 'GET',
       headers,
-      body: options.form ? new URLSearchParams(options.form) : undefined,
+      body: options.form
+        ? new URLSearchParams(options.form)
+        : posted
+          ? JSON.stringify(options.json)
+          : undefined,
       redirect: 'manual'
     });
     for (const raw of response.headers.getSetCookie()) {
@@ -642,6 +650,27 @@ test('production multi-provider tenant switch', async () => {
   expect(chooserTenants(await (await browser.go(0, `/t/${keycloak}/settings`)).text())).toEqual(
     [second, keycloak].sort()
   );
+
+  // The public browser-session operations on this origin carry the session cookies to
+  // Rust: enumeration lists each live tenant, and logout durably revokes only the selected one.
+  /** The tenants the public enumeration answers live at `replica`, or its status. */
+  const live = async (replica: 0 | 1, query = '') => {
+    const answer = await browser.go(replica, `/auth/browser/session${query}`);
+    if (!answer.ok) return answer.status;
+    return ((await answer.json()) as { sessions: { tenant: string }[] }).sessions
+      .map(({ tenant }) => tenant)
+      .sort();
+  };
+  expect(await live(0)).toEqual([second, keycloak].sort());
+  expect(await live(1, `?tenant=${second}`)).toEqual([second]);
+  const loggedOut = await browser.go(1, '/auth/browser/logout', { json: { tenant: second } });
+  expect(loggedOut.status, await loggedOut.clone().text()).toBe(204);
+  expect(browser.cookies.has(sessionCookie(second))).toBe(false);
+  browser.cookies.set(sessionCookie(second), secondSession);
+  expect(await live(0, `?tenant=${second}`)).toBe(401);
+  expect(browser.cookies.has(sessionCookie(second))).toBe(false);
+  expect(await live(1)).toEqual([keycloak]);
+  expect(browser.cookies.get(sessionCookie(keycloak))).toBe(keycloakSession);
 }, journeyTimeout);
 
 test('production provider replacement settings', async () => {

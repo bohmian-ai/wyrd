@@ -551,8 +551,10 @@ async fn server_dev_first_run_is_client_ready() {
 
 /// Reruns retain the active release and key; a failed one-time save does not
 /// turn a retry into another issuance. Missing input, a non-loopback public
-/// gRPC bind, a missing or incompatible system Node, a release without the
-/// production UI, and an occupied UI listener are refused before setup, and
+/// gRPC bind, a missing or incompatible system Node, an active release
+/// without the production UI (as an incomplete installation to remove, never
+/// reactivated by reinstalling), and an occupied UI listener are refused
+/// before setup, and
 /// an explicit host selected on a later start is still connected.
 ///
 /// # Panics
@@ -701,7 +703,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
             .output()
             .await
             .expect("missing UI payload"),
-        "production UI",
+        "WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE",
     );
     symlink(ui_build(), &payload).expect("restore the UI payload");
     let occupied = TcpListener::bind(&local.ui).expect("occupy the UI listener");

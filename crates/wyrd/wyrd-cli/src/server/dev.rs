@@ -78,7 +78,8 @@ impl DevArgs {
     /// Compose local setup and remain attached until interruption or exit.
     ///
     /// # Errors
-    /// Refuses invalid local inputs, an incompatible release, failed server
+    /// Refuses invalid local inputs, an incomplete active installation (with
+    /// its removal recovery), an incompatible release, failed server
     /// operations, unsafe storage, unusable saved credentials, or failed hosts.
     /// Committed migration/provisioning steps remain on failure; reruns never
     /// reissue an active tenant's key. Cancellation settles the owned server.
@@ -98,7 +99,7 @@ impl DevArgs {
                 return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
             }
             installed = async {
-                match installer.installed() {
+                match installer.installed()? {
                     Some(installed) => Ok(installed),
                     None => installer.install().await,
                 }

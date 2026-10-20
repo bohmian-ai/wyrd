@@ -25,7 +25,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
-use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome};
 
 use crate::components::auth::Caller;
@@ -81,6 +81,11 @@ pub(crate) fn input_schema() -> JsonValue {
                 "minLength": 1,
                 "maxLength": MAX_SQL_BYTES
             },
+            "params": {
+                "type": "array",
+                "items": {"type": ["null", "boolean", "number", "string"]},
+                "description": "Optional ordered bind values for the $1..$n placeholders in sql. Values are bound as data, never spliced into the SQL."
+            },
             "deadline_ms": {
                 "type": "integer",
                 "minimum": 1,
@@ -119,14 +124,19 @@ pub(crate) struct InvalidQueryArguments {
 
 /// Closed arguments of one bounded `bifrost.query` request.
 ///
-/// Every field is either the SQL itself or the optional deadline the public
-/// request already carries, plus the two response ceilings. There is no
+/// Every field is either the SQL itself or the optional bind values and
+/// deadline the public request already carries, plus the two response
+/// ceilings. There is no
 /// path, class, tenant, or principal field to omit.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QueryArguments {
     /// A single read-only SELECT statement.
     pub(crate) sql: String,
+    /// Ordered bind values for the `$1..$n` placeholders in `sql`; omitted,
+    /// the query binds nothing.
+    #[serde(default)]
+    pub(crate) params: Vec<QueryParam>,
     /// Optional caller deadline in milliseconds.
     #[serde(default)]
     pub(crate) deadline_ms: Option<u32>,
@@ -194,10 +204,11 @@ impl QueryArguments {
         Ok(())
     }
 
-    /// Project the SQL and optional deadline onto the public query request.
+    /// Project the SQL, its ordered bind values, and the optional deadline
+    /// onto the public query request unchanged.
     pub(crate) fn to_request(&self) -> BifrostQueryRequest {
         BifrostQueryRequest {
-            params: Vec::new(),
+            params: self.params.clone(),
             sql: self.sql.clone(),
             deadline_ms: self.deadline_ms.map(i64::from),
         }

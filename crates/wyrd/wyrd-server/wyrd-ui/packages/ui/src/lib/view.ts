@@ -30,6 +30,8 @@ export interface MountViewOptions {
   readonly load?: PanelLoader;
   readonly onaction?: ViewActionHandler;
   readonly mode?: 'light' | 'dark';
+  /** Receives the whole document after each completed layout edit; absent, the layout is fixed. */
+  readonly onlayout?: (doc: ViewDocument) => void;
 }
 
 /** Validate a view document's structure; panel inputs are validated per panel at load. */

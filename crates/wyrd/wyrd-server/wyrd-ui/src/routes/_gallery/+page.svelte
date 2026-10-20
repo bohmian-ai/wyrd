@@ -34,17 +34,19 @@
 
   const table = { ...series, terminal: terminal(4, 'degraded') };
   const versions = { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } as const;
-  const doc = {
+  /** Placed panels; edits replace the document for this visit only. */
+  let doc = $state.raw<unknown>({
     version: 'wyrd.view/v1',
     catalogId: 'wyrd.ui/v1',
     title: 'Ranker overview',
     range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' },
     panels: [
-      { id: 'header', component: 'CardHeader', input: { cardRef: card } },
-      { id: 'latency', component: 'Chart', input: timeseries },
-      { id: 'broken', component: 'Chart', input: { type: 'stat' } }
+      { id: 'header', component: 'CardHeader', input: { cardRef: card }, layout: { x: 0, y: 0, w: 12, h: 3 } },
+      { id: 'latency', component: 'Chart', input: timeseries, layout: { x: 0, y: 3, w: 8, h: 8 } },
+      { id: 'broken', component: 'Chart', input: { type: 'stat' }, layout: { x: 8, y: 3, w: 4, h: 4 } },
+      { id: 'unplaced', component: 'Chart', input: { ...timeseries, title: 'Unplaced: full width at content height' } }
     ]
-  };
+  });
 </script>
 
 <svelte:head><title>Component gallery</title></svelte:head>
@@ -97,7 +99,7 @@
       <button type="button" class="open" onclick={() => (drawer = true)}>Open drawer</button>
 
       <h2>View document</h2>
-      <WyrdView {doc} executor={fixtureExecutor} {onaction} />
+      <WyrdView {doc} executor={fixtureExecutor} {onaction} onlayout={(next) => (doc = next)} />
     </section>
   {/each}
   <Drawer open={drawer} title="Span detail" onclose={() => (drawer = false)}><p>Drawer body.</p></Drawer>

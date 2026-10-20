@@ -360,3 +360,114 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   ]);
   expect(callServerTool.mock.calls[0][1]).toEqual({ signal: abort.signal });
 });
+
+/** A view document over Chart panels with the given layouts; `undefined` leaves a panel unplaced. */
+function laidOut(layouts: Record<string, { x: number; y: number; w: number; h: number } | undefined>) {
+  return {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: Object.entries(layouts).map(([id, layout]) => ({ id, component: 'Chart', input: { ...timeseries, title: id }, ...(layout && { layout }) }))
+  };
+}
+
+/** The rendered panel element for `id`. */
+const panel = (container: Element, id: string) => container.querySelector<HTMLElement>(`[data-panel="${id}"]`)!;
+
+test('TASK-027: Layout document contract', () => {
+  expect(validateView(laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: undefined }))).not.toHaveProperty('code');
+  for (const layout of [{ x: 12, y: 0, w: 1, h: 1 }, { x: 0, y: 0, w: 0, h: 1 }, { x: 8, y: 0, w: 5, h: 1 }, { x: 0, y: -1, w: 1, h: 1 }, { x: 0, y: 0, w: 1, h: 49 }, { x: 0, y: 0, w: 1, h: 1.5 }, { x: 0, y: 0, w: 4 }])
+    expect(validateView(laidOut({ a: layout as never })), JSON.stringify(layout)).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('layout') });
+  const sized = laidOut({ a: undefined });
+  expect(validateView({ ...sized, panels: [{ ...sized.panels[0], width: 'full' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('width') });
+  // The published view schema carries layout; no component entry gains a size input.
+  expect(Object.keys(catalog.view.properties.panels.items.properties)).toContain('layout');
+  expect(JSON.stringify(catalog.components)).not.toMatch(/"(layout|width|height)"/);
+});
+
+test('TASK-027: Grid placement', async () => {
+  const chart = recording(() => ({ ok: true, value: series }));
+  // `d` collides with `a`, and `c` is unplaced, so `d` moves below both; the document is untouched.
+  const doc = laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 }, c: undefined, d: { x: 0, y: 0, w: 6, h: 4 } });
+  const written = structuredClone(doc);
+  const view = render(WyrdView, { doc, executor: chart.executor });
+  const place = (id: string) => [panel(view.container, id).style.gridColumn, panel(view.container, id).style.gridRow];
+  expect(place('a')).toEqual(['1 / span 8', '1 / span 6']);
+  expect(place('b')).toEqual(['9 / span 4', '1 / span 6']);
+  expect(place('c')).toEqual(['1 / span 12', '7 / span 1']);
+  expect(place('d')).toEqual(['1 / span 6', '8 / span 4']);
+  // Placed panels hold their rows; an unplaced panel takes its content height.
+  expect(panel(view.container, 'a').style.height).not.toBe('');
+  expect(panel(view.container, 'c').style.height).toBe('');
+  expect(doc).toEqual(written);
+  view.unmount();
+
+  // Without layout, panels flow full width in document order, as before.
+  const plain = render(WyrdView, { doc: laidOut({ a: undefined, b: undefined }), executor: chart.executor });
+  expect([panel(plain.container, 'a').style.gridRow, panel(plain.container, 'b').style.gridRow]).toEqual(['1 / span 1', '2 / span 1']);
+  expect(panel(plain.container, 'b').style.gridColumn).toBe('1 / span 12');
+  plain.unmount();
+});
+
+test('TASK-027: Layout editing', async () => {
+  const chart = recording(() => ({ ok: true, value: series }));
+  const doc = laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 } });
+  const written = structuredClone(doc);
+
+  // Without a host handler there is nothing to grab.
+  const readonly = render(WyrdView, { doc, executor: chart.executor });
+  expect(readonly.queryByRole('button', { name: /Move or resize/ })).toBeNull();
+  readonly.unmount();
+
+  const onlayout = vi.fn();
+  const edited = recording(() => ({ ok: true, value: series }));
+  const view = render(WyrdView, { doc, executor: edited.executor, onlayout });
+  await waitFor(() => expect(edited.calls).toHaveLength(2));
+  const handle = view.getByRole('button', { name: 'Move or resize a' });
+  handle.focus();
+  // Arrows move and Shift+arrows resize as a preview; Enter completes one change.
+  await fireEvent.keyDown(handle, { key: 'ArrowRight' });
+  await fireEvent.keyDown(handle, { key: 'ArrowDown', shiftKey: true });
+  expect([panel(view.container, 'a').style.gridColumn, panel(view.container, 'a').style.gridRow]).toEqual(['2 / span 8', '1 / span 7']);
+  expect(onlayout).not.toHaveBeenCalled();
+  await fireEvent.keyDown(handle, { key: 'Enter' });
+  expect(onlayout).toHaveBeenCalledTimes(1);
+  const updated = onlayout.mock.calls[0][0];
+  expect(updated).toEqual({ ...written, panels: [{ ...written.panels[0], layout: { x: 1, y: 0, w: 8, h: 7 } }, written.panels[1]] });
+  expect(doc).toEqual(written);
+
+  // Escape restores the layout from before the edit and reports nothing.
+  await fireEvent.keyDown(handle, { key: 'ArrowDown' });
+  await fireEvent.keyDown(handle, { key: 'Escape' });
+  expect(panel(view.container, 'a').style.gridRow).toBe('1 / span 7');
+  expect(onlayout).toHaveBeenCalledTimes(1);
+
+  // Edits stay inside the grid.
+  for (let step = 0; step < 6; step++) await fireEvent.keyDown(handle, { key: 'ArrowRight', shiftKey: true });
+  for (let step = 0; step < 4; step++) await fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+  await fireEvent.keyDown(handle, { key: 'ArrowUp' });
+  await fireEvent.keyDown(handle, { key: 'Enter' });
+  expect(onlayout.mock.calls[1][0].panels[0].layout).toEqual({ x: 0, y: 0, w: 11, h: 7 });
+
+  // Neither editing nor the host keeping the edited document reloads a panel.
+  await view.rerender({ doc: onlayout.mock.calls[1][0], executor: edited.executor, onlayout });
+  await tick();
+  expect(edited.calls).toHaveLength(2);
+  view.unmount();
+});
+
+test('TASK-027: Narrow views', () => {
+  const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(500);
+  try {
+    const chart = recording(() => ({ ok: true, value: series }));
+    const doc = laidOut({ a: { x: 6, y: 0, w: 6, h: 4 }, b: { x: 0, y: 0, w: 6, h: 4 }, c: { x: 0, y: 4, w: 12, h: 2 } });
+    const view = render(WyrdView, { doc, executor: chart.executor, onlayout: vi.fn() });
+    expect([...view.container.querySelectorAll('[data-panel]')].map((each) => each.getAttribute('data-panel'))).toEqual(['b', 'a', 'c']);
+    expect(panel(view.container, 'a').style.gridColumn).toBe('1 / -1');
+    expect(panel(view.container, 'a').style.height).not.toBe('');
+    expect(view.queryByRole('button', { name: /Move or resize/ })).toBeNull();
+    view.unmount();
+  } finally {
+    width.mockRestore();
+  }
+});

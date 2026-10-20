@@ -25,7 +25,7 @@ export const dashboard = {
   title: 'Support desk',
   range,
   panels: [
-    { id: 'service', component: 'CardHeader', input: service },
-    { id: 'spans', component: 'Chart', input: spans }
+    { id: 'service', component: 'CardHeader', input: service, layout: { x: 0, y: 0, w: 12, h: 3 } },
+    { id: 'spans', component: 'Chart', input: spans, layout: { x: 0, y: 3, w: 12, h: 8 } }
   ]
 };

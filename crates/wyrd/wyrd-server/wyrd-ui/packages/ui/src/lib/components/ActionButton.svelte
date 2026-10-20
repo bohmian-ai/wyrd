@@ -5,6 +5,7 @@
 -->
 <script lang="ts">
   import type { ActionState } from '../contract.js';
+  import ActionNote from './ActionNote.svelte';
 
   interface Props {
     label: string;
@@ -22,26 +23,13 @@
   let { label, state, variant = 'secondary', lead, icon, disabled = false, onclick }: Props = $props();
 
   const blocked = $derived(disabled || state?.state === 'pending' || state?.state === 'unavailable');
-  const note = $derived.by(() => {
-    switch (state?.state) {
-      case 'denied':
-      case 'error':
-        return `${state.problem.title} (${state.problem.code})`;
-      case 'unavailable':
-        return state.reason;
-      case 'success':
-        return state.message;
-      default:
-        return undefined;
-    }
-  });
 </script>
 
 <span class="action">
   <button type="button" class={variant} disabled={blocked} aria-busy={state?.state === 'pending' ? 'true' : undefined} {onclick}>
     {#if lead}<span class="lead" aria-hidden="true">{lead}</span>{/if}{state?.state === 'pending' ? `${label}…` : label}{#if icon}<span class="icon" aria-hidden="true">{icon}</span>{/if}
   </button>
-  {#if note}<span class="note" data-state={state?.state} role={state?.state === 'success' ? 'status' : 'alert'}>{note}</span>{/if}
+  <ActionNote {state} />
 </span>
 
 <style>
@@ -106,16 +94,5 @@
   button:focus-visible {
     outline: 2px solid var(--declare);
     outline-offset: 2px;
-  }
-  .note {
-    color: var(--muted);
-    font: 11px var(--font-mono);
-    overflow-wrap: anywhere;
-  }
-  .note[data-state='denied'] {
-    color: var(--warn);
-  }
-  .note[data-state='error'] {
-    color: var(--danger);
   }
 </style>

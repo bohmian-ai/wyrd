@@ -27,6 +27,12 @@ importers:
         specifier: link:../../../../sdks/wyrd-sdk-ts/wyrd
         version: link:../../../../sdks/wyrd-sdk-ts/wyrd
     devDependencies:
+      '@modelcontextprotocol/client':
+        specifier: 2.3.1
+        version: 2.3.1
+      '@modelcontextprotocol/ext-apps':
+        specifier: 2.0.3
+        version: 2.0.3(@modelcontextprotocol/client@2.3.1)(@modelcontextprotocol/core@2.3.1)(zod@4.5.4)
       '@sveltejs/adapter-node':
         specifier: 5.5.7
         version: 5.5.7(@sveltejs/kit@2.70.3(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.2)(vite@8.3.4(@types/node@26.6.5)(jiti@2.7.0)))(svelte@5.57.2)(typescript@5.9.3)(vite@8.3.4(@types/node@26.6.5)(jiti@2.7.0)))
@@ -48,6 +54,9 @@ importers:
       '@types/node':
         specifier: latest
         version: 26.6.5
+      '@wyrd/testing':
+        specifier: link:../../../../sdks/wyrd-sdk-ts/testing
+        version: link:../../../../sdks/wyrd-sdk-ts/testing
       autoprefixer:
         specifier: latest
         version: 10.6.1(postcss@8.5.31)
@@ -87,6 +96,12 @@ importers:
         specifier: 4.5.4
         version: 4.5.4
     devDependencies:
+      '@fontsource/familjen-grotesk':
+        specifier: 5.3.0
+        version: 5.3.0
+      '@fontsource/fragment-mono':
+        specifier: 5.3.0
+        version: 5.3.0
       '@modelcontextprotocol/client':
         specifier: 2.3.1
         version: 2.3.1

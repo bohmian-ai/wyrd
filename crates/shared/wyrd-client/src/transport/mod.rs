@@ -25,7 +25,7 @@ pub(crate) fn backoff_ms(attempt: u32) -> u64 {
 }
 
 pub use config::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
-pub use credential::{CredentialChain, CredentialSource, ResolvedCredential};
+pub use credential::{BrowserSession, CredentialChain, CredentialSource, ResolvedCredential};
 pub use grpc::GrpcConnection;
 pub use http::{ArrowResponse, AuthenticatedReplayError, HttpTransport};
 pub use mock::{MockRecord, MockTransport};

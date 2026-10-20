@@ -50,6 +50,118 @@ pub trait AccessTokenSource: Send + Sync {
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError>;
 }
 
+/// One tenant browser session a server-side web host forwards to Wyrd.
+///
+/// Rust owns browser sessions: the server issued this opaque cookie to a
+/// browser at `origin`, and a web host acting for that browser (the Wyrd UI's
+/// server, never browser code) presents it on the browser's behalf. Requests
+/// carry the one `wyrd_session_<tenant>=<value>` cookie, `Origin`, and the
+/// forwarded host and scheme of `origin`, so the server resolves the session
+/// against the public origin it was issued for. The cookie is not a bearer:
+/// it authenticates the tenant `/v1` HTTP surface only, so gRPC, MCP and
+/// token exchange refuse a client built on it. `Debug` is redacted.
+#[derive(Clone)]
+pub struct BrowserSession {
+    /// The single `wyrd_session_<tenant>=<value>` cookie pair.
+    cookie: SecretString,
+    /// The browser-facing origin the session was issued at, `scheme://host[:port]`.
+    origin: reqwest::Url,
+}
+
+impl BrowserSession {
+    /// Name prefix of every Rust-issued tenant browser-session cookie.
+    const PREFIX: &'static str = "wyrd_session_";
+
+    /// Validate one browser-session cookie pair and its public origin.
+    ///
+    /// `cookie` must be exactly one `wyrd_session_<tenant>=<value>` pair, the
+    /// form the server issues, so a host cannot forward several tenants'
+    /// sessions or unrelated cookies through it. `origin` must be an `http`
+    /// or `https` URL with a host and no userinfo, path, query or fragment.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] naming `browser_session.cookie` or
+    /// `browser_session.origin` when either is malformed.
+    pub fn new(cookie: SecretString, origin: &str) -> Result<Self, WyrdClientError> {
+        let invalid = |field: &str, reason: &str| WyrdClientError::Config {
+            field: format!("browser_session.{field}"),
+            reason: reason.to_owned(),
+        };
+        let pair = cookie.expose_secret();
+        let well_formed = pair.split_once('=').is_some_and(|(name, value)| {
+            name.strip_prefix(Self::PREFIX)
+                .is_some_and(|label| !label.is_empty())
+                && !value.is_empty()
+        }) && pair
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b';' && byte != b',');
+        if !well_formed {
+            return Err(invalid(
+                "cookie",
+                "must be exactly one wyrd_session_<tenant>=<value> cookie pair",
+            ));
+        }
+        let parsed = reqwest::Url::parse(origin)
+            .map_err(|_| invalid("origin", "must be an absolute http or https URL"))?;
+        let bare = matches!(parsed.scheme(), "http" | "https")
+            && parsed.host().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none();
+        if !bare {
+            return Err(invalid(
+                "origin",
+                "must be scheme://host[:port] with no userinfo, path, query or fragment",
+            ));
+        }
+        Ok(Self {
+            cookie,
+            origin: parsed,
+        })
+    }
+
+    /// The request headers that present this session: `Cookie`, `Origin`,
+    /// `X-Forwarded-Host` and `X-Forwarded-Proto`.
+    ///
+    /// # Panics
+    /// Never: [`Self::new`] admits only header-safe ASCII values.
+    pub(crate) fn headers(&self) -> [(&'static str, reqwest::header::HeaderValue); 4] {
+        let value = |text: &str| {
+            reqwest::header::HeaderValue::from_str(text)
+                .expect("invariant: a validated browser session is header-safe ASCII")
+        };
+        let mut cookie = value(self.cookie.expose_secret());
+        cookie.set_sensitive(true);
+        let host = match self.origin.port() {
+            Some(port) => format!("{}:{port}", self.origin.host_str().unwrap_or_default()),
+            None => self.origin.host_str().unwrap_or_default().to_owned(),
+        };
+        [
+            ("cookie", cookie),
+            ("origin", value(&self.origin.origin().ascii_serialization())),
+            ("x-forwarded-host", value(&host)),
+            ("x-forwarded-proto", value(self.origin.scheme())),
+        ]
+    }
+
+    /// The secret cookie pair, for credential fingerprinting.
+    pub(crate) fn cookie(&self) -> &SecretString {
+        &self.cookie
+    }
+}
+
+impl std::fmt::Debug for BrowserSession {
+    /// Shows the public origin only; the cookie is redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserSession")
+            .field("cookie", &"[REDACTED]")
+            .field("origin", &self.origin.as_str())
+            .finish()
+    }
+}
+
 /// A resolved credential ready to attach to an outbound request.
 ///
 /// Secrets are held as [`SecretString`]; call `.expose_secret()` on the inner
@@ -87,6 +199,9 @@ pub enum ResolvedCredential {
         /// The acting client's own auth path, which supplies the actor token.
         actor: Arc<AuthMiddleware>,
     },
+    /// A Rust-owned tenant browser session forwarded by a server-side web
+    /// host. It has no bearer: only the HTTP transport presents it.
+    BrowserSession(BrowserSession),
 }
 
 impl std::fmt::Debug for ResolvedCredential {
@@ -110,6 +225,9 @@ impl std::fmt::Debug for ResolvedCredential {
                 .field("subject_token", &"[REDACTED]")
                 .field("audience", audience)
                 .finish_non_exhaustive(),
+            Self::BrowserSession(session) => {
+                f.debug_tuple("BrowserSession").field(session).finish()
+            }
         }
     }
 }

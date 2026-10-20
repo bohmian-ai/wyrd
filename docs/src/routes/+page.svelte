@@ -3,6 +3,13 @@
   import CoverScene from '$lib/components/CoverScene.svelte';
   import { firstPage, navGroups } from '$lib/derived-nav';
   import type { Section } from '$lib/content';
+  import CodeBlock from '$lib/mdsvex/CodeBlock.svelte';
+  import LangTabs from '$lib/components/LangTabs.svelte';
+  import LangTab from '$lib/components/LangTab.svelte';
+  import Tabs from '$lib/components/Tabs.svelte';
+  import Tab from '$lib/components/Tab.svelte';
+
+  let { data } = $props();
 
   // Landing: the painted cover and value statement, the Declare → Observe →
   // Verify strip, the platform summary, then one door per published section.
@@ -34,10 +41,10 @@
 <section class="cover dark-field" aria-label="Wyrd">
   <CoverScene />
   <div class="wrap hero">
-    <p class="eyebrow">Open-source verification and assurance for AI systems</p>
+    <p class="eyebrow">Open-source verification infrastructure for AI systems · v{__WYRD_VERSION__}</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
-    <p class="tagline">Declare what an AI system should do, record what it does, and get a verdict on whether they match.</p>
-    <p class="lede">For an individual LLM, a deployed agent service, or a traditional HTTP service. Verify before release and keep verifying in production.</p>
+    <p class="tagline">Know whether your AI system does what you said it would, before release and in production.</p>
+    <p class="lede">Verify a single API response or a multi-hour agent coding session. Check a support agent's answers, an uploaded document against your policy, or every step of a long-running workflow.</p>
     <div class="cta">
       {#if start}
         <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
@@ -54,9 +61,9 @@
     <p class="eyebrow">Core platform</p>
     <h2 id="layers-h">One loop, three steps.</h2>
     <ol class="strip">
-      <li><span class="n">01</span><b>Declare</b><p>Describe the AI system as a set of versioned Cards, and bind the Verifiers that check them.</p></li>
-      <li><span class="n">02</span><b class="o">Observe</b><p>Record what the system does. Observations, traces, logs, metrics, and custom data land in Bifrost, Wyrd's SQL data plane.</p></li>
-      <li><span class="n">03</span><b>Verify</b><p>Verifiers judge that behavior in real time or on a schedule, before and after deployment. Each verdict names the exact versions that ran.</p></li>
+      <li><span class="n">01</span><b>Declare</b><p>Describe the system in YAML, and bind the Verifiers that check them.</p></li>
+      <li><span class="n">02</span><b class="o">Observe</b><p>Record what the system does using Wyrd's purpose-built high-throughput data plane.</p></li>
+      <li><span class="n">03</span><b>Verify</b><p>Verify behavior in real time or in the background using Wyrd's verification engine.</p></li>
     </ol>
   </section>
 
@@ -65,29 +72,39 @@
       <div>
         <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">Run a local server, then verify a support agent's answers with three Verifiers.</p>
+        <p class="sub">One support agent and one Verifier, one step per tab: declare what a ticket must contain, hand the ticket to the verification engine, and read the verdict.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
           {/each}
         </nav>
       </div>
-      <figure class="code">
-        <figcaption><span>Example declaration</span><span>YAML</span></figcaption>
-        <pre><span class="ln">1</span><span class="k">apiVersion</span>: wyrd/v1
-<span class="ln">2</span><span class="k">kind</span>: Service
-<span class="ln">3</span><span class="k">metadata</span>:
-<span class="ln">4</span>  <span class="k">name</span>: support-desk
-<span class="ln">5</span><span class="k">spec</span>:
-<span class="ln">6</span>  <span class="k">verified_by</span>:
-<span class="ln">7</span>    - <span class="k">verifier</span>: ./no-refund-promise.yaml
-<span class="ln">8</span>  <span class="k">components</span>:
-<span class="ln">9</span>    - <span class="k">alias</span>: agent
-<span class="ln">10</span>      <span class="k">ref</span>: ./support-agent.yaml
-<span class="ln">11</span>      <span class="k">verified_by</span>:
-<span class="ln">12</span>        - <span class="k">verifier</span>: ./ticket-complete.yaml
-<span class="ln">13</span>        - <span class="k">verifier</span>: ./follows-policy.yaml</pre>
-      </figure>
+      <div class="loop">
+        <Tabs>
+          <Tab label="01 Declare">
+            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks.</p>
+            <Tabs>
+              <Tab label="Service"><CodeBlock lang="yaml" {...data.declare.service} /></Tab>
+              <Tab label="Verifier"><CodeBlock lang="yaml" {...data.declare.verifier} /></Tab>
+            </Tabs>
+          </Tab>
+          <Tab label="02 Observe">
+            <p class="step">Inside a Run, hand the agent's ticket to the verification engine. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <LangTabs langs={['python', 'rust', 'typescript']}>
+              {#each data.observe as o (o.lang)}
+                <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
+              {/each}
+            </LangTabs>
+          </Tab>
+          <Tab label="03 Verify">
+            <p class="step">The verdict cites the evidence it judged. A failed check is a result, not an exception.</p>
+            <Tabs>
+              <Tab label="Real time"><CodeBlock lang="json" {...data.verify.realtime} /></Tab>
+              <Tab label="Background"><CodeBlock lang="json" {...data.verify.background} /></Tab>
+            </Tabs>
+          </Tab>
+        </Tabs>
+      </div>
     </section>
   {/if}
 
@@ -261,7 +278,7 @@
 
   .qs {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
     gap: 48px;
     align-items: start;
     padding: 48px 0 56px;
@@ -302,36 +319,14 @@
     content: '→  ';
     color: var(--warn);
   }
-  .code {
+  .loop :global(.tabs) {
     margin: 0;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--code-bg);
-    color: var(--code-text);
   }
-  .code figcaption {
-    display: flex;
-    justify-content: space-between;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--code-muted);
-    color: var(--code-muted);
-    font: 13px var(--font-mono);
-  }
-  .code pre {
-    margin: 0;
-    padding: 16px 14px;
-    overflow-x: auto;
-    font: 14px/1.7 var(--font-mono);
-  }
-  .ln {
-    display: inline-block;
-    width: 28px;
-    margin-right: 14px;
-    border-right: 1px solid var(--code-muted);
-    color: var(--code-muted);
-  }
-  .k {
-    color: var(--code-keyword);
+  .step {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 15px;
+    line-height: 1.5;
   }
   .empty {
     max-width: 68ch;

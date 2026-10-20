@@ -4,7 +4,7 @@ description: Run the support-desk API against your local server, get verdicts fr
 pillar: wyrd
 section: Get started
 order: 3
-status: partial
+status: runnable
 ---
 
 You will run `support-desk`, a small customer-support API, against the local server from [Set up Wyrd](/get-started/setup/). Each question it answers is one Wyrd Run, and three Verifiers judge the answer:
@@ -24,8 +24,6 @@ The code is the same app in Python, Rust, and TypeScript. This page runs the Pyt
 - A local server running from [Set up Wyrd](/get-started/setup/), in another terminal. The app reads the endpoint and credential that setup saved, so you export nothing.
 - An OpenAI API key with access to `gpt-4o` (the agent) and `gpt-6-luna` (the policy judge).
 - Python 3.11+ and `git`.
-
-<Aside type="caution" title="Version">This page describes Wyrd 0.2.0, built from this repository. The published packages are 0.1.1; see [Set up Wyrd](/get-started/setup/) before mixing them.</Aside>
 
 ## 1. Get the example
 

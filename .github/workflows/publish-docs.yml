@@ -13,6 +13,8 @@ on:
     branches: [main]
     paths:
       - docs/**
+      # The header shows the workspace version; a release bump redeploys it.
+      - Cargo.toml
       - .github/workflows/publish-docs.yml
   workflow_dispatch:
 

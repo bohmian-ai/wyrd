@@ -769,6 +769,11 @@ pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
 cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
 """
+[tasks."test:identity:ui:container"]
+description = """Official Debian image: real Keycloak sign-in, session use on pages and /v1, refusals, restart
+continuity, and logout at nginx's public origin. Builds the image on Linux."""
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+run = "scripts/identity/with-identity-providers.sh -- bash scripts/server/test-startup-identity.sh"
 
 [tasks."build:server"]
 hide = true

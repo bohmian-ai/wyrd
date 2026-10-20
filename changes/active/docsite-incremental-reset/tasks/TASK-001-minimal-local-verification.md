@@ -199,3 +199,126 @@ journey aggregate belongs in this task.
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 - Use `$wyrd-implement`; consult the security and operations authorities before
   publishing their corresponding claims.
+
+## Implementation Evidence
+
+Result: `IMPLEMENTED` with one publication blocker (macOS arm64 startup, below).
+
+### Sample and capability reuse
+
+- `examples/quickstart/quickstart.yaml`: one assertion Verifier (`refund-limit`)
+  and one Service (`support-reply`) whose Service-level `verified_by` binds it.
+  The binding uses `{sibling: {kind, name, version}}` because an authored
+  `{kind, name, version}` ref is an external registry reference and is refused
+  for a Card first declared in the same request
+  (`WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`, observed on 0.2.0), and a `./path`
+  ref may not target a multi-document file (`wyrd-loader/src/resolve.rs`).
+  `sibling` is the existing wire form (`wyrd-spec/src/reference.rs` `Ref::Sibling`);
+  no contract changed. The conventional alternative is two YAML files joined by
+  `./path` refs, as in `examples/readme`; the approved one-file constraint
+  selects `sibling`.
+- `examples/quickstart/quickstart.py`: `Cards.declare_from_path` →
+  `Cards.pull(receipt.root, ".wyrd-bundle")` → `WyrdState.from_path` →
+  `run().observe.verify` twice, printing verdict, requirement reason, and the
+  exact subject and Verifier refs. No new SDK, server, or CLI code.
+- Journey: `sdks/wyrd-sdk-python/tests/integration/test_docsite_quickstart.py`
+  copies the two files into an empty directory and runs them with `runpy`.
+
+### Released set (checked 2026-10-20)
+
+| Artifact | Version | Targets published |
+|---|---|---|
+| PyPI `wyrd-ai` (SDK + `wyrd` CLI), `requires_python >=3.11` | 0.2.0 | macOS arm64, manylinux_2_28 aarch64, manylinux_2_28 x86_64 (abi3 cp310) |
+| GitHub release `bohmian-ai/wyrd` `v0.2.0` server tarballs | 0.2.0 | `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-rocky`, signed `checksums.txt` |
+
+`git diff v0.2.0 HEAD` over the Python package, `wyrd-client` observe, the
+loader, and Card specs is empty apart from a manifest line, so 0.2.0 matches
+the source the regression journey exercises.
+
+### Released-artifact walkthroughs (no `wyrd.testing`, no repo `pythonpath`)
+
+| Platform | Environment | Result |
+|---|---|---|
+| macOS arm64 (Darwin 24.6, 18 GiB) | `uv venv -p 3.12`, `uv pip install wyrd-ai==0.2.0`, `postgres:16` in Docker with a `wyrd` owner login, isolated `WYRD_CONFIG_HOME`, `--bind 127.0.0.1:18080 --grpc-bind 127.0.0.1:15051` | **Blocked without a workaround**; passes with `WYRD_BIFROST_MEMORY_LIMIT_BYTES=4294967296` |
+| Linux arm64 (`python:3.12-slim` container, Python 3.12.15) | `pip install wyrd-ai==0.2.0`, `postgres:16` on a Docker network, default config and listeners | PASS, no workaround: `wyrd server dev --tenant acme --non-interactive --skip-gateway --format json` ready, `wyrd list` exit 0, script run twice |
+| Linux x86_64 | Artifacts published; not executed | Not claimed |
+
+macOS blocker diagnosis:
+
+- **Symptom:** `wyrd server dev` exits `WYRD_CLI_503_SERVER_DEV` stage
+  `readiness`; log: `Bifrost memory limit 19327352832 must be positive and at
+  most the 18253611008 bytes process memory 19327352832 leaves above the
+  1073741824-byte server minimum`.
+- **Cause:** `crates/wyrd/wyrd-cli/src/server/dev.rs` `detect_memory` passes the
+  whole `hw.memsize` as `WYRD_BIFROST_MEMORY_LIMIT_BYTES`; the server's
+  `shared_memory_cap` (`crates/vala/vala-bifrost-redux/src/resources.rs`)
+  requires that cap ≤ process memory − 1 GiB server minimum. Every macOS host
+  without the variable fails. Present in 0.2.0 and at HEAD. The
+  `cfg!(target_os = "macos")` probe also conflicts with AGENTS.md §2.
+- **Fix site:** the CLI's memory supply (outside this task's write set), then a
+  release. Until then Setup cannot publish a workaround-free macOS path.
+
+Commands and observed results on the macOS walkthrough (with the workaround):
+
+1. Fresh start → one-line readiness JSON; `wyrd list` exit 0 using only saved settings.
+2. `python quickstart.py` (twice) →
+   ```text
+   passed: the comparison held
+     subject:  default/Service/support-reply@1.0.0#<uid>
+     verifier: default/Verifier/refund-limit@1.0.0#<uid>
+   failed: operator LessThanOrEquals returned false
+     subject:  default/Service/support-reply@1.0.0#<uid>
+     verifier: default/Verifier/refund-limit@1.0.0#<uid>
+   ```
+   The second run re-declares idempotently, replaces `.wyrd-bundle`, same UIDs.
+3. Stop (`kill -INT`) → script fails `transport unavailable (http): error sending
+   request for url (http://127.0.0.1:18080/auth/token)`.
+4. Restart with `wyrd server dev --non-interactive --format json` and no
+   database URL, tenant, or listener inputs → ready from saved settings; script
+   passes with the same UIDs (persistence).
+5. Destructive reset: stop, `DROP DATABASE wyrd; CREATE DATABASE wyrd OWNER
+   wyrd;`, delete the config directory (it also holds the installed server,
+   sealing key, and local data) → fresh `wyrd server dev` re-downloads and
+   provisions; the script passes with new UIDs and replaces the stale bundle.
+6. Editing the Verifier without a version bump →
+   `WYRD_REGISTRY_409_SPEC_DRIFT` ("spec hash mismatch"); recovery is bumping the
+   Verifier and the Service that pins it (verified with 1.1.0).
+
+### TASK-002 handoff
+
+- Invocation: start `wyrd server dev` once, then `python quickstart.py` in the
+  directory holding both files. `.wyrd-bundle/` is generated, not authored.
+- The failing verdict is an ordinary result; refusal is a raised `WyrdError`
+  (`WYRD_PERMISSION_403_DENIED_RBAC` without `verifier:run`).
+- The evidence is supplied JSON; the result shows the declared criterion was
+  judged, not that any model or application ran.
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One YAML + one complete script; script declares and loads | `examples/quickstart/` | Scenario 1; macOS and Linux walkthroughs | PASS |
+| Both judgments expose identities, verdict, reason; failure is ordinary | `quickstart.py` prints; test asserts | `test_docsite_quickstart_verifies_and_repeats` | PASS |
+| Second execution works | Same script, no cleanup | Scenario 2 loop; walkthrough reruns | PASS |
+| Insufficient authority refused | Viewer key on the pulled bundle | `test_docsite_quickstart_refuses_insufficient_authority` | PASS |
+| Fresh released walkthrough | PyPI/GitHub 0.2.0 | Linux arm64 PASS; macOS arm64 needs `WYRD_BIFROST_MEMORY_LIMIT_BYTES` | FAIL (macOS blocker) |
+| Stop/restart, persistence, reset evidence | Walkthrough steps 3–5 | macOS released server | PASS |
+| Application regression coverage intact | No existing test changed | `git diff` | PASS |
+
+### Verification commands
+
+```text
+RED (sample moved aside): ...::test_docsite_quickstart_verifies_and_repeats → 1 error (FileNotFoundError)
+mise run py:setup && mise run build:server → exit 0
+mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_docsite_quickstart.py::test_docsite_quickstart_verifies_and_repeats → 1 passed
+mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_docsite_quickstart.py::test_docsite_quickstart_refuses_insufficient_authority → 1 passed
+WYRD_LOG=info mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_docsite_quickstart.py → 2 passed
+uv run --directory sdks/wyrd-sdk-python ruff format --config pyproject.toml ../../examples/quickstart → unchanged
+uv run --directory sdks/wyrd-sdk-python ruff check --config pyproject.toml ../../examples/quickstart → All checks passed
+mise run py:format → clean; mise run py:lints → All checks passed, stubs valid
+git diff --check → clean
+```
+
+Non-goals held: no SDK, server, CLI, stub, or docs-page change; no provider,
+gateway, UI, or external example; the unrelated `developer-docsite-rebuild`
+working-tree edits were left untouched.

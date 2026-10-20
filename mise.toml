@@ -1319,7 +1319,7 @@ cargo run --locked -q -p wyrd-spec --example gen_schemas --features server -- co
 """
 
 [tasks."codegen:check"]
-description = "Fail if UI problem examples, TypeScript error codes, TypeScript wire types, or UI theme tokens drift from source"
+description = "Fail if UI problem examples, TypeScript error codes, TypeScript wire types, UI theme tokens, or the UI component catalog drift from source"
 run = """
 set -eu
 GENERATED="crates/wyrd-spec/schemas/ui_problem_examples.json sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts"
@@ -1332,6 +1332,7 @@ shasum -a 256 $GENERATED > "$AFTER"
 diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 (cd crates/wyrd/wyrd-server/wyrd-ui && node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check)
+(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && node packages/ui/scripts/catalog.ts --check)
 """
 
 # --- napi TypeScript pipeline -----------------------------------------------------

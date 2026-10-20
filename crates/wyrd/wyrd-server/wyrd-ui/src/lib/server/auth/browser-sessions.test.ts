@@ -1,45 +1,21 @@
 // @vitest-environment node
 import { afterEach, expect, test, vi } from 'vitest';
 import type { Cookies } from '@sveltejs/kit';
-import * as client from 'openid-client';
 import { BrowserSessions } from './browser-sessions';
 
 vi.mock('$env/dynamic/private', () => ({
   env: { WYRD_SERVER_URL: 'http://127.0.0.1:8080' }
 }));
-vi.mock('openid-client', async (actual) => ({
-  ...(await actual<typeof import('openid-client')>()),
-  buildAuthorizationUrl: vi.fn(() => new URL('https://wyrd.example/auth/authorize')),
-  authorizationCodeGrant: vi.fn(),
-  refreshTokenGrant: vi.fn(),
-  tokenRevocation: vi.fn()
-}));
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => vi.unstubAllGlobals());
 
-/** A terminal OAuth refusal from the token endpoint. */
-const invalidGrant = () =>
-  new client.ResponseBodyError('invalid_grant', {
-    cause: { error: 'invalid_grant' },
-    response: new Response(null, { status: 400 })
-  });
+const url = new URL('https://wyrd.example/t/acme');
 
-const url = new URL('https://wyrd.example/login/callback?code=c&state=s');
-
-/** An unsigned access token whose claims the BFF projects; `exp` is `lifetime` seconds away. */
-function accessToken(lifetime: number): string {
-  const part = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
-  return `${part({ alg: 'none' })}.${part({
-    exp: Math.floor(Date.now() / 1000) + lifetime,
-    principal: { id: 'p-1', tenant_id: 't-1' },
-    permissions: []
-  })}.`;
-}
-
-/** A SvelteKit cookie jar over a map, recording each `set` option. */
-function jar() {
-  const values = new Map<string, string>();
+/** A SvelteKit cookie jar over a map, recording each `set` and `delete` option. */
+function jar(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
   const options = new Map<string, Record<string, unknown>>();
+  const deleted: string[] = [];
   const cookies = {
     get: (name: string) => values.get(name),
     getAll: () => [...values].map(([name, value]) => ({ name, value })),
@@ -47,78 +23,213 @@ function jar() {
       values.set(name, value);
       options.set(name, opts);
     },
-    delete: (name: string) => void values.delete(name)
+    delete: (name: string) => {
+      values.delete(name);
+      deleted.push(name);
+    }
   } as unknown as Cookies;
-  return { cookies, values, options };
+  return { cookies, values, options, deleted };
 }
 
-/** Sign in to `acme` at `at` through the code grant, with the login cookie `begin` set. */
-async function signIn(sessions: BrowserSessions, refreshToken: string, lifetime = 60, at = url) {
-  const browser = jar();
-  await sessions.begin('acme', at, browser.cookies);
-  vi.mocked(client.authorizationCodeGrant).mockResolvedValueOnce({
-    access_token: accessToken(lifetime),
-    refresh_token: refreshToken,
-    token_type: 'bearer'
-  } as Awaited<ReturnType<typeof client.authorizationCodeGrant>>);
-  expect(await sessions.complete(at, browser.cookies)).toBe('/t/acme');
-  return browser;
-}
-
-test('accepts an opaque refresh token and forwards it unchanged', async () => {
-  const sessions = new BrowserSessions();
-  const opaque = 'opaque-refresh-token-not-a-jwt';
-  const browser = await signIn(sessions, opaque, 1);
-  expect(browser.values.has('wyrd_session_acme')).toBe(true);
-  expect(browser.options.get('wyrd_session_acme')?.maxAge).toBe(12 * 60 * 60);
-
-  // The cached access token is inside its renewal margin, so the read refreshes.
-  vi.mocked(client.refreshTokenGrant).mockResolvedValueOnce({
-    access_token: accessToken(60),
-    token_type: 'bearer'
-  } as Awaited<ReturnType<typeof client.refreshTokenGrant>>);
-  expect(await sessions.read('acme', url, browser.cookies)).not.toBeNull();
-  expect(vi.mocked(client.refreshTokenGrant).mock.calls[0][1]).toBe(opaque);
-
-  // A terminal refusal clears only this tenant's session.
-  const other = await signIn(new BrowserSessions(), 'other-login', 60);
-  vi.mocked(client.refreshTokenGrant).mockRejectedValueOnce(invalidGrant());
-  const expired = await signIn(sessions, opaque, 1);
-  expect(await sessions.read('acme', url, expired.cookies)).toBeNull();
-  expect(expired.values.has('wyrd_session_acme')).toBe(false);
-  expect(other.values.has('wyrd_session_acme')).toBe(true);
-});
-
-test('failed refresh-token revocation still signs out', async () => {
-  const sessions = new BrowserSessions();
-  const browser = await signIn(sessions, 'refresh-to-revoke');
-  const cookie = browser.values.get('wyrd_session_acme')!;
-  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-  vi.mocked(client.tokenRevocation).mockRejectedValueOnce(new TypeError('fetch failed'));
-
-  await expect(sessions.logout('acme', url, browser.cookies)).resolves.toBeUndefined();
-  expect(vi.mocked(client.tokenRevocation).mock.calls[0][1]).toBe('refresh-to-revoke');
-  expect(browser.values.has('wyrd_session_acme')).toBe(false);
-  expect(warn).toHaveBeenCalledOnce();
-  expect(JSON.stringify(warn.mock.calls)).not.toContain('refresh-to-revoke');
-  warn.mockRestore();
-
-  // The cached access token is gone too: a replayed cookie must renew through the server.
-  browser.values.set('wyrd_session_acme', cookie);
-  vi.mocked(client.refreshTokenGrant).mockRejectedValueOnce(invalidGrant());
-  expect(await sessions.read('acme', url, browser.cookies)).toBeNull();
-  expect(vi.mocked(client.refreshTokenGrant).mock.calls[0][1]).toBe('refresh-to-revoke');
-});
-
-test('the session cookie is Secure exactly when the browser used https', async () => {
-  const secure = await signIn(new BrowserSessions(), 'over-https');
-  expect(secure.options.get('wyrd_session_acme')?.secure).toBe(true);
-  const plain = await signIn(
-    new BrowserSessions(),
-    'over-http',
-    60,
-    new URL('http://localhost:8080/login/callback?code=c&state=s')
+/** Stub `fetch` with `answer` and record each request. */
+function server(answer: (request: Request) => Response) {
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: URL, init: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      return answer(request);
+    })
   );
-  expect(plain.options.get('wyrd_session_acme')?.secure).toBe(false);
-  expect(plain.options.get('wyrd_session_acme')?.httpOnly).toBe(true);
+  return requests;
+}
+
+const view = {
+  tenant: 'acme',
+  tenant_id: 't-1',
+  tenant_name: 'Acme',
+  principal_id: 'p-1',
+  principal_kind: 'user',
+  credential: 'sso',
+  permissions: ['cards:read'],
+  expires_at: '2026-10-20T00:00:00Z'
+};
+
+test('sign-in relays the server login cookie and returns its provider URL', async () => {
+  const requests = server(
+    () =>
+      new Response(JSON.stringify({ authorization_url: 'https://idp.example/authorize?state=s' }), {
+        headers: {
+          'set-cookie':
+            'wyrd_login=binding; Path=/auth/callback; Max-Age=300; HttpOnly; SameSite=Lax; Secure'
+        }
+      })
+  );
+  const browser = jar({ wyrd_session_other: 'never-forwarded' });
+
+  const target = await new BrowserSessions().begin('acme', url, browser.cookies);
+
+  expect(target).toBe('https://idp.example/authorize?state=s');
+  expect(requests[0].url).toBe('http://127.0.0.1:8080/auth/browser/login');
+  expect(requests[0].headers.get('origin')).toBe('https://wyrd.example');
+  expect(requests[0].headers.get('cookie')).toBeNull();
+  expect(await requests[0].json()).toEqual({ tenant: 'acme' });
+  expect(browser.values.get('wyrd_login')).toBe('binding');
+  expect(browser.options.get('wyrd_login')).toMatchObject({
+    path: '/auth/callback',
+    maxAge: 300,
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax'
+  });
+});
+
+test('reading a session forwards only that tenant cookie and the trusted origin', async () => {
+  const requests = server(() => Response.json({ sessions: [view] }));
+  const browser = jar({ wyrd_session_acme: 'a.1', wyrd_session_other: 'b.2', theme: 'dark' });
+
+  const session = await new BrowserSessions().read('acme', url, browser.cookies);
+
+  expect(session?.context().tenant).toEqual({
+    key: 'acme',
+    name: 'Acme',
+    tenantId: 't-1',
+    permissions: ['cards:read']
+  });
+  expect(requests[0].url).toBe('http://127.0.0.1:8080/auth/browser/session?tenant=acme');
+  expect(requests[0].headers.get('cookie')).toBe('wyrd_session_acme=a.1');
+  expect(requests[0].headers.get('x-wyrd-access-token')).toBeNull();
+
+  await session!.api('POST', '/cards', { name: 'c' });
+  expect(requests[1].url).toBe('http://127.0.0.1:8080/v1/cards');
+  expect(requests[1].headers.get('cookie')).toBe('wyrd_session_acme=a.1');
+  expect(requests[1].headers.get('origin')).toBe('https://wyrd.example');
+  expect(requests[1].headers.get('x-forwarded-host')).toBe('wyrd.example');
+  expect(requests[1].headers.get('x-forwarded-proto')).toBe('https');
+});
+
+test('a session the server refuses is cleared; an outage is the upstream problem', async () => {
+  server(
+    () =>
+      new Response(JSON.stringify({ code: 'WYRD_AUTH_401_INVALID_TOKEN' }), {
+        status: 401,
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  const refused = jar({ wyrd_session_acme: 'dead', wyrd_session_other: 'live' });
+  expect(await new BrowserSessions().read('acme', url, refused.cookies)).toBeNull();
+  expect(refused.values.has('wyrd_session_acme')).toBe(false);
+  expect(refused.values.get('wyrd_session_other')).toBe('live');
+
+  server(() => new Response(null, { status: 503 }));
+  const down = jar({ wyrd_session_acme: 'maybe-live' });
+  await expect(new BrowserSessions().read('acme', url, down.cookies)).rejects.toMatchObject({
+    status: 502
+  });
+  expect(down.values.get('wyrd_session_acme')).toBe('maybe-live');
+
+  const none = server(() => Response.json({ sessions: [view] }));
+  expect(await new BrowserSessions().read('acme', url, jar().cookies)).toBeNull();
+  expect(none).toHaveLength(0);
+});
+
+test('logout revokes through the server and a failed logout is reported', async () => {
+  const requests = server(
+    () =>
+      new Response(null, {
+        status: 204,
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  const browser = jar({ wyrd_session_acme: 'a.1', wyrd_session_other: 'b.2' });
+  await new BrowserSessions().logout('acme', url, browser.cookies);
+  expect(requests[0].url).toBe('http://127.0.0.1:8080/auth/browser/logout');
+  expect(requests[0].headers.get('cookie')).toBe('wyrd_session_acme=a.1');
+  expect(await requests[0].json()).toEqual({ tenant: 'acme' });
+  expect(browser.values.has('wyrd_session_acme')).toBe(false);
+  expect(browser.values.get('wyrd_session_other')).toBe('b.2');
+
+  server(() => new Response(null, { status: 503 }));
+  const kept = jar({ wyrd_session_acme: 'a.1' });
+  await expect(new BrowserSessions().logout('acme', url, kept.cookies)).rejects.toMatchObject({
+    status: 502
+  });
+});
+
+test('an unreachable server is the upstream problem and tenant keys are validated', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    })
+  );
+  await expect(new BrowserSessions().begin('acme', url, jar().cookies)).rejects.toMatchObject({
+    status: 502
+  });
+  await expect(new BrowserSessions().begin('Bad!', url, jar().cookies)).rejects.toMatchObject({
+    status: 404
+  });
+});
+
+test('metadata requires current live enumeration', async () => {
+  const beta = { ...view, tenant: 'beta', tenant_id: 't-2', tenant_name: 'Beta', principal_id: 'p-2' };
+  const selected = async (browser: ReturnType<typeof jar>) => {
+    server(() => Response.json({ sessions: [view] }));
+    return (await new BrowserSessions().read('acme', url, browser.cookies))!;
+  };
+
+  const live = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2', theme: 'dark' });
+  const session = await selected(live);
+  const current = { ...view, principal_id: 'p-1', expires_at: '2026-10-21T00:00:00Z' };
+  const requests = server(() => Response.json({ sessions: [beta, current] }));
+  expect(await new BrowserSessions().metadata(session, url, live.cookies)).toEqual({
+    subject: { id: 'p-1', name: 'p-1' },
+    expiresAt: Date.parse('2026-10-21T00:00:00Z'),
+    tenants: [
+      { key: 'acme', name: 'Acme' },
+      { key: 'beta', name: 'Beta' }
+    ]
+  });
+  expect(requests[0].headers.get('cookie')).toBe('wyrd_session_acme=a.1; wyrd_session_beta=b.2');
+
+  const down = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2' });
+  const before = await selected(down);
+  server(
+    () =>
+      new Response(JSON.stringify({ code: 'WYRD_SPEC_503_SERVICE_UNAVAILABLE' }), { status: 503 })
+  );
+  await expect(new BrowserSessions().metadata(before, url, down.cookies)).rejects.toMatchObject({
+    status: 502
+  });
+  expect(down.values.get('wyrd_session_acme')).toBe('a.1');
+  expect(down.values.get('wyrd_session_beta')).toBe('b.2');
+
+  const dead = jar({ wyrd_session_acme: 'a.1' });
+  const revoked = await selected(dead);
+  server(
+    () =>
+      new Response(JSON.stringify({ code: 'WYRD_AUTH_401_UNAUTHENTICATED' }), {
+        status: 401,
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  await expect(new BrowserSessions().metadata(revoked, url, dead.cookies)).rejects.toMatchObject({
+    status: 401
+  });
+  expect(dead.values.has('wyrd_session_acme')).toBe(false);
+
+  const sibling = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2' });
+  const gone = await selected(sibling);
+  server(
+    () =>
+      new Response(JSON.stringify({ sessions: [beta] }), {
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  await expect(new BrowserSessions().metadata(gone, url, sibling.cookies)).rejects.toMatchObject({
+    status: 401
+  });
+  expect(sibling.values.has('wyrd_session_acme')).toBe(false);
+  expect(sibling.values.get('wyrd_session_beta')).toBe('b.2');
 });

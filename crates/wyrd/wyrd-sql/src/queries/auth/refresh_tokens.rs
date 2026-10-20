@@ -43,17 +43,6 @@ const REFRESH_BY_HASH_SQL: &str = r"
      LIMIT 1
 ";
 
-/// The unrevoked, unexpired row with this hash, left unconsumed.
-const ACTIVE_REFRESH_SQL: &str = r"
-    SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
-           issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
-           human_connection_id, human_connection_revision, client_id
-      FROM wyrd.auth_refresh_tokens
-     WHERE token_hash = $1
-       AND revoked_at IS NULL
-       AND expires_at > statement_timestamp()
-";
-
 /// Inserts one human refresh row bound to the login connection revision and
 /// the OAuth client it is issued to.
 const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r"
@@ -152,25 +141,6 @@ pub async fn refresh_by_hash(
     sqlx::query_as::<_, RefreshTokenRow>(REFRESH_BY_HASH_SQL)
         .bind(token_hash)
         .bind(tenant_id)
-        .fetch_optional(&mut **conn.transaction())
-        .await
-}
-
-/// Resolve the unrevoked, unexpired refresh row with `token_hash` without
-/// consuming it; `None` when the token is unknown, revoked, or expired.
-///
-/// A `wyrd-ui` refresh token does not rotate: each refresh presents the same
-/// token, so the refresh grant reads it here under the family lock instead
-/// of consuming it, and `PostgreSQL` decides its expiry.
-///
-/// # Errors
-/// Returns a SQLx error when the lookup statement fails.
-pub async fn active_refresh(
-    conn: &mut TenantConn<'_>,
-    token_hash: &str,
-) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
-    sqlx::query_as::<_, RefreshTokenRow>(ACTIVE_REFRESH_SQL)
-        .bind(token_hash)
         .fetch_optional(&mut **conn.transaction())
         .await
 }

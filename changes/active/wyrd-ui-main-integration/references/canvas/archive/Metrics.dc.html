@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Metrics</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;min-width:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer}
+.btn:hover{background:#1f2230}
+.seg{height:28px;padding:0 12px;background:#12141c;border:1px solid #252838;color:#8f92a5;font:12px "Fragment Mono",monospace;cursor:pointer;margin-left:-1px}
+.tab{padding:8px 14px;color:#8f92a5;font:12px "Fragment Mono",monospace}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.metric{display:flex;justify-content:space-between;align-items:center;padding:7px 10px;font:12px "Fragment Mono",monospace;color:#e6e4da;border-left:2px solid transparent}
+.metric span:last-child{font-size:10px;color:#8f92a5}
+.lg{display:grid;grid-template-columns:20px minmax(0,1fr) 80px 80px 80px;gap:10px;align-items:center;padding:0 14px;height:28px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace}
+</style>
+</helmet>
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif; display: flex; flex-direction: column;">
+  <header style="display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid #252838;">
+    <span class="mono" style="font-size: 12px; color: #8f92a5;">ui-live / Observe /</span>
+    <span class="mono" style="font-size: 12px;">Metrics</span>
+    <nav aria-label="Observe" style="display: flex; margin-left: 24px;">
+      <a class="tab" href="#">Overview</a><a class="tab" href="Logs.dc.html">Logs</a>
+      <a class="tab" href="#" aria-current="page" style="color: #e6e4da; box-shadow: inset 0 -2px 0 #7a8cff;">Metrics</a>
+      <a class="tab" href="Main.dc.html">Traces</a><a class="tab" href="#">GenAI</a>
+    </nav>
+  </header>
+
+  <section aria-label="Query" style="padding: 16px 24px 0;">
+    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <label style="flex: 1 1 520px; min-width: 0; height: 34px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 0 10px; background: #12141c; border: 1px solid #3a4170; border-radius: 2px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8f92a5" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+        <span class="mono" style="font-size: 12px; color: #8f92a5;">WHERE</span>
+        <input class="mono" aria-label="Filter metric points with SQL" value="service_name LIKE 'sim-%'" style="flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: #e6e4da; font-size: 12px;">
+        <kbd class="mono" style="font-size: 11px; color: #8f92a5; border: 1px solid #252838; padding: 0 5px;">/</kbd>
+      </label>
+      <div role="group" aria-label="Zoom" style="display: inline-flex;">
+        <button class="btn" aria-label="Zoom out" style="border-right: 0;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14"></path></svg></button>
+        <button class="btn" aria-label="Zoom in"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M12 5v14"></path></svg></button>
+      </div>
+      <button class="btn" aria-label="Reset zoom" disabled style="opacity: .45;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path></svg></button>
+      <a class="btn" href="TimePicker.dc.html" style="min-width: 176px; justify-content: space-between;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="16"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
+        <span>Last 6 hours</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg>
+      </a>
+      <button class="btn" aria-pressed="false"><span style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid #8f92a5;"></span>Live</button>
+    </div>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 16px; padding: 16px 24px 24px; flex: 1;">
+    <aside aria-label="Metrics" style="flex: 0 0 240px; background: #12141c; border: 1px solid #252838; border-radius: 2px; align-self: flex-start;">
+      <div style="padding: 10px; border-bottom: 1px solid #252838;"><input class="mono" aria-label="Find a metric" placeholder="find a metric…" style="width: 100%; box-sizing: border-box; height: 28px; background: #0b0c12; border: 1px solid #252838; color: #e6e4da; font-size: 12px; padding: 0 8px;"></div>
+      <div class="metric" style="background: #1a2040; border-left-color: #7a8cff;"><span>sim.latency</span><span>histogram · ms</span></div>
+      <div class="metric"><span>sim.requests</span><span>counter</span></div>
+      <div class="metric"><span>sim.queue.depth</span><span>gauge</span></div>
+    </aside>
+
+    <section aria-label="sim.latency" style="flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column; gap: 16px;">
+      <div style="background: #12141c; border: 1px solid #252838; border-radius: 2px;">
+        <div style="display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid #252838;">
+          <div><div class="mono" style="font-size: 14px;">sim.latency</div><div class="mono" style="font-size: 11px; color: #8f92a5;">histogram · ms · p90 estimate, linear within bucket</div></div>
+          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <div role="group" aria-label="Calculation" style="display: inline-flex;">
+              <button class="seg">mean</button><button class="seg">p50</button><button class="seg" aria-pressed="true" style="background: #1a2040; color: #e6e4da; border-color: #3a4170;">p90</button><button class="seg">p99</button>
+            </div>
+            <label class="mono" style="font-size: 12px; color: #8f92a5; display: inline-flex; align-items: center; gap: 6px;">by <select aria-label="Group by" style="height: 28px; background: #12141c; border: 1px solid #252838; color: #e6e4da; font: 12px 'Fragment Mono', monospace;"><option>service</option><option>http.route</option><option>none</option></select></label>
+          </div>
+        </div>
+        <div style="padding: 14px; position: relative;">
+          <svg viewBox="-44 -10 960 300" width="100%" role="img" aria-label="p90 latency per service over 6 hours; slow services sit near 1 to 1.5 seconds, healthy ones under 300 milliseconds">
+            <g font-family="Fragment Mono, monospace" font-size="10" fill="#8f92a5">
+              <text x="-40" y="4">2.0s</text><text x="-40" y="69">1.5s</text><text x="-40" y="134">1.0s</text><text x="-40" y="199">0.5s</text><text x="-40" y="264">0</text>
+              <text x="0" y="284">13:27</text><text x="210" y="284">14:57</text><text x="430" y="284">16:27</text><text x="650" y="284">17:57</text><text x="870" y="284">19:27</text>
+            </g>
+            <g stroke="#1c1f2c"><path d="M0 0H900M0 65H900M0 130H900M0 195H900M0 260H900"></path></g>
+            <path d="M0 195H900" stroke="#f0a13c" stroke-dasharray="4 4" fill="none"></path>
+            <text x="905" y="198" font-family="Fragment Mono, monospace" font-size="10" fill="#f0a13c">SLO</text>
+            <rect x="375" y="0" width="150" height="260" fill="#7a8cff18" stroke="#7a8cff" stroke-dasharray="3 3"></rect>
+            <g fill="none" stroke-width="2">
+              <path stroke="#7a8cff" d="M0.0 94.9 L75.0 112.4 L150.0 96.3 L225.0 74.6 L300.0 53.0 L375.0 43.2 L450.0 52.6 L525.0 83.1 L600.0 98.2 L675.0 99.7 L750.0 65.8 L825.0 48.1 L900.0 48.4"></path>
+              <path stroke="#c5f23b" d="M0.0 142.7 L75.0 129.7 L150.0 91.8 L225.0 74.4 L300.0 75.2 L375.0 95.0 L450.0 130.7 L525.0 138.8 L600.0 121.5 L675.0 95.1 L750.0 73.7 L825.0 74.0 L900.0 109.0"></path>
+              <path stroke="#4d5ef0" d="M0.0 135.8 L75.0 146.4 L150.0 141.4 L225.0 125.6 L300.0 101.6 L375.0 106.3 L450.0 108.1 L525.0 131.7 L600.0 148.6 L675.0 144.7 L750.0 112.5 L825.0 99.7 L900.0 92.7"></path>
+              <path stroke="#a9b4ff" d="M0.0 191.1 L75.0 196.9 L150.0 207.1 L225.0 214.4 L300.0 217.0 L375.0 212.0 L450.0 200.8 L525.0 191.3 L600.0 200.6 L675.0 210.2 L750.0 214.3 L825.0 218.2 L900.0 209.0"></path>
+              <path stroke="#8fae2a" d="M0.0 226.7 L75.0 224.3 L150.0 223.0 L225.0 229.8 L300.0 233.1 L375.0 234.9 L450.0 230.6 L525.0 227.3 L600.0 224.2 L675.0 223.9 L750.0 229.5 L825.0 232.7 L900.0 232.5"></path>
+            </g>
+          </svg>
+          <div class="mono" style="font-size: 11px; color: #8f92a5;">Drag across the chart to zoom every Observe view to that window.</div>
+        </div>
+      </div>
+
+      <div style="background: #12141c; border: 1px solid #252838; border-radius: 2px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #252838;">
+          <span class="mono" style="font-size: 12px;">12 series · top 5 by latest p90 shown</span>
+          <div style="display: flex; gap: 6px;"><button class="btn" style="height: 28px; font-size: 12px;">Show all</button><button class="btn" style="height: 28px; font-size: 12px;">Open in SQL ↗</button></div>
+        </div>
+        <div class="lg h" style="color: #8f92a5;"><span></span><span>Service</span><span style="text-align: right;">Latest</span><span style="text-align: right;">Max</span><span style="text-align: right;">Mean</span></div>
+        <sc-for list="{{series}}" as="s" hint-placeholder-count="7">
+          <label class="lg" style="color: {{s.fg}};">
+            <input type="checkbox" checked="{{s.on}}" aria-label="Show {{s.n}}" style="accent-color: {{s.c}};">
+            <span style="display: inline-flex; align-items: center; gap: 8px;"><span style="width: 10px; height: 2px; background: {{s.c}};"></span>{{s.n}}</span>
+            <span style="text-align: right;">{{s.last}}</span><span style="text-align: right;">{{s.max}}</span><span style="text-align: right;">{{s.mean}}</span>
+          </label>
+        </sc-for>
+      </div>
+    </section>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const s = (n, c, on, last, max, mean) => ({ n: n, c: c, on: on, last: last, max: max, mean: mean, fg: on ? '#e6e4da' : '#8f92a5' });
+    return {
+      series: [
+        s('sim-slow-6', '#7a8cff', true, '1.63s', '1.67s', '1.33s'),
+        s('sim-slow-11', '#c5f23b', true, '1.16s', '1.43s', '1.18s'),
+        s('sim-slow-1', '#4d5ef0', true, '1.29s', '1.29s', '1.04s'),
+        s('sim-drifting-9', '#a9b4ff', true, '392ms', '532ms', '421ms'),
+        s('sim-healthy-0', '#8fae2a', true, '212ms', '262ms', '236ms'),
+        s('sim-flaky-2', '#8f92a5', false, '274ms', '880ms', '301ms'),
+        s('sim-failing-3', '#8f92a5', false, '251ms', '466ms', '247ms')
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

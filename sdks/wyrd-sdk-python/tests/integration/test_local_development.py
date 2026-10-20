@@ -351,12 +351,16 @@ def terminal_session() -> None:
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def wait_for_local_cli(child: subprocess.Popen[str], master: int, terminal: str, bind: str) -> None:
+def wait_for_local_cli(
+    child: subprocess.Popen[str], master: int, terminal: str, binds: tuple[str, ...]
+) -> None:
     """Assert readiness, or the first-setup offer's outcome, without exposing credentials.
 
     ``decline`` answers the offer, ``interrupt`` interrupts the CLI at it, and
-    ``exit`` terminates only the serving child while it is unanswered.
-    ``restart`` requires readiness with no offer.
+    ``exit`` terminates only the UI child while it is unanswered, after which
+    the CLI must settle its server too. ``restart`` requires readiness with no
+    offer. Every listener in ``binds`` is free once an interrupted or failed
+    CLI has exited.
     """
     assert child.stdout is not None
     if not terminal:
@@ -394,16 +398,19 @@ def wait_for_local_cli(child: subprocess.Popen[str], master: int, terminal: str,
                 elif terminal == "interrupt":
                     child.send_signal(signal.SIGINT)
                 else:
-                    serving = subprocess.check_output(["pgrep", "-P", str(child.pid)], text=True)
-                    for pid in serving.split():
+                    ui = subprocess.check_output(
+                        ["pgrep", "-P", str(child.pid), "-f", "ui/build/index.js"], text=True
+                    )
+                    for pid in ui.split():
                         os.kill(int(pid), signal.SIGTERM)
             if not chunk:
                 assert terminal in ("interrupt", "exit") and asked
                 code = child.wait(timeout=50)
                 assert code == 130 if terminal == "interrupt" else code not in (0, 130)
-                host, port = bind.rsplit(":", 1)
-                with socket.socket() as settled:
-                    settled.bind((host, int(port)))
+                for bind in binds:
+                    host, port = bind.rsplit(":", 1)
+                    with socket.socket() as settled:
+                        settled.bind((host, int(port)))
                 return
     assert terminal in ("decline", "restart"), "ready after the offer was not answered"
     assert asked == (terminal == "decline")
@@ -442,7 +449,8 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
 
     The database outlives every CLI and SDK process started for this
     deployment, so restarts reuse its database, configuration, and warehouse.
-    The CLI migrates it and issues credentials; this fixture never does.
+    The CLI migrates it and issues credentials; this fixture never does. The
+    release's ``ui/`` is the checkout's production UI build.
     """
     root = Path(__file__).resolve().parents[4]
     version = subprocess.check_output(
@@ -458,6 +466,9 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
         config.mkdir(mode=0o700)
         release.mkdir(parents=True)
         shutil.copy2(root / "target/debug/wyrd-server", release / "wyrd-server")
+        ui = root / "crates/wyrd/wyrd-server/wyrd-ui"
+        assert (ui / "build/index.js").is_file(), "build the production UI through mise first"
+        (release / "ui").symlink_to(ui)
         (config / "server/current").symlink_to(Path("versions") / version)
         env = dict(os.environ)
         for name in (
@@ -481,6 +492,7 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
             WYRD_SERVER_BIND=local_listener(),
             WYRD_GRPC_BIND=local_listener(),
             WYRD_BIFROST_PEER_BIND_ADDR=local_listener(),
+            WYRD_UI_BIND=local_listener(),
             WYRD_METRICS_BIND="127.0.0.1:0",
             WYRD_LOCAL_DEV_CONFIG_HOME=str(config),
         )
@@ -523,7 +535,9 @@ def installed_local_cli(
             os.close(slave)
         try:
             try:
-                wait_for_local_cli(child, master, terminal, env["WYRD_SERVER_BIND"])
+                wait_for_local_cli(
+                    child, master, terminal, (env["WYRD_SERVER_BIND"], env["WYRD_UI_BIND"])
+                )
                 errors.seek(0)
                 failure = errors.read()
                 assert "wyrd_sk_" not in failure and "wyrd_global_" not in failure
@@ -569,8 +583,8 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
     """Run fresh SDK processes through real installed startup and shutdown.
 
     Interactive first setup offers detected hosts once; after a decline, an
-    interruption at the offer, or the serving child's exit there, a restart
-    of the same deployment reaches readiness without another question.
+    interruption at the offer, or the UI child's exit there, a restart of the
+    same deployment reaches readiness without another question.
     """
     root = Path(__file__).resolve().parents[4]
     native = str(root / "target/debug/wyrd")

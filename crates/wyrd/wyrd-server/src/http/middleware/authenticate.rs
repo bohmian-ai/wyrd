@@ -2,7 +2,8 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::Request;
+use axum::http::uri::Authority;
+use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -10,8 +11,11 @@ use std::sync::Arc;
 
 use secrecy::SecretString;
 use wyrd_auth_verify::TokenAudience;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::RequestOrigin;
+use crate::auth::browser::{browser_sessions, require_same_origin, session_cookies};
 use crate::auth::exchange_api_key::api_key_invalid;
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::routes::TokenGrants;
@@ -40,17 +44,108 @@ pub async fn require_authenticated(
     authenticate_on(&state, request, next, TokenAudience::Wyrd).await
 }
 
+/// Reject unauthenticated requests to the protected tenant `/v1` HTTP
+/// surface, which alone also accepts a browser session.
+///
+/// Identical to [`require_authenticated`] for every request carrying
+/// `X-Wyrd-Access-Token`, and for every request carrying no browser-session
+/// cookie; otherwise see [`authenticate_browser_session`]. MCP, OTLP, platform
+/// and gateway ingress keep their bearer-only layers.
+pub async fn require_tenant_authenticated(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    authenticate_tenant_http(&state, request, next, TokenAudience::Wyrd).await
+}
+
 /// Reject unauthenticated requests to the Bifrost HTTP surface.
 ///
-/// Identical to [`require_authenticated`] except that it also accepts a
-/// `bifrost`-audience delegated token. It layers only the Bifrost and query
+/// Identical to [`require_tenant_authenticated`] except that it also accepts
+/// a `bifrost`-audience delegated token. It layers only the Bifrost and query
 /// routers, which is what confines a Bifrost-bound token to Bifrost.
 pub async fn require_bifrost_authenticated(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    authenticate_on(&state, request, next, TokenAudience::Bifrost).await
+    authenticate_tenant_http(&state, request, next, TokenAudience::Bifrost).await
+}
+
+/// Authenticate a tenant `/v1` request by its bearer token or, without one,
+/// by its browser session.
+///
+/// An explicit `X-Wyrd-Access-Token` always takes the bearer path, and a
+/// refused token never falls back to a cookie. A request with no session
+/// cookie takes the bearer path too, so its refusal is unchanged. More than
+/// one session cookie is refused rather than choosing one.
+async fn authenticate_tenant_http(
+    state: &AppState,
+    request: Request<Body>,
+    next: Next,
+    surface: TokenAudience,
+) -> Response {
+    if request.headers().contains_key(WYRD_ACCESS_TOKEN_HEADER) {
+        return authenticate_on(state, request, next, surface).await;
+    }
+    let mut cookies = session_cookies(request.headers());
+    let Some((_, cookie)) = cookies.pop() else {
+        return authenticate_on(state, request, next, surface).await;
+    };
+    if !cookies.is_empty() {
+        return WyrdErrorResponse(WyrdError::Validation {
+            message: "send exactly one browser-session cookie with a tenant API request".to_owned(),
+            details: serde_json::json!({ "reason": "browser_session_ambiguous" }),
+        })
+        .into_response();
+    }
+    authenticate_browser_session(state, request, next, &cookie).await
+}
+
+/// Authenticate a tenant `/v1` request by the one browser session it presents.
+///
+/// A request that may mutate (any method but `GET`, `HEAD` and `OPTIONS`)
+/// must carry the exact `Origin` it arrived at. The session is then resolved
+/// with the principal's current authority, never extending it, and the
+/// principal is inserted exactly as a verified bearer's would be, so every
+/// handler's permission checks and audit run unchanged.
+async fn authenticate_browser_session(
+    state: &AppState,
+    mut request: Request<Body>,
+    next: Next,
+    cookie: &str,
+) -> Response {
+    let safe = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    if !safe {
+        let authority = request.uri().authority().map(Authority::as_str);
+        let checked = RequestOrigin::from_parts(request.headers(), authority)
+            .ok_or_else(|| WyrdError::OriginRefused {
+                message: "the request names no usable Host".to_owned(),
+                details: serde_json::json!({}),
+            })
+            .and_then(|origin| require_same_origin(request.headers(), &origin));
+        if let Err(error) = checked {
+            return WyrdErrorResponse(error).into_response();
+        }
+    }
+    let sessions = match browser_sessions(state) {
+        Ok(sessions) => sessions,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match sessions.resolve(cookie).await {
+        Ok(session) => {
+            request
+                .extensions_mut()
+                .insert(AuthenticatedPrincipal::from_verified(Arc::new(
+                    session.verified,
+                )));
+            next.run(request).await
+        }
+        Err(error) => WyrdErrorResponse(error).into_response(),
+    }
 }
 
 /// Reject unauthenticated requests to the OTLP HTTP routes.

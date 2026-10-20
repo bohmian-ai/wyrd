@@ -657,26 +657,62 @@ tokens are never Wyrd authority.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
-| Web app | `wyrd-ui`, confidential (`client_secret_basic`) | Authorization code + PKCE (`GET /auth/authorize`) | The BFF's encrypted HttpOnly cookie; refresh token does not rotate, 12-hour absolute lifetime |
+| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
 
-The BFF uses `openid-client`; the shared Rust client uses `oauth2`, so Rust,
-Python, and TypeScript share one implementation. The four OAuth form
+Rust owns browser login transactions, callbacks, session creation, validation,
+expiry and revocation. Node renders the UI and forwards its selected tenant
+cookie to Rust; it does not redeem an OAuth code, retain a refresh token/API key,
+or encrypt a credential cookie. No UI-specific client secret, encryption key,
+environment variable, secret provisioning step, session service or sticky
+routing is required. Replicas resolve sessions through the existing Postgres.
+The shared Rust client uses `oauth2` for CLI/SDK flows, so Rust, Python and
+TypeScript share one implementation. The four OAuth form
 endpoints (`POST /auth/token`, `/auth/platform/token`,
 `/auth/device_authorization`, and `/auth/revoke`) take form bodies, refuse
 with RFC 6749 §5.2 JSON, and are the one exception to `WyrdError`
 problem+json; their successes keep their own standard shapes (RFC 6749 §5.1
 tokens, the RFC 8628 §3.2 device response, an empty RFC 7009 revocation
-`200`). Browser interactions are not form endpoints: `GET /auth/authorize`
-redirects with an RFC 6749 §4.1.2.1 `error` once the client and redirect URI
-are trusted and shows a local HTML page before that, while `GET /auth/callback`
-and the `/auth/device` page answer with redirects, HTML, or Problem Details. Deployed Services and Agents keep their own API keys or
-workload assertions; human SSO never replaces or disables them.
+`200`). First-party browser-session operations are not OAuth token endpoints:
+`POST /auth/browser/login` begins a bound tenant provider login;
+`POST /auth/browser/api-key` verifies a recovery key and establishes a session;
+`GET /auth/browser/session` returns only live browser-safe session metadata,
+optionally filtered by tenant route key; and `POST /auth/browser/logout`
+revokes the selected session. They use typed Rust contracts and Wyrd errors.
+The shared `GET /auth/callback` completes a bound provider login; browser
+completion creates the session and redirects to the fixed tenant page, while
+device and provider-test completions retain their own behavior. There is no
+separate Node `/login/callback` OAuth-code exchange or UI refresh-token flow.
+Deployed Services and Agents keep their own API keys or workload assertions;
+human SSO never replaces or disables them.
+
+Browser session cookies contain only random identifiers. Records store their
+digests, tenant/principal, absolute expiry/revocation and either the exact
+human-connection revision or recovery-credential reference, not recoverable
+credentials. Recovery logout revokes only its browser session. Rust checks
+current authority on browser requests; existing tenant access-token snapshot
+semantics remain unchanged. Login transactions expire in five minutes and
+sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
+HTTP APIs accept exactly one selected browser cookie through the existing
+principal/permission/audit boundary; ambiguous multiple session cookies are
+refused. Only metadata enumeration accepts multiple tenant sessions. Other
+protocol surfaces do not inherit cookie auth.
+An explicit access-token header always takes the bearer path and never falls
+back to a cookie after refusal. Cookie-authenticated mutations require exact
+trusted Origin checks; provider callback correlation remains transaction-bound.
+Production cookies are host-only, HttpOnly, Secure and SameSite=Lax, with the
+existing loopback-development exception. No API key or OAuth token reaches
+browser cookies, page data, URLs or JavaScript. Store failure is unavailable,
+not anonymous success. Prior credential-bearing UI cookies require re-login;
+no plaintext-cookie compatibility path is retained.
 
 #### Cross-service delegation
 
-The API key is exchanged at `/auth/token` — never on the wire, with one
-exception: public gateway ingress (the OpenAI-compatible, Anthropic Messages,
+The API key is exchanged at `/auth/token`, or once at
+`/auth/browser/api-key` for a revocable first-party browser recovery session.
+Other API requests use their scoped access token or explicit browser-session
+boundary, with one exception: public gateway ingress (the OpenAI-compatible,
+Anthropic Messages,
 and Gemini `GenerateContent` inference routes) accepts a `wyrd_sk_` key in its
 existing credential headers for stock clients that hold only a static key. The
 server exchanges it through the same API-key grant, reuses the minted token per

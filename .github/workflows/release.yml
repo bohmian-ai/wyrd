@@ -512,9 +512,11 @@ jobs:
   # One bundle per local-server target `wyrd server install` selects by
   # `wyrd-server-<target>.tar.gz`; the Linux bundles also feed the images.
   # Linux bundles build on the oldest glibc their images run: ubuntu-22.04
-  # for the ubuntu and debian images, rockylinux:9 for rocky. The arm runner
-  # cannot finish the fat LTO link of wyrd-server even with swap: it thrashes
-  # until the runner loses contact with GitHub, so arm links with thin LTO.
+  # for the debian images, rockylinux:9 for rocky. Every bundle carries the
+  # production UI in ui/; native installs run it on the system Node. The arm
+  # runner cannot finish the fat LTO link of wyrd-server even with swap: it
+  # thrashes until the runner loses contact with GitHub, so arm links with thin
+  # LTO.
   build-server:
     name: server - ${{ matrix.bundle }}
     needs: locate-build
@@ -552,7 +554,7 @@ jobs:
 
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust protoc cmake
+          install_args: rust protoc cmake node pnpm
           cache: true
 
       - uses: Swatinem/rust-cache@v2
@@ -586,6 +588,7 @@ jobs:
         run: |
           tar -czf "$BUNDLE" -C release .
           tar -tzf "$BUNDLE" | grep -qx './wyrd-server'
+          tar -tzf "$BUNDLE" | grep -qx './ui/build/index.js'
           shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.bundle }}
 
       - uses: actions/upload-artifact@v7
@@ -633,10 +636,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - distro: ubuntu
-            arch: amd64
-            runner: ubuntu-24.04
-            bundle: x86_64-unknown-linux-gnu
           - distro: debian
             arch: amd64
             runner: ubuntu-24.04
@@ -645,10 +644,6 @@ jobs:
             arch: amd64
             runner: ubuntu-24.04
             bundle: x86_64-unknown-linux-gnu-rocky
-          - distro: ubuntu
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            bundle: aarch64-unknown-linux-gnu
           - distro: debian
             arch: arm64
             runner: ubuntu-24.04-arm
@@ -711,7 +706,7 @@ jobs:
           push-to-registry: true
 
   # `docker pull bohmian/wyrd` resolves through these multi-arch tags: one per
-  # distro, and the ubuntu image as the bare version and latest.
+  # distro, and the debian image as the bare version and latest.
   publish-docker-manifests:
     name: docker manifests
     if: ${{ !cancelled() && github.event_name == 'release' && needs.publish-docker.result == 'success' }}
@@ -732,9 +727,7 @@ jobs:
         run: |
           repo=bohmian/wyrd
           docker buildx imagetools create -t "$repo:$TAG" -t "$repo:latest" \
-            -t "$repo:ubuntu-$TAG" -t "$repo:ubuntu-latest" \
-            "$repo:ubuntu-amd64-$TAG" "$repo:ubuntu-arm64-$TAG"
-          docker buildx imagetools create -t "$repo:debian-$TAG" -t "$repo:debian-latest" \
+            -t "$repo:debian-$TAG" -t "$repo:debian-latest" \
             "$repo:debian-amd64-$TAG" "$repo:debian-arm64-$TAG"
           docker buildx imagetools create -t "$repo:rocky-$TAG" -t "$repo:rocky-latest" \
             "$repo:rocky-amd64-$TAG"

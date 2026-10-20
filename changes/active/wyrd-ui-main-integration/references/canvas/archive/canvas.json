@@ -1,0 +1,190 @@
+{
+ "v": 3,
+ "createdOnFiles": {
+  "v": 1,
+  "at": "2026-10-13T20:10:00Z"
+ },
+ "title": "Wyrd Observe redesign",
+ "launch": {
+  "view": "canvas"
+ },
+ "pages": [],
+ "boards": {
+  "Main.dc.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1440,
+   "h": 1000,
+   "title": "Traces — one toolbar, timeline brush, live list + side panel",
+   "expand": "fill"
+  },
+  "Logs.dc.html": {
+   "x": 1520,
+   "y": 0,
+   "w": 1440,
+   "h": 1000,
+   "title": "Logs — same toolbar and timeline, severity-stacked",
+   "expand": "fill"
+  },
+  "Metrics.dc.html": {
+   "x": 3040,
+   "y": 0,
+   "w": 1440,
+   "h": 1000,
+   "title": "Metrics — one chart, group-by and legend instead of top-4",
+   "expand": "fill"
+  },
+  "TimePicker.dc.html": {
+   "x": 0,
+   "y": 1120,
+   "w": 520,
+   "h": 600,
+   "title": "Time picker, open"
+  },
+  "Home.dc.html": {
+   "x": 0,
+   "y": 1900,
+   "w": 1440,
+   "h": 1000,
+   "title": "Home — attention from failed verification, Services health, live Observe summary",
+   "expand": "fill"
+  },
+  "Agent.dc.html": {
+   "x": 1520,
+   "y": 1900,
+   "w": 1440,
+   "h": 1160,
+   "title": "Agent Card — composition, live invocations, bound Verifiers",
+   "expand": "fill"
+  },
+  "Prompt.dc.html": {
+   "x": 3040,
+   "y": 1900,
+   "w": 1440,
+   "h": 1000,
+   "title": "Prompt Card — the prompt is the page",
+   "expand": "fill"
+  },
+  "Model.dc.html": {
+   "x": 4560,
+   "y": 1900,
+   "w": 1440,
+   "h": 1060,
+   "title": "Model Card — interface, artifacts, production vitals, drift",
+   "expand": "fill"
+  },
+  "Query.dc.html": {
+   "x": 0,
+   "y": 3300,
+   "w": 1440,
+   "h": 1000,
+   "title": "Query — catalog, editor, results table joined across the warehouse",
+   "expand": "fill"
+  },
+  "QueryChart.dc.html": {
+   "x": 1520,
+   "y": 3300,
+   "w": 1440,
+   "h": 1000,
+   "title": "Query — chart view of the same result",
+   "expand": "fill"
+  },
+  "Verify.dc.html": {
+   "x": 0,
+   "y": 4700,
+   "w": 1440,
+   "h": 1000,
+   "title": "Overview — every Verifier result: WHERE, charts, facets (Verifier, failed requirement, Service…), group-by, preview",
+   "expand": "fill"
+  },
+  "VerifyDrift.dc.html": {
+   "x": 3040,
+   "y": 4700,
+   "w": 1440,
+   "h": 1000,
+   "title": "Window result — the same page for a scheduled Verifier whose requirements are drift checks",
+   "expand": "fill"
+  },
+  "VerifyResult.dc.html": {
+   "x": 1520,
+   "y": 4700,
+   "w": 1440,
+   "h": 1260,
+   "title": "Result — requirements with reasons and citations, steps, evidence, this Verifier over time",
+   "expand": "fill"
+  }
+ },
+ "order": [
+  "Main.dc.html",
+  "Logs.dc.html",
+  "Metrics.dc.html",
+  "TimePicker.dc.html",
+  "Home.dc.html",
+  "Agent.dc.html",
+  "Prompt.dc.html",
+  "Model.dc.html",
+  "Query.dc.html",
+  "QueryChart.dc.html",
+  "Verify.dc.html",
+  "VerifyResult.dc.html",
+  "VerifyDrift.dc.html"
+ ],
+ "notes": {
+  "title": {
+   "x": 0,
+   "y": -320,
+   "text": "Observe: one toolbar, one timeline, one time picker",
+   "kind": "title1",
+   "maxW": 4480
+  },
+  "fix": {
+   "x": 640,
+   "y": 1120,
+   "w": 520,
+   "text": "What changes, by your four points:\n1. One aligned toolbar row: SQL bar (plain text = name/trace-id match), zoom −/+, reset, time picker, Live. The separate search box, SORT and duration rows go: sort lives in column headers, duration is a facet + SQL.\n2. Time picker button opens presets (5m → 30d) with custom range inside it.\n3. Zooming shows a 'Zoomed … ✕' chip and the ↺ button returns to the preset you came from.\n4. The from/to row you saw is the absolute-range editor that appears after a zoom; it moves into the picker.\nRevision 2: amber removed from charts (lime is the secondary series; amber stays only on the WARN label). Traces lead with three linked charts: spans/min, errors, duration p50/p95.",
+   "size": "m"
+  },
+  "title2": {
+   "x": 0,
+   "y": 1580,
+   "text": "Home and Card pages: each kind leads with what it is, then how it is behaving",
+   "kind": "title1",
+   "maxW": 6000
+  },
+  "cardsfix": {
+   "x": 1200,
+   "y": 1120,
+   "w": 560,
+   "text": "Card pages, shared shape:\n• Header: name, kind, version, status, one-line description; uid shortened with copy.\n• Kind-specific hero: Agent = composition graph, Prompt = the messages, Model = interface + artifacts.\n• Vitals strip from Bifrost, filtered to this component's spans (agent.invoke / prompt.render / model.predict).\n• Verification table: the Verifiers bound to it, with trend and latest.\n• Right rail: relationships with kind pills, compact metadata.\n• Tabs: Overview · Versions · YAML (raw).\nGone: one box per spec field, \"Declared empty.\" boxes, full hashes, \"read-only projection of server truth\".",
+   "size": "m"
+  },
+  "title3": {
+   "x": 0,
+   "y": 3000,
+   "text": "Query: explore the warehouse in SQL — table, chart, details, history",
+   "kind": "title1",
+   "maxW": 3000
+  },
+  "querynote": {
+   "x": 3040,
+   "y": 3300,
+   "w": 520,
+   "text": "Query (extends foundation Q-01):\n• Same toolbar row: time range applies to each table's time column; limit; Copy SQL; CSV; Run ⌘↵ / Cancel.\n• Catalog of real vala tables; correlation columns (card_uid, run_id) highlighted — they join any table.\n• Starter queries show the joins (spans ⋈ verification.results on run_id).\n• Results: Table · Chart (line/bar/area/number, x/y/group from result columns) · Details (query id, status, time, rows, bytes, error) · History.\n• card_uid values render as their Card.\n• Bounds shown are Oracle's real ones: one read-only SELECT, SQL ≤ 64 KiB, 2 h default deadline; the page's Limit bounds rows.",
+   "size": "m"
+  },
+  "title4": {
+   "x": 0,
+   "y": 4480,
+   "text": "Verify: overview of results → click one → the result",
+   "kind": "title1",
+   "maxW": 4480
+  },
+  "verifynote": {
+   "x": 0,
+   "y": 6040,
+   "w": 720,
+   "text": "Revision 11 — one generic Verifier (verifier-building-blocks). There is no Eval, Task or Drift kind: a Verifier has inputs, optional steps (extract · agent · code), requirements (assert · trace · agent · code · drift checks) and a decide rule (all | pass_rate).\n\nOverview: one row per vala.verification.results row (one execution). Columns: Verifier, subject · Service, run (or window), requirement summary, verdict. Facets: verdict, Verifier, failed requirement, Service, subject, run. Group by: Verifier / requirement / Service / run.\n\nResult: one page for every Verifier. Requirements in declaration order with outcome (passed · failed · inconclusive · not_applicable), reason, actual, citations and check provenance; steps with action, timing, attempts and tool calls; pinned evidence; provenance (execution, binding, sub/act principals, on_failure dispatches); this Verifier's pass rate by requirement / subject / run.\n\nWindow result: the same page when the Verifier judges samples on a schedule. A drift requirement expands to its features (vala.drift.result_features, joined on result_id + requirement_id), history across windows and distribution vs baseline. No manual run: window Verifiers refuse verify().\n\nStored sources: vala.verification.results (verdict, execution_status, verifier_card_uid, card_uid = subject, owner_card_uid, binding_id, run_id, window_start/end, outcome). outcome is a sensitive Variant: requirement and step detail needs the elevated payload permission; without it rows show verdict only."
+  }
+ },
+ "designSystems": []
+}

@@ -15,8 +15,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use wyrd_auth::cli_logins::{CliLogins, DEVICE_VERIFICATION_PATH};
 use wyrd_spec::auth::{
-    DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorCode,
-    OAuthErrorResponse, TokenRevocationRequest,
+    DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorResponse,
+    TokenRevocationRequest,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -47,8 +47,8 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
 /// §3.1).
 ///
 /// The public client `wyrd-cli` identifies itself with `client_id`; another
-/// client is `unauthorized_client`. Like `GET /auth/authorize` it appends no
-/// audit event: it evaluates no principal permission.
+/// client is `unauthorized_client`. Like `POST /auth/browser/login` it
+/// appends no audit event: it evaluates no principal permission.
 ///
 /// # Errors
 /// Answers the RFC 6749 §5.2 body for a malformed request, an unidentified
@@ -82,10 +82,7 @@ pub async fn device_authorization(
     headers: HeaderMap,
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
-    match crate::auth::oauth::require_client(&headers, &form)? {
-        OAuthClientId::WyrdCli => {}
-        OAuthClientId::WyrdUi => return Err(OAuthError(OAuthErrorCode::UnauthorizedClient)),
-    }
+    let OAuthClientId::WyrdCli = crate::auth::oauth::require_client(&headers, &form)?;
     let request: DeviceAuthorizationRequest = form.decode()?;
     let device = cli_logins(&state)?
         .authorize(&request.tenant, &origin)

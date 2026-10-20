@@ -22,8 +22,7 @@ use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken
 use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef, UnrepresentableIntersection};
 use wyrd_spec::auth::{
-    Attribution, ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse,
-    TokenType,
+    Attribution, ExchangeTokenType, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRefScope;
@@ -47,11 +46,6 @@ use crate::card_scope::{
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::exchange_api_key::{principal_kind_wire, role_refs};
 use wyrd_auth_issue::hash_secret;
-
-/// Absolute lifetime of a `wyrd-ui` session: its refresh token does not
-/// rotate (RFC 9700 §4.14.2 applies rotation to public clients only), so the
-/// row's expiry, fixed at login, is the session's hard end.
-pub const UI_SESSION_LIFETIME: Duration = Duration::hours(12);
 
 /// Tenant token lifetimes.
 #[derive(Debug, Clone)]
@@ -128,12 +122,21 @@ pub enum TenantGrant {
         /// The API-key row the holder presented.
         credential_id: Uuid,
     },
+    /// A live browser session created with this API key, re-resolved on one
+    /// request.
+    ///
+    /// Confers exactly the authority the key's own exchange would, but the
+    /// session's request is not the key's runtime activity, so resolving it
+    /// writes nothing.
+    BrowserRecovery {
+        /// The API-key row the session was created with.
+        credential_id: Uuid,
+    },
     /// A verified federated OIDC login.
     OidcLogin,
     /// A consumed human refresh token.
     Refresh {
-        /// The refresh row presented: consumed by a `wyrd-cli` rotation, or
-        /// the unrotated `wyrd-ui` session row.
+        /// The refresh row presented, consumed by a `wyrd-cli` rotation.
         consumed: Uuid,
     },
     /// A verified workload `jwt-bearer` assertion.
@@ -174,7 +177,9 @@ impl TenantGrant {
     /// The stored credential the token is attributed to, when there is one.
     fn credential_id(&self) -> Option<Uuid> {
         match self {
-            Self::ApiKey { credential_id } => Some(*credential_id),
+            Self::ApiKey { credential_id } | Self::BrowserRecovery { credential_id } => {
+                Some(*credential_id)
+            }
             Self::Refresh { consumed } => Some(*consumed),
             Self::OidcLogin | Self::JwtBearer | Self::Delegation { .. } => None,
         }
@@ -197,7 +202,10 @@ impl TenantGrant {
             Self::JwtBearer => Some(MINT_KIND_JWT_BEARER),
             // The subject's Card scope was minted with its own token; the
             // exchange confers no new emit authority.
-            Self::OidcLogin | Self::Refresh { .. } | Self::Delegation { .. } => None,
+            Self::OidcLogin
+            | Self::Refresh { .. }
+            | Self::Delegation { .. }
+            | Self::BrowserRecovery { .. } => None,
         }
     }
 
@@ -652,8 +660,7 @@ impl TenantTokenIssuer {
     /// refresh row on a `wyrd-cli` rotation; it is both the family back-link
     /// that makes reuse detectable and the credential attribution of the
     /// renewed access token. The refresh token lives for the configured
-    /// `refresh_ttl` for `wyrd-cli`, and for [`UI_SESSION_LIFETIME`] for
-    /// `wyrd-ui`, whose token never rotates. One `PostgreSQL` instant feeds
+    /// `refresh_ttl`. One `PostgreSQL` instant feeds
     /// both its signed `exp` and its durable row expiry. Only human sessions
     /// get a refresh token — a machine re-exchanges its durable credential
     /// instead.
@@ -680,10 +687,7 @@ impl TenantTokenIssuer {
                 request_id,
             )
             .await?;
-        let lifetime = match session.client {
-            OAuthClientId::WyrdCli => self.settings.refresh_ttl,
-            OAuthClientId::WyrdUi => UI_SESSION_LIFETIME,
-        };
+        let lifetime = self.settings.refresh_ttl;
         // One PostgreSQL instant, sampled in the caller's transaction, feeds both
         // the signed `exp` and the durable row expiry that PostgreSQL later
         // evaluates, so the two can never disagree.
@@ -714,9 +718,7 @@ impl TenantTokenIssuer {
     /// Mint a human access token from [`Self::issue`] for a session bound to
     /// `connection`, without a refresh token.
     ///
-    /// This alone is a `wyrd-ui` refresh, whose refresh token does not
-    /// rotate; [`Self::issue_human_session`] builds every new refresh token
-    /// on it. `refresh_row` is the refresh row presented, if any: it makes
+    /// [`Self::issue_human_session`] builds every new refresh token on it. `refresh_row` is the refresh row presented, if any: it makes
     /// the grant a refresh and attributes the access token to it; `None` is
     /// a login. Before anything is read or minted this takes the User's
     /// tenant-qualified refresh-family lock — the lock rotation and

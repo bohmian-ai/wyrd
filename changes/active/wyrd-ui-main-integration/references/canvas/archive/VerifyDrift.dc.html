@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Window result</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 12px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#1f2230}
+.btn.primary{background:#7a8cff;border-color:#7a8cff;color:#0b0c12;font-weight:600}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.panel{background:#12141c;border:1px solid #252838;border-radius:2px}
+.ph{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #252838}
+.pb{padding:14px 16px}
+.kind{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;background:#1a2040;border:1px solid #3a4170;color:#c7cdff;font:11px "Fragment Mono",monospace;letter-spacing:.04em;text-transform:uppercase;border-radius:2px}
+.ok{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3dbe5a;color:#3dbe5a;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.bad{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #e2484d;color:#e2484d;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.neutral{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3a3d4f;color:#8f92a5;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px;font:12px "Fragment Mono",monospace}
+.kv dt{color:#8f92a5}.kv dd{margin:0;color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab{padding:10px 2px;margin-right:22px;color:#8f92a5;font:13px "Familjen Grotesk",sans-serif}
+.tab[aria-current]{color:#e6e4da;box-shadow:inset 0 -2px 0 #7a8cff}
+.vital{padding:14px 16px;display:flex;flex-direction:column;gap:4px;border-right:1px solid #252838;min-width:0}
+.vital:last-child{border-right:0}
+.vv{font:600 22px "Familjen Grotesk",sans-serif;color:#e6e4da}
+.vs{font:11px "Fragment Mono",monospace;color:#8f92a5}
+table{width:100%;border-collapse:collapse;font:12px "Fragment Mono",monospace}
+th{text-align:left;font-weight:400;color:#8f92a5;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:8px 16px;border-bottom:1px solid #252838}
+td{padding:9px 16px;border-bottom:1px solid #1c1f2c;color:#e6e4da}
+tr:last-child td{border-bottom:0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;background:#1a1d28;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;color:#e6e4da;white-space:nowrap}
+.node{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#12141c;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;min-width:0}
+.node small{color:#8f92a5;font-size:10.5px}
+.node.self{border:2px solid #7a8cff;background:#141933}
+.edge{font:10.5px "Fragment Mono",monospace;color:#8f92a5;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.row{display:grid;align-items:center;gap:12px;padding:0 14px;min-height:34px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.row:hover{background:#1a1d28}.row.sel{background:#141933;box-shadow:inset 3px 0 0 #7a8cff}
+.rh{display:grid;align-items:center;gap:12px;padding:0 14px;height:30px;border-bottom:1px solid #252838;font:10.5px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.facet{display:flex;align-items:center;gap:8px;padding:3px 0;font:12px "Fragment Mono",monospace;color:#c9c7be}
+.facet b{font-weight:400;color:#e6e4da}.facet span:last-child{margin-left:auto;color:#8f92a5}
+</style>
+</helmet>
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif;">
+  <header style="display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid #252838; background: #0e1017;">
+    <span class="mono" style="font-size: 11px; padding: 3px 8px; background: #7a8cff; color: #0b0c12; font-weight: 600;">WYRD</span>
+    <nav aria-label="Primary" style="display: flex; gap: 2px;"><a href="Home.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Home</a><a href="Model.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Cards</a><a href="Main.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Observe</a><a href="Verify.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#e6e4da;background:#1a2040">Verify</a><a href="#" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Changes</a><a href="Query.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Query</a></nav>
+    <span class="mono" style="font-size: 12px; color: #8f92a5; margin-left: 12px;">Verify / sim-drifting-4-drift</span>
+    <span style="margin-left: auto; display: flex; gap: 8px; align-items: center;"><span class="chip">⌕ Find a Card…  <kbd style="color:#8f92a5">⌘K</kbd></span><span class="chip">ui-live ▾</span><span class="chip">alice ▾</span></span>
+  </header>
+  <section style="padding:18px 24px 16px;border-bottom:1px solid #252838;background:linear-gradient(180deg,#10121a 0%,#0b0c12 100%)">
+    <div class="mono vs" style="margin-bottom:8px"><a href="Verify.dc.html">Verify</a> / sim-drifting-4-drift / Oct 12 → Oct 13</div>
+    <div style="display:flex;align-items:flex-start;gap:16px"><div style="flex:1;display:flex;flex-direction:column;gap:7px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h1 style="margin:0;font-size:26px;font-weight:600">sim-drifting-4-drift · Oct 12 → Oct 13</h1><span class="neutral">window</span><span class="bad">✕ failed · 1 of 2 requirements</span></div>
+      <p style="margin:0;font-size:15px;color:#c9c7be">Scores one day of sim-drifting-4 samples against fitted baselines. Each drift requirement is one check; the window fails when any requirement fails.</p>
+      <div class="mono" style="font-size:11.5px;color:#8f92a5;display:flex;gap:16px;flex-wrap:wrap"><span>subject <a href="#">sim-drifting-4</a> · Service <a href="#">sim-drifting-4</a></span><span>baseline <a href="#">sim-drifting-4-data</a></span><span>schedule daily 02:00 UTC</span><span>decide all</span><span>Verifier v1.0.0 · <a href="#">definition</a></span><span>‹ previous day · next day ›</span></div></div>
+      <div style="display:flex;gap:8px"><a class="btn" href="Query.dc.html">Open in Query ↗</a></div></div>
+  </section>
+  <div style="display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:16px;padding:16px 24px 24px">
+    <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+      <div class="panel"><div class="ph"><span class="h">Requirements</span><span class="vs">baselines fitted Oct 1 from sim-drifting-4-data</span></div><div class="rh" style="grid-template-columns:150px minmax(0,1fr) 150px 96px"><span>Requirement</span><span>Statement</span><span>Check</span><span>Outcome</span></div><div class="row sel" style="grid-template-columns:150px minmax(0,1fr) 150px 96px"><span>features_stable</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No input feature drifts past PSI 0.20 · 2 of 6 drifted</span><span class="vs">drift · PSI · features</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 150px 96px"><span>volume_in_control</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Request volume stays inside SPC control limits</span><span class="vs">drift · SPC · metric</span><span class="ok">✓ passed</span></div></div>
+      <div class="panel"><div style="display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid #252838"><span class="h">features_stable · by</span><div role="group" style="display:inline-flex"><button class="btn" aria-pressed="true" style="height:28px;margin-left:0px;background:#1a2040;border-color:#3a4170">feature</button><button class="btn" aria-pressed="false" style="height:28px;margin-left:-1px;color:#8f92a5">window</button></div><span class="vs" style="margin-left:auto">score per day, last 13 days · dashed = 0.20 · gap = no score</span></div>
+        <div class="rh" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px"><span>Feature</span><span>Over time</span><span style="text-align:right">Score</span><span style="text-align:right">Limit</span><span>This window</span></div><div class="row sel" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>prediction</span><div><svg width="100%" height="28" viewBox="0 0 220 28" preserveAspectRatio="none"><line x1="0" x2="220" y1="12" y2="12" stroke="#5d6075" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><path d="M0 24 L18 23 L37 24 L55 22" fill="none" stroke="#e2484d" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="M92 21 L110 17 L128 12 L147 10 L165 8 L183 6 L202 5 L220 3" fill="none" stroke="#e2484d" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><span style="text-align:right;color:#e2484d">0.31</span><span class="vs" style="text-align:right">0.20</span><span class="bad">✕ drift</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>ticket_length</span><div><svg width="100%" height="28" viewBox="0 0 220 28" preserveAspectRatio="none"><line x1="0" x2="220" y1="12" y2="12" stroke="#5d6075" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><path d="M0 25 L18 24 L37 25 L55 24" fill="none" stroke="#e2484d" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="M92 22 L110 20 L128 18 L147 14 L165 13 L183 12 L202 10 L220 9" fill="none" stroke="#e2484d" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><span style="text-align:right;color:#e2484d">0.24</span><span class="vs" style="text-align:right">0.20</span><span class="bad">✕ drift</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>confidence</span><div><svg width="100%" height="28" viewBox="0 0 220 28" preserveAspectRatio="none"><line x1="0" x2="220" y1="12" y2="12" stroke="#5d6075" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><path d="M0 26 L18 25 L37 26 L55 24" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="M92 23 L110 22 L128 21 L147 20 L165 20 L183 19 L202 18 L220 18" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><span style="text-align:right;color:#e6e4da">0.12</span><span class="vs" style="text-align:right">0.20</span><span class="ok">✓ stable</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>language</span><div><svg width="100%" height="28" viewBox="0 0 220 28" preserveAspectRatio="none"><line x1="0" x2="220" y1="12" y2="12" stroke="#5d6075" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><path d="M0 26 L18 25 L37 26 L55 25" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="M92 25 L110 26 L128 25 L147 25 L165 26 L183 25 L202 25 L220 25" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><span style="text-align:right;color:#e6e4da">0.04</span><span class="vs" style="text-align:right">0.20</span><span class="ok">✓ stable</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>channel</span><div><svg width="100%" height="28" viewBox="0 0 220 28" preserveAspectRatio="none"><line x1="0" x2="220" y1="12" y2="12" stroke="#5d6075" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><path d="M0 26 L18 26 L37 26 L55 26" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="M92 26 L110 26 L128 26 L147 26 L165 26 L183 26 L202 26 L220 26" fill="none" stroke="#4d5ef0" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><span style="text-align:right;color:#e6e4da">0.02</span><span class="vs" style="text-align:right">0.20</span><span class="ok">✓ stable</span></div><div class="row" style="grid-template-columns:150px minmax(0,1fr) 70px 70px 100px;min-height:44px"><span>tokens_in</span><span class="vs">not scored: samples missing in this window</span><span></span><span></span><span class="neutral">? inconclusive</span></div></div>
+      <div class="panel"><div class="ph"><span class="h">Windows · this Verifier on sim-drifting-4</span><span class="vs">click to switch the window</span></div>
+        <div class="rh" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Window</span><span style="text-align:right">Drifted</span><span style="text-align:right">Max PSI</span><span>Verdict</span></div><div class="row sel" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 12 02:00 → Oct 13 02:00</span><span style="text-align:right">2 of 6</span><span style="text-align:right">0.31</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 11 → Oct 12</span><span style="text-align:right">2 of 6</span><span style="text-align:right">0.29</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 10 → Oct 11</span><span style="text-align:right">2 of 6</span><span style="text-align:right">0.27</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 9 → Oct 10</span><span style="text-align:right">1 of 6</span><span style="text-align:right">0.25</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 5 → Oct 6</span><span style="text-align:right">— of 6</span><span style="text-align:right">—</span><span class="neutral">? inconclusive</span></div><div class="row" style="grid-template-columns:minmax(0,1fr) 90px 70px 100px"><span>Oct 4 → Oct 5</span><span style="text-align:right">0 of 6</span><span style="text-align:right">0.07</span><span class="ok">✓ passed</span></div></div>
+    </div>
+    <aside class="panel" style="align-self:start"><div class="ph"><span class="h">prediction · this window vs baseline</span></div>
+      <div class="pb"><div class="vs" style="margin-bottom:4px">■ baseline</div><div style="display:flex;gap:4px;align-items:flex-end;height:64px"><span style="flex:1;height:5px;background:#3a3d4f"></span><span style="flex:1;height:15px;background:#3a3d4f"></span><span style="flex:1;height:34px;background:#3a3d4f"></span><span style="flex:1;height:54px;background:#3a3d4f"></span><span style="flex:1;height:64px;background:#3a3d4f"></span><span style="flex:1;height:44px;background:#3a3d4f"></span><span style="flex:1;height:20px;background:#3a3d4f"></span><span style="flex:1;height:10px;background:#3a3d4f"></span></div>
+        <div class="vs" style="margin:8px 0 4px"><span style="color:#c5f23b">■</span> Oct 12 → Oct 13</div><div style="display:flex;gap:4px;align-items:flex-end;height:64px"><span style="flex:1;height:2px;background:#c5f23b"></span><span style="flex:1;height:5px;background:#c5f23b"></span><span style="flex:1;height:12px;background:#c5f23b"></span><span style="flex:1;height:22px;background:#c5f23b"></span><span style="flex:1;height:39px;background:#c5f23b"></span><span style="flex:1;height:59px;background:#c5f23b"></span><span style="flex:1;height:64px;background:#c5f23b"></span><span style="flex:1;height:42px;background:#c5f23b"></span></div>
+        <div class="mono" style="display:flex;justify-content:space-between;font-size:10px;color:#8f92a5;padding-top:4px"><span>0.0</span><span>0.5</span><span>1.0</span></div>
+        <dl class="kv" style="margin:12px 0 0"><dt>score</dt><dd style="color:#e2484d">0.31 PSI</dd><dt>limit</dt><dd>0.20</dd><dt>moved most</dt><dd>bins 6–8 · 87% of the score</dd></dl></div></aside>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

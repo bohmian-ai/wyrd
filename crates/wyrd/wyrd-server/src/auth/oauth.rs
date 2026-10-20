@@ -36,8 +36,7 @@ use wyrd_spec::error::WyrdError;
 pub const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// Every `grant_type` `POST /auth/token` accepts.
-pub const GRANT_TYPES: [&str; 5] = [
-    "authorization_code",
+pub const GRANT_TYPES: [&str; 4] = [
     "refresh_token",
     "urn:ietf:params:oauth:grant-type:device_code",
     TOKEN_EXCHANGE,
@@ -89,19 +88,6 @@ impl OAuthError {
         match Self::from(error) {
             Self(OAuthErrorCode::InvalidGrant) => Self(OAuthErrorCode::InvalidRequest),
             other => other,
-        }
-    }
-}
-
-impl OAuthError {
-    /// The RFC 6749 §4.1.2.1 error a refused authorization request redirects
-    /// back with: a server failure keeps its code and every other refusal of
-    /// the sign-in is `access_denied`.
-    #[must_use]
-    pub fn authorization(error: WyrdError) -> OAuthErrorCode {
-        match Self::from(error).0 {
-            code @ (OAuthErrorCode::ServerError | OAuthErrorCode::TemporarilyUnavailable) => code,
-            _ => OAuthErrorCode::AccessDenied,
         }
     }
 }
@@ -263,9 +249,9 @@ impl<S: Send + Sync> FromRequest<S> for OAuthForm {
 
 /// The client a request identifies, if any.
 ///
-/// Both registered clients are public (RFC 6749 §2.1): `wyrd-cli` and the
-/// `wyrd-ui` BFF each name themselves with the `client_id` parameter alone
-/// and hold no secret. A request that also presents an `Authorization`
+/// The one registered client is public (RFC 6749 §2.1): `wyrd-cli` names
+/// itself with the `client_id` parameter alone and holds no secret; any
+/// other `client_id`, including the retired `wyrd-ui`, is unknown. A request that also presents an `Authorization`
 /// header is attempting client authentication no client is registered for.
 ///
 /// # Errors
@@ -358,9 +344,10 @@ mod tests {
         ));
     }
 
-    /// Both clients identify by `client_id` alone; an unknown client or any
-    /// `Authorization` header is `invalid_client`, and only a request that
-    /// must name a client refuses naming none.
+    /// The CLI identifies by `client_id` alone; an unknown client — the
+    /// retired `wyrd-ui` among them — or any `Authorization` header is
+    /// `invalid_client`, and only a request that must name a client refuses
+    /// naming none.
     ///
     /// # Panics
     /// Panics when a client is identified differently.
@@ -371,7 +358,7 @@ mod tests {
         let invalid = OAuthError(OAuthErrorCode::InvalidClient);
         assert_eq!(
             identify_client(&none, &form(b"client_id=wyrd-ui")),
-            Ok(Some(OAuthClientId::WyrdUi))
+            Err(invalid)
         );
         assert_eq!(
             identify_client(&none, &form(b"client_id=wyrd-cli")),
@@ -389,7 +376,7 @@ mod tests {
             HeaderValue::from_static("Basic d3lyZC11aTpzM2NyZXQ="),
         );
         assert_eq!(
-            identify_client(&basic, &form(b"client_id=wyrd-ui")),
+            identify_client(&basic, &form(b"client_id=wyrd-cli")),
             Err(invalid)
         );
     }

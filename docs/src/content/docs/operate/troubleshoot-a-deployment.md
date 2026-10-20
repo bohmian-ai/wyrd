@@ -18,6 +18,7 @@ Match the code or message you see below. This page covers server installation, l
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | Wyrd publishes servers only for macOS on arm64 and glibc Linux on x86_64 or arm64 | Run the server on a supported host, or use the `bohmian/wyrd` container image |
 | `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` | GitHub could not be reached, a download broke off, no stable release is published, or the newest release has no bundle for this machine | Check access to `github.com` and retry. The message says which one |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | The signature on `checksums.txt` is missing or wrong, the download does not match its signed SHA-256, or the bundle did not unpack into a runnable server | Retry once. If it fails again, do not work around it: report the release |
+| `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | The newest version is already unpacked on this machine but part of it, such as the UI or its dependencies, is missing | Delete the directory the message names, then rerun `wyrd server install` to download it again. Nothing was activated |
 | `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | The newest server is on a different version line than your `wyrd` CLI | Upgrade the CLI (`pip install -U wyrd-ai` or `npm install -g wyrd-ai@latest`), then rerun |
 
 ## Local startup
@@ -41,7 +42,7 @@ On a terminal, `wyrd server dev` does this for you: with `WYRD_PLATFORM_CREDENTI
 
 To recover by hand: a failed `server dev` stops its server, so recovery starts the installed server directly.
 
-1. Start the installed server with the same database URL. On macOS, also set `WYRD_BIFROST_MEMORY_LIMIT_BYTES` to the output of `sysctl -n hw.memsize`; `server dev` normally supplies it.
+1. Start the installed server with the same database URL.
 
    ```bash
    export WYRD_SERVER_BIND=127.0.0.1:8080

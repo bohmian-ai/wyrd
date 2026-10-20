@@ -1,24 +1,23 @@
 //! Tenant human OIDC login initiation.
 //!
-//! A login begins at the authorization endpoint
-//! ([`HumanConnections::authorize`]), at a device verification page
-//! ([`crate::cli_logins::CliLogins::approve`]), or as a candidate connection
-//! test ([`HumanConnections::begin_test`]). Each resolves the tenant from its
-//! route key, requires the connection it signs in through, and writes a
-//! login-state row keyed by the SHA-256 of a random state value that exists
-//! only in the returned provider authorization URL, bound to how the login
-//! was initiated. The common callback
+//! A login begins at browser sign-in
+//! ([`crate::browser_sessions::BrowserSessions::begin`]), at a device
+//! verification page ([`crate::cli_logins::CliLogins::approve`]), or as a
+//! candidate connection test ([`HumanConnections::begin_test`]). Each
+//! resolves the tenant from its route key, requires the connection it signs
+//! in through, and writes a login-state row keyed by the SHA-256 of a random
+//! state value that exists only in the returned provider authorization URL,
+//! bound to how the login was initiated. The common callback
 //! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row and
-//! records the outcome: an authorization code for the OAuth client, an
-//! approval on the device authorization, or a tested candidate. No tokens are
-//! minted until a code or device code is redeemed at the token endpoint. No
-//! request header ever selects a tenant, connection, or redirect.
+//! records the outcome: a browser session for the browser that began it, an
+//! approval on the device authorization, or a tested candidate. No request
+//! header ever selects a tenant, connection, or redirect.
 
 use std::time::Duration;
 
 use serde_json::json;
 use url::Url;
-use wyrd_spec::auth::{AbsoluteUrl, ClientAuthorization, LoginInitiation, Sha256Hex};
+use wyrd_spec::auth::{AbsoluteUrl, LoginInitiation, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{LoginState, insert_login_state};
@@ -32,31 +31,6 @@ use crate::error::{relying_party_error, store_error};
 pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
 impl HumanConnections {
-    /// Begin the tenant login that answers an OAuth authorization request
-    /// (RFC 6749 §4.1.1) and return the provider authorization URL to send
-    /// the browser to.
-    ///
-    /// The caller has already matched `authorization`'s client and exact
-    /// redirect URI against the client registration and required an S256
-    /// PKCE challenge; this binds them to the login so the callback can issue
-    /// the code to exactly that client, redirect URI, and challenge.
-    ///
-    /// # Errors
-    /// Returns the refusals of [`Self::begin_bound`].
-    pub async fn authorize(
-        &self,
-        tenant_route_key: &TenantSlug,
-        authorization: ClientAuthorization,
-        origin: &Url,
-    ) -> Result<AbsoluteUrl, WyrdError> {
-        self.begin_bound(
-            tenant_route_key,
-            LoginInitiation::Authorize(authorization),
-            origin,
-        )
-        .await
-    }
-
     /// Begin a tenant human SSO login bound to `initiation` and return the
     /// provider authorization URL.
     ///
@@ -166,7 +140,7 @@ mod pg_tests {
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::TenantSlug;
-    use wyrd_spec::auth::{ClientAuthorization, OAuthClientId};
+    use wyrd_spec::auth::{LoginInitiation, Sha256Hex};
 
     use crate::audit::test_audit::RecordedAudit;
     use crate::connections::HumanConnections;
@@ -190,14 +164,9 @@ mod pg_tests {
         Url::parse("https://wyrd.example.com").expect("origin parses")
     }
 
-    /// A `wyrd-ui` authorization request with a fixed S256 challenge.
-    fn authorization() -> ClientAuthorization {
-        ClientAuthorization {
-            client: OAuthClientId::WyrdUi,
-            redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
-            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
-            state: None,
-        }
+    /// A browser sign-in bound to a fixed login-transaction digest.
+    fn browser() -> LoginInitiation {
+        LoginInitiation::Browser(Sha256Hex::digest(b"login-transaction"))
     }
 
     /// Number of login-state rows in the fixture tenant.
@@ -213,28 +182,28 @@ mod pg_tests {
     }
 
     /// An unknown tenant and a tenant with no Active connection get the same
-    /// generic refusal, so the authorization endpoint does not enumerate
-    /// tenants, and neither writes login state.
+    /// generic refusal, so sign-in does not enumerate tenants, and neither
+    /// writes login state.
     ///
     /// # Panics
-    /// Panics when either authorization is accepted or the refusals differ.
+    /// Panics when either sign-in is begun or the refusals differ.
     #[tokio::test]
     async fn unknown_tenant_and_no_connection_are_indistinguishable() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let owner = connections(&fixture);
 
         let unknown = owner
-            .authorize(
+            .begin_bound(
                 &TenantSlug::new("no-such-tenant").expect("slug is valid"),
-                authorization(),
+                browser(),
                 &origin(),
             )
             .await
             .expect_err("unknown tenant refuses");
         let unconfigured = owner
-            .authorize(
+            .begin_bound(
                 &TenantSlug::new(fixture.tenant_slug()).expect("slug is valid"),
-                authorization(),
+                browser(),
                 &origin(),
             )
             .await

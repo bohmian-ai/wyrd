@@ -16,11 +16,8 @@ mod pg_tests {
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{ClientAuthorization, LoginInitiation, OAuthClientId, Sha256Hex};
-    use wyrd_sql::queries::auth::{
-        LoginState, consume_login_state, insert_login_state, issue_authorization_code,
-        redeem_authorization_code,
-    };
+    use wyrd_spec::auth::{LoginInitiation, Sha256Hex};
+    use wyrd_sql::queries::auth::{LoginState, consume_login_state, insert_login_state};
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
     /// Skip when no database is configured, matching the sibling suites.
@@ -28,8 +25,8 @@ mod pg_tests {
         std::env::var("WYRD_DATABASE_URL").ok()
     }
 
-    /// An authorization-request login state for `wyrd-ui` whose PKCE
-    /// challenge is the hex of `flow`, so each login is distinguishable.
+    /// A browser login state bound to the login-transaction digest `flow`, so
+    /// each login is distinguishable.
     fn login_state(flow: Sha256Hex) -> LoginState {
         LoginState {
             connection: HumanConnectionBinding {
@@ -41,12 +38,7 @@ mod pg_tests {
             redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
             code_verifier: SecretString::from("verifier"),
             nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Authorize(ClientAuthorization {
-                client: OAuthClientId::WyrdUi,
-                redirect_uri: "https://ui.example.com/auth/callback".to_owned(),
-                code_challenge: flow.to_string(),
-                state: Some("client-state".to_owned()),
-            }),
+            initiation: LoginInitiation::Browser(flow),
         }
     }
 
@@ -100,51 +92,38 @@ mod pg_tests {
         consumed.is_some()
     }
 
-    /// Issue the authorization code hashing to `code` on `state` from
-    /// `tenant`'s connection and commit.
+    /// Record, in `tenant` and with the superuser, a pending row of the
+    /// retired `wyrd-ui` authorization-code profile under `state`, as an
+    /// upgraded deployment may still hold one.
     ///
     /// # Panics
-    /// Panics when the statement or commit fails.
-    async fn issue(
-        fixture: &PgFixture,
-        tenant: DataTenantId,
-        state: &Sha256Hex,
-        code: &Sha256Hex,
-    ) -> bool {
-        let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
-        let issued = issue_authorization_code(
-            &mut conn,
-            state,
-            code,
-            Uuid::now_v7(),
-            Duration::from_mins(1),
+    /// Panics when the row is not written.
+    async fn begin_retired_ui_login(fixture: &PgFixture, tenant: DataTenantId, state: &Sha256Hex) {
+        sqlx::query(
+            "INSERT INTO wyrd.auth_login_state (
+                 state_hash, data_tenant_id, connection_id, connection_revision, issuer,
+                 client_id, redirect_uri, code_verifier, nonce, oauth_client_id,
+                 client_redirect_uri, code_challenge, expires_at
+             ) VALUES ($1, $2, $3, 1, 'https://idp.example.com', 'wyrd',
+                       'https://wyrd.example.com/auth/callback', 'verifier', 'nonce',
+                       'wyrd-ui', 'https://wyrd.example.com/login/callback', 'challenge',
+                       statement_timestamp() + interval '5 minutes')",
         )
+        .bind(state.as_bytes().as_slice())
+        .bind(tenant.as_uuid())
+        .bind(Uuid::now_v7())
+        .execute(&fixture.superuser_pool().expect("superuser pool opens"))
         .await
-        .expect("issue runs");
-        conn.commit().await.expect("issue commits");
-        issued
+        .expect("retired login state inserts");
     }
 
-    /// Redeem the authorization code hashing to `code` from `tenant`'s
-    /// connection and commit.
+    /// Tenant B cannot purge or consume tenant A's login state, while tenant
+    /// A consumes its own exactly once; a pending row of the retired
+    /// `wyrd-ui` authorization-code profile is never consumed.
     ///
     /// # Panics
-    /// Panics when the statement or commit fails.
-    async fn redeem(fixture: &PgFixture, tenant: DataTenantId, code: &Sha256Hex) -> bool {
-        let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
-        let redeemed = redeem_authorization_code(&mut conn, code)
-            .await
-            .expect("redeem runs");
-        conn.commit().await.expect("redeem commits");
-        redeemed.is_some_and(|redeemed| redeemed.live)
-    }
-
-    /// Tenant B cannot purge, consume, issue a code on, or redeem tenant A's
-    /// login state, while tenant A performs each valid transition exactly once.
-    ///
-    /// # Panics
-    /// Panics when any cross-tenant transition takes effect or a valid one
-    /// fails or repeats.
+    /// Panics when any cross-tenant transition takes effect, a valid one
+    /// fails or repeats, or the retired row is consumed.
     #[tokio::test]
     async fn login_state_transitions_are_confined_to_the_owning_tenant() {
         if database_url().is_none() {
@@ -195,20 +174,16 @@ mod pg_tests {
         assert!(consume(&fixture, tenant_a, &state).await, "A consumes");
         assert!(!consume(&fixture, tenant_a, &state).await, "once");
 
-        let code = Sha256Hex::digest(b"a-code");
+        let retired = Sha256Hex::digest(b"a-retired-ui");
+        begin_retired_ui_login(&fixture, tenant_a, &retired).await;
         assert!(
-            !issue(&fixture, tenant_b, &state, &code).await,
-            "B cannot issue a code"
+            !consume(&fixture, tenant_a, &retired).await,
+            "a retired wyrd-ui login is never completed"
         );
-        assert!(issue(&fixture, tenant_a, &state, &code).await, "A issues");
         assert!(
-            !issue(&fixture, tenant_a, &state, &Sha256Hex::digest(b"again")).await,
-            "once"
+            visible(&fixture, tenant_a, &retired).await,
+            "it only expires"
         );
-
-        assert!(!redeem(&fixture, tenant_b, &code).await, "B cannot redeem");
-        assert!(redeem(&fixture, tenant_a, &code).await, "A redeems");
-        assert!(!redeem(&fixture, tenant_a, &code).await, "once");
     }
 
     /// The callback's state lookup through `WyrdPostgres` names the owning

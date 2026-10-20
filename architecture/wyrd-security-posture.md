@@ -194,11 +194,10 @@ credential.
   access-only. Refresh tokens are stored by
   one-way digest and rotated on every use for public clients (`wyrd-cli`):
   reuse of a rotated refresh token revokes its rotation chain and emits a
-  security audit event (RFC 9700 §4.14.2). The confidential web-app client
-  (`wyrd-ui`) authenticates every refresh, so its refresh token does not
-  rotate and ends at a fixed 12-hour absolute lifetime. Revoking a refresh
-  token (RFC 7009) ends that one login's renewal; it does not withdraw access
-  tokens already issued.
+  security audit event (RFC 9700 §4.14.2). The first-party web app uses
+  Rust-owned browser sessions, not an OAuth client or refresh-token grant.
+  Revoking an OAuth refresh token (RFC 7009) ends that login's renewal; it
+  does not withdraw access tokens already issued.
 - Every tenant access token carries issuer, audience `wyrd`, subject,
   issued-at, expiry, unique token identity, principal, tenant, Card scope,
   credential attribution, delegation chain, informational roles, and one
@@ -228,22 +227,27 @@ credential.
 
 ### OAuth authorization server
 
-- Wyrd is the OAuth 2.0 authorization server for its own clients. It
-  implements only the authorization code grant with PKCE S256 at
-  `GET /auth/authorize` (RFC 6749 §4.1, RFC 7636), the device authorization
-  grant (RFC 8628), the refresh grant (RFC 6749 §6), revocation (RFC 7009),
-  token exchange (RFC 8693), JWT bearer assertions (RFC 7523), and RFC 8414
-  metadata at `/.well-known/oauth-authorization-server`.
-- Two clients are registered. `wyrd-ui`, the web app's backend-for-frontend,
-  is confidential and authenticates with `client_secret_basic`; the server
-  holds only SHA-256 digests of its secret. `wyrd-cli` is public. The
-  `wyrd-ui` redirect URI is fixed to `{public origin}/login/callback` and is
-  matched exactly.
-- An authorization code is stored by digest, expires within 60 seconds, is
-  single-use, and is bound to the client, redirect URI, PKCE challenge,
-  tenant, and principal. A device approval records only the approving
-  principal, tenant, and connection; tokens are minted when the code or
-  device code is redeemed, never stored awaiting pickup.
+- Wyrd is the OAuth 2.0 authorization server for its headless clients. Its
+  device authorization grant (RFC 8628), refresh grant (RFC 6749 §6),
+  revocation (RFC 7009), token exchange (RFC 8693), JWT bearer assertions
+  (RFC 7523), and RFC 8414 metadata at
+  `/.well-known/oauth-authorization-server` retain their machine-client
+  contracts. First-party browser login is the session boundary below, not an
+  additional OAuth authorization-code client. UI-only authorization/refresh
+  routes and advertised grants with no remaining consumer are retired; no
+  compatibility aliases or replacement client registration are introduced.
+- `wyrd-cli` is the public client used by CLI/SDK login. The first-party web
+  app is not a separate OAuth client: Rust owns its browser-session boundary.
+  A Node client secret or UI cookie-encryption key is not provisioned. Public
+  OAuth grant, client identification, redirect and refresh rules remain
+  explicit for their actual machine-client consumers; browser login does not
+  introduce a replacement OAuth client or relax exact provider callbacks.
+- Device approval records only the approving principal, tenant and
+  connection; tokens are minted on device-code redemption, never stored
+  awaiting pickup. Existing authorization-code records retain their history
+  and retention rules; retiring UI issuance does not delete those records.
+  Provider-side authorization codes are exchanged only through the existing
+  bound relying-party callback and never become browser session credentials.
 - The token, platform token, revocation, and device authorization endpoints
   take form-encoded bodies and answer with `Cache-Control: no-store`. Token
   success is the RFC 6749 §5.1 token response, device authorization success
@@ -254,12 +258,6 @@ credential.
   the one exception to `WyrdError` problem+json: a refusal converted from a
   `WyrdError` is logged under its Wyrd code, while a malformed form or
   client-identification refusal is answered directly with no Wyrd code.
-- The web app keeps a person's session in one Secure, HttpOnly,
-  SameSite=Lax cookie that it encrypts and that holds the refresh token (or,
-  for operator recovery sign-in, the API key). No token reaches page data,
-  URLs, or browser JavaScript. Logout clears the cookie and revokes the
-  refresh token best-effort; it does not end the IdP session, and an access
-  token the web app already cached stays valid until it expires.
 - Interactive CLI login rate limiting is an ingress concern: deployments
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
@@ -274,6 +272,77 @@ credential.
   settings. Gateway documents name provider keys as `local_env` sources the
   CLI resolves at apply time, and the server applies a composite document
   atomically, so a refused document commits nothing.
+
+### First-party browser sessions
+
+- Rust owns the complete browser-session lifecycle in the existing auth and
+  SQL owners. Node renders pages and forwards the selected tenant's cookie
+  and trusted public-origin context; it owns no durable session, OAuth code
+  exchange, refresh token, API key or credential encryption. The existing
+  database is the shared replica authority, with no additional secret/env
+  configuration, Redis, session service or sticky routing.
+- `POST /auth/browser/login` starts a tenant provider login and
+  `POST /auth/browser/api-key` verifies a recovery key before creating a
+  browser session. The existing provider callback finishes the exact bound
+  login transaction. State, nonce, PKCE, issuer, connection revision, public
+  origin and one-use completion remain validated by the same Rust owners as
+  device and connection-test login. Browser transaction cookies are opaque
+  bindings; no PKCE verifier is exposed to Node or browser storage. Login
+  transactions expire within five minutes. Post-login redirection is to the
+  resolved tenant's fixed signed-in path, never an arbitrary return URL.
+- Session identifiers use cryptographic randomness and are regenerated at
+  successful login. A host-only HttpOnly, SameSite=Lax cookie carries only
+  that identifier, not OAuth tokens, API keys or identity/permission claims.
+  Cookies are Secure in production; only the existing loopback-development
+  HTTP exception is permitted. Raw identifiers never enter database rows,
+  metadata, URLs, logs or traces. The record stores a one-way digest, tenant,
+  principal, twelve-hour absolute expiry, revocation and either the exact
+  human-connection revision or originating credential reference. There is
+  no sliding renewal and no recoverable credential vault. Database-owned
+  timestamps and tenant RLS govern the record; existing auth maintenance owns
+  expiry cleanup.
+- `GET /auth/browser/session` returns only safe tenant/principal/permission/
+  expiry metadata for presented live sessions; an optional tenant route key
+  filters those sessions, not their authority. Enumeration clears invalid or
+  expired cookies and returns only live per-tenant contexts, without merging
+  principals/permissions across tenants. A refused selected tenant never falls
+  back to another session. Store failure still refuses the whole request.
+  Cookie names and readable labels are never trusted as membership. No-session and invalid/expired/
+  revoked session is an authentication refusal, distinct from store
+  unavailability. `POST /auth/browser/logout` revokes only the selected tenant
+  session and clears its cookie. Recovery logout never revokes the API key or
+  other browser sessions; logout does not end the IdP session.
+- Every browser-session request checks current tenant/principal authority.
+  Human sessions require the exact Active connection revision. API-key-backed
+  sessions require a still-valid originating credential and preserve all its
+  effective-permission restrictions. Existing grant resolution, credential
+  attribution, permission checks and non-blocking audit are reused; no Node
+  role mapping, durable credential cache or fallback authority exists. Tenant
+  bearer verification remains local and synchronous until token expiry; this
+  session boundary does not change that contract.
+- The existing protected tenant `/v1` HTTP APIs explicitly accept cookie
+  sessions through their normal principal/permission boundary. Platform,
+  MCP, OTLP, gateway and gRPC routes do not inherit cookie authentication.
+  Tenant API cookie authentication requires exactly one selected session;
+  ambiguous multiple session cookies are refused, never first-cookie-wins.
+  Only the session-metadata enumeration accepts multiple tenant sessions.
+  When `X-Wyrd-Access-Token` is present, existing bearer rules always apply;
+  refusal never falls back to a cookie. Every cookie-authenticated mutation,
+  including login, recovery and logout, requires exact trusted public Origin;
+  missing or mismatched Origin is refused. The provider callback instead
+  requires its bound one-use transaction. Node validates incoming form/action
+  origin before forwarding and cannot replace a hostile or missing Origin
+  with trusted authority. SameSite and SvelteKit checks supplement, rather
+  than replace, Rust enforcement. Read-only GETs never mutate settings or log
+  out a session.
+- Session metadata and credential-bearing responses use
+  `Cache-Control: no-store`. Existing Wyrd error codes distinguish refused authority from
+  unavailable storage; a database outage cannot become anonymous, cached or
+  mock success. Cookie authentication is documented alongside bearer
+  authentication in served OpenAPI. UI-only OAuth issuance/renewal is retired
+  when its consumers move, without changing CLI/device, SDK, platform,
+  workload or provider-test behavior. Existing credential-bearing UI cookies
+  are cleared and require sign-in; there is no plaintext compatibility path.
 
 ### Delegation and federation
 

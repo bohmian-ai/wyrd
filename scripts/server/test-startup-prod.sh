@@ -118,6 +118,7 @@ mcp="$(curl -sS -N --max-time 30 -D - -H "x-wyrd-access-token: Bearer $token" \
   "$http/mcp")"
 grep -qi '^content-type: text/event-stream' <<<"$mcp" || fail "MCP did not stream: $mcp"
 grep -q '"supportedVersions":\["2026-07-28"\]' <<<"$mcp" || fail "MCP discovery returned no supported version: $mcp"
+ui_sign_in "$api_key"
 sdk_phase startup_image_write
 passed+=(startup_image_journey:write)
 

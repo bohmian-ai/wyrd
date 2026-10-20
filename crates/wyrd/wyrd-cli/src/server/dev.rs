@@ -92,6 +92,9 @@ struct DevInputs {
     bind: SocketAddr,
     /// Loopback public gRPC listener.
     grpc: SocketAddr,
+    /// Loopback listener of the UI's Node BFF (`WYRD_UI_BIND`);
+    /// `http://{ui}` is the browser's public origin.
+    ui: SocketAddr,
     /// Effective `WYRD_STORAGE_URL`.
     storage_url: String,
     /// Effective absolute `WYRD_BIFROST_DATA_DIR`.
@@ -110,22 +113,33 @@ struct DevInputs {
     configured: bool,
 }
 
-/// The CLI's owned foreground server, also settled after a failed startup.
+/// The production UI's adapter-node entry inside an installed release.
+const UI_ENTRY: &str = "ui/build/index.js";
+
+/// Oldest system Node.js major version the bundled UI is built and tested on.
+const NODE_MAJOR: u32 = 26;
+
+/// Recovery for an absent, failing, or older system `node`.
+const NODE_REQUIRED: &str =
+    "install Node.js 26 or newer as `node` on PATH and rerun; no server step has run";
+
+/// The CLI's owned foreground server and production UI, also settled after a
+/// failed startup.
 struct DevServer {
     /// Verified installation selected without updating an existing release.
     installed: InstalledServer,
     /// Resolved inputs every child receives and restarts reuse.
     inputs: DevInputs,
-    /// HTTP endpoint shared by setup, readiness, clients, and MCP hosts.
+    /// HTTP endpoint shared by setup, readiness, clients, MCP hosts, and the UI.
     endpoint: String,
-    /// macOS memory detected once and supplied only to child processes.
-    memory: Option<String>,
     /// Retained local deployment sealing key every child receives as
     /// `WYRD_SEALING_KEY_FILE`, in place of any caller-supplied source.
     sealing_key: PathBuf,
     /// Serving child retained across readiness, setup, and foreground waiting.
     child: Option<Child>,
-    /// Destination of progress notices and the serving child's output.
+    /// UI child started after the server is ready and settled with it.
+    ui: Option<Child>,
+    /// Destination of progress notices and both children's output.
     diagnostics: Diagnostics,
 }
 
@@ -233,6 +247,8 @@ struct DevReady {
     endpoint: String,
     /// Public gRPC endpoint saved for fresh clients.
     grpc: String,
+    /// Browser origin of the production UI.
+    ui: String,
     /// Served tenant.
     tenant: String,
     /// Storage URL without userinfo, query, or fragment.
@@ -257,10 +273,11 @@ impl DevReady {
             .as_deref()
             .map_or_else(String::new, |dir| dir.display().to_string());
         println!(
-            "Local Wyrd ready at {} for tenant {}.\n  gRPC: {}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
+            "Local Wyrd ready at {} for tenant {}.\n  gRPC: {}\n  UI: {}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
             self.endpoint,
             self.tenant,
             self.grpc,
+            self.ui,
             self.storage_url,
             self.bifrost_data_dir.display(),
             self.gateway,
@@ -287,7 +304,8 @@ impl DevArgs {
     /// Compose local setup and remain attached until interruption or exit.
     ///
     /// # Errors
-    /// Refuses invalid local inputs, an incompatible release, failed server
+    /// Refuses invalid local inputs, an incomplete active installation (with
+    /// its removal recovery), an incompatible release, failed server
     /// operations, unsafe storage, unusable saved credentials, or failed hosts.
     /// Committed migration/provisioning steps remain on failure; reruns never
     /// reissue an active tenant's key. Interruption is observed from before
@@ -319,7 +337,7 @@ impl DevArgs {
                 return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
             }
             installed = async {
-                match installer.installed() {
+                match installer.installed()? {
                     Some(installed) => Ok(installed),
                     None => installer.install().await,
                 }
@@ -384,6 +402,11 @@ impl DevArgs {
             ),
             "127.0.0.1:50051",
             "--grpc-bind / WYRD_GRPC_BIND must be a loopback socket address with a nonzero port",
+        )?;
+        let ui = loopback(
+            first(None, "WYRD_UI_BIND", None),
+            "127.0.0.1:3000",
+            "WYRD_UI_BIND must be a loopback socket address with a nonzero port",
         )?;
         if let Some(storage) = &self.storage_url
             && !url::Url::parse(storage).is_ok_and(|url| {
@@ -531,6 +554,7 @@ impl DevArgs {
             tenant,
             bind,
             grpc,
+            ui,
             storage_url,
             bifrost,
             gateway,
@@ -640,8 +664,8 @@ fn local_data(
 }
 
 impl DevServer {
-    /// Retain a compatible installed binary, its loopback listener settings,
-    /// and the local sealing key every child receives.
+    /// Retain a compatible installed release, its loopback listener settings,
+    /// and the local sealing key every server child receives.
     ///
     /// # Errors
     /// Refuses a release outside the CLI's supported version line.
@@ -666,9 +690,9 @@ impl DevServer {
             installed,
             endpoint: format!("http://{}", inputs.bind),
             inputs,
-            memory: None,
             sealing_key,
             child: None,
+            ui: None,
             diagnostics,
         })
     }
@@ -692,13 +716,55 @@ impl DevServer {
         if let Some(platform) = &inputs.platform_database {
             command.env("WYRD_PLATFORM_DATABASE_URL", platform.expose_secret());
         }
-        if let Some(memory) = &self.memory {
-            command.env("WYRD_BIFROST_MEMORY_LIMIT_BYTES", memory);
-        }
         command
             .env("WYRD_SEALING_KEY_FILE", &self.sealing_key)
             .env_remove("WYRD_SEALING_KEY_BASE64");
         command
+    }
+
+    /// Construct the UI child: the installed adapter-node build on the system
+    /// Node, listening on the UI bind with that address as its trusted public
+    /// origin, so forwarded headers are never consulted, and calling the
+    /// server at its loopback endpoint.
+    fn ui_command(&self) -> Command {
+        let ui = self.inputs.ui;
+        let mut command = Command::new("node");
+        command
+            .arg(self.installed.dir.join(UI_ENTRY))
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .env("HOST", ui.ip().to_string())
+            .env("PORT", ui.port().to_string())
+            .env("ORIGIN", format!("http://{ui}"))
+            .env("WYRD_SERVER_URL", &self.endpoint);
+        command
+    }
+
+    /// Refuse an installed release without the production UI, or an absent,
+    /// failing, or pre-[`NODE_MAJOR`] system `node`, before any server step.
+    ///
+    /// # Errors
+    /// Returns the `ui` stage with install or Node.js guidance.
+    async fn check_ui(&self) -> Result<(), WyrdCliError> {
+        if !self.installed.dir.join(UI_ENTRY).is_file() {
+            return Err(dev_error(
+                "ui",
+                "the installed release has no production UI; run `wyrd server install` and rerun; no server step has run",
+            ));
+        }
+        let version = Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|_| dev_error("ui", NODE_REQUIRED))?;
+        let major = String::from_utf8_lossy(&version.stdout)
+            .trim()
+            .strip_prefix('v')
+            .and_then(|version| version.split('.').next()?.parse::<u32>().ok());
+        if !version.status.success() || major.is_none_or(|major| major < NODE_MAJOR) {
+            return Err(dev_error("ui", NODE_REQUIRED));
+        }
+        Ok(())
     }
 
     /// Migrate, serve, save settings, provision, persist, authenticate a new
@@ -711,17 +777,17 @@ impl DevServer {
     /// provisioning so a protected-file failure surfaces before a one-time
     /// key is issued. Only first setup offers the
     /// gateway and detected hosts; `configured` restarts skip both offers
-    /// unless a gateway file or hosts were selected explicitly. The serving
-    /// child stays observed during every offer: its exit cancels any
-    /// unanswered question.
+    /// unless a gateway file or hosts were selected explicitly. Both children
+    /// stay observed during every offer: either exit cancels any unanswered
+    /// question.
     ///
     /// # Errors
     /// Returns a stage-specific recovery message without child secret output.
-    /// Committed server operations survive a failed later stage. The child
-    /// remains owned by this handle and is settled by `stop` on every exit.
+    /// Committed server operations survive a failed later stage. The children
+    /// remain owned by this handle and are settled by `stop` on every exit.
     ///
     /// # Panics
-    /// Panics if the serving child is not retained after readiness.
+    /// Panics if either child is not retained after readiness.
     async fn run(
         &mut self,
         hosts: &[McpHost],
@@ -746,6 +812,7 @@ impl DevServer {
         let client = saved_client(&self.endpoint, &grpc).await?;
         let Self {
             child,
+            ui,
             endpoint,
             inputs,
             diagnostics,
@@ -754,15 +821,16 @@ impl DevServer {
         let child = child
             .as_mut()
             .expect("the server is retained after readiness");
+        let ui = ui.as_mut().expect("the UI is retained after readiness");
         let gateway = tokio::select! {
             configured = inputs.configure_gateway(client, diagnostics) => configured?,
-            exited = Self::exited(child) => return exited,
+            exited = Self::exited(child, ui) => return exited,
         };
         let offer = !inputs.configured || !hosts.is_empty();
         let mcp = if offer {
             tokio::select! {
                 offered = mcp::offer_local(hosts, endpoint, inputs.interactive) => offered?,
-                exited = Self::exited(child) => return exited,
+                exited = Self::exited(child, ui) => return exited,
             }
         } else {
             None
@@ -781,6 +849,7 @@ impl DevServer {
             ready: true,
             endpoint: endpoint.clone(),
             grpc: format!("http://{}", inputs.grpc),
+            ui: format!("http://{}", inputs.ui),
             tenant: inputs.tenant.to_string(),
             storage_url: redacted(&inputs.storage_url),
             bifrost_data_dir: inputs.bifrost.clone(),
@@ -800,7 +869,7 @@ impl DevServer {
             ),
         }
         drop(ready);
-        Self::exited(child).await
+        Self::exited(child, ui).await
     }
 
     /// Save the resolved settings and database URLs through the protected
@@ -893,58 +962,39 @@ impl DevServer {
         ))
     }
 
-    /// Reserve HTTP through migration, then start and await the ordinary server.
+    /// Check the UI prerequisites, reserve both HTTP listeners through
+    /// migration, then start and await the ordinary server and, once it is
+    /// ready, the UI.
     ///
     /// # Errors
-    /// Refuses occupied listeners, invalid memory input, migration, or readiness.
-    /// Cancellation leaves committed migrations intact and the child owned here.
+    /// Refuses a missing UI or Node.js, occupied listeners, migration, or
+    /// readiness. Cancellation leaves committed migrations intact and the
+    /// children owned here.
     async fn start(&mut self) -> Result<(), WyrdCliError> {
+        self.check_ui().await?;
         let reservation = std::net::TcpListener::bind(self.inputs.bind)
             .map_err(|_| dev_error("listener", "WYRD_SERVER_BIND is occupied or unavailable; stop the other listener or choose another loopback port"))?;
-        self.detect_memory().await?;
+        let ui_reservation = std::net::TcpListener::bind(self.inputs.ui)
+            .map_err(|_| dev_error("listener", "WYRD_UI_BIND is occupied or unavailable; stop the other listener or choose another loopback port"))?;
         self.migrate().await?;
         drop(reservation);
         let mut command = self.command();
         self.diagnostics.attach(&mut command)?;
-        self.child = Some(command.spawn().map_err(|_| {
+        let child = self.child.insert(command.spawn().map_err(|_| {
             dev_error(
                 "startup",
                 "check the installed server and listener availability, then rerun",
             )
         })?);
-        self.ready().await
-    }
-
-    /// Supply macOS host memory only when the caller supplied no limit.
-    ///
-    /// # Errors
-    /// Returns redacted guidance if the operating-system probe fails.
-    async fn detect_memory(&mut self) -> Result<(), WyrdCliError> {
-        if cfg!(target_os = "macos")
-            && Environment::Process
-                .var("WYRD_BIFROST_MEMORY_LIMIT_BYTES")
-                .is_none()
-        {
-            let output = Command::new("sysctl")
-                .args(["-n", "hw.memsize"])
-                .output()
-                .await
-                .map_err(|_| {
-                    dev_error(
-                        "memory",
-                        "set WYRD_BIFROST_MEMORY_LIMIT_BYTES to this machine's usable memory",
-                    )
-                })?;
-            let memory = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !output.status.success() || !memory.parse::<u64>().is_ok_and(|bytes| bytes > 0) {
-                return Err(dev_error(
-                    "memory",
-                    "set WYRD_BIFROST_MEMORY_LIMIT_BYTES to this machine's usable memory",
-                ));
-            }
-            self.memory = Some(memory);
-        }
-        Ok(())
+        Self::ready(child, &format!("{}/readyz", self.endpoint)).await?;
+        drop(ui_reservation);
+        let mut command = self.ui_command();
+        self.diagnostics.attach(&mut command)?;
+        let ui =
+            self.ui.insert(command.spawn().map_err(|_| {
+                dev_error("startup", "check the installed UI and Node.js, then rerun")
+            })?);
+        Self::ready(ui, &format!("http://{}/", self.inputs.ui)).await
     }
 
     /// Invoke the installed server's durable migration owner without its output.
@@ -1007,13 +1057,18 @@ impl DevServer {
         ProvisionedTenant::parse(printed.expose_secret())
     }
 
-    /// Observe the owned foreground server; every unsolicited exit is a failure.
-    /// The reaped status stays cached on `child`, so `stop` still settles it.
+    /// Observe the owned server and UI; every unsolicited exit of either is a
+    /// failure. Reaped statuses stay cached on the children, so `stop` still
+    /// settles both.
     ///
     /// # Errors
-    /// Returns redacted recovery guidance if waiting fails or the server exits.
-    async fn exited(child: &mut Child) -> Result<ExitCode, WyrdCliError> {
-        child.wait().await.map_err(|_| {
+    /// Returns redacted recovery guidance if waiting fails or a child exits.
+    async fn exited(server: &mut Child, ui: &mut Child) -> Result<ExitCode, WyrdCliError> {
+        tokio::select! {
+            waited = server.wait() => waited,
+            waited = ui.wait() => waited,
+        }
+        .map_err(|_| {
             dev_error(
                 "server exit",
                 "rerun; saved client configuration and committed server state remain",
@@ -1021,89 +1076,101 @@ impl DevServer {
         })?;
         Err(dev_error(
             "server exit",
-            "the foreground server exited; rerun with the same tenant and configuration directory",
+            "the foreground server or UI exited; rerun with the same tenant and configuration directory",
         ))
     }
 
-    /// Wait for this child to become ready, refusing an occupied listener.
+    /// Wait for `child` to answer a successful `GET url`, refusing an occupied
+    /// listener: a child that exits first fails readiness.
     ///
     /// # Errors
     /// Returns a redacted readiness failure if the child exits or is not ready
     /// within the existing two-minute local-server readiness budget.
-    ///
-    /// # Panics
-    /// Panics if called before `start` has spawned and retained the child.
-    async fn ready(&mut self) -> Result<(), WyrdCliError> {
+    async fn ready(child: &mut Child, url: &str) -> Result<(), WyrdCliError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| dev_error("readiness", "check local HTTP connectivity and rerun"))?;
         tokio::time::timeout(Duration::from_mins(2), async {
             loop {
-                if self.child.as_mut().expect("readiness follows spawn").try_wait()
-                    .map_err(|_| dev_error("readiness", "the server could not be observed; rerun"))?.is_some() {
-                    return Err(dev_error("readiness", "the server exited before readiness; inspect its redacted diagnostics and rerun"));
+                if child.try_wait()
+                    .map_err(|_| dev_error("readiness", "the server or UI could not be observed; rerun"))?.is_some() {
+                    return Err(dev_error("readiness", "the server or UI exited before readiness; inspect its redacted diagnostics and rerun"));
                 }
-                if http.get(format!("{}/readyz", self.endpoint)).send().await
+                if http.get(url).send().await
                     .is_ok_and(|response| response.status().is_success()) {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        }).await.map_err(|_| dev_error("readiness", "the server did not become ready within two minutes; inspect its diagnostics and rerun"))?
+        }).await.map_err(|_| dev_error("readiness", "the server or UI did not become ready within two minutes; inspect its diagnostics and rerun"))?
     }
 
-    /// Forward termination and reap the child before returning to the caller.
+    /// Settle the UI and the server together before returning to the caller.
     ///
     /// # Errors
-    /// Returns a shutdown failure if signalling or reaping fails. A child
-    /// exceeding the server's 35-second drain budget plus ten-second grace is
-    /// killed and reaped; it cannot remain detached from the CLI.
+    /// Returns the first shutdown failure; both children are still settled.
     async fn stop(&mut self) -> Result<(), WyrdCliError> {
-        let Some(mut child) = self.child.take() else {
-            return Ok(());
-        };
-        if let Some(pid) = child.id() {
-            let signalled = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status()
-                .await
-                .map_err(|_| {
-                    dev_error(
-                        "shutdown",
-                        "the server could not be signalled; stop it before rerunning",
-                    )
-                })?;
-            if !signalled.success()
-                && child
-                    .try_wait()
-                    .map_err(|_| dev_error("shutdown", "the server could not be observed"))?
-                    .is_none()
-            {
-                child.kill().await.map_err(|_| {
-                    dev_error("shutdown", "stop the remaining server before rerunning")
-                })?;
-            }
-        }
-        if let Ok(result) = tokio::time::timeout(Duration::from_secs(45), child.wait()).await {
-            result.map_err(|_| {
+        let (ui, server) = tokio::join!(settle(self.ui.take()), settle(self.child.take()));
+        ui.and(server)
+    }
+}
+
+/// Forward termination to an owned child and reap it.
+///
+/// # Errors
+/// Returns a shutdown failure if signalling or reaping fails. A child
+/// exceeding the server's 35-second drain budget plus ten-second grace is
+/// killed and reaped; it cannot remain detached from the CLI.
+async fn settle(child: Option<Child>) -> Result<(), WyrdCliError> {
+    let Some(mut child) = child else {
+        return Ok(());
+    };
+    if let Some(pid) = child.id() {
+        let signalled = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .await
+            .map_err(|_| {
                 dev_error(
                     "shutdown",
-                    "the server could not be reaped; stop it before rerunning",
+                    "the server or UI could not be signalled; stop it before rerunning",
                 )
             })?;
-        } else {
-            child
-                .kill()
-                .await
-                .map_err(|_| dev_error("shutdown", "stop the remaining server before rerunning"))?;
-            return Err(dev_error(
-                "shutdown",
-                "the server exceeded its drain deadline and was killed; rerun with the same configuration",
-            ));
+        if !signalled.success()
+            && child
+                .try_wait()
+                .map_err(|_| dev_error("shutdown", "the server or UI could not be observed"))?
+                .is_none()
+        {
+            child.kill().await.map_err(|_| {
+                dev_error(
+                    "shutdown",
+                    "stop the remaining server or UI before rerunning",
+                )
+            })?;
         }
-        Ok(())
     }
+    if let Ok(result) = tokio::time::timeout(Duration::from_secs(45), child.wait()).await {
+        result.map_err(|_| {
+            dev_error(
+                "shutdown",
+                "the server or UI could not be reaped; stop it before rerunning",
+            )
+        })?;
+    } else {
+        child.kill().await.map_err(|_| {
+            dev_error(
+                "shutdown",
+                "stop the remaining server or UI before rerunning",
+            )
+        })?;
+        return Err(dev_error(
+            "shutdown",
+            "the server or UI exceeded its drain deadline and was killed; rerun with the same configuration",
+        ));
+    }
+    Ok(())
 }
 
 /// Server-derived tenant identity and its optional one-time credential.

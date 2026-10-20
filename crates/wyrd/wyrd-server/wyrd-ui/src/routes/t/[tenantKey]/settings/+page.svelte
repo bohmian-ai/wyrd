@@ -1,8 +1,5 @@
 <script lang="ts">
   import type { PageProps } from './$types';
-  import Panel from '$lib/components/Panel.svelte';
-  import Badge from '$lib/components/Badge.svelte';
-  import StateBlock from '$lib/components/StateBlock.svelte';
   let { data, form }: PageProps = $props();
   let connections = $derived(data.connections);
   let candidate = $derived(connections?.candidate ?? null);
@@ -24,21 +21,35 @@
 </div>
 
 {#if form?.problem}
-  <div role="alert"><StateBlock state={form.problem.status === 403 ? 'unauthorized' : 'error'} title={form.problem.title} detail={form.problem.remediation} code={form.problem.code} /></div>
+  <div class="app-problem" role="alert" data-state={form.problem.status === 403 ? 'unauthorized' : 'error'}>
+    <strong>{form.problem.status === 403 ? '⊘' : '✕'} {form.problem.title}</strong>
+    <p>{form.problem.remediation}</p>
+    <code>{form.problem.code}</code>
+  </div>
 {/if}
 
 {#if data.problem?.status === 403}
-  <StateBlock state="unauthorized" title="You can't manage sign-in for this tenant" detail="Managing the SSO connection requires the identity_connections:write permission." code={data.problem.code} />
+  <div class="app-problem" data-state="unauthorized">
+    <strong>⊘ You can't manage sign-in for this tenant</strong>
+    <p>Managing the SSO connection requires the identity_connections:write permission.</p>
+    <code>{data.problem.code}</code>
+  </div>
 {:else if data.problem}
-  <StateBlock state="error" title="Settings are unavailable" detail={data.problem.remediation} code={data.problem.code} />
+  <div class="app-problem" data-state="error">
+    <strong>✕ Settings are unavailable</strong>
+    <p>{data.problem.remediation}</p>
+    <code>{data.problem.code}</code>
+  </div>
 {:else if connections}
   <div class="grid">
-    <Panel title="Callback URL">
+    <section>
+      <h2>Callback URL</h2>
       <p>Register this exact redirect URI with your identity provider's Web application.</p>
       <code>{connections.callback_url}</code>
-    </Panel>
+    </section>
 
-    <Panel title="Active connection">
+    <section>
+      <h2>Active connection</h2>
       {#if connections.active}
         {@const active = connections.active}
         <dl>
@@ -58,17 +69,21 @@
           </form>
         </div>
       {:else}
-        <StateBlock state="absent" title="No active connection" detail="Sign-in for this tenant uses API keys until a tested candidate is activated." />
+        <div class="app-problem" data-state="absent">
+          <strong>– No active connection</strong>
+          <p>Sign-in for this tenant uses API keys until a tested candidate is activated.</p>
+        </div>
       {/if}
-    </Panel>
+    </section>
 
-    <Panel title="Candidate connection" variant="accent">
+    <section>
+      <h2>Candidate connection</h2>
       {#if candidate}
         <dl>
           <dt>Issuer</dt><dd>{candidate.issuer}</dd>
           <dt>Client ID</dt><dd>{candidate.client_id}</dd>
           <dt>Revision</dt><dd>{candidate.revision}</dd>
-          <dt>Test</dt><dd><Badge tone={tested ? 'ok' : 'warn'}>{tested ? `Passed · until ${candidate.tested_until}` : 'Not tested'}</Badge></dd>
+          <dt>Test</dt><dd class:ok={tested} class:warn={!tested}>{tested ? `✓ Passed · until ${candidate.tested_until}` : '! Not tested'}</dd>
         </dl>
         <div class="row">
           <form method="POST" action="?/test">
@@ -112,7 +127,7 @@
         <textarea id="group-roles" class="app-input" name="groupRoles" rows="4">{candidate ? roles(candidate.group_role_map) : ''}</textarea>
         <button class="app-control primary" type="submit">{candidate ? 'Replace candidate' : 'Stage candidate'}</button>
       </form>
-    </Panel>
+    </section>
   </div>
 {/if}
 
@@ -120,10 +135,23 @@
   .heading {
     margin-bottom: 20px;
   }
+  h1 {
+    font: var(--weight-strong) 24px var(--font-sans);
+  }
   .grid {
     display: grid;
     gap: 20px;
     max-width: 760px;
+  }
+  section {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
+  }
+  h2 {
+    margin: 0 0 12px;
+    font: var(--weight-strong) 13px var(--font-sans);
   }
   dl {
     display: grid;
@@ -138,6 +166,12 @@
   dd {
     margin: 0;
     overflow-wrap: anywhere;
+  }
+  .ok {
+    color: var(--ok);
+  }
+  .warn {
+    color: var(--warn);
   }
   code {
     font: 12px var(--font-mono);
@@ -154,7 +188,7 @@
     gap: 8px;
     margin-top: 16px;
     padding-top: 16px;
-    border-top: 2px dashed var(--border);
+    border-top: 1px dashed var(--border);
   }
   label {
     font: 700 11px var(--font-mono);

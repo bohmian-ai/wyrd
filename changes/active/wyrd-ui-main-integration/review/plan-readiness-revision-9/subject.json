@@ -1,0 +1,8 @@
+{
+  "gate": "Spec",
+  "spec_revision": 9,
+  "spec_sha256": "c42dac36664b55b93af964ad839de4891a7ddfa4651e789cf3702ea9f54563b2",
+  "source_commit": "8651b96fd0c049ab5e63b0606c98326af1fc8848",
+  "task_coverage": null,
+  "scope": "Independent static spec readiness re-review; no replacement tasks exist"
+}

@@ -1,7 +1,7 @@
 //! OAuth 2.0 authorization-server wire contracts.
 //!
 //! `POST /auth/token` takes `application/x-www-form-urlencoded` parameters
-//! (RFC 6749 §4.1.3, §6; RFC 8628 §3.4; RFC 8693 §2.1; RFC 7523 §2.1) and
+//! (RFC 6749 §6; RFC 8628 §3.4; RFC 8693 §2.1; RFC 7523 §2.1) and
 //! answers the RFC 6749 §5.1 [`TokenResponse`] or the §5.2
 //! [`OAuthErrorResponse`]. Unrecognized parameters are ignored (RFC 6749
 //! §3.2). The client is identified by HTTP Basic authentication or the
@@ -17,17 +17,6 @@ use crate::ids::TenantSlug;
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "grant_type")]
 pub enum TokenRequest {
-    /// RFC 6749 §4.1.3: redeem a Wyrd authorization code with its PKCE
-    /// verifier (RFC 7636 §4.5).
-    #[serde(rename = "authorization_code")]
-    AuthorizationCode {
-        /// The code `GET /auth/authorize` returned to the redirect URI.
-        code: SecretBearer,
-        /// The exact redirect URI the authorization request carried.
-        redirect_uri: String,
-        /// The PKCE code verifier whose S256 challenge the request carried.
-        code_verifier: SecretBearer,
-    },
     /// RFC 6749 §6: renew a human session.
     #[serde(rename = "refresh_token")]
     RefreshToken {
@@ -120,11 +109,9 @@ pub struct TokenResponse {
     pub token_type: TokenType,
     /// Seconds until the access token expires.
     pub expires_in: u64,
-    /// Refresh token. Issued only for a human session: at authorization-code
-    /// and device-code redemption, and when `wyrd-cli` rotates its refresh
-    /// token. `wyrd-ui` keeps presenting its original refresh token, and no
-    /// machine grant issues one: those clients re-present their durable
-    /// credential instead.
+    /// Refresh token. Issued only for a `wyrd-cli` human session: at
+    /// device-code redemption and whenever it rotates. No machine grant
+    /// issues one: those clients re-present their durable credential instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<SecretBearer>,
     /// RFC 8693 §2.2.1 type of the issued token; present on token-exchange
@@ -146,10 +133,6 @@ pub enum TokenType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum OAuthClientId {
-    /// The UI's backend-for-frontend: a confidential client authenticating
-    /// with `client_secret_basic` (RFC 6749 §2.3.1).
-    #[serde(rename = "wyrd-ui")]
-    WyrdUi,
     /// The CLI and SDK saved logins: a public client.
     #[serde(rename = "wyrd-cli")]
     WyrdCli,
@@ -160,7 +143,6 @@ impl OAuthClientId {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::WyrdUi => "wyrd-ui",
             Self::WyrdCli => "wyrd-cli",
         }
     }
@@ -169,7 +151,6 @@ impl OAuthClientId {
     #[must_use]
     pub fn parse(client_id: &str) -> Option<Self> {
         match client_id {
-            "wyrd-ui" => Some(Self::WyrdUi),
             "wyrd-cli" => Some(Self::WyrdCli),
             _ => None,
         }
@@ -230,24 +211,21 @@ pub struct OAuthErrorResponse {
 pub struct AuthorizationServerMetadata {
     /// The deployment's public origin.
     pub issuer: AbsoluteUrl,
-    /// `GET /auth/authorize`.
-    pub authorization_endpoint: AbsoluteUrl,
     /// `POST /auth/token`.
     pub token_endpoint: AbsoluteUrl,
     /// RFC 8628 §4: `POST /auth/device_authorization`.
     pub device_authorization_endpoint: AbsoluteUrl,
     /// RFC 7009: `POST /auth/revoke`.
     pub revocation_endpoint: AbsoluteUrl,
-    /// `["code"]`.
+    /// Empty: no grant uses an authorization endpoint, so none is published
+    /// (RFC 8414 §2).
     pub response_types_supported: Vec<String>,
     /// Every grant `POST /auth/token` accepts.
     pub grant_types_supported: Vec<String>,
-    /// `client_secret_basic` for `wyrd-ui` and `none` for `wyrd-cli`.
+    /// `["none"]`: `wyrd-cli` is a public client.
     pub token_endpoint_auth_methods_supported: Vec<String>,
     /// The same methods at the revocation endpoint.
     pub revocation_endpoint_auth_methods_supported: Vec<String>,
-    /// `["S256"]`.
-    pub code_challenge_methods_supported: Vec<String>,
 }
 
 #[cfg(test)]
@@ -280,21 +258,6 @@ mod tests {
     fn grants_decode_from_rfc_parameters() {
         assert_eq!(
             parse(&[
-                ("grant_type", "authorization_code"),
-                ("code", "c"),
-                ("redirect_uri", "https://wyrd.example.com/login/callback"),
-                ("code_verifier", "v"),
-                ("client_id", "wyrd-ui"),
-            ])
-            .expect("code grant decodes"),
-            TokenRequest::AuthorizationCode {
-                code: SecretBearer::new("c".to_owned()),
-                redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
-                code_verifier: SecretBearer::new("v".to_owned()),
-            }
-        );
-        assert_eq!(
-            parse(&[
                 (
                     "grant_type",
                     "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -323,6 +286,16 @@ mod tests {
             }
         );
         assert!(parse(&[("grant_type", "password"), ("username", "u")]).is_err());
+        assert!(
+            parse(&[
+                ("grant_type", "authorization_code"),
+                ("code", "c"),
+                ("redirect_uri", "https://wyrd.example.com/login/callback"),
+                ("code_verifier", "v"),
+            ])
+            .is_err(),
+            "the retired browser code grant does not decode"
+        );
         assert!(parse(&[("grant_type", "wyrd_api_key"), ("api_key", "k")]).is_err());
     }
 
@@ -365,7 +338,8 @@ mod tests {
             OAuthClientId::parse("wyrd-cli"),
             Some(OAuthClientId::WyrdCli)
         );
-        assert_eq!(OAuthClientId::WyrdUi.as_str(), "wyrd-ui");
+        assert_eq!(OAuthClientId::WyrdCli.as_str(), "wyrd-cli");
+        assert_eq!(OAuthClientId::parse("wyrd-ui"), None);
         assert_eq!(OAuthClientId::parse("other"), None);
     }
 

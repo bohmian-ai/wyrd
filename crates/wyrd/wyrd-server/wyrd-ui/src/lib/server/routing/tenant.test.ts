@@ -1,15 +1,11 @@
 // @vitest-environment node
-import { env } from '$env/dynamic/private';
-import { mockDataEnabled } from '../development';
 import { expect, test, vi } from 'vitest';
 import { LocalSessions, sessions } from '../auth/session';
-import { WyrdClient } from '../wyrd';
 import { problem } from '../problem';
-import { load as homeLoad } from '../../../routes/t/[tenantKey]/+page.server';
 import { load as rootLoad, actions } from '../../../routes/+page.server';
 
 vi.mock('$env/dynamic/private', () => ({
-  env: { WYRD_UI_LOCAL_AUTH: 'true', WYRD_UI_MOCK_DATA: 'true' }
+  env: { WYRD_UI_LOCAL_AUTH: 'true' }
 }));
 
 test('root resolves zero, one and many tenants, using only an authorized recent selection', () => {
@@ -26,37 +22,6 @@ test('root resolves zero, one and many tenants, using only an authorized recent 
   expect(sessions.destination(session!)).toBe('/t/acme');
   session!.memberships.length = 0;
   expect(sessions.destination(session!)).toBeNull();
-});
-
-test('Home load preserves safe canonical problems and never serializes upstream diagnostics', async () => {
-  const sessions = new LocalSessions();
-  const { session } = sessions.read(sessions.create());
-  const wyrd = new WyrdClient(sessions.bind(session!, 'acme'), true);
-  const event = { locals: { wyrd }, setHeaders: vi.fn() } as unknown as Parameters<
-    typeof homeLoad
-  >[0];
-  vi.spyOn(wyrd, 'home').mockImplementation(() => {
-    throw {
-      code: 'WYRD_SPEC_502_UPSTREAM_FAILURE',
-      status: 502,
-      title: 'secret host',
-      detail: 'Bearer private-token',
-      details: { connection: 'private database' }
-    };
-  });
-  const result = await homeLoad(event);
-  expect(result).toMatchObject({
-    home: null,
-    problem: { code: 'WYRD_SPEC_502_UPSTREAM_FAILURE', status: 502 }
-  });
-  expect(JSON.stringify(result)).not.toMatch(/private|secret|Bearer/);
-  vi.mocked(wyrd.home).mockImplementation(() => {
-    throw new Error('secret connection');
-  });
-  expect(await homeLoad(event)).toMatchObject({
-    home: null,
-    problem: { code: 'WYRD_SPEC_500_INTERNAL' }
-  });
 });
 
 test('switching revalidates membership and keeps other tabs bound to their URL', () => {
@@ -113,7 +78,7 @@ test('real root load and actions handle tenant counts, challenge, and least priv
   const request = new Request('http://localhost/', { method: 'GET' });
   const ready = (async () => new Response('ok')) as unknown as typeof fetch;
   const loadEvent = {
-    locals: { session, sessionProblem: null, mockData: false },
+    locals: { session, sessionProblem: null },
     request,
     url: new URL(request.url),
     fetch: ready
@@ -151,50 +116,10 @@ test('real root load and actions handle tenant counts, challenge, and least priv
     await expect(rootLoad(loadEvent)).rejects.toBeDefined();
     session!.memberships.splice(1);
     await expect(rootLoad(loadEvent)).rejects.toMatchObject({ status: 302, location: '/t/acme' });
-    const wyrd = new WyrdClient(sessions.bind(session!, 'acme'), true);
-    session!.memberships[0].permissions = [];
-    const denied = new WyrdClient(sessions.bind(session!, 'acme'), true);
-    await expect(
-      homeLoad({ locals: { wyrd: denied } } as Parameters<typeof homeLoad>[0])
-    ).rejects.toMatchObject({ status: 403 });
-    expect(wyrd.home().attention.length).toBeGreaterThan(0);
     session!.memberships.length = 0;
     expect(await rootLoad(loadEvent)).toMatchObject({ session: { tenants: [] } });
   } finally {
     delete sessions.principal.memberships[1].requiresReauthentication;
     sessions.remove(id);
-  }
-});
-
-test('Home cannot reveal observation summaries with only Card read permission', () => {
-  const sessions = new LocalSessions();
-  const { session } = sessions.read(sessions.create());
-  session!.memberships[0].permissions = ['cards:read'];
-  const wyrd = new WyrdClient(sessions.bind(session!, 'acme'), true);
-  expect(() => wyrd.home()).toThrow(expect.objectContaining({ status: 403 }));
-});
-
-test('mock data must be explicitly enabled and never falls back when disabled', async () => {
-  const local = new LocalSessions();
-  const { session } = local.read(local.create());
-  const context = local.bind(session!, 'acme');
-  const wyrd = new WyrdClient(context, true);
-  const event = { locals: { wyrd }, setHeaders: vi.fn() } as unknown as Parameters<
-    typeof homeLoad
-  >[0];
-  try {
-    for (const setting of ['false', '', undefined]) {
-      (env as Record<string, string | undefined>).WYRD_UI_MOCK_DATA = setting;
-      event.locals.wyrd = new WyrdClient(context, mockDataEnabled({ get: () => undefined }));
-      expect(await homeLoad(event)).toMatchObject({
-        home: null,
-        problem: { code: 'WYRD_SPEC_502_UPSTREAM_FAILURE' }
-      });
-    }
-    env.WYRD_UI_MOCK_DATA = 'true';
-    event.locals.wyrd = new WyrdClient(context, mockDataEnabled({ get: () => undefined }));
-    expect((await homeLoad(event))?.home?.changes).toHaveLength(5);
-  } finally {
-    env.WYRD_UI_MOCK_DATA = 'true';
   }
 });

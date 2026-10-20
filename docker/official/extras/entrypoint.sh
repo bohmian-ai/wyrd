@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run wyrd-server and nginx; exit when either of them exits.
+# Run wyrd-server, the production UI's Node BFF, and nginx; exit when any of
+# them exits.
 #
 # `wyrd-server migrate` and `wyrd-server setup` run as one-off commands against
 # the same image (`docker run ... wyrd-server migrate`), never from here.
@@ -27,7 +28,15 @@ trap 'kill -TERM "${pids[@]}" 2>/dev/null; wait' TERM INT
 pids+=($!)
 wait_for_port "${WYRD_SERVER_BIND##*:}" wyrd-server "${pids[0]}"
 
-envsubst '${WYRD_SERVER_BIND} ${WYRD_GRPC_BIND}' \
+# nginx states the public origin in X-Forwarded-*; the BFF trusts only that.
+HOST="${WYRD_UI_BIND%:*}" PORT="${WYRD_UI_BIND##*:}" \
+  PROTOCOL_HEADER=x-forwarded-proto HOST_HEADER=x-forwarded-host \
+  WYRD_SERVER_URL="http://${WYRD_SERVER_BIND}" \
+  node /app/ui/build/index.js &
+pids+=($!)
+wait_for_port "${WYRD_UI_BIND##*:}" wyrd-ui "${pids[1]}"
+
+envsubst '${WYRD_SERVER_BIND} ${WYRD_GRPC_BIND} ${WYRD_UI_BIND}' \
   </etc/nginx/nginx.conf.template >/etc/nginx/nginx.conf
 nginx -g 'daemon off;' &
 pids+=($!)

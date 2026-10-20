@@ -19,7 +19,6 @@
 //! - `span_event`, `span_link` — OTel-canonical nested types.
 //! - `resource`, `instrumentation_scope` — OTel-canonical producer typing.
 //! - `span` — `SpanRecord` + `SpanKind` + `SpanStatus`.
-//! - `trace_summary` — `TraceSummaryRecord`.
 //! - `gen_ai_evaluation_result` — one evaluation result attached to a GenAI span.
 //! - `gen_ai_span` — `GenAiSpanRecord` (full OTel GenAI semconv surface).
 //!
@@ -44,7 +43,6 @@ pub mod resource;
 pub mod span;
 pub mod span_event;
 pub mod span_link;
-pub mod trace_summary;
 
 pub use attribute_value::AttributeValue;
 pub use gen_ai_evaluation_result::GenAiEvaluationResult;
@@ -54,7 +52,6 @@ pub use resource::Resource;
 pub use span::{SpanKind, SpanRecord, SpanStatus};
 pub use span_event::SpanEvent;
 pub use span_link::SpanLink;
-pub use trace_summary::TraceSummaryRecord;
 // `attributes` is a constants module; consumers use `attributes::FOO`,
 // not a glob re-export.
 
@@ -1544,208 +1541,6 @@ mod span_record_tests {
 }
 
 #[cfg(test)]
-mod trace_summary_record_tests {
-    use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
-
-    use crate::DataTenantId;
-    use crate::vala::ids::{SpanId, TraceId};
-    use crate::vala::trace::{
-        InstrumentationScope, Resource, SpanKind, SpanStatus, TraceSummaryRecord,
-    };
-
-    /// Floor `t` to the start of the minute it falls in.
-    fn floor_to_minute(t: DateTime<Utc>) -> DateTime<Utc> {
-        t.with_second(0).unwrap().with_nanosecond(0).unwrap()
-    }
-
-    fn summary() -> TraceSummaryRecord {
-        let start = Utc.timestamp_opt(1_700_000_030, 0).unwrap();
-        let end = start + Duration::milliseconds(2_500);
-        TraceSummaryRecord {
-            trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
-            data_tenant_id: DataTenantId::new_v7(),
-            bucket_time: floor_to_minute(start),
-            start_time: start,
-            end_time: end,
-            duration_ms: 2_500,
-            span_count: 8,
-            error_count: 1,
-            root_span_id: Some(SpanId::from_hex("0123456789abcdef").unwrap()),
-            root_name: Some("GET /checkout".into()),
-            root_kind: Some(SpanKind::Server),
-            root_status: SpanStatus::Error {
-                description: Some("upstream timeout".into()),
-            },
-            root_scope: Some(InstrumentationScope {
-                name: "wyrd-tracing".into(),
-                version: Some("0.3.1".into()),
-                attributes: serde_json::Map::new(),
-            }),
-            resource: Resource {
-                service_name: "checkout".into(),
-                service_namespace: Some("payments".into()),
-                service_version: Some("1.2.3".into()),
-                service_instance_id: Some("worker-0".into()),
-                attributes: serde_json::Map::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn trace_summary_record_round_trip_full() {
-        let s = summary();
-        let j = serde_json::to_string(&s).unwrap();
-        let back: TraceSummaryRecord = serde_json::from_str(&j).unwrap();
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn trace_summary_record_round_trip_anonymous() {
-        let mut s = summary();
-        s.root_span_id = None;
-        s.root_name = None;
-        s.root_kind = None;
-        s.root_status = SpanStatus::Unset;
-        s.root_scope = None;
-        let j = serde_json::to_string(&s).unwrap();
-        assert!(!j.contains("root_span_id"));
-        assert!(!j.contains("root_name"));
-        assert!(!j.contains("root_kind"));
-        assert!(!j.contains("root_scope"));
-        let back: TraceSummaryRecord = serde_json::from_str(&j).unwrap();
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn trace_summary_record_deny_unknown_fields() {
-        let mut obj = serde_json::to_value(summary())
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .clone();
-        obj.insert("rogue".into(), serde_json::json!(true));
-        let s = serde_json::to_string(&obj).unwrap();
-        let r: Result<TraceSummaryRecord, _> = serde_json::from_str(&s);
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_happy_path() {
-        summary().validate().unwrap();
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_zero_span_count() {
-        let mut s = summary();
-        s.span_count = 0;
-        s.error_count = 0;
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_error_count_exceeding_span_count() {
-        let mut s = summary();
-        s.span_count = 3;
-        s.error_count = 4;
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_accepts_error_count_equal_to_span_count() {
-        let mut s = summary();
-        s.span_count = 3;
-        s.error_count = 3;
-        s.validate().unwrap();
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_end_before_start() {
-        let mut s = summary();
-        s.end_time = s.start_time - Duration::seconds(1);
-        s.duration_ms = 0;
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_mismatched_duration() {
-        let mut s = summary();
-        s.duration_ms = 999;
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_bucket_after_start() {
-        let mut s = summary();
-        s.bucket_time = s.start_time + Duration::seconds(1);
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_accepts_bucket_equal_to_start() {
-        let mut s = summary();
-        s.bucket_time = s.start_time;
-        s.validate().unwrap();
-    }
-
-    #[test]
-    fn trace_summary_record_validate_propagates_resource_failure() {
-        let mut s = summary();
-        s.resource.service_name = String::new();
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_propagates_root_scope_failure() {
-        let mut s = summary();
-        s.root_scope = Some(InstrumentationScope {
-            name: String::new(),
-            version: None,
-            attributes: serde_json::Map::new(),
-        });
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_empty_root_name() {
-        let mut s = summary();
-        s.root_name = Some(String::new());
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_rejects_overlong_root_name() {
-        let mut s = summary();
-        s.root_name = Some("a".repeat(257));
-        assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn trace_summary_record_validate_accepts_unset_root_status() {
-        let mut s = summary();
-        s.root_span_id = None;
-        s.root_name = None;
-        s.root_kind = None;
-        s.root_status = SpanStatus::Unset;
-        s.root_scope = None;
-        s.validate().unwrap();
-    }
-
-    #[test]
-    fn trace_summary_record_bucket_time_at_minute_boundary_round_trips() {
-        let t = Utc.timestamp_opt(1_700_000_040, 0).unwrap();
-        let floored = floor_to_minute(t);
-        assert_eq!(floored, t);
-    }
-
-    #[test]
-    fn trace_summary_record_bucket_time_below_start_within_minute() {
-        let s = summary();
-        let diff = s.start_time - s.bucket_time;
-        assert!(diff <= Duration::seconds(60));
-    }
-}
-
-#[cfg(test)]
 mod gen_ai_evaluation_result_tests {
     use crate::vala::trace::GenAiEvaluationResult;
 
@@ -2479,15 +2274,13 @@ mod key_array_sync_tests {
 mod otel_proto_parity_tests {
     //! Lock the OTel-canonical trace surface against accidental drift.
 
-    use chrono::{Duration, TimeZone, Timelike, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use schemars::schema_for;
     use serde_json::Value;
 
-    use crate::DataTenantId;
     use crate::vala::ids::{SpanId, TraceId};
     use crate::vala::trace::{
         GenAiSpanRecord, InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus,
-        TraceSummaryRecord,
     };
 
     #[test]
@@ -2670,65 +2463,6 @@ mod otel_proto_parity_tests {
         };
 
         record.validate().expect("minimal OTel span validates");
-    }
-
-    #[test]
-    fn trace_summary_record_json_field_names_match_wire_spec() {
-        let start = Utc
-            .timestamp_opt(1_700_000_030, 0)
-            .single()
-            .expect("timestamp is valid");
-        let end = start + Duration::milliseconds(2_500);
-        let bucket_time = start.with_second(0).unwrap().with_nanosecond(0).unwrap();
-        let record = TraceSummaryRecord {
-            trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef")
-                .expect("valid trace id"),
-            data_tenant_id: DataTenantId::new_v7(),
-            bucket_time,
-            start_time: start,
-            end_time: end,
-            duration_ms: 2_500,
-            span_count: 4,
-            error_count: 0,
-            root_span_id: Some(SpanId::from_hex("0123456789abcdef").expect("valid span id")),
-            root_name: Some("GET /".into()),
-            root_kind: Some(SpanKind::Server),
-            root_status: SpanStatus::Ok,
-            root_scope: None,
-            resource: Resource {
-                service_name: "svc".into(),
-                service_namespace: None,
-                service_version: None,
-                service_instance_id: None,
-                attributes: serde_json::Map::new(),
-            },
-        };
-
-        let j = serde_json::to_value(&record).expect("serializes");
-        let obj = j.as_object().expect("is an object");
-
-        assert!(obj.contains_key("trace_id"), "missing trace_id");
-        assert!(obj.contains_key("data_tenant_id"), "missing data_tenant_id");
-        assert!(
-            obj.contains_key("bucket_time"),
-            "missing bucket_time (Delta partition key)"
-        );
-        assert!(obj.contains_key("start_time"), "missing start_time");
-        assert!(obj.contains_key("end_time"), "missing end_time");
-        assert!(obj.contains_key("duration_ms"), "missing duration_ms");
-        assert!(obj.contains_key("span_count"), "missing span_count");
-        assert!(obj.contains_key("error_count"), "missing error_count");
-        assert!(obj.contains_key("root_span_id"), "missing root_span_id");
-        assert!(obj.contains_key("root_name"), "missing root_name");
-        assert!(obj.contains_key("root_kind"), "missing root_kind");
-        assert!(obj.contains_key("root_status"), "missing root_status");
-        assert!(obj.contains_key("resource"), "missing resource");
-
-        // Verify trace_id is hex, not a byte array.
-        assert_eq!(
-            obj["trace_id"].as_str().expect("trace_id is string"),
-            "0123456789abcdef0123456789abcdef"
-        );
     }
 
     #[test]

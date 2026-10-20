@@ -1027,7 +1027,6 @@ mod pg_tests {
             connections: logins.connections.clone(),
         }
         .finish_id_token_exchange(
-            &state_hash,
             &active.trusted,
             &login,
             &MappedClaims {

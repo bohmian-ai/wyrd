@@ -102,11 +102,44 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(plot.getByRole('alert')).toHaveTextContent('This host has no Query');
   plot.unmount();
 
-  // More than four series fold into "other".
-  const many: QueryResult = { ...series, rows: ['a', 'b', 'c', 'd', 'e'].map((model, index) => ['2026-10-20T10:00:00Z', model, index + 1]), terminal: terminal(5) };
-  const folded = render(Chart, { input: timeseries, result: { state: 'populated', data: many } });
-  expect([...folded.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim())).toEqual(['e', 'd', 'c', 'other']);
-  folded.unmount();
+  // Up to twenty series keep their own line and a distinct dash and marker; past twenty, the smallest totals sum into "other".
+  const models = (count: number): QueryResult => ({ ...series, rows: Array.from({ length: count }, (_, index) => ['2026-10-20T10:00:00Z', `m${index + 1}`, index + 1]), terminal: terminal(count) });
+  for (const count of [5, 20, 21]) {
+    const many = render(Chart, { input: timeseries, result: { state: 'populated', data: models(count) } });
+    const labels = [...many.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+    expect(labels).toHaveLength(Math.min(count, 20));
+    expect(labels.at(-1)).toBe(count > 20 ? 'other' : `m${count}`);
+    const cues = [...many.container.querySelectorAll('.legend svg')].map((icon) => `${icon.querySelector('line')?.getAttribute('stroke-dasharray')}|${icon.querySelector('path')?.getAttribute('d')}`);
+    expect(new Set(cues).size).toBe(labels.length);
+    expect(many.container.querySelectorAll('svg.plot polyline')).toHaveLength(labels.length);
+    await fireEvent.focus(many.getByRole('application'));
+    expect(many.getByRole('status')).toHaveTextContent(count > 20 ? 'other: 3 ms' : 'm1: 1 ms');
+    many.unmount();
+  }
+
+  // Signed values draw finite geometry around a zero baseline.
+  const signed = (values: number[]): QueryResult => ({
+    columns: [{ name: 'at', data_type: 'Timestamp(Microsecond, None)', nullable: false }, { name: 'model', data_type: 'Utf8', nullable: false }, { name: 'p95', data_type: 'Float64', nullable: false }],
+    rows: values.map((value, index) => [`2026-10-20T1${index}:00:00Z`, `c${index}`, value]),
+    terminal: terminal(values.length)
+  });
+  for (const values of [[-5, 10], [-5, -3], [-5, -5], [0, 0], [3, 8]]) {
+    const line = render(Chart, { input: { ...timeseries, series: undefined }, result: { state: 'populated', data: signed(values) } });
+    const coordinates = [...line.container.querySelectorAll('svg.plot polyline')].flatMap((each) => each.getAttribute('points')!.split(/[ ,]/).map(Number));
+    coordinates.push(...[...line.container.querySelectorAll('svg.plot line.grid')].map((each) => Number(each.getAttribute('y1'))));
+    expect(coordinates.every(Number.isFinite), `${values}`).toBe(true);
+    line.unmount();
+    const bar = render(Chart, { input: { type: 'bar', sql: 'SELECT 1', x: 'model', y: ['p95'] }, result: { state: 'populated', data: signed(values) } });
+    const zero = Number(bar.container.querySelector('svg.bars line.grid')!.getAttribute('y1'));
+    expect(Number.isFinite(zero), `${values}`).toBe(true);
+    [...bar.container.querySelectorAll('rect.bar')].forEach((rect, index) => {
+      const [y, height] = [Number(rect.getAttribute('y')), Number(rect.getAttribute('height'))];
+      expect(height, `${values}`).toBeGreaterThanOrEqual(0);
+      if (values[index] < 0) expect(y).toBe(zero);
+      else expect(y + height).toBeCloseTo(zero);
+    });
+    bar.unmount();
+  }
 
   // Bar, stat and table; the table keeps duplicate names and nulls positionally.
   const bars: QueryResult = { columns: [{ name: 'model', data_type: 'Utf8', nullable: false }, { name: 'runs', data_type: 'Int64', nullable: false }], rows: [['a', 3], ['b', 12]], terminal: terminal(2) };

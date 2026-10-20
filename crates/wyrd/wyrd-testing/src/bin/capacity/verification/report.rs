@@ -11,11 +11,11 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use wyrd_testing::capacity::Percentiles;
+use wyrd_testing::capacity::{Histogram, Percentiles};
 
 use crate::verification::Result;
 use crate::verification::run::{
-    DIRECT, Histogram, Measured, OVERHEAD, QUEUE_WAIT, QUEUED, RUN, STAGED, SUBMIT, SUBMITTED,
+    DIRECT, Measured, OVERHEAD, QUEUE_WAIT, QUEUED, RUN, STAGED, SUBMIT, SUBMITTED,
     TRIGGER_TO_TERMINAL, VERIFIER,
 };
 
@@ -104,12 +104,12 @@ impl Report {
     /// the server's whole execution.
     pub fn direct(&mut self, step: &str, measured: &Measured) {
         let usage = &measured.usage;
-        let overhead = usage.histogram(OVERHEAD, DIRECT);
-        let run = usage.histogram(RUN, DIRECT);
+        let overhead = usage.telemetry.histogram((OVERHEAD, &[DIRECT]));
+        let run = usage.telemetry.histogram((RUN, &[DIRECT]));
         let reason = format!(
             "overhead {}; verifier {}; server total {}; client extra mean {} ms",
             summary(&overhead),
-            summary(&usage.histogram(VERIFIER, DIRECT)),
+            summary(&usage.telemetry.histogram((VERIFIER, &[DIRECT]))),
             summary(&run),
             client_extra(measured, &run),
         );
@@ -121,15 +121,19 @@ impl Report {
     /// [`queued_miss`].
     pub fn queued(&mut self, step: &str, measured: &Measured) {
         let usage = &measured.usage;
-        let submit = usage.histogram(SUBMIT, STAGED);
+        let submit = usage.telemetry.histogram((SUBMIT, &[STAGED]));
         let reason = format!(
             "submit {}; client extra mean {} ms; queue wait {}; run overhead {}; verifier {}; trigger->terminal {}; {}",
             summary(&submit),
             client_extra(measured, &submit),
-            summary(&usage.histogram(QUEUE_WAIT, SUBMITTED)),
-            summary(&usage.histogram(OVERHEAD, QUEUED)),
-            summary(&usage.histogram(VERIFIER, QUEUED)),
-            summary(&usage.histogram(TRIGGER_TO_TERMINAL, SUBMITTED)),
+            summary(&usage.telemetry.histogram((QUEUE_WAIT, &[SUBMITTED]))),
+            summary(&usage.telemetry.histogram((OVERHEAD, &[QUEUED]))),
+            summary(&usage.telemetry.histogram((VERIFIER, &[QUEUED]))),
+            summary(
+                &usage
+                    .telemetry
+                    .histogram((TRIGGER_TO_TERMINAL, &[SUBMITTED]))
+            ),
             measured
                 .drain
                 .map_or("did not drain within 60 s".to_owned(), |seconds| {
@@ -243,7 +247,7 @@ impl Report {
 /// limit, fewer than [`MIN_SAMPLES`] overhead observations, or an overhead
 /// p99 bucket bound not strictly under [`P99_LIMIT_SECONDS`].
 fn direct_miss(measured: &Measured, memory_limit: u64) -> Option<String> {
-    let overhead = measured.usage.histogram(OVERHEAD, DIRECT);
+    let overhead = measured.usage.telemetry.histogram((OVERHEAD, &[DIRECT]));
     let p99 = overhead.percentiles().p99;
     correctness_miss(measured, memory_limit).or_else(|| {
         if overhead.count < MIN_SAMPLES {
@@ -319,8 +323,10 @@ fn bound_ms(bound: Option<f64>) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
+    use wyrd_testing::capacity::{Histogram, Telemetry, Usage};
+
     use super::{direct_miss, queued_miss};
-    use crate::verification::run::{HISTOGRAMS, Histogram, Measured, Usage};
+    use crate::verification::run::{HISTOGRAMS, Measured, SELECTION};
 
     /// A memory limit far above every test's peak.
     const LIMIT: u64 = 64 << 30;
@@ -353,7 +359,11 @@ mod tests {
             drain: Some(1.0),
             usage: Usage {
                 seconds: 1.0,
-                histograms: vec![histogram; HISTOGRAMS.len()],
+                telemetry: Telemetry {
+                    selection: SELECTION,
+                    histograms: vec![histogram; HISTOGRAMS.len()],
+                    ..Telemetry::default()
+                },
                 ..Usage::default()
             },
             ..Measured::default()

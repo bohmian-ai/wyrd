@@ -10,9 +10,16 @@
 //! cumulative bucket covering the quantile, computed from a window's bucket
 //! deltas after summing every replica's buckets, never by averaging replica
 //! percentiles. Raw percentiles come from per-sample measurements.
+//!
+//! A workload names the server histograms and runtime components it reads in
+//! one [`Selection`]; a [`Window`] reads them, the server's CPU and peak
+//! memory, and this process's CPU at its open and differences them into a
+//! [`Usage`] at its close. Workload verdicts and reports stay with each
+//! workload.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use num_traits::ToPrimitive;
 use serde::Serialize;
@@ -110,6 +117,286 @@ pub fn quantile(before: &[(f64, f64)], after: &[(f64, f64)], q: f64) -> Option<f
         .iter()
         .find(|(_, count)| *count >= q * total)
         .map(|(bound, _)| *bound)
+}
+
+/// One server histogram's observations, cumulative in one scrape or over a
+/// window.
+#[derive(Debug, Default, Clone)]
+pub struct Histogram {
+    /// Cumulative `le` buckets.
+    pub buckets: Vec<(f64, f64)>,
+    /// Observed seconds.
+    pub sum: f64,
+    /// Observations.
+    pub count: f64,
+}
+
+impl Histogram {
+    /// The histogram of every `family` series whose labels contain each of
+    /// `labels` in one scrape, summed across those series.
+    #[must_use]
+    pub fn read(metrics: &Metrics, family: &str, labels: &[&str]) -> Self {
+        Self {
+            buckets: metrics.buckets(family, labels),
+            sum: metrics.sum(&format!("{family}_sum"), labels),
+            count: metrics.sum(&format!("{family}_count"), labels),
+        }
+    }
+
+    /// The observations `after` added to `self`; a bucket bound or series
+    /// absent from `self` counts from zero.
+    #[must_use]
+    pub fn since(&self, after: &Self) -> Self {
+        Self {
+            buckets: deltas(&self.buckets, &after.buckets),
+            sum: after.sum - self.sum,
+            count: after.count - self.count,
+        }
+    }
+
+    /// Bucket-bound p50/p95/p99, seconds, of these observations.
+    #[must_use]
+    pub fn percentiles(&self) -> Percentiles {
+        let zero: Vec<(f64, f64)> = self
+            .buckets
+            .iter()
+            .map(|(bound, _)| (*bound, 0.0))
+            .collect();
+        Percentiles::buckets(&zero, &self.buckets)
+    }
+
+    /// Exact mean, seconds, from `_sum` / `_count`, or `None` without
+    /// observations.
+    #[must_use]
+    pub fn mean(&self) -> Option<f64> {
+        (self.count > 0.0).then(|| self.sum / self.count)
+    }
+}
+
+/// One histogram a workload judges or reports: its family and the label
+/// matchers (`name="value"`) every selected series must contain.
+pub type HistogramKey = (&'static str, &'static [&'static str]);
+
+/// The server telemetry one workload's windows read.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    /// Histograms differenced whole, each by its [`HistogramKey`].
+    pub histograms: &'static [HistogramKey],
+    /// Runtime component histograms, each with the label naming its
+    /// components; an empty label reads a family without labels as one
+    /// component.
+    pub breakdown: &'static [(&'static str, &'static str)],
+    /// Common family prefix dropped from breakdown component names.
+    pub prefix: &'static str,
+}
+
+impl Selection {
+    /// A selection reading no histogram and no component, for a workload
+    /// that keeps only the window's resources.
+    pub const RESOURCES: Self = Self {
+        histograms: &[],
+        breakdown: &[],
+        prefix: "",
+    };
+
+    /// Every selected histogram in one scrape, in selection order.
+    fn histograms(&self, metrics: &Metrics) -> Vec<Histogram> {
+        self.histograms
+            .iter()
+            .map(|(family, labels)| Histogram::read(metrics, family, labels))
+            .collect()
+    }
+
+    /// Every breakdown component's total seconds and observations in one
+    /// scrape, keyed `family{label=value}` with [`Self::prefix`] and the
+    /// `_seconds` unit dropped; a family with an empty label is the one
+    /// component `family`.
+    fn breakdown(&self, metrics: &Metrics) -> BTreeMap<String, (f64, f64)> {
+        let mut components = BTreeMap::new();
+        for (family, label) in self.breakdown {
+            let name = family
+                .trim_start_matches(self.prefix)
+                .trim_end_matches("_seconds");
+            if label.is_empty() {
+                let sum = metrics.sum(&format!("{family}_sum"), &[]);
+                let count = metrics.sum(&format!("{family}_count"), &[]);
+                components.insert(name.to_owned(), (sum, count));
+                continue;
+            }
+            let counts = metrics.by_label(&format!("{family}_count"), label);
+            for (value, sum) in metrics.by_label(&format!("{family}_sum"), label) {
+                let count = counts.get(&value).copied().unwrap_or(0.0);
+                components.insert(format!("{name}{{{label}={value}}}"), (sum, count));
+            }
+        }
+        components
+    }
+}
+
+/// A selection's telemetry in one scrape, differenced against a later one.
+#[derive(Debug, Clone)]
+pub struct Readings {
+    /// What was read.
+    selection: Selection,
+    /// Each selected histogram, in selection order.
+    histograms: Vec<Histogram>,
+    /// Each breakdown component's seconds and observations.
+    breakdown: BTreeMap<String, (f64, f64)>,
+}
+
+impl Readings {
+    /// Reads `selection` from one scrape.
+    #[must_use]
+    pub fn read(metrics: &Metrics, selection: Selection) -> Self {
+        Self {
+            selection,
+            histograms: selection.histograms(metrics),
+            breakdown: selection.breakdown(metrics),
+        }
+    }
+
+    /// What `after`, a later scrape, added: every selected histogram's
+    /// observations, and every breakdown component that gained an
+    /// observation. A series first exported after these readings counts
+    /// from zero.
+    #[must_use]
+    pub fn since(&self, after: &Metrics) -> Telemetry {
+        Telemetry {
+            selection: self.selection,
+            histograms: self
+                .histograms
+                .iter()
+                .zip(self.selection.histograms(after))
+                .map(|(before, after)| before.since(&after))
+                .collect(),
+            breakdown: self
+                .selection
+                .breakdown(after)
+                .into_iter()
+                .map(|(key, (sum, count))| {
+                    let (sum0, count0) = self.breakdown.get(&key).copied().unwrap_or_default();
+                    (key, (sum - sum0, count - count0))
+                })
+                .filter(|(_, (_, count))| *count > 0.0)
+                .collect(),
+        }
+    }
+}
+
+/// A selection's telemetry over one window.
+#[derive(Debug, Clone)]
+pub struct Telemetry {
+    /// What was read.
+    pub selection: Selection,
+    /// Each selected histogram over the window, in selection order.
+    pub histograms: Vec<Histogram>,
+    /// New seconds and observations of each breakdown component, keyed
+    /// `family{label=value}`.
+    pub breakdown: BTreeMap<String, (f64, f64)>,
+}
+
+impl Default for Telemetry {
+    /// No telemetry: an unmeasured window.
+    fn default() -> Self {
+        Self {
+            selection: Selection::RESOURCES,
+            histograms: Vec::new(),
+            breakdown: BTreeMap::new(),
+        }
+    }
+}
+
+impl Telemetry {
+    /// The window's histogram under `key`; empty when the selection did not
+    /// read it.
+    #[must_use]
+    pub fn histogram(&self, key: HistogramKey) -> Histogram {
+        self.selection
+            .histograms
+            .iter()
+            .position(|selected| *selected == key)
+            .and_then(|index| self.histograms.get(index))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Server and driver usage over one window.
+#[derive(Debug, Default, Clone)]
+pub struct Usage {
+    /// Wall-clock window length.
+    pub seconds: f64,
+    /// Server CPU seconds.
+    pub server_cpu_seconds: f64,
+    /// Peak server memory over the window.
+    pub peak_memory_bytes: u64,
+    /// CPU seconds this benchmark process used, to show the driver was not
+    /// the bottleneck.
+    pub driver_cpu_seconds: f64,
+    /// The workload's selected telemetry over the window.
+    pub telemetry: Telemetry,
+}
+
+/// One server's resources, this process's CPU, and a selection's telemetry
+/// at a window's start, closed into a [`Usage`].
+///
+/// Opening and closing each scrape `/metrics` once and hand that scrape back,
+/// so a workload reading further series takes them from the same scrape. The
+/// window's seconds end before the closing scrape; its CPU readings follow it.
+pub struct Window {
+    /// Window start, taken once the opening readings are done.
+    started: Instant,
+    /// Server CPU and peak memory since the start.
+    resources: ResourceWindow,
+    /// The selection at start.
+    readings: Readings,
+    /// This process's CPU seconds at start.
+    driver_cpu_seconds: f64,
+}
+
+impl Window {
+    /// Opens a window over `server` reading `selection`, and returns the
+    /// opening scrape.
+    ///
+    /// # Errors
+    ///
+    /// Returns scrape or memory-peak failures.
+    pub async fn open(
+        server: &LocalServer,
+        selection: Selection,
+    ) -> Result<(Self, Metrics), Error> {
+        let metrics = server.metrics().await?;
+        let window = Self {
+            resources: ResourceWindow::open([server])?,
+            readings: Readings::read(&metrics, selection),
+            driver_cpu_seconds: driver_cpu_seconds(),
+            started: Instant::now(),
+        };
+        Ok((window, metrics))
+    }
+
+    /// Differences `server`'s resources and the selection against the open,
+    /// and returns the closing scrape.
+    ///
+    /// # Errors
+    ///
+    /// Returns scrape or memory-peak failures.
+    pub async fn close(self, server: &LocalServer) -> Result<(Usage, Metrics), Error> {
+        let seconds = self.started.elapsed().as_secs_f64();
+        let metrics = server.metrics().await?;
+        let resources = self.resources.finish([server], seconds)?;
+        let (server_cpu_seconds, peak_memory_bytes) = resources
+            .first()
+            .map_or((0.0, 0), |used| (used.cpu_seconds, used.peak_memory));
+        let usage = Usage {
+            seconds,
+            server_cpu_seconds,
+            peak_memory_bytes,
+            driver_cpu_seconds: driver_cpu_seconds() - self.driver_cpu_seconds,
+            telemetry: self.readings.since(&metrics),
+        };
+        Ok((usage, metrics))
+    }
 }
 
 /// One replica's resource use over a measurement window.
@@ -251,7 +538,96 @@ pub fn install_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, deltas, quantile};
+    use super::{Percentiles, Readings, Selection, deltas, quantile};
+    use crate::release_server::Metrics;
+
+    /// A two-point streaming selection over one family and a breakdown by
+    /// `point`, as a gateway or verification workload names them.
+    const STREAM: Selection = Selection {
+        histograms: &[
+            (
+                "wyrd_gateway_overhead_seconds",
+                &["stream=\"true\"", "point=\"answer\""],
+            ),
+            (
+                "wyrd_gateway_overhead_seconds",
+                &["stream=\"true\"", "point=\"end\""],
+            ),
+            ("wyrd_gateway_overhead_seconds", &["stream=\"false\""]),
+        ],
+        breakdown: &[
+            ("wyrd_gateway_overhead_seconds", "point"),
+            ("outbox_write_seconds", ""),
+        ],
+        prefix: "wyrd_gateway_",
+    };
+
+    /// One `wyrd_gateway_overhead_seconds` series of `stream` and `point`
+    /// with cumulative bucket counts at bounds 0.001 and `+Inf`, and its sum.
+    fn series(stream: &str, point: &str, fast: f64, total: f64, sum: f64) -> String {
+        let labels = format!("stream=\"{stream}\",point=\"{point}\"");
+        format!(
+            "wyrd_gateway_overhead_seconds_bucket{{{labels},le=\"0.001\"}} {fast}\n\
+             wyrd_gateway_overhead_seconds_bucket{{{labels},le=\"+Inf\"}} {total}\n\
+             wyrd_gateway_overhead_seconds_sum{{{labels}}} {sum}\n\
+             wyrd_gateway_overhead_seconds_count{{{labels}}} {total}\n"
+        )
+    }
+
+    /// Shared readings keep each label selection independent, count a series
+    /// first exported mid-window from zero, give an idle selection no
+    /// percentiles, and keep only breakdown components that gained an
+    /// observation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a delta, percentile, or component is wrong.
+    #[test]
+    fn shared_measurements_preserve_workload_deltas() {
+        let before = Metrics::parse(&format!(
+            "{}{}outbox_write_seconds_sum 2\noutbox_write_seconds_count 4\n",
+            series("true", "answer", 10.0, 10.0, 0.005),
+            series("false", "answer", 3.0, 3.0, 0.001),
+        ));
+        let after = Metrics::parse(&format!(
+            "{}{}{}outbox_write_seconds_sum 2\noutbox_write_seconds_count 4\n",
+            series("true", "answer", 1009.0, 1010.0, 0.505),
+            series("true", "end", 0.0, 20.0, 0.4),
+            series("false", "answer", 3.0, 3.0, 0.001),
+        ));
+        let telemetry = Readings::read(&before, STREAM).since(&after);
+
+        let answer = telemetry.histogram(STREAM.histograms[0]);
+        assert_eq!((answer.count, answer.sum), (1000.0, 0.5));
+        assert_eq!(answer.percentiles().p50, Some(0.001));
+        assert_eq!(answer.percentiles().p99, Some(0.001));
+        assert_eq!(answer.mean(), Some(0.0005));
+
+        let end = telemetry.histogram(STREAM.histograms[1]);
+        assert_eq!(end.count, 20.0);
+        assert_eq!(end.percentiles().p50, Some(f64::INFINITY));
+
+        let buffered = telemetry.histogram(STREAM.histograms[2]);
+        assert_eq!(buffered.count, 0.0);
+        assert_eq!(buffered.percentiles().p99, None);
+        assert_eq!(buffered.mean(), None);
+
+        assert_eq!(
+            telemetry
+                .histogram(("wyrd_gateway_overhead_seconds", &[]))
+                .count,
+            0.0,
+            "an unselected key reads empty"
+        );
+        let components: Vec<&String> = telemetry.breakdown.keys().collect();
+        assert_eq!(
+            components,
+            ["overhead{point=answer}", "overhead{point=end}"],
+            "an idle component is dropped and the prefix and unit trimmed"
+        );
+        let (seconds, count) = telemetry.breakdown["overhead{point=answer}"];
+        assert!((seconds - 0.5).abs() < 1e-9 && (count - 1000.0).abs() < f64::EPSILON);
+    }
 
     /// A quantile is the first cumulative bucket bound covering it among the
     /// observations between two readings, and an empty interval has none.

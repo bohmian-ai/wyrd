@@ -19,9 +19,9 @@ use tokio::task::JoinSet;
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_testing::capacity::{Percentiles, deltas, driver_cpu_seconds};
+use wyrd_testing::capacity::{HistogramKey, Percentiles, Selection, Usage, Window};
 use wyrd_testing::profile::{Capture, Profile};
-use wyrd_testing::release_server::{LocalServer, MemoryPeak, Metrics};
+use wyrd_testing::release_server::LocalServer;
 
 use crate::verification::Result;
 use crate::verification::workload::{ASSERT_VERIFIER, Tenant, context, failing};
@@ -81,16 +81,17 @@ pub const STAGED: &str = "outcome=\"staged\"";
 pub const SUBMITTED: &str = "origin=\"manual\"";
 
 /// The server histograms a step judges or reports, as `(family, series
-/// filter)`; [`Usage::histogram`] reads them by that pair.
-pub const HISTOGRAMS: [(&str, &str); 8] = [
-    (OVERHEAD, DIRECT),
-    (VERIFIER, DIRECT),
-    (RUN, DIRECT),
-    (SUBMIT, STAGED),
-    (QUEUE_WAIT, SUBMITTED),
-    (OVERHEAD, QUEUED),
-    (VERIFIER, QUEUED),
-    (TRIGGER_TO_TERMINAL, SUBMITTED),
+/// filters)`; [`wyrd_testing::capacity::Telemetry::histogram`] reads them
+/// by that key.
+pub const HISTOGRAMS: [HistogramKey; 8] = [
+    (OVERHEAD, &[DIRECT]),
+    (VERIFIER, &[DIRECT]),
+    (RUN, &[DIRECT]),
+    (SUBMIT, &[STAGED]),
+    (QUEUE_WAIT, &[SUBMITTED]),
+    (OVERHEAD, &[QUEUED]),
+    (VERIFIER, &[QUEUED]),
+    (TRIGGER_TO_TERMINAL, &[SUBMITTED]),
 ];
 
 /// The verification runtime's component histograms a window differences,
@@ -117,6 +118,13 @@ const BREAKDOWN: [(&str, &str); 15] = [
     ("bifrost_scribe_lane_job_seconds", "lane"),
     ("wyrd_postgres_pool_acquire_seconds", "outcome"),
 ];
+
+/// Everything a verification window reads from `/metrics`.
+pub const SELECTION: Selection = Selection {
+    histograms: &HISTOGRAMS,
+    breakdown: &BREAKDOWN,
+    prefix: "wyrd_verification_",
+};
 
 /// Component rows printed per window, largest total first.
 const PARETO_ROWS: usize = 25;
@@ -195,181 +203,6 @@ impl Measured {
     }
 }
 
-/// One server histogram's observations, cumulative or over a window.
-#[derive(Debug, Default, Clone)]
-pub struct Histogram {
-    /// Cumulative `le` buckets.
-    pub buckets: Vec<(f64, f64)>,
-    /// Observed seconds.
-    pub sum: f64,
-    /// Observations.
-    pub count: f64,
-}
-
-impl Histogram {
-    /// The histogram of `family` series matching `filter` in one scrape.
-    fn read(metrics: &Metrics, family: &str, filter: &str) -> Self {
-        Self {
-            buckets: metrics.buckets(family, &[filter]),
-            sum: metrics.sum(&format!("{family}_sum"), &[filter]),
-            count: metrics.sum(&format!("{family}_count"), &[filter]),
-        }
-    }
-
-    /// The observations `after` added to `self`.
-    fn since(&self, after: &Self) -> Self {
-        Self {
-            buckets: deltas(&self.buckets, &after.buckets),
-            sum: after.sum - self.sum,
-            count: after.count - self.count,
-        }
-    }
-
-    /// Bucket-bound p50/p95/p99, seconds.
-    pub fn percentiles(&self) -> Percentiles {
-        let zero: Vec<(f64, f64)> = self
-            .buckets
-            .iter()
-            .map(|(bound, _)| (*bound, 0.0))
-            .collect();
-        Percentiles::buckets(&zero, &self.buckets)
-    }
-
-    /// Exact mean, seconds, from `_sum` / `_count`.
-    pub fn mean(&self) -> Option<f64> {
-        (self.count > 0.0).then(|| self.sum / self.count)
-    }
-}
-
-/// Server and driver usage over one window.
-#[derive(Debug, Default, Clone)]
-pub struct Usage {
-    /// Wall-clock window length, drain included.
-    pub seconds: f64,
-    /// Server CPU seconds.
-    pub server_cpu_seconds: f64,
-    /// Peak server memory over the window.
-    pub peak_memory_bytes: u64,
-    /// CPU seconds this benchmark process used, to show the driver was not
-    /// the bottleneck.
-    pub driver_cpu_seconds: f64,
-    /// Each of [`HISTOGRAMS`] over the window, in its order.
-    pub histograms: Vec<Histogram>,
-    /// New seconds and observations of each [`BREAKDOWN`] component, keyed
-    /// `family{label=value}`.
-    pub breakdown: BTreeMap<String, (f64, f64)>,
-}
-
-impl Usage {
-    /// The window's `family` histogram under `filter`, one of
-    /// [`HISTOGRAMS`]; empty when the window did not read it.
-    pub fn histogram(&self, family: &str, filter: &str) -> Histogram {
-        HISTOGRAMS
-            .iter()
-            .position(|key| *key == (family, filter))
-            .and_then(|index| self.histograms.get(index))
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-/// Server counters at the start of a window, closed into a [`Usage`].
-struct Window {
-    /// Window start.
-    started: Instant,
-    /// Server CPU microseconds at start.
-    server_cpu_us: u64,
-    /// Peak-memory window reset at start.
-    peak: MemoryPeak,
-    /// Each of [`HISTOGRAMS`] at start.
-    histograms: Vec<Histogram>,
-    /// Each [`BREAKDOWN`] component at start.
-    breakdown: BTreeMap<String, (f64, f64)>,
-    /// This process's CPU seconds at start.
-    driver_cpu_seconds: f64,
-}
-
-impl Window {
-    /// Records the server's counters now.
-    ///
-    /// # Errors
-    ///
-    /// Returns scrape or memory-peak failures.
-    async fn open(server: &LocalServer) -> Result<Self> {
-        let metrics = server.metrics().await?;
-        Ok(Self {
-            server_cpu_us: server.cpu_usec(),
-            peak: server.memory_peak()?,
-            histograms: histograms(&metrics),
-            breakdown: breakdown(&metrics),
-            driver_cpu_seconds: driver_cpu_seconds(),
-            started: Instant::now(),
-        })
-    }
-
-    /// Differences the server's counters against the start.
-    ///
-    /// # Errors
-    ///
-    /// Returns scrape or memory-peak failures.
-    async fn close(self, server: &LocalServer) -> Result<Usage> {
-        let seconds = self.started.elapsed().as_secs_f64();
-        let metrics = server.metrics().await?;
-        Ok(Usage {
-            seconds,
-            server_cpu_seconds: server.cpu_usec().saturating_sub(self.server_cpu_us) as f64 / 1e6,
-            peak_memory_bytes: self.peak.read()?,
-            driver_cpu_seconds: driver_cpu_seconds() - self.driver_cpu_seconds,
-            histograms: self
-                .histograms
-                .iter()
-                .zip(histograms(&metrics))
-                .map(|(before, after)| before.since(&after))
-                .collect(),
-            breakdown: breakdown(&metrics)
-                .into_iter()
-                .map(|(key, (sum, count))| {
-                    let (sum0, count0) = self.breakdown.get(&key).copied().unwrap_or_default();
-                    (key, (sum - sum0, count - count0))
-                })
-                .filter(|(_, (_, count))| *count > 0.0)
-                .collect(),
-        })
-    }
-}
-
-/// Every one of [`HISTOGRAMS`] in one scrape, in its order.
-fn histograms(metrics: &Metrics) -> Vec<Histogram> {
-    HISTOGRAMS
-        .iter()
-        .map(|(family, filter)| Histogram::read(metrics, family, filter))
-        .collect()
-}
-
-/// Every [`BREAKDOWN`] component's total seconds and observations in one
-/// scrape, keyed `family{label=value}` with the family's common prefix and
-/// unit dropped; a family with an empty label is the one component `family`.
-fn breakdown(metrics: &Metrics) -> BTreeMap<String, (f64, f64)> {
-    let mut components = BTreeMap::new();
-    for (family, label) in BREAKDOWN {
-        let name = family
-            .trim_start_matches("wyrd_verification_")
-            .trim_end_matches("_seconds");
-        if label.is_empty() {
-            let sum = metrics.sum(&format!("{family}_sum"), &[]);
-            let count = metrics.sum(&format!("{family}_count"), &[]);
-            components.insert(name.to_owned(), (sum, count));
-            continue;
-        }
-        let counts = metrics.by_label(&format!("{family}_count"), label);
-        for (value, sum) in metrics.by_label(&format!("{family}_sum"), label) {
-            let count = counts.get(&value).copied().unwrap_or(0.0);
-            components.insert(format!("{name}{{{label}={value}}}"), (sum, count));
-        }
-    }
-    components
-}
-
 /// The application: one tenant's Service, driven through the public client.
 pub struct Bench<'a> {
     /// The server, for `/metrics`, resource evidence, and its PID.
@@ -414,17 +247,17 @@ impl<'a> Bench<'a> {
             .profiles
             .join(format!("{number:02}-{}", step.replace(' ', "-")));
         let capture = Capture::start(pid, 0, PROFILE_HERTZ, &directory)?;
-        let window = Window::open(self.server).await?;
+        let (window, _) = Window::open(self.server, SELECTION).await?;
         let mut measured = self.drive(op, clients, WINDOW).await;
         if op == Op::Submit {
             measured.drain = self.drain().await?;
         }
         measured.clients = clients;
-        measured.usage = window.close(self.server).await?;
+        measured.usage = window.close(self.server).await?.0;
         let metadata = serde_json::json!({
             "step": step,
             "clients": clients,
-            "breakdown": measured.usage.breakdown,
+            "breakdown": measured.usage.telemetry.breakdown,
         });
         let profile = capture.finish(&metadata)?;
         report_pareto(step, &measured, &profile);
@@ -537,7 +370,8 @@ fn report_pareto(step: &str, measured: &Measured, profile: &Profile) {
         latency.p99.unwrap_or_default(),
         measured.error_count(),
     );
-    let mut components: Vec<(&String, &(f64, f64))> = measured.usage.breakdown.iter().collect();
+    let mut components: Vec<(&String, &(f64, f64))> =
+        measured.usage.telemetry.breakdown.iter().collect();
     components.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
     for (component, (seconds, count)) in components.iter().take(PARETO_ROWS) {
         eprintln!(

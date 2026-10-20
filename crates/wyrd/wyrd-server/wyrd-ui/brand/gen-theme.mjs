@@ -4,6 +4,7 @@
 //   brand/theme.css                                   workbench Tailwind theme
 //   docs/src/styles/wyrd-tokens.css                   docs site tokens
 //   .agents/skills/wyrd-ui/references/wyrd-theme.css  wyrd-ui skill reference
+//   packages/ui/src/lib/theme.css                     wyrd-ai-ui component tokens
 //   brand/logo.svg, brand/logo-light.svg, brand/app-icon.svg,
 //   docs/src/assets/wyrd-mark.svg, docs/public/favicon.svg   Wyrd mark renderings
 // Usage:
@@ -170,6 +171,15 @@ function docsCss({ modes, scale, tokens }) {
   return [BANNER, '', fonts, '', ...modeBlocks, ''].join('\n');
 }
 
+/** wyrd-ai-ui: the workbench tokens without the Tailwind mapping, for any host page. */
+function packageCss({ modes, scale, tokens }) {
+  const fonts = `:root {\n${fontLines(scale).join('\n')}\n}`;
+  const modeBlocks = modes.map(
+    (mode) => `[data-mode="${mode}"] {\n${tokenLines(tokens, mode).join('\n')}\n}`
+  );
+  return [BANNER, '', fonts, '', ...modeBlocks, ''].join('\n');
+}
+
 /** wyrd-ui skill reference: the same tokens under the skill's theme selectors. */
 function skillCss({ modes, scale, tokens }) {
   const modeBlocks = modes.map((mode) => {
@@ -225,6 +235,7 @@ export function renderTargets(palette) {
     { path: join(here, 'theme.css'), content: workbenchCss(palette) },
     { path: join(repo, 'docs/src/styles/wyrd-tokens.css'), content: docsCss(palette) },
     { path: join(repo, '.agents/skills/wyrd-ui/references/wyrd-theme.css'), content: skillCss(palette) },
+    { path: join(here, '../packages/ui/src/lib/theme.css'), content: packageCss(palette) },
     { path: join(here, 'logo.svg'), content: markSvg(palette, 'dark') },
     { path: join(here, 'logo-light.svg'), content: markSvg(palette, 'light') },
     { path: join(here, 'app-icon.svg'), content: markSvg(palette, 'adaptive') },

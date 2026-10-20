@@ -645,8 +645,9 @@ test('TASK-027: Grid placement', async () => {
   expect(placeAll([undefined, fixed], [294])).toEqual([{ x: 0, y: 0, w: 12, h: 6, auto: true }, { ...fixed, y: 6, auto: false }]);
   expect(placeAll([undefined, undefined], [0, 2000])).toEqual([{ x: 0, y: 0, w: 12, h: 1, auto: true }, { x: 0, y: 1, w: 12, h: 39, auto: true }]);
   // The renderer measures that content and places from it, without stretching the panel or writing the document.
+  let tall = 294;
   const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
-    return this.dataset.panel === 'tall' ? 294 : 0;
+    return this.dataset.panel === 'tall' || this.dataset.panel === '__proto__' ? tall : 0;
   });
   try {
     const mixed = laidOut({ tall: undefined, after: fixed });
@@ -656,6 +657,27 @@ test('TASK-027: Grid placement', async () => {
     expect(panel(measured.container, 'tall').style.height).toBe('');
     expect(mixed).toEqual(kept);
     measured.unmount();
+
+    // Panel ids that name Object.prototype members place like any other, authored and measured.
+    const ids = ['constructor', 'toString', '__proto__'];
+    const renamed = (names: string[]) =>
+      laidOut(Object.fromEntries([[names[0], { x: 0, y: 0, w: 6, h: 4 }], [names[1], undefined], [names[2], { x: 6, y: 0, w: 6, h: 4 }], ['n', { x: 0, y: 4, w: 12, h: 2 }]]));
+    const rows = (view: ReturnType<typeof render>, names: string[]) => [...names, 'n'].map((id) => [panel(view.container, id).style.gridColumn, panel(view.container, id).style.gridRow, panel(view.container, id).style.height]);
+    const special = render(WyrdView, { doc: renamed(ids), executor: chart.executor });
+    const plain = render(WyrdView, { doc: renamed(['p', 'q', 'r']), executor: chart.executor });
+    expect(rows(special, ids)).toEqual(rows(plain, ['p', 'q', 'r']));
+    expect(rows(special, ids)[0].slice(0, 2)).toEqual(['1 / span 6', '1 / span 4']);
+    special.unmount();
+    plain.unmount();
+    // A measured `__proto__` panel occupies its content rows, and follows its content when that changes.
+    const grows = render(WyrdView, { doc: laidOut(Object.fromEntries([['__proto__', undefined], ['constructor', fixed]])), executor: chart.executor });
+    expect(panel(grows.container, 'constructor').style.gridRow).toBe('7 / span 4');
+    tall = 400;
+    (ResizeObserver as unknown as { notify(): void }).notify();
+    await tick();
+    expect(panel(grows.container, '__proto__').style.gridRow).toBe('1 / span 8');
+    expect(panel(grows.container, 'constructor').style.gridRow).toBe('9 / span 4');
+    grows.unmount();
   } finally {
     height.mockRestore();
   }
@@ -731,6 +753,37 @@ test('TASK-027: Layout editing', async () => {
   expect([panel(silent.container, 'a').style.gridRow, panel(silent.container, 'b').style.gridRow]).toEqual(['2 / span 6', '2 / span 6']);
   expect(quiet.calls).toHaveLength(4);
   silent.unmount();
+
+  // Ids naming Object.prototype members edit like any other; untouched ones keep their layout, or its absence.
+  const named = laidOut(Object.fromEntries([['a', { x: 0, y: 0, w: 4, h: 4 }], ['constructor', { x: 4, y: 0, w: 4, h: 4 }], ['toString', undefined], ['__proto__', { x: 8, y: 0, w: 4, h: 4 }]]));
+  const original = structuredClone(named);
+  const told = vi.fn();
+  const odd = render(WyrdView, { doc: named, executor: quiet.executor, onlayout: told });
+  const press = async (id: string, ...keys: string[]) => {
+    const grip = odd.getByRole('button', { name: `Move or resize ${id}` });
+    grip.focus();
+    for (const key of keys) await fireEvent.keyDown(grip, { key });
+  };
+  await press('a', 'ArrowDown', 'Enter');
+  expect(validateView(told.mock.lastCall![0])).not.toHaveProperty('code');
+  expect(told.mock.lastCall![0].panels.slice(1)).toEqual(original.panels.slice(1));
+  await press('constructor', 'ArrowDown', 'Escape');
+  expect(panel(odd.container, 'constructor').style.gridRow).toBe('1 / span 4');
+  expect(told).toHaveBeenCalledOnce();
+  for (const id of ['constructor', 'toString', '__proto__']) await press(id, 'ArrowRight', 'Enter');
+  expect(told).toHaveBeenCalledTimes(4);
+  const last = told.mock.lastCall![0];
+  expect(validateView(last)).not.toHaveProperty('code');
+  expect(last.panels.map((each: { layout?: unknown }) => each.layout)).toEqual([
+    { x: 0, y: 1, w: 4, h: 4 },
+    { x: 5, y: 0, w: 4, h: 4 },
+    // Full width cannot move right; `__proto__` starts from where collision moved it.
+    { x: 0, y: 5, w: 12, h: 1 },
+    { x: 8, y: 6, w: 4, h: 4 }
+  ]);
+  expect(Object.hasOwn(last.panels[3], 'layout')).toBe(true);
+  expect(named).toEqual(original);
+  odd.unmount();
 });
 
 test('TASK-027: Pointer edit cancellation', async () => {

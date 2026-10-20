@@ -2,11 +2,11 @@ name: publish-docs
 
 # Builds the SvelteKit static docs site and deploys it to GitHub Pages.
 #
-# The site is served from the project subpath https://bohmian-ai.github.io/wyrd/.
-# `paths.base = '/wyrd'` in docs/svelte.config.js prefixes every asset and link
-# so the static output is correct under that subpath. There is no custom domain
-# / CNAME — do not add one without also changing paths.base and the llms.txt
-# origin constant (docs/scripts/generate_llms_txt.py).
+# The site is served at https://docs.bohmian.ai/wyrd/, the custom domain set in
+# the repository's Pages settings. `paths.base = '/wyrd'` in
+# docs/svelte.config.js prefixes every asset and link, so the build is uploaded
+# inside a wyrd/ folder. The llms.txt origin constant
+# (docs/scripts/generate_llms_txt.py) must name the same domain.
 
 on:
   push:
@@ -70,10 +70,21 @@ jobs:
       - name: Build docs
         run: mise run docs:build
 
+      # The custom domain serves the artifact root, so the build goes under
+      # wyrd/ to match paths.base. Pages only serves a 404 page from the root,
+      # so the fallback shell is copied there, and the bare domain redirects to
+      # the docs.
+      - name: Stage Pages artifact under /wyrd
+        run: |
+          mkdir -p _site
+          cp -R docs/build _site/wyrd
+          cp _site/wyrd/404.html _site/404.html
+          printf '<!doctype html><meta charset="utf-8"><title>Wyrd docs</title><meta http-equiv="refresh" content="0; url=/wyrd/"><link rel="canonical" href="/wyrd/"><a href="/wyrd/">Wyrd docs</a>\n' > _site/index.html
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: docs/build
+          path: _site
 
   deploy:
     name: deploy docs

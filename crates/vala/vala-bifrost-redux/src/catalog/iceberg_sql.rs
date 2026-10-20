@@ -30,7 +30,7 @@ pub async fn build_catalog<S: std::hash::BuildHasher>(
     storage_factory: Arc<dyn StorageFactory>,
     storage_properties: HashMap<String, String, S>,
 ) -> Result<SqlCatalog, BifrostCatalogError> {
-    sqlx_catalog::any::install_default_drivers();
+    sqlx::any::install_default_drivers();
 
     let mut properties = storage_properties;
     properties.insert(

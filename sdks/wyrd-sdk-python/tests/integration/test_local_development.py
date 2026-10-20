@@ -345,6 +345,19 @@ def local_listener() -> str:
         return f"127.0.0.1:{bound.getsockname()[1]}"
 
 
+def assert_listener_released(bind: str) -> None:
+    """Bind ``bind`` the way a restarted server would, proving no listener holds it.
+
+    ``SO_REUSEADDR`` matches the server's own listener bind: a live listener
+    still refuses it, while ``TIME_WAIT`` left by connections the server closed
+    during graceful shutdown does not.
+    """
+    host, port = bind.rsplit(":", 1)
+    with socket.socket() as settled:
+        settled.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        settled.bind((host, int(port)))
+
+
 def terminal_session() -> None:
     """Give the fixture CLI its own controlling terminal before exec."""
     os.setsid()
@@ -408,9 +421,7 @@ def wait_for_local_cli(
                 code = child.wait(timeout=50)
                 assert code == 130 if terminal == "interrupt" else code not in (0, 130)
                 for bind in binds:
-                    host, port = bind.rsplit(":", 1)
-                    with socket.socket() as settled:
-                        settled.bind((host, int(port)))
+                    assert_listener_released(bind)
                 return
     assert terminal in ("decline", "restart"), "ready after the offer was not answered"
     assert asked == (terminal == "decline")
@@ -901,9 +912,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
             assert "may have committed" in failed.stderr, failed.stderr
             assert "nothing was applied" not in failed.stderr
             assert "wyrd_sk_" not in failed.stdout + failed.stderr
-            host, port = env["WYRD_SERVER_BIND"].rsplit(":", 1)
-            with socket.socket() as settled:
-                settled.bind((host, int(port)))
+            assert_listener_released(env["WYRD_SERVER_BIND"])
             with installed_local_cli(cli_path, home, env, "", tenant="acme"):
                 assert deployments() == sorted([*names, "lost-answer"]), "commit not durable"
                 reapplied = wyrd("gateway", "deployment", "put", "--file", str(lost))
@@ -1059,9 +1068,7 @@ def restart_on_another_listener(
     saved = tomllib.loads((home / "wyrd/config.toml").read_text())
     assert saved["client"]["http_url"] == f"http://{rebound}"
     assert saved["dev"]["bind"] == rebound
-    host, port = rebound.rsplit(":", 1)
-    with socket.socket() as settled:
-        settled.bind((host, int(port)))
+    assert_listener_released(rebound)
 
 
 @pytest.mark.local_dev

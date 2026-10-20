@@ -3938,10 +3938,11 @@ fn assert_oauth_refusal(reply: &(StatusCode, Value), status: StatusCode, error: 
 ///      even when `azp` names the client, an `azp`
 ///      naming another client, a validly signed token whose algorithm
 ///      discovery did not advertise, an `HS256` token even when discovery
-///      advertises `HS256` beside an asymmetric algorithm, and a provider
-///      outage each return the browser to the tenant sign-in page, leaving no
-///      session, User, identity, role grant, or refresh row, while a valid
-///      single-audience token whose `azp` names the client signs in.
+///      advertises `HS256` beside an asymmetric algorithm each return the
+///      browser to the tenant sign-in page, a provider outage is answered as
+///      `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` without a redirect, and none
+///      leaves a session, User, identity, role grant, or refresh row, while a
+///      valid single-audience token whose `azp` names the client signs in.
 ///
 /// A discovered unsafe (cleartext or internal) provider URL is proven by the
 /// `wyrd-auth` unit tests (`login::destination_tests`,
@@ -4297,7 +4298,6 @@ async fn tenant_callback_refusal_journey() {
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
         ),
-        ("outage", Box::new(|_| wiremock::ResponseTemplate::new(503))),
     ];
     for (label, reply_for) in &cases {
         mount_mock_provider(&mock, id_token_reply("unused")).await;
@@ -4312,6 +4312,32 @@ async fn tenant_callback_refusal_journey() {
         );
         assert_browser_refused(&reply, "test-tenant-3");
     }
+    // A provider outage is the server's failure, not a credential refusal: it
+    // is answered as its own `503` problem, not redirected to sign-in, and
+    // still spends the login transaction.
+    mount_mock_provider(&mock, id_token_reply("unused")).await;
+    let (binding, state, _) = begin_mock_login(&srv, "test-tenant-3").await;
+    mount_mock_provider(&mock, wiremock::ResponseTemplate::new(503)).await;
+    let reply = callback_reply(&srv, "mock-code", &state, None, Some(&binding)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "outage: {}",
+        reply.body
+    );
+    let problem: Value = serde_json::from_str(&reply.body).expect("outage problem decodes");
+    assert_eq!(problem["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE");
+    assert!(reply.location.is_none(), "an outage does not redirect");
+    assert!(
+        cookie_cleared(&reply.cookies, LOGIN_COOKIE),
+        "the outage clears the login cookie: {:?}",
+        reply.cookies
+    );
+    assert!(
+        cookie_set(&reply.cookies, "wyrd_session_test-tenant-3").is_none(),
+        "an outage sets no session: {:?}",
+        reply.cookies
+    );
     // A validly signed token whose algorithm discovery did not advertise is
     // refused by the advertised-set check; `HS256` advertised beside an
     // asymmetric algorithm (discovery requires one) passes that check and is
@@ -4349,8 +4375,9 @@ async fn tenant_callback_refusal_journey() {
         );
         assert_browser_refused(&reply, "test-tenant-3");
     }
-    // Every refusal above happened before identity: tenant C holds no User,
-    // provider identity, role grant, refresh row, or browser session.
+    // Every refusal and the outage above happened before identity: tenant C
+    // holds no User, provider identity, role grant, refresh row, or browser
+    // session.
     let persisted: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
                 (SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1), \

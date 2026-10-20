@@ -164,7 +164,8 @@ const config = {
   kit: {
     // Static SSG with a client-side fallback shell for any non-prerendered URL.
     adapter: adapter({ fallback: '404.html' }),
-    // Project subpath on GitHub Pages: https://<org>.github.io/wyrd/
+    // Served at https://docs.bohmian.ai/wyrd/; publish-docs.yml uploads the
+    // build inside a wyrd/ folder so the custom domain serves this subpath.
     paths: { base: BASE },
     // Static assets live in public/ (favicon, llms.txt, llms-full.txt) — the
     // generator scripts write there. SvelteKit's default is static/.

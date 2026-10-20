@@ -409,6 +409,40 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
         read(&server, "", beta_cookie.clone()).await.status,
         StatusCode::OK
     );
+    // Beta's value relabeled as Acme and logged out as Acme revokes neither
+    // tenant's session; only the Acme label is cleared.
+    let relabeled = send(
+        &server,
+        BrowserRequest {
+            method: Method::POST,
+            uri: "/auth/browser/logout",
+            origin: Some(ORIGIN),
+            cookies: acme_cookie(&beta_cookie[0].1),
+            body: Some(json!({ "tenant": acme })),
+        },
+    )
+    .await;
+    assert_eq!(
+        relabeled.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        relabeled.body
+    );
+    assert!(
+        relabeled
+            .set_cookie(&cookie_name(&acme))
+            .is_some_and(|cleared| cleared.contains("Max-Age=0"))
+    );
+    assert_eq!(
+        read(&server, "", beta_cookie.clone()).await.status,
+        StatusCode::OK,
+        "the relabeled Beta session survives"
+    );
+    assert_eq!(
+        read(&server, "", acme_cookie(&session)).await.status,
+        StatusCode::OK,
+        "Acme's own session survives"
+    );
     superuser(
         &server,
         "UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1",
@@ -447,6 +481,11 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
     assert_eq!(
         read(&server, "", acme_cookie(&second)).await.status,
         StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&server, logout(Some(ORIGIN))).await.status,
+        StatusCode::NO_CONTENT,
+        "logging out a revoked session again still clears"
     );
     assert_eq!(
         read(&server, "", acme_cookie(&session)).await.status,

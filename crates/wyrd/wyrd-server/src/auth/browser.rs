@@ -510,7 +510,7 @@ pub async fn logout(
     let sessions = browser_sessions(&state)?;
     for (label, value) in session_cookies(&headers) {
         if label.as_ref() == Some(&request.tenant) {
-            sessions.logout(&value).await?;
+            sessions.logout(&request.tenant, &value).await?;
         }
     }
     Ok(with_cookies(

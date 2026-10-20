@@ -277,24 +277,39 @@ impl BrowserSessions {
         Ok(session)
     }
 
-    /// Revoke the session a cookie value names, immediately and only that
-    /// session; the API key or connection it was created through is untouched.
+    /// Revoke the session a cookie value names for the tenant
+    /// `tenant_route_key` selects, immediately and only that session; the API
+    /// key or connection it was created through is untouched.
     ///
-    /// A malformed, unknown, or already revoked value revokes nothing and is
-    /// not an error, so logout always clears the browser's cookie.
+    /// The value's tenant prefix must be the tenant the route key resolves to
+    /// before any revocation opens, so a value relabeled under another
+    /// tenant's cookie revokes nothing. A malformed, unknown, mismatching or
+    /// already revoked value revokes nothing and is not an error, so logout
+    /// always clears the browser's cookie. Revocation commits before the
+    /// cleared cookie reaches the browser; when that response is lost, the
+    /// browser still presents a value that no longer resolves, and repeating
+    /// the logout is safe.
     ///
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-    pub async fn logout(&self, cookie: &str) -> Result<(), WyrdError> {
+    pub async fn logout(
+        &self,
+        tenant_route_key: &TenantSlug,
+        cookie: &str,
+    ) -> Result<(), WyrdError> {
         let Ok((tenant, hash)) = cookie_key(cookie) else {
             return Ok(());
         };
-        let mut conn = self
-            .connections
-            .postgres()
-            .tenant_conn(tenant)
+        let postgres = self.connections.postgres();
+        let routed = postgres
+            .resolve_tenant_slug(tenant_route_key)
             .await
             .map_err(store_error)?;
+        if routed != Some(tenant) {
+            tracing::info!("logout cookie does not belong to the selected tenant");
+            return Ok(());
+        }
+        let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
         revoke_browser_session(&mut conn, &hash)
             .await
             .map_err(store_error)?;

@@ -920,7 +920,7 @@ mod pg_tests {
             response
                 .headers()
                 .get(header::CACHE_CONTROL)
-                .map(|value| value.as_bytes()),
+                .map(axum::http::HeaderValue::as_bytes),
             Some(&b"no-store"[..])
         );
         let cookies: Vec<&str> = response

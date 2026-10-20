@@ -30,9 +30,9 @@
     gap: 4px;
     border: 1px solid var(--bc);
     border-radius: var(--r);
-    padding: 1px 6px;
+    padding: 1px 7px;
     color: var(--bc);
-    font: var(--weight-strong) 11px/16px var(--font-mono);
+    font: 11px/16px var(--font-mono);
     white-space: nowrap;
   }
   .pill:not([data-tone='neutral']) {

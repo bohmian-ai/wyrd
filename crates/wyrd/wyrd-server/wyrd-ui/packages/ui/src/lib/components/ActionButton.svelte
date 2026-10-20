@@ -9,12 +9,15 @@
   interface Props {
     label: string;
     state?: ActionState;
-    primary?: boolean;
+    /** `primary` is the one strong action on a surface; `link` sits in a panel head. */
+    variant?: 'primary' | 'secondary' | 'link';
+    /** A decorative glyph after the label, such as ↗ for navigation away; hidden from assistive tech. */
+    icon?: string;
     disabled?: boolean;
     onclick: () => void;
   }
 
-  let { label, state, primary = false, disabled = false, onclick }: Props = $props();
+  let { label, state, variant = 'secondary', icon, disabled = false, onclick }: Props = $props();
 
   const blocked = $derived(disabled || state?.state === 'pending' || state?.state === 'unavailable');
   const note = $derived.by(() => {
@@ -33,8 +36,8 @@
 </script>
 
 <span class="action">
-  <button type="button" class:primary disabled={blocked} aria-busy={state?.state === 'pending' ? 'true' : undefined} {onclick}>
-    {state?.state === 'pending' ? `${label}…` : label}
+  <button type="button" class={variant} disabled={blocked} aria-busy={state?.state === 'pending' ? 'true' : undefined} {onclick}>
+    {state?.state === 'pending' ? `${label}…` : label}{#if icon}<span class="icon" aria-hidden="true">{icon}</span>{/if}
   </button>
   {#if note}<span class="note" data-state={state?.state} role={state?.state === 'success' ? 'status' : 'alert'}>{note}</span>{/if}
 </span>
@@ -44,37 +47,64 @@
     display: inline-flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
+    justify-content: flex-end;
+    gap: 4px 8px;
     min-width: 0;
   }
   button {
+    display: inline-flex;
+    align-items: center;
+    height: 34px;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    padding: 4px 10px;
+    padding: 0 12px;
     background: var(--surface-2);
     color: var(--text);
-    font: var(--weight-strong) 12px var(--font-sans);
+    font: 13px var(--font-sans);
+    white-space: nowrap;
     cursor: pointer;
   }
-  button:hover:not(:disabled) {
+  .secondary:hover:not(:disabled) {
     background: var(--surface-hover);
   }
-  button.primary {
+  .primary {
     border-color: var(--declare);
     background: var(--declare);
     color: var(--declare-ink);
+    font-weight: 600;
+  }
+  .primary:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--declare) 82%, var(--text));
+    background: color-mix(in srgb, var(--declare) 82%, var(--text));
+  }
+  .icon {
+    margin-left: 6px;
+  }
+  .link .icon {
+    margin-left: 4px;
+  }
+  .link {
+    height: auto;
+    border: 0;
+    padding: 0;
+    background: none;
+    color: var(--declare);
+    font: 11px var(--font-mono);
+  }
+  .link:hover:not(:disabled) {
+    text-decoration: underline;
   }
   button:disabled {
     cursor: not-allowed;
-    opacity: 0.6;
+    opacity: 0.55;
   }
   button:focus-visible {
     outline: 2px solid var(--declare);
     outline-offset: 2px;
   }
   .note {
-    font: 11px var(--font-sans);
     color: var(--muted);
+    font: 11px var(--font-mono);
     overflow-wrap: anywhere;
   }
   .note[data-state='denied'] {

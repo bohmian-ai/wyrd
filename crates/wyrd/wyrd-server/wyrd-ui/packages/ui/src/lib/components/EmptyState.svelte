@@ -34,14 +34,15 @@
 
 <style>
   .state {
-    display: grid;
-    gap: 4px;
-    border: 1px dashed var(--muted);
-    border-radius: var(--r);
-    padding: 14px;
-    color: var(--text);
-    font: 12px/18px var(--font-sans);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
     min-width: 0;
+    border: 1px dashed var(--border);
+    border-radius: var(--r);
+    padding: 22px 16px;
+    color: var(--muted);
+    font: 12px/1.5 var(--font-mono);
     overflow-wrap: anywhere;
   }
   .state[data-state='error'] {
@@ -51,19 +52,18 @@
     border-color: var(--warn);
   }
   .word {
-    color: var(--muted);
-    font: var(--weight-strong) 11px var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
   strong {
-    font-size: 13px;
+    color: var(--text);
+    font: 600 13px var(--font-sans);
   }
   p {
     margin: 0;
-    color: var(--muted);
   }
   code {
-    font: 11px var(--font-mono);
-    color: var(--muted);
+    font: inherit;
   }
 </style>

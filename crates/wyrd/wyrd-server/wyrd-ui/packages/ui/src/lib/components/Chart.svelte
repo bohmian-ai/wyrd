@@ -15,10 +15,12 @@
 
   let { input, executed, result, actions = {}, onaction }: ChartProps & ActionProps = $props();
 
-  /** Plot box in SVG units; the SVG scales uniformly to its panel. */
-  const W = 600;
-  const H = 220;
-  const PAD = { left: 52, right: 8, top: 8, bottom: 24 };
+  /** Rendered body width; the plot tracks its content box so SVG text draws at its CSS size. */
+  let bodyWidth = $state(0);
+  const W = $derived(bodyWidth > 64 ? bodyWidth - 32 : 560);
+  const H = 160;
+  /** Tick labels sit above their gridline, so the plot needs no left gutter. */
+  const PAD = { left: 32, right: 6, top: 16, bottom: 22 };
   /** Position-indexed series styles: colour, dash and marker always differ together. */
   const STYLES = [
     { stroke: 'var(--declare)', dash: '', marker: 'square' },
@@ -38,12 +40,30 @@
     const ys = lines.flatMap((line) => line.points.map((point) => point.y));
     const low = Math.min(0, ...ys);
     const high = Math.max(...ys);
-    return { x0: xs[0], x1: xs[xs.length - 1], y0: low, y1: high > low ? high : low + 1 };
+    return { x0: xs[0], x1: xs[xs.length - 1], y0: low, y1: niceCeil(high > low ? high : low + 1) };
   });
   const sx = (x: number) =>
     PAD.left + (bounds.x1 > bounds.x0 ? ((x - bounds.x0) / (bounds.x1 - bounds.x0)) * (W - PAD.left - PAD.right) : 0);
   const sy = (y: number) => H - PAD.bottom - ((y - bounds.y0) / (bounds.y1 - bounds.y0)) * (H - PAD.top - PAD.bottom);
   const ticks = $derived([0, 0.5, 1].map((share) => bounds.y0 + share * (bounds.y1 - bounds.y0)));
+  /** Up to four x labels on observed instants: clock time within a day and a half, else the date. */
+  const xLabels = $derived.by(() => {
+    if (xs.length === 0) return [];
+    const short = bounds.x1 - bounds.x0 <= 36 * 3_600_000;
+    const label = (ms: number) => new Date(ms).toISOString().slice(short ? 11 : 5, short ? 16 : 10);
+    const picks = [...new Set([0, 1, 2, 3].map((share) => Math.round((share / 3) * (xs.length - 1))))];
+    return picks.map((index, position) => ({
+      at: xs[index],
+      text: label(xs[index]),
+      anchor: position === 0 ? 'start' : position === picks.length - 1 ? 'end' : 'middle'
+    }));
+  });
+
+  /** The smallest round step × 10ⁿ at or above `value`, so the halfway gridline lands on a round number too. */
+  function niceCeil(value: number): number {
+    const power = 10 ** Math.floor(Math.log10(value));
+    return ([1, 2, 3, 4, 5, 6, 8, 10].find((step) => step * power >= value) ?? 10) * power;
+  }
 
   /** Keyboard- and pointer-driven tooltip position over `xs`. */
   let focused = $state<number | undefined>();
@@ -92,6 +112,20 @@
 
   const bars = $derived(data && input.type === 'bar' && result.state === 'populated' ? barRows(data, input.x, input.y) : []);
   const barMax = $derived(Math.max(0, ...bars.flatMap((row) => row.values.map((value) => value ?? 0))) || 1);
+  /** One drawn bar per category × `y`, positioned across the plot width. */
+  const barCells = $derived.by(() => {
+    if (input.type !== 'bar') return [];
+    const ys = input.y;
+    const cells = bars.flatMap((row) =>
+      row.values.map((value, position) => ({ label: ys.length > 1 ? `${row.label} · ${ys[position]}` : row.label, value }))
+    );
+    const slot = (W - PAD.left - PAD.right) / Math.max(1, cells.length);
+    const width = Math.min(48, slot * 0.7);
+    return cells.map((cell, index) => {
+      const height = ((cell.value ?? 0) / barMax) * (H - PAD.top - PAD.bottom);
+      return { ...cell, x: PAD.left + index * slot + (slot - width) / 2, width, y: H - PAD.bottom - height, height };
+    });
+  });
 
   const stat = $derived.by(() => {
     if (!data || input.type !== 'stat' || result.state !== 'populated') return undefined;
@@ -105,148 +139,154 @@
 
 <section class="chart" aria-label={input.title ?? 'Chart'}>
   <header>
-    {#if input.title}<h3>{input.title}</h3>{/if}
-    {#if input.unit}<span class="unit">{input.unit}</span>{/if}
+    <h3>{input.title ?? 'Chart'}{#if input.unit}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
     {#if degraded && data}
       <span title={data.terminal.warnings.join(', ')}><StatusPill tone="warn" label="Partial result" /></span>
     {/if}
+    <span class="open">
+      <ActionButton
+        variant="link"
+        label="Open in Query"
+        icon="↗"
+        state={onaction ? actions['chart.open_in_query'] : { state: 'unavailable', reason: 'This host has no Query' }}
+        disabled={!executed}
+        onclick={() => executed && onaction?.({ name: 'chart.open_in_query', input: executed })}
+      />
+    </span>
   </header>
 
-  {#if result.state === 'populated'}
-    {#if degraded && data}
-      <p class="partial">Some sources did not complete: {data.terminal.warnings.join(', ') || 'see source completion'}.</p>
-    {/if}
-    {#if input.type === 'timeseries'}
-      <!-- The plot is keyboard-operable: focus opens the tooltip and arrows walk it. -->
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-      <svg
-        class="plot"
-        viewBox="0 0 {W} {H}"
-        role="application"
-        aria-roledescription="chart"
-        tabindex="0"
-        aria-label="{input.title ?? 'Time series'}: {lines.map((line) => line.label).join(', ')}"
-        onfocus={() => (focused ??= xs.length - 1)}
-        onblur={() => (focused = undefined)}
-        {onkeydown}
-        onpointerdown={(event) => {
-          const x = svgX(event);
-          brush = onaction ? { from: x, to: x } : undefined;
-          (event.currentTarget as Element).setPointerCapture?.(event.pointerId);
-        }}
-        onpointermove={(event) => {
-          const x = svgX(event);
-          if (brush) brush = { ...brush, to: x };
-          else focused = nearest(x);
-        }}
-        onpointerup={release}
-        onpointerleave={() => (brush ? undefined : (focused = undefined))}
-      >
-        {#each ticks as tick (tick)}
-          <line class="grid" x1={PAD.left} x2={W - PAD.right} y1={sy(tick)} y2={sy(tick)} />
-          <text class="axis" x={PAD.left - 4} y={sy(tick) + 4} text-anchor="end">{fmtNumber(tick)}</text>
-        {/each}
-        {#if xs.length > 0}
-          <text class="axis" x={PAD.left} y={H - 6}>{fmtInstant(bounds.x0)}</text>
-          <text class="axis" x={W - PAD.right} y={H - 6} text-anchor="end">{fmtInstant(bounds.x1)}</text>
-        {/if}
-        {#each lines as line, index (line.label)}
-          {@const style = STYLES[index]}
-          <polyline
-            points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
-            stroke={style.stroke}
-            stroke-dasharray={style.dash}
-          />
-          {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
-            <path class="marker" d={marker(style.marker, sx(point.x), sy(point.y))} fill={style.stroke} />
-          {/each}
-        {/each}
-        {#if focused !== undefined && xs[focused] !== undefined}
-          <line class="cursor" x1={sx(xs[focused])} x2={sx(xs[focused])} y1={PAD.top} y2={H - PAD.bottom} />
-        {/if}
-        {#if brush}
-          <rect class="brush" x={Math.min(brush.from, brush.to)} y={PAD.top} width={Math.abs(brush.to - brush.from)} height={H - PAD.top - PAD.bottom} />
-        {/if}
-      </svg>
-      {#if focused !== undefined && xs[focused] !== undefined}
-        {@const at = xs[focused]}
-        <p class="tooltip" role="status">
-          <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
-          {#each lines as line (line.label)}
-            {@const point = line.points.find((each) => each.x === at)}
-            <span>{line.label}: {point ? `${fmtNumber(point.y)}${unitLabel}` : '—'}</span>
-          {/each}
-        </p>
+  <div class="body" class:centered={input.type === 'stat' && result.state === 'populated'} bind:clientWidth={bodyWidth}>
+    {#if result.state === 'populated'}
+      {#if degraded && data}
+        <p class="partial">Some sources did not complete: {data.terminal.warnings.join(', ') || 'see source completion'}.</p>
       {/if}
-      <ul class="legend">
-        {#each lines as line, index (line.label)}
-          {@const style = STYLES[index]}
-          <li>
-            <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
-              <line x1="0" x2="24" y1="4" y2="4" stroke={style.stroke} stroke-dasharray={style.dash} />
-              <path d={marker(style.marker, 12, 4)} fill={style.stroke} />
-            </svg>
-            {line.label}
-          </li>
-        {/each}
-      </ul>
-    {:else if input.type === 'bar'}
-      <ul class="bars" aria-label={input.title ?? 'Bar chart'}>
-        {#each bars as row, index (index)}
-          {#each row.values as value, position (position)}
+      {#if input.type === 'timeseries'}
+        <!-- The plot is keyboard-operable: focus opens the tooltip and arrows walk it. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+        <svg
+          class="plot"
+          viewBox="0 0 {W} {H}"
+          role="application"
+          aria-roledescription="chart"
+          tabindex="0"
+          aria-label="{input.title ?? 'Time series'}: {lines.map((line) => line.label).join(', ')}"
+          onfocus={() => (focused ??= xs.length - 1)}
+          onblur={() => (focused = undefined)}
+          {onkeydown}
+          onpointerdown={(event) => {
+            const x = svgX(event);
+            brush = onaction ? { from: x, to: x } : undefined;
+            (event.currentTarget as Element).setPointerCapture?.(event.pointerId);
+          }}
+          onpointermove={(event) => {
+            const x = svgX(event);
+            if (brush) brush = { ...brush, to: x };
+            else focused = nearest(x);
+          }}
+          onpointerup={release}
+          onpointerleave={() => (brush ? undefined : (focused = undefined))}
+        >
+          {#each ticks as tick (tick)}
+            <line class="grid" x1="0" x2={W} y1={sy(tick)} y2={sy(tick)} />
+            <text class="axis" x="0" y={sy(tick) - 4}>{fmtNumber(tick)}</text>
+          {/each}
+          {#each xLabels as label (label.at)}
+            <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
+          {/each}
+          {#each lines as line, index (line.label)}
+            {@const style = STYLES[index]}
+            <polyline
+              points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
+              stroke={style.stroke}
+              stroke-dasharray={style.dash}
+            />
+            {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
+              <path class="marker" d={marker(style.marker, sx(point.x), sy(point.y))} fill={style.stroke} />
+            {/each}
+          {/each}
+          {#if focused !== undefined && xs[focused] !== undefined}
+            <line class="cursor" x1={sx(xs[focused])} x2={sx(xs[focused])} y1={PAD.top} y2={H - PAD.bottom} />
+          {/if}
+          {#if brush}
+            <rect class="brush" x={Math.min(brush.from, brush.to)} y={PAD.top} width={Math.abs(brush.to - brush.from)} height={H - PAD.top - PAD.bottom} />
+          {/if}
+        </svg>
+        {#if focused !== undefined && xs[focused] !== undefined}
+          {@const at = xs[focused]}
+          <p class="tooltip" role="status">
+            <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
+            {#each lines as line (line.label)}
+              {@const point = line.points.find((each) => each.x === at)}
+              <span>{line.label}: {point ? `${fmtNumber(point.y)}${unitLabel}` : '—'}</span>
+            {/each}
+          </p>
+        {/if}
+        <ul class="legend">
+          {#each lines as line, index (line.label)}
+            {@const style = STYLES[index]}
             <li>
-              <span class="category">{row.label}{input.y.length > 1 ? ` · ${input.y[position]}` : ''}</span>
-              <span class="track" aria-hidden="true"><span class="bar" style:width="{((value ?? 0) / barMax) * 100}%"></span></span>
-              <span class="value">{value === null ? '—' : `${fmtNumber(value)}${unitLabel}`}</span>
+              <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
+                <line x1="0" x2="24" y1="4" y2="4" stroke={style.stroke} stroke-dasharray={style.dash} />
+                <path d={marker(style.marker, 12, 4)} fill={style.stroke} />
+              </svg>
+              {line.label}
             </li>
           {/each}
-        {/each}
-      </ul>
-    {:else if input.type === 'stat'}
-      <p class="stat">{stat === undefined ? '—' : fmtNumber(stat)}{#if input.unit}<span class="unit">{input.unit}</span>{/if}</p>
-    {:else if data}
-      <!-- A wide result scrolls; the focusable region lets a keyboard reader pan it. -->
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <div class="scroller" role="region" aria-label="{input.title ?? 'Result'} table" tabindex="0">
-        <table>
-          <thead>
-            <tr>{#each data.columns as column, index (index)}<th scope="col" title={column.data_type}>{column.name}</th>{/each}</tr>
-          </thead>
-          <tbody>
-            {#each data.rows as row, index (index)}
-              <tr>{#each row as cell, position (position)}<td>{cell === null ? '∅' : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}</td>{/each}</tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+        </ul>
+      {:else if input.type === 'bar'}
+        <svg
+          class="plot bars"
+          viewBox="0 0 {W} {H}"
+          role="img"
+          aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : fmtNumber(cell.value)}${unitLabel}`).join(', ')}"
+        >
+          <line class="grid" x1="0" x2={W} y1={H - PAD.bottom} y2={H - PAD.bottom} />
+          {#each barCells as cell, index (index)}
+            <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height} />
+            <text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.value === null ? '—' : fmtNumber(cell.value)}</text>
+            <text class="axis" x={cell.x + cell.width / 2} y={H - 4} text-anchor="middle">{cell.label}</text>
+          {/each}
+        </svg>
+      {:else if input.type === 'stat'}
+        <p class="stat">{stat === undefined ? '—' : fmtNumber(stat)}{#if input.unit}<span class="unit">{input.unit}</span>{/if}</p>
+      {:else if data}
+        <!-- A wide result scrolls; the focusable region lets a keyboard reader pan it. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <div class="scroller" role="region" aria-label="{input.title ?? 'Result'} table" tabindex="0">
+          <table>
+            <thead>
+              <tr>{#each data.columns as column, index (index)}<th scope="col" title={column.data_type}>{column.name}</th>{/each}</tr>
+            </thead>
+            <tbody>
+              {#each data.rows as row, index (index)}
+                <tr>{#each row as cell, position (position)}<td>{cell === null ? '∅' : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}</td>{/each}</tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {:else if result.state === 'empty'}
+      <EmptyState state="empty" title="No data" detail={result.reason} />
+    {:else if result.state === 'loading'}
+      <EmptyState state="loading" title="Running query" />
+    {:else}
+      <EmptyState state={result.state} problem={result.problem} />
     {/if}
-  {:else if result.state === 'empty'}
-    <EmptyState state="empty" title="No data" detail={result.reason} />
-  {:else if result.state === 'loading'}
-    <EmptyState state="loading" title="Running query" />
-  {:else}
-    <EmptyState state={result.state} problem={result.problem} />
-  {/if}
+  </div>
 
   <footer>
+    <span>source</span>
     <code title={input.sql}>{input.sql}</code>
-    <ActionButton
-      label="Open in Query"
-      state={onaction ? actions['chart.open_in_query'] : { state: 'unavailable', reason: 'This host has no Query' }}
-      disabled={!executed}
-      onclick={() => executed && onaction?.({ name: 'chart.open_in_query', input: executed })}
-    />
   </footer>
 </section>
 
 <style>
   .chart {
-    display: grid;
-    gap: 8px;
+    display: flex;
+    flex-direction: column;
     min-width: 0;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    padding: 12px;
     background: var(--surface);
     color: var(--text);
     font-family: var(--font-sans);
@@ -255,22 +295,39 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
   }
   h3 {
     margin: 0;
-    font: var(--weight-strong) 13px var(--font-sans);
-  }
-  .unit {
+    min-width: 0;
     color: var(--muted);
-    font: 11px var(--font-mono);
+    font: 400 11px var(--font-mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .open {
+    margin-left: auto;
+  }
+  .body {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    padding: 12px 16px;
+  }
+  .centered {
+    justify-content: center;
   }
   .partial {
     margin: 0;
     color: var(--warn);
-    font-size: 12px;
+    font: 11px var(--font-mono);
   }
   .plot {
+    display: block;
     width: 100%;
     height: auto;
     touch-action: none;
@@ -281,15 +338,22 @@
   }
   polyline {
     fill: none;
-    stroke-width: 2;
+    stroke-width: 1.6;
   }
   .grid {
     stroke: var(--border);
     stroke-dasharray: 3 3;
   }
-  .axis {
+  .axis,
+  .value {
     fill: var(--muted);
-    font: 11px var(--font-mono);
+    font: 10px var(--font-mono);
+  }
+  .value {
+    fill: var(--text);
+  }
+  .bar {
+    fill: var(--declare);
   }
   .cursor {
     stroke: var(--muted);
@@ -313,70 +377,53 @@
     margin: 0;
     padding: 0;
     list-style: none;
-    font-size: 12px;
+    color: var(--muted);
+    font: 11px var(--font-mono);
   }
   .legend li {
     display: inline-flex;
     align-items: center;
     gap: 6px;
   }
-  .bars {
-    display: grid;
-    gap: 6px;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-  .bars li {
-    display: grid;
-    grid-template-columns: minmax(0, 30%) 1fr auto;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-  }
-  .category {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .track {
-    height: 10px;
-  }
-  .bar {
-    display: block;
-    height: 100%;
-    background: var(--declare);
-  }
-  .value {
-    font: 11px var(--font-mono);
-  }
   .stat {
     margin: 0;
-    font: 700 32px/1.1 var(--font-sans);
+    padding: 8px 0;
+    font: 600 40px/1.1 var(--font-sans);
     font-variant-numeric: tabular-nums;
   }
   .stat .unit {
     margin-left: 6px;
+    color: var(--muted);
+    font: 11px var(--font-mono);
+  }
+  .unit {
+    text-transform: none;
   }
   .scroller {
-    overflow: auto;
     max-height: 320px;
+    margin: 0 -16px -12px;
+    overflow: auto;
   }
   table {
-    border-collapse: collapse;
     width: 100%;
+    border-collapse: collapse;
     font: 12px var(--font-mono);
   }
   th {
     position: sticky;
     top: 0;
     border-bottom: 1px solid var(--border);
+    padding: 8px 16px;
     background: var(--surface);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.06em;
     text-align: left;
+    text-transform: uppercase;
   }
-  th,
   td {
-    padding: 4px 8px;
+    padding: 9px 16px;
     white-space: nowrap;
   }
   tbody tr:not(:last-child) td {
@@ -384,19 +431,19 @@
   }
   footer {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    border-top: 1px solid var(--border-soft);
-    padding-top: 8px;
-  }
-  footer code {
-    flex: 1 1 200px;
+    gap: 10px;
     min-width: 0;
-    overflow: hidden;
+    border-top: 1px solid var(--border-soft);
+    padding: 8px 16px;
     color: var(--muted);
     font: 11px var(--font-mono);
+  }
+  footer code {
+    min-width: 0;
+    overflow: hidden;
+    font: inherit;
+    color: var(--text);
     text-overflow: ellipsis;
     white-space: nowrap;
   }

@@ -86,7 +86,7 @@ test('TASK-003: Validated portable rendering', async () => {
 
   // Timeseries: one line per series value, each with a distinct dash and marker in the legend.
   const plot = render(Chart, { input: timeseries, result: { state: 'populated', data: series } });
-  expect(plot.getByRole('heading', { name: 'Latency' })).toBeInTheDocument();
+  expect(plot.getByRole('heading', { name: 'Latency · ms' })).toBeInTheDocument();
   const legend = plot.container.querySelectorAll('.legend li');
   expect([...legend].map((item) => item.textContent?.trim())).toEqual(['a', 'b']);
   expect(new Set([...plot.container.querySelectorAll('.legend line')].map((line) => line.getAttribute('stroke-dasharray'))).size).toBe(2);
@@ -111,7 +111,7 @@ test('TASK-003: Validated portable rendering', async () => {
   // Bar, stat and table; the table keeps duplicate names and nulls positionally.
   const bars: QueryResult = { columns: [{ name: 'model', data_type: 'Utf8', nullable: false }, { name: 'runs', data_type: 'Int64', nullable: false }], rows: [['a', 3], ['b', 12]], terminal: terminal(2) };
   const bar = render(Chart, { input: { type: 'bar', sql: 'SELECT 1', x: 'model', y: ['runs'] }, result: { state: 'populated', data: bars } });
-  expect(bar.container.querySelector('.bars')).toHaveTextContent('a 3b 12');
+  expect(bar.getByRole('img', { name: 'Bar chart: a 3, b 12' })).toBeInTheDocument();
   bar.unmount();
   const stat = render(Chart, { input: { type: 'stat', sql: 'SELECT 1', unit: 'runs' }, result: { state: 'populated', data: { columns: [{ name: 'n', data_type: 'Int64', nullable: false }], rows: [['12400']], terminal: terminal(1) } } });
   expect(stat.container.querySelector('.stat')).toHaveTextContent('12,400runs');
@@ -154,10 +154,10 @@ test('TASK-003: Validated portable rendering', async () => {
     result: { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } } }
   });
   expect(header.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
-  expect(header.container).toHaveTextContent('search/ranker@1.4.2');
+  expect(header.container).toHaveTextContent('search / ranker@1.4.2');
   expect(header.container).toHaveTextContent('✓active');
   expect([...header.container.querySelectorAll('option')].map((option) => option.value)).toEqual(['1.4.2', '1.4.1']);
-  expect(header.container).toHaveTextContent('Showing the newest 2 versions');
+  expect(header.container).toHaveTextContent('showing the newest 2 versions');
   expect(header.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page');
   await fireEvent.click(header.getByRole('button', { name: 'Copy uid' }));
   expect(writeText).toHaveBeenCalledWith('card_01HX');
@@ -167,7 +167,7 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(await header.findByText('Copy failed')).toBeInTheDocument();
   header.unmount();
   const noVersions = render(CardHeader, { input: { cardRef: card }, result: { state: 'populated', data: { card: registered, versions: { state: 'denied', problem: denied } } } });
-  expect(noVersions.container).toHaveTextContent('Versions unavailable: Forbidden (WYRD_AUTH_403_FORBIDDEN)');
+  expect(noVersions.container).toHaveTextContent('versions unavailable: Forbidden (WYRD_AUTH_403_FORBIDDEN)');
   expect(noVersions.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
   noVersions.unmount();
   for (const result of [{ state: 'loading' }, { state: 'denied', problem: denied }, { state: 'error', problem: { code: 'WYRD_REGISTRY_404_NOT_FOUND', title: 'Not found' } }] as const) {

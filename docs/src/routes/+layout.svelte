@@ -66,6 +66,7 @@
     <WyrdMark size={28} label="Wyrd" />
     <span class="word">Wyrd</span>
     <span class="tag">docs</span>
+    <span class="tag">v{__WYRD_VERSION__}</span>
   </a>
   {#if hasPages}<Search />{/if}
   {#if reference}<a class="head-link" href={`${base}${reference.path}`}>Reference</a>{/if}

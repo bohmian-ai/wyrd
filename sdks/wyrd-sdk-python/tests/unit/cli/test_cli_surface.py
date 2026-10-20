@@ -8,7 +8,7 @@ import pytest
 import wyrd.cli
 from wyrd import WyrdError
 from wyrd.cli import run_wyrd_cli
-from wyrd.testing.cli import plan
+from wyrd.testing.cli import declare_check
 
 
 @pytest.fixture
@@ -24,7 +24,7 @@ def run_cli(monkeypatch: pytest.MonkeyPatch):
 
 def test_production_cli_exposes_only_the_console_script() -> None:
     assert wyrd.cli.__all__ == ["run_wyrd_cli"]
-    assert not hasattr(wyrd.cli, "apply")
+    assert not hasattr(wyrd.cli, "declare")
 
 
 def test_help_exits_zero(run_cli) -> None:
@@ -35,8 +35,8 @@ def test_unknown_subcommand_exits_with_usage(run_cli) -> None:
     assert run_cli("dev", "bootstrap") == os.EX_USAGE
 
 
-def test_in_process_plan_raises_catalog_error_for_missing_tree(tmp_path: Path) -> None:
+def test_in_process_declare_check_raises_catalog_error_for_missing_tree(tmp_path: Path) -> None:
     """In-process commands raise WyrdError instead of exiting."""
     with pytest.raises(WyrdError) as caught:
-        plan(str(tmp_path / "missing.yaml"))
+        declare_check(str(tmp_path / "missing.yaml"))
     assert caught.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

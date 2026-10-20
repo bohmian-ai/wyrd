@@ -79,7 +79,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
-wyrd-tonic = { workspace = true, features = ["client", "server"] }
+wyrd-tonic = { path = "../../wyrd/wyrd-tonic", features = ["client", "server"] }
 
 [lints]
 workspace = true

@@ -168,12 +168,12 @@ mod pg_tests {
         std::fs::create_dir_all(&root)?;
         std::fs::write(root.join("verifier.yaml"), VERIFIER)?;
         std::fs::write(root.join("service.yaml"), SERVICE)?;
-        let verifier = Box::pin(cards.register_from_path(&root.join("verifier.yaml"))).await?;
-        let receipt = Box::pin(cards.register_from_path(&root.join("service.yaml"))).await?;
+        let verifier = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
+        let receipt = Box::pin(cards.declare_from_path(&root.join("service.yaml"))).await?;
         std::fs::remove_dir_all(&root)?;
-        let assertion = Box::pin(cards.register_from_path(Path::new(concat!(
+        let assertion = Box::pin(cards.declare_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/register_and_hydrate/no-refund-promise.yaml"
+            "/../../../fixtures/cards/declare_and_pull/no-refund-promise.yaml"
         ))))
         .await?;
         let uid = |root: &CardRef| -> Result<String, McpJourneyError> {
@@ -224,17 +224,17 @@ mod pg_tests {
             ));
 
             Box::pin(
-                cards.register_from_path(&fixtures.join("register_and_hydrate/support-model.yaml")),
+                cards.declare_from_path(&fixtures.join("declare_and_pull/support-model.yaml")),
             )
             .await?;
             let desk = Box::pin(
-                cards.register_from_path(&fixtures.join("register_and_hydrate/support-desk.yaml")),
+                cards.declare_from_path(&fixtures.join("declare_and_pull/support-desk.yaml")),
             )
             .await?;
-            Box::pin(cards.register_from_path(&fixtures.join("observe_a_run/observed-model.yaml")))
+            Box::pin(cards.declare_from_path(&fixtures.join("observe_a_run/observed-model.yaml")))
                 .await?;
             Box::pin(
-                cards.register_from_path(&fixtures.join("observe_a_run/observed-service.yaml")),
+                cards.declare_from_path(&fixtures.join("observe_a_run/observed-service.yaml")),
             )
             .await?;
 
@@ -275,10 +275,7 @@ mod pg_tests {
         /// Returns tool, transport, or response decoding failures.
         async fn get(&self, reference: &CardRef) -> Result<GetCardResponse, McpJourneyError> {
             let arguments = serde_json::json!({ "card_ref": reference });
-            let response = self
-                .agent
-                .call_tool(call("cards.get_by_ref", arguments)?)
-                .await?;
+            let response = self.agent.call_tool(call(CARDS_GET, arguments)?).await?;
             Ok(serde_json::from_value(structured(response)?)?)
         }
 
@@ -342,7 +339,7 @@ mod pg_tests {
             Ok(())
         }
 
-        /// Refuse malformed cursors, incomplete references, and missing Cards.
+        /// Refuse malformed cursors, incomplete, ambiguous, or partial selectors, and missing Cards.
         ///
         /// # Errors
         /// Returns transport failures or an unexpectedly successful call.
@@ -354,12 +351,22 @@ mod pg_tests {
                     "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
                 ),
                 (
-                    "cards.get_by_ref",
+                    CARDS_GET,
                     serde_json::json!({ "card_ref": { "kind": "Service", "name": "support-desk" } }),
                     "WYRD_SPEC_400_VALIDATION",
                 ),
                 (
-                    "cards.get_by_ref",
+                    CARDS_GET,
+                    serde_json::json!({ "card_ref": self.service, "kind": "Service", "card_uid": self.service.uid }),
+                    "WYRD_SPEC_400_VALIDATION",
+                ),
+                (
+                    CARDS_GET,
+                    serde_json::json!({ "kind": "Service" }),
+                    "WYRD_SPEC_400_VALIDATION",
+                ),
+                (
+                    CARDS_GET,
                     serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0", "space": "default" } }),
                     "WYRD_REGISTRY_404_CARD_NOT_FOUND",
                 ),
@@ -385,7 +392,7 @@ mod pg_tests {
             let failure = refusal(
                 foreign
                     .call_tool(call(
-                        "cards.get_by_ref",
+                        CARDS_GET,
                         serde_json::json!({ "card_ref": self.service }),
                     )?)
                     .await,
@@ -423,10 +430,7 @@ mod pg_tests {
 
             for (tool, arguments) in [
                 ("cards.list", serde_json::json!({})),
-                (
-                    "cards.get_by_ref",
-                    serde_json::json!({ "card_ref": self.service }),
-                ),
+                (CARDS_GET, serde_json::json!({ "card_ref": self.service })),
             ] {
                 let failure = refusal(denied.call_tool(call(tool, arguments)?).await)?;
                 assert!(
@@ -1037,7 +1041,7 @@ mod pg_tests {
             .await?;
         let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
         let fixture = register_fixture(&cards).await?;
-        let judged = Box::pin(cards.register_from_path(Path::new(concat!(
+        let judged = Box::pin(cards.declare_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards/verify_in_real_time/answer-judged.yaml"
         ))))
@@ -1399,7 +1403,7 @@ mod pg_tests {
         let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
             .await
             .expect("handle connects");
-        let receipt = Box::pin(cards.register_from_path(Path::new(concat!(
+        let receipt = Box::pin(cards.declare_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards/verify_in_real_time/support.yaml"
         ))))
@@ -1703,7 +1707,7 @@ mod pg_tests {
         };
         let mut agents = Vec::new();
         for name in ["frames", "frames-other"] {
-            let receipt = Box::pin(cards.register_from_path(Path::new(&fixture(name)))).await?;
+            let receipt = Box::pin(cards.declare_from_path(Path::new(&fixture(name)))).await?;
             let uid = |name: &str| -> Result<String, McpJourneyError> {
                 Ok(receipt
                     .outcomes

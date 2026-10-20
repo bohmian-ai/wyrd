@@ -5,7 +5,7 @@
 //! serve, `setup`) on the whole host, Linux or macOS; the report title carries
 //! the host fingerprint, so compare only reports from matching hosts. One
 //! tenant registers an assertion Verifier, a Model, and a Service, and the
-//! application loads the hydrated Service bundle under a Card-bound key, so
+//! application loads the pulled Service bundle under a Card-bound key, so
 //! every call is the public Rust client's `observe().verify` or
 //! `observe().submit` exactly as production makes it. All evidence comes from
 //! client timings, `/metrics`, and the OS's readings of the server process.

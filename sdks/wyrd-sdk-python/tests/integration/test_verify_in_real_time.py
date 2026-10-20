@@ -42,11 +42,11 @@ from .support import (
     binding_ids,
     binding_status,
     client_of,
-    download,
+    declare,
     group_binding,
     group_execution,
     hydrated,
-    register,
+    pull,
     service_key,
     timeline,
 )
@@ -64,7 +64,7 @@ CALLS = "/v1/chat/completions"
 
 def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     """The ``verifier:run`` grant on exactly the registered ``verifier``."""
-    uid = register(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
+    uid = declare(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
     return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
 
 
@@ -117,7 +117,7 @@ def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> 
 
     Returns the result's ``execution_id``.
     """
-    registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
+    registered = declare(cards, "cards/verify_in_real_time/assistant.yaml")
     token = WyrdClient(credential=service_key("assistant")).access_token()
     response = httpx.post(
         f"{server.base_url}/v1/verification/execute",
@@ -220,7 +220,7 @@ def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         .to_pylist()
     )
     caller = principal()
-    agent = register(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
+    agent = declare(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
     assert (call["sub_principal_id"], call["run_id"], call["card_uid"]) == (
         caller,
         None,
@@ -468,8 +468,8 @@ def enqueue_over_http(server: WyrdTestServer, key: str, idempotency_key: str, bo
 
 
 def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path) -> None:
-    registered = register(cards, "cards/verify_in_real_time/support.yaml")
-    bundle = download(cards, "support", tmp_path)
+    registered = declare(cards, "cards/verify_in_real_time/support.yaml")
+    bundle = pull(cards, "support", tmp_path)
     key = service_key("support")
     binding_id = group_binding(wyrd_server, cards, registered["support"])
     state = WyrdState.from_path(bundle, WyrdClient(credential=key))
@@ -529,7 +529,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
         verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
     assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
     with pytest.raises(WyrdError) as refused:
-        register(cards, "cards/verify_in_real_time/support-unsourced.yaml")
+        declare(cards, "cards/verify_in_real_time/support-unsourced.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
     assert "verified_by[0].runs_on" in str(refused.value)
 
@@ -546,8 +546,8 @@ def test_grouped_refund_changes_verdict(
             "auth": {"scheme": "bearer", "token": "refund-hook-token"},
         }
     )
-    registered = register(cards, "cards/verify_in_real_time/refund.yaml")
-    bundle = download(cards, "refund", tmp_path)
+    registered = declare(cards, "cards/verify_in_real_time/refund.yaml")
+    bundle = pull(cards, "refund", tmp_path)
     binding_id = group_binding(wyrd_server, cards, registered["refund"])
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("refund")))
     state.start_bifrost()
@@ -627,7 +627,7 @@ def test_grouped_refund_changes_verdict(
         },
     ]
     with pytest.raises(WyrdError) as refused:
-        register(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
+        declare(cards, "cards/verify_in_real_time/refund-on-failure.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
     assert "verified_by[1].on_failure" in str(refused.value)
 
@@ -640,8 +640,8 @@ def test_grouped_coding_uses_declared_sources(
     tmp_path: Path,
     fresh_tracer_provider: None,
 ) -> None:
-    registered = register(cards, "cards/verify_in_real_time/coding.yaml")
-    bundle = download(cards, "coding", tmp_path)
+    registered = declare(cards, "cards/verify_in_real_time/coding.yaml")
+    bundle = pull(cards, "coding", tmp_path)
     binding_id = group_binding(wyrd_server, cards, registered["coding"])
     wyrd_server.scoped_api_key("py_live_reader", ["tool:invoke", "bifrost_query:read"])
     principals = Principals(client_of(wyrd_server))
@@ -758,14 +758,14 @@ def test_grouped_coding_uses_declared_sources(
         ),
     ]:
         with pytest.raises(WyrdError) as refused:
-            register(cards, f"{relative}.yaml")
+            declare(cards, f"{relative}.yaml")
         name = relative.rsplit("/", 1)[-1]
         assert refused.value.code == code, name
         assert reason in f"{refused.value} {refused.value.details}", name
         with pytest.raises(WyrdError) as absent:
             cards.resolve_latest(kind, "default", name)
         assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND", name
-    register(cards, "cards/verify_in_real_time/coding-external.yaml")
+    declare(cards, "cards/verify_in_real_time/coding-external.yaml")
 
 
 def frame(directory: Path, label: str) -> Path:
@@ -795,14 +795,14 @@ def submit_frames(state: WyrdState, group: str, paths: list[Path]) -> list[verif
 def test_grouped_sampled_frames_use_visible_outcomes(
     wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, tmp_path: Path
 ) -> None:
-    registered = register(cards, "cards/verify_in_real_time/frames.yaml")
-    register(cards, "cards/verify_in_real_time/frames-other.yaml")
+    registered = declare(cards, "cards/verify_in_real_time/frames.yaml")
+    declare(cards, "cards/verify_in_real_time/frames-other.yaml")
     binding_id = group_binding(wyrd_server, cards, registered["frames"])
-    bundle = download(cards, "frames", tmp_path / "frames")
+    bundle = pull(cards, "frames", tmp_path / "frames")
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("frames")))
     state.start_bifrost()
     other = WyrdState.from_path(
-        download(cards, "frames-other", tmp_path / "other"),
+        pull(cards, "frames-other", tmp_path / "other"),
         WyrdClient(credential=service_key("frames-other")),
     )
     other.start_bifrost()
@@ -903,12 +903,10 @@ def test_grouped_conversations_coexist_with_drift(
     other_tenant: str,
     tmp_path: Path,
 ) -> None:
-    registered = register(cards, "cards/verify_in_real_time/support.yaml")
+    registered = declare(cards, "cards/verify_in_real_time/support.yaml")
     key = service_key("support")
     binding_id = group_binding(wyrd_server, cards, registered["support"])
-    state = WyrdState.from_path(
-        download(cards, "support", tmp_path / "a"), WyrdClient(credential=key)
-    )
+    state = WyrdState.from_path(pull(cards, "support", tmp_path / "a"), WyrdClient(credential=key))
     state.start_bifrost()
     assistant.start_bifrost()
     suffix = secrets.token_hex(4)
@@ -926,7 +924,7 @@ def test_grouped_conversations_coexist_with_drift(
     state.run("agent").observe.verify("turn-check", turn(""), group_id=b)
     solo = state.run("agent").observe.verify("turn-check", turn("solo"))
     queued.wait(WAIT_SECONDS)
-    newer = register(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
+    newer = declare(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
     late = enqueue_over_http(
         wyrd_server,
         key,
@@ -945,12 +943,12 @@ def test_grouped_conversations_coexist_with_drift(
         wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name=f"b-admin-{suffix}"),
     )
     b_cards = Cards(tenant_b)
-    register(b_cards, "cards/verify_in_real_time/support.yaml")
+    declare(b_cards, "cards/verify_in_real_time/support.yaml")
     b_key = cli.issue_key(
         kind="Service", name="support", version="1.0.0", space="default", client=tenant_b
     ).key
     b_state = WyrdState.from_path(
-        download(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
+        pull(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
     )
     b_state.start_bifrost()
     b_state.run("agent").observe.verify("turn-check", turn("tenant b"), group_id=a)
@@ -1025,10 +1023,10 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
             client_of(server, service_key("assistant", neighbor_client)),
         )
         cards = Cards(WyrdClient())
-        registered = register(cards, "cards/verify_in_real_time/support.yaml")
+        registered = declare(cards, "cards/verify_in_real_time/support.yaml")
         binding_id = group_binding(server, cards, registered["support"])
         support = WyrdState.from_path(
-            download(cards, "support", tmp_path / "support"),
+            pull(cards, "support", tmp_path / "support"),
             WyrdClient(credential=service_key("support")),
         )
         support.start_bifrost()

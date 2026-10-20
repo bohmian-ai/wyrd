@@ -60,6 +60,8 @@ mod pg_tests {
     }
 
     /// MCP gateway reads return the HTTP-configured redacted resources,
+    /// a composite apply commits its credentials and deployments together,
+    /// redacted, while a refused one commits nothing,
     /// including a named deployment's model allowlist and access level; MCP
     /// replacements and deletions are observed over HTTP with the same
     /// invalid-configuration and conflict problems, and a reader without
@@ -82,7 +84,9 @@ mod pg_tests {
     /// the expected values; a tool answer repeats a submitted secret; the
     /// invalid capture policy, in-use credential deletion, or deletions do
     /// not return their expected problem or empty result; credentials remain
-    /// after deletion; or the reader is not denied reads and writes with 403.
+    /// after deletion; a composite apply repeats its secret, commits after a
+    /// refusal, or differs from HTTP; or the reader is not denied reads,
+    /// writes, and applies with 403.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed MCP journey lane"]
     async fn agent_administers_redacted_gateway_configuration() -> Result<(), McpJourneyError> {
@@ -90,6 +94,9 @@ mod pg_tests {
         // same tool, a write-only source, and a unit view in every answer.
         const SUBMITTED: &str = "sk-live-mcp-submission";
         const ROTATED: &str = "sk-live-mcp-rotation";
+        /// Managed secret submitted through the composite apply tool, which
+        /// no MCP or HTTP answer may repeat.
+        const APPLIED: &str = "sk-live-mcp-apply";
         let server = WyrdTestServer::start_bound().await?;
         let admin = server
             .bootstrap_user("mcp-gateway-admin", &["admin"])
@@ -210,6 +217,90 @@ mod pg_tests {
         );
         credential_admin.delete_credential(&name).await?;
 
+        let apply = |document: serde_json::Value| {
+            let client = &client;
+            async move {
+                Ok::<_, McpJourneyError>(
+                    client
+                        .call_tool(
+                            CallToolRequestParams::new("gateway.apply_provider_deployments")
+                                .with_arguments(object(document)?),
+                        )
+                        .await?,
+                )
+            }
+        };
+        let managed_write = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "provider": "openai",
+                "source": {"managed_secret": {"secret": APPLIED}},
+            })
+        };
+        let deployment = |name: &str, credential: &str| {
+            serde_json::json!({
+                "name": name,
+                "adapter": "openai",
+                "auth": {"bearer": {"credential": credential}},
+            })
+        };
+        let refused = apply(serde_json::json!({
+            "credentials": [managed_write("partial")],
+            "deployments": [deployment("partial", "partial"), deployment("orphan", "absent")],
+        }))
+        .await?;
+        assert!(!serde_json::to_string(&refused)?.contains(APPLIED));
+        let refused = problem(refused)?;
+        assert_eq!(
+            refused["code"], "WYRD_GATEWAY_400_INVALID_CONFIGURATION",
+            "{refused}"
+        );
+        assert!(
+            gateway
+                .credentials()
+                .await?
+                .iter()
+                .all(|view| view.name.as_str() != "partial"),
+            "a refused apply commits none of its credentials"
+        );
+        let answer = apply(serde_json::json!({
+            "credentials": [managed_write("applied")],
+            "deployments": [deployment("applied", "applied")],
+        }))
+        .await?;
+        assert!(
+            !serde_json::to_string(&answer)?.contains(APPLIED),
+            "no part of the apply answer repeats the submitted value"
+        );
+        let applied = structured(answer)?;
+        assert_eq!(applied["credentials"][0]["source"], "managed_secret");
+        assert_eq!(
+            applied["credentials"][0],
+            serde_json::to_value(
+                gateway
+                    .credential(
+                        &wyrd_spec::ids::ProviderCredentialName::new("applied")
+                            .map_err(|error| error.to_string())?
+                    )
+                    .await?
+            )?,
+            "HTTP reads the same redacted applied credential"
+        );
+        assert_eq!(applied["deployments"][0]["name"], "applied");
+        for tool in [
+            "gateway.delete_provider_deployment",
+            "gateway.delete_provider_credential",
+        ] {
+            structured(
+                client
+                    .call_tool(
+                        CallToolRequestParams::new(tool)
+                            .with_arguments(object(serde_json::json!({"name": "applied"}))?),
+                    )
+                    .await?,
+            )?;
+        }
+
         let written = structured(
             client
                 .call_tool(
@@ -295,6 +386,21 @@ mod pg_tests {
                 .await?,
         )?;
         assert_eq!(denied_write["status"], 403, "{denied_write}");
+        let denied_apply = problem(
+            reader_client
+                .call_tool(
+                    CallToolRequestParams::new("gateway.apply_provider_deployments")
+                        .with_arguments(object(serde_json::json!({
+                            "deployments": [{
+                                "name": "denied",
+                                "adapter": "openai",
+                                "auth": {"bearer": {"credential": "primary"}},
+                            }],
+                        }))?),
+                )
+                .await?,
+        )?;
+        assert_eq!(denied_apply["status"], 403, "{denied_apply}");
         reader_client.cancel().await?;
         server.shutdown().await?;
         Ok(())

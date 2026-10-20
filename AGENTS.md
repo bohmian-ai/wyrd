@@ -71,10 +71,10 @@ Locked cross-cutting decisions that any contributor must honor:
   authoring helpers, OTEL integration, agent workflow integration, and test
   tooling, but they must not move server-owned durable behavior out of the
   server or create language-specific durable contracts.
-- Wyrd runs on macOS and Linux, on both x86_64 and arm64. This is locked and
-  never open for discussion. Every feature, including isolation, resource
-  limits, and process management, must work identically on all four
-  targets. Never build on a platform-specific mechanism (cgroups,
+- Wyrd runs on Linux x86_64, Linux arm64, and macOS arm64 (Apple Silicon).
+  Intel macOS is not a supported target. This is locked and never open for
+  discussion. Every feature, including isolation, resource limits, and
+  process management, must work identically on all three targets. Never build on a platform-specific mechanism (cgroups,
   namespaces, Landlock, seccomp, `/proc`, `prlimit`, setuid/credential
   switching, sandbox-exec, or similar), never gate a feature behind
   `cfg(target_os)`, and never treat a platform-specific mechanism as a

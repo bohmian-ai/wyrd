@@ -151,7 +151,10 @@ pub(crate) async fn list_tables_through_proxy(
     let info = host.peer_info().expect("proxy initialization metadata");
     let instructions = info.instructions.as_deref().expect("server instructions");
     assert!(instructions.contains("tools/list"));
-    assert!(instructions.contains("wyrd.guide"));
+    assert!(
+        instructions.contains(r#"wyrd.guide {"topic":"start"}"#),
+        "the proxy forwards the server's onboarding instructions: {instructions}"
+    );
     let tools = host
         .list_all_tools()
         .await
@@ -523,6 +526,40 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
         foreign,
         "the conflicting file is untouched"
     );
+    let (code, stdout, stderr) =
+        install(home.path(), &["--host", "copilot-cli", "--format", "json"]).await;
+    assert_eq!(code, Some(73), "a JSON conflict fails the run");
+    assert!(stdout.is_empty(), "a failed JSON install prints no result");
+    let refused: Value = serde_json::from_str(&stderr).expect("stderr is one error document");
+    assert_eq!(refused["code"], "WYRD_CLI_409_MCP_HOST_INSTALL");
+    assert_eq!(refused["details"]["hosts"][0]["host"], "copilot-cli");
+    assert_eq!(refused["details"]["hosts"][0]["status"], "conflict");
+    assert_eq!(files.snapshot()[2], foreign, "a JSON refusal edits nothing");
+    let (code, stdout, stderr) = install(home.path(), &["--format", "json"]).await;
+    assert_eq!(code, Some(64), "JSON mode never prompts for hosts");
+    assert!(stdout.is_empty());
+    let unselected: Value = serde_json::from_str(&stderr).expect("stderr is one error document");
+    assert_eq!(unselected["code"], "WYRD_CLI_400_MCP_HOST_SELECTION");
+    let (code, stdout, stderr) = install(
+        home.path(),
+        &[
+            "--host",
+            "codex",
+            "--host",
+            "claude-code",
+            "--format",
+            "json",
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.is_empty(), "a JSON success writes no stderr");
+    let report: Value = serde_json::from_str(&stdout).expect("stdout is one report");
+    assert_eq!(report["hosts"][0]["host"], "codex");
+    assert_eq!(report["hosts"][0]["status"], "unchanged");
+    assert_eq!(report["hosts"][1]["host"], "claude-code");
+    assert!(report["hosts"][1]["path"].is_string());
+    assert!(!stdout.contains(SENTINEL_KEY) && !stderr.contains(SENTINEL_KEY));
     let vscode = json_file(&files.vscode);
     assert_eq!(vscode["servers"]["other"]["command"], "other");
     assert_eq!(vscode["servers"]["wyrd"]["type"], "stdio");

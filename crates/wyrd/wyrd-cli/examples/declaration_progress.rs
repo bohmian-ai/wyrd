@@ -1,29 +1,25 @@
-//! Interactive terminal demo for Card registration progress rendering.
+//! Interactive terminal demo for Card declaration progress rendering.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use wyrd_cli::registration::RegistrationProgressRenderer;
-use wyrd_client::cards::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
+use wyrd_cli::declaration::DeclarationProgressRenderer;
+use wyrd_client::cards::{DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink};
 use wyrd_spec::registry::RelativeArtifactPath;
 
 fn main() {
     let should_fail = std::env::args().any(|argument| argument == "--fail");
-    let renderer = RegistrationProgressRenderer::with_interactive(true);
+    let renderer = DeclarationProgressRenderer::with_interactive(true);
     let sink = renderer.sink();
 
-    sink(RegistrationProgressEvent::Phase(
-        RegistrationPhase::Preparing,
-    ));
+    sink(DeclarationProgressEvent::Phase(DeclarationPhase::Preparing));
     thread::sleep(Duration::from_millis(500));
-    sink(RegistrationProgressEvent::Phase(
-        RegistrationPhase::Submitting,
+    sink(DeclarationProgressEvent::Phase(
+        DeclarationPhase::Submitting,
     ));
     thread::sleep(Duration::from_millis(700));
-    sink(RegistrationProgressEvent::Phase(
-        RegistrationPhase::Uploading,
-    ));
+    sink(DeclarationProgressEvent::Phase(DeclarationPhase::Uploading));
 
     let semaphore = Arc::new(DemoSemaphore::new(4));
     let mut workers = Vec::new();
@@ -47,17 +43,15 @@ fn main() {
     }
 
     if succeeded {
-        sink(RegistrationProgressEvent::Phase(
-            RegistrationPhase::Completing,
+        sink(DeclarationProgressEvent::Phase(
+            DeclarationPhase::Completing,
         ));
         thread::sleep(Duration::from_millis(700));
-        sink(RegistrationProgressEvent::Phase(
-            RegistrationPhase::Verifying,
-        ));
+        sink(DeclarationProgressEvent::Phase(DeclarationPhase::Verifying));
         thread::sleep(Duration::from_millis(500));
     } else {
-        sink(RegistrationProgressEvent::Phase(
-            RegistrationPhase::CleaningUp,
+        sink(DeclarationProgressEvent::Phase(
+            DeclarationPhase::CleaningUp,
         ));
         thread::sleep(Duration::from_millis(900));
     }
@@ -70,13 +64,13 @@ fn main() {
     }
 }
 
-fn simulate_upload(sink: RegistrationProgressSink, index: usize, should_fail: bool) -> bool {
+fn simulate_upload(sink: DeclarationProgressSink, index: usize, should_fail: bool) -> bool {
     let artifact = RelativeArtifactPath::new(&format!("artifact-{index}.bin"))
         .expect("invariant: demo artifact path is valid");
     let total_bytes = 8 * 1024 * 1024;
     let chunk_bytes = total_bytes / 16;
 
-    sink(RegistrationProgressEvent::ArtifactStarted {
+    sink(DeclarationProgressEvent::ArtifactStarted {
         artifact: artifact.clone(),
         total_bytes: Some(total_bytes),
     });
@@ -84,13 +78,13 @@ fn simulate_upload(sink: RegistrationProgressSink, index: usize, should_fail: bo
     for chunk in 1..=16 {
         thread::sleep(Duration::from_millis(90 + (index as u64 * 25)));
         let uploaded_bytes = chunk * chunk_bytes;
-        sink(RegistrationProgressEvent::ArtifactProgress {
+        sink(DeclarationProgressEvent::ArtifactProgress {
             artifact: artifact.clone(),
             uploaded_bytes,
             total_bytes: Some(total_bytes),
         });
         if should_fail && chunk == 8 {
-            sink(RegistrationProgressEvent::ArtifactFinished {
+            sink(DeclarationProgressEvent::ArtifactFinished {
                 artifact,
                 success: false,
             });
@@ -98,7 +92,7 @@ fn simulate_upload(sink: RegistrationProgressSink, index: usize, should_fail: bo
         }
     }
 
-    sink(RegistrationProgressEvent::ArtifactFinished {
+    sink(DeclarationProgressEvent::ArtifactFinished {
         artifact,
         success: true,
     });

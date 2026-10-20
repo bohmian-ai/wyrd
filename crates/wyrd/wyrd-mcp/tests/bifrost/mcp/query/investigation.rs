@@ -73,20 +73,18 @@ impl EvidenceInvestigation {
             "/../../../fixtures/cards"
         ));
         for component in ["support-model.yaml", "support-agent.yaml"] {
-            Box::pin(
-                cards.register_from_path(&fixtures.join("register_and_hydrate").join(component)),
-            )
-            .await?;
+            Box::pin(cards.declare_from_path(&fixtures.join("declare_and_pull").join(component)))
+                .await?;
         }
         let receipt =
-            Box::pin(cards.register_from_path(&fixtures.join("mcp_investigation/service.yaml")))
+            Box::pin(cards.declare_from_path(&fixtures.join("mcp_investigation/service.yaml")))
                 .await?;
         let drift = Box::pin(
-            cards.register_from_path(&fixtures.join("mcp_investigation/drift-verifier.yaml")),
+            cards.declare_from_path(&fixtures.join("mcp_investigation/drift-verifier.yaml")),
         )
         .await?;
         let assertion = Box::pin(
-            cards.register_from_path(&fixtures.join("register_and_hydrate/no-refund-promise.yaml")),
+            cards.declare_from_path(&fixtures.join("declare_and_pull/no-refund-promise.yaml")),
         )
         .await?;
         let bifrost = Bifrost::connect_with(&http, BifrostOptions::default()).await?;
@@ -324,7 +322,7 @@ impl EvidenceInvestigation {
             let response: GetCardResponse = serde_json::from_value(structured(
                 self.agent
                     .call_tool(Self::request(
-                        "cards.get_by_ref",
+                        "cards.get",
                         &json!({ "card_ref": reference }),
                     )?)
                     .await?,

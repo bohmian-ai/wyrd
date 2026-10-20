@@ -19,10 +19,10 @@ use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName};
-use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
+    NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
@@ -580,11 +580,11 @@ impl VerificationFixture {
         conn: &mut TenantConn<'_>,
         card: &Card,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
         let key = Uuid::now_v7().to_string();
-        insert_registration_operation(
+        insert_declaration_operation(
             conn,
-            NewRegistrationOperation {
+            NewDeclarationOperation {
                 operation_id,
                 attribution: Attribution::direct(self.actor.id),
                 idempotency_key: &key,

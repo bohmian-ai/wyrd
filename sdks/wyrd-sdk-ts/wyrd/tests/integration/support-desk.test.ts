@@ -75,7 +75,7 @@ test("support desk answers, verifies, and explains every request", async ({ serv
   const tickets = await (await Bifrost.connect({ client: admin })).describeTable("vala.datasets", "tickets");
   expect(tickets.user_fields.map((field) => field.name)).toEqual(["ticket_id", "question", "answer", "refund"]);
   await expect(
-    (await Cards.connect({ client: admin })).registerFromPath(fixture("cards/support_desk/conflicting-desk.yaml")),
+    (await Cards.connect({ client: admin })).declareFromPath(fixture("cards/support_desk/conflicting-desk.yaml")),
   ).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" });
   const viewer = WyrdClient.connect({
     serverUrl: server.baseUrl,

@@ -30,7 +30,7 @@ pub use credential::{
 };
 pub use deployment::{
     DeploymentAccess, ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderDeployment,
-    VertexLocation,
+    ProviderDeploymentsApplied, ProviderDeploymentsApply, VertexLocation,
 };
 pub use policy::{
     FALLBACK_HEADER, FallbackRule, FallbackScope, GatewayBudget, GatewayBudgetPeriod,

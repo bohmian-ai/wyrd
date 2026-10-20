@@ -1,4 +1,4 @@
-//! Private stdout progress coordination for registry artifact transfers.
+//! Private progress coordination for registry artifact transfers.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -20,9 +20,20 @@ pub(crate) struct DownloadProgressDisplay {
 
 impl DownloadProgressDisplay {
     /// Construct a display that always targets stdout for one download workflow.
+    #[cfg(feature = "internal")]
     #[must_use]
     pub(crate) fn stdout() -> Self {
         Self::new(ProgressDrawTarget::stdout())
+    }
+
+    /// Construct a display that tracks transfers without ever drawing.
+    ///
+    /// Graph pull uses it: its caller may be printing a machine-readable
+    /// result to the same stdout, and bars painted on a terminal would
+    /// corrupt that stream.
+    #[must_use]
+    pub(crate) fn hidden() -> Self {
+        Self::new(ProgressDrawTarget::hidden())
     }
 
     /// Start one artifact bar with the server-declared size when available.

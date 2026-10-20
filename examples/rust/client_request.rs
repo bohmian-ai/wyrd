@@ -16,7 +16,7 @@ use wyrd_ai::WyrdClient;
 use wyrd_ai::cards::{Cards, ListCardsRequest};
 
 /// Build the ambient client, connect `Cards` over it, and print up to ten
-/// registered Cards.
+/// declared Cards.
 ///
 /// # Errors
 /// Returns the configuration or no-credential refusal of

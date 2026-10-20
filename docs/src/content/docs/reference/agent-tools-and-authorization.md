@@ -14,8 +14,7 @@ An Agent that prepares evidence in a Verifier step can call tools that the serve
 | Tool | Does | Also needs |
 | --- | --- | --- |
 | `cards.list` | Lists Card summaries by kind, name, space, or metadata | `cards:read` |
-| `cards.get` | Reads one Card by kind and UID | `cards:read` on it |
-| `cards.get_by_ref` | Reads one Card by exact kind, name, version, and space | `cards:read` on it |
+| `cards.get` | Reads one Card by exact kind, name, version, and space, or by kind and UID | `cards:read` on it |
 | `bifrost.list_tables` | Lists tables | `bifrost_table:read` |
 | `bifrost.describe_table` | Reads one table's schema | `bifrost_table:read` on it |
 | `bifrost.query` | Runs one read-only SQL query | `bifrost_query:read` on every table or schema it reads |

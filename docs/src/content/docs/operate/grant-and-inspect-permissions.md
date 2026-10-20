@@ -25,7 +25,7 @@ wyrd principal list --kind service
 wyrd principal role list --principal <principal-id>
 ```
 
-A Service or Agent principal created by `wyrd apply` starts with `workload`. A tenant administrator holds `admin`.
+A Service or Agent principal created by `wyrd declare` starts with `workload`. A tenant administrator holds `admin`.
 
 ## 2. Grant or revoke a role
 

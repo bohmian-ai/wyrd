@@ -27,7 +27,7 @@ use crate::error::WyrdCliError;
 /// Build a client from the ambient configuration, optionally re-pointed.
 ///
 /// This is the default for a command that administers the deployment the user
-/// is already configured against — `wyrd apply`, `wyrd card get` — where the
+/// is already configured against — `wyrd declare`, `wyrd get` — where the
 /// credential comes from the same chain the SDKs read. `server` overrides only
 /// the endpoint, so `--server` can aim an otherwise ambient invocation
 /// elsewhere.

@@ -1,6 +1,6 @@
 """A developer runs Wyrd locally with only the administrator key ``wyrd setup`` printed.
 
-They register and hydrate an assistant, invoke a model through the Gateway with
+They declare and pull an assistant, invoke a model through the Gateway with
 the stock OpenAI client, observe and verify a Run, export its spans through
 ``state.start_telemetry``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for
@@ -10,6 +10,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 from __future__ import annotations
 
 import fcntl
+import http.client
 import json
 import os
 import pty
@@ -23,16 +24,17 @@ import tempfile
 import termios
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import openai
 import pytest
+import tomllib
 from opentelemetry import trace
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost
@@ -45,7 +47,7 @@ from wyrd.state import WyrdState
 from wyrd.testing import UnmigratedDatabase, WyrdTestServer, cli
 
 from .gateway.support import Upstream
-from .support import Receiver, download, hydrated, register
+from .support import Receiver, declare, hydrated, pull
 
 pytestmark = pytest.mark.integration
 
@@ -86,10 +88,10 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     """Run the whole local workflow as ``client`` and assert each step."""
     configure_gateway(client)
     cards = Cards(client)
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    register(cards, "cards/verify_in_real_time/assistant.yaml")
-    state = hydrated(download(cards, "assistant", bundle_home), client)
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    declare(cards, "cards/verify_in_real_time/assistant.yaml")
+    state = hydrated(pull(cards, "assistant", bundle_home), client)
     state.start_bifrost()
 
     assert invoke(client) == "hi"
@@ -179,10 +181,10 @@ def test_start_telemetry_refuses_the_applications_own_provider(
         server_url=server.base_url, credential=server.tenant_admin_key(), grpc_url=server.grpc_url
     )
     cards = Cards(client)
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    register(cards, "cards/verify_in_real_time/assistant.yaml")
-    state = hydrated(download(cards, "assistant", tmp_path), client)
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    declare(cards, "cards/verify_in_real_time/assistant.yaml")
+    state = hydrated(pull(cards, "assistant", tmp_path), client)
     own = TracerProvider()
     trace.set_tracer_provider(own)
 
@@ -217,7 +219,7 @@ def cli_bootstrap_client(monkeypatch: pytest.MonkeyPatch) -> WyrdClient:
 def test_cli_bootstrap_saved_config(cli_bootstrap_client: WyrdClient) -> None:
     """A fresh Python runtime writes and reads using only the CLI's saved files."""
     cards = Cards(cli_bootstrap_client)
-    refs = register(cards, "cards/gateway_inference/ask-prompt.yaml")
+    refs = declare(cards, "cards/gateway_inference/ask-prompt.yaml")
     assert cards.get(refs["ask-prompt"]).metadata["name"] == "ask-prompt"
 
 
@@ -409,7 +411,7 @@ def wait_for_local_cli(child: subprocess.Popen[str], master: int, terminal: str,
         assert b"wyrd_global_" in disclosed
 
 
-def stop_local_cli(child: subprocess.Popen[str]) -> None:
+def stop_local_cli(child: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
     """Interrupt and reap the owned CLI, killing its group on deadline failure."""
     if child.poll() is None:
         child.send_signal(signal.SIGINT)
@@ -422,6 +424,16 @@ def stop_local_cli(child: subprocess.Popen[str]) -> None:
             pass
         child.wait()
         raise RuntimeError("local CLI failed to settle its server") from err
+
+
+PROVIDER_KEY_VARIABLES = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "TYPESAFE_API_KEY",
+)
+"""Provider keys ``wyrd server dev`` offers; removed so only a test opts in to the offer."""
 
 
 @contextmanager
@@ -459,6 +471,7 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
             "WYRD_CONFIG_PATH",
             "WYRD_PLATFORM_CREDENTIAL",
             "WYRD_PLATFORM_DATABASE_URL",
+            *PROVIDER_KEY_VARIABLES,
         ):
             env.pop(name, None)
         env.update(
@@ -478,9 +491,17 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
 
 @contextmanager
 def installed_local_cli(
-    cli_path: str, home: Path, env: dict[str, str], terminal: str, tenant: str = "local"
+    cli_path: str,
+    home: Path,
+    env: dict[str, str],
+    terminal: str,
+    tenant: str = "local",
+    extra: tuple[str, ...] = (),
 ) -> Iterator[None]:
-    """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends."""
+    """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends.
+
+    ``extra`` appends further ``server dev`` arguments, such as a gateway file.
+    """
     command_env = dict(env)
     master, slave = pty.openpty() if terminal else (-1, -1)
     if terminal:
@@ -488,7 +509,7 @@ def installed_local_cli(
         command_env["CODEX_HOME"] = str(home / "codex")
     with tempfile.TemporaryFile(mode="w+") as errors:
         child = subprocess.Popen(
-            [cli_path, "server", "dev", "--tenant", tenant],
+            [cli_path, "server", "dev", "--tenant", tenant, *extra],
             cwd=home,
             env=command_env,
             stdin=slave if terminal else subprocess.DEVNULL,
@@ -637,19 +658,66 @@ def calls_since(recorded: Receiver, start: int) -> list[tuple[str, str | None]]:
     return [(d.path, d.body.get("model")) for d in recorded.deliveries[start:]]
 
 
+class LosingProxy(BaseHTTPRequestHandler):
+    """Forward-proxies plain HTTP, dropping the answer to every composite gateway apply.
+
+    The apply is forwarded and its full answer read, so the server has
+    committed before the connection closes with no response.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def forward(self) -> None:
+        """Forward one request to its absolute target and relay or drop the answer."""
+        target = urlsplit(self.path)
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        upstream = http.client.HTTPConnection(target.netloc, timeout=60)
+        try:
+            upstream.request(
+                self.command,
+                target.path + (f"?{target.query}" if target.query else ""),
+                body=body,
+                headers={k: v for k, v in self.headers.items() if k.lower() != "proxy-connection"},
+            )
+            answer = upstream.getresponse()
+            payload = answer.read()
+        finally:
+            upstream.close()
+        if self.command == "POST" and target.path == "/v1/admin/gateway/provider-deployments":
+            self.close_connection = True
+            return
+        self.send_response(answer.status)
+        for name, value in answer.getheaders():
+            if name.lower() not in ("transfer-encoding", "connection", "content-length"):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = forward
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
+        """Keep proxy traffic out of test output."""
+
+
 @pytest.mark.local_dev
 def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     """Set up four named deployments with the installed CLI, as ``examples/gateway-setup`` does.
 
     The server reaches local provider fixtures through its non-production
-    ``[gateway.endpoints]`` configuration. Refused files write nothing,
-    reapplying converges, a fresh TypeScript process calls every deployment
+    ``[gateway.endpoints]`` configuration. Refused files, including the
+    shipped document with its ``local_env`` keys unset, write nothing; the
+    document applied from the environment, and the two-step deployment list,
+    converge; and a restart with ``--gateway-file`` reapplies it, a fresh TypeScript process calls every deployment
     with the saved deployment alone, and each upstream sees its own key and
-    never a Wyrd credential. One Agent per provider is then applied, downloaded
-    with ``wyrd get``, and loaded from that bundle by a fresh Python process,
+    never a Wyrd credential. One Agent per provider is then declared, pulled
+    with ``wyrd pull``, and loaded from that bundle by a fresh Python process,
     which sends each Agent's rendered Prompt to its deployment. A restarted
     server still decrypts the credentials and serves the same downloaded
-    Agents, and a revoked credential or an under-granted caller is refused.
+    Agents, and a revoked credential or an under-granted caller is refused. A
+    startup whose gateway apply commits but loses its answer fails without
+    claiming noncommit and settles its server; the committed deployment reads
+    back on restart and reapplying the same document succeeds.
     """
     root = Path(__file__).resolve().parents[4]
     cli_path = str(root / "target/debug/wyrd")
@@ -659,12 +727,15 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     for name in ("gateway.json", "capture-policy.json"):
         shutil.copy2(root / "examples/gateway-setup" / name, tmp_path / name)
-    entries = json.loads((tmp_path / "gateway.json").read_text())
-    for provider, (_, value) in UPSTREAM_KEYS.items():
-        secret = value.removeprefix("Bearer ")
-        source = {"managed_secret": {"secret": secret}}
-        document = {"name": f"{provider}-key", "provider": provider, "source": source}
-        (tmp_path / f"{provider}-credential.json").write_text(json.dumps(document))
+    composite = json.loads((tmp_path / "gateway.json").read_text())
+    entries = composite["deployments"]
+    keys = {
+        credential["source"]["local_env"]: UPSTREAM_KEYS[credential["provider"]][1].removeprefix(
+            "Bearer "
+        )
+        for credential in composite["credentials"]
+    }
+    (tmp_path / "deployments.json").write_text(json.dumps(entries))
     (tmp_path / "openai-prod.json").write_text(json.dumps(entries[0]))
     (tmp_path / "malformed.json").write_text("[{")
     (tmp_path / "duplicate.json").write_text(json.dumps([entries[0], entries[0]]))
@@ -693,24 +764,32 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 for refused in ("malformed.json", "duplicate.json"):
                     failed = wyrd("gateway", "deployment", "put", "--file", refused)
                     assert failed.returncode != 0 and "--file" in failed.stderr, failed.stderr
-                missing = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                missing = wyrd("gateway", "deployment", "put", "--file", "deployments.json")
                 assert missing.returncode != 0
                 assert [o["status"] for o in json.loads(missing.stdout)] == [
                     "failed",
                     *["unattempted"] * 3,
                 ], missing.stdout
+                unset = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                assert unset.returncode != 0 and "local_env" in unset.stderr, unset.stderr
                 assert deployments() == []
 
-                for provider in UPSTREAM_KEYS:
-                    put = wyrd(
-                        "gateway", "credential", "put", "--file", f"{provider}-credential.json"
-                    )
-                    assert put.returncode == 0, put.stderr
-                    assert "sk-" not in put.stdout + put.stderr
                 for _ in range(2):
-                    applied = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                    applied = wyrd(
+                        "gateway",
+                        "deployment",
+                        "put",
+                        "--file",
+                        "gateway.json",
+                        caller={**env, **keys},
+                    )
                     assert applied.returncode == 0, applied.stderr
-                    assert {o["status"] for o in json.loads(applied.stdout)} == {"completed"}
+                    assert "sk-" not in applied.stdout + applied.stderr
+                    assert sorted(d["name"] for d in json.loads(applied.stdout)["deployments"]) == (
+                        sorted(entry["name"] for entry in entries)
+                    )
+                rewritten = wyrd("gateway", "deployment", "put", "--file", "deployments.json")
+                assert {o["status"] for o in json.loads(rewritten.stdout)} == {"completed"}
                 single = wyrd("gateway", "deployment", "put", "--file", "openai-prod.json")
                 assert json.loads(single.stdout)["name"] == "openai-prod", single.stderr
                 names = sorted(entry["name"] for entry in entries)
@@ -719,7 +798,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert captured.returncode == 0, captured.stderr
 
                 agent = root / "fixtures/cards/gateway_inference/ask-agent.yaml"
-                assert wyrd("apply", str(agent)).returncode == 0
+                assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
                     *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
                     *("--version", "1.0.0", "--space", "default"),
@@ -745,10 +824,10 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 run_typescript(env, "cli_gateway_setup")
                 direct = len(recorded.deliveries)
 
-                applied = wyrd("apply", str(root / "examples/gateway-setup/agents/service.yaml"))
+                applied = wyrd("declare", str(root / "examples/gateway-setup/agents/service.yaml"))
                 assert applied.returncode == 0, applied.stderr
                 got = wyrd(
-                    *("get", "--kind", "Service", "--name", "gateway-agents"),
+                    *("pull", "--kind", "Service", "--name", "gateway-agents"),
                     *("--version", "1.0.0", "--space", "default", "--output-dir", "gateway-agents"),
                 )
                 assert got.returncode == 0, got.stderr
@@ -765,7 +844,10 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 (path, model) for path, (_, model) in UPSTREAM_CALLS.items()
             )
 
-            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+            gateway_file = ("--gateway-file", str(tmp_path / "gateway.json"))
+            with installed_local_cli(
+                cli_path, home, {**env, **keys}, "", tenant="acme", extra=gateway_file
+            ):
                 assert deployments() == names
                 run_typescript(env, "cli_gateway_setup")
                 rerun = len(recorded.deliveries)
@@ -776,6 +858,43 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 delivered = len(recorded.deliveries)
                 run_typescript(env, "cli_gateway_revoked")
                 assert len(recorded.deliveries) == delivered, "a revoked credential was sent"
+            assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
+
+            lost = tmp_path / "lost.json"
+            lost.write_text(json.dumps({"deployments": [{**entries[1], "name": "lost-answer"}]}))
+            proxy = ThreadingHTTPServer(("127.0.0.1", 0), LosingProxy)
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+            via = f"http://127.0.0.1:{proxy.server_address[1]}"
+            try:
+                failed = subprocess.run(
+                    [cli_path, "server", "dev", "--tenant", "acme", "--gateway-file", str(lost)],
+                    cwd=home,
+                    env={
+                        **env,
+                        "HTTP_PROXY": via,
+                        "http_proxy": via,
+                        "NO_PROXY": "",
+                        "no_proxy": "",
+                    },
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=200,
+                )
+            finally:
+                proxy.shutdown()
+            assert failed.returncode not in (0, 130), failed.stderr
+            assert "may have committed" in failed.stderr, failed.stderr
+            assert "nothing was applied" not in failed.stderr
+            assert "wyrd_sk_" not in failed.stdout + failed.stderr
+            host, port = env["WYRD_SERVER_BIND"].rsplit(":", 1)
+            with socket.socket() as settled:
+                settled.bind((host, int(port)))
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                assert deployments() == sorted([*names, "lost-answer"]), "commit not durable"
+                reapplied = wyrd("gateway", "deployment", "put", "--file", str(lost))
+                assert reapplied.returncode == 0, reapplied.stderr
+                assert deployments() == sorted([*names, "lost-answer"])
             assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
             for delivery in recorded.deliveries:
                 gemini = delivery.path.endswith(":generateContent")
@@ -789,3 +908,298 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert not any(v.startswith("Bearer ey") for v in delivery.headers.values())
     finally:
         upstream.shutdown()
+
+
+def converse(
+    child: subprocess.Popen[bytes], master: int, answers: list[tuple[bytes, bytes]]
+) -> tuple[bytes, bytes]:
+    """Answer each expected question, in order, until the whole ready message.
+
+    Returns everything the CLI printed and everything the terminal echoed or
+    was sent, so callers can prove what was and was not disclosed.
+    """
+    assert child.stdout is not None
+    shown = disclosed = b""
+    seen = 0
+    pending = list(answers)
+    deadline = time.monotonic() + 150
+    # The ready message arrives one line per write; wait for its last line.
+    while b"Press Ctrl-C to stop." not in shown:
+        assert time.monotonic() < deadline, f"guided startup deadline: {shown!r}"
+        readable, _, _ = select.select([child.stdout, master], [], [], 1)
+        for source in readable:
+            descriptor = master if source == master else child.stdout.fileno()
+            try:
+                chunk = os.read(descriptor, 4096)
+            except OSError:
+                chunk = b""
+            if source == master:
+                disclosed += chunk
+                continue
+            assert chunk, f"guided CLI exited: {shown!r}"
+            shown += chunk
+            while pending and (found := shown.find(pending[0][0], seen)) >= 0:
+                seen = found + len(pending[0][0])
+                os.write(master, pending.pop(0)[1] + b"\n")
+    assert not pending, f"unasked questions: {pending!r}"
+    return shown, disclosed
+
+
+def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], sent: int) -> None:
+    """Send ``sent`` while the first concealed question waits on a real terminal.
+
+    The CLI must exit with 130, leave terminal echo restored, disclose nothing,
+    and install, migrate, or save nothing.
+    """
+    master, slave = pty.openpty()
+    try:
+        child = subprocess.Popen(
+            [cli_path, "server", "dev"],
+            cwd=home,
+            env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=terminal_session,
+        )
+        assert child.stdout is not None
+        shown = b""
+        deadline = time.monotonic() + 60
+        while b"(input hidden): " not in shown:
+            assert time.monotonic() < deadline, f"hidden question deadline: {shown!r}"
+            chunk = os.read(child.stdout.fileno(), 4096)
+            assert chunk, f"CLI exited before asking: {shown!r}"
+            shown += chunk
+        while termios.tcgetattr(slave)[3] & termios.ECHO:
+            assert time.monotonic() < deadline, "echo was never disabled"
+            time.sleep(0.05)
+        os.write(master, b"postgres://typed-but-unsent")
+        child.send_signal(sent)
+        stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 130, stderr
+        assert termios.tcgetattr(slave)[3] & termios.ECHO, "echo left disabled"
+        assert b"typed-but-unsent" not in shown + stdout + stderr
+        assert not (home / "wyrd/config.toml").exists()
+        assert not (home / "wyrd/credentials.toml").exists()
+        assert not (home / "wyrd/server/sealing.key").exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def unattended_terminal_offers_no_hosts(cli_path: str) -> None:
+    """A complete ``--non-interactive`` run on a terminal never asks about hosts.
+
+    A detected host is left unchanged on first setup; an explicit ``--host``
+    on the configured restart still installs it without a question.
+    """
+    with local_deployment() as (home, env):
+        host_config = home / "codex/config.toml"
+        before = host_config.read_bytes()
+        with installed_local_cli(cli_path, home, env, "restart", extra=("--non-interactive",)):
+            pass
+        assert host_config.read_bytes() == before, "unattended setup changed a host"
+        with installed_local_cli(
+            cli_path, home, env, "restart", extra=("--non-interactive", "--host", "codex")
+        ):
+            assert host_config.read_bytes() != before, "explicit host was not installed"
+
+
+def restart_on_another_listener(
+    cli_path: str, home: Path, env: dict[str, str], listed: Callable[[str], list[str]]
+) -> None:
+    """Resume completed setup on a terminal with only the HTTP listener changed.
+
+    Provider keys and a detected host remain, yet no gateway or host question
+    is asked: the saved key, proven against the server, marks the deployment
+    as configured. The key and gateway state are unchanged, the new endpoint
+    is saved and usable, and the owned server settles on interruption.
+    """
+    rebound = local_listener()
+    protected = home / "wyrd/credentials.toml"
+    key = tomllib.loads(protected.read_text())["default"]["api_key"]
+    master, slave = pty.openpty()
+    child = subprocess.Popen(
+        [cli_path, "server", "dev", "--bind", rebound],
+        cwd=home,
+        env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=terminal_session,
+    )
+    os.close(slave)
+    try:
+        shown, _ = converse(child, master, [])
+        assert child.stdout is not None
+        threading.Thread(target=child.stdout.read, daemon=True).start()
+        assert b"Configure which providers" not in shown, "restart offered providers"
+        assert b"Connect which hosts" not in shown, "restart offered hosts"
+        assert f"Local Wyrd ready at http://{rebound} for tenant guided.".encode() in shown
+        assert listed("deployment") == ["gemini-local"]
+        assert listed("credential") == ["gemini-key"]
+    finally:
+        stop_local_cli(child)
+        os.close(master)
+    assert tomllib.loads(protected.read_text())["default"]["api_key"] == key
+    saved = tomllib.loads((home / "wyrd/config.toml").read_text())
+    assert saved["client"]["http_url"] == f"http://{rebound}"
+    assert saved["dev"]["bind"] == rebound
+    host, port = rebound.rsplit(":", 1)
+    with socket.socket() as settled:
+        settled.bind((host, int(port)))
+
+
+@pytest.mark.local_dev
+def test_installed_cli_guided_setup() -> None:
+    """Guided first setup asks only for missing inputs and approved providers.
+
+    An unattended run lists every missing input before any effect. On a
+    terminal the database URL is asked with echo off and the tenant slug in
+    the open. Of the detected provider keys only the approved Gemini key,
+    selected from ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY`` and renamed, is
+    applied. Fresh CLI processes then read it with saved settings alone, and
+    no key or database URL reaches output or general configuration.
+    Interrupting the first hidden question restores echo and changes nothing,
+    and an unattended run on a terminal never offers hosts.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    secrets = {
+        "OPENAI_API_KEY": "sk-guided-openai",
+        "GOOGLE_API_KEY": "sk-guided-google",
+        "GEMINI_API_KEY": "sk-guided-gemini",
+    }
+    with local_deployment() as (home, env):
+        database = env.pop("WYRD_DATABASE_URL")
+        env.update(secrets)
+        unattended = subprocess.run(
+            [cli_path, "server", "dev", "--non-interactive"],
+            cwd=home,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert unattended.returncode != 0
+        assert "WYRD_DATABASE_URL" in unattended.stderr and "--tenant" in unattended.stderr
+        assert not (home / "wyrd/credentials.toml").exists()
+        for sent in (signal.SIGINT, signal.SIGTERM):
+            interrupt_hidden_question(cli_path, home, env, sent)
+
+        master, slave = pty.openpty()
+        stderr = tempfile.TemporaryFile()  # noqa: SIM115 - read after the child exits
+        child = subprocess.Popen(
+            [cli_path, "server", "dev"],
+            cwd=home,
+            env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            preexec_fn=terminal_session,
+        )
+        os.close(slave)
+        try:
+            shown, disclosed = converse(
+                child,
+                master,
+                [
+                    (b"(input hidden): ", database.encode()),
+                    (b"Tenant slug to provision: ", b"guided"),
+                    (b"Configure which providers", b"2"),
+                    (b"Deployment name for gemini [gemini]: ", b"gemini-local"),
+                    (b"Apply deployments gemini-local", b""),
+                    (b"Connect which hosts", b""),
+                ],
+            )
+            assert child.stdout is not None
+            threading.Thread(target=child.stdout.read, daemon=True).start()
+            assert b"openai from OPENAI_API_KEY" in shown
+            assert b"gemini from GOOGLE_API_KEY" in shown
+            assert b"WYRD_STORAGE_URL is unset" in shown
+            assert b"configured deployments gemini-local" in shown
+
+            def listed(resource: str) -> list[str]:
+                fresh = subprocess.run(
+                    [cli_path, "gateway", resource, "list"],
+                    cwd=home,
+                    env={k: v for k, v in env.items() if k not in secrets},
+                    capture_output=True,
+                    text=True,
+                )
+                assert fresh.returncode == 0, fresh.stderr
+                return [item["name"] for item in json.loads(fresh.stdout)]
+
+            assert listed("deployment") == ["gemini-local"]
+            assert listed("credential") == ["gemini-key"]
+        finally:
+            stop_local_cli(child)
+            os.close(master)
+        stderr.seek(0)
+        errors = stderr.read()
+        stderr.close()
+        general = (home / "wyrd/config.toml").read_bytes()
+        protected = (home / "wyrd/credentials.toml").read_bytes()
+        assert b'tenant = "guided"' in general
+        for leaked in (database, *secrets.values(), "wyrd_sk_"):
+            assert leaked.encode() not in shown + errors + general
+        assert database.encode() not in disclosed
+        assert database.encode() in protected
+        assert not any(value.encode() in protected for value in secrets.values())
+        restart_on_another_listener(cli_path, home, env, listed)
+    unattended_terminal_offers_no_hosts(cli_path)
+
+
+EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")
+"""Standalone example repositories, checked out beside Wyrd or under ``WYRD_EXAMPLES_DIR``."""
+
+
+@pytest.mark.local_dev
+def test_standalone_examples_use_saved_local_setup() -> None:
+    """Each standalone example starts Wyrd with its own shipped gateway document.
+
+    No example ships a Wyrd bootstrap of its own: no key or tenant script, and
+    a Compose file that runs PostgreSQL only. Starting the installed CLI from
+    each repository's ``gateway.json`` with ``OPENAI_API_KEY`` set converges on
+    one tenant; fresh CLI and Python processes then use the ``openai``
+    deployment the apps call with saved settings alone, and the provider key
+    reaches neither output nor saved files.
+    """
+    root = Path(__file__).resolve().parents[4]
+    examples = Path(os.environ.get("WYRD_EXAMPLES_DIR", root.parent))
+    repos = [examples / name for name in EXAMPLE_REPOS]
+    absent = [str(repo) for repo in repos if not (repo / "gateway.json").is_file()]
+    if absent:
+        raise pytest.skip.Exception(f"standalone examples are not checked out: {absent}")
+    cli_path = str(root / "target/debug/wyrd")
+    provider_key = "sk-example-openai"
+    with local_deployment() as (home, env):
+        caller = dict(env)
+
+        def listed(resource: str) -> list[str]:
+            fresh = subprocess.run(
+                [cli_path, "gateway", resource, "list"],
+                cwd=home,
+                env=caller,
+                capture_output=True,
+                text=True,
+            )
+            assert fresh.returncode == 0, fresh.stderr
+            assert provider_key not in fresh.stdout + fresh.stderr
+            return [item["name"] for item in json.loads(fresh.stdout)]
+
+        for repo in repos:
+            assert not (repo / "docker/keys.sh").exists()
+            assert not (repo / "docker/setup.sh").exists()
+            compose = repo / "docker-compose.yml"
+            assert not compose.exists() or "wyrd:dev" not in compose.read_text(), compose
+            assert provider_key not in (repo / "gateway.json").read_text()
+            gateway_file = ("--gateway-file", str(repo / "gateway.json"))
+            started = {**env, "OPENAI_API_KEY": provider_key}
+            with installed_local_cli(
+                cli_path, home, started, "", tenant="support", extra=gateway_file
+            ):
+                assert listed("deployment") == ["openai"], repo
+                assert listed("credential") == ["openai-key"], repo
+                run_python(caller, "test_cli_bootstrap_saved_config")
+        for saved in (home / "wyrd").rglob("*.toml"):
+            assert provider_key not in saved.read_text(), saved

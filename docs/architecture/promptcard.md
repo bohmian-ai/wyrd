@@ -52,8 +52,8 @@ PR3 intentionally does not add:
 - projection helpers or provider wire projection;
 - `PromptWireSerializer` or `DefaultWireSerializer`;
 - `RunOutput`;
-- `Prompt.register()` or `PromptCard.register()`.
+- `Prompt.declare()` or `PromptCard.declare()`.
 
-Registration remains a registry/client responsibility. Card instances only own
+Declaration remains a registry/client responsibility. Card instances only own
 local holder behavior such as `save`, `load`, `model_dump_json`, and
 `model_validate_json`.

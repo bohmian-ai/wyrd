@@ -56,12 +56,12 @@ export function projectCard(uid: string, version?: string): CardDetail | null {
     uid,
     name: row.name,
     kind: row.kind,
-    summary: `Registered ${row.kind} Card in space ${row.space}.`,
+    summary: `Declared ${row.kind} Card in space ${row.space}.`,
     status: row.status,
     version: row.version,
     currentVersion: row.version,
     versions: [
-      { version: row.version, created: '2026-08-01 00:00Z', by: row.owner || '—', note: 'registration' }
+      { version: row.version, created: '2026-08-01 00:00Z', by: row.owner || '—', note: 'declaration' }
     ],
     actions: [],
     spec: [

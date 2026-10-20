@@ -18,7 +18,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
@@ -34,7 +34,7 @@ use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, fixture, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, coordinates, declare, declared, fixture, pull};
 use crate::verifier_building_blocks::{completion, requirement, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
@@ -79,7 +79,7 @@ fn on_judge(builder: WyrdTestServerBuilder, judge: &MockServer) -> WyrdTestServe
 impl Assistant {
     /// Start the judge and the server, deploy the judge model on the gateway,
     /// then register the latency baseline, the latency Model, and the
-    /// assistant, and hydrate the assistant.
+    /// assistant, and pull the assistant.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -127,18 +127,18 @@ impl Assistant {
             .await
             .expect("the capture policy puts");
         let cards = deployment.cards().await;
-        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-        register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
-        let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
-        let bundle = hydrate(&cards, &assistant.root).await;
+        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+        let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+        let bundle = pull(&cards, &assistant.root).await;
         Self {
             deployment,
             judge,
             bundle,
             service: assistant.root.clone(),
-            answer_check: registered(&assistant, "answer-check"),
-            answer_judged: registered(&assistant, "answer-judged"),
-            agent: registered(&assistant, "assistant-agent"),
+            answer_check: declared(&assistant, "answer-check"),
+            answer_judged: declared(&assistant, "answer-judged"),
+            agent: declared(&assistant, "assistant-agent"),
         }
     }
 
@@ -172,10 +172,10 @@ impl Assistant {
             .deployment
             .client(&self.deployment.other_tenant_admin(slug).await);
         let cards = Cards::connect_with(&admin).await.expect("handle connects");
-        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-        register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
-        let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
-        let bundle = hydrate(&cards, &assistant.root).await;
+        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+        let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+        let bundle = pull(&cards, &assistant.root).await;
         let [kind, name, version, space] = coordinates(&assistant.root);
         let key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(admin))
             .await
@@ -937,8 +937,8 @@ async fn window_verifier_records_samples_and_refuses_verify() {
 async fn unfitted_baseline_is_skipped_on_schedule() {
     let assistant = Assistant::start().await;
     let cards = assistant.deployment.cards().await;
-    let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
-    let bundle = hydrate(&cards, &unfitted.root).await;
+    let unfitted = declare(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
+    let bundle = pull(&cards, &unfitted.root).await;
     let key = assistant.deployment.service_key(&unfitted.root).await;
     let state = WyrdState::from_path_with(
         bundle.path().join("bundle"),
@@ -1201,7 +1201,7 @@ async fn another_tenant_cannot_verify_the_assistant() {
 /// its hydrated bundle loaded as the Service itself.
 struct Grouped {
     /// The Service registration, naming every Card it registered.
-    receipt: RegistrationReceipt,
+    receipt: DeclarationReceipt,
     /// The hydrated bundle the Service state and any other caller load.
     bundle: TempDir,
     /// The Service's API key.
@@ -1222,8 +1222,8 @@ impl Assistant {
     /// binding.
     async fn grouped(&self, relative: &str) -> Grouped {
         let cards = self.deployment.cards().await;
-        let receipt = register(&cards, relative).await;
-        let bundle = hydrate(&cards, &receipt.root).await;
+        let receipt = declare(&cards, relative).await;
+        let bundle = pull(&cards, &receipt.root).await;
         let key = self.deployment.service_key(&receipt.root).await;
         let state =
             WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
@@ -1497,8 +1497,8 @@ async fn grouped_support_resumes() {
     queued.wait(WAIT).await.expect("the queued turn is judged");
     let body = |turn: &serde_json::Value| {
         json!({
-            "verifier_card_uid": registered(&support.receipt, "turn-check").uid,
-            "card_uid": registered(&support.receipt, "assistant-agent").uid,
+            "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
+            "card_uid": declared(&support.receipt, "assistant-agent").uid,
             "group_id": group,
             "inputs": {"turn": {"kind": "json", "value": turn}},
         })
@@ -1518,8 +1518,8 @@ async fn grouped_support_resumes() {
             deployment,
             "support-turn-0006",
             &json!({
-                "verifier_card_uid": registered(&support.receipt, "turn-check").uid,
-                "card_uid": registered(&support.receipt, "assistant-agent").uid,
+                "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
+                "card_uid": declared(&support.receipt, "assistant-agent").uid,
                 "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
             }),
         )
@@ -1640,11 +1640,11 @@ async fn grouped_support_resumes() {
                 "service_type": "agent",
                 "components": [{
                     "alias": "agent",
-                    "ref": registered(&support.receipt, "assistant-agent"),
+                    "ref": declared(&support.receipt, "assistant-agent"),
                     "verified_by": [{
-                        "verifier": registered(&support.receipt, "turn-check"),
+                        "verifier": declared(&support.receipt, "turn-check"),
                     }, {
-                        "verifier": registered(&support.receipt, "conversation-verifier"),
+                        "verifier": declared(&support.receipt, "conversation-verifier"),
                         "runs_on": {"kind": "group_end", "after": after},
                     }],
                 }],
@@ -1748,7 +1748,7 @@ async fn grouped_support_resumes() {
     let refused = deployment
         .cards()
         .await
-        .register_from_path(&fixture("cards/verify_in_real_time/support-unsourced.yaml"))
+        .declare_from_path(&fixture("cards/verify_in_real_time/support-unsourced.yaml"))
         .await
         .expect_err("a group_end binding needs a Verifier with sources");
     assert_eq!(
@@ -1898,7 +1898,7 @@ async fn grouped_refund_changes_verdict() {
     let refused = deployment
         .cards()
         .await
-        .register_from_path(&fixture("cards/verify_in_real_time/refund-on-failure.yaml"))
+        .declare_from_path(&fixture("cards/verify_in_real_time/refund-on-failure.yaml"))
         .await
         .expect_err("on_failure on a group_end binding is refused");
     assert_eq!(
@@ -2336,7 +2336,7 @@ async fn grouped_coding_uses_declared_sources() {
             .next()
             .expect("a fixture path names its Card");
         let refused = cards
-            .register_from_path(&fixture(&format!("{relative}.yaml")))
+            .declare_from_path(&fixture(&format!("{relative}.yaml")))
             .await
             .expect_err(relative);
         assert_eq!(refused.code(), code, "{relative}: {refused}");
@@ -2359,7 +2359,7 @@ async fn grouped_coding_uses_declared_sources() {
         );
     }
     cards
-        .register_from_path(&fixture("cards/verify_in_real_time/coding-external.yaml"))
+        .declare_from_path(&fixture("cards/verify_in_real_time/coding-external.yaml"))
         .await
         .expect("a registered source Verifier named by reference binds");
     let token = deployment
@@ -2533,8 +2533,8 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
         .grouped("cards/verify_in_real_time/frames.yaml")
         .await;
     let cards = deployment.cards().await;
-    let other = register(&cards, "cards/verify_in_real_time/frames-other.yaml").await;
-    let other_bundle = hydrate(&cards, &other.root).await;
+    let other = declare(&cards, "cards/verify_in_real_time/frames-other.yaml").await;
+    let other_bundle = pull(&cards, &other.root).await;
     let other_state = WyrdState::from_path_with(
         other_bundle.path().join("bundle"),
         deployment.client(&deployment.service_key(&other.root).await),
@@ -2886,14 +2886,14 @@ async fn grouped_conversations_coexist_with_drift() {
     queued.wait(WAIT).await.expect("the queued turn is judged");
 
     let cards = deployment.cards().await;
-    let newer = register(&cards, "cards/verify_in_real_time/turn-check-newer.yaml").await;
+    let newer = declare(&cards, "cards/verify_in_real_time/turn-check-newer.yaml").await;
     let late = support
         .enqueue_over_http(
             deployment,
             "support-newer-turn",
             &json!({
                 "verifier_card_uid": newer.root.uid,
-                "card_uid": registered(&support.receipt, "assistant-agent").uid,
+                "card_uid": declared(&support.receipt, "assistant-agent").uid,
                 "group_id": a,
                 "inputs": {"turn": {"kind": "json", "value": turn("newer")}},
             }),
@@ -2910,8 +2910,8 @@ async fn grouped_conversations_coexist_with_drift() {
     let b_cards = Cards::connect_with(&tenant_b)
         .await
         .expect("handle connects");
-    let b_support = register(&b_cards, "cards/verify_in_real_time/support.yaml").await;
-    let b_bundle = hydrate(&b_cards, &b_support.root).await;
+    let b_support = declare(&b_cards, "cards/verify_in_real_time/support.yaml").await;
+    let b_bundle = pull(&b_cards, &b_support.root).await;
     let [kind, name, version, space] = coordinates(&b_support.root);
     let b_key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(tenant_b))
         .await

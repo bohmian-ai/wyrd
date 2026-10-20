@@ -36,7 +36,7 @@ Wyrd judges your AI system; it does not run it. Your model, agent, or HTTP servi
 | Running and deploying the service | Observations and the queries over them |
 | The service's Wyrd API key, kept in your secret store | Verdicts, failure actions, policy decisions, and the audit log |
 
-Your service calls Wyrd as itself. Registering a Service or Agent gives it a principal: an identity in your tenant with its own permissions. It may record observations only about the Cards in its own declaration, and every observation and verdict names the principal that produced it. See [Identity and authorization](/understand/identity-and-authorization/).
+Your service calls Wyrd as itself. Declaring a Service or Agent gives it a principal: an identity in your tenant with its own permissions. It may record observations only about the Cards in its own declaration, and every observation and verdict names the principal that produced it. See [Identity and authorization](/understand/identity-and-authorization/).
 
 The SDKs, the CLI, MCP, and HTTP all call the same server, so a verdict reads the same from Python, from Rust, or from an agent over MCP.
 

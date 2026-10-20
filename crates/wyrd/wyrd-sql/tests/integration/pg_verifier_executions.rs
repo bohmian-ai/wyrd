@@ -23,7 +23,7 @@ use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRefScope;
-use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
@@ -33,7 +33,7 @@ use wyrd_spec::verification::{
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::provision_system_principal;
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
+    NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
@@ -131,11 +131,11 @@ fn retired() -> Value {
 /// # Panics
 /// Panics when the registration operation or Card row fails to insert.
 async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) -> CardUid {
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let operation_id = DeclarationOperationId::new(Uuid::now_v7());
     let key = Uuid::now_v7().to_string();
-    insert_registration_operation(
+    insert_declaration_operation(
         conn,
-        NewRegistrationOperation {
+        NewDeclarationOperation {
             operation_id,
             attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,
@@ -183,7 +183,7 @@ fn service_card(name: &str) -> Card {
 ///
 /// # Panics
 /// Panics when the Card, principal, or activation write fails.
-async fn register_service(
+async fn declare_service(
     conn: &mut TenantConn<'_>,
     actor: &Principal,
     name: &str,
@@ -640,7 +640,7 @@ async fn scheduled_and_submitted_executions_freeze_their_inputs() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let operator = FrozenTarget::Uid(uid());
     let binding = bind(&mut conn, &owner, &verifier, vec![operator.clone()]).await;
@@ -719,7 +719,7 @@ async fn unrunnable_targets_are_refused() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, owner_principal) = declare_service(&mut conn, &actor, "svc").await;
     let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
     let old = register_verifier(&mut conn, &actor, "old", retired()).await;
@@ -742,7 +742,7 @@ async fn unrunnable_targets_are_refused() {
     }
     assert_eq!(execution_count(&mut conn).await, 0);
 
-    let (dormant, _) = register_service(&mut conn, &actor, "dormant").await;
+    let (dormant, _) = declare_service(&mut conn, &actor, "dormant").await;
     sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
         .bind(dormant.as_uuid())
         .execute(&mut **conn.transaction())
@@ -828,7 +828,7 @@ async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &alice, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &alice, "svc").await;
     let custom = register_verifier(&mut conn, &alice, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &alice, "psi", psi_drift()).await;
     let through = |subject: &Principal, actor: &Principal| {
@@ -982,7 +982,7 @@ async fn keyed_submissions_are_tenant_scoped() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &alice, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &alice, "svc").await;
     let custom = register_verifier(&mut conn, &alice, "custom", custom_drift()).await;
     let local = submission(
         tenant,
@@ -1028,7 +1028,7 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut setup, &alice, "svc").await;
+    let (owner, _) = declare_service(&mut setup, &alice, "svc").await;
     let custom = register_verifier(&mut setup, &alice, "custom", custom_drift()).await;
     setup.commit().await.expect("setup commits");
     let original = submission(
@@ -1133,7 +1133,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     let system = provision_system_principal(&mut setup, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
-    let (owner, principal) = register_service(&mut setup, &actor, "svc").await;
+    let (owner, principal) = declare_service(&mut setup, &actor, "svc").await;
     let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
     let armed_after = database_now(&mut setup).await;
@@ -1232,7 +1232,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     let now = database_now(&mut conn).await;
     let due = now - SCHEDULE_CLAIM_DELAY;
 
-    let (stale_owner, stale) = register_service(&mut conn, &actor, "stale").await;
+    let (stale_owner, stale) = declare_service(&mut conn, &actor, "stale").await;
     let inactive = bind(&mut conn, &stale_owner, &custom, Vec::new()).await;
     record_machine_authentication(&mut conn, stale)
         .await
@@ -1240,7 +1240,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     age_activity(&mut conn, stale, Duration::days(2)).await;
     set_cursor(&mut conn, inactive, Some(due)).await;
 
-    let (live_owner, live) = register_service(&mut conn, &actor, "live").await;
+    let (live_owner, live) = declare_service(&mut conn, &actor, "live").await;
     let unready = bind(&mut conn, &live_owner, &psi, Vec::new()).await;
     let missed = bind(&mut conn, &live_owner, &custom, Vec::new()).await;
     record_machine_authentication(&mut conn, live)
@@ -1305,7 +1305,7 @@ async fn leases_renew_once_a_third_has_passed_and_never_revive() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
@@ -1371,7 +1371,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
@@ -1476,7 +1476,7 @@ async fn every_attempt_claims_the_submissions_cause() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (subject, _) = register_service(&mut conn, &actor, "svc").await;
+    let (subject, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let cause = Cause {
         trace_id: TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").expect("trace id parses"),
@@ -1517,7 +1517,7 @@ async fn retries_back_off_then_exhaust_to_errored() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
@@ -1609,7 +1609,7 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
     let error = engine_error();
@@ -1686,7 +1686,7 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let pager = FrozenTarget::Uid(uid());
     let inline = FrozenTarget::Digest("sha256:operator".to_owned());
@@ -1792,7 +1792,7 @@ async fn release_requeues_without_consuming_an_attempt() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
@@ -1833,7 +1833,7 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
@@ -1903,7 +1903,7 @@ async fn queue_state_is_tenant_isolated() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
     record_machine_authentication(&mut conn, principal)
@@ -2036,7 +2036,7 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
     let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
     let ready = bind(&mut conn, &owner, &custom, Vec::new()).await;
@@ -2121,7 +2121,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
 
@@ -2270,7 +2270,7 @@ async fn failed_execution_with_two_dispatches(
     conn: &mut TenantConn<'_>,
     actor: &Principal,
 ) -> ExecutionId {
-    let (owner, _) = register_service(conn, actor, "svc").await;
+    let (owner, _) = declare_service(conn, actor, "svc").await;
     let verifier = register_verifier(conn, actor, "drift", custom_drift()).await;
     let binding = bind(
         conn,
@@ -2631,7 +2631,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let actor = actor(fixture.data_tenant_id());
     let queue = VerifierExecutionQueue::default();
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    let (owner, principal) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
     let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
     let verifier = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
     let yearly = register_verifier(&mut conn, &actor, "yearly", custom_drift()).await;
@@ -3114,7 +3114,7 @@ async fn a_verification_target_reads_its_tenant_in_one_statement() {
     let system = provision_system_principal(&mut setup, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
-    let (owner, _) = register_service(&mut setup, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut setup, &actor, "svc").await;
     let verifier = register_verifier(&mut setup, &actor, "assert", drift("psi")).await;
     setup.commit().await.expect("setup commits");
 
@@ -3190,7 +3190,7 @@ async fn a_claim_takes_up_to_its_limit_in_one_statement() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let mut submitted_ids = BTreeSet::new();
     for _ in 0..3 {
@@ -3246,7 +3246,7 @@ async fn a_batch_decides_its_submissions_against_each_other() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let mut changed = request(&verifier, &owner);
     changed.run_id = Some(RunId::from_string("app-run-batch".to_owned()));
@@ -3317,7 +3317,7 @@ async fn a_batch_completes_many_executions_like_complete() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(
         &mut conn,

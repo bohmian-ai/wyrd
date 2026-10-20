@@ -1,4 +1,4 @@
-//! Axum adapter for card registration.
+//! Axum adapter for card declaration.
 //!
 //! Authentication is enforced by the `/v1` middleware layer. The route keeps
 //! the `card_write` permission check local because it is a capability decision
@@ -15,7 +15,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+    CardDeclarationOutcome, DeclareCardRequest, DeclareCardResponse, DeleteCardResponse,
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
@@ -31,7 +31,7 @@ use utoipa_axum::routes;
 /// Build card routes for the `/v1` group.
 pub fn cards_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list_cards_http, register_card_http))
+        .routes(routes!(list_cards_http, declare_card_http))
         .routes(routes!(get_card_http, delete_card_http))
         .routes(routes!(get_card_by_ref_http, delete_card_by_ref_http))
         .routes(routes!(get_latest_card_http))
@@ -371,13 +371,13 @@ async fn list_artifacts_http(
 #[utoipa::path(
     post,
     path = "/cards",
-    request_body = CreateCardRequest,
+    request_body = DeclareCardRequest,
     params(
         ("Idempotency-Key" = String, Header, description = "Stable key reused for retries", example = "card-register-001")
     ),
     responses(
         (status = 201, description = "Card registered",
-         body = wyrd_spec::registry::CreateCardResponse),
+         body = wyrd_spec::registry::DeclareCardResponse),
         (status = 400, description = "The submission is not a valid Card, or its idempotency key is missing or malformed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_SPEC_TOO_LARGE, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -400,9 +400,9 @@ async fn list_artifacts_http(
 )]
 #[tracing::instrument(
     skip(state, caller, headers, body),
-    fields(operation = "card.registration.create")
+    fields(operation = "card.declaration.create")
 )]
-/// Accept a card registration request and return its durable registration result.
+/// Accept a card declaration request and return its durable declaration result.
 ///
 /// The required `Idempotency-Key` lets a caller safely retry after a lost
 /// response. The service binds that key to the authenticated principal and
@@ -412,40 +412,40 @@ async fn list_artifacts_http(
 /// A request whose verification bindings name any `on_failure` Operator,
 /// inline or referenced, also needs `operators:invoke`: the frozen Operator is
 /// later dispatched by the system without another end-user decision, so the
-/// registering caller is the one authorized to create that outbound action.
-/// Operator-free registration evaluates `card:write` alone.
+/// declaring caller is the one authorized to create that outbound action.
+/// Operator-free declaration evaluates `card:write` alone.
 ///
 /// Every verdict is staged exactly once on the process audit outbox as soon as
-/// it is decided, before the `Idempotency-Key` is read or the registration
-/// runs, so it is recorded whatever the registration's outcome.
+/// it is decided, before the `Idempotency-Key` is read or the declaration
+/// runs, so it is recorded whatever the declaration's outcome.
 ///
 /// # Errors
 /// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, or without
 /// `operators:invoke` for an Operator-bearing request, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
-pub(crate) async fn register_card_http(
+pub(crate) async fn declare_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
-    Json(body): Json<CreateCardRequest>,
-) -> Result<(StatusCode, Json<wyrd_spec::registry::CreateCardResponse>), WyrdErrorResponse> {
+    Json(body): Json<DeclareCardRequest>,
+) -> Result<(StatusCode, Json<wyrd_spec::registry::DeclareCardResponse>), WyrdErrorResponse> {
     // `require_authenticated` on the `/v1` router has already verified the
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
-    // calling?" while this capability check answers "may they register cards?".
-    authorize_card_write(&state, &caller, "card.registration.create", "cards")?;
+    // calling?" while this capability check answers "may they declare cards?".
+    authorize_card_write(&state, &caller, "card.declaration.create", "cards")?;
     if service::dispatches_operators(&body) {
         audit::authorize(
             &state,
             &caller,
             &Permission::operator_invoke(),
-            "card.registration.create",
+            "card.declaration.create",
             "operators",
         )?;
     }
     let idempotency_key = extract_required_idempotency_key(&headers)?;
-    service::register_card(&state, &caller, idempotency_key.as_str(), body)
+    service::declare_card(&state, &caller, idempotency_key.as_str(), body)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
         .map_err(WyrdErrorResponse::from)
@@ -454,7 +454,7 @@ pub(crate) async fn register_card_http(
 /// Complete a Pending Card after the client-side storage transfer finishes.
 ///
 /// The server rechecks every manifest and stores the immutable Card blob before
-/// activating the Card. Repeating the request with the registration key is an
+/// activating the Card. Repeating the request with the declaration key is an
 /// idempotent Active no-op; provider URLs and transfer details never cross
 /// this lifecycle boundary.
 #[utoipa::path(
@@ -465,7 +465,7 @@ pub(crate) async fn register_card_http(
         ("Idempotency-Key" = String, Header, description = "Registration key reused for retries", example = "card-register-001")
     ),
     responses(
-        (status = 200, description = "Card completed", body = CreateCardResponse),
+        (status = 200, description = "Card completed", body = DeclareCardResponse),
         (status = 400, description = "The Card UID or idempotency key is malformed, or an artifact never finished uploading (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_REGISTRY_400_UPLOAD_INTERRUPTED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -490,20 +490,20 @@ pub(crate) async fn register_card_http(
 )]
 #[tracing::instrument(
     skip(state, caller, headers),
-    fields(operation = "card.registration.complete")
+    fields(operation = "card.declaration.complete")
 )]
 async fn complete_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
     Path(card_uid): Path<String>,
-) -> Result<Json<CreateCardResponse>, WyrdErrorResponse> {
+) -> Result<Json<DeclareCardResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.complete",
+        "card.declaration.complete",
         &format!("card:{card_uid}"),
     )?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
@@ -550,7 +550,7 @@ async fn complete_card_http(
     ),
     tag = "Cards"
 )]
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.declaration.delete"))]
 async fn delete_card_http(
     State(state): State<AppState>,
     caller: Caller,
@@ -565,7 +565,7 @@ async fn delete_card_http(
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.delete",
+        "card.declaration.delete",
         &format!("card:{card_uid}"),
     )?;
     service::delete_card_with_kind(&state, &caller, &card_uid, kind)
@@ -614,7 +614,7 @@ async fn delete_card_http(
     ),
     tag = "Cards"
 )]
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.declaration.delete"))]
 async fn delete_card_by_ref_http(
     State(state): State<AppState>,
     caller: Caller,
@@ -624,7 +624,7 @@ async fn delete_card_by_ref_http(
     authorize_card_write(
         &state,
         &caller,
-        "card.registration.delete",
+        "card.declaration.delete",
         &card_resource(&card_ref),
     )?;
     service::delete_card_by_ref(&state, &caller, &card_ref)
@@ -703,8 +703,8 @@ impl DeleteCardRefQuery {
     }
 }
 
-fn single_card_response(outcome: CardRegistrationOutcome) -> CreateCardResponse {
-    CreateCardResponse {
+fn single_card_response(outcome: CardDeclarationOutcome) -> DeclareCardResponse {
+    DeclareCardResponse {
         root: outcome.card_ref.clone(),
         outcomes: vec![outcome],
         upload_plans: Vec::new(),
@@ -799,12 +799,12 @@ fn parse_card_uid(value: &str) -> Result<CardUid, WyrdErrorResponse> {
     })
 }
 
-/// Extract and validate the required registration idempotency key.
+/// Extract and validate the required declaration idempotency key.
 ///
-/// Registration requires a caller-supplied key because the server cannot infer
+/// Declaration requires a caller-supplied key because the server cannot infer
 /// whether two otherwise identical requests are a retry or an intentional new
 /// operation. The service combines this key with the principal and canonical
-/// request hash to provide exactly-once registration semantics.
+/// request hash to provide exactly-once declaration semantics.
 fn extract_required_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<IdempotencyKey, WyrdErrorResponse> {
@@ -832,9 +832,9 @@ mod tests {
     use super::extract_required_idempotency_key;
     use axum::http::HeaderMap;
 
-    /// Reject registration requests that omit the idempotency key header.
+    /// Reject declaration requests that omit the idempotency key header.
     #[test]
-    fn registration_requires_idempotency_key() {
+    fn declaration_requires_idempotency_key() {
         let error = extract_required_idempotency_key(&HeaderMap::new())
             .expect_err("registration must require an idempotency key");
 
@@ -844,7 +844,7 @@ mod tests {
 
     /// Reject malformed idempotency keys with a dedicated catalog code.
     #[test]
-    fn registration_rejects_malformed_idempotency_key() {
+    fn declaration_rejects_malformed_idempotency_key() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Idempotency-Key",

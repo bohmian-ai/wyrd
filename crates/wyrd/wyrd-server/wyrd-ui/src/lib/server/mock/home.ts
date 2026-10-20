@@ -130,7 +130,7 @@ export function mockHome(tenant: Tenant): HomeView {
       {
         label: 'Cards',
         value: 318,
-        unit: 'registered',
+        unit: 'declared',
         detail: '16 kinds · 3 unowned · 12 added this week',
         href: `${base}/cards`
       },

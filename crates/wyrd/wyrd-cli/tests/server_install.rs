@@ -178,6 +178,11 @@ async fn server_install_selects_latest_stable() {
     let compatible = installer(&server, &root, "0.2.1");
     let installed = compatible.install().await.expect("install succeeds");
     assert_eq!(installed.version, Version::new(0, 2, 3));
+    assert_eq!(
+        serde_json::to_value(&installed).expect("install result serializes"),
+        serde_json::json!({ "version": "0.2.3", "dir": installed.dir }),
+        "`server install --format json` prints exactly the installed version and directory"
+    );
     assert_eq!(run_installed(&compatible), "wyrd-server 0.2.3");
     let config_mode = std::fs::metadata(home.path().join("wyrd"))
         .expect("config directory created")
@@ -268,4 +273,27 @@ async fn server_install_preserves_previous_on_failure() {
     let refused = update.install().await.expect_err("no releases listed");
     assert_eq!(refused.code(), "WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE");
     assert_eq!(run_installed(&update), "wyrd-server 0.2.0");
+
+    let home = tempfile::tempdir().expect("installed CLI config home");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a closed loopback port");
+    let unreachable = Command::new(assert_cmd::cargo::cargo_bin("wyrd"))
+        .env("WYRD_CONFIG_HOME", home.path())
+        .env("HTTPS_PROXY", format!("http://{closed}"))
+        .env("NO_PROXY", "")
+        .env_remove("RUST_LOG")
+        .args(["server", "install", "--format", "json"])
+        .output()
+        .expect("installed CLI runs");
+    assert_eq!(unreachable.status.code(), Some(69));
+    assert!(
+        unreachable.stdout.is_empty(),
+        "a failed install prints no result"
+    );
+    let error: serde_json::Value =
+        serde_json::from_slice(&unreachable.stderr).expect("stderr is one error document");
+    assert_eq!(error["code"], "WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE");
+    assert!(error["remediation"].is_string());
+    assert!(!home.path().join("server/current").exists());
 }

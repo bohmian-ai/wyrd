@@ -2,7 +2,7 @@
 the Wyrd gateway, inside one Wyrd Run per question.
 
 Everything the agent is comes from the Cards in ``service/``, downloaded into
-``.wyrd-bundle`` by ``scripts/deploy.py``: the model and prompt from
+``.wyrd-bundle`` by ``deploy.py``: the model and prompt from
 ``support-prompt``, the gateway deployment from ``support-agent``, and the
 three Verifiers: ``no-refund-promise`` on the Service, and ``ticket-complete``
 and ``follows-policy`` on the agent.
@@ -34,6 +34,7 @@ class Desk:
     """The hydrated Service, its Bifrost writer and telemetry, and a gateway client."""
 
     def __init__(self, client: WyrdClient | None = None) -> None:
+        # ANCHOR: init
         self.client = client or WyrdClient()
         self.state = WyrdState.from_path(BUNDLE, self.client)
         self.state.start_bifrost()
@@ -41,6 +42,7 @@ class Desk:
         # own traces become spans too, under the request's Run.
         self.state.start_telemetry()
         set_trace_processors([WyrdAgentsTraceProcessor()])
+        # ANCHOR_END: init
         # The gateway speaks the OpenAI API. `http_auth` swaps the placeholder
         # key for a fresh Wyrd access token on every request.
         self.gateway = AsyncOpenAI(

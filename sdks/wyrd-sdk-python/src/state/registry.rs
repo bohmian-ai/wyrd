@@ -1,58 +1,58 @@
-//! Python Card registration orchestration owned by an authenticated registry handle.
+//! Python Card declaration orchestration owned by an authenticated registry handle.
 
 use pyo3::prelude::*;
 use wyrd_client::cards::Cards;
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::envelope::CardKind;
 
-use super::{PyRegistrationReceipt, register_python_card};
+use super::{PyDeclarationReceipt, declare_python_card};
 
-/// Owns the authenticated context for one Python registration operation.
+/// Owns the authenticated context for one Python declaration operation.
 pub(super) struct PythonCardRegistry<'a> {
     /// Shared authenticated Cards handle whose transport, storage, and tenant
-    /// context every registration delegates to; borrowed so the Python view
+    /// context every declaration delegates to; borrowed so the Python view
     /// that owns it stays the single owner.
     registry: &'a Cards,
 }
 
-/// Delegates Python holders into the native registration workflow.
+/// Delegates Python holders into the native declaration workflow.
 impl<'a> PythonCardRegistry<'a> {
-    /// Borrow an authenticated registry context for registration calls.
+    /// Borrow an authenticated registry context for declaration calls.
     pub(super) fn new(registry: &'a Cards) -> Self {
         Self { registry }
     }
 
-    /// Register one supported Python Card and return its server receipt.
+    /// Declare one supported Python Card and return its server receipt.
     ///
     /// Python callback work runs before this method is called; the delegated
     /// native workflow performs hashing and network IO detached from the GIL.
     ///
     /// # Errors
     /// Returns validation, serialization, artifact, transport, or server
-    /// completion errors from the native registration workflow.
-    pub(super) fn register(
+    /// completion errors from the native declaration workflow.
+    pub(super) fn declare(
         &self,
         py: Python<'_>,
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<PyRegistrationReceipt> {
-        register_python_card(py, self.registry, card, version_bump, save_args, None)
+    ) -> CardPyResult<PyDeclarationReceipt> {
+        declare_python_card(py, self.registry, card, version_bump, save_args, None)
     }
 
-    /// Register a typed Card while enforcing its kind at the boundary.
+    /// Declare a typed Card while enforcing its kind at the boundary.
     ///
     /// # Errors
-    /// Returns the same registration errors as [`Self::register`], plus
+    /// Returns the same declaration errors as [`Self::declare`], plus
     /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the holder is another kind.
-    pub(super) fn register_typed(
+    pub(super) fn declare_typed(
         &self,
         py: Python<'_>,
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
         kind: &CardKind,
-    ) -> CardPyResult<PyRegistrationReceipt> {
-        register_python_card(py, self.registry, card, version_bump, save_args, Some(kind))
+    ) -> CardPyResult<PyDeclarationReceipt> {
+        declare_python_card(py, self.registry, card, version_bump, save_args, Some(kind))
     }
 }

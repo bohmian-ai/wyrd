@@ -2,7 +2,7 @@
 --
 -- Identity model (architecture/wyrd-design.md:100-127):
 --   - PrincipalId is a UUID; discrimination lives on PrincipalKind, NOT in the id.
---   - Service / Agent principals are upserted by `wyrd apply` keyed on
+--   - Service / Agent principals are upserted by `wyrd declare` keyed on
 --     (data_tenant_id, principal_kind, card_kind, card_uid). Re-apply preserves
 --     principal_id.
 --   - Refresh tokens are principal-generic: one table for User/Service/Agent.
@@ -65,7 +65,7 @@ CREATE POLICY operator_access ON wyrd.auth_roles TO CURRENT_USER
 -- ---------------------------------------------------------------------------
 -- Non-human principals (Service / Agent) — card-bound
 -- ---------------------------------------------------------------------------
--- Upserted by `wyrd apply` keyed on (data_tenant_id, principal_kind, card_kind, card_uid).
+-- Upserted by `wyrd declare` keyed on (data_tenant_id, principal_kind, card_kind, card_uid).
 -- Re-apply preserves principal_id. card_ref JSONB is a denormalized projection
 -- of the structured CardRef for lookup ergonomics — the durable key is
 -- (card_kind, card_uid).

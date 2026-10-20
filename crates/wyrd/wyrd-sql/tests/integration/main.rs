@@ -5,7 +5,7 @@
 //! nextest selects a surface with `-E 'test(/^<module>::/)'`.
 
 mod pg_admin_principals;
-mod pg_cards_register;
+mod pg_cards_declare;
 mod pg_drift_baselines;
 mod pg_login_state;
 mod pg_migration;

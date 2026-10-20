@@ -12,7 +12,7 @@ against the declared requirements.
 💬 **Join the community:** [Wyrd Discord](https://discord.gg/K5bf23yPNb)
 — Ask questions, share what you're building, and help shape Wyrd.
 
-**Coming this week:** Wyrd `v0.2.0` is targeted for October 16, 2026, with the
+**Coming this week:** Wyrd `v0.2.0` is targeted for October 19, 2026, with the
 full verification primitive suite. Next release: the UI.
 
 ## Declare
@@ -84,11 +84,11 @@ spec:
       check: {kind: assert, path: steps.read-letter.output.text, operator: contains, expected: "Order ID:"}
 ```
 
-Register it, then download the registered versions for your app:
+Declare it, then download the declared versions for your app:
 
 ```bash
-wyrd apply refund-letters/service.yaml
-wyrd get --kind Service --space default --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
+wyrd declare refund-letters/service.yaml
+wyrd pull --kind Service --space default --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## Observe

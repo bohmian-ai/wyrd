@@ -47,13 +47,13 @@ const test = serverTest().extend<{ sso: void; config: string }>({
 test("newest saved login is used without a selector", async ({ server, config }) => {
   server.saveHumanLogin(config, ADMIN_TENANT, "alice", "alice-password");
 
-  const receipt = await (await cards()).registerFromPath(PROMPT);
+  const receipt = await (await cards()).declareFromPath(PROMPT);
 
   expect(receipt.root).toMatchObject({ kind: "Prompt", name: "ask-prompt" });
 });
 
 test("saved reader login is denied a write", async ({ config: _ }) => {
-  await expect((await cards(READER_TENANT)).registerFromPath(PROMPT)).rejects.toMatchObject({
+  await expect((await cards(READER_TENANT)).declareFromPath(PROMPT)).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
 });

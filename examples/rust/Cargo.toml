@@ -9,6 +9,11 @@ authors = { workspace = true }
 publish = false
 description = "Runnable Wyrd Rust examples."
 
+# The quickstart's Rust reference app, compiled here against the public SDK.
+[lib]
+name = "support_desk_app"
+path = "../support-desk-app/rust/lib.rs"
+
 [[bin]]
 name = "transport_grpc"
 path = "transport_grpc.rs"
@@ -27,6 +32,7 @@ path = "../support-desk/rust/main.rs"
 
 [dependencies]
 anyhow = "1"
+axum = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -129,11 +129,6 @@ pub struct DataCard {
     #[cfg(feature = "python")]
     #[serde(skip)]
     pub interface: Option<Py<PyAny>>,
-    /// Temporary verified workspace retained while an eager registry load owns
-    /// interface paths beneath it.
-    #[cfg(feature = "python")]
-    #[serde(skip)]
-    pub artifact_workspace: Option<tempfile::TempDir>,
 }
 
 impl DataCard {
@@ -342,8 +337,6 @@ impl DataCard {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         })
     }
 
@@ -492,7 +485,6 @@ impl DataCard {
             created_at: utc_now(),
             is_card: true,
             interface: interface.map(|handle| handle.into_py_any(py)).transpose()?,
-            artifact_workspace: None,
         })
     }
 
@@ -719,40 +711,25 @@ impl DataCard {
 
     /// Load data artifacts through the held interface.
     ///
-    /// Pass `path` to load an existing local materialization. Registry clients
-    /// materialize artifacts before calling this local-only holder operation.
-    ///
-    /// Eager registry loads retain a verified artifact workspace on the
-    /// holder. This method is the explicit boundary where local bytes enter
-    /// memory.
+    /// Pass `path` to load an existing local materialization; `WyrdState`
+    /// loads pulled bundles through this local-only holder operation. This
+    /// method is the explicit boundary where local bytes enter memory.
     ///
     /// # Arguments
-    /// * `path` - Optional local materialization directory. Omit it only when
-    ///   reloading a holder returned by `Cards.data.get(eager_load=True)`.
+    /// * `path` - Local materialization directory.
     /// * `load_kwargs` - Optional `DataLoadArgs` or JSON-compatible mapping
     ///   forwarded to the data interface.
     ///
     /// # Errors
-    /// Returns a Wyrd error when no local materialization path or interface is
-    /// supplied, or interface load fails.
-    #[pyo3(signature = (path=None, load_kwargs=None))]
+    /// Returns a Wyrd error when no interface is attached or interface load
+    /// fails.
+    #[pyo3(signature = (path, load_kwargs=None))]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: Option<PathBuf>,
+        path: PathBuf,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
-        let path = path
-            .or_else(|| {
-                self.artifact_workspace
-                    .as_ref()
-                    .map(|workspace| workspace.path().join("artifacts"))
-            })
-            .ok_or_else(|| {
-                WyrdPyError::validation(
-                    "DataCard.load requires path for a holder without server artifacts",
-                )
-            })?;
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::validation("DataCard interface is required for local load")
@@ -841,7 +818,7 @@ impl DataCard {
         let mut card = Self::from_path(&path)?;
         card.hydrate_interface(py, interface)?;
         if path.is_dir() {
-            card.load(py, Some(path), load_kwargs)?;
+            card.load(py, path, load_kwargs)?;
         }
         Ok(card)
     }
@@ -1166,8 +1143,6 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         };
 
         let spec = card.to_data_spec_from_metadata();
@@ -1263,8 +1238,6 @@ spec:
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         };
         assert!(card.as_card_ref().is_err());
     }
@@ -1284,8 +1257,6 @@ spec:
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         };
         assert!(card.as_card_ref().is_err());
     }
@@ -1310,8 +1281,6 @@ spec:
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
-            #[cfg(feature = "python")]
-            artifact_workspace: None,
         };
 
         let card_ref = card.as_card_ref().expect("identity is valid");

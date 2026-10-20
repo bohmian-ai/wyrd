@@ -1,4 +1,4 @@
-//! Card registration HTTP surface and its server-owned orchestration.
+//! Card declaration HTTP surface and its server-owned orchestration.
 
 mod mapping;
 pub(crate) mod reconciler;

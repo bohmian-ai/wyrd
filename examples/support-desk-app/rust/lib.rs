@@ -1,7 +1,8 @@
 //! A customer-support API whose answers are checked by Wyrd.
 //!
-//! [`SupportDesk::deploy`] registers the Cards in `service/` and loads them
-//! back as a [`WyrdState`]. [`SupportDesk::router`] serves three requests:
+//! [`SupportDesk::deploy`] declares the Cards in `service/` and loads them
+//! back as a [`WyrdState`]. [`SupportDesk::serve`] serves the three requests
+//! of [`SupportDesk::router`] with Wyrd telemetry, then flushes on exit:
 //!
 //! - `POST /ask` answers a question and runs the two model-free Verifiers
 //!   now with `verify`: the Service's `no-refund-promise` and the agent's
@@ -32,9 +33,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
-use wyrd_ai::cards::{CardSelector, Cards, HydrationMode};
+use wyrd_ai::cards::{BundleMode, CardSelector, Cards};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::observe::Run;
+use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
@@ -51,32 +53,32 @@ pub fn service_dir() -> PathBuf {
 /// The deployed support desk: the hydrated Service every request runs in.
 #[derive(Clone)]
 pub struct SupportDesk {
-    /// The Service's Cards, loaded from the hydrated bundle.
+    /// The Service's Cards, loaded from the Card bundle.
     state: WyrdState,
 }
 
 impl SupportDesk {
-    /// Register `service/support-desk.yaml` and every Card it references,
-    /// hydrate them into `bundle`, turn on gateway call metadata capture so
+    /// Declare `service/support-desk.yaml` and every Card it references,
+    /// pull them into `bundle`, turn on gateway call metadata capture so
     /// each model call is retained as evidence, and start the Bifrost writer
     /// the ticket rows go through.
     ///
-    /// Registering is idempotent, so restarting the app re-registers nothing.
+    /// Declaring is idempotent, so restarting the app re-declares nothing.
     ///
     /// # Errors
-    /// Returns the server's refusal of the registration, hydration, or
+    /// Returns the server's refusal of the declaration, pull, or
     /// capture policy, or the local error loading the bundle.
     pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Self, WyrdError> {
         // ANCHOR: deploy
         let cards = Cards::connect_with(client).await?;
         let receipt = cards
-            .register_from_path(service_dir().join("support-desk.yaml"))
+            .declare_from_path(service_dir().join("support-desk.yaml"))
             .await?;
         cards
-            .hydrate(
+            .pull(
                 CardSelector::exact(receipt.root),
                 bundle,
-                HydrationMode::Complete,
+                BundleMode::Complete,
             )
             .await?;
         Gateway::connect_with(client)
@@ -87,15 +89,49 @@ impl SupportDesk {
             })
             .await?;
         // ANCHOR_END: deploy
+        // ANCHOR: init
         let state = WyrdState::from_path_with(bundle, client.clone())?;
+        // Starts the buffered writer the ticket rows go through.
         state.start_bifrost().await?;
+        // ANCHOR_END: init
         Ok(Self { state })
     }
 
-    /// The hydrated Service, for telemetry setup and shutdown.
-    #[must_use]
-    pub fn state(&self) -> &WyrdState {
-        &self.state
+    /// Serve the routes on `listener` until `stop` resolves, exporting spans
+    /// to Wyrd, then flush the spans and drain the buffered tickets.
+    ///
+    /// [`start_telemetry`] installs the process's `tracing` pipeline and
+    /// returns its [`Telemetry`](wyrd_ai::otel::Telemetry) handle, which this call owns for the life of
+    /// the server. After serving ends, the handle's shutdown flushes the
+    /// spans and the state's shutdown drains the Bifrost writer, in that
+    /// order and whether or not serving failed. It must run on a
+    /// multi-threaded Tokio runtime, because the span flush blocks while the
+    /// export runs on that runtime.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
+    /// already installed a `tracing` subscriber, the telemetry flush or
+    /// writer drain failure, or `WYRD_SPEC_500_INTERNAL` naming the serving
+    /// failure. Ticket rows still buffered when a drain fails can be lost.
+    pub async fn serve(
+        self,
+        listener: tokio::net::TcpListener,
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), WyrdError> {
+        // ANCHOR: serve
+        let telemetry = start_telemetry(&self.state)?;
+        let state = self.state.clone();
+        let served = axum::serve(listener, self.router())
+            .with_graceful_shutdown(stop)
+            .await;
+        // Flush spans first, then drain buffered tickets, before exiting.
+        telemetry.shutdown()?;
+        state.shutdown().await?;
+        // ANCHOR_END: serve
+        served.map_err(|error| WyrdError::Internal {
+            message: format!("the support API stopped serving: {error}"),
+            details: json!({}),
+        })
     }
 
     /// The HTTP routes of the app.

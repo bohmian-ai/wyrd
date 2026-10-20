@@ -41,9 +41,9 @@ use crate::AppState;
 use crate::audit;
 use crate::bifrost::service;
 use crate::components::auth::Caller;
-use crate::components::cards::routes::{get_card_by_ref_for, get_card_for, list_cards_for};
+use crate::components::cards::routes::list_cards_for;
 use crate::mcp::bifrost::{DescribeTableArguments, compact_entry};
-use crate::mcp::cards::{GetCardArgs, GetCardByRefArgs};
+use crate::mcp::cards::GetCardArgs;
 use crate::query::collect::{BoundedQuery, QueryArguments};
 
 /// Audit operation of every tool invocation decision.
@@ -205,11 +205,7 @@ impl Invocation {
             }
             BuiltinTool::CardsGet => {
                 let args: GetCardArgs = parse(args)?;
-                to_value(get_card_for(&self.state, &self.caller, &args.kind, &args.card_uid).await)
-            }
-            BuiltinTool::CardsGetByRef => {
-                let args: GetCardByRefArgs = parse(args)?;
-                to_value(get_card_by_ref_for(&self.state, &self.caller, &args.card_ref).await)
+                to_value(args.read(&self.state, &self.caller).await)
             }
             BuiltinTool::BifrostListTables => {
                 let Empty {} = parse(args)?;

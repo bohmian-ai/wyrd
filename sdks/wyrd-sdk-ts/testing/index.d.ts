@@ -1,15 +1,16 @@
 import type {
   CardRef,
-  HydrationSummary,
+  DeclarationReceipt,
   ProviderCredentialView,
-  RegistrationReceipt,
+  PullSummary,
+  RegisteredCard,
   WyrdClient,
 } from "wyrd-ai";
 
 export { NativeWyrdTestServer, type NativeTestServerOptions, startTestServer } from "./native.cjs";
 
-/** One loader diagnostic reported by {@link cli.plan}. */
-export interface PlanDiagnostic {
+/** One loader diagnostic reported by {@link cli.declareCheck}. */
+export interface CheckDiagnostic {
   readonly code: string;
   readonly status: number;
   readonly severity: string;
@@ -20,8 +21,8 @@ export interface PlanDiagnostic {
   readonly details?: unknown;
 }
 
-/** Deterministic local registration plan printed by `wyrd plan --format json`. */
-export interface PlanReport {
+/** Deterministic local check report printed by `wyrd declare --check --format json`. */
+export interface CheckReport {
   readonly ok: boolean;
   readonly cards: readonly {
     readonly kind: string;
@@ -29,13 +30,7 @@ export interface PlanReport {
     readonly name: string;
     readonly version: string | null;
   }[];
-  readonly diagnostics: readonly PlanDiagnostic[];
-}
-
-/** Result of `wyrd load --format json`. */
-export interface LoadOutput {
-  readonly card_ref: CardRef;
-  readonly materialized: boolean;
+  readonly diagnostics: readonly CheckDiagnostic[];
 }
 
 /** Card selector: a `uid` with `kind`, or `kind`, `space`, and `name`; `version` narrows either. */
@@ -100,18 +95,18 @@ export interface CliClientOptions {
  * `WyrdError` instead of exiting.
  */
 export declare const cli: {
-  /** Validate a local Card tree without contacting a server (`wyrd plan`). */
-  plan(path: string): PlanReport;
-  /** Register a local Card tree and return its receipt (`wyrd apply`). */
-  apply(path: string, options?: CliClientOptions): Promise<RegistrationReceipt>;
-  /** Hydrate a Card's reachable graph into `outputDir` (`wyrd get`). */
-  get(
+  /** Validate a local Card tree without contacting a server (`wyrd declare --check`). */
+  declareCheck(path: string): CheckReport;
+  /** Declare a local Card tree and return its receipt (`wyrd declare`). */
+  declare(path: string, options?: CliClientOptions): Promise<DeclarationReceipt>;
+  /** Read one Card envelope without downloading artifacts (`wyrd get`). */
+  get(selector: CliCardSelector, options?: CliClientOptions): Promise<RegisteredCard>;
+  /** Pull a Card's reachable graph into `outputDir` (`wyrd pull`). */
+  pull(
     selector: CliCardSelector,
     outputDir: string,
     options?: CliClientOptions & { readonly metadataOnly?: boolean },
-  ): Promise<HydrationSummary>;
-  /** Load one Card and materialize its artifacts (`wyrd load`). */
-  load(selector: CliCardSelector, options?: CliClientOptions & { readonly path?: string }): Promise<LoadOutput>;
+  ): Promise<PullSummary>;
   /** Issue an API key bound to one exact Card (`wyrd auth issue-key`). */
   issueKey(
     card: {

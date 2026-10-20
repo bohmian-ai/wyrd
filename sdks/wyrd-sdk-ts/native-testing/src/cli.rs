@@ -34,7 +34,7 @@ pub struct NativeCliConnection {
     pub access_token: String,
 }
 
-/// Card selector for `get` and `load`: a `uid` with `kind`, or `kind`,
+/// Card selector for `get` and `pull`: a `uid` with `kind`, or `kind`,
 /// `space`, and `name`; `version` narrows either.
 #[napi(object)]
 pub struct NativeCardSelector {
@@ -148,43 +148,63 @@ fn decode<T: DeserializeOwned>(value: Value, field: &str) -> Result<T, WyrdError
     })
 }
 
-/// Validates a local Card tree without contacting a server (`wyrd plan`).
+/// Checks a local Card tree without contacting a server
+/// (`wyrd declare --check`).
 ///
 /// # Errors
 ///
-/// Returns a napi error only when the plan cannot be serialized; a load
+/// Returns a napi error only when the report cannot be serialized; a load
 /// failure is returned in the outcome.
 #[napi]
-pub fn cli_plan(path: String) -> napi::Result<NativeCliOutcome> {
-    NativeCliOutcome::from_result(commands::plan(&path))
+pub fn cli_declare_check(path: String) -> napi::Result<NativeCliOutcome> {
+    NativeCliOutcome::from_result(commands::declare_check(&path))
 }
 
-/// Registers a local Card tree and returns its receipt (`wyrd apply`).
+/// Declares a local Card tree and returns its receipt (`wyrd declare`).
 ///
 /// # Errors
 ///
 /// Returns a napi error only when the receipt cannot be serialized; local,
 /// client, and server failures are returned in the outcome.
 #[napi]
-pub async fn cli_apply(
+pub async fn cli_declare(
     path: String,
     connection: Option<NativeCliConnection>,
 ) -> napi::Result<NativeCliOutcome> {
     let result = match client(connection) {
-        Ok(client) => commands::apply(&path, client).await,
+        Ok(client) => commands::declare(&path, client).await,
         Err(error) => Err(error),
     };
     NativeCliOutcome::from_result(result)
 }
 
-/// Hydrates a Card's reachable graph into `output_dir` (`wyrd get`).
+/// Reads one Card envelope without downloading artifacts (`wyrd get`).
+///
+/// # Errors
+///
+/// Returns a napi error only when the envelope cannot be serialized;
+/// selector, client, and server failures are returned in the outcome.
+#[napi]
+pub async fn cli_get(
+    selector: NativeCardSelector,
+    connection: Option<NativeCliConnection>,
+) -> napi::Result<NativeCliOutcome> {
+    let selector = SelectorArgs::from(selector);
+    let result = match client(connection) {
+        Ok(client) => commands::get(&selector, client).await,
+        Err(error) => Err(error),
+    };
+    NativeCliOutcome::from_result(result)
+}
+
+/// Pulls a Card's reachable graph into `output_dir` (`wyrd pull`).
 ///
 /// # Errors
 ///
 /// Returns a napi error only when the summary cannot be serialized; selector,
 /// client, and server failures are returned in the outcome.
 #[napi]
-pub async fn cli_get(
+pub async fn cli_pull(
     selector: NativeCardSelector,
     output_dir: String,
     metadata_only: Option<bool>,
@@ -193,7 +213,7 @@ pub async fn cli_get(
     let selector = SelectorArgs::from(selector);
     let result = match client(connection) {
         Ok(client) => {
-            commands::get(
+            commands::pull(
                 &selector,
                 &output_dir,
                 metadata_only.unwrap_or(false),
@@ -201,26 +221,6 @@ pub async fn cli_get(
             )
             .await
         }
-        Err(error) => Err(error),
-    };
-    NativeCliOutcome::from_result(result)
-}
-
-/// Loads one Card and materializes its artifacts (`wyrd load`).
-///
-/// # Errors
-///
-/// Returns a napi error only when the output cannot be serialized; selector,
-/// client, and server failures are returned in the outcome.
-#[napi]
-pub async fn cli_load(
-    selector: NativeCardSelector,
-    path: Option<String>,
-    connection: Option<NativeCliConnection>,
-) -> napi::Result<NativeCliOutcome> {
-    let selector = SelectorArgs::from(selector);
-    let result = match client(connection) {
-        Ok(client) => commands::load(&selector, path.as_deref().map(AsRef::as_ref), client).await,
         Err(error) => Err(error),
     };
     NativeCliOutcome::from_result(result)

@@ -3,7 +3,7 @@
 //! The tenant registers, as a tenant administrator would, an assertion
 //! Verifier of four checks over one 2 KiB `context` slot, a Model, and a
 //! Service binding the Verifier to the Model. The application then loads the
-//! hydrated Service bundle with a Card-bound Service key, so every `verify`
+//! pulled Service bundle with a Card-bound Service key, so every `verify`
 //! and `submit` carries an authenticated owner, exactly as `WyrdState` does
 //! in production.
 
@@ -11,7 +11,7 @@ use std::path::Path;
 
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
-use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::state::WyrdState;
 use wyrd_client::{GlobalConfig, WyrdClient};
@@ -52,17 +52,17 @@ pub fn context(sequence: u64) -> serde_json::Value {
 
 /// One provisioned tenant: the application's state.
 pub struct Tenant {
-    /// The application: the hydrated Service bundle under the Service key.
+    /// The application: the pulled Service bundle under the Service key.
     pub state: WyrdState,
 }
 
 impl Tenant {
-    /// Registers the Card graph for `setup`'s tenant under `root`, issues the
-    /// Service its Card-bound key, hydrates the bundle, and loads it.
+    /// Declares the Card graph for `setup`'s tenant under `root`, issues the
+    /// Service its Card-bound key, pulls the bundle, and loads it.
     ///
     /// # Errors
     ///
-    /// Returns a file, client, registration, key, or hydration failure.
+    /// Returns a file, client, declaration, key, or pull failure.
     pub async fn provision(setup: &SetupTenant, root: &Path) -> Result<Self> {
         let directory = root.join(&setup.slug);
         std::fs::create_dir_all(&directory)?;
@@ -75,7 +75,7 @@ impl Tenant {
         }
         let admin = connect(&setup.api_key)?;
         let cards = Cards::connect_with(&admin).await?;
-        let service = Box::pin(cards.register_from_path(&directory.join("service.yaml"))).await?;
+        let service = Box::pin(cards.declare_from_path(&directory.join("service.yaml"))).await?;
         let issued: IssueKeyResponse = admin
             .request_json(
                 Method::POST,
@@ -89,13 +89,13 @@ impl Tenant {
             .await
             .map_err(|error| format!("issuing the Service key: {error}"))?;
         let bundle = directory.join("bundle");
-        Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
+        Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
             &CardSelector::exact(service.root.clone()),
             &bundle,
-            HydrationMode::Complete,
+            BundleMode::Complete,
         ))
         .await
-        .map_err(|error| format!("hydrating the Service bundle: {error}"))?;
+        .map_err(|error| format!("pulling the Service bundle: {error}"))?;
         let key = SecretString::from(issued.key.expose().to_owned());
         Ok(Self {
             state: WyrdState::from_path_with(&bundle, connect(&key)?)?,

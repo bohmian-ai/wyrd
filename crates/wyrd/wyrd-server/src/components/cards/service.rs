@@ -1,4 +1,4 @@
-//! Card registration service orchestration.
+//! Card declaration service orchestration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -31,10 +31,10 @@ use wyrd_spec::ids::{CardName, CardUid, SlotName, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
-    ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardRegistrationOutcome,
-    CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest,
-    CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
-    ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed,
+    ArtifactInventoryResponse, ArtifactManifestEntry, CardDeclarationOutcome, CardLifecycleStatus,
+    CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, DeclarationOperationId,
+    DeclarationOutcomeKind, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
+    DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
     RelativeArtifactPath, canonical_artifact_manifest_hash, validate_artifact_manifest,
 };
 use wyrd_spec::request_id::RequestId;
@@ -44,22 +44,22 @@ use wyrd_spec::verification::{GroupEndSettings, GroupSource};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow, CardQuery,
-    CardReconcileClaim, CardRegistrationOperationRow, ListCursor, NewCardRow,
-    NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
+    CardArtifactManifestRow, CardDeclarationOperationRow, CardDeleteState,
+    CardManifestCompletionRow, CardQuery, CardReconcileClaim, ListCursor, NewCardRow,
+    NewDeclarationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
     RECONCILE_KIND_FINALIZATION, Resolution, SubmittedCardIdentity, activate_card,
-    commit_registration_operation, fail_card, find_card_by_ref,
+    commit_declaration_operation, declaration_request_hash, fail_card, find_card_by_ref,
     get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
     inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation, list_versions, lock_card_reconciliation_lease,
+    insert_declaration_operation, list_versions, lock_card_reconciliation_lease,
     lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
     lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
     mark_card_reconciliation_succeeded, mark_manifest_upload_initialized, mark_manifest_verified,
     persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
-    record_card_blob, record_card_reconciliation_failure, registration_request_hash,
-    reschedule_card_reconciliation, resolve_version, schedule_card_reconciliation,
-    soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
+    record_card_blob, record_card_reconciliation_failure, reschedule_card_reconciliation,
+    resolve_version, schedule_card_reconciliation, soft_delete_card_by_ref,
+    soft_delete_card_with_kind, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
@@ -525,7 +525,7 @@ fn encode_list_cursor(cursor: &ListCursor) -> Result<String, WyrdError> {
 }
 
 /// Deterministic request plan produced before the write transaction opens.
-struct RegistrationPlan {
+struct DeclarationPlan {
     submissions: Vec<CardSubmission>,
     request_hash: String,
     order: TopoOrder,
@@ -536,13 +536,13 @@ struct RegistrationPlan {
 /// Existing row plus the outcome implied by the authored version mode.
 struct ExistingNode {
     row: ParsedCardRow,
-    outcome: RegistrationOutcomeKind,
+    outcome: DeclarationOutcomeKind,
 }
 
-/// Register a composite card request through the server-owned transaction.
+/// Declare a composite card request through the server-owned transaction.
 ///
 /// This operation resolves references, applies idempotency replay, writes the
-/// registration transaction, and initializes any artifact uploads.
+/// declaration transaction, and initializes any artifact uploads.
 ///
 /// The route has already staged its allowed verdicts (`card:write`, plus
 /// `operators:invoke` for an Operator-bearing request) on the process audit
@@ -550,14 +550,14 @@ struct ExistingNode {
 ///
 /// # Errors
 /// Returns the validation, idempotency, dependency, registry, or upload
-/// failure the registration raised.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration"))]
-pub async fn register_card(
+/// failure the declaration raised.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.declaration"))]
+pub async fn declare_card(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
-    request: CreateCardRequest,
-) -> Result<CreateCardResponse, WyrdError> {
+    request: DeclareCardRequest,
+) -> Result<DeclareCardResponse, WyrdError> {
     let request_hash = hash_request(&request)?;
     let (operation_id, seed) =
         if let Some(replayed) = replay(state, caller, idempotency_key, &request_hash).await? {
@@ -565,13 +565,13 @@ pub async fn register_card(
         } else {
             validate_request(&request)?;
             let tables = declared_tables(&request.submissions)?;
-            let (order, root) = plan_registration_graph(&request.submissions)?;
+            let (order, root) = plan_declaration_graph(&request.submissions)?;
             let external_refs = resolve_external(state, caller, &request.submissions).await?;
             for table in tables {
                 register_table(state, caller.clone(), table).await?;
             }
-            let plan = plan_registration(request, request_hash, external_refs, order, root);
-            RegistrationWriter { state, caller }
+            let plan = plan_declaration(request, request_hash, external_refs, order, root);
+            DeclarationWriter { state, caller }
                 .write(idempotency_key, plan)
                 .await?
         };
@@ -582,7 +582,7 @@ pub async fn register_card(
 ///
 /// Each declared JSON Schema is parsed into Bifrost user fields here, before
 /// any table or Card is written, so an unsupported schema refuses the whole
-/// registration. [`register_card`] then ensures each table through the
+/// registration. [`declare_card`] then ensures each table through the
 /// catalog owner, which refuses a conflicting existing schema before the
 /// Card transaction opens; tables are never dropped afterwards.
 ///
@@ -617,12 +617,12 @@ fn declared_tables(submissions: &[CardSubmission]) -> Result<Vec<RegisterTableRe
 
 /// Whether any submitted verification binding names an `on_failure` Operator.
 ///
-/// Registration needs `operators:invoke` in addition to `card:write` exactly
+/// Declaration needs `operators:invoke` in addition to `card:write` exactly
 /// when this holds, inline or referenced alike, because the frozen Operator is
 /// later dispatched without another end-user decision. Only top-level binding
 /// sites count; nested sites and undecodable specs are refused by validation
 /// before anything is persisted, so they can never freeze an Operator.
-pub(crate) fn dispatches_operators(request: &CreateCardRequest) -> bool {
+pub(crate) fn dispatches_operators(request: &DeclareCardRequest) -> bool {
     request.submissions.iter().any(|submission| {
         Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).is_ok_and(|spec| {
             spec.binding_sites()
@@ -644,7 +644,7 @@ pub(crate) fn dispatches_operators(request: &CreateCardRequest) -> bool {
 ///
 /// Returns `None` when the pair has no operation for the key, or when its
 /// operation is still pending without a stored response; the caller then
-/// registers or waits for the winner.
+/// declares or waits for the winner.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_410_OPERATION_EXPIRED` for an expired operation, the
@@ -657,7 +657,7 @@ async fn replay(
     caller: &Caller,
     idempotency_key: &str,
     request_hash: &str,
-) -> Result<Option<(RegistrationOperationId, RegistrationReplaySeed)>, WyrdError> {
+) -> Result<Option<(DeclarationOperationId, DeclarationReplaySeed)>, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let operation =
         match lookup_existing_operation(&mut conn, caller.attribution(), idempotency_key).await? {
@@ -670,17 +670,17 @@ async fn replay(
     let Some(operation) = operation else {
         return Ok(None);
     };
-    let operation_id = RegistrationOperationId::new(operation.operation_id);
+    let operation_id = DeclarationOperationId::new(operation.operation_id);
     replay_operation(operation, request_hash, idempotency_key)
         .map(|seed| seed.map(|seed| (operation_id, seed)))
 }
 
 /// Validate and decode one persisted operation response.
 fn replay_operation(
-    operation: CardRegistrationOperationRow,
+    operation: CardDeclarationOperationRow,
     request_hash: &str,
     idempotency_key: &str,
-) -> Result<Option<RegistrationReplaySeed>, WyrdError> {
+) -> Result<Option<DeclarationReplaySeed>, WyrdError> {
     if operation.status == "expired" {
         return Err(WyrdError::RegistryOperationExpired {
             message: "registration operation has expired".to_owned(),
@@ -693,10 +693,10 @@ fn replay_operation(
     let Some(stored) = operation.stored_response else {
         return Ok(None);
     };
-    let mut seed: RegistrationReplaySeed = serde_json::from_value(stored)
+    let mut seed: DeclarationReplaySeed = serde_json::from_value(stored)
         .map_err(|error| registry_db_error(format!("invalid stored response: {error}")))?;
     for outcome in &mut seed.outcomes {
-        outcome.outcome = RegistrationOutcomeKind::IdempotentNoop;
+        outcome.outcome = DeclarationOutcomeKind::IdempotentNoop;
     }
     Ok(Some(seed))
 }
@@ -707,7 +707,7 @@ async fn wait_for_replay(
     caller: &Caller,
     idempotency_key: &str,
     request_hash: &str,
-) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
+) -> Result<(DeclarationOperationId, DeclarationReplaySeed), WyrdError> {
     for delay_ms in [50_u64, 100, 250, 500, 1_000, 1_000, 1_000] {
         if let Some(result) = replay(state, caller, idempotency_key, request_hash).await? {
             return Ok(result);
@@ -723,16 +723,16 @@ async fn wait_for_replay(
 /// Initialize pending artifact uploads after the composite transaction commits.
 #[tracing::instrument(
     skip(state, caller, seed),
-    fields(operation = "card.registration.initialize_uploads")
+    fields(operation = "card.declaration.initialize_uploads")
 )]
 async fn initialize_uploads(
     state: &AppState,
     caller: &Caller,
-    operation_id: RegistrationOperationId,
-    seed: RegistrationReplaySeed,
+    operation_id: DeclarationOperationId,
+    seed: DeclarationReplaySeed,
     idempotency_key: &str,
-) -> Result<CreateCardResponse, WyrdError> {
-    let mut response = CreateCardResponse {
+) -> Result<DeclareCardResponse, WyrdError> {
+    let mut response = DeclareCardResponse {
         root: seed.root.clone(),
         outcomes: seed.outcomes.clone(),
         upload_plans: Vec::new(),
@@ -800,7 +800,7 @@ async fn initialize_uploads(
         }
     }
     if let Some(error) = initialization_error {
-        abort_pending_registration_cards(state, caller, &response.outcomes, idempotency_key).await;
+        abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key).await;
         return Err(error);
     }
     plans.sort_by(|left, right| {
@@ -838,20 +838,16 @@ async fn initialize_uploads(
         {
             continue;
         }
-        response.outcomes[index] =
-            match complete_card(state, caller, card_uid, idempotency_key).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    abort_pending_registration_cards(
-                        state,
-                        caller,
-                        &response.outcomes,
-                        idempotency_key,
-                    )
+        response.outcomes[index] = match complete_card(state, caller, card_uid, idempotency_key)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key)
                     .await;
-                    return Err(error);
-                }
-            };
+                return Err(error);
+            }
+        };
     }
     Ok(response)
 }
@@ -860,7 +856,7 @@ async fn initialize_uploads(
 async fn initialize_card_uploads(
     state: &AppState,
     caller: &Caller,
-    operation_id: RegistrationOperationId,
+    operation_id: DeclarationOperationId,
     card_uid: &CardUid,
     allowed_paths: &[String],
 ) -> Result<Vec<CardUploadEntry>, WyrdError> {
@@ -892,10 +888,10 @@ async fn initialize_card_uploads(
 }
 
 /// Abort every still-pending Card when post-commit initialization fails.
-async fn abort_pending_registration_cards(
+async fn abort_pending_declaration_cards(
     state: &AppState,
     caller: &Caller,
-    outcomes: &[CardRegistrationOutcome],
+    outcomes: &[CardDeclarationOutcome],
     idempotency_key: &str,
 ) {
     for outcome in outcomes {
@@ -927,7 +923,7 @@ async fn load_manifest_rows(
 async fn initialize_manifest_row(
     state: &AppState,
     caller: &Caller,
-    operation_id: RegistrationOperationId,
+    operation_id: DeclarationOperationId,
     card_uid: &CardUid,
     row: &CardArtifactManifestRow,
 ) -> Result<CardUploadEntry, WyrdError> {
@@ -1030,7 +1026,7 @@ async fn resolve_external(
 /// # Errors
 /// Returns a stable Wyrd error when graph construction, root selection, or
 /// Service-root composition validation fails.
-fn plan_registration_graph(
+fn plan_declaration_graph(
     submissions: &[CardSubmission],
 ) -> Result<(TopoOrder, RootPick), WyrdError> {
     let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
@@ -1042,14 +1038,14 @@ fn plan_registration_graph(
 }
 
 /// Assemble the validated graph with resolved external dependencies.
-fn plan_registration(
-    request: CreateCardRequest,
+fn plan_declaration(
+    request: DeclareCardRequest,
     request_hash: String,
     external_refs: ResolvedRefs,
     order: TopoOrder,
     root: RootPick,
-) -> RegistrationPlan {
-    RegistrationPlan {
+) -> DeclarationPlan {
+    DeclarationPlan {
         submissions: request.submissions,
         request_hash,
         order,
@@ -1058,20 +1054,20 @@ fn plan_registration(
     }
 }
 
-/// Writes one planned registration in a single tenant transaction.
+/// Writes one planned declaration in a single tenant transaction.
 ///
 /// Owns the server state and authenticated caller the atomic write needs:
 /// the tenant connection comes from `state`, and the caller's tenant and
 /// principal scope every idempotency row and persisted node.
-/// [`RegistrationPlan`] stays a pure value; this writer carries the IO.
-struct RegistrationWriter<'a> {
+/// [`DeclarationPlan`] stays a pure value; this writer carries the IO.
+struct DeclarationWriter<'a> {
     /// Server state that opens the tenant registry connection.
     state: &'a AppState,
     /// Authenticated caller whose tenant and principal scope the write.
     caller: &'a Caller,
 }
 
-impl RegistrationWriter<'_> {
+impl DeclarationWriter<'_> {
     /// Reserve idempotency and atomically persist every topo-ordered node.
     ///
     /// A lost idempotency race rolls the attempt back and returns the winner's
@@ -1083,13 +1079,13 @@ impl RegistrationWriter<'_> {
     /// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when a preflight-validated UID is
     /// no longer Active, and the idempotency, validation, or registry failure
     /// otherwise; nothing commits on any error.
-    #[tracing::instrument(skip(self, plan), fields(operation = "card.registration.write"))]
+    #[tracing::instrument(skip(self, plan), fields(operation = "card.declaration.write"))]
     async fn write(
         &self,
         idempotency_key: &str,
-        mut plan: RegistrationPlan,
-    ) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
-        let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+        mut plan: DeclarationPlan,
+    ) -> Result<(DeclarationOperationId, DeclarationReplaySeed), WyrdError> {
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
         let mut conn = self
             .state
             .registry_tenant_conn(self.caller.data_tenant_id)
@@ -1099,9 +1095,9 @@ impl RegistrationWriter<'_> {
         // identity — rolls back the entire attempt, including its bookkeeping row.
         // The row locks remain held while cards and relationships are written below.
         plan.external_refs = recheck_active_card_refs(&mut conn, &plan.external_refs).await?;
-        let inserted = insert_registration_operation(
+        let inserted = insert_declaration_operation(
             &mut conn,
-            NewRegistrationOperation {
+            NewDeclarationOperation {
                 operation_id,
                 attribution: self.caller.attribution(),
                 idempotency_key,
@@ -1116,7 +1112,7 @@ impl RegistrationWriter<'_> {
         }
 
         let mut sibling_uids = HashMap::new();
-        let mut outcomes: Vec<CardRegistrationOutcome> = Vec::with_capacity(plan.order.nodes.len());
+        let mut outcomes: Vec<CardDeclarationOutcome> = Vec::with_capacity(plan.order.nodes.len());
         let mut resolved_root = None;
         for node in &plan.order.nodes {
             let is_root = same_identity(&node.card_ref, &plan.root.root);
@@ -1160,13 +1156,13 @@ impl RegistrationWriter<'_> {
         }
         let root = resolved_root
             .ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
-        let response = CreateCardResponse {
+        let response = DeclareCardResponse {
             root,
             outcomes,
             upload_plans: Vec::new(),
         };
         let seed = replay_seed(&response, &plan.submissions);
-        commit_registration_operation(&mut conn, operation_id, &seed).await?;
+        commit_declaration_operation(&mut conn, operation_id, &seed).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok((operation_id, seed))
     }
@@ -1176,8 +1172,8 @@ impl RegistrationWriter<'_> {
 ///
 /// A fresh node writes its Card row, edges, artifact inventory, projected
 /// Card-bound principal, and — through [`BindingProjector`] — its frozen
-/// verification bindings on the caller's registration transaction; nothing is
-/// committed here, so any failure rolls the whole registration back.
+/// verification bindings on the caller's declaration transaction; nothing is
+/// committed here, so any failure rolls the whole declaration back.
 ///
 /// # Errors
 /// Returns a registry error when the submission cannot be canonicalized or
@@ -1186,9 +1182,9 @@ impl RegistrationWriter<'_> {
 async fn persist_node(
     conn: &mut TenantConn<'_>,
     caller: &Caller,
-    operation_id: RegistrationOperationId,
+    operation_id: DeclarationOperationId,
     submission: &mut CardSubmission,
-) -> Result<CardRegistrationOutcome, WyrdError> {
+) -> Result<CardDeclarationOutcome, WyrdError> {
     let mut card = submission_card(submission)?;
     let outbound_refs = scope_child_card_refs(&card.spec);
     let spec_hash = card
@@ -1249,24 +1245,24 @@ async fn persist_node(
     }
     Ok(outcome_row_to_response(
         &row,
-        RegistrationOutcomeKind::Registered,
+        DeclarationOutcomeKind::Declared,
     ))
 }
 
 /// Transaction-scoped projector of one owner Card's verification bindings.
 ///
-/// Registration builds one per bound Service or Agent inside its own
+/// Declaration builds one per bound Service or Agent inside its own
 /// caller-owned [`TenantConn`], after the owner Card and its Card-bound
 /// principal are written, so the Card, principal, and binding rows commit or
 /// roll back together. It never commits.
 struct BindingProjector<'a, 'c> {
-    /// The registration transaction; sibling Cards persisted earlier in it,
+    /// The declaration transaction; sibling Cards persisted earlier in it,
     /// such as a referenced Trigger, are visible here.
     conn: &'a mut TenantConn<'c>,
 }
 
 impl<'a, 'c> BindingProjector<'a, 'c> {
-    /// Borrow the registration transaction for one owner's projection.
+    /// Borrow the declaration transaction for one owner's projection.
     fn new(conn: &'a mut TenantConn<'c>) -> Self {
         Self { conn }
     }
@@ -1280,7 +1276,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// # Errors
     /// Returns the freeze errors documented on [`BindingProjector::freeze`]
     /// and the mapped registry database error when a row cannot be written;
-    /// the caller then rolls back the whole registration.
+    /// the caller then rolls back the whole declaration.
     async fn project(
         &mut self,
         owner: &CardUid,
@@ -1472,7 +1468,7 @@ fn inline_digest(body: &Spec) -> Result<FrozenTarget, WyrdError> {
 /// resolution or registry error otherwise.
 async fn resolve_existing(
     conn: &mut TenantConn<'_>,
-    operation_id: RegistrationOperationId,
+    operation_id: DeclarationOperationId,
     card: &mut Card,
     spec_hash: &str,
     artifact_hash: Option<&str>,
@@ -1503,7 +1499,7 @@ async fn resolve_existing(
             }
             Ok(existing.map(|row| ExistingNode {
                 row,
-                outcome: RegistrationOutcomeKind::IdempotentNoop,
+                outcome: DeclarationOutcomeKind::IdempotentNoop,
             }))
         }
         authored => match resolve_version(
@@ -1536,7 +1532,7 @@ async fn resolve_existing(
             .map(|row| {
                 row.map(|row| ExistingNode {
                     row,
-                    outcome: RegistrationOutcomeKind::Deduplicated,
+                    outcome: DeclarationOutcomeKind::Deduplicated,
                 })
             }),
         },
@@ -1556,7 +1552,7 @@ async fn resolve_existing(
 /// apiVersion, an undecodable spec, a repeated or nested artifact path or a
 /// manifest hash mismatch, and the binding or Verifier
 /// `WYRD_SPEC_400_VALIDATION` refusal otherwise.
-fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
+fn validate_request(request: &DeclareCardRequest) -> Result<(), WyrdError> {
     if request.submissions.len() > 1
         && request
             .submissions
@@ -1602,7 +1598,7 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
 }
 
 /// Compute the canonical request hash required by idempotency replay.
-fn hash_request(request: &CreateCardRequest) -> Result<String, WyrdError> {
+fn hash_request(request: &DeclareCardRequest) -> Result<String, WyrdError> {
     let canonical = canonical_order(&request.submissions)
         .into_iter()
         .map(|index| &request.submissions[index])
@@ -1611,14 +1607,14 @@ fn hash_request(request: &CreateCardRequest) -> Result<String, WyrdError> {
         .iter()
         .map(|submission| canonical_artifact_manifest_hash(&submission.artifacts))
         .collect::<Result<Vec<_>, _>>()?;
-    registration_request_hash(&canonical, &hashes)
+    declaration_request_hash(&canonical, &hashes)
 }
 
 /// Strip upload URLs from the durable response and retain only replay inputs.
 fn replay_seed(
-    response: &CreateCardResponse,
+    response: &DeclareCardResponse,
     submissions: &[CardSubmission],
-) -> RegistrationReplaySeed {
+) -> DeclarationReplaySeed {
     let artifact_manifest_paths = response
         .outcomes
         .iter()
@@ -1636,14 +1632,14 @@ fn replay_seed(
             })
         })
         .collect();
-    RegistrationReplaySeed {
+    DeclarationReplaySeed {
         root: response.root.clone(),
         outcomes: response.outcomes.clone(),
         artifact_manifest_paths,
     }
 }
 
-/// Build the Prompt Card submission an Agent's inline Prompt registers as.
+/// Build the Prompt Card submission an Agent's inline Prompt declares as.
 ///
 /// The Prompt is named `<agent-name>-prompt` in the Agent's space and carries
 /// no version intent, so [`persist_node`] reuses an identical existing version
@@ -1681,7 +1677,7 @@ fn inline_prompt_submission(
 
 /// Pin a generated inline Prompt to the version an existing exact Agent pins.
 ///
-/// When `agent` names an exact version that is already registered and that
+/// When `agent` names an exact version that is already declared and that
 /// stored Agent pins a Prompt at the generated `<agent>-prompt` identity,
 /// `prompt` takes that exact version instead of auto-selecting from the line's
 /// latest. [`persist_node`] then reuses the stored Prompt when the inline body
@@ -1834,11 +1830,11 @@ struct CardCompletionState {
 /// Storage IO runs before the final short SQL transaction. The transition is
 /// therefore safe to retry without holding a database connection across
 /// backend calls. The route validates and forwards the caller's idempotency
-/// key so transport retries retain the registration saga key.
+/// key so transport retries retain the declaration saga key.
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
-        operation = "card.registration.complete",
+        operation = "card.declaration.complete",
         idempotency_key_present = !idempotency_key.is_empty()
     )
 )]
@@ -1847,7 +1843,7 @@ pub async fn complete_card(
     caller: &Caller,
     card_uid: &CardUid,
     idempotency_key: &str,
-) -> Result<CardRegistrationOutcome, WyrdError> {
+) -> Result<CardDeclarationOutcome, WyrdError> {
     complete_card_inner(state, caller, card_uid, idempotency_key, None, true).await
 }
 
@@ -2007,7 +2003,7 @@ async fn complete_card_inner(
     _idempotency_key: &str,
     lease_owner: Option<Uuid>,
     schedule_failures: bool,
-) -> Result<CardRegistrationOutcome, WyrdError> {
+) -> Result<CardDeclarationOutcome, WyrdError> {
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_completion_status(&completion_state.card, card_uid)?;
     if completion_state.card.status == CardStatus::Active {
@@ -2016,11 +2012,11 @@ async fn complete_card_inner(
             mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
             conn.commit().await.map_err(registry_db_error)?;
         }
-        return load_card_registration_outcome(
+        return load_card_declaration_outcome(
             state,
             caller,
             card_uid,
-            RegistrationOutcomeKind::IdempotentNoop,
+            DeclarationOutcomeKind::IdempotentNoop,
         )
         .await;
     }
@@ -2065,14 +2061,14 @@ async fn complete_card_inner(
         lease_owner,
     )
     .await?;
-    load_card_registration_outcome(
+    load_card_declaration_outcome(
         state,
         caller,
         card_uid,
         if activated {
-            RegistrationOutcomeKind::Registered
+            DeclarationOutcomeKind::Declared
         } else {
-            RegistrationOutcomeKind::IdempotentNoop
+            DeclarationOutcomeKind::IdempotentNoop
         },
     )
     .await
@@ -2137,7 +2133,7 @@ pub async fn delete_card_with_kind(
 ///
 /// # Errors
 /// Returns the same failures as [`delete_card_with_kind`].
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.declaration.delete"))]
 pub async fn delete_card_by_ref(
     state: &AppState,
     caller: &Caller,
@@ -2199,7 +2195,7 @@ async fn finish_card_delete(
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
-        operation = "card.registration.cleanup",
+        operation = "card.declaration.cleanup",
         idempotency_key_present = !idempotency_key.is_empty()
     )
 )]
@@ -2208,7 +2204,7 @@ async fn abort_card(
     caller: &Caller,
     card_uid: &CardUid,
     idempotency_key: &str,
-) -> Result<CardRegistrationOutcome, WyrdError> {
+) -> Result<CardDeclarationOutcome, WyrdError> {
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_abort_status(&completion_state.card, card_uid)?;
     let cleanup_failures = cleanup_card_artifacts(
@@ -2229,11 +2225,11 @@ async fn abort_card(
             }),
         });
     }
-    load_card_registration_outcome(
+    load_card_declaration_outcome(
         state,
         caller,
         card_uid,
-        RegistrationOutcomeKind::IdempotentNoop,
+        DeclarationOutcomeKind::IdempotentNoop,
     )
     .await
 }
@@ -2372,12 +2368,12 @@ async fn commit_card_activation(
 }
 
 /// Load the server-derived outcome after a lifecycle transition.
-async fn load_card_registration_outcome(
+async fn load_card_declaration_outcome(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-    outcome: RegistrationOutcomeKind,
-) -> Result<CardRegistrationOutcome, WyrdError> {
+    outcome: DeclarationOutcomeKind,
+) -> Result<CardDeclarationOutcome, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let card = sql_get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
@@ -2440,7 +2436,7 @@ async fn cleanup_card_artifacts(
     failures
 }
 
-/// Remove the deterministic blob written before a registration failure.
+/// Remove the deterministic blob written before a declaration failure.
 async fn cleanup_card_blob(
     state: &AppState,
     caller: &Caller,
@@ -2522,7 +2518,7 @@ async fn cleanup_manifest_artifact(
 /// Persist the Pending→Failed lifecycle transition in one tenant transaction.
 ///
 /// Cleanup evaluates no principal permission — the caller's `card:write`
-/// decision was already audited when registration was received — so the durable
+/// decision was already audited when declaration was received — so the durable
 /// record it owes is the failed card row plus structured diagnostics.
 async fn commit_card_failure(
     state: &AppState,
@@ -2699,18 +2695,18 @@ fn map_storage_error(error: StorageError) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use super::{
-        card_upload_entry, hash_request, immutable_card_blob_bytes, plan_registration_graph,
+        card_upload_entry, hash_request, immutable_card_blob_bytes, plan_declaration_graph,
         validate_request, verify_card_hashes,
     };
     use uuid::Uuid;
     use wyrd_spec::registry::{
-        ArtifactManifestEntry, CreateCardRequest, RelativeArtifactPath,
+        ArtifactManifestEntry, DeclareCardRequest, RelativeArtifactPath,
         canonical_artifact_manifest_hash,
     };
     use wyrd_spec::storage::{UploadId, UploadPlan};
 
-    /// Decode a compact registration request used by pure composition tests.
-    fn request(value: serde_json::Value) -> CreateCardRequest {
+    /// Decode a compact declaration request used by pure composition tests.
+    fn request(value: serde_json::Value) -> DeclareCardRequest {
         serde_json::from_value(value).expect("test_setup: registration fixture must deserialize")
     }
 
@@ -2792,7 +2788,7 @@ mod tests {
 
     /// Reject a peer-only Verifier Service component before registry access.
     #[test]
-    fn registration_graph_rejects_verifier_service_component() {
+    fn declaration_graph_rejects_verifier_service_component() {
         let request = request(serde_json::json!({
             "submissions": [service("app", serde_json::json!({
                 "components": [{
@@ -2807,7 +2803,7 @@ mod tests {
             }))]
         }));
 
-        let error = plan_registration_graph(&request.submissions)
+        let error = plan_declaration_graph(&request.submissions)
             .expect_err("Verifier Service component must fail before registry I/O");
 
         assert_eq!(error.code(), "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND");
@@ -2815,25 +2811,25 @@ mod tests {
 
     /// Reject an unbound Verifier submitted beside a Service root before registry access.
     #[test]
-    fn registration_graph_rejects_unbound_verifier_peer() {
+    fn declaration_graph_rejects_unbound_verifier_peer() {
         let request = request(serde_json::json!({
             "submissions": [service("app", serde_json::json!({})), verifier("quality")]
         }));
 
-        let error = plan_registration_graph(&request.submissions)
+        let error = plan_declaration_graph(&request.submissions)
             .expect_err("Service-root Verifier requires a submitted binding");
 
         assert_eq!(error.code(), "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER");
     }
 
-    /// Preserve standalone Verifier registration at the server boundary.
+    /// Preserve standalone Verifier declaration at the server boundary.
     #[test]
-    fn registration_graph_accepts_standalone_verifier() {
+    fn declaration_graph_accepts_standalone_verifier() {
         let request = request(serde_json::json!({
             "submissions": [verifier("quality")]
         }));
 
-        plan_registration_graph(&request.submissions)
+        plan_declaration_graph(&request.submissions)
             .expect("standalone Verifier registration remains valid");
     }
 

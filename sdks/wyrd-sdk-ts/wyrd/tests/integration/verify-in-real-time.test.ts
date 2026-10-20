@@ -35,7 +35,7 @@ import {
   toolTurn,
 } from "../support/assistant.js";
 import { type ReceivedRequest, Receiver, type Reply } from "../support/http-receiver.js";
-import { ancestry, binding, fixture, groupExecution, registered, timeline } from "../support/server.js";
+import { ancestry, binding, fixture, groupExecution, declared, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -348,11 +348,11 @@ test("window verifier records samples and refuses verify", async ({ state }) => 
 
 test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const cards = await Cards.connect();
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-  const { root } = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+  const { root } = await cards.declareFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
-  await cards.hydrate(root, bundle);
+  await cards.pull(root, bundle);
   const key = await cli.issueKey({ ...root, space: root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key.key }) });
   await state.startBifrost();
@@ -498,9 +498,9 @@ async function enqueueOverHttp(baseUrl: string, key: string, idempotencyKey: str
  */
 async function grouped(baseUrl: string, path: string) {
   const cards = await Cards.connect();
-  const receipt = await cards.registerFromPath(fixture(path));
+  const receipt = await cards.declareFromPath(fixture(path));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" });
   const token = await WyrdClient.connect().accessToken();
   const bindingIds: string[] = [];
@@ -538,8 +538,8 @@ test("grouped support resumes", async ({ server, assistant }) => {
   }
   await submitted.execution.wait({ timeoutMs: WAIT_MS });
   const body = (turn: object) => ({
-    verifier_card_uid: registered(receipt, "turn-check").uid,
-    card_uid: registered(receipt, "assistant-agent").uid,
+    verifier_card_uid: declared(receipt, "turn-check").uid,
+    card_uid: declared(receipt, "assistant-agent").uid,
     group_id: group,
     inputs: { turn: { kind: "json", value: turn } },
   });
@@ -568,13 +568,13 @@ test("grouped support resumes", async ({ server, assistant }) => {
 
   const judged = await groupExecution(server, bindingId, WAIT_MS);
 
-  expect([judged.group_id, judged.owner_card_uid]).toEqual([group, registered(receipt).uid]);
+  expect([judged.group_id, judged.owner_card_uid]).toEqual([group, declared(receipt).uid]);
   expect(judged.group?.sources.turns.execution_ids).toHaveLength(6);
   expect(judged.group?.sources.turns.execution_ids[5]).toBe(replayed);
   expect(judged.result?.outcome.evidence.turns).toEqual({ kind: "json", value: turns });
   expect(judged.result?.outcome.verdict).toBe("passed");
   await expect(
-    cards.registerFromPath(fixture("cards/verify_in_real_time/support-unsourced.yaml")),
+    cards.declareFromPath(fixture("cards/verify_in_real_time/support-unsourced.yaml")),
   ).rejects.toMatchObject({
     code: "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
     message: expect.stringContaining("verified_by[0].runs_on"),
@@ -665,7 +665,7 @@ test("grouped refund changes verdict", async ({ server }) => {
   expect(hooks.received).toHaveLength(2);
   await hooks.close();
   await expect(
-    cards.registerFromPath(fixture("cards/verify_in_real_time/refund-on-failure.yaml")),
+    cards.declareFromPath(fixture("cards/verify_in_real_time/refund-on-failure.yaml")),
   ).rejects.toMatchObject({
     code: "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
     message: expect.stringContaining("verified_by[1].on_failure"),
@@ -754,7 +754,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
     ["invalid/reserved-source", "Verifier", "WYRD_LOADER_400_INVALID_ENVELOPE", "inputs.group_id"],
   ] as const) {
     const name = relative.split("/").at(-1) ?? relative;
-    const refused = await cards.registerFromPath(fixture(`${relative}.yaml`)).then(
+    const refused = await cards.declareFromPath(fixture(`${relative}.yaml`)).then(
       () => undefined,
       (error: unknown) => error as WyrdError,
     );
@@ -764,7 +764,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
       code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
     });
   }
-  await cards.registerFromPath(fixture("cards/verify_in_real_time/coding-external.yaml"));
+  await cards.declareFromPath(fixture("cards/verify_in_real_time/coding-external.yaml"));
 }, 180_000);
 
 /**
@@ -795,9 +795,9 @@ async function submitFrames(state: WyrdState, group: string, paths: string[]): P
 
 test("grouped sampled frames use visible outcomes", async ({ server, provider, assistant }) => {
   const { cards, bundle, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/frames.yaml");
-  const other = await cards.registerFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
+  const other = await cards.declareFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
   const otherBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
-  await cards.hydrate(other.root, otherBundle);
+  await cards.pull(other.root, otherBundle);
   const otherKey = await cli.issueKey({ ...other.root, space: other.root.space ?? "default" });
   const otherState = WyrdState.fromPath(otherBundle, { client: WyrdClient.connect({ credential: otherKey.key }) });
   await otherState.startBifrost();
@@ -925,10 +925,10 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   const solo = await state.run("agent").observe.verify("turn-check", turn("solo"), { positional: true });
   await queued.execution.wait({ timeoutMs: WAIT_MS });
   const cards = await Cards.connect();
-  const newer = await cards.registerFromPath(fixture("cards/verify_in_real_time/turn-check-newer.yaml"));
+  const newer = await cards.declareFromPath(fixture("cards/verify_in_real_time/turn-check-newer.yaml"));
   const late = await enqueueOverHttp(server.baseUrl, key, "support-newer-turn", {
-    verifier_card_uid: registered(newer).uid,
-    card_uid: registered(receipt, "assistant-agent").uid,
+    verifier_card_uid: declared(newer).uid,
+    card_uid: declared(receipt, "assistant-agent").uid,
     group_id: "conv-a",
     inputs: { turn: { kind: "json", value: turn("newer") } },
   });
@@ -937,9 +937,9 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
     credential: server.bootstrapServiceInTenant(server.seedTenant("tenant-b"), ["admin"], "tenant_b_admin"),
   });
   const bCards = await Cards.connect({ client: tenantB });
-  const bReceipt = await bCards.registerFromPath(fixture("cards/verify_in_real_time/support.yaml"));
+  const bReceipt = await bCards.declareFromPath(fixture("cards/verify_in_real_time/support.yaml"));
   const bBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
-  await bCards.hydrate(bReceipt.root, bBundle);
+  await bCards.pull(bReceipt.root, bBundle);
   const bKey = await cli.issueKey({ ...bReceipt.root, space: bReceipt.root.space ?? "default" }, { client: tenantB });
   const bState = WyrdState.fromPath(bBundle, { client: WyrdClient.connect({ credential: bKey.key }) });
   await bState.startBifrost();

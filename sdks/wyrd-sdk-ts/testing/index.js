@@ -34,17 +34,17 @@ function value(outcome) {
 }
 
 export const cli = {
-  plan(path) {
-    return value(native.cliPlan(path));
+  declareCheck(path) {
+    return value(native.cliDeclareCheck(path));
   },
-  async apply(path, options = {}) {
-    return value(await native.cliApply(path, await connection(options)));
+  async declare(path, options = {}) {
+    return value(await native.cliDeclare(path, await connection(options)));
   },
-  async get(selector, outputDir, options = {}) {
-    return value(await native.cliGet(selector, outputDir, options.metadataOnly, await connection(options)));
+  async get(selector, options = {}) {
+    return value(await native.cliGet(selector, await connection(options)));
   },
-  async load(selector, options = {}) {
-    return value(await native.cliLoad(selector, options.path, await connection(options)));
+  async pull(selector, outputDir, options = {}) {
+    return value(await native.cliPull(selector, outputDir, options.metadataOnly, await connection(options)));
   },
   async issueKey(card, options = {}) {
     return value(await native.cliIssueKey(card, await connection(options)));

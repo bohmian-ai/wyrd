@@ -78,7 +78,7 @@ export const cardDetails: Record<string, CardDetailFixture> = {
     versions: [
       { version: 'v7', created: '2026-08-30 14:02Z', by: 'j.reyes', note: 'add egress allowlist' },
       { version: 'v6', created: '2026-07-12 09:44Z', by: 'j.reyes', note: 'raise retention to 90d' },
-      { version: 'v5', created: '2026-06-02 16:10Z', by: 'r.okafor', note: 'initial prod registration' }
+      { version: 'v5', created: '2026-06-02 16:10Z', by: 'r.okafor', note: 'initial prod declaration' }
     ],
     actions: [{ label: 'Open in Observe', href: '/observe?service=settlement-api' }],
     spec: [
@@ -146,7 +146,7 @@ export const cardDetails: Record<string, CardDetailFixture> = {
     currentVersion: 'v5',
     versions: [
       { version: 'v5', created: '2026-08-22 15:40Z', by: 'r.okafor', note: 'accept DiffEvidence' },
-      { version: 'v4', created: '2026-07-30 10:12Z', by: 'r.okafor', note: 'initial prod registration' }
+      { version: 'v4', created: '2026-07-30 10:12Z', by: 'r.okafor', note: 'initial prod declaration' }
     ],
     actions: [{ label: 'View verification', href: '/changes/change_01/verification' }],
     spec: [],

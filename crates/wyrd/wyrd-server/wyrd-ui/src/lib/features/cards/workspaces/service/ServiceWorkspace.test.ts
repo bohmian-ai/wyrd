@@ -239,7 +239,7 @@ test('Definition presents the declaration, bindings, governance and closed raw s
   // The v11 declaration rescopes with the version.
   const v11 = await get(`${CARD}?view=definition&version=v11`);
   expect(v11).toContain('DECLARATION — WHAT v11 DEFINES');
-  expect(v11).toContain('registered 2026-08-02');
+  expect(v11).toContain('declared 2026-08-02');
   expect(v11).not.toContain('ranker-shadow');
 });
 

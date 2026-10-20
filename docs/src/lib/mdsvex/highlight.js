@@ -52,14 +52,25 @@ export function codeBlock(code, lang = 'text', title, marked) {
       }
     }
   ];
-  let html;
-  try {
-    html = highlighter.codeToHtml(code, { lang, theme: WYRD_THEME, transformers });
-  } catch {
-    html = highlighter.codeToHtml(code, { lang: 'text', theme: WYRD_THEME, transformers });
-  }
+  const html = highlight(code, lang, transformers);
   const titleAttr = title ? ` title="${title}"` : '';
   return `<CodeBlock lang="${lang}"${titleAttr} html={\`${escapeSvelte(html)}\`} />`;
+}
+
+/**
+ * Shiki HTML for `code` on the Wyrd theme; an unknown language falls back to
+ * plain text. Pages outside mdsvex, such as the landing page, render the
+ * result through `<CodeBlock html>` themselves.
+ * @param {string} code
+ * @param {string} lang
+ * @param {import('shiki').ShikiTransformer[]} [transformers]
+ */
+export function highlight(code, lang, transformers = []) {
+  try {
+    return highlighter.codeToHtml(code, { lang, theme: WYRD_THEME, transformers });
+  } catch {
+    return highlighter.codeToHtml(code, { lang: 'text', theme: WYRD_THEME, transformers });
+  }
 }
 
 /**
@@ -100,11 +111,14 @@ function parseLines(spec) {
  * Anchor comment lines never appear in the output. Throws, failing the build,
  * for a missing file, a missing region, a range past the end of the file, or a
  * non-literal attribute. Returns the embedded files so Vite rebuilds the page
- * when one changes.
+ * when one changes. `render` turns each resolved body into its replacement:
+ * the highlighted `<CodeBlock>` for the site, or a Markdown fence for the
+ * plain-text agent reference.
  * @param {string} content
+ * @param {(code: string, lang: string, title: string, marked?: string) => string} [render]
  * @returns {{ code: string, dependencies: string[] }}
  */
-export function embedCodeFromFile(content) {
+export function embedCodeFromFile(content, render = codeBlock) {
   /** @type {string[]} */
   const dependencies = [];
   const code = content.replace(/<CodeFromFile\b([^>]*?)\/>/g, (tag, attrs) => {
@@ -123,7 +137,7 @@ export function embedCodeFromFile(content) {
     dependencies.push(abs);
     if (props.region && props.range) throw new Error(`CodeFromFile: use "region" or "range", not both: ${tag}`);
     const body = props.region ? sliceRegion(src, props.region, tail) : props.range ? sliceRange(src, props.range) : src;
-    return codeBlock(stripAnchors(body), props.lang, props.title ?? path.basename(tail), props.highlight);
+    return render(stripAnchors(body), props.lang, props.title ?? path.basename(tail), props.highlight);
   });
   return { code, dependencies };
 }

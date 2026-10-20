@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wyrd_ai::cards::{CardKind, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, DeclarationReceipt};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Inputs, Submission};
 use wyrd_ai::{
@@ -19,7 +19,7 @@ use wyrd_ai::{
 };
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, Hooks, fixture, hydrate, register, registered};
+use crate::support::{Deployment, Hooks, declare, declared, fixture, pull};
 
 /// The bearer token the `on-call-hooks` connection sends to the hook.
 const ON_CALL_TOKEN: &str = "on-call-hook-token";
@@ -40,7 +40,7 @@ struct Watch {
     /// The local on-call hook the connection points at.
     hooks: Hooks,
     /// The Service registration.
-    service: RegistrationReceipt,
+    service: DeclarationReceipt,
     /// The scheduled Verifier every sample is submitted to.
     verifier: &'static str,
 }
@@ -65,7 +65,7 @@ impl Watch {
             .deployment
             .server()
             .wait_for_baseline(
-                registered(&watch.service, verifier)
+                declared(&watch.service, verifier)
                     .uid
                     .as_ref()
                     .expect("registered Verifier has a UID"),
@@ -87,8 +87,8 @@ impl Watch {
                 .await;
         let hooks = deployment.hooks("on-call-hooks", ON_CALL_TOKEN).await;
         let cards = deployment.cards().await;
-        register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-        let watch = register(
+        declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+        let watch = declare(
             &cards,
             &format!("cards/scheduled_drift_alerts_operator/{service}"),
         )
@@ -119,7 +119,7 @@ impl Watch {
     /// a submission queued an execution.
     async fn record(&self, samples: impl IntoIterator<Item = Inputs>) {
         let cards = self.deployment.cards().await;
-        let bundle = hydrate(&cards, &self.service.root).await;
+        let bundle = pull(&cards, &self.service.root).await;
         let watcher = self
             .deployment
             .client(&self.deployment.service_key(&self.service.root).await);
@@ -352,7 +352,7 @@ async fn path_only_operator_without_connection_is_refused() {
     let refused = deployment
         .cards()
         .await
-        .register_from_path(&fixture("invalid/operator-path-without-connection.yaml"))
+        .declare_from_path(&fixture("invalid/operator-path-without-connection.yaml"))
         .await
         .expect_err("a path-only Operator needs a connection");
 
@@ -385,7 +385,7 @@ async fn scheduled_binding_rejects_redundant_inputs() {
         ("optional-samples-slot.yaml", "inputs.latency"),
     ] {
         let refused = cards
-            .register_from_path(&fixture(&format!("invalid/{file}")))
+            .declare_from_path(&fixture(&format!("invalid/{file}")))
             .await
             .expect_err("a removed scheduled-samples field is refused");
         assert!(

@@ -3,24 +3,24 @@
 
 use std::path::{Path, PathBuf};
 
-use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::{HydratedCard, WyrdState};
 use wyrd_ai::{Card, Spec};
 
-use crate::support::{Deployment, fixture, hydrate, register, registered};
+use crate::support::{Deployment, declare, declared, fixture, pull};
 
 /// The support desk Service the stories register.
-const DESK: &str = "cards/register_and_hydrate/support-desk.yaml";
+const DESK: &str = "cards/declare_and_pull/support-desk.yaml";
 
 /// Register the artifact-bearing support Model, then the desk graph that
 /// references it, and return both receipts in that order.
 ///
 /// # Panics
 /// Panics when a registration is refused.
-async fn register_desk(cards: &Cards) -> (RegistrationReceipt, RegistrationReceipt) {
-    let model = register(cards, "cards/register_and_hydrate/support-model.yaml").await;
-    (model, register(cards, DESK).await)
+async fn declare_desk(cards: &Cards) -> (DeclarationReceipt, DeclarationReceipt) {
+    let model = declare(cards, "cards/declare_and_pull/support-model.yaml").await;
+    (model, declare(cards, DESK).await)
 }
 
 /// The Service whose Agents declare their Prompt inline, by path and by
@@ -32,9 +32,9 @@ const PROMPT_DESK: &str = "cards/agent_prompt/prompt-desk.yaml";
 ///
 /// # Panics
 /// Panics when a registration is refused.
-async fn register_prompt_desk(cards: &Cards) -> RegistrationReceipt {
-    register(cards, "cards/agent_prompt/desk-prompt.yaml").await;
-    register(cards, PROMPT_DESK).await
+async fn declare_prompt_desk(cards: &Cards) -> DeclarationReceipt {
+    declare(cards, "cards/agent_prompt/desk-prompt.yaml").await;
+    declare(cards, PROMPT_DESK).await
 }
 
 /// Write an unversioned Agent named `name` whose inline Prompt sends
@@ -73,19 +73,19 @@ spec:
 ///
 /// # Panics
 /// Panics when registration is refused or records either Card missing.
-async fn register_inline(
+async fn declare_inline(
     cards: &Cards,
     dir: &Path,
     name: &str,
     message: &str,
 ) -> (CardRef, CardRef) {
     let receipt = cards
-        .register_from_path(inline_agent(dir, name, message))
+        .declare_from_path(inline_agent(dir, name, message))
         .await
         .expect("inline agent registers");
     (
-        registered(&receipt, name),
-        registered(&receipt, &format!("{name}-prompt")),
+        declared(&receipt, name),
+        declared(&receipt, &format!("{name}-prompt")),
     )
 }
 
@@ -125,12 +125,12 @@ fn service_selector(name: &str) -> SelectorArgs {
 /// Panics when registration, hydration, or an offline read differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn service_graph_registers_and_hydrates() {
+async fn service_graph_declares_and_pulls() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let (_, desk) = register_desk(&cards).await;
+    let (_, desk) = declare_desk(&cards).await;
 
-    let bundle = hydrate(&cards, &desk.root).await;
+    let bundle = pull(&cards, &desk.root).await;
 
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
     assert_eq!(state.root_ref(), &desk.root);
@@ -143,8 +143,7 @@ async fn service_graph_registers_and_hydrates() {
     assert_eq!(artifacts[0].relative_path(), "support-model.bin");
     assert_eq!(
         std::fs::read(artifacts[0].local_path()).expect("artifact reads"),
-        std::fs::read(fixture("cards/register_and_hydrate/support-model.bin"))
-            .expect("fixture reads")
+        std::fs::read(fixture("cards/declare_and_pull/support-model.bin")).expect("fixture reads")
     );
     deployment.shutdown().await;
 }
@@ -157,10 +156,10 @@ async fn service_graph_registers_and_hydrates() {
 /// refused with the not-found code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn latest_version_resolves_to_the_registered_card() {
+async fn latest_version_resolves_to_the_declared_card() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let (_, desk) = register_desk(&cards).await;
+    let (_, desk) = declare_desk(&cards).await;
 
     let latest = cards
         .resolve_latest(
@@ -191,12 +190,12 @@ async fn latest_version_resolves_to_the_registered_card() {
 /// Panics when the second registration or a read differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn registering_the_graph_again_is_idempotent() {
+async fn declaring_the_graph_again_is_idempotent() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let (_, desk) = register_desk(&cards).await;
+    let (_, desk) = declare_desk(&cards).await;
 
-    let again = register(&cards, DESK).await;
+    let again = declare(&cards, DESK).await;
 
     assert_eq!(again.root, desk.root);
     let status = cards
@@ -219,8 +218,8 @@ async fn registering_the_graph_again_is_idempotent() {
 async fn cards_get_returns_every_kind_typed() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let baseline = register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-    let (model, desk) = register_desk(&cards).await;
+    let baseline = declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+    let (model, desk) = declare_desk(&cards).await;
 
     let mut read = Vec::new();
     for receipt in [&baseline, &model, &desk] {
@@ -264,12 +263,12 @@ async fn cards_get_returns_every_kind_typed() {
 /// Panics when registration is refused or records no artifact hash.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn artifact_without_digest_registers() {
+async fn artifact_without_digest_declares() {
     let deployment = Deployment::start().await;
 
-    let model = register(
+    let model = declare(
         &deployment.cards().await,
-        "cards/register_and_hydrate/support-model.yaml",
+        "cards/declare_and_pull/support-model.yaml",
     )
     .await;
 
@@ -290,7 +289,7 @@ async fn wrong_artifact_digest_is_refused() {
     let refused = deployment
         .cards()
         .await
-        .register_from_path(&fixture("invalid/wrong-artifact-digest/support-model.yaml"))
+        .declare_from_path(&fixture("invalid/wrong-artifact-digest/support-model.yaml"))
         .await
         .expect_err("a wrong digest is refused");
 
@@ -310,7 +309,7 @@ async fn retired_card_kind_is_refused() {
     let refused = deployment
         .cards()
         .await
-        .register_from_path(&fixture("invalid/retired-drift-kind.yaml"))
+        .declare_from_path(&fixture("invalid/retired-drift-kind.yaml"))
         .await
         .expect_err("a retired kind is refused");
 
@@ -324,9 +323,9 @@ async fn retired_card_kind_is_refused() {
 /// Panics when the registration succeeds or is refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn reader_cannot_register_cards() {
+async fn reader_cannot_declare_cards() {
     let deployment = Deployment::start().await;
-    register_desk(&deployment.cards().await).await;
+    declare_desk(&deployment.cards().await).await;
     let reader = Cards::connect_with(
         &deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await),
     )
@@ -334,7 +333,7 @@ async fn reader_cannot_register_cards() {
     .expect("handle connects");
 
     let refused = reader
-        .register_from_path(&fixture(DESK))
+        .declare_from_path(&fixture(DESK))
         .await
         .expect_err("a reader cannot register");
 
@@ -342,32 +341,37 @@ async fn reader_cannot_register_cards() {
     deployment.shutdown().await;
 }
 
-/// `wyrd apply` and `wyrd get`, run in process as the administrator,
-/// register the same graph and hydrate a loadable bundle.
+/// `wyrd declare`, `wyrd get`, and `wyrd pull`, run in process as the
+/// administrator, declare the same graph, read its one root envelope, and
+/// pull a loadable bundle.
 ///
 /// # Panics
 /// Panics when a CLI command fails or the bundle differs from the graph.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn cli_apply_and_get_round_trip_the_graph() {
+async fn cli_declare_get_and_pull_round_trip_the_graph() {
     let deployment = Deployment::start().await;
-    let (_, desk) = register_desk(&deployment.cards().await).await;
+    let (_, desk) = declare_desk(&deployment.cards().await).await;
     let dir = tempfile::tempdir().expect("bundle directory creates");
     let bundle = dir.path().join("bundle");
 
-    let applied = cli::apply(&fixture(DESK), Some(deployment.admin()))
+    let declared = cli::declare(&fixture(DESK), Some(deployment.admin()))
         .await
-        .expect("apply registers");
-    let summary = cli::get(
+        .expect("declare succeeds");
+    let envelope = cli::get(&service_selector("support-desk"), Some(deployment.admin()))
+        .await
+        .expect("get reads the envelope");
+    let summary = cli::pull(
         &service_selector("support-desk"),
         &bundle,
         false,
         Some(deployment.admin()),
     )
     .await
-    .expect("get hydrates");
+    .expect("pull publishes the bundle");
 
-    assert_eq!(applied.root, desk.root);
+    assert_eq!(declared.root, desk.root);
+    assert_eq!(envelope.metadata.uid, desk.root.uid);
     assert_eq!(summary.root, desk.root);
     assert_eq!(
         WyrdState::from_path(&bundle)
@@ -388,7 +392,7 @@ async fn refused_cli_command_raises_its_catalog_code() {
     let deployment = Deployment::start().await;
     let dir = tempfile::tempdir().expect("bundle directory creates");
 
-    let refused = cli::get(
+    let refused = cli::pull(
         &service_selector("no-such-service"),
         &dir.path().join("bundle"),
         false,
@@ -462,7 +466,7 @@ fn derived(card: &Card) -> (Vec<String>, Option<serde_json::Value>) {
 }
 
 /// Portable and native Prompts, standalone and inline in an Agent, register,
-/// read back, re-register idempotently, and hydrate exactly as authored with
+/// read back, re-declare idempotently, and pull exactly as authored with
 /// the same spec hash, which is the authored spec's canonical hash, and the
 /// same derived variables and response schema; each inline Agent Prompt
 /// registers as the Agent's own `<agent>-prompt` Card the hydrated Agent
@@ -478,10 +482,10 @@ fn derived(card: &Card) -> (Vec<String>, Option<serde_json::Value>) {
 async fn prompt_forms_round_trip_as_authored() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let fixture_path = "cards/register_and_hydrate/authored-prompts.yaml";
-    let receipt = register(&cards, fixture_path).await;
-    let again = register(&cards, fixture_path).await;
-    let bundle = hydrate(&cards, &receipt.root).await;
+    let fixture_path = "cards/declare_and_pull/authored-prompts.yaml";
+    let receipt = declare(&cards, fixture_path).await;
+    let again = declare(&cards, fixture_path).await;
+    let bundle = pull(&cards, &receipt.root).await;
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
     let answer_schema = Some(portable_spec()["response_format"].clone());
     let forms = [
@@ -516,12 +520,12 @@ async fn prompt_forms_round_trip_as_authored() {
     ] {
         assert_eq!(
             state.agent(alias).expect("agent hydrates").prompt_ref(),
-            &registered(&receipt, prompt),
+            &declared(&receipt, prompt),
             "{alias} navigates to its registered inline Prompt"
         );
     }
     for (name, authored, variables, schema) in forms {
-        let card_ref = registered(&receipt, name);
+        let card_ref = declared(&receipt, name);
         let read = cards
             .get(CardSelector::exact(card_ref.clone()))
             .await
@@ -559,14 +563,14 @@ async fn prompt_forms_round_trip_as_authored() {
             "{name} hydrates its derived metadata"
         );
         assert_eq!(
-            registered(&again, name),
-            registered(&receipt, name),
+            declared(&again, name),
+            declared(&receipt, name),
             "{name} keeps its reference"
         );
     }
 
     let refused = cards
-        .register_from_path(&fixture("invalid/prompt-with-removed-fields.yaml"))
+        .declare_from_path(&fixture("invalid/prompt-with-removed-fields.yaml"))
         .await
         .expect_err("a removed Prompt field is refused");
     assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
@@ -583,18 +587,18 @@ async fn prompt_forms_round_trip_as_authored() {
 /// Panics when a registration, read, or hydration differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn agent_prompt_registration_identity() {
+async fn agent_prompt_declaration_identity() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
     let dir = tempfile::tempdir().expect("fixture directory creates");
 
     let (agent, prompt) =
-        register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
-    let replay = register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+        declare_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+    let replay = declare_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
     let (changed_agent, changed_prompt) =
-        register_inline(&cards, dir.path(), "first-agent", "Answer at length.").await;
+        declare_inline(&cards, dir.path(), "first-agent", "Answer at length.").await;
     let (_, other_prompt) =
-        register_inline(&cards, dir.path(), "second-agent", "Answer briefly.").await;
+        declare_inline(&cards, dir.path(), "second-agent", "Answer briefly.").await;
 
     assert_eq!(prompt.kind, CardKind::Prompt);
     assert_eq!(prompt.space, agent.space);
@@ -628,10 +632,10 @@ spec:
     )
     .expect("authored prompt writes");
     let independent = cards
-        .register_from_path(&authored)
+        .declare_from_path(&authored)
         .await
         .expect("authored prompt registers");
-    let (_, clash) = register_inline(&cards, dir.path(), "clash-agent", "Answer briefly.").await;
+    let (_, clash) = declare_inline(&cards, dir.path(), "clash-agent", "Answer briefly.").await;
     assert_ne!(clash.version, independent.root.version);
     assert_ne!(clash.uid, independent.root.uid);
 
@@ -640,7 +644,7 @@ spec:
     )
     .await
     .expect("handle connects");
-    let (_, foreign) = register_inline(&tenant, dir.path(), "first-agent", "Answer briefly.").await;
+    let (_, foreign) = declare_inline(&tenant, dir.path(), "first-agent", "Answer briefly.").await;
     assert_ne!(foreign.uid, prompt.uid);
     assert_eq!(
         cards
@@ -651,9 +655,9 @@ spec:
         "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE"
     );
 
-    let desk = register_prompt_desk(&cards).await;
-    let authored = registered(&desk, "desk-prompt");
-    let inline = registered(&desk, "inline-agent-prompt");
+    let desk = declare_prompt_desk(&cards).await;
+    let authored = declared(&desk, "desk-prompt");
+    let inline = declared(&desk, "inline-agent-prompt");
     assert_eq!(authored.version.to_string(), "1.0.0");
     for (name, expected) in [
         ("path-agent", &authored),
@@ -661,11 +665,11 @@ spec:
         ("inline-agent", &inline),
     ] {
         assert_eq!(
-            &persisted_prompt(&cards, &registered(&desk, name)).await,
+            &persisted_prompt(&cards, &declared(&desk, name)).await,
             expected
         );
     }
-    let bundle = hydrate(&cards, &desk.root).await;
+    let bundle = pull(&cards, &desk.root).await;
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads");
     let aliases = state
         .aliases_for(&inline)
@@ -690,17 +694,17 @@ spec:
 /// Panics when registration, hydration, a read, or a refusal differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn hydrated_agent_prompt_card_navigation() {
+async fn pulled_agent_prompt_card_navigation() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    let desk = register_prompt_desk(&cards).await;
-    let bundle = hydrate(&cards, &desk.root).await;
+    let desk = declare_prompt_desk(&cards).await;
+    let bundle = pull(&cards, &desk.root).await;
     deployment.shutdown().await;
 
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
     let explicit = state.prompt("my_prompt").expect("explicit alias reads");
     let explicit_ref = explicit.as_card_ref().expect("prompt identity is valid");
-    assert_eq!(explicit_ref, registered(&desk, "desk-prompt"));
+    assert_eq!(explicit_ref, declared(&desk, "desk-prompt"));
     for (alias, prompt) in [
         ("inline_agent", "inline-agent-prompt"),
         ("path_agent", "desk-prompt"),
@@ -710,9 +714,9 @@ async fn hydrated_agent_prompt_card_navigation() {
         let card = agent.prompt();
         assert_eq!(
             card.as_card_ref().expect("prompt identity is valid"),
-            registered(&desk, prompt)
+            declared(&desk, prompt)
         );
-        assert_eq!(agent.prompt_ref(), &registered(&desk, prompt));
+        assert_eq!(agent.prompt_ref(), &declared(&desk, prompt));
         let Ok(HydratedCard::Agent(generic)) = state.get(alias) else {
             panic!("{alias} is looked up as an Agent");
         };

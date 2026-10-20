@@ -21,7 +21,7 @@ The examples continue the `support-desk` service from [How verification works](/
 
 ## Your code runs an exact version
 
-Your application starts from a bundle of the exact Service version it was deployed with: `wyrd get` downloads the Service and every Card it references, and the SDK loads it from disk with no network call. Because the bundle is pinned, every observation can name the exact Card versions that produced it. [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/) walks through it in all three SDKs.
+Your application starts from a bundle of the exact Service version it was deployed with: `wyrd pull --output-dir <dir>` downloads the Service and every Card it references into that directory, and the SDK loads it from disk with no network call. `wyrd get` only prints a Card's envelope. Because the bundle is pinned, every observation can name the exact Card versions that produced it. [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/) walks through it in all three SDKs.
 
 ## A run is one invocation
 
@@ -129,7 +129,7 @@ Bifrost keeps every observation and verdict, so a question like "which model ver
 
 ## Read data where it already lives
 
-<Aside type="caution" title="Not read yet">You can register Source Cards today, but the server does not read from them. The shape below is the registered contract, not a working ingest path.</Aside>
+<Aside type="caution" title="Not read yet">You can declare Source Cards today, but the server does not read from them. The shape below is the declared contract, not a working ingest path.</Aside>
 
 If the data is already in another system, describe it with a Source Card instead of copying it into Bifrost. A Source names the kind of data and how to reach it; it never holds a secret, only the name of the server environment variable that does.
 

@@ -5,7 +5,7 @@ import type {
   AgentCard,
   CardKind,
   CardRef,
-  CardRegistrationOutcome,
+  CardDeclarationOutcome,
   CardSummary,
   CardTypes,
   DriftBaselineState,
@@ -20,7 +20,7 @@ import type {
   WyrdState,
 } from "wyrd-ai";
 
-// Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
+// Narrowing a declared envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<
   NonNullable<
     NonNullable<NonNullable<Extract<RegisteredCard, { kind: "Verifier" }>["status"]>["verification"]>["baseline"]
@@ -54,7 +54,7 @@ expectTypeOf<CardSummary["status"]>().toEqualTypeOf<CardTypes.CardLifecycleStatu
 
 // Response Options Rust always serializes are required and nullable; skipped ones are optional and non-null.
 expectTypeOf<CardSummary["artifact_hash"]>().toEqualTypeOf<string | null>();
-expectTypeOf<CardRegistrationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
+expectTypeOf<CardDeclarationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
 expectTypeOf<PrincipalSummary["email"]>().toEqualTypeOf<string | null>();
 expectTypeOf<VerificationResult["run_id"]>().toEqualTypeOf<string | null | undefined>();
 

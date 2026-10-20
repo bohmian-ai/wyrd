@@ -86,7 +86,7 @@ run = "bash scripts/run-family-tests.sh wyrd"
 hide = true
 description = "Run the card registration SQL and server unit slices"
 run = """
-cargo test --locked -p wyrd-sql --lib queries::cards::register
+cargo test --locked -p wyrd-sql --lib queries::cards::declare
 cargo test --locked -p wyrd-server --lib components::cards
 """
 
@@ -99,10 +99,10 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run the durable card registration Postgres suite with its lifecycle already provisioned"
 run = """
-cargo test --locked -p wyrd-sql --test integration -- pg_cards_register:: --nocapture --test-threads=1
-cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_card_registration_route::/)'
+cargo test --locked -p wyrd-sql --test integration -- pg_cards_declare:: --nocapture --test-threads=1
+cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_card_declaration_route::/)'
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_verification_routes::/)'
-cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^register_and_hydrate::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^declare_and_pull::/)'
 """
 
 [tasks."test:principals:unit"]
@@ -157,13 +157,15 @@ description = "Run the real-server CLI Card lifecycle journey with its lifecycle
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:local-dev:journey"]
-description = "Installed CLI bootstrap, CLI gateway setup, and fresh saved-config Rust, Python, TypeScript, and MCP callers"
+description = "Installed CLI bootstrap, guided setup, CLI gateway setup, and fresh saved-config Rust, Python, TypeScript, and MCP callers"
 depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
   # share the test builds' third-party artifacts instead of rebuilding them.
   "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
-  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads) | test(=pg_tests::server_dev_keeps_the_gateway_managed_secret_key)'",
+  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads) | test(=pg_tests::server_dev_keeps_the_gateway_managed_secret_key) | test(=pg_tests::server_dev_saved_settings_survive_working_directory_change)'",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_guided_setup",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_standalone_examples_use_saved_local_setup",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
@@ -181,7 +183,7 @@ hide = true
 description = "Run the real-server CLI and Rust SDK typed WyrdState journeys with their lifecycle already provisioned"
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
-  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=register_and_hydrate::service_graph_registers_and_hydrates)'",
+  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=declare_and_pull::service_graph_declares_and_pulls)'",
   "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
 ]
 
@@ -385,6 +387,20 @@ Slack test channel and PagerDuty test service. Reads WYRD_LIVE_SLACK_BOT_TOKEN, 
 WYRD_LIVE_SLACK_CHANNEL_ID, and WYRD_LIVE_PAGERDUTY_KEY from the environment, normally an untracked
 mise.local.toml. Deliberately outside every credential-free lane and the CI gate."""
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --run-ignored only --test-threads=1 -E \"test(=pg_operator_delivery::live_smoke_delivers_to_slack) | test(=pg_operator_delivery::live_smoke_delivers_to_pagerduty)\"'"
+
+[tasks."test:agent-readiness:smoke:live"]
+description = """Opt-in live coding-agent readiness: Claude Code and Codex each build and run a Wyrd-verified Python
+application from this checkout's locally served docs and connected MCP, against a foreground `wyrd server dev` the
+harness owns for that agent alone. Only authorized server evidence decides each outcome. Calls paid agents. Claude
+Code reads ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`), normally from an untracked
+mise.local.toml; Codex uses the owner's existing `codex login` through a linked auth.json. A missing one blocks that
+agent. Transcripts, apps, and report.json land in
+target/agent-readiness/<UTC time>/. Deliberately outside the CI gate."""
+depends = ["py:setup", "docs:install"]
+run = [
+  "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m tests.agent_readiness.live",
+]
 
 [tasks."test:bifrost:integration:server"]
 description = "Run wyrd-server integration targets that exercise Bifrost serving seams."
@@ -1152,14 +1168,14 @@ run = "pnpm start"
 
 [tasks."examples:cli:registration-progress"]
 description = "Show Card registration terminal progress rendering"
-run = "cargo run --locked -p wyrd-cli --example registration_progress"
+run = "cargo run --locked -p wyrd-cli --example declaration_progress"
 
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
 run = [
   "cargo build --locked -p wyrd-rust-examples",
-  "cargo check --locked -p wyrd-cli --example registration_progress",
+  "cargo check --locked -p wyrd-cli --example declaration_progress",
 ]
 
 [tasks."dev:backend"]
@@ -1416,10 +1432,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
-description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
+description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), and the quickstart's TypeScript reference app"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec tsc --noEmit"
+run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit"]
 
 [tasks."ts:test:unit"]
 description = "wyrd-ai unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"

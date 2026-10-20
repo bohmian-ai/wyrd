@@ -33,7 +33,7 @@ export interface Worked {
 }
 
 /**
- * Run the whole local workflow as `client`: register and hydrate the
+ * Run the whole local workflow as `client`: declare and pull the
  * assistant, invoke the Gateway, observe and verify a Run, export a span
  * through `state.startTelemetry`, and
  * read the evidence back. No key is issued and nothing is flushed.
@@ -41,11 +41,11 @@ export interface Worked {
 export async function work(client: WyrdClient): Promise<Worked> {
   await configureGateway(client);
   const cards = await Cards.connect({ client });
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-  const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+  const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-local-"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle, { client });
   await state.startBifrost();
 

@@ -2,7 +2,7 @@
 
 from . import cards, client, config, data, model, prompt, state, verify
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
-from .cards import AgentCard, Card, CardKind, CardRef, Cards, RegistrationReceipt
+from .cards import AgentCard, Card, CardKind, CardRef, Cards, DeclarationReceipt
 from .cli import run_wyrd_cli
 from .client import WyrdClient
 from .config import WyrdConfig
@@ -46,7 +46,7 @@ __all__ = [
     "ProviderRequest",
     "ProviderResponse",
     "ResponseFormat",
-    "RegistrationReceipt",
+    "DeclarationReceipt",
     "SampleInput",
     "SessionError",
     "Split",

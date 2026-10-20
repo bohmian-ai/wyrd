@@ -1,4 +1,4 @@
-"""End-to-end Card registration, lookup, artifact loading, and deletion journeys."""
+"""End-to-end Card declaration, artifact-free lookup, and deletion journeys."""
 
 from __future__ import annotations
 
@@ -7,26 +7,21 @@ import threading
 from hashlib import sha256
 from pathlib import Path
 
-import pandas as pd
 import pytest
-from sklearn.linear_model import LogisticRegression
 from wyrd import WyrdError
 from wyrd.cards import (
     Cards,
-    DataLoadArgs,
     DataSaveArgs,
-    ModelLoadArgs,
     ModelSaveArgs,
     VersionBump,
 )
 from wyrd.client import WyrdClient
-from wyrd.data import DataCard, DataInterface, DataStats, FieldSpec, PandasInterface
+from wyrd.data import DataCard, DataInterface, DataStats, FieldSpec
 from wyrd.model import (
     ModelCard,
     ModelCardMetadata,
     ModelInterface,
     ModelSignature,
-    SklearnInterface,
 )
 from wyrd.prompt import Prompt, PromptCard
 from wyrd.testing import WyrdTestServer
@@ -83,7 +78,7 @@ class LargeDataInterface(DataInterface):
         return DataStats(byte_count=len(payload), sha256=sha256(payload).hexdigest())
 
     def load(self, path: Path, load_kwargs=None) -> None:
-        """Provide the abstract loader without use in this registration test."""
+        """Provide the abstract loader without use in this declaration test."""
         del path, load_kwargs
 
 
@@ -116,7 +111,7 @@ def _model_metadata() -> ModelCardMetadata:
     return ModelCardMetadata(task_type="other", signature=signature)
 
 
-def test_prompt_cards_register_get_list_resolve_latest_and_delete(cards: Cards) -> None:
+def test_prompt_cards_declare_get_list_resolve_latest_and_delete(cards: Cards) -> None:
     name = "crud-prompt"
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),
@@ -125,7 +120,7 @@ def test_prompt_cards_register_get_list_resolve_latest_and_delete(cards: Cards) 
         version="0.1.0",
     )
 
-    receipt = cards.register(card)
+    receipt = cards.declare(card)
 
     assert card.uid == receipt.root.uid
     assert receipt.root.name == name
@@ -147,14 +142,14 @@ def test_prompt_cards_register_get_list_resolve_latest_and_delete(cards: Cards) 
     assert deleted.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
 
 
-def test_data_card_custom_interface_get_requires_interface_and_loads_artifacts(
+def test_data_card_custom_interface_get_requires_interface_and_downloads_no_artifacts(
     cards: Cards,
 ) -> None:
     name = "custom-data"
     interface = JsonDataInterface({"rows": 2})
     card = DataCard(interface, space="python-e2e", name=name, version="0.1.0")
 
-    cards.data.register(
+    cards.data.declare(
         card,
         save_args=DataSaveArgs({"compression": "none"}, copy_bytes=True),
     )
@@ -166,67 +161,17 @@ def test_data_card_custom_interface_get_requires_interface_and_loads_artifacts(
     assert no_interface.value.code == "WYRD_DATA_400_VALIDATION"
 
     unloaded = cards.data.get(uid=card.uid, interface=JsonDataInterface)
-    with pytest.raises(WyrdError) as not_loadable:
-        unloaded.load(load_kwargs=DataLoadArgs({"strict": True}))
-    assert not_loadable.value.code == "WYRD_DATA_400_VALIDATION"
-
-    loaded = cards.data.get(
-        uid=card.uid,
-        interface=JsonDataInterface,
-        eager_load=True,
-        load_kwargs=DataLoadArgs({"strict": True}),
-    )
-    assert loaded.uid == card.uid
-    assert loaded.interface.value == {"rows": 2}
-    assert loaded.interface.loaded_kwargs == {"strict": True}
+    assert unloaded.uid == card.uid
+    assert unloaded.interface.value is None
+    with pytest.raises(TypeError):
+        unloaded.load()  # ty: ignore[missing-argument]
+    with pytest.raises(TypeError):
+        cards.data.get(uid=card.uid, interface=JsonDataInterface, eager_load=True)  # ty: ignore[no-matching-overload]
 
     cards.data.delete(uid=card.uid)
 
 
-def test_data_card_pandas_interface_eager_loads_after_real_registry_round_trip(
-    cards: Cards,
-) -> None:
-    """A Pandas DataCard retains its tabular values through eager artifact hydration."""
-    data = pd.DataFrame({"customer_id": [101, 202], "score": [0.25, 0.75]})
-    card = DataCard(
-        PandasInterface(data=data),
-        space="python-e2e",
-        name="pandas-data",
-        version="0.1.0",
-    )
-
-    cards.data.register(card)
-    loaded = cards.data.get(uid=card.uid, interface=PandasInterface, eager_load=True)
-
-    assert loaded.uid == card.uid
-    pd.testing.assert_frame_equal(loaded.data, data)
-
-    cards.data.delete(uid=card.uid)
-    with pytest.raises(WyrdError) as deleted:
-        cards.data.get(uid=card.uid, interface=PandasInterface)
-    assert deleted.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
-
-
-def test_eager_data_load_uses_constructed_server_and_retains_workspace(
-    wyrd_server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A Cards handle stays bound to server A when ambient config changes to B."""
-    cards = Cards(WyrdClient(server_url=wyrd_server.base_url, credential=wyrd_server.api_key))
-    card = DataCard(
-        JsonDataInterface({"rows": 3}), space="python-e2e", name="eager-data", version="0.1.0"
-    )
-    cards.data.register(card)
-
-    monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
-    monkeypatch.setenv("WYRD_API_KEY", "server-b-must-not-be-used")
-    loaded = cards.data.get(uid=card.uid, interface=JsonDataInterface, eager_load=True)
-
-    assert loaded.interface.value == {"rows": 3}
-    assert loaded.interface.loaded_path is not None
-    assert loaded.interface.loaded_path.exists()
-
-
-def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
+def test_model_card_custom_interface_get_requires_interface_and_downloads_no_artifacts(
     cards: Cards,
 ) -> None:
     name = "custom-model"
@@ -239,7 +184,7 @@ def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
         metadata=_model_metadata(),
     )
 
-    cards.model.register(card, save_args=ModelSaveArgs({"format": "text"}))
+    cards.model.declare(card, save_args=ModelSaveArgs({"format": "text"}))
 
     assert card.uid
     assert interface.saved_kwargs == {"format": "text"}
@@ -248,60 +193,25 @@ def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
     assert no_interface.value.code == "WYRD_MODEL_400_VALIDATION"
 
     unloaded = cards.model.get(uid=card.uid, interface=TextModelInterface)
-    with pytest.raises(WyrdError) as not_loadable:
-        unloaded.load(load_kwargs=ModelLoadArgs({"strict": True}))
-    assert not_loadable.value.code == "WYRD_MODEL_400_VALIDATION"
-
-    loaded = cards.model.get(
-        uid=card.uid,
-        interface=TextModelInterface,
-        eager_load=True,
-        load_kwargs=ModelLoadArgs({"strict": True}),
-    )
-    assert loaded.interface.value == "model-bytes"
-    assert loaded.interface.loaded_kwargs == {"strict": True}
-    assert loaded.model == "model-bytes"
-    assert loaded.preprocessor is None
-    assert loaded.processor is None
+    assert unloaded.uid == card.uid
+    assert unloaded.interface.value == ""
+    with pytest.raises(TypeError):
+        unloaded.load()  # ty: ignore[missing-argument]
+    with pytest.raises(TypeError):
+        cards.model.get(uid=card.uid, interface=TextModelInterface, eager_load=True)  # ty: ignore[no-matching-overload]
 
     cards.model.delete(uid=card.uid)
-
-
-def test_model_card_sklearn_interface_eager_loads_after_real_registry_round_trip(
-    cards: Cards,
-) -> None:
-    """A scikit-learn ModelCard remains executable after eager artifact hydration."""
-    features = [[0.0], [1.0], [2.0], [3.0]]
-    labels = [0, 0, 1, 1]
-    card = ModelCard(
-        SklearnInterface(model=LogisticRegression(random_state=0).fit(features, labels)),
-        space="python-e2e",
-        name="sklearn-model",
-        version="0.1.0",
-        metadata=_model_metadata(),
-    )
-
-    cards.model.register(card)
-    loaded = cards.model.get(uid=card.uid, eager_load=True)
-
-    assert loaded.uid == card.uid
-    assert loaded.model.predict([[0.0], [3.0]]).tolist() == [0, 1]
-
-    cards.model.delete(uid=card.uid)
-    with pytest.raises(WyrdError) as deleted:
-        cards.model.get(uid=card.uid)
-    assert deleted.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
 
 
 def test_typed_registry_rejects_a_card_of_the_wrong_kind(cards: Cards) -> None:
     card = PromptCard(Prompt.openai_chat("gpt-4o", messages="Hello"), name="wrong-kind")
 
     with pytest.raises(WyrdError) as raised:
-        cards.data.register(card)  # ty: ignore[invalid-argument-type]
+        cards.data.declare(card)  # ty: ignore[invalid-argument-type]
     assert raised.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
-def test_card_registration_replay_is_idempotent(cards: Cards) -> None:
+def test_card_declaration_replay_is_idempotent(cards: Cards) -> None:
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Replay me"),
         space="python-e2e",
@@ -309,15 +219,15 @@ def test_card_registration_replay_is_idempotent(cards: Cards) -> None:
         version="0.1.0",
     )
 
-    first = cards.prompt.register(card)
-    second = cards.prompt.register(card)
+    first = cards.prompt.declare(card)
+    second = cards.prompt.declare(card)
 
     assert first.root.uid == second.root.uid == card.uid
     assert second.outcomes[0].outcome == "idempotent_noop"
     cards.prompt.delete(uid=card.uid)
 
 
-def test_registration_version_modes_match_server_contract(cards: Cards) -> None:
+def test_declaration_version_modes_match_server_contract(cards: Cards) -> None:
     """Omitted/Patch/Minor bumps and exact pins resolve without mixed intent."""
     name = "versions"
 
@@ -327,7 +237,7 @@ def test_registration_version_modes_match_server_contract(cards: Cards) -> None:
         name=name,
         version="1",
     )
-    assert cards.prompt.register(omitted).root.version == "1.0.0"
+    assert cards.prompt.declare(omitted).root.version == "1.0.0"
     assert omitted.version == "1.0.0"
 
     patch = PromptCard(
@@ -336,7 +246,7 @@ def test_registration_version_modes_match_server_contract(cards: Cards) -> None:
         name=name,
         version="1",
     )
-    assert cards.prompt.register(patch, version_bump=VersionBump.Patch).root.version == "1.0.1"
+    assert cards.prompt.declare(patch, version_bump=VersionBump.Patch).root.version == "1.0.1"
     assert patch.version == "1.0.1"
 
     minor = PromptCard(
@@ -345,7 +255,7 @@ def test_registration_version_modes_match_server_contract(cards: Cards) -> None:
         name=name,
         version="1",
     )
-    assert cards.prompt.register(minor, version_bump=VersionBump.Minor).root.version == "1.1.0"
+    assert cards.prompt.declare(minor, version_bump=VersionBump.Minor).root.version == "1.1.0"
     assert minor.version == "1.1.0"
 
     exact = PromptCard(
@@ -354,17 +264,17 @@ def test_registration_version_modes_match_server_contract(cards: Cards) -> None:
         name=name,
         version="2.3.4",
     )
-    assert cards.prompt.register(exact).root.version == "2.3.4"
+    assert cards.prompt.declare(exact).root.version == "2.3.4"
     assert exact.version == "2.3.4"
 
 
-def test_registration_releases_the_gil(cards: Cards) -> None:
+def test_declaration_releases_the_gil(cards: Cards) -> None:
     """Native artifact hashing and upload let another Python thread make progress."""
     counter = [0]
     stop = threading.Event()
 
     def compete() -> None:
-        """Increment while registration releases the interpreter lock."""
+        """Increment while declaration releases the interpreter lock."""
         while not stop.is_set():
             counter[0] += 1
 
@@ -374,14 +284,14 @@ def test_registration_releases_the_gil(cards: Cards) -> None:
         LargeDataInterface(counter), space="python-e2e", name="gil-data", version="0.1.0"
     )
     try:
-        cards.data.register(card)
+        cards.data.declare(card)
     finally:
         stop.set()
         thread.join()
     assert counter[0] > 0
 
 
-def test_card_registration_rejects_invalid_artifact_layout(cards: Cards) -> None:
+def test_card_declaration_rejects_invalid_artifact_layout(cards: Cards) -> None:
     card = DataCard(
         SymlinkDataInterface({"rows": 1}),
         space="python-e2e",
@@ -389,11 +299,11 @@ def test_card_registration_rejects_invalid_artifact_layout(cards: Cards) -> None
         version="0.1.0",
     )
     with pytest.raises(WyrdError) as raised:
-        cards.data.register(card)
+        cards.data.declare(card)
     assert raised.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
-def test_card_registration_rejects_underprivileged_writer(wyrd_server: WyrdTestServer) -> None:
+def test_card_declaration_rejects_underprivileged_writer(wyrd_server: WyrdTestServer) -> None:
     denied = Cards(WyrdClient(credential=wyrd_server.bootstrap_service([], name="no-roles")))
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="No write permission"),
@@ -403,7 +313,7 @@ def test_card_registration_rejects_underprivileged_writer(wyrd_server: WyrdTestS
     )
     original = (card.uid, card.version)
     with pytest.raises(WyrdError) as raised:
-        denied.prompt.register(card)
+        denied.prompt.declare(card)
     assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert (card.uid, card.version) == original
 
@@ -417,7 +327,7 @@ def test_card_registry_enforces_cross_tenant_isolation(
         name="tenant-a-prompt",
         version="0.1.0",
     )
-    cards.prompt.register(card)
+    cards.prompt.declare(card)
     tenant_b = wyrd_server.seed_tenant("tenant-b")
     cards_b = Cards(
         WyrdClient(

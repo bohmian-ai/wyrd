@@ -2,7 +2,7 @@
 records each ticket, and checks every answer against its refund policy with
 the ``support/policy-check`` Verifier.
 
-``deploy`` registers the checked-in Cards under ``service/``, which ensures the
+``deploy`` declares the checked-in Cards under ``service/``, which ensures the
 declared ``vala.datasets.tickets`` table, turns on metadata capture, and checks
 the Agent's model is deployed. ``serve`` answers every question in its own
 Agent Run with ``answer``, the application's own gateway call, and submits each
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 import openai
 from opentelemetry import trace
 from wyrd import verify
-from wyrd.cards import Cards, RegistrationReceipt
+from wyrd.cards import Cards, DeclarationReceipt
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.observe import Run
@@ -50,14 +50,14 @@ MCP_VERSION = "2026-07-28"
 
 @dataclass
 class Desk:
-    """The deployed support desk: its registration, loaded Card graph, and gateway client."""
+    """The deployed support desk: its declaration, loaded Card graph, and gateway client."""
 
-    receipt: RegistrationReceipt
+    receipt: DeclarationReceipt
     state: WyrdState
     gateway: openai.OpenAI
 
     def uid(self, name: str) -> str:
-        """The registered UID of the Card named ``name``."""
+        """The declared UID of the Card named ``name``."""
         return next(
             str(outcome.card_ref.uid)
             for outcome in self.receipt.outcomes
@@ -116,19 +116,19 @@ def answer(gateway: openai.OpenAI, state: WyrdState, run: Run, asked: str) -> st
 
 
 def deploy(client: WyrdClient, bundle: Path) -> Desk:
-    """Register and hydrate the Service into ``bundle``, capture gateway call
+    """Declare and pull the Service into ``bundle``, capture gateway call
     metadata, and check the Agent's model is deployed.
 
     Raises:
-        WyrdError: the registration refusal, including
+        WyrdError: the declaration refusal, including
             ``WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`` for an incompatible
             existing ``tickets`` table.
         LookupError: naming the exact gateway deployment to configure when
             the Agent's gateway deployment does not exist.
     """
     cards = Cards(client)
-    receipt = cards.register_from_path(SERVICE / "support-desk.yaml")
-    state = WyrdState.from_path(cards.hydrate(receipt.root, bundle).destination, client)
+    receipt = cards.declare_from_path(SERVICE / "support-desk.yaml")
+    state = WyrdState.from_path(cards.pull(receipt.root, bundle).destination, client)
     gateway = Gateway(client)
     gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
     name = state.card("agent").spec["execution_route"].get("deployment")

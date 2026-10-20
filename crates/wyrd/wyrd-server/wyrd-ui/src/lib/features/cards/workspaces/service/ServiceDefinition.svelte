@@ -137,7 +137,7 @@
               >{row.version}{row.version === detail.currentVersion ? ' (current)' : ''}</a
             >
           </span>
-          <span class="mono">registered {row.created} · {row.note}</span>
+          <span class="mono">declared {row.created} · {row.note}</span>
         {/each}
       </div>
     </Panel>

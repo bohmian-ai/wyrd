@@ -122,7 +122,7 @@ def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> 
 
 def test_path_only_operator_without_connection_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as raised:
-        cards.register_from_path(FIXTURES / "invalid/operator-path-without-connection.yaml")
+        cards.declare_from_path(FIXTURES / "invalid/operator-path-without-connection.yaml")
     assert raised.value.code == "WYRD_SPEC_400_INVALID_OPERATOR"
 
 
@@ -148,7 +148,7 @@ def test_scheduled_binding_rejects_redundant_inputs(
     cards: Cards, file: str, field: str, kind: str, name: str
 ) -> None:
     with pytest.raises(WyrdError) as raised:
-        cards.register_from_path(FIXTURES / "invalid" / file)
+        cards.declare_from_path(FIXTURES / "invalid" / file)
     assert field in json.dumps(raised.value.details), raised.value.details
     with pytest.raises(WyrdError) as absent:
         cards.resolve_latest(kind, "default", name)

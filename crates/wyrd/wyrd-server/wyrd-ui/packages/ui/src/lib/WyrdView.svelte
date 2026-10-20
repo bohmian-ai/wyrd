@@ -7,7 +7,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { fmtInstant, parseInstant } from './format.js';
-  import { failed, type ActionIntent, type ActionState, type Executor, type Problem } from './contract.js';
+  import { failed, wyrdProblem, type ActionIntent, type ActionState, type Executor, type Problem } from './contract.js';
   import {
     inputProblem,
     loadPanel,
@@ -66,7 +66,7 @@
     return (component, input, context) =>
       using
         ? loadPanel(component, input, { executor: using, ...context })
-        : Promise.resolve({ code: 'WYRD_UI_NO_EXECUTOR', title: 'This host cannot load panels' });
+        : Promise.resolve(wyrdProblem('internal', 'This host passed no executor or loader, so it cannot load panels.'));
   });
 
   /** What panels load from: the range and panels without their layout, so a layout-only change never reloads. */
@@ -197,8 +197,7 @@
       controllers.push(controller);
       run(valid.component, valid.input, { range, signal: controller.signal }).then(
         (loaded) => settle(panel.id, controller, 'code' in loaded ? failed(loaded) : loaded),
-        (error: unknown) =>
-          settle(panel.id, controller, failed({ code: 'WYRD_UI_LOAD_FAILED', title: 'Panel failed to load', detail: String(error) }))
+        (error: unknown) => settle(panel.id, controller, failed(wyrdProblem('internal', `The panel failed to load: ${String(error)}`)))
       );
       const loading = { input: valid.input, result: { state: 'loading' } } as ComponentProps[ComponentName];
       return { id: panel.id, component: valid.component, props: loading, actions: {} };
@@ -232,10 +231,7 @@
     try {
       panel.actions[valid.name] = (await onaction(valid, panel.id)) ?? { state: 'success' };
     } catch (error) {
-      panel.actions[valid.name] = {
-        state: 'error',
-        problem: { code: 'WYRD_UI_ACTION_FAILED', title: 'Action failed', detail: String(error) }
-      };
+      panel.actions[valid.name] = { state: 'error', problem: wyrdProblem('internal', `The host action failed: ${String(error)}`) };
     }
   }
 </script>

@@ -5,6 +5,7 @@
  */
 import {
   failed,
+  wyrdProblem,
   type ActionIntent,
   type CardSummary,
   type Executor,
@@ -101,12 +102,7 @@ export function bucketFor(range: AbsoluteRange): string {
 export function chartParams(sql: string, range: AbsoluteRange | undefined): QueryParam[] | Problem {
   const used = Math.max(0, ...Array.from(sql.matchAll(/\$([1-3])(?!\d)/g), (match) => Number(match[1])));
   if (used === 0) return [];
-  if (range === undefined)
-    return {
-      code: 'WYRD_UI_CHART_RANGE_REQUIRED',
-      title: 'Chart needs a time range',
-      detail: 'The SQL binds $1..$3 but no range was supplied.'
-    };
+  if (range === undefined) return wyrdProblem('validation', 'The SQL binds $1..$3 but no range was supplied.');
   return [range.from, range.to, bucketFor(range)].slice(0, used);
 }
 
@@ -117,7 +113,7 @@ const TEMPORAL = /^(Timestamp|Date)/;
 
 /** A result that does not match its chart definition. */
 function shapeError(detail: string): Loaded<never> {
-  return { state: 'error', problem: { code: 'WYRD_UI_CHART_SHAPE', title: 'Chart result does not match its definition', detail } };
+  return { state: 'error', problem: wyrdProblem('validation', detail) };
 }
 
 /**
@@ -232,12 +228,7 @@ export async function loadCardHeader(input: CardHeaderInput, context: LoadContex
 /** Validation failure of a panel input, naming the component and the failing field. */
 export function inputProblem(component: string, issue: { path: readonly PropertyKey[]; message: string }): Problem {
   const field = issue.path.length === 0 ? 'input' : `input.${issue.path.map(String).join('.')}`;
-  return {
-    code: 'WYRD_SPEC_400_VALIDATION',
-    title: 'Validation failed',
-    status: 400,
-    detail: `${component} ${field}: ${issue.message}`
-  };
+  return wyrdProblem('validation', `${component} ${field}: ${issue.message}`);
 }
 
 /** A component's loader, typed by its validated input. */
@@ -280,8 +271,7 @@ export async function loadPanel(
  */
 export function validateIntent(component: ComponentName, intent: ActionIntent): ActionIntent | Problem {
   const emits: Readonly<Record<string, { readonly input: ZodType }>> = components[component].emits;
-  if (!Object.hasOwn(emits, intent.name))
-    return { code: 'WYRD_SPEC_400_VALIDATION', title: 'Validation failed', status: 400, detail: `${component} does not emit ${intent.name}` };
+  if (!Object.hasOwn(emits, intent.name)) return wyrdProblem('validation', `${component} does not emit ${intent.name}`);
   const parsed = emits[intent.name].input.safeParse(intent.input);
   if (!parsed.success) return inputProblem(`${component} ${intent.name}`, parsed.error.issues[0]);
   return { name: intent.name, input: parsed.data };

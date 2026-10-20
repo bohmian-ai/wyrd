@@ -63,7 +63,10 @@ import {
   type WireResult
 } from 'wyrd-ai-ui';
 import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, type ChartInput } from 'wyrd-ai-ui/loaders';
-import { mountView, validateView, WyrdView } from 'wyrd-ai-ui/view';
+import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
+import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
+import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
+import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, type WyrdClient } from 'wyrd-ai';
@@ -126,7 +129,7 @@ test('TASK-003: Validated portable rendering', async () => {
     terminal: terminal(values.length)
   });
   for (const values of [[-5, 10], [-5, -3], [-5, -5], [0, 0], [3, 8]]) {
-    const line = render(Chart, { input: { ...timeseries, series: undefined }, result: { state: 'populated', data: signed(values) } });
+    const line = render(Chart, { input: { ...timeseries, series: undefined } as ChartInput, result: { state: 'populated', data: signed(values) } });
     const coordinates = [...line.container.querySelectorAll('svg.plot polyline')].flatMap((each) => each.getAttribute('points')!.split(/[ ,]/).map(Number));
     coordinates.push(...[...line.container.querySelectorAll('svg.plot line.grid')].map((each) => Number(each.getAttribute('y1'))));
     expect(coordinates.every(Number.isFinite), `${values}`).toBe(true);
@@ -186,20 +189,20 @@ test('TASK-003: Validated portable rendering', async () => {
   refused.unmount();
 
   // A result that does not match its definition is an error, never a blank chart.
-  expect(shapeChart({ ...timeseries, y: ['model'] } as ChartInput, series)).toMatchObject({ state: 'error', problem: { code: 'WYRD_UI_CHART_SHAPE', detail: 'y column "model" is Utf8' } });
+  expect(shapeChart({ ...timeseries, y: ['model'] } as ChartInput, series)).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION', detail: 'y column "model" is Utf8' } });
   expect(shapeChart(timeseries, { ...series, rows: [] }).state).toBe('empty');
   // A duplicated name binds its first column, for validation and drawing alike.
   const v = (data_type: string) => ({ name: 'v', data_type, nullable: false });
   const textFirst: QueryResult = { columns: [v('Utf8'), v('Int64')], rows: [['bad', 3]], terminal: terminal(1) };
   const numberFirst: QueryResult = { columns: [v('Int64'), v('Utf8')], rows: [[3, 'bad']], terminal: terminal(1) };
-  const statOf = { type: 'stat', sql: 'SELECT 1', y: ['v'] } as const;
+  const statOf: ChartInput = { type: 'stat', sql: 'SELECT 1', y: ['v'] };
   expect(shapeChart(statOf, textFirst)).toMatchObject({ state: 'error', problem: { detail: 'y column "v" is Utf8' } });
   expect(shapeChart(statOf, numberFirst).state).toBe('populated');
   const firstStat = render(Chart, { input: statOf, result: shapeChart(statOf, numberFirst) });
   expect(firstStat.container.querySelector('.stat')).toHaveTextContent('3');
   firstStat.unmount();
   const at = { name: 'at', data_type: 'Timestamp(Microsecond, None)', nullable: false };
-  const lineOf = { type: 'timeseries', sql: 'SELECT 1', x: 'at', y: ['v'], series: 'model' } as const;
+  const lineOf: ChartInput = { type: 'timeseries', sql: 'SELECT 1', x: 'at', y: ['v'], series: 'model' };
   const model = (data_type: string) => ({ name: 'model', data_type, nullable: false });
   expect(shapeChart(lineOf, { columns: [at, model('Int64'), model('Utf8'), v('Float64')], rows: [], terminal: terminal(0) })).toMatchObject({ state: 'error', problem: { detail: 'series column "model" is Int64' } });
   expect(shapeChart(lineOf, { columns: [{ ...at, data_type: 'Utf8' }, at, model('Utf8'), v('Float64')], rows: [], terminal: terminal(0) })).toMatchObject({ state: 'error', problem: { detail: 'x column "at" is Utf8' } });
@@ -324,7 +327,7 @@ test('TASK-003: Dependent loads and safe actions', async () => {
 
   // Authored SQL is never rewritten; only referenced range binds are sent.
   expect(chartParams('SELECT 1', undefined)).toEqual([]);
-  expect(chartParams('SELECT $1', undefined)).toMatchObject({ code: 'WYRD_UI_CHART_RANGE_REQUIRED' });
+  expect(chartParams('SELECT $1', undefined)).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(chartParams('WHERE at >= $1 AND at < $2 GROUP BY date_bin($3::interval, at)', RANGE)).toEqual([RANGE.from, RANGE.to, '5 minutes']);
   const chart = recording(() => ({ ok: true, value: series }));
   const loaded = await loadChart(timeseries, { executor: chart.executor, range: RANGE });
@@ -443,7 +446,7 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   controls.unmount();
   // Through a view, a version change reaches the host once and its refusal shows.
   let refuse: (state: { state: 'denied'; problem: typeof denied }) => void = () => {};
-  const viewAction = vi.fn(() => new Promise((resolve) => (refuse = resolve)));
+  const viewAction = vi.fn(() => new Promise<{ state: 'denied'; problem: typeof denied }>((resolve) => (refuse = resolve)));
   const headed = render(WyrdView, { doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'h', component: 'CardHeader', input: { cardRef: card } }] }, executor: fixtureExecutor, onaction: viewAction });
   await waitFor(() => expect(headed.getByRole('combobox', { name: 'Version' })).toBeEnabled());
   const viewSelect = headed.getByRole('combobox', { name: 'Version' });
@@ -522,6 +525,48 @@ test('Node query acquisition cancellation', async () => {
   } finally {
     connect.mockRestore();
   }
+});
+
+test('Canonical UI problem projections', async () => {
+  // Local failures carry a catalog problem, with the safe context in `detail`.
+  const { validation, internal, upstream } = examples;
+  expect(chartParams('SELECT $1', undefined)).toEqual({ ...validation, detail: 'The SQL binds $1..$3 but no range was supplied.' });
+  expect(shapeChart({ ...timeseries, y: ['model'] } as ChartInput, series)).toEqual({ state: 'error', problem: { ...validation, detail: 'y column "model" is Utf8' } });
+  expect(validateIntent('Chart', { name: 'card.tab', input: {} })).toEqual({ ...validation, detail: 'Chart does not emit card.tab' });
+  expect(validateView({})).toMatchObject({ ...validation, detail: expect.stringContaining('View input.version') });
+  const [mcpFailure] = await mcpExecutor({ callServerTool: async () => ({ content: [], isError: true }) } as never).run([{ op: 'bifrost.list_tables' }]);
+  expect(mcpFailure).toEqual({ ok: false, problem: { ...upstream, detail: 'bifrost.list_tables returned an error' } });
+  const remote = remoteLoader('/load', async () => new Response('{}', { status: 502 }));
+  expect(await remote('Chart', timeseries, { range: RANGE, signal: new AbortController().signal })).toEqual({ ...upstream, detail: 'The panel endpoint answered 502' });
+  // An upstream refusal keeps its own identity and its denied state.
+  const refused = await loadChart(timeseries, { executor: recording(() => ({ ok: false, problem: denied })).executor, range: RANGE });
+  expect(refused.result).toEqual({ state: 'denied', problem: denied });
+
+  // A host that cannot load, a rejected load and a failed action render catalog problems.
+  const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'a', component: 'Chart', input: timeseries }] };
+  const unloaded = render(WyrdView, { doc });
+  expect(await unloaded.findByText(internal.code)).toBeInTheDocument();
+  unloaded.unmount();
+  const rejected = render(WyrdView, { doc, load: () => Promise.reject(new Error('offline')) });
+  expect(await rejected.findByText(internal.code)).toBeInTheDocument();
+  rejected.unmount();
+  const failing = render(WyrdView, { doc, executor: recording(() => ({ ok: true, value: series })).executor, onaction: () => Promise.reject(new Error('boom')) });
+  await fireEvent.click(await failing.findByRole('button', { name: 'Open in Query' }));
+  expect(await failing.findByRole('alert')).toHaveTextContent(`${internal.title} (${internal.code})`);
+  failing.unmount();
+
+  // Both panel endpoints answer a malformed request with the full canonical problem.
+  for (const POST of [bffLoad, exampleLoad]) {
+    const response = await POST({ locals: { browserSession: { client: () => ({}) } }, request: new Request('http://ui/load', { method: 'POST', body: '{"component":1}' }) } as never);
+    expect(response.status).toBe(400);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    expect(await response.json()).toEqual({ ...validation, detail: expect.stringMatching(/^Panel input/) });
+  }
+
+  // Browser exports load no native SDK at runtime.
+  const browser = import.meta.glob('/packages/ui/src/lib/{index,contract,loaders,view,plot,format,schemas,layout,mcp}.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+  expect(Object.keys(browser)).toHaveLength(9);
+  for (const [path, source] of Object.entries(browser)) expect(source, path).not.toMatch(/^(import|export) (?!type )[^;]*from 'wyrd-ai'/m);
 });
 
 /** A view document over Chart panels with the given layouts; `undefined` leaves a panel unplaced. */

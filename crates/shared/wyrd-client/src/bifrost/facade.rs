@@ -29,7 +29,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
-#[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;

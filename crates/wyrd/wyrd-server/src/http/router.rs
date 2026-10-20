@@ -32,6 +32,7 @@ use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::{
     require_authenticated, require_bifrost_authenticated, require_otlp_authenticated,
+    require_tenant_authenticated,
 };
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
@@ -81,7 +82,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(gateway_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            require_authenticated,
+            require_tenant_authenticated,
         ))
         .merge(otlp_group)
         .merge(bifrost_group)

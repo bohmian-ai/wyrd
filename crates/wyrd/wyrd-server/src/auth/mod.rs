@@ -49,7 +49,7 @@ impl RequestOrigin {
     ///
     /// Returns `None` when there is no host, or the host carries anything
     /// beyond a host and port (a path, user information, a query).
-    fn from_parts(headers: &HeaderMap, authority: Option<&str>) -> Option<Url> {
+    pub(crate) fn from_parts(headers: &HeaderMap, authority: Option<&str>) -> Option<Url> {
         let first = |name| {
             headers
                 .get(name)

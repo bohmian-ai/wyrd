@@ -71,13 +71,30 @@ impl BrowserResponse {
 /// Send one browser request to the in-process router.
 ///
 /// # Panics
-/// Panics when the request cannot be built, the route fails to respond, or a
-/// non-empty body is not JSON.
+/// As [`send_with`].
 async fn send(server: &WyrdTestServer, request: BrowserRequest<'_>) -> BrowserResponse {
+    send_with(server, request, None).await
+}
+
+/// Send one browser request, with `bearer` as `X-Wyrd-Access-Token` when
+/// given, to the in-process router.
+///
+/// A non-empty body that is not JSON is kept as a JSON string.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn send_with(
+    server: &WyrdTestServer,
+    request: BrowserRequest<'_>,
+    bearer: Option<&str>,
+) -> BrowserResponse {
     let mut builder = Request::builder()
         .method(request.method)
         .uri(request.uri)
         .header(header::HOST, "wyrd.test");
+    if let Some(bearer) = bearer {
+        builder = builder.header("x-wyrd-access-token", format!("Bearer {bearer}"));
+    }
     if let Some(origin) = request.origin {
         builder = builder.header(header::ORIGIN, origin);
     }
@@ -109,7 +126,8 @@ async fn send(server: &WyrdTestServer, request: BrowserRequest<'_>) -> BrowserRe
     let body = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).expect("response body is JSON")
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     BrowserResponse {
         status,
@@ -165,14 +183,28 @@ fn cookie_name(tenant: &str) -> String {
 /// Bootstrap an `admin` Service in `tenant` and return its id and API key.
 ///
 /// # Panics
-/// Panics when bootstrapping fails or returns a user.
+/// As [`service_with`].
 async fn service(
     server: &WyrdTestServer,
     tenant: wyrd_spec::DataTenantId,
     name: &str,
 ) -> (Uuid, SecretString) {
+    service_with(server, tenant, name, &["admin"]).await
+}
+
+/// Bootstrap a Service holding `roles` in `tenant` and return its id and API
+/// key.
+///
+/// # Panics
+/// Panics when bootstrapping fails or returns a user.
+async fn service_with(
+    server: &WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    name: &str,
+    roles: &[&str],
+) -> (Uuid, SecretString) {
     match server
-        .bootstrap_service_in_tenant(tenant, name, &["admin"])
+        .bootstrap_service_in_tenant(tenant, name, roles)
         .await
         .expect("service bootstraps")
     {
@@ -476,4 +508,242 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
         outage.set_cookie(&cookie_name(&acme)).is_none(),
         "nothing cleared"
     );
+}
+
+/// Call a tenant API route as a browser carrying `cookies`, from `origin`,
+/// optionally with an explicit bearer.
+async fn api(
+    server: &WyrdTestServer,
+    method: Method,
+    uri: &str,
+    origin: Option<&str>,
+    cookies: Vec<(String, String)>,
+    bearer: Option<&str>,
+) -> BrowserResponse {
+    send_with(
+        server,
+        BrowserRequest {
+            method,
+            uri,
+            origin,
+            cookies,
+            body: None,
+        },
+        bearer,
+    )
+    .await
+}
+
+/// The stored expiry of a session and its recovery key's last use.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn session_state(server: &WyrdTestServer, cookie: &str) -> (String, Option<String>) {
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    sqlx::query_as(
+        "SELECT s.expires_at::text, k.last_used_at::text \
+           FROM wyrd.auth_browser_sessions s \
+           JOIN wyrd.auth_api_keys k ON k.id = s.api_key_id \
+          WHERE s.session_hash = $1",
+    )
+    .bind(Sha256::digest(cookie.as_bytes()).to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("session reads")
+}
+
+/// A selected browser session reaches the same tenant API permission checks
+/// and audit as a bearer; mutations need the exact origin; an explicit bearer
+/// never falls back to a cookie; ambiguous, dead, wrong-tenant and
+/// least-privilege sessions stay refused; reads neither slide nor write; and
+/// MCP, OTLP and platform surfaces stay bearer-only.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn browser_session_requests_enforce_origin_and_bearer_precedence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let beta_id = server.seed_tenant("beta").await.expect("tenant seeds");
+    let (admin, admin_key) = service(&server, server.data_tenant_id(), "bs-admin").await;
+    let (_, viewer_key) =
+        service_with(&server, server.data_tenant_id(), "bs-viewer", &["viewer"]).await;
+    let (target, _) = service_with(&server, server.data_tenant_id(), "bs-target", &[]).await;
+    let (_, beta_key) = service(&server, beta_id, "bs-beta").await;
+    let session_for = |tenant: String, key: SecretString| {
+        let server = &server;
+        async move {
+            let created = recover(server, &tenant, key.expose_secret(), Some(ORIGIN)).await;
+            assert_eq!(created.status, StatusCode::OK, "{}", created.body);
+            vec![(
+                cookie_name(&tenant),
+                created.cookie_value(&cookie_name(&tenant)),
+            )]
+        }
+    };
+    let admin_cookie = session_for(acme.clone(), admin_key).await;
+    let viewer_cookie = session_for(acme.clone(), viewer_key).await;
+    let beta_cookie = session_for("beta".to_owned(), beta_key).await;
+    let grant = format!("/v1/principals/{target}/roles/editor");
+
+    // A read authenticates by the session and neither slides nor writes it.
+    let before = session_state(&server, &admin_cookie[0].1).await;
+    let listed = api(
+        &server,
+        Method::GET,
+        "/v1/principals",
+        None,
+        admin_cookie.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(session_state(&server, &admin_cookie[0].1).await, before);
+
+    // A mutation requires the exact origin.
+    for origin in [None, Some("http://evil.test"), Some("null")] {
+        let refused = api(
+            &server,
+            Method::PUT,
+            &grant,
+            origin,
+            admin_cookie.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+        assert_eq!(refused.body["code"], json!("WYRD_AUTH_403_ORIGIN_REFUSED"));
+    }
+    let granted = api(
+        &server,
+        Method::PUT,
+        &grant,
+        Some(ORIGIN),
+        admin_cookie.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
+    assert_eq!(granted.body["changed"], json!(true));
+
+    // An explicit bearer always wins; a refused one never falls back.
+    let bad_bearer = api(
+        &server,
+        Method::GET,
+        "/v1/principals",
+        None,
+        admin_cookie.clone(),
+        Some("not-a-jwt"),
+    )
+    .await;
+    assert_eq!(
+        bad_bearer.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_bearer.body
+    );
+    assert_eq!(
+        bad_bearer.body["code"],
+        json!("WYRD_AUTH_400_BAD_TOKEN_FORMAT")
+    );
+
+    // Exactly one session cookie; a dead one is refused, never anonymous.
+    let both = [admin_cookie.clone(), beta_cookie.clone()].concat();
+    let ambiguous = api(&server, Method::GET, "/v1/principals", None, both, None).await;
+    assert_eq!(
+        ambiguous.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        ambiguous.body
+    );
+    assert_eq!(
+        ambiguous.body["details"]["reason"],
+        json!("browser_session_ambiguous")
+    );
+    let dead = vec![(
+        cookie_name(&acme),
+        format!("{}.forged", server.data_tenant_id()),
+    )];
+    let refused = api(&server, Method::GET, "/v1/principals", None, dead, None).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+    assert_eq!(refused.body["code"], json!("WYRD_AUTH_401_INVALID_TOKEN"));
+    let none = api(
+        &server,
+        Method::GET,
+        "/v1/principals",
+        None,
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_eq!(none.status, StatusCode::UNAUTHORIZED);
+
+    // The session's tenant and the key's least privilege still bind.
+    let foreign = api(
+        &server,
+        Method::GET,
+        &format!("/v1/principals/{target}/roles"),
+        None,
+        beta_cookie.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "{}", foreign.body);
+    let denied = api(
+        &server,
+        Method::DELETE,
+        &grant,
+        Some(ORIGIN),
+        viewer_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.body);
+    assert_eq!(
+        denied.body["code"],
+        json!("WYRD_PERMISSION_403_DENIED_RBAC")
+    );
+
+    // Other protocol surfaces stay bearer-only.
+    for (method, uri) in [
+        (Method::POST, "/mcp"),
+        (Method::POST, "/v1/traces"),
+        (Method::GET, "/platform/oidc/connection"),
+    ] {
+        let refused = api(
+            &server,
+            method,
+            uri,
+            Some(ORIGIN),
+            admin_cookie.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::UNAUTHORIZED,
+            "{uri}: {}",
+            refused.body
+        );
+    }
+
+    // The cookie-authenticated grant is audited as the session's principal.
+    server
+        .await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    let decisions = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "outcome",
+            &format!("operation = 'auth.principal.role.grant' AND sub_principal_id = '{admin}'"),
+        )
+        .await
+        .expect("audit rows read");
+    assert_eq!(decisions, vec![vec![Some("allowed".to_owned())]]);
 }

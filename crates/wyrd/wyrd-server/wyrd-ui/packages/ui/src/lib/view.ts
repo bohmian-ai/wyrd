@@ -5,7 +5,7 @@
  */
 import './theme.css';
 import { mount, unmount } from 'svelte';
-import type { ActionIntent, ActionState, Executor, Problem } from './contract.js';
+import { wyrdProblem, type ActionIntent, type ActionState, type Executor, type Problem } from './contract.js';
 import { inputProblem, type ComponentName, type ComponentProps } from './loaders.js';
 import { ViewDocumentSchema, type AbsoluteRange, type ViewDocument } from './schemas.js';
 import WyrdView from './WyrdView.svelte';
@@ -60,6 +60,6 @@ export function remoteLoader(url: string, fetcher: typeof fetch = fetch): PanelL
     });
     const body = (await response.json()) as ComponentProps[ComponentName] | Problem;
     if (response.ok) return body;
-    return 'code' in body ? body : { code: 'WYRD_UI_LOAD_FAILED', title: 'Panel failed to load', status: response.status };
+    return 'code' in body ? body : wyrdProblem('upstream', `The panel endpoint answered ${response.status}`);
   };
 }

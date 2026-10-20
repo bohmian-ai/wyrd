@@ -1,4 +1,5 @@
-// Generates src/lib/catalog.json from the component schemas in src/lib/schemas.ts.
+// Generates src/lib/catalog.json from the component schemas in src/lib/schemas.ts, and
+// src/lib/problems.json from the Rust error catalog's browser-safe problem projection.
 // Usage: node scripts/catalog.ts [--check]   (--check exits non-zero on drift)
 import { readFileSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
@@ -25,17 +26,23 @@ const catalog = {
     ])
   )
 };
-const content = `${JSON.stringify(catalog, null, 2)}\n`;
+const problems = readFileSync(new URL('../../../../../../wyrd-spec/schemas/ui_problem_examples.json', import.meta.url), 'utf8');
+const outputs: [URL, string][] = [
+  [path, `${JSON.stringify(catalog, null, 2)}\n`],
+  [new URL('../src/lib/problems.json', import.meta.url), problems]
+];
 
-if (process.argv.includes('--check')) {
-  let current = '';
-  try {
-    current = readFileSync(path, 'utf8');
-  } catch {}
-  if (current !== content) {
-    console.error('catalog.json drift - run `pnpm --filter wyrd-ai-ui catalog` and commit');
-    process.exit(1);
+for (const [file, content] of outputs) {
+  if (process.argv.includes('--check')) {
+    let current = '';
+    try {
+      current = readFileSync(file, 'utf8');
+    } catch {}
+    if (current !== content) {
+      console.error(`${file.pathname.split('/').pop()} drift - run \`pnpm --filter wyrd-ai-ui catalog\` and commit`);
+      process.exit(1);
+    }
+  } else {
+    writeFileSync(file, content);
   }
-} else {
-  writeFileSync(path, content);
 }

@@ -4,7 +4,7 @@
  * credential; this module holds neither.
  */
 import type { App } from '@modelcontextprotocol/ext-apps';
-import type { Executor, Problem, WireRequest, WireResult } from './contract.js';
+import { wyrdProblem, type Executor, type Problem, type WireRequest, type WireResult } from './contract.js';
 
 /** The tool and arguments serving one read, and how its structured answer maps back. */
 function tool(request: WireRequest): { name: string; arguments: Record<string, unknown>; value?: (content: Record<string, unknown>) => unknown } {
@@ -21,12 +21,12 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
   }
 }
 
-/** A tool's structured refusal or a JSON-RPC error's problem `data`, as a stable problem. */
+/** A tool's structured refusal or a JSON-RPC error's problem `data`, as a stable problem; anything else is an upstream failure. */
 function problem(source: unknown, fallback: string): Problem {
   const body = source as Partial<Problem> | undefined;
   if (typeof body?.code === 'string')
     return { code: body.code, title: body.title ?? fallback, status: body.status, detail: body.detail };
-  return { code: 'WYRD_UI_MCP_TOOL_FAILED', title: 'MCP tool call failed', detail: fallback };
+  return wyrdProblem('upstream', fallback);
 }
 
 /** Build an executor over a connected MCP App. */

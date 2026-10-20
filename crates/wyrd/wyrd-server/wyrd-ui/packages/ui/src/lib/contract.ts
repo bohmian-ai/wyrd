@@ -16,14 +16,30 @@ import type {
   VerificationExecutionState
 } from 'wyrd-ai';
 
+import problems from './problems.json';
+
 export type { CardRef, CardSummary, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
 
-/** The stable Wyrd error a refused or failed read reports. */
+/**
+ * The stable Wyrd error a refused or failed read reports. Upstream reads keep
+ * their own projection; local failures carry the full canonical problem.
+ */
 export interface Problem {
   readonly code: string;
   readonly title: string;
   readonly status?: number;
   readonly detail?: string;
+  readonly type?: string;
+  readonly details?: unknown;
+  readonly remediation?: string;
+}
+
+/**
+ * A canonical problem, generated from the Rust error catalog by
+ * `scripts/catalog.ts`, with this failure's safe context as `detail`.
+ */
+export function wyrdProblem(kind: keyof typeof problems, detail: string): Problem {
+  return { ...structuredClone(problems[kind]), detail };
 }
 
 /** The closed set of existing domain reads a loader may plan. */

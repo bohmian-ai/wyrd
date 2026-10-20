@@ -23,6 +23,7 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETR
 use serde_json::value::RawValue;
 
 use crate::error::{ProviderError, ProviderResult};
+use crate::exchange::ExchangeTimer;
 use crate::retry::{RetryPolicy, parse_retry_after};
 use crate::transport::HttpTransport;
 
@@ -31,6 +32,9 @@ use crate::transport::HttpTransport;
 /// Every answer body is read through the transport's `max_response_bytes`
 /// bound before its status is inspected, so neither a success nor a refusal
 /// can buffer an unbounded body.
+///
+/// Each HTTP exchange, retries included, is logged in the caller's
+/// [`crate::exchange::scope`] as ended once its body is read, before decode.
 ///
 /// # Errors
 ///
@@ -49,6 +53,7 @@ pub async fn send_bytes_with_retry(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let mut attempt = 0;
     loop {
+        let mut exchange = ExchangeTimer::start();
         let response = transport
             .client()
             .request(method.clone(), url)
@@ -57,10 +62,14 @@ pub async fn send_bytes_with_retry(
             .send()
             .await
             .map_err(|error| map_reqwest_error(provider, error))?;
+        exchange.headers();
 
         let status = response.status();
         let retry_after = retry_after_ms(&response);
-        let text = read_bounded(provider, response, transport.config().max_response_bytes).await?;
+        let bytes =
+            read_bounded_bytes(provider, response, transport.config().max_response_bytes).await?;
+        drop(exchange);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
 
         if status.is_success() {
             return Ok(text);
@@ -122,7 +131,9 @@ impl ProviderByteStream {
 ///
 /// Streaming requests never retry, because output may already have been
 /// billed. A non-success answer is read through the transport's body bound and
-/// returned as its status error, like a buffered request.
+/// returned as its status error, like a buffered request. A successful
+/// exchange is logged in the caller's [`crate::exchange::scope`] as open,
+/// since its body is read incrementally; a refusal is logged as ended.
 ///
 /// # Errors
 ///
@@ -137,6 +148,7 @@ pub async fn open_stream(
     body: &RawValue,
 ) -> ProviderResult<ProviderByteStream> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut exchange = ExchangeTimer::start();
     let response = transport
         .client()
         .post(url)
@@ -145,6 +157,7 @@ pub async fn open_stream(
         .send()
         .await
         .map_err(|error| map_reqwest_error(provider, error))?;
+    exchange.headers();
     let status = response.status();
     if !status.is_success() {
         let retry_after = retry_after_ms(&response);
@@ -156,6 +169,7 @@ pub async fn open_stream(
             retry_after,
         ));
     }
+    exchange.open();
     Ok(ProviderByteStream {
         provider: provider.to_owned(),
         response,
@@ -280,7 +294,8 @@ impl HttpTransport {
     ///
     /// Never retries, because the request may start non-idempotent provider
     /// work. A refusal body is read through this transport's
-    /// `max_response_bytes` bound.
+    /// `max_response_bytes` bound. A successful exchange is logged in the
+    /// caller's [`crate::exchange::scope`] as open; a refusal as ended.
     ///
     /// # Errors
     ///
@@ -292,20 +307,44 @@ impl HttpTransport {
         provider: &str,
         method: Method,
         url: &str,
-        mut headers: HeaderMap,
+        headers: HeaderMap,
         payload: Option<Payload>,
     ) -> ProviderResult<reqwest::Response> {
+        let (response, exchange) = self
+            .open_timed(provider, method, url, headers, payload)
+            .await?;
+        exchange.open();
+        Ok(response)
+    }
+
+    /// Sends one request exactly as [`Self::open_once`] describes and returns
+    /// the successful answer with the timer of its still-unread exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::open_once`]; a failed exchange is logged
+    /// as ended when it fails.
+    async fn open_timed(
+        &self,
+        provider: &str,
+        method: Method,
+        url: &str,
+        mut headers: HeaderMap,
+        payload: Option<Payload>,
+    ) -> ProviderResult<(reqwest::Response, ExchangeTimer)> {
         let mut request = self.client().request(method, url);
         if let Some(payload) = payload {
             headers.insert(CONTENT_TYPE, payload.content_type);
             headers.insert(CONTENT_LENGTH, HeaderValue::from(payload.len));
             request = request.body(payload.body);
         }
+        let mut exchange = ExchangeTimer::start();
         let response = request
             .headers(headers)
             .send()
             .await
             .map_err(|error| map_reqwest_error(provider, error))?;
+        exchange.headers();
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after_ms(&response);
@@ -317,11 +356,13 @@ impl HttpTransport {
                 retry_after,
             ));
         }
-        Ok(response)
+        Ok((response, exchange))
     }
 
     /// Sends one request like [`Self::open_once`] and returns the successful
-    /// answer's content type and bytes, read through `max_response_bytes`.
+    /// answer's content type and bytes, read through `max_response_bytes`;
+    /// the exchange is logged in the caller's [`crate::exchange::scope`] as
+    /// ended once the body is read.
     ///
     /// # Errors
     ///
@@ -335,14 +376,13 @@ impl HttpTransport {
         headers: HeaderMap,
         payload: Option<Payload>,
     ) -> ProviderResult<(String, Vec<u8>)> {
-        let response = self
-            .open_once(provider, method, url, headers, payload)
+        let (response, exchange) = self
+            .open_timed(provider, method, url, headers, payload)
             .await?;
         let answer_type = answer_type(&response).to_owned();
-        Ok((
-            answer_type,
-            read_bounded_bytes(provider, response, self.config().max_response_bytes).await?,
-        ))
+        let bytes = read_bounded_bytes(provider, response, self.config().max_response_bytes).await?;
+        drop(exchange);
+        Ok((answer_type, bytes))
     }
 }
 

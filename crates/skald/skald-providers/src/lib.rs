@@ -8,6 +8,7 @@ pub mod auth;
 pub mod clients;
 pub mod endpoint;
 pub mod error;
+pub mod exchange;
 pub mod raw;
 pub mod retry;
 pub mod stream;

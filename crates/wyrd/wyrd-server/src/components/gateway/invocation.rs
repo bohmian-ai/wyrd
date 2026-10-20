@@ -52,6 +52,11 @@ use super::capture::{
 };
 use super::ledger::{Admission, GatewayLedger, LedgerCall};
 use super::service::{GatewayAdministration, unavailable};
+use super::telemetry::{CallTelemetry, IngressClock, Phase};
+use crate::app::metrics::{
+    GATEWAY_ATTEMPT_DURATION_SECONDS, GATEWAY_QUEUE_DELAY_SECONDS,
+    GATEWAY_REQUEST_DURATION_SECONDS, GATEWAY_TIME_TO_FIRST_BYTE_SECONDS,
+};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
@@ -196,6 +201,9 @@ impl From<CallFailure> for WyrdError {
 pub struct GatewayInvocation<'a> {
     /// Server state carrying authorization, audit, storage, and the engine.
     state: &'a AppState,
+    /// When the public request carrying the call reached the server; `None`
+    /// for a server-internal call, which records phase telemetry only.
+    arrival: Option<std::time::Instant>,
 }
 
 /// Everything admission fixed for one call, owned so execution and accounting
@@ -256,7 +264,24 @@ impl<'a> GatewayInvocation<'a> {
     /// Borrows invocation dependencies from server state.
     #[must_use]
     pub fn new(state: &'a AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            arrival: None,
+        }
+    }
+
+    /// Times the call this handle runs from the arrival of the public
+    /// request `clock` timed, recording its `authenticate` and `parse` phases
+    /// for `operation` now that the request is decoded and validated; a
+    /// request without a clock keeps phase telemetry only.
+    #[must_use]
+    pub(crate) fn parsed(
+        mut self,
+        clock: Option<IngressClock>,
+        operation: GatewayOperation,
+    ) -> Self {
+        self.arrival = clock.map(|clock| clock.parsed(operation));
+        self
     }
 
     /// Runs one governed call for `caller`.
@@ -361,14 +386,10 @@ impl<'a> GatewayInvocation<'a> {
         if let Err(failure) = &result {
             let span = tracing::Span::current();
             if !failure.settled {
-                let stopped = matches!(failure.error, WyrdError::ServiceUnavailable { .. })
-                    && (self.state.shutdown_token.is_cancelled() || cancel.is_cancelled());
-                let outcome = if stopped {
-                    GatewayCallOutcome::Cancelled
-                } else {
-                    GatewayCallOutcome::Failed
-                };
-                span.record("outcome", outcome_name(outcome));
+                span.record(
+                    "outcome",
+                    outcome_name(self.unsettled(&failure.error, cancel)),
+                );
             }
             span.record("error.code", failure.error.code());
             if !failure.dispatched {
@@ -383,6 +404,19 @@ impl<'a> GatewayInvocation<'a> {
         result
     }
 
+    /// Terminal outcome of a call that failed with `error` before its
+    /// execution task settled it: `Cancelled` when drain or cancellation made
+    /// the service unavailable, and `Failed` otherwise.
+    fn unsettled(&self, error: &WyrdError, cancel: &CancellationToken) -> GatewayCallOutcome {
+        let stopped = matches!(error, WyrdError::ServiceUnavailable { .. })
+            && (self.state.shutdown_token.is_cancelled() || cancel.is_cancelled());
+        if stopped {
+            GatewayCallOutcome::Cancelled
+        } else {
+            GatewayCallOutcome::Failed
+        }
+    }
+
     /// Runs one gateway call: admits it on the caller's task, then executes
     /// and settles it on a tracked background [`CallTask`] so accounting and
     /// capture still finish if the caller goes away.
@@ -391,6 +425,9 @@ impl<'a> GatewayInvocation<'a> {
     /// the provider attempts, and, for a buffered answer, the accounting
     /// commit. A stream answers when it opens. Capture never delays the
     /// answer. Dropping this future before the answer cancels the call.
+    ///
+    /// The call's `answer` point is recorded once the answer, or a refusal
+    /// before execution, is in hand here, ready for the response body.
     ///
     /// # Errors
     /// Returns every error of [`Self::invoke`] as a [`CallFailure`]. Errors
@@ -404,9 +441,16 @@ impl<'a> GatewayInvocation<'a> {
     ) -> Result<GatewayCallResponse, CallFailure> {
         let received = Instant::now();
         let (ingress, stream) = (request.ingress, request.stream);
-        let (call, plan, admission) = self.admit_call(caller, request).await?;
-        let cancel = cancel.child_token();
-        let cancel_on_drop = cancel.clone().drop_guard();
+        let telemetry = CallTelemetry::new(request.operation, stream, self.arrival);
+        let (call, plan, admission) = match self.admit_call(caller, request, &telemetry).await {
+            Ok(admitted) => admitted,
+            Err(failure) => {
+                telemetry.answered(self.unsettled(&failure.error, cancel), Duration::ZERO);
+                return Err(failure);
+            }
+        };
+        let call_cancel = cancel.child_token();
+        let cancel_on_drop = call_cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
         let task = CallTask {
             state: self.state.clone(),
@@ -416,22 +460,36 @@ impl<'a> GatewayInvocation<'a> {
             ingress,
             stream,
             received,
+            telemetry,
             call_span: tracing::Span::current(),
-            cancel,
+            cancel: call_cancel,
         };
         self.state.gateway_tasks.spawn(
             task.run(head)
                 .instrument(tracing::info_span!("gateway.execute")),
         );
-        let (answer, dispatched) = answer.await.map_err(|error| CallFailure {
-            error: unavailable(error),
-            dispatched: true,
-            settled: false,
-        })?;
+        let Answer {
+            result,
+            dispatched,
+            outcome,
+            upstream,
+        } = match answer.await {
+            Ok(answer) => answer,
+            Err(error) => {
+                let error = unavailable(error);
+                telemetry.answered(self.unsettled(&error, cancel), Duration::ZERO);
+                return Err(CallFailure {
+                    error,
+                    dispatched: true,
+                    settled: false,
+                });
+            }
+        };
+        telemetry.answered(outcome, upstream);
         // The answer reached the caller: a stream now ends on drain, deadline,
         // or its own drop rather than when this future returns.
         cancel_on_drop.disarm();
-        answer.map_err(|error| CallFailure {
+        result.map_err(|error| CallFailure {
             error,
             dispatched,
             settled: true,
@@ -453,10 +511,14 @@ impl<'a> GatewayInvocation<'a> {
     /// out-of-range timeout, the mapped permission denial of the requested
     /// model, and every error of the snapshot load, [`Self::route`], and
     /// [`Self::admit`]. Every one is undispatched.
+    ///
+    /// The snapshot, authorize, route, and admit phases are recorded on
+    /// `telemetry` as each completes.
     async fn admit_call(
         &self,
         caller: &Caller,
         mut request: GatewayCallRequest,
+        telemetry: &CallTelemetry,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
         tracing::Span::current().record("call_id", tracing::field::display(call_id.as_uuid()));
@@ -479,9 +541,12 @@ impl<'a> GatewayInvocation<'a> {
                 invalid_request(GatewayContractError::new("timeout", "is out of range"))
             })?;
         let tenant = caller.data_tenant_id;
+        let started = std::time::Instant::now();
         let snapshot = GatewayAdministration::new(self.state)
             .snapshot(tenant)
             .await?;
+        telemetry.since(Phase::Snapshot, started);
+        let started = std::time::Instant::now();
         self.decide(caller, OPERATION, &request.model, &snapshot)
             .map_err(permission_deny_reason_to_wyrd)?;
         let subject = match request.subject.take() {
@@ -491,11 +556,14 @@ impl<'a> GatewayInvocation<'a> {
             Some(GatewayCallAttribution::Resolved(subject)) => Some(subject),
             None => None,
         };
+        telemetry.since(Phase::Authorize, started);
         // A call continuing a caller's trace parents its captured attempts on
         // this `gateway.call` span; an untraced call keeps its own trace.
         let trace = wyrd_telemetry::continued_context();
 
+        let started = std::time::Instant::now();
         let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
+        telemetry.since(Phase::Route, started);
 
         let admitted_at = Utc::now();
         let call = AdmittedCall {
@@ -516,7 +584,9 @@ impl<'a> GatewayInvocation<'a> {
             subject,
             trace,
         };
+        let started = std::time::Instant::now();
         let admission = self.admit(&call, &mut plan).await?;
+        telemetry.since(Phase::Admit, started);
         Ok((call, plan, admission))
     }
 
@@ -1006,7 +1076,7 @@ impl<'a> GatewayInvocation<'a> {
         let outcome = outcome_name(outcome);
         metrics::counter!("wyrd_gateway_requests_total", "operation" => operation, "outcome" => outcome)
             .increment(1);
-        metrics::histogram!("wyrd_gateway_request_duration_seconds", "operation" => operation, "outcome" => outcome)
+        metrics::histogram!(GATEWAY_REQUEST_DURATION_SECONDS, "operation" => operation, "outcome" => outcome)
             .record(received.elapsed().as_secs_f64());
         for attempt in &execution.attempts {
             let outcome = outcome_name(attempt.outcome);
@@ -1015,7 +1085,7 @@ impl<'a> GatewayInvocation<'a> {
             let seconds = (attempt.terminal_at - attempt.started_at)
                 .to_std()
                 .map_or(0.0, |elapsed| elapsed.as_secs_f64());
-            metrics::histogram!("wyrd_gateway_attempt_duration_seconds", "operation" => operation, "outcome" => outcome)
+            metrics::histogram!(GATEWAY_ATTEMPT_DURATION_SECONDS, "operation" => operation, "outcome" => outcome)
                 .record(seconds);
         }
         let routing = match execution.outcome {
@@ -1054,8 +1124,18 @@ impl<'a> GatewayInvocation<'a> {
     }
 }
 
-/// The caller's answer and whether any attempt was billable.
-type Answer = (Result<GatewayCallResponse, WyrdError>, bool);
+/// The caller's answer as the execution task hands it over.
+struct Answer {
+    /// The answer, or the error the caller receives.
+    result: Result<GatewayCallResponse, WyrdError>,
+    /// Whether any attempt was billable.
+    dispatched: bool,
+    /// The settled outcome of a buffered call, or the outcome of an opened
+    /// stream's head, for the `answer` telemetry point.
+    outcome: GatewayCallOutcome,
+    /// Provider exchange time the call waited on before this answer.
+    upstream: Duration,
+}
 
 /// Execution of one admitted call on a tracked `gateway_tasks` task.
 ///
@@ -1076,6 +1156,8 @@ struct CallTask {
     stream: bool,
     /// Receipt time, for queue delay and request duration.
     received: Instant,
+    /// The call's phase and handoff telemetry.
+    telemetry: CallTelemetry,
     /// The caller's `gateway.call` span, which receives the settled outcome.
     call_span: tracing::Span,
     /// Call cancellation, fired if the caller drops before the answer.
@@ -1091,7 +1173,7 @@ impl CallTask {
     async fn run(self, head: oneshot::Sender<Answer>) {
         let _active = ActiveCall::begin();
         metrics::histogram!(
-            "wyrd_gateway_queue_delay_seconds",
+            GATEWAY_QUEUE_DELAY_SECONDS,
             "operation" => operation_name(self.plan.operation)
         )
         .record(self.received.elapsed().as_secs_f64());
@@ -1112,16 +1194,25 @@ impl CallTask {
                 cancel: &self.cancel,
             })
             .await;
+        if !execution.attempts.is_empty() {
+            self.telemetry
+                .phase(Phase::Credential, execution.timing.credential);
+            self.telemetry
+                .phase(Phase::Translate, execution.timing.translate);
+        }
         let end = match &mut execution.response {
             Some(ResponseBody::Events(events) | ResponseBody::MediaStream { events, .. }) => {
-                events.end.take()
+                events.end.take().map(|end| (end, events.handed_off.take()))
             }
             _ => None,
         };
         let dispatched = execution.attempts.iter().any(|attempt| attempt.billable);
         match end {
             None => self.settle_buffered(execution, dispatched, head).await,
-            Some(end) => self.settle_stream(execution, end, dispatched, head).await,
+            Some((end, handed_off)) => {
+                self.settle_stream(execution, end, handed_off, dispatched, head)
+                    .await;
+            }
         }
     }
 
@@ -1139,8 +1230,11 @@ impl CallTask {
         head: oneshot::Sender<Answer>,
     ) {
         let operation = self.plan.operation;
+        let upstream = execution.timing.upstream;
+        let started = std::time::Instant::now();
         let accounted =
             GatewayInvocation::account(&self.state, &self.call, &self.admission, &execution).await;
+        self.telemetry.since(Phase::Account, started);
         let entries = accounted.as_deref().ok();
         let mut facts = GatewayInvocation::facts(
             &self.call,
@@ -1165,8 +1259,16 @@ impl CallTask {
         let answer = accounted.and_then(|_| GatewayInvocation::respond(&self.call, execution));
         record_call(&self.call_span, outcome, answer.is_ok());
         // A dropped caller no longer awaits the answer.
-        head.send((answer, dispatched)).ok();
+        head.send(Answer {
+            result: answer,
+            dispatched,
+            outcome,
+            upstream,
+        })
+        .ok();
+        let started = std::time::Instant::now();
         GatewayInvocation::capture(&self.state, &self.call, facts).await;
+        self.telemetry.since(Phase::Capture, started);
     }
 
     /// Answers the caller with the opened stream, waits for the stream to
@@ -1176,29 +1278,42 @@ impl CallTask {
     /// accounting or capture. Output has already reached the caller, so an
     /// accounting failure is only logged. A relay that drops without
     /// reporting its end, as at shutdown, settles the call as `Cancelled`.
+    ///
+    /// Last of all, once the response body has dropped the stream, the
+    /// stream's `end` point is recorded from `handed_off`, the instant its
+    /// final frame was taken; this wait is bounded by the call's deadline
+    /// and cancellation and never delays accounting or capture.
     async fn settle_stream(
         self,
         mut execution: CallExecution,
         end: oneshot::Receiver<StreamEnd>,
+        handed_off: Option<oneshot::Receiver<Option<std::time::Instant>>>,
         dispatched: bool,
         head: oneshot::Sender<Answer>,
     ) {
         let operation = self.plan.operation;
         let resolved = execution.resolved.clone();
+        let timing = execution.timing;
+        let opened = execution.outcome;
         let mut attempts = std::mem::take(&mut execution.attempts);
         let attempt_span = std::mem::replace(&mut execution.attempt_span, tracing::Span::none());
         record_first_byte(operation, self.received);
-        head.send((
-            GatewayInvocation::respond(&self.call, execution),
+        head.send(Answer {
+            result: GatewayInvocation::respond(&self.call, execution),
             dispatched,
-        ))
+            outcome: opened,
+            upstream: timing.until_headers(),
+        })
         .ok();
         let end = end.await.unwrap_or_else(|_| StreamEnd {
             outcome: GatewayCallOutcome::Cancelled,
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture: None,
+            last_byte: None,
+            relay: Duration::ZERO,
         });
+        self.telemetry.phase(Phase::Relay, end.relay);
         if let Some(last) = attempts.last_mut() {
             last.outcome = end.outcome;
             last.terminal_at = end.terminal_at;
@@ -1225,9 +1340,12 @@ impl CallTask {
             refusal: None,
             capture: end.capture,
             attempt_span,
+            timing,
         };
+        let started = std::time::Instant::now();
         let entries =
             GatewayInvocation::account(&self.state, &self.call, &self.admission, &accounted).await;
+        self.telemetry.since(Phase::Account, started);
         let entries = entries.as_deref().ok();
         let facts = GatewayInvocation::facts(
             &self.call,
@@ -1238,7 +1356,21 @@ impl CallTask {
             entries,
         );
         GatewayInvocation::observe(operation, self.received, end.outcome, &accounted, entries);
+        let started = std::time::Instant::now();
         GatewayInvocation::capture(&self.state, &self.call, facts).await;
+        self.telemetry.since(Phase::Capture, started);
+        if let Some(handed_off) = handed_off {
+            let handed = tokio::select! {
+                handed = tokio::time::timeout_at(self.call.deadline, handed_off) => {
+                    handed.ok().and_then(Result::ok).flatten()
+                }
+                () = self.cancel.cancelled() => None,
+            };
+            if let Some(handed) = handed {
+                self.telemetry
+                    .ended(end.outcome, handed, timing.until_last_byte(end.last_byte));
+            }
+        }
     }
 }
 
@@ -1257,7 +1389,7 @@ fn record_call(span: &tracing::Span, outcome: GatewayCallOutcome, answered: bool
 /// buffered answer, or the opening of a stream.
 fn record_first_byte(operation: GatewayOperation, received: Instant) {
     metrics::histogram!(
-        "wyrd_gateway_time_to_first_byte_seconds",
+        GATEWAY_TIME_TO_FIRST_BYTE_SECONDS,
         "operation" => operation_name(operation)
     )
     .record(received.elapsed().as_secs_f64());

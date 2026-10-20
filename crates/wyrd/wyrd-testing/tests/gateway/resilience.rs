@@ -3,7 +3,9 @@
 //! These cover the call lifecycle a successful journey never reaches: a
 //! deployment that refuses retryably hands the call to its sibling, an
 //! administered limit refuses the next call before any dispatch, and a caller
-//! that goes away mid-call still leaves settled accounting behind.
+//! that goes away mid-call still leaves settled accounting behind. The
+//! gateway's latency telemetry is proven over the same lifecycle: what the
+//! server spent, what it waited on its provider, and the overhead between.
 //!
 //! A draining server's `503` refusal is not observable through the
 //! public surface — the listener is shut down gracefully, so the connection is
@@ -15,8 +17,11 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
+use wyrd_testing::bifrost::shared_process_telemetry_for_test;
+use wyrd_testing::capacity::Histogram;
+use wyrd_testing::release_server::Metrics;
 
 use crate::harness::{Journey, openai_code, refusal, tokens};
 
@@ -34,6 +39,32 @@ fn completion() -> Value {
         "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
     })
 }
+
+/// Chat Completions stream ending with its finish reason, usage, and the
+/// `[DONE]` sentinel.
+const CHAT_EVENTS: &str = concat!(
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// How long the timed upstream holds every answer, so provider wait is
+/// distinguishable from the gateway's own work.
+const UPSTREAM_DELAY: Duration = Duration::from_millis(50);
+
+/// Request-path phases every governed call of the timing journey records.
+const CALL_PHASES: [&str; 10] = [
+    "authenticate",
+    "parse",
+    "snapshot",
+    "authorize",
+    "route",
+    "admit",
+    "credential",
+    "translate",
+    "account",
+    "capture",
+];
 
 /// One Chat Completions request body addressing `model`.
 fn chat(model: &str) -> Value {
@@ -259,4 +290,166 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         answered.json::<Value>().await.expect("answer json"),
         completion()
     );
+}
+
+/// Proves the gateway's latency telemetry over one buffered and one streamed
+/// call through the public server.
+///
+/// The upstream holds each answer for [`UPSTREAM_DELAY`]. The buffered call
+/// exposes one `answer` point whose provider wait covers the delay and whose
+/// overhead is exactly its server duration less that wait. The stream
+/// exposes an `answer` point at its head, waiting only until the provider's
+/// headers, and a later `end` point at its final frame, waiting until the
+/// provider's last byte. Every request-path phase is recorded from the
+/// request's arrival, the relay phase for the stream, and each family renders
+/// the fine sub-millisecond buckets.
+///
+/// # Panics
+/// Panics when a call fails or a metric expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_capacity_metrics_cover_buffered_and_streamed_calls() {
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CHAT_EVENTS, "text/event-stream")
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(completion())
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(2)
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/timed").await;
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    let (_, telemetry) = shared_process_telemetry_for_test().expect("process telemetry");
+    let before = Metrics::parse(&telemetry.render());
+
+    let buffered = journey
+        .post("/v1/chat/completions", &bearer, &chat("acme-first/m"))
+        .await;
+    assert_eq!(buffered.status().as_u16(), 200);
+    buffered.json::<Value>().await.expect("buffered answer");
+    let mut streamed = chat("acme-first/m");
+    streamed["stream"] = json!(true);
+    let streamed = journey
+        .post("/v1/chat/completions", &bearer, &streamed)
+        .await;
+    assert_eq!(streamed.status().as_u16(), 200);
+    assert!(
+        streamed
+            .text()
+            .await
+            .expect("complete stream")
+            .ends_with("data: [DONE]\n\n")
+    );
+    journey.settled_usage().await;
+    let after = Metrics::parse(&telemetry.render());
+    let delta = |family: &str, labels: &[&str]| {
+        Histogram::read(&before, family, labels).since(&Histogram::read(&after, family, labels))
+    };
+    let point = |stream: &'static str, point: &'static str| {
+        let labels = [
+            "operation=\"chat_completions\"",
+            stream,
+            point,
+            "outcome=\"succeeded\"",
+        ];
+        (
+            delta("wyrd_gateway_duration_seconds", &labels),
+            delta("wyrd_gateway_overhead_seconds", &labels),
+        )
+    };
+    let upstream = |stream: &str, point: &str| {
+        delta(
+            "wyrd_gateway_upstream_seconds",
+            &["operation=\"chat_completions\"", stream, point],
+        )
+    };
+    let delay = UPSTREAM_DELAY.as_secs_f64();
+
+    let (duration, overhead) = point("stream=\"false\"", "point=\"answer\"");
+    let waited = upstream("stream=\"false\"", "point=\"end\"");
+    assert_eq!(
+        (duration.count, overhead.count, waited.count),
+        (1.0, 1.0, 1.0)
+    );
+    assert!(waited.sum >= delay, "the provider wait covers the delay");
+    assert!(
+        duration.sum >= waited.sum,
+        "server duration covers the wait"
+    );
+    assert!(
+        (overhead.sum - (duration.sum - waited.sum)).abs() < 1e-9,
+        "overhead is server duration less provider wait"
+    );
+
+    let (head, head_overhead) = point("stream=\"true\"", "point=\"answer\"");
+    let (end, end_overhead) = point("stream=\"true\"", "point=\"end\"");
+    let headers = upstream("stream=\"true\"", "point=\"headers\"");
+    let last_byte = upstream("stream=\"true\"", "point=\"end\"");
+    assert_eq!(
+        (
+            head.count,
+            head_overhead.count,
+            end.count,
+            end_overhead.count
+        ),
+        (1.0, 1.0, 1.0, 1.0),
+        "a stream records its head and its final frame"
+    );
+    assert!(
+        headers.sum >= delay,
+        "the head waits on the provider's headers"
+    );
+    assert!(
+        last_byte.sum >= headers.sum,
+        "the end waits until the last byte"
+    );
+    assert!(end.sum >= head.sum, "the final frame follows the head");
+
+    for phase in CALL_PHASES {
+        let recorded = delta(
+            "wyrd_gateway_phase_duration_seconds",
+            &[
+                "operation=\"chat_completions\"",
+                &format!("phase=\"{phase}\""),
+            ],
+        );
+        assert_eq!(recorded.count, 2.0, "both calls record the {phase} phase");
+    }
+    let relay = delta(
+        "wyrd_gateway_phase_duration_seconds",
+        &["operation=\"chat_completions\"", "phase=\"relay\""],
+    );
+    assert_eq!(relay.count, 1.0, "the stream records its relay phase");
+    for family in [
+        "wyrd_gateway_duration_seconds",
+        "wyrd_gateway_overhead_seconds",
+        "wyrd_gateway_upstream_seconds",
+        "wyrd_gateway_phase_duration_seconds",
+        "wyrd_gateway_request_duration_seconds",
+        "wyrd_gateway_attempt_duration_seconds",
+        "wyrd_gateway_time_to_first_byte_seconds",
+        "wyrd_gateway_queue_delay_seconds",
+    ] {
+        assert!(
+            after
+                .buckets(family, &["operation=\"chat_completions\""])
+                .iter()
+                .any(|(bound, _)| (*bound - 0.0005).abs() < f64::EPSILON),
+            "{family} renders the fine buckets"
+        );
+    }
 }

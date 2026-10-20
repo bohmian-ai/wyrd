@@ -35,8 +35,8 @@ use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallPlan, CredentialResolver,
-    DeploymentHealth, FailureClass, GatewayCost, GatewayEngine, IngressDialect, MediaAnswer,
-    ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
+    DeploymentHealth, ExecutionTiming, FailureClass, GatewayCost, GatewayEngine, IngressDialect,
+    MediaAnswer, ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
 };
 use wyrd_runtime::{
     Action, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, Resource, RoleRef,
@@ -780,6 +780,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let refused = super::routes::chat_completions(
         State(state.clone()),
         Ok(invoker(tenant, 1, [])),
+        None,
         HeaderMap::new(),
         Ok(Json(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
@@ -882,6 +883,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let public = super::routes::chat_completions(
         State(state.clone()),
         Ok(broad),
+        None,
         HeaderMap::new(),
         Ok(Json(
             json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
@@ -1302,6 +1304,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         refusal: None,
         capture: None,
         attempt_span: tracing::Span::none(),
+        timing: ExecutionTiming::default(),
     };
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     GatewayLedger::new(&mut conn)
@@ -1444,6 +1447,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
                     refusal: None,
                     capture: None,
                     attempt_span: tracing::Span::none(),
+                    timing: ExecutionTiming::default(),
                 },
             )
             .await
@@ -1759,6 +1763,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let streaming = super::routes::chat_completions(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         HeaderMap::new(),
         Ok(Json(chat(json!({"stream": true})))),
     )
@@ -1836,7 +1841,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         .await;
     let streamed_responses = super::routes::responses(
         State(state.clone()),
-        Ok(caller.clone()),
+        Ok(caller.clone()), None,
         HeaderMap::new(),
         Ok(Json(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
     )
@@ -1849,6 +1854,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let embeddings = super::routes::embeddings(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         Ok(Json(
             json!({"model": "deepseek/deepseek-chat", "input": ["b", "a"], "dimensions": 1}),
         )),
@@ -1866,6 +1872,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let zero = super::routes::embeddings(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         Ok(Json(
             json!({"model": "deepseek/deepseek-chat", "input": "a", "dimensions": 0}),
         )),
@@ -1887,6 +1894,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         let answered = super::routes::responses(
             State(state.clone()),
             Ok(caller.clone()),
+            None,
             HeaderMap::new(),
             Ok(Json(sent.clone())),
         )
@@ -1906,37 +1914,53 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let model_name = "deepseek/deepseek-chat";
     let cases: [(Handler, Value, &str); 8] = [
         (
-            |s, c, r| Box::pin(super::routes::chat_completions(s, c, HeaderMap::new(), r)),
+            |s, c, r| {
+                Box::pin(super::routes::chat_completions(
+                    s,
+                    c,
+                    None,
+                    HeaderMap::new(),
+                    r,
+                ))
+            },
             json!({"model": model_name}),
             "messages",
         ),
         (
-            |s, c, r| Box::pin(super::routes::chat_completions(s, c, HeaderMap::new(), r)),
+            |s, c, r| {
+                Box::pin(super::routes::chat_completions(
+                    s,
+                    c,
+                    None,
+                    HeaderMap::new(),
+                    r,
+                ))
+            },
             json!({"model": 7, "messages": []}),
             "body",
         ),
         (
-            |s, c, r| Box::pin(super::routes::responses(s, c, HeaderMap::new(), r)),
+            |s, c, r| Box::pin(super::routes::responses(s, c, None, HeaderMap::new(), r)),
             json!({"model": model_name}),
             "input",
         ),
         (
-            |s, c, r| Box::pin(super::routes::responses(s, c, HeaderMap::new(), r)),
+            |s, c, r| Box::pin(super::routes::responses(s, c, None, HeaderMap::new(), r)),
             json!({"model": model_name, "input": 7}),
             "body",
         ),
         (
-            |s, c, r| Box::pin(super::routes::embeddings(s, c, r)),
+            |s, c, r| Box::pin(super::routes::embeddings(s, c, None, r)),
             json!({"model": model_name}),
             "input",
         ),
         (
-            |s, c, r| Box::pin(super::routes::image_generations(s, c, r)),
+            |s, c, r| Box::pin(super::routes::image_generations(s, c, None, r)),
             json!({"model": model_name}),
             "prompt",
         ),
         (
-            |s, c, r| Box::pin(super::routes::audio_speech(s, c, r)),
+            |s, c, r| Box::pin(super::routes::audio_speech(s, c, None, r)),
             json!({"model": model_name, "input": "hi"}),
             "voice",
         ),
@@ -2005,6 +2029,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let generated = super::routes::image_generations(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         Ok(Json(
             json!({"model": "deepseek/deepseek-chat", "prompt": "a cat"}),
         )),
@@ -2020,6 +2045,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let spoken = super::routes::audio_speech(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         Ok(Json(
             json!({"model": "deepseek/deepseek-chat", "input": "hi", "voice": "alloy"}),
         )),
@@ -2050,6 +2076,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let transcribed = super::routes::audio_transcriptions(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         headers,
         Body::from(body),
     )
@@ -2098,6 +2125,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let streamed = super::routes::audio_transcriptions(
         State(audio.clone()),
         Ok(caller.clone()),
+        None,
         headers,
         Body::from_stream(futures_util::stream::iter(chunks)),
     )
@@ -2132,6 +2160,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let oversized = super::routes::audio_transcriptions(
         State(audio.clone()),
         Ok(caller.clone()),
+        None,
         headers,
         Body::from_stream(futures_util::stream::iter(chunks)),
     )
@@ -2143,6 +2172,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let broken = super::routes::audio_translations(
         State(audio.clone()),
         Ok(caller.clone()),
+        None,
         headers,
         Body::from_stream(futures_util::stream::iter(chunks)),
     )
@@ -2154,9 +2184,14 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         "oversized and broken Audio uploads never dispatch"
     );
     let (headers, body) = form("mask");
-    let missing =
-        super::routes::image_edits(State(state.clone()), Ok(caller.clone()), headers, Ok(body))
-            .await;
+    let missing = super::routes::image_edits(
+        State(state.clone()),
+        Ok(caller.clone()),
+        None,
+        headers,
+        Ok(body),
+    )
+    .await;
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(missing).await["error"]["param"], "image");
     assert_eq!(
@@ -2168,6 +2203,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let limited = super::routes::chat_completions(
         State(state.clone()),
         Ok(caller.clone()),
+        None,
         HeaderMap::new(),
         Ok(Json(chat(json!({"user": "limited"})))),
     )
@@ -2244,6 +2280,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         super::routes::chat_completions(
             State(state.clone()),
             Ok(invoker(tenant, 7, [open_access()])),
+            None,
             HeaderMap::new(),
             Ok(Json(json!({
                 "model": format!("{name}/{name}"),
@@ -3952,6 +3989,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
             let response = super::routes::audio_speech(
                 State(state),
                 Ok(invoker(tenant, 1, [open_access()])),
+                None,
                 Ok(Json(
                     json!({"model": "speech/speech", "input": "hi", "voice": voice}),
                 )),
@@ -5579,21 +5617,23 @@ impl FallbackIngress {
         match self {
             Self::ChatCompletions => {
                 let body = json!({"model": requested, "messages": messages});
-                super::routes::chat_completions(state, caller, headers, Ok(Json(body))).await
+                super::routes::chat_completions(state, caller, None, headers, Ok(Json(body))).await
             }
             Self::Responses => {
                 let body = json!({"model": requested, "input": "hi"});
-                super::routes::responses(state, caller, headers, Ok(Json(body))).await
+                super::routes::responses(state, caller, None, headers, Ok(Json(body))).await
             }
             Self::AnthropicMessages => {
                 let body = json!({"model": requested, "max_tokens": 8, "messages": messages});
-                super::ingress::anthropic_messages(state, caller, headers, Ok(Json(body))).await
+                super::ingress::anthropic_messages(state, caller, None, headers, Ok(Json(body)))
+                    .await
             }
             Self::GeminiGenerateContent => {
                 let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
                 super::ingress::gemini_generate_content(
                     state,
                     caller,
+                    None,
                     axum::extract::Path(
                         requested
                             .split_once('/')

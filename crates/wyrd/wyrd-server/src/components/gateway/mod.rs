@@ -21,6 +21,7 @@ mod pg_administration_tests;
 mod pg_invocation_tests;
 pub(crate) mod routes;
 mod service;
+mod telemetry;
 
 pub(crate) use api_keys::GatewayApiKeys;
 pub use batches::{BatchAnswer, GatewayBatches};

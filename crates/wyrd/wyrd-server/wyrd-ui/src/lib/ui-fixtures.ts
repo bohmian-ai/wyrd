@@ -66,8 +66,13 @@ export const fixtureExecutor: Executor = {
             return { ok: true, value: registered };
           case 'cards.list':
             return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };
-          case 'bifrost.query':
-            return { ok: true, value: day };
+          case 'bifrost.query': {
+            // Honour bound $1/$2 like the server, so a brushed range visibly narrows the plot.
+            const [from, to] = request.params ?? [];
+            if (typeof from !== 'string' || typeof to !== 'string') return { ok: true, value: day };
+            const rows = day.rows.filter((row) => Date.parse(`${row[0]}Z`) >= Date.parse(from) && Date.parse(`${row[0]}Z`) < Date.parse(to));
+            return { ok: true, value: { ...day, rows, terminal: terminal(rows.length) } };
+          }
           default:
             return { ok: false, problem: denied };
         }

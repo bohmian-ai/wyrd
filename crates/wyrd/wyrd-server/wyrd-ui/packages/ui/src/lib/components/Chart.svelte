@@ -15,11 +15,16 @@
 
   let { input, executed, result, actions = {}, onaction }: ChartProps & ActionProps = $props();
 
-  /** Rendered body width; the plot tracks its content box so SVG text draws at its CSS size. */
-  let bodyWidth = $state(0);
-  const W = $derived(bodyWidth > 64 ? bodyWidth - 32 : 560);
-  const H = 160;
-  /** Tick labels sit above their gridline, so the plot needs no left gutter. */
+  /**
+   * Rendered plot box. The plot draws in CSS pixels at the box's size, so text
+   * keeps its size and a host that widens or heightens the panel gets a larger
+   * plot; 560×160 is the fallback before layout.
+   */
+  let boxWidth = $state(0);
+  let boxHeight = $state(0);
+  const W = $derived(boxWidth > 64 ? boxWidth : 560);
+  const H = $derived(Math.max(160, boxHeight));
+  /** Tick labels sit above their gridline at the left; the gutter keeps the first points clear of them. */
   const PAD = { left: 32, right: 6, top: 16, bottom: 22 };
   /** Position-indexed series styles: colour, dash and marker always differ together. */
   const STYLES = [
@@ -173,62 +178,64 @@
     </span>
   </header>
 
-  <div class="body" class:centered={input.type === 'stat' && result.state === 'populated'} bind:clientWidth={bodyWidth}>
+  <div class="body" class:centered={input.type === 'stat' && result.state === 'populated'} >
     {#if result.state === 'populated'}
       {#if degraded && data}
         <p class="partial">Some sources did not complete: {data.terminal.warnings.join(', ') || 'see source completion'}.</p>
       {/if}
       {#if input.type === 'timeseries'}
         <!-- The plot is keyboard-operable: focus opens the tooltip and arrows walk it. -->
-        <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-        <svg
-          class="plot"
-          viewBox="0 0 {W} {H}"
-          role="application"
-          aria-roledescription="chart"
-          tabindex="0"
-          aria-label="{input.title ?? 'Time series'}: {lines.map((line) => line.label).join(', ')}"
-          onfocus={() => (focused ??= xs.length - 1)}
-          onblur={() => (focused = undefined)}
-          {onkeydown}
-          onpointerdown={(event) => {
-            const x = svgX(event);
-            brush = onaction ? { from: x, to: x } : undefined;
-            (event.currentTarget as Element).setPointerCapture?.(event.pointerId);
-          }}
-          onpointermove={(event) => {
-            const x = svgX(event);
-            if (brush) brush = { ...brush, to: x };
-            else focused = nearest(x);
-          }}
-          onpointerup={release}
-          onpointerleave={() => (brush ? undefined : (focused = undefined))}
-        >
-          {#each ticks as tick (tick)}
-            <line class="grid" x1="0" x2={W} y1={sy(tick)} y2={sy(tick)} />
-            <text class="axis" x="0" y={sy(tick) - 4}>{fmtNumber(tick)}</text>
-          {/each}
-          {#each xLabels as label (label.at)}
-            <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
-          {/each}
-          {#each lines as line, index (line.label)}
-            {@const style = STYLES[index]}
-            <polyline
-              points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
-              stroke={style.stroke}
-              stroke-dasharray={style.dash}
-            />
-            {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
-              <path class="marker" d={marker(style.marker, sx(point.x), sy(point.y))} fill={style.stroke} />
+        <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+          <svg
+            class="plot"
+            viewBox="0 0 {W} {H}"
+            role="application"
+            aria-roledescription="chart"
+            tabindex="0"
+            aria-label="{input.title ?? 'Time series'}: {lines.map((line) => line.label).join(', ')}"
+            onfocus={() => (focused ??= xs.length - 1)}
+            onblur={() => (focused = undefined)}
+            {onkeydown}
+            onpointerdown={(event) => {
+              const x = svgX(event);
+              brush = onaction ? { from: x, to: x } : undefined;
+              (event.currentTarget as Element).setPointerCapture?.(event.pointerId);
+            }}
+            onpointermove={(event) => {
+              const x = svgX(event);
+              if (brush) brush = { ...brush, to: x };
+              else focused = nearest(x);
+            }}
+            onpointerup={release}
+            onpointerleave={() => (brush ? undefined : (focused = undefined))}
+          >
+            {#each ticks as tick (tick)}
+              <line class="grid" x1="0" x2={W} y1={sy(tick)} y2={sy(tick)} />
+              <text class="axis" x="0" y={sy(tick) - 4}>{fmtNumber(tick)}</text>
             {/each}
-          {/each}
-          {#if focused !== undefined && xs[focused] !== undefined}
-            <line class="cursor" x1={sx(xs[focused])} x2={sx(xs[focused])} y1={PAD.top} y2={H - PAD.bottom} />
-          {/if}
-          {#if brush}
-            <rect class="brush" x={Math.min(brush.from, brush.to)} y={PAD.top} width={Math.abs(brush.to - brush.from)} height={H - PAD.top - PAD.bottom} />
-          {/if}
-        </svg>
+            {#each xLabels as label (label.at)}
+              <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
+            {/each}
+            {#each lines as line, index (line.label)}
+              {@const style = STYLES[index]}
+              <polyline
+                points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
+                stroke={style.stroke}
+                stroke-dasharray={style.dash}
+              />
+              {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
+                <path class="marker" d={marker(style.marker, sx(point.x), sy(point.y))} fill={style.stroke} />
+              {/each}
+            {/each}
+            {#if focused !== undefined && xs[focused] !== undefined}
+              <line class="cursor" x1={sx(xs[focused])} x2={sx(xs[focused])} y1={PAD.top} y2={H - PAD.bottom} />
+            {/if}
+            {#if brush}
+              <rect class="brush" x={Math.min(brush.from, brush.to)} y={PAD.top} width={Math.abs(brush.to - brush.from)} height={H - PAD.top - PAD.bottom} />
+            {/if}
+          </svg>
+        </div>
         {#if focused !== undefined && xs[focused] !== undefined}
           {@const at = xs[focused]}
           <p class="tooltip" role="status">
@@ -252,19 +259,21 @@
           {/each}
         </ul>
       {:else if input.type === 'bar'}
-        <svg
-          class="plot bars"
-          viewBox="0 0 {W} {H}"
-          role="img"
-          aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
-        >
-          <line class="grid" x1="0" x2={W} y1={H - PAD.bottom} y2={H - PAD.bottom} />
-          {#each barCells as cell, index (index)}
-            <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
-            {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.shown}</text>{/if}
-            {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
-          {/each}
-        </svg>
+        <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
+          <svg
+            class="plot bars"
+            viewBox="0 0 {W} {H}"
+            role="img"
+            aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
+          >
+            <line class="grid" x1="0" x2={W} y1={H - PAD.bottom} y2={H - PAD.bottom} />
+            {#each barCells as cell, index (index)}
+              <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
+              {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.shown}</text>{/if}
+              {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
+            {/each}
+          </svg>
+        </div>
       {:else if input.type === 'stat'}
         <p class="stat">{stat === undefined ? '—' : fmtNumber(stat)}{#if input.unit}<span class="unit">{input.unit}</span>{/if}</p>
       {:else if data}
@@ -344,11 +353,20 @@
     color: var(--warn);
     font: 11px var(--font-mono);
   }
+  /* Fills the body's spare height, never less than the default plot. */
+  .box {
+    position: relative;
+    flex: 1;
+    min-height: 160px;
+  }
   .plot {
+    position: absolute;
+    inset: 0;
     display: block;
     width: 100%;
-    height: auto;
+    height: 100%;
     touch-action: none;
+    user-select: none;
   }
   .plot:focus-visible {
     outline: 2px solid var(--declare);

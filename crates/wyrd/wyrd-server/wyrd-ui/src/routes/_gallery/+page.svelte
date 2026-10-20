@@ -36,7 +36,7 @@
   const versions = { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } as const;
   const doc = {
     title: 'Ranker overview',
-    range: { last: '6h' },
+    range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' },
     panels: [
       { id: 'header', component: 'CardHeader', input: { cardRef: card } },
       { id: 'latency', component: 'Chart', input: timeseries },

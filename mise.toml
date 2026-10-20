@@ -149,7 +149,13 @@ cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignore
 
 [tasks."test:cli:journey"]
 description = "Run the real-server CLI Card lifecycle journey"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cli:journey:inner'"
+run = [
+  # The `server_dev_*` cases launch the built server and installed production UI.
+  "cargo build --locked -p wyrd-server --bins --tests",
+  "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile",
+  "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build",
+  "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cli:journey:inner'",
+]
 
 [tasks."test:cli:journey:inner"]
 hide = true

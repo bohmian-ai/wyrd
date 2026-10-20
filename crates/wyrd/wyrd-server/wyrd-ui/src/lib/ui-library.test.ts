@@ -124,7 +124,7 @@ test('TASK-003: Validated portable rendering', async () => {
   }
   // Authored series named "other" keep their values; the aggregate's caption stays distinct from every one of them.
   const grouped = (groups: [string, number][]): QueryResult => ({ ...series, rows: groups.map(([name, value]) => ['2026-10-20T10:00:00Z', name, value]), terminal: terminal(groups.length) });
-  const captions = (view: ReturnType<typeof render>) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+  const captions = (view: { container: Element }) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
   const taken: [string, number][] = [['other', 21], ['other (aggregate)', 20], ...Array.from({ length: 19 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
   const named = render(Chart, { input: timeseries, result: { state: 'populated', data: grouped(taken) } });
   expect(captions(named)).toHaveLength(20);
@@ -662,7 +662,7 @@ test('TASK-027: Grid placement', async () => {
     const ids = ['constructor', 'toString', '__proto__'];
     const renamed = (names: string[]) =>
       laidOut(Object.fromEntries([[names[0], { x: 0, y: 0, w: 6, h: 4 }], [names[1], undefined], [names[2], { x: 6, y: 0, w: 6, h: 4 }], ['n', { x: 0, y: 4, w: 12, h: 2 }]]));
-    const rows = (view: ReturnType<typeof render>, names: string[]) => [...names, 'n'].map((id) => [panel(view.container, id).style.gridColumn, panel(view.container, id).style.gridRow, panel(view.container, id).style.height]);
+    const rows = (view: { container: Element }, names: string[]) => [...names, 'n'].map((id) => [panel(view.container, id).style.gridColumn, panel(view.container, id).style.gridRow, panel(view.container, id).style.height]);
     const special = render(WyrdView, { doc: renamed(ids), executor: chart.executor });
     const plain = render(WyrdView, { doc: renamed(['p', 'q', 'r']), executor: chart.executor });
     expect(rows(special, ids)).toEqual(rows(plain, ['p', 'q', 'r']));

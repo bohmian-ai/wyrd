@@ -118,6 +118,9 @@ fn fingerprint_credential(credential: &ResolvedCredential) -> String {
             hasher.update(audience.as_str());
             hasher.update(fingerprint_credential(actor.credential()));
         }
+        ResolvedCredential::BrowserSession(session) => {
+            hasher.update(session.cookie().expose_secret());
+        }
     }
     hex::encode(hasher.finalize())
 }

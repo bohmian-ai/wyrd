@@ -11,6 +11,7 @@ use secrecy::SecretString;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::{Bifrost, TableConfig};
+use wyrd_client::transport::BrowserSession;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 
@@ -79,6 +80,24 @@ pub fn connect_wyrd_client(
     drop(server_url);
     drop(credential);
     drop(grpc_url);
+    NativeWyrdClientResult::from_outcome(client.map_err(|error| WyrdError::from(&error)))
+}
+
+/// Builds one client that acts as a forwarded Rust-owned browser session.
+///
+/// For a server-side web host only: `cookie` is the browser's single
+/// `wyrd_session_<tenant>=<value>` cookie pair and `origin` the public origin
+/// it was issued at. Construction performs no IO and consults no ambient
+/// credential; a malformed session or server URL is returned as catalog
+/// metadata.
+#[napi]
+pub fn connect_browser_session_client(
+    server_url: String,
+    cookie: String,
+    origin: String,
+) -> NativeWyrdClientResult {
+    let client = BrowserSession::new(SecretString::from(cookie), &origin)
+        .and_then(|session| WyrdClient::for_browser_session(&server_url, session));
     NativeWyrdClientResult::from_outcome(client.map_err(|error| WyrdError::from(&error)))
 }
 

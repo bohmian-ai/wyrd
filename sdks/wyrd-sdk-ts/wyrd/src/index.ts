@@ -92,6 +92,7 @@ import type {
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
+  connectBrowserSessionClient,
   connectWyrdClient,
   openWyrdState,
   storedTimestampText,
@@ -1575,6 +1576,35 @@ export class WyrdClient {
     options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
   ): WyrdClient {
     const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl);
+    return new WyrdClient(nativeHandle(result.client, result.error));
+  }
+
+  /**
+   * Build a client that acts as one forwarded browser session, without IO.
+   *
+   * For a server-side web host, such as the Wyrd UI's server, serving a
+   * browser signed in through Wyrd's Rust-owned browser sessions. Each request
+   * presents the browser's tenant session cookie and the public origin it was
+   * issued at; nothing is minted, cached, or renewed, and no ambient
+   * credential is consulted. The client reaches the tenant `/v1` HTTP
+   * surface only, so Cards, Bifrost queries, and verification reads work,
+   * while gRPC ingest, MCP, and {@link WyrdClient.accessToken} refuse it.
+   * Never construct one in browser code: the cookie is the browser's
+   * credential and must not leave the server.
+   *
+   * @param options - `serverUrl`, the Wyrd server's HTTP base URL; `cookie`,
+   * the single `wyrd_session_<tenant>=<value>` cookie pair; `origin`, the
+   * browser-facing origin the session was issued at.
+   * @returns The client.
+   * @throws {@link WyrdError} `WYRD_CLIENT_400_CONFIG_INVALID` for a malformed
+   * cookie, origin, or server URL.
+   */
+  static forBrowserSession(options: {
+    readonly serverUrl: string;
+    readonly cookie: string;
+    readonly origin: string;
+  }): WyrdClient {
+    const result = connectBrowserSessionClient(options.serverUrl, options.cookie, options.origin);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 

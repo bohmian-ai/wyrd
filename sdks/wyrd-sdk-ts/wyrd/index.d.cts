@@ -996,6 +996,17 @@ export declare class NativeWyrdState {
 }
 
 /**
+ * Builds one client that acts as a forwarded Rust-owned browser session.
+ *
+ * For a server-side web host only: `cookie` is the browser's single
+ * `wyrd_session_<tenant>=<value>` cookie pair and `origin` the public origin
+ * it was issued at. Construction performs no IO and consults no ambient
+ * credential; a malformed session or server URL is returned as catalog
+ * metadata.
+ */
+export declare function connectBrowserSessionClient(serverUrl: string, cookie: string, origin: string): NativeWyrdClientResult
+
+/**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,

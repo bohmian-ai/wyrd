@@ -34,6 +34,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
+use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::operator_connection::HttpsOrigin;
 use wyrd_spec::request_id::RequestId;
@@ -41,6 +42,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::config::HttpConfig;
+use crate::transport::credential::{BrowserSession, ResolvedCredential};
 use crate::transport::trace;
 use reqwest::Method;
 use reqwest::StatusCode;
@@ -76,6 +78,15 @@ const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 /// Never: the constant is a valid lowercase header name.
 fn access_token_header() -> HeaderName {
     HeaderName::from_static(HEADER_WYRD_ACCESS_TOKEN)
+}
+
+/// What authenticates one HTTP request: a Wyrd bearer, or a browser session
+/// presented by its cookie and trusted public origin.
+enum RequestCredential {
+    /// The middleware's current access token.
+    Bearer(SecretBearer),
+    /// A forwarded Rust-owned browser session.
+    BrowserSession(BrowserSession),
 }
 
 /// [`HEADER_REQUEST_ID`] as a typed header name.
@@ -486,9 +497,9 @@ impl HttpTransport {
         body: reqwest::Body,
     ) -> Result<reqwest::Response, WyrdError> {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        let credential = self.request_credential().await?;
         let request = self
-            .authenticated(method, url, bearer.expose(), &self.auth.request_id(None))
+            .authenticated(method, url, &credential, &self.auth.request_id(None))
             .body(body);
         let response = request.send().await.map_err(|err| WyrdError::Internal {
             message: format!("transport error: {err}"),
@@ -567,9 +578,9 @@ impl HttpTransport {
         path: &str,
     ) -> Result<reqwest::Response, WyrdError> {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        let credential = self.request_credential().await?;
         let response = self
-            .authenticated(method, url, bearer.expose(), &self.auth.request_id(None))
+            .authenticated(method, url, &credential, &self.auth.request_id(None))
             .send()
             .await
             .map_err(|err| WyrdError::Internal {
@@ -673,13 +684,13 @@ impl HttpTransport {
         S: Serialize,
     {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        let credential = self.request_credential().await?;
         let payload = serde_json::to_vec(body).map_err(|error| WyrdError::Internal {
             message: format!("request serialization failed: {error}"),
             details: serde_json::json!({}),
         })?;
         let response = self
-            .authenticated(method, url, bearer.expose(), request_id)
+            .authenticated(method, url, &credential, request_id)
             .header("content-type", "application/json")
             .header("accept", QUERY_STREAM_CONTENT_TYPE)
             .body(payload)
@@ -840,9 +851,28 @@ impl HttpTransport {
         })
     }
 
+    /// The credential that authenticates this transport's next request.
+    ///
+    /// A browser session is presented as itself; every other credential as
+    /// the middleware's current bearer, exchanged or renewed as needed.
+    ///
+    /// # Errors
+    /// Returns the middleware's stable error when no bearer can be produced.
+    async fn request_credential(&self) -> Result<RequestCredential, WyrdError> {
+        match self.auth.credential() {
+            ResolvedCredential::BrowserSession(session) => {
+                Ok(RequestCredential::BrowserSession(session.clone()))
+            }
+            _ => Ok(RequestCredential::Bearer(
+                self.auth.bearer().await.map_err(AuthError::into_wyrd)?,
+            )),
+        }
+    }
+
     /// Start a request to `url`, already resolved by
-    /// [`Self::authenticated_url`], carrying `bearer` as
-    /// `x-wyrd-access-token`, `request_id` as `wyrd-request-id`, and the
+    /// [`Self::authenticated_url`], carrying `credential` (a bearer as
+    /// `x-wyrd-access-token`, a browser session as its cookie and trusted
+    /// public origin), `request_id` as `wyrd-request-id`, and the
     /// caller's trace context from [`trace::outbound`] as `traceparent` and,
     /// when non-empty, `tracestate`.
     ///
@@ -852,14 +882,25 @@ impl HttpTransport {
         &self,
         method: Method,
         url: impl reqwest::IntoUrl,
-        bearer: &str,
+        credential: &RequestCredential,
         request_id: &str,
     ) -> reqwest::RequestBuilder {
         let request = self
             .client
             .request(method, url)
-            .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {bearer}"))
             .header(HEADER_REQUEST_ID, request_id);
+        let request = match credential {
+            RequestCredential::Bearer(bearer) => request.header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            ),
+            RequestCredential::BrowserSession(session) => session
+                .headers()
+                .into_iter()
+                .fold(request, |request, (name, value)| {
+                    request.header(name, value)
+                }),
+        };
         trace::headers()
             .into_iter()
             .fold(request, |request, (name, value)| {
@@ -948,10 +989,10 @@ impl HttpTransport {
         let mut auth_retried = false;
 
         loop {
-            let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+            let credential = self.request_credential().await?;
 
             let mut req = self
-                .authenticated(method.clone(), url, bearer.expose(), request_id)
+                .authenticated(method.clone(), url, &credential, request_id)
                 .timeout(self.request_timeout);
 
             if let Some(key) = idempotency_key {

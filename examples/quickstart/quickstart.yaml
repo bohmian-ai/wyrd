@@ -1,0 +1,19 @@
+# The Verifier: one assertion over the supplied reply.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: refund-limit, version: 1.0.0, space: default}
+spec:
+  inputs:
+    reply: {type: json}
+  requirements:
+    - id: within-limit
+      statement: The refund is at most 100 dollars
+      check: {kind: assert, path: inputs.reply.refund, operator: less_than_or_equals, expected: 100}
+---
+# The subject: a Service bound to the Verifier declared above in this file.
+apiVersion: wyrd/v1
+kind: Service
+metadata: {name: support-reply, version: 1.0.0, space: default}
+spec:
+  verified_by:
+    - verifier: {sibling: {kind: Verifier, name: refund-limit, version: 1.0.0}}

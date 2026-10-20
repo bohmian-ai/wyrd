@@ -662,6 +662,70 @@ test('TASK-027: Layout editing', async () => {
   await tick();
   expect(edited.calls).toHaveLength(2);
   view.unmount();
+
+  // A host that never echoes still receives every completed edit: each callback carries the earlier ones.
+  // Collision and measured height stay out of the document: `c` keeps no layout and `d` keeps its authored box.
+  const siblings = laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 }, c: undefined, d: { x: 0, y: 0, w: 6, h: 4 } });
+  const authored = structuredClone(siblings);
+  const recorded = vi.fn();
+  const quiet = recording(() => ({ ok: true, value: series }));
+  const silent = render(WyrdView, { doc: siblings, executor: quiet.executor, onlayout: recorded });
+  await waitFor(() => expect(quiet.calls).toHaveLength(4));
+  for (const id of ['a', 'b']) {
+    const grip = silent.getByRole('button', { name: `Move or resize ${id}` });
+    grip.focus();
+    await fireEvent.keyDown(grip, { key: 'ArrowDown' });
+    await fireEvent.keyDown(grip, { key: 'Enter' });
+  }
+  expect(recorded).toHaveBeenCalledTimes(2);
+  const latest = recorded.mock.calls[1][0];
+  expect(latest).toEqual({ ...authored, panels: [{ ...authored.panels[0], layout: { x: 0, y: 1, w: 8, h: 6 } }, { ...authored.panels[1], layout: { x: 8, y: 1, w: 4, h: 6 } }, authored.panels[2], authored.panels[3]] });
+  expect(latest.panels[2]).not.toHaveProperty('layout');
+  expect(siblings).toEqual(authored);
+  await silent.rerender({ doc: latest, executor: quiet.executor, onlayout: recorded });
+  await tick();
+  expect([panel(silent.container, 'a').style.gridRow, panel(silent.container, 'b').style.gridRow]).toEqual(['2 / span 6', '2 / span 6']);
+  expect(quiet.calls).toHaveLength(4);
+  silent.unmount();
+});
+
+test('TASK-027: Pointer edit cancellation', async () => {
+  // jsdom has no pointer capture; give it the platform methods the browser provides.
+  HTMLElement.prototype.setPointerCapture ??= () => {};
+  HTMLElement.prototype.releasePointerCapture ??= () => {};
+  const onlayout = vi.fn();
+  const chart = recording(() => ({ ok: true, value: series }));
+  const view = render(WyrdView, { doc: laidOut({ a: { x: 0, y: 0, w: 8, h: 6 } }), executor: chart.executor, onlayout });
+  const grip = view.getByRole('button', { name: 'Move or resize a' });
+  const corner = panel(view.container, 'a').querySelector('.corner')!;
+  const box = () => [panel(view.container, 'a').style.gridColumn, panel(view.container, 'a').style.gridRow];
+  const original = box();
+  // Escape ends a held move or resize, focused on the grip or not; later movement and release change nothing.
+  for (const [handle, focused] of [[grip, true], [grip, false], [corner, false]] as const) {
+    if (focused) grip.focus();
+    else grip.blur();
+    await fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0, pointerId: 1 });
+    await fireEvent.pointerMove(handle, { clientX: 2, clientY: 104, pointerId: 1 });
+    expect(box()).not.toEqual(original);
+    await fireEvent.keyDown(focused ? grip : document.body, { key: 'Escape' });
+    expect(box()).toEqual(original);
+    await fireEvent.pointerMove(handle, { clientX: 3, clientY: 156, pointerId: 1 });
+    await fireEvent.pointerUp(handle, { clientX: 3, clientY: 156, pointerId: 1 });
+    expect(box()).toEqual(original);
+    expect(onlayout).not.toHaveBeenCalled();
+  }
+  // A fresh gesture still completes once; a cancelled pointer reports nothing.
+  await fireEvent.pointerDown(corner, { button: 0, clientX: 0, clientY: 0, pointerId: 2 });
+  await fireEvent.pointerMove(corner, { clientX: 0, clientY: 52, pointerId: 2 });
+  await fireEvent.pointerUp(corner, { clientX: 0, clientY: 52, pointerId: 2 });
+  expect(onlayout).toHaveBeenCalledOnce();
+  expect(onlayout.mock.calls[0][0].panels[0].layout).toEqual({ x: 0, y: 0, w: 8, h: 7 });
+  await fireEvent.pointerDown(grip, { button: 0, clientX: 0, clientY: 0, pointerId: 3 });
+  await fireEvent.pointerMove(grip, { clientX: 0, clientY: 52, pointerId: 3 });
+  await fireEvent.pointerCancel(grip, { pointerId: 3 });
+  expect(box()).toEqual(['1 / span 8', '1 / span 7']);
+  expect(onlayout).toHaveBeenCalledOnce();
+  view.unmount();
 });
 
 test('TASK-027: Narrow views', () => {

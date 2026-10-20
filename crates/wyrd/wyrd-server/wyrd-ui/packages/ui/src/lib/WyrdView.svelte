@@ -92,18 +92,22 @@
   let width = $state(0);
   const narrow = $derived(width > 0 && width < NARROW);
   const editable = $derived(!!onlayout && !narrow);
-  /** Completed edits shown until the host passes a new document. */
-  let kept = $state<Record<string, Layout>>({});
+  /** Completed edits, shown and reported until the host passes a new document. */
+  let kept = $state.raw<Record<string, Layout>>({});
   /** The edit in progress, previewed but not yet reported. */
-  let draft = $state<{ id: string; layout: Layout } | undefined>();
+  let draft = $state.raw<{ id: string; layout: Layout } | undefined>();
+  /** Ends the held pointer gesture, if any, without completing it. */
+  let release: (() => void) | undefined;
 
+  // A new document drops local edits; leaving ends a held gesture.
   $effect.pre(() => {
     void parsed;
     untrack(() => {
+      cancel();
       kept = {};
-      draft = undefined;
     });
   });
+  $effect(() => () => release?.());
 
   const layouts = $derived(
     parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (kept[panel.id] ?? panel.layout))) : []
@@ -130,13 +134,23 @@
     return { x, y, w, h: auto ? Math.min(48, Math.max(1, Math.round((height + GAP) / (ROW + GAP)))) : h };
   }
 
-  /** Reports the draft as a new document and keeps it on screen. */
+  /**
+   * Keeps the draft on screen and reports the document with every completed
+   * edit, so a host that never passes it back still holds all of them.
+   * Collision and measured heights are rendering only and never reported.
+   */
   function commit() {
     if (!draft || !parsed.success) return;
-    const { id, layout } = draft;
+    const done = { ...kept, [draft.id]: draft.layout };
     draft = undefined;
-    kept[id] = layout;
-    onlayout?.({ ...parsed.data, panels: parsed.data.panels.map((panel) => (panel.id === id ? { ...panel, layout } : panel)) });
+    kept = done;
+    onlayout?.({ ...parsed.data, panels: parsed.data.panels.map((panel) => (done[panel.id] ? { ...panel, layout: done[panel.id] } : panel)) });
+  }
+
+  /** Drops the edit in progress, ending a held pointer gesture so it cannot complete later. */
+  function cancel() {
+    release?.();
+    draft = undefined;
   }
 
   const KEYS: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
@@ -151,31 +165,45 @@
       event.preventDefault();
       commit();
     } else if (event.key === 'Escape') {
-      draft = undefined;
+      cancel();
     }
   }
 
-  /** A pointer drag: the handle moves, the corner resizes, both snapped to whole cells. */
+  /**
+   * A pointer drag: the handle moves, the corner resizes, both snapped to
+   * whole cells. Release completes it; pointercancel or Escape anywhere ends
+   * it with nothing reported, whatever has focus.
+   */
   function drag(id: string, resize: boolean, event: PointerEvent) {
     if (event.button !== 0) return;
     event.preventDefault();
+    cancel();
     const target = event.currentTarget as HTMLElement;
     const from = current(id, target);
     const column = (width + GAP) / COLUMNS;
-    const [startX, startY] = [event.clientX, event.clientY];
-    target.setPointerCapture(event.pointerId);
+    const [pointer, startX, startY] = [event.pointerId, event.clientX, event.clientY];
+    target.setPointerCapture(pointer);
     const move = (next: PointerEvent) =>
       (draft = { id, layout: edit(from, Math.round((next.clientX - startX) / column), Math.round((next.clientY - startY) / (ROW + GAP)), resize) });
-    const end = (last: PointerEvent) => {
+    const escape = (next: KeyboardEvent) => next.key === 'Escape' && cancel();
+    const stop = () => {
+      release = undefined;
       target.removeEventListener('pointermove', move);
       target.removeEventListener('pointerup', end);
       target.removeEventListener('pointercancel', end);
+      window.removeEventListener('keydown', escape);
+      if (target.hasPointerCapture?.(pointer)) target.releasePointerCapture(pointer);
+    };
+    const end = (last: PointerEvent) => {
+      stop();
       if (last.type === 'pointerup') commit();
       else draft = undefined;
     };
+    release = stop;
     target.addEventListener('pointermove', move);
     target.addEventListener('pointerup', end);
     target.addEventListener('pointercancel', end);
+    window.addEventListener('keydown', escape);
   }
 
   function abortAll() {

@@ -1,0 +1,101 @@
+/* GENERATED FILE — do not edit by hand.
+ * Source of truth: crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json.
+ * Regenerate with `node brand/gen-theme.mjs` from crates/wyrd/wyrd-server/wyrd-ui. */
+
+:root {
+  --font-sans: "Familjen Grotesk", system-ui, sans-serif;
+  --font-mono: "Fragment Mono", ui-monospace, monospace;
+}
+
+[data-mode="light"] {
+  /* surface */
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #eef0f4;
+  --surface-hover: #e9ecf2;
+
+  /* ink */
+  --text: #101014;
+  --muted: #62626d;
+  --border: #d9dde5;
+  --border-soft: #e8ebf0;
+
+  /* declare */
+  --declare: #4d5ef0;
+  --declare-soft: #eceefe;
+  --declare-ink: #ffffff;
+
+  /* observe */
+  --observe: #c5f23b;
+  --observe-soft: #f3fce0;
+
+  /* evidence */
+  --evidence: #c5f23b;
+  --evidence-ink: #0b0c12;
+
+  /* status */
+  --ok: #3dbe5a;
+  --warn: #f0a13c;
+  --danger: #e2484d;
+  --danger-soft: #fbe9ea;
+
+  /* code */
+  --code-bg: #12141c;
+  --code-text: #e6e4da;
+  --code-muted: #8f92a5;
+  --code-keyword: #7a8cff;
+  --code-string: #c5f23b;
+  --code-number: #f0a13c;
+
+  /* type */
+  --weight-strong: 700;
+
+  /* geometry */
+  --r: 2px;
+}
+[data-mode="dark"] {
+  /* surface */
+  --bg: #0b0c12;
+  --surface: #12141c;
+  --surface-2: #1a1d28;
+  --surface-hover: #1f2230;
+
+  /* ink */
+  --text: #e6e4da;
+  --muted: #8f92a5;
+  --border: #252838;
+  --border-soft: #1c1f2c;
+
+  /* declare */
+  --declare: #7a8cff;
+  --declare-soft: #1a2040;
+  --declare-ink: #0b0c12;
+
+  /* observe */
+  --observe: #c5f23b;
+  --observe-soft: #394523;
+
+  /* evidence */
+  --evidence: #c5f23b;
+  --evidence-ink: #0b0c12;
+
+  /* status */
+  --ok: #3dbe5a;
+  --warn: #f0a13c;
+  --danger: #e2484d;
+  --danger-soft: #2b1a22;
+
+  /* code */
+  --code-bg: #12141c;
+  --code-text: #e6e4da;
+  --code-muted: #8f92a5;
+  --code-keyword: #7a8cff;
+  --code-string: #c5f23b;
+  --code-number: #f0a13c;
+
+  /* type */
+  --weight-strong: 600;
+
+  /* geometry */
+  --r: 2px;
+}

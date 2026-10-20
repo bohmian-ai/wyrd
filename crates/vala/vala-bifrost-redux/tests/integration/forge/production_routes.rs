@@ -280,9 +280,11 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
     let mut table = expirable_table("four_routes").await;
     // Promotion already settled twice while the fixture started, so the routes
     // still owed are compaction, expiration, expired cleanup, and orphan work.
-    // Stopping the worker after each held attempt releases any sibling claim
-    // it took meanwhile back to `retryable`, so a route is done only once every
-    // row it owns has settled, not merely once it exists.
+    // Stopping the worker after each held attempt releases any fair sibling
+    // claim it took meanwhile back to `retryable`, so a route is done only once
+    // it has succeeded and every row it owns has settled, not merely once it
+    // exists. A dispatched compaction admitted in that window closes as
+    // `cancelled` instead and is dispatched again (see `route_row_settled`).
     let mut deletes_before_expiry = None;
     for _ in 0..12 {
         let settled = settled_tasks(&table.fixture).await;
@@ -296,11 +298,14 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
             "expired_cleanup",
             "orphan_cleanup",
         ];
-        if routes.iter().all(|strategy| seen.contains(strategy))
-            && settled
+        if routes.iter().all(|route| {
+            settled
                 .iter()
-                .filter(|(_, strategy, _)| routes.contains(&strategy.as_str()))
-                .all(|(_, _, state)| state == "succeeded")
+                .any(|(_, strategy, state)| strategy == route && state == "succeeded")
+        }) && settled
+            .iter()
+            .filter(|(_, strategy, _)| routes.contains(&strategy.as_str()))
+            .all(|(_, strategy, state)| route_row_settled(strategy, state))
         {
             break;
         }
@@ -327,8 +332,13 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
             "{strategy} owns its own durable task: {settled:?}"
         );
         assert!(
-            rows.iter().all(|(_, _, state)| state == "succeeded"),
+            rows.iter().any(|(_, _, state)| state == "succeeded"),
             "{strategy} settled on its own: {settled:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, value, state)| route_row_settled(value, state)),
+            "{strategy} left no failed or unsettled task: {settled:?}"
         );
     }
     let identities = settled
@@ -367,6 +377,17 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
             "every expiration handed off its candidates instead of deleting them"
         );
     }
+}
+
+/// Reports whether one route's task row reached an accepted terminal state.
+///
+/// Every route must succeed. Additionally, a leader-dispatched `small_files`
+/// claim that the worker admitted just before the test stopped it closes as
+/// `cancelled`: a pre-effect release that keeps one owner per dispatch, after
+/// which the leader dispatches the same work again under a new task. So only
+/// that route may leave a `cancelled` row beside its success.
+fn route_row_settled(strategy: &str, state: &str) -> bool {
+    state == "succeeded" || (strategy == "small_files" && state == "cancelled")
 }
 
 /// Sums every recorded counter series of one family carrying all given labels.

@@ -88,6 +88,19 @@ impl From<GatewayCallResponse> for BatchAnswer {
     }
 }
 
+/// The outcome of one batch creation's tracked claim-and-settle work.
+///
+/// [`GatewayBatches::claim_and_settle`] returns it to [`GatewayBatches::create`],
+/// which answers a settled creation directly and turns a digest another
+/// creation already holds into a refresh or a conflict.
+enum BatchCreation {
+    /// This creation claimed the digest and settled it with this answer.
+    Settled(BatchAnswer),
+    /// Another creation already holds the digest; carries its row when it is
+    /// still readable.
+    Held(Option<GatewayBatchRow>),
+}
+
 /// Public file id, which names an uploaded input file or a batch's output or
 /// error file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,15 +381,16 @@ impl<'a> GatewayBatches<'a> {
     /// provider is called. A replay of a created batch returns it refreshed; a
     /// replay while the first creation is pending is refused as a conflict.
     /// The creation or refresh call decides permission again against the
-    /// snapshot that routes it. Creation
-    /// runs on the input file's deployment with the provider's file id, in
-    /// tracked server work that settles the claim as [`Self::settle`]
+    /// snapshot that routes it. The claim and the creation run on the input
+    /// file's deployment with the provider's file id, in tracked server work
+    /// ([`Self::claim_and_settle`]) that settles the claim as [`Self::settle`]
     /// describes.
     ///
     /// # Cancellation
     /// Dropping this future cancels the creation call, which starts no
-    /// successor attempt; the tracked work still releases the claim when no
-    /// attempt began dispatch and keeps it pending when one did.
+    /// successor attempt. The claim is committed only inside the tracked work,
+    /// so it is never stranded: that work still releases it when no attempt
+    /// began dispatch and keeps it pending when one did.
     ///
     /// # Errors
     /// Returns `GatewayInvalidRequest` for a missing `input_file_id` or an
@@ -426,28 +440,6 @@ impl<'a> GatewayBatches<'a> {
             upstream_batch_id: None,
             batch: None,
         };
-        let mut conn = self.conn(tenant).await?;
-        let claimed = claim_gateway_batch(&mut conn, &claim, &digest)
-            .await
-            .map_err(unavailable)?;
-        let existing = if claimed {
-            None
-        } else {
-            gateway_batch_by_request(&mut conn, &digest)
-                .await
-                .map_err(unavailable)?
-        };
-        conn.commit().await.map_err(unavailable)?;
-        if !claimed {
-            if let Some(row) = existing.filter(|row| row.upstream_batch_id.is_some()) {
-                return self.refresh(caller, row, BatchAction::RetrieveBatch).await;
-            }
-            return Err(WyrdError::GatewayResourceConflict {
-                message: "an identical batch creation is pending; vary metadata to create a distinct batch".to_owned(),
-                details: json!({ "input_file_id": input }),
-            });
-        }
-
         let mut native = body;
         native["input_file_id"] = Value::String(file.upstream_file_id);
         let request = request(model, Some(deployment), BatchAction::CreateBatch, native);
@@ -456,16 +448,65 @@ impl<'a> GatewayBatches<'a> {
         // settles the claim from the call's dispatch evidence.
         let _cancel_on_drop = cancel.clone().drop_guard();
         let state = self.state.clone();
-        let caller = caller.clone();
-        self.state
+        let task_caller = caller.clone();
+        let creation = self
+            .state
             .gateway_tasks
             .spawn(async move {
                 GatewayBatches::new(&state)
-                    .settle(&caller, claim, request, &cancel)
+                    .claim_and_settle(&task_caller, claim, &digest, request, &cancel)
                     .await
             })
             .await
-            .map_err(unavailable)?
+            .map_err(unavailable)??;
+        match creation {
+            BatchCreation::Settled(answer) => Ok(answer),
+            BatchCreation::Held(Some(row)) if row.upstream_batch_id.is_some() => {
+                self.refresh(caller, row, BatchAction::RetrieveBatch).await
+            }
+            BatchCreation::Held(_) => Err(WyrdError::GatewayResourceConflict {
+                message: "an identical batch creation is pending; vary metadata to create a distinct batch".to_owned(),
+                details: json!({ "input_file_id": input }),
+            }),
+        }
+    }
+
+    /// Claims a batch creation's canonical request digest and, when this
+    /// creation wins the claim, creates the batch and settles the claim.
+    ///
+    /// Runs on tracked server work so the claim commit and its settlement
+    /// cannot be separated: a requester that leaves at any point, including
+    /// mid-commit, leaves the claim to this work, which settles it as
+    /// [`Self::settle`] describes. When another creation already holds the
+    /// digest, nothing is claimed and the holder's row is returned for
+    /// [`Self::create`] to answer from.
+    ///
+    /// # Errors
+    /// Returns `ServiceUnavailable` when the claim cannot be written, read, or
+    /// committed, and every error of [`Self::settle`].
+    async fn claim_and_settle(
+        &self,
+        caller: &Caller,
+        claim: GatewayBatchRow,
+        digest: &str,
+        request: GatewayCallRequest,
+        cancel: &CancellationToken,
+    ) -> Result<BatchCreation, WyrdError> {
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let claimed = claim_gateway_batch(&mut conn, &claim, digest)
+            .await
+            .map_err(unavailable)?;
+        if !claimed {
+            let holder = gateway_batch_by_request(&mut conn, digest)
+                .await
+                .map_err(unavailable)?;
+            conn.commit().await.map_err(unavailable)?;
+            return Ok(BatchCreation::Held(holder));
+        }
+        conn.commit().await.map_err(unavailable)?;
+        self.settle(caller, claim, request, cancel)
+            .await
+            .map(BatchCreation::Settled)
     }
 
     /// Creates the claimed batch and settles its claim.

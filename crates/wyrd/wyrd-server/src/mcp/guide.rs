@@ -208,7 +208,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
         GuideTopic::BifrostSql => (
             vec![
                 "Call bifrost.list_tables, then bifrost.describe_table for every table used. Inspect field names and types, including correlation fields. Qualify table names exactly as namespace.name from discovery; do not guess a custom table's fields.",
-                "Use a single DataFusion SELECT with explicit projections, suitable time bounds, and LIMIT. bifrost.query accepts sql and optional deadline_ms, max_rows, max_bytes. Replace placeholders with discovered identifiers and adjust the example time windows.",
+                "Use a single DataFusion SELECT with explicit projections, suitable time bounds, and LIMIT. bifrost.query accepts sql and optional params (ordered scalar binds for $1..$n), deadline_ms, max_rows, max_bytes. Replace placeholders with discovered identifiers and adjust the example time windows.",
                 "Inspect columns once, map positional rows to their column order, and inspect terminal. Treat isError or a failed terminal as failure; do not use incomplete rows as a complete answer. Result ceilings refuse oversized results rather than truncating them.",
                 "Correlate telemetry using described trace_id/span_id and time columns. For verification, use exact subject/owner Card UIDs, then result_id to inspect Drift details. Use only tables and payload columns the caller is authorized to read.",
                 "The custom-table example assumes discovery describes id and value. A Service declares custom tables in bifrost.datasets; replace the qualified name and projection with the actual declared schema.",

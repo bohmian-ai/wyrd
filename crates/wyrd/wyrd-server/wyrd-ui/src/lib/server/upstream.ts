@@ -47,9 +47,12 @@ const dropped = [
   'x-real-ip'
 ];
 
+/** The server's sign-in binding cookie, the one cookie a forwarded `/auth/*` request carries. */
+const loginCookie = 'wyrd_login';
+
 /**
  * Send one browser `/auth/*` request to the configured Wyrd server and return
- * its answer unchanged: method, path and query, body, cookies, redirects
+ * its answer unchanged: method, path and query, body, the login cookie, redirects
  * (never followed here), and error responses. `url` is the request's public
  * URL as this BFF established it, so the server derives sign-in redirects and
  * callbacks from the origin the browser actually reached, never from a
@@ -63,6 +66,13 @@ export async function forwardAuth(
 ): Promise<Response> {
   const headers = new Headers(request.headers);
   for (const name of dropped) headers.delete(name);
+  // Only the login binding is the server's on this leg; session cookies never ride a forwarded request.
+  const login = (request.headers.get('cookie') ?? '')
+    .split(';')
+    .map((pair) => pair.trim())
+    .filter((pair) => pair.startsWith(`${loginCookie}=`));
+  if (login.length) headers.set('cookie', login.join('; '));
+  else headers.delete('cookie');
   headers.set('x-forwarded-host', url.host);
   headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
   const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body;

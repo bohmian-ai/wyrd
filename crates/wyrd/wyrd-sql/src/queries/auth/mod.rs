@@ -44,17 +44,13 @@ pub use human_connections::{
     promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
     sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
-pub use login_state::{
-    LoginState, RedeemedCode, consume_login_state, insert_login_state, issue_authorization_code,
-    redeem_authorization_code,
-};
+pub use login_state::{LoginState, consume_login_state, insert_login_state};
 pub use principal_directory::{
     AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
 };
 pub use refresh_tokens::{
-    active_refresh, consume_active_refresh, insert_human_refresh_token, lock_refresh_family,
-    refresh_by_hash, refresh_issuance_instant, revoke_refresh, revoke_refresh_chain,
-    revoke_refresh_family,
+    consume_active_refresh, insert_human_refresh_token, lock_refresh_family, refresh_by_hash,
+    refresh_issuance_instant, revoke_refresh, revoke_refresh_chain, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{

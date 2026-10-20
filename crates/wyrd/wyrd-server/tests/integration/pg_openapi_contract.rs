@@ -366,12 +366,13 @@ async fn identity_connection_operations_publish_their_contract() {
 
 /// Tenant human login publishes its OAuth authorization-server contract.
 ///
-/// The browser begins at `GET /auth/authorize`, which answers `303`; the
-/// retired `/auth/login` is not served. The common callback publishes the
-/// browser's `303` back to the client (with its `Location`) and the CLI's
-/// `text/html` page, never a token body. The token endpoint takes an RFC 6749
-/// form body that offers the authorization-code grant, and RFC 8414 metadata
-/// is served. The token, device authorization, and revocation forms publish
+/// The browser begins at `POST /auth/browser/login`, which returns the
+/// provider URL and sets the login cookie; the retired `/auth/login` and
+/// `/auth/authorize` are not served. The common callback publishes the
+/// browser's `303` to the tenant (with its `Location` and `Set-Cookie`) and
+/// the CLI's `text/html` page, never a token body. The token endpoint takes
+/// an RFC 6749 form body that offers no authorization-code grant, and RFC
+/// 8414 metadata is served. The token, device authorization, and revocation forms publish
 /// the public client's optional `client_id`, and each operation accepts
 /// either that public form or confidential RFC 7617 Basic client
 /// authentication.
@@ -386,11 +387,15 @@ async fn tenant_login_operations_publish_their_contract() {
         document["paths"]["/auth/login"].is_null(),
         "/auth/login is retired"
     );
-    let authorize = &document["paths"]["/auth/authorize"]["get"];
-    assert_eq!(authorize["security"], serde_json::json!([{}]));
     assert!(
-        authorize["responses"]["303"].is_object(),
-        "authorize redirects: {authorize}"
+        document["paths"]["/auth/authorize"].is_null(),
+        "/auth/authorize is retired"
+    );
+    let login = &document["paths"]["/auth/browser/login"]["post"];
+    assert_eq!(login["security"], serde_json::json!([{}]));
+    assert!(
+        login["responses"]["200"].is_object(),
+        "the browser login begins: {login}"
     );
     assert!(
         document["paths"]["/.well-known/oauth-authorization-server"]["get"].is_object(),
@@ -399,8 +404,9 @@ async fn tenant_login_operations_publish_their_contract() {
 
     let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
     assert!(
-        callback["303"]["headers"]["Location"].is_object(),
-        "the browser completion redirect publishes its Location: {callback}"
+        callback["303"]["headers"]["Location"].is_object()
+            && callback["303"]["headers"]["Set-Cookie"].is_object(),
+        "the browser completion redirect publishes its Location and cookie: {callback}"
     );
     assert!(
         callback["200"]["content"]["text/html"].is_object(),
@@ -416,10 +422,10 @@ async fn tenant_login_operations_publish_their_contract() {
         "the token endpoint takes a form body: {token}"
     );
     assert!(
-        document["components"]["schemas"]["TokenRequest"]
+        !document["components"]["schemas"]["TokenRequest"]
             .to_string()
             .contains("authorization_code"),
-        "the token endpoint offers the authorization-code grant"
+        "the token endpoint offers no authorization-code grant"
     );
 
     assert!(

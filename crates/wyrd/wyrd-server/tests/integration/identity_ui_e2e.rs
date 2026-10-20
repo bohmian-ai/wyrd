@@ -14,10 +14,13 @@
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
 //! journey drives both BFFs over HTTP like a browser behind a TCP load
 //! balancer, reaching every `/auth/*` route only through a BFF's public
-//! origin; no Vitest mock stands in for the BFF or the server.
+//! origin; no Vitest mock stands in for the BFF or the server. Rust owns every
+//! browser session in Postgres; the BFFs hold none, so the journey also signs
+//! in on one replica, uses the session on the other, and on a BFF replica it
+//! starts only after sign-in.
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
-//! it visibly; `mise run test:identity:journey` builds the UI and runs it.
+//! it visibly; `mise run test:identity:ui` builds the UI and runs it.
 //!
 //! Every connection is activated as a deployment would: staged, tested
 //! through one real provider sign-in returned to the server's callback, and
@@ -390,24 +393,23 @@ async fn sso_tenant(
 /// The production UI journey over two BFF replicas in front of two Wyrd
 /// replicas.
 ///
-/// Access tokens live 30 seconds, so a BFF renews each session's cached
-/// access token with its refresh token (or API key) through the ordinary
-/// token endpoint every half minute. A deactivated or replaced connection
-/// stops renewal at once, but each BFF keeps a session's issued token until
-/// its expiry, and the first use afterwards ends the session.
+/// Each browser session is an opaque Rust-owned cookie the server resolves
+/// on every request, so logout, deactivation, and connection replacement end
+/// a session at once on every replica; no BFF caches a token to outlive them.
 ///
 /// # Panics
 /// Panics when any setup step fails or the Vitest journey does not pass.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:journey`"]
+#[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:ui`"]
 async fn production_ui_bff_journey() {
     let host = format!("localhost:{}", free_port());
     let origin = format!("http://{host}");
-    let builder =
-        || WyrdTestServerBuilder::default().with_access_ttl(chrono::Duration::seconds(30));
-    let srv = builder().start_bound().await.expect("server starts");
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
-    let replica = Box::pin(srv.start_bound_replica(builder()))
+    let replica = Box::pin(srv.start_bound_replica(WyrdTestServerBuilder::default()))
         .await
         .expect("server replica starts");
     let replica_url = replica

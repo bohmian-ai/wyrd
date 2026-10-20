@@ -1,7 +1,7 @@
 //! HTTP routes for the tenant auth surfaces: the OAuth authorization
-//! server (authorization, token, device authorization, revocation, and
-//! metadata endpoints), the OIDC provider callback, and Card-bound API key
-//! issuance.
+//! server (token, device authorization, revocation, and metadata
+//! endpoints), browser sign-in sessions, the OIDC provider callback, and
+//! Card-bound API key issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use wyrd_auth::callback::{AuthorizationCodeExchange, LoginCompletion};
+use wyrd_auth::callback::LoginCompletion;
 use wyrd_auth_verify::{AccessTokenClaims, VerifiedToken};
 use wyrd_spec::auth::{
     CallbackQuery, ExchangeTokenType, IssueKeyRequest, OAuthClientId, OAuthErrorCode,
@@ -21,7 +21,8 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 
-use crate::auth::authorize::{client_redirect, error_name};
+use crate::auth::RequestOrigin;
+use crate::auth::browser::{login_binding, login_refused, signed_in};
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
     MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, stage_scope_mint_failure_audit,
@@ -41,8 +42,8 @@ use utoipa_axum::routes;
 
 /// Build the tenant-plane auth router.
 ///
-/// Mounts the auth surfaces — the authorization endpoint
-/// (`GET /auth/authorize`), the CLI device authorization
+/// Mounts the auth surfaces — browser sign-in
+/// (`POST /auth/browser/login`), the CLI device authorization
 /// (`POST /auth/device_authorization`) and its verification page
 /// (`GET`/`POST /auth/device`), the common OIDC provider callback
 /// (`GET /auth/callback`), the token endpoint (`POST /auth/token`), token
@@ -54,8 +55,8 @@ use utoipa_axum::routes;
 /// the device polling interval with `slow_down`.
 pub fn auth_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(crate::auth::authorize::authorize))
-        .routes(routes!(crate::auth::authorize::metadata))
+        .routes(routes!(crate::auth::browser::login))
+        .routes(routes!(crate::auth::metadata::metadata))
         .routes(routes!(crate::auth::cli_login::device_authorization))
         .routes(routes!(
             crate::auth::cli_login::device_page,
@@ -73,8 +74,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// `POST /auth/token` — the OAuth token endpoint.
 ///
 /// Every tenant grant arrives here as form parameters and leaves with the
-/// same RFC 6749 §5.1 [`TokenResponse`]: an authorization code (RFC 6749
-/// §4.1.3, `wyrd-ui`), a refresh token (§6), an RFC 8628 device code
+/// same RFC 6749 §5.1 [`TokenResponse`]: a refresh token (§6), an RFC 8628 device code
 /// (`wyrd-cli`), an RFC 8693 token exchange — a Wyrd API key as subject, or
 /// a delegation — and an RFC 7523 workload assertion. The human grants
 /// require their client, which names itself with `client_id`. Tenant and principal are derived
@@ -86,8 +86,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// `invalid_target` for a token exchange naming an unsupported `audience`,
 /// `invalid_client` (`401`) for a missing or refused client,
 /// `unauthorized_client` for a grant another client must use,
-/// `unsupported_grant_type`, `invalid_grant` for every unusable code,
-/// refresh token, device code, or assertion, the RFC 8628 §3.5 device codes,
+/// `unsupported_grant_type`, `invalid_grant` for every unusable refresh
+/// token, device code, or assertion, the RFC 8628 §3.5 device codes,
 /// and `server_error` or `temporarily_unavailable` when issuance or the store
 /// fails. Each grant's audit event is staged on the process audit outbox and
 /// never refuses the grant.
@@ -133,14 +133,6 @@ async fn token(
     };
     let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient));
     let response = match form.token_request()? {
-        TokenRequest::AuthorizationCode {
-            code,
-            redirect_uri,
-            code_verifier,
-        } => grants
-            .authorization_code(&code, required?, &redirect_uri, &code_verifier)
-            .await
-            .map_err(OAuthError::from)?,
         TokenRequest::RefreshToken { refresh_token } => grants
             .refresh(&refresh_token, required?)
             .await
@@ -204,31 +196,6 @@ pub(crate) struct TokenGrants<'a> {
 }
 
 impl<'a> TokenGrants<'a> {
-    /// Redeem an authorization code issued to `client` (RFC 6749 §4.1.3).
-    ///
-    /// # Errors
-    /// The refusals of [`AuthorizationCodeExchange::redeem_code`], and
-    /// [`WyrdError::Internal`] when auth is not configured.
-    async fn authorization_code(
-        &self,
-        code: &SecretBearer,
-        client: OAuthClientId,
-        redirect_uri: &str,
-        code_verifier: &SecretBearer,
-    ) -> Result<TokenResponse, WyrdError> {
-        AuthorizationCodeExchange {
-            issuer: self.issuer()?,
-            connections: self
-                .state
-                .auth
-                .human_connections
-                .clone()
-                .ok_or_else(not_configured)?,
-        }
-        .redeem_code(code, client, redirect_uri, code_verifier, self.request_id)
-        .await
-    }
-
     /// Exchange a Wyrd API key for an access token of its own principal.
     ///
     /// A key that does not parse names no tenant, so it is refused with the
@@ -440,22 +407,23 @@ Wyrd settings to activate the connection.</p></body></html>";
 ///
 /// Anonymous by construction: the caller is mid-login and has no Wyrd session
 /// yet. The opaque `state` generated at initiation is the only input that
-/// selects the tenant and connection; no header is consulted. The RFC 9207
-/// `iss` parameter, when sent, is forwarded so the exchange can bind the
-/// response to the login's issuer before any token request. The response
-/// carries no token and not the provider code: a login begun at
-/// `GET /auth/authorize` is redirected (`303`) back to its client's redirect
-/// URI with a single-use Wyrd authorization code and the client's `state`
-/// (RFC 6749 §4.1.2), or with an RFC 6749 §4.1.2.1 error once its state was
-/// consumed — including a provider's own `error`, which the client receives
-/// as `access_denied`, or as `server_error` or `temporarily_unavailable`
-/// when the provider reported one of those; a device-code login records its approval and receives a static
-/// page; a candidate connection test marks its bound candidate revision
-/// tested, issues nothing, and receives a static page.
+/// selects the tenant and connection. The RFC 9207 `iss` parameter, when
+/// sent, is forwarded so the exchange can bind the response to the login's
+/// issuer before any token request. The response carries no token and not
+/// the provider code. A browser sign-in completes only for the browser
+/// presenting its `wyrd_login` login-transaction cookie: on success the
+/// tenant's session cookie is set and the browser redirected (`303`) to
+/// `/t/{tenant}`; once its state was consumed, any refusal — including a
+/// provider's own `error` or a missing binding — redirects (`303`) to
+/// `/t/{tenant}/login?login=failed`. Both clear the login cookie. A
+/// device-code login records its approval and receives a static page; a
+/// candidate connection test marks its bound candidate revision tested,
+/// issues nothing, and receives a static page.
 ///
 /// # Errors
 /// Returns problem JSON for every refusal of
-/// [`exchange_authorization_code`] that cannot be returned to a client.
+/// [`exchange_authorization_code`] that cannot be returned to a browser
+/// sign-in page.
 #[utoipa::path(
     get,
     path = "/auth/callback",
@@ -474,9 +442,14 @@ Wyrd settings to activate the connection.</p></body></html>";
           poll issues the session, or a candidate connection test sign-in marked that \
           candidate revision tested and issued no session; the browser shows a static page",
           content_type = "text/html", body = String),
-        (status = 303, description = "An authorization-request login completed: redirect to \
-          the client's redirect URI with `code` and `state`, or with an RFC 6749 §4.1.2.1 \
-          `error`", headers(("Location" = String, description = "The client's redirect URI"))),
+        (status = 303, description = "A browser sign-in completed: redirect to `/t/{tenant}` \
+          with the tenant session cookie set, or, when refused, to \
+          `/t/{tenant}/login?login=failed`; the `wyrd_login` cookie is cleared",
+          headers(
+            ("Location" = String, description = "The tenant home or sign-in page"),
+            ("Set-Cookie" = String, description = "The tenant session cookie and the cleared \
+              login-transaction cookie")
+          )),
         (status = 400, description = "The query carries both or neither of `code` and \
           `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed \
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
@@ -501,33 +474,32 @@ Wyrd settings to activate the connection.</p></body></html>";
 #[tracing::instrument(level = "debug", skip_all)]
 async fn callback(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
     request_id: Option<Extension<RequestId>>,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
+    let binding = login_binding(&headers);
     let completed = exchange_authorization_code(
         &state,
         query.response()?,
         &query.state,
         query.iss.as_deref(),
+        binding.as_deref(),
         request_id.as_str(),
     )
     .await?;
-    Ok(match completed {
-        LoginCompletion::Authorized {
-            authorization,
-            code,
-        } => client_redirect(&authorization, &[("code", code.expose_secret())]),
-        LoginCompletion::Refused {
-            authorization,
-            error,
-        } => client_redirect(
-            &authorization,
-            &[("error", error_name(OAuthError::authorization(error)))],
-        ),
-        LoginCompletion::DeviceApproved => Html(CLI_LOGIN_COMPLETE_PAGE).into_response(),
-        LoginCompletion::ConnectionTested => Html(CONNECTION_TEST_COMPLETE_PAGE).into_response(),
-    })
+    match completed {
+        LoginCompletion::SignedIn(created) => signed_in(&state, &origin, &created).await,
+        LoginCompletion::Refused { tenant_id, error } => {
+            login_refused(&state, &origin, tenant_id, error).await
+        }
+        LoginCompletion::DeviceApproved => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
+        LoginCompletion::ConnectionTested => {
+            Ok(Html(CONNECTION_TEST_COMPLETE_PAGE).into_response())
+        }
+    }
 }
 
 /// `POST /auth/issue-key` — mint a Card-bound API key for an existing principal.

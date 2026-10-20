@@ -12,7 +12,7 @@ use sha2::Digest as _;
 use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
 use uuid::Uuid;
 
-use crate::auth::{OAuthClientId, PrincipalId, PrincipalKindTag, SecretBearer};
+use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
 use crate::error::WyrdError;
 
 /// Absolute URL used by auth contracts.
@@ -337,31 +337,16 @@ pub struct Sha256HexError;
 /// How a tenant human login was initiated: what its verified sign-in grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginInitiation {
-    /// An OAuth authorization request (RFC 6749 §4.1.1): the sign-in issues
-    /// that client an authorization code.
-    Authorize(ClientAuthorization),
+    /// A browser sign-in bound to the SHA-256 of the random login-transaction
+    /// secret the beginning browser holds in its short-lived cookie: the
+    /// sign-in creates that browser's session.
+    Browser(Sha256Hex),
     /// A device-code login (RFC 8628) bound to its device authorization id:
     /// the sign-in records the device's approval.
     Device(Uuid),
     /// A candidate connection test begun by this principal. Its sign-in marks
     /// the bound candidate revision tested and issues nothing.
     ConnectionTest(ConnectionTester),
-}
-
-/// The validated authorization request (RFC 6749 §4.1.1) a login answers.
-///
-/// Recorded on the login state, so the authorization code the callback issues
-/// is bound to exactly this client, redirect URI, and PKCE challenge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientAuthorization {
-    /// The requesting client.
-    pub client: OAuthClientId,
-    /// The client's registered redirect URI the request named exactly.
-    pub redirect_uri: String,
-    /// The PKCE S256 code challenge (RFC 7636 §4.3).
-    pub code_challenge: String,
-    /// The client's opaque `state`, echoed on the redirect.
-    pub state: Option<String>,
 }
 
 /// The authorized caller a candidate connection test was begun by.

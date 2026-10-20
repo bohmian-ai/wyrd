@@ -36,8 +36,8 @@ pub use human_connection::{
 };
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{
-    AbsoluteUrl, CallbackQuery, ClientAuthorization, ConnectionTester, IssuerUrl,
-    LoginInitResponse, LoginInitiation, ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
+    AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,
+    ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
 };
 pub use permission_scope::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,

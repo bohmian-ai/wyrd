@@ -20,10 +20,13 @@ use chrono::{DateTime, Utc};
 use rand::RngCore as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
+use url::Url;
 use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::{Action, PermissionSet, Resource};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, BrowserCredential, BrowserSessionView, Sha256Hex};
+use wyrd_spec::auth::{
+    AbsoluteUrl, Attribution, BrowserCredential, BrowserSessionView, LoginInitiation, Sha256Hex,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::vala::api::AuditOutcome;
@@ -72,6 +75,23 @@ impl std::fmt::Debug for CreatedBrowserSession {
     }
 }
 
+/// A provider sign-in begun for one browser.
+pub struct BegunBrowserLogin {
+    /// The provider authorization URL to send the browser to.
+    pub authorization_url: AbsoluteUrl,
+    /// The login-transaction binding the browser must present at the
+    /// callback; only its SHA-256 is stored.
+    pub binding: SecretString,
+}
+
+impl std::fmt::Debug for BegunBrowserLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BegunBrowserLogin")
+            .field("authorization_url", &self.authorization_url)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The browser-session owner over the tenant issuer and the human-connection
 /// owner's store.
 #[derive(Clone)]
@@ -96,6 +116,41 @@ impl BrowserSessions {
             issuer,
             connections,
         }
+    }
+
+    /// Begin a provider sign-in for `tenant_route_key` from the browser that
+    /// will hold the returned login-transaction binding.
+    ///
+    /// A fresh random binding is generated and only its SHA-256 is bound to
+    /// the login state ([`HumanConnections::begin_bound`]); the callback
+    /// requires the browser to present the binding before any provider IO,
+    /// so a provider redirect replayed into another browser completes
+    /// nothing. The redirect URI is the callback on `origin`. Nothing is
+    /// audited: initiation evaluates no principal permission.
+    ///
+    /// # Errors
+    /// Returns the refusals of [`HumanConnections::begin_bound`]: the one
+    /// generic [`WyrdError::InvalidToken`] for an unknown tenant or one
+    /// without an Active connection, and the provider and store
+    /// unavailability errors.
+    pub async fn begin(
+        &self,
+        tenant_route_key: &TenantSlug,
+        origin: &Url,
+    ) -> Result<BegunBrowserLogin, WyrdError> {
+        let binding = SecretString::from(random_secret());
+        let authorization_url = self
+            .connections
+            .begin_bound(
+                tenant_route_key,
+                LoginInitiation::Browser(Sha256Hex::digest(binding.expose_secret().as_bytes())),
+                origin,
+            )
+            .await?;
+        Ok(BegunBrowserLogin {
+            authorization_url,
+            binding,
+        })
     }
 
     /// Create a session from a recovery API key presented for

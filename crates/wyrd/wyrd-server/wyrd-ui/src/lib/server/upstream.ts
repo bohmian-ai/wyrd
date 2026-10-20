@@ -47,17 +47,22 @@ const dropped = [
   'x-real-ip'
 ];
 
-/** The server's sign-in binding cookie, the one cookie a forwarded `/auth/*` request carries. */
+/** The server's sign-in binding cookie, which every forwarded `/auth/*` request carries. */
 const loginCookie = 'wyrd_login';
+
+/** Prefix of the server's tenant session cookies, which only `/auth/browser/*` requests carry. */
+const sessionPrefix = 'wyrd_session_';
 
 /**
  * Send one browser `/auth/*` request to the configured Wyrd server and return
- * its answer unchanged: method, path and query, body, the login cookie, redirects
- * (never followed here), and error responses. `url` is the request's public
- * URL as this BFF established it, so the server derives sign-in redirects and
- * callbacks from the origin the browser actually reached, never from a
- * forwarded header the browser sent. A server that cannot be reached is the
- * stable `upstream` problem.
+ * its answer unchanged: method, path and query, body, the server's own cookies,
+ * redirects (never followed here), and error responses. Every request carries
+ * the login binding; the browser-session operations also carry the tenant
+ * session cookies, which the server alone selects, validates, and revokes.
+ * `url` is the request's public URL as this BFF established it, so the server
+ * derives sign-in redirects and callbacks from the origin the browser actually
+ * reached, never from a forwarded header the browser sent. A server that
+ * cannot be reached is the stable `upstream` problem.
  */
 export async function forwardAuth(
   request: Request,
@@ -66,12 +71,15 @@ export async function forwardAuth(
 ): Promise<Response> {
   const headers = new Headers(request.headers);
   for (const name of dropped) headers.delete(name);
-  // Only the login binding is the server's on this leg; session cookies never ride a forwarded request.
-  const login = (request.headers.get('cookie') ?? '')
+  // Unrelated application cookies never ride a forwarded request.
+  const sessions = url.pathname.startsWith('/auth/browser/');
+  const forwarded = (request.headers.get('cookie') ?? '')
     .split(';')
     .map((pair) => pair.trim())
-    .filter((pair) => pair.startsWith(`${loginCookie}=`));
-  if (login.length) headers.set('cookie', login.join('; '));
+    .filter(
+      (pair) => pair.startsWith(`${loginCookie}=`) || (sessions && pair.startsWith(sessionPrefix))
+    );
+  if (forwarded.length) headers.set('cookie', forwarded.join('; '));
   else headers.delete('cookie');
   headers.set('x-forwarded-host', url.host);
   headers.set('x-forwarded-proto', url.protocol.slice(0, -1));

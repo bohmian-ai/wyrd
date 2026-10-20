@@ -49,6 +49,33 @@ test('auth forwarding sends the browser request to the configured server under t
   for (const name of ['host', 'forwarded', 'accept-encoding']) expect(headers.has(name)).toBe(false);
 });
 
+test('public browser-session operations carry the Wyrd session cookies and nothing else', async () => {
+  const cookie = 'wyrd_session_acme=a.1; theme=dark; wyrd_session_beta=b.2; wyrd_login=abc';
+  const { calls, fetcher } = upstream(() => new Response('{}'));
+  const read = new URL('http://ui.example/auth/browser/session?tenant=acme');
+  await forwardAuth(new Request(read, { headers: { cookie } }), read, fetcher);
+  const logout = new URL('http://ui.example/auth/browser/logout');
+  await forwardAuth(
+    new Request(logout, {
+      method: 'POST',
+      headers: { cookie, origin: 'http://ui.example', 'content-type': 'application/json' },
+      body: '{"tenant":"acme"}'
+    }),
+    logout,
+    fetcher
+  );
+  expect(calls.map(({ url }) => url)).toEqual([
+    'https://wyrd.internal:8443/auth/browser/session?tenant=acme',
+    'https://wyrd.internal:8443/auth/browser/logout'
+  ]);
+  for (const { init } of calls)
+    expect(new Headers(init.headers).get('cookie')).toBe(
+      'wyrd_session_acme=a.1; wyrd_session_beta=b.2; wyrd_login=abc'
+    );
+  expect(new Headers(calls[1].init.headers).get('origin')).toBe('http://ui.example');
+  expect(await new Response(calls[1].init.body).text()).toBe('{"tenant":"acme"}');
+});
+
 test('auth forwarding returns redirects, cookies, and errors unchanged without following', async () => {
   const redirect = upstream(() => {
     const headers = new Headers({ location: 'https://idp.example/authorize?state=s' });

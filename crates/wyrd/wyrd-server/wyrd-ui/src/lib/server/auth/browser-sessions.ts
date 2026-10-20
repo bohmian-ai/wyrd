@@ -244,9 +244,12 @@ export class BrowserSessions {
   }
 
   /**
-   * Safe page metadata: the current tenant plus every other tenant whose
-   * session the server still resolves. Every session cookie is presented to
-   * the one operation that accepts several; the server clears dead ones.
+   * Safe page metadata from the server's current answer alone: the current
+   * tenant plus every other tenant whose session the server still resolves.
+   * Every session cookie is presented to the one operation that accepts
+   * several; the server clears dead ones. A refusal or outage is reported,
+   * and a current tenant missing from the live set is unauthenticated, so an
+   * earlier read never stands in for the server's present answer.
    */
   async metadata(session: BrowserSession, url: URL, cookies: Cookies): Promise<SessionMetadata> {
     const presented = cookies
@@ -259,14 +262,17 @@ export class BrowserSessions {
       cookie: presented
     });
     relayCookies(response, cookies);
-    const live = response.ok ? ((await response.json()) as { sessions: View[] }).sessions : [];
-    const tenants = [{ key: session.tenantKey, name: session.tenantName }];
-    for (const view of live)
-      if (view.tenant !== session.tenantKey) tenants.push({ key: view.tenant, name: view.tenant_name });
+    if (!response.ok) await refuse(response);
+    const { sessions } = (await response.json()) as { sessions: View[] };
+    const current = sessions.find((view) => view.tenant === session.tenantKey);
+    if (!current) reject('unauthenticated');
     return {
-      subject: { id: session.principalId, name: session.principalId },
-      expiresAt: session.expiresAt,
-      tenants
+      subject: { id: current.principal_id, name: current.principal_id },
+      expiresAt: Date.parse(current.expires_at),
+      tenants: [current, ...sessions.filter((view) => view !== current)].map((view) => ({
+        key: view.tenant,
+        name: view.tenant_name
+      }))
     };
   }
 }

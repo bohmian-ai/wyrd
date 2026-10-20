@@ -171,3 +171,65 @@ test('an unreachable server is the upstream problem and tenant keys are validate
     status: 404
   });
 });
+
+test('metadata requires current live enumeration', async () => {
+  const beta = { ...view, tenant: 'beta', tenant_id: 't-2', tenant_name: 'Beta', principal_id: 'p-2' };
+  const selected = async (browser: ReturnType<typeof jar>) => {
+    server(() => Response.json({ sessions: [view] }));
+    return (await new BrowserSessions().read('acme', url, browser.cookies))!;
+  };
+
+  const live = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2', theme: 'dark' });
+  const session = await selected(live);
+  const current = { ...view, principal_id: 'p-1', expires_at: '2026-10-21T00:00:00Z' };
+  const requests = server(() => Response.json({ sessions: [beta, current] }));
+  expect(await new BrowserSessions().metadata(session, url, live.cookies)).toEqual({
+    subject: { id: 'p-1', name: 'p-1' },
+    expiresAt: Date.parse('2026-10-21T00:00:00Z'),
+    tenants: [
+      { key: 'acme', name: 'Acme' },
+      { key: 'beta', name: 'Beta' }
+    ]
+  });
+  expect(requests[0].headers.get('cookie')).toBe('wyrd_session_acme=a.1; wyrd_session_beta=b.2');
+
+  const down = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2' });
+  const before = await selected(down);
+  server(
+    () =>
+      new Response(JSON.stringify({ code: 'WYRD_SPEC_503_SERVICE_UNAVAILABLE' }), { status: 503 })
+  );
+  await expect(new BrowserSessions().metadata(before, url, down.cookies)).rejects.toMatchObject({
+    status: 502
+  });
+  expect(down.values.get('wyrd_session_acme')).toBe('a.1');
+  expect(down.values.get('wyrd_session_beta')).toBe('b.2');
+
+  const dead = jar({ wyrd_session_acme: 'a.1' });
+  const revoked = await selected(dead);
+  server(
+    () =>
+      new Response(JSON.stringify({ code: 'WYRD_AUTH_401_UNAUTHENTICATED' }), {
+        status: 401,
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  await expect(new BrowserSessions().metadata(revoked, url, dead.cookies)).rejects.toMatchObject({
+    status: 401
+  });
+  expect(dead.values.has('wyrd_session_acme')).toBe(false);
+
+  const sibling = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2' });
+  const gone = await selected(sibling);
+  server(
+    () =>
+      new Response(JSON.stringify({ sessions: [beta] }), {
+        headers: { 'set-cookie': 'wyrd_session_acme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' }
+      })
+  );
+  await expect(new BrowserSessions().metadata(gone, url, sibling.cookies)).rejects.toMatchObject({
+    status: 401
+  });
+  expect(sibling.values.has('wyrd_session_acme')).toBe(false);
+  expect(sibling.values.get('wyrd_session_beta')).toBe('b.2');
+});

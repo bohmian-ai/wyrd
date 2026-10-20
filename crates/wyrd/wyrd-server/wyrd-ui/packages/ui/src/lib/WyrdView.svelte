@@ -116,14 +116,17 @@
   });
 
   const layouts = $derived(
-    parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (kept[panel.id] ?? panel.layout))) : []
+    parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (Object.hasOwn(kept, panel.id) ? kept[panel.id] : panel.layout))) : []
   );
-  /** Rendered panel heights in px; an unplaced panel occupies the rows its content needs. */
-  let heights = $state<Record<string, number>>({});
+  /**
+   * Rendered panel heights in px; an unplaced panel occupies the rows its content needs.
+   * Own entries only, replaced whole: any id, `__proto__` included, is a plain key.
+   */
+  let heights = $state.raw<Record<string, number>>({});
   const placements = $derived(
     new Map(
       parsed.success
-        ? place(layouts, parsed.data.panels.map((panel) => heights[panel.id] ?? 0)).map((at, index) => [parsed.data.panels[index].id, at])
+        ? place(layouts, parsed.data.panels.map((panel) => Object.hasOwn(heights, panel.id) ? heights[panel.id] : 0)).map((at, index) => [parsed.data.panels[index].id, at])
         : []
     )
   );
@@ -160,7 +163,7 @@
     const done = { ...kept, [draft.id]: draft.layout };
     draft = undefined;
     kept = done;
-    onlayout?.({ ...parsed.data, panels: parsed.data.panels.map((panel) => (done[panel.id] ? { ...panel, layout: done[panel.id] } : panel)) });
+    onlayout?.({ ...parsed.data, panels: parsed.data.panels.map((panel) => (Object.hasOwn(done, panel.id) ? { ...panel, layout: done[panel.id] } : panel)) });
   }
 
   /** Drops the edit in progress, ending a held pointer gesture so it cannot complete later. */
@@ -300,7 +303,7 @@
           data-panel={panel.id}
           data-component={panel.component}
           style={boxStyle(panel.id)}
-          bind:offsetHeight={heights[panel.id]}
+          bind:offsetHeight={null, (height) => (heights = { ...heights, [panel.id]: height })}
         >
           {#if editable}
             <button

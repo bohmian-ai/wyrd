@@ -2,10 +2,13 @@
 <script lang="ts">
   import { remoteLoader, WyrdView } from 'wyrd-ai-ui/view';
   import { dashboard } from '../../panels';
+
+  /** The document as last arranged; edits live only for this page visit. */
+  let doc = $state.raw<unknown>(dashboard);
 </script>
 
 <main>
-  <WyrdView doc={dashboard} load={remoteLoader('/view/load')} />
+  <WyrdView {doc} load={remoteLoader('/view/load')} onlayout={(next) => (doc = next)} />
   <a href="/">The same panels as components</a>
 </main>
 

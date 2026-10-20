@@ -176,9 +176,26 @@ export type Range = z.infer<typeof RangeSchema>;
 /** An absolute range with RFC 3339 bounds. */
 export type AbsoluteRange = z.infer<typeof AbsoluteRangeSchema>;
 
+/**
+ * A panel's place on the view's 12-column grid of 40px rows, in whole units.
+ * Components never see it: they fill whatever box the view gives them.
+ */
+export const LayoutSchema = z
+  .object({
+    x: z.number().int().min(0).max(11),
+    y: z.number().int().min(0),
+    w: z.number().int().min(1).max(12),
+    h: z.number().int().min(1).max(48)
+  })
+  .strict()
+  .refine((layout) => layout.x + layout.w <= 12, { message: 'x + w must not exceed 12 columns', path: ['w'] });
+
+/** A grid position and size; see `LayoutSchema`. */
+export type Layout = z.infer<typeof LayoutSchema>;
+
 /** One placed panel; its `input` is validated against its component's schema at load. */
 export const PanelSchema = z
-  .object({ id: z.string().min(1), component: z.string().min(1), input: z.unknown() })
+  .object({ id: z.string().min(1), component: z.string().min(1), input: z.unknown(), layout: LayoutSchema.optional() })
   .strict();
 
 /** The catalog every view document is validated against. */

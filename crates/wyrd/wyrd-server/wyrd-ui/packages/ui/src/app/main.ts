@@ -22,6 +22,7 @@ function theme() {
 app.onhostcontextchanged = theme;
 app.ontoolresult = (result) => {
   view?.destroy();
-  view = mountView(document.body, { doc: result.structuredContent, executor });
+  // Layout edits stay on screen for this render only; nothing is saved.
+  view = mountView(document.body, { doc: result.structuredContent, executor, onlayout: () => {} });
 };
 void app.connect().then(theme);

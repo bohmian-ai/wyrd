@@ -19,7 +19,8 @@
     type ComponentName,
     type ComponentProps
   } from './loaders.js';
-  import { ViewDocumentSchema, type AbsoluteRange } from './schemas.js';
+  import { ViewDocumentSchema, type AbsoluteRange, type Layout, type ViewDocument } from './schemas.js';
+  import { COLUMNS, GAP, NARROW, ROW, edit, place, rowsHeight } from './layout.js';
   import ActionButton from './components/ActionButton.svelte';
   import CardHeader from './components/CardHeader.svelte';
   import Chart from './components/Chart.svelte';
@@ -37,9 +38,11 @@
     onaction?: ViewActionHandler;
     /** Forces a mode; absent, the host's `[data-mode]` applies. */
     mode?: 'light' | 'dark';
+    /** Receives the whole document after each completed layout edit; absent, panels cannot be moved or resized. */
+    onlayout?: (doc: ViewDocument) => void;
   }
 
-  let { doc, executor, load, onaction, mode }: Props = $props();
+  let { doc, executor, load, onaction, mode, onlayout }: Props = $props();
 
   /** One rendered panel. */
   interface PanelView {
@@ -55,27 +58,125 @@
   let panels = $state<PanelView[]>([]);
   let controllers: AbortController[] = [];
 
-  const loader = $derived<PanelLoader>(
-    load ??
-      ((component, input, context) =>
-        executor
-          ? loadPanel(component, input, { executor, ...context })
-          : Promise.resolve({ code: 'WYRD_UI_NO_EXECUTOR', title: 'This host cannot load panels' }))
+  /** The host's loader or executor; derived so a host re-passing the same one never reloads panels. */
+  const source = $derived(load ?? executor);
+  const loader = $derived.by<PanelLoader>(() => {
+    const using = source;
+    if (typeof using === 'function') return using;
+    return (component, input, context) =>
+      using
+        ? loadPanel(component, input, { executor: using, ...context })
+        : Promise.resolve({ code: 'WYRD_UI_NO_EXECUTOR', title: 'This host cannot load panels' });
+  });
+
+  /** What panels load from: the range and panels without their layout, so a layout-only change never reloads. */
+  const content = $derived(
+    parsed.success ? JSON.stringify([parsed.data.range, parsed.data.panels.map(({ layout: _, ...panel }) => panel)]) : undefined
   );
 
   // A changed document drops any brushed range.
   $effect.pre(() => {
-    void parsed;
+    void content;
     untrack(() => (brushed = undefined));
   });
 
   $effect(() => {
-    const view = parsed;
+    void content;
     const range = brushed;
     const run = loader;
-    untrack(() => start(view, range, run));
+    untrack(() => start(parsed, range, run));
     return abortAll;
   });
+
+  /** Rendered width; zero until measured. */
+  let width = $state(0);
+  const narrow = $derived(width > 0 && width < NARROW);
+  const editable = $derived(!!onlayout && !narrow);
+  /** Completed edits shown until the host passes a new document. */
+  let kept = $state<Record<string, Layout>>({});
+  /** The edit in progress, previewed but not yet reported. */
+  let draft = $state<{ id: string; layout: Layout } | undefined>();
+
+  $effect.pre(() => {
+    void parsed;
+    untrack(() => {
+      kept = {};
+      draft = undefined;
+    });
+  });
+
+  const layouts = $derived(
+    parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (kept[panel.id] ?? panel.layout))) : []
+  );
+  const placements = $derived(new Map(parsed.success ? place(layouts).map((at, index) => [parsed.data.panels[index].id, at]) : []));
+  /** Panels in reading order: document order on the grid, `(y, x)` when stacked. */
+  const ordered = $derived(
+    narrow ? panels.toSorted((a, b) => { const [p, q] = [placements.get(a.id)!, placements.get(b.id)!]; return p.y - q.y || p.x - q.x; }) : panels
+  );
+
+  function boxStyle(id: string) {
+    const at = placements.get(id);
+    if (!at) return '';
+    const column = narrow ? '1 / -1' : `${at.x + 1} / span ${at.w}`;
+    const row = narrow ? '' : `grid-row: ${at.y + 1} / span ${at.h};`;
+    return `grid-column: ${column}; ${row}${at.auto ? '' : ` height: ${rowsHeight(at.h)};`}`;
+  }
+
+  /** The layout an edit of `id` starts from; an unplaced panel starts from its measured height. */
+  function current(id: string, element: HTMLElement): Layout {
+    if (draft?.id === id) return draft.layout;
+    const { x, y, w, h, auto } = placements.get(id)!;
+    const height = element.closest<HTMLElement>('.panel')?.offsetHeight ?? 0;
+    return { x, y, w, h: auto ? Math.min(48, Math.max(1, Math.round((height + GAP) / (ROW + GAP)))) : h };
+  }
+
+  /** Reports the draft as a new document and keeps it on screen. */
+  function commit() {
+    if (!draft || !parsed.success) return;
+    const { id, layout } = draft;
+    draft = undefined;
+    kept[id] = layout;
+    onlayout?.({ ...parsed.data, panels: parsed.data.panels.map((panel) => (panel.id === id ? { ...panel, layout } : panel)) });
+  }
+
+  const KEYS: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+
+  /** Arrows move, Shift+arrows resize, Enter completes and Escape cancels the edit. */
+  function key(id: string, event: KeyboardEvent) {
+    const step = KEYS[event.key];
+    if (step) {
+      event.preventDefault();
+      draft = { id, layout: edit(current(id, event.currentTarget as HTMLElement), step[0], step[1], event.shiftKey) };
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      commit();
+    } else if (event.key === 'Escape') {
+      draft = undefined;
+    }
+  }
+
+  /** A pointer drag: the handle moves, the corner resizes, both snapped to whole cells. */
+  function drag(id: string, resize: boolean, event: PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const target = event.currentTarget as HTMLElement;
+    const from = current(id, target);
+    const column = (width + GAP) / COLUMNS;
+    const [startX, startY] = [event.clientX, event.clientY];
+    target.setPointerCapture(event.pointerId);
+    const move = (next: PointerEvent) =>
+      (draft = { id, layout: edit(from, Math.round((next.clientX - startX) / column), Math.round((next.clientY - startY) / (ROW + GAP)), resize) });
+    const end = (last: PointerEvent) => {
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', end);
+      target.removeEventListener('pointercancel', end);
+      if (last.type === 'pointerup') commit();
+      else draft = undefined;
+    };
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', end);
+    target.addEventListener('pointercancel', end);
+  }
 
   function abortAll() {
     for (const controller of controllers) controller.abort();
@@ -139,7 +240,7 @@
   }
 </script>
 
-<div class="wyrd-view" data-mode={mode}>
+<div class="wyrd-view" data-mode={mode} bind:clientWidth={width}>
   {#if !parsed.success}
     <EmptyState state="error" problem={inputProblem('View', parsed.error.issues[0])} />
   {:else}
@@ -151,17 +252,33 @@
       </p>
     {/if}
     <div class="panels">
-      {#each panels as panel (panel.id)}
-        <div class="panel" data-panel={panel.id} data-component={panel.component}>
-          {#if panel.problem || !panel.props}
-            <EmptyState state="error" problem={panel.problem} />
-          {:else}
-            {@const onaction = (intent: ActionIntent) => act(panel, intent)}
-            {#if panel.component === 'Chart'}
-              <Chart {...panel.props as ChartProps} actions={panel.actions} {onaction} />
+      {#each ordered as panel (panel.id)}
+        <div class="panel" class:editable class:editing={draft?.id === panel.id} data-panel={panel.id} data-component={panel.component} style={boxStyle(panel.id)}>
+          {#if editable}
+            <button
+              type="button"
+              class="move"
+              aria-label="Move or resize {panel.id}"
+              title="Drag to move. Arrows move, Shift+arrows resize, Enter keeps, Escape cancels."
+              onkeydown={(event) => key(panel.id, event)}
+              onpointerdown={(event) => drag(panel.id, false, event)}
+              onblur={commit}>⠿</button
+            >
+          {/if}
+          <div class="fill">
+            {#if panel.problem || !panel.props}
+              <EmptyState state="error" problem={panel.problem} />
             {:else}
-              <CardHeader {...panel.props as CardHeaderProps} actions={panel.actions} {onaction} />
+              {@const onaction = (intent: ActionIntent) => act(panel, intent)}
+              {#if panel.component === 'Chart'}
+                <Chart {...panel.props as ChartProps} actions={panel.actions} {onaction} />
+              {:else}
+                <CardHeader {...panel.props as CardHeaderProps} actions={panel.actions} {onaction} />
+              {/if}
             {/if}
+          </div>
+          {#if editable}
+            <span class="corner" role="presentation" title="Drag to resize" onpointerdown={(event) => drag(panel.id, true, event)}></span>
           {/if}
         </div>
       {/each}
@@ -190,15 +307,62 @@
     margin: 0;
     font: 12px var(--font-mono);
   }
+  /* Keep in step with COLUMNS, ROW and GAP in layout.ts. */
   .panels {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    grid-auto-rows: minmax(40px, auto);
     gap: 12px;
   }
   .panel {
+    position: relative;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr);
     min-width: 0;
   }
-  .panel[data-component='CardHeader'] {
-    grid-column: 1 / -1;
+  .panel.editable {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .panel.editing {
+    outline: 1px dashed var(--declare);
+    outline-offset: 2px;
+  }
+  /* The component fills its box; anything taller scrolls inside the panel. */
+  .fill {
+    display: grid;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+  }
+  .move {
+    height: 16px;
+    border: 0;
+    padding: 0;
+    background: none;
+    color: var(--muted);
+    font: 12px/16px var(--font-mono);
+    cursor: move;
+    touch-action: none;
+  }
+  .move:hover {
+    color: var(--declare);
+  }
+  .move:focus-visible {
+    outline: 2px solid var(--declare);
+    outline-offset: 2px;
+  }
+  .corner {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 12px;
+    height: 12px;
+    border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted);
+    cursor: nwse-resize;
+    touch-action: none;
+  }
+  .corner:hover {
+    border-color: var(--declare);
   }
 </style>

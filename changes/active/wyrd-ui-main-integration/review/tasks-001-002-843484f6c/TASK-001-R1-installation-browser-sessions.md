@@ -444,3 +444,70 @@ Not started. Record criterion → implementation → exact command/result with
 PASS/FAIL/UNVERIFIED, diagnosis and remaining human/runtime gates here during
 execution. The review's FIND IDs retain their identities; REQ-033 remains the
 separate caller-directed obligation.
+
+### Scenario 1 evidence (FIND-TASK-001-1)
+
+Commit `b16c8e68f`. Write set: `crates/wyrd/wyrd-cli/src/{error.rs,server/install.rs,server/dev.rs}`,
+`crates/wyrd/wyrd-cli/tests/{server_install.rs,pg_tests.rs}`, generated
+`docs/src/content/docs/api/errors.md`, `docs/.../operate/troubleshoot-a-deployment.md`.
+`scripts/build.sh` unchanged; its bundle layout set the rule.
+
+**Reuse/owner.** Existing owner `ServerInstaller`. The gap: `extract` checked
+marker names only, `install` skipped all checks when a cached `wyrd-server` existed,
+and `installed` checked only the binary. Extension: one private
+`install.rs::check_payload` rule, called from `extract`, from cached reuse
+before `activate`, and from `installed`. It is static only, with no Node and no import resolver.
+The rule follows the pinned adapter-node 5.5.7 output that `scripts/build.sh bundle` stages:
+- non-empty `wyrd-server` and `ui/build/{index,handler,env,shims}.js`;
+- `ui/build/client/_app/version.json`;
+- at least one file under `ui/build/server`;
+- `ui/package.json` parsed with `"type":"module"`;
+- `ui/node_modules/<name>/package.json` for every declared production dependency.
+
+New stable error `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` names the directory
+and its recovery: remove it, then rerun `wyrd server install`. `installed()` now
+returns `Result<Option<_>>`, so `wyrd server dev` refuses an incomplete active
+version locally, with no network call. Previously it reached `check_ui`'s "run
+`wyrd server install`" advice, which would have reactivated the same version.
+
+**Diagnosis (unexpected failure during GREEN).**
+- Symptom: `pg_tests::server_dev_repeat_and_partial_failure_preserve_state`
+  panicked at `pg_tests.rs:666`; it expected `"production UI"`.
+- Evidence: stderr contained `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE`.
+- Cause: the interim `installed()` folded "incomplete" into `None`, so DevArgs
+  called `install()`. That made a live GitHub listing request and then refused.
+- Fix site: shared `ServerInstaller::installed` became `Result<Option<_>>`
+  (callers: `dev.rs::run` and the test helper). The test expectation moved to
+  the new truthful code, which the finding requires.
+
+A fresh read-only diagnostician independently reported the same cause, fix site
+and callers.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Signed empty-marker payload rejected; current kept; no partial version | `extract` → `check_payload` | `server_install_preserves_previous_on_failure` (`empty_markers`) | PASS |
+| Missing generated support (server chunks, `handler.js`) or production dependency rejected | `check_payload` | same test (`no_server_chunks`, `no_handler`, `no_dependency`, `no_ui`) | PASS |
+| Cached binary-only / missing-deps latest refused before `activate`; current unchanged; cached bytes kept | `install` cached branch | same test (`incomplete_caches` loop) | PASS |
+| Truthful recovery: following it (remove dir, rerun) succeeds; no reactivation | `ServerInstallIncomplete` message/remediation | same test (recovered installs); `assert_incomplete` | PASS |
+| Already-active incomplete version: lookup refuses with recovery, reinstall does not reactivate | `installed()` → `Err`; `dev.rs` `?` | same test; `pg_tests::server_dev_repeat_and_partial_failure_preserve_state` | PASS |
+| Healthy complete cache reused with no bundle download | `install` cached branch | `server_install_selects_latest_stable` (offline v0.2.4) | PASS |
+| Realistic positive fixture; the real checkout UI layout passes | `UI_PAYLOAD` fixture; real `wyrd-ui` dir via `pg_tests` LocalDev | 4 `pg_tests::server_dev_*` with built UI | PASS |
+| Signatures/digests, compatibility, staging, cancellation preserved | unchanged code paths | existing corruption cases in the same test | PASS |
+| Source-free extracted-runtime load/start with system Node; Linux native | — | not run on this Mac | UNVERIFIED |
+
+Commands (all from the worktree):
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_preserves_previous_on_failure)'`
+  - RED: failed with `a bad update fails: InstalledServer { version: 0.2.1 … }`, a signed incomplete payload accepted.
+  - GREEN: 1 passed.
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_selects_latest_stable)'`
+  - 1 passed. This is a guard: healthy reuse already worked, and it stays green.
+- After `cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests` and the pnpm UI install/build, the four `pg_tests::server_dev_*` exact tests (the `test:local-dev:journey` nextest step under `with-test-postgres.sh`) passed: 4 passed.
+- `mise run test:cli:journey`: 45 passed, 0 failed, 3 ignored.
+  - Lane limit: this lane does not build `wyrd-server` or the UI. Without those artifacts, its four `server_dev_*` tests fail on their "build … through mise first" precondition. `test:local-dev:journey` owns building them.
+- `cargo nextest run --locked -p wyrd-cli --lib`: 70 passed.
+- `mise run fmt`, `mise run lints`, `mise run check:deps`, `mise run docs:check` (after `docs:generate`), and `git diff --check` all passed.
+
+Non-goals held: no auth/UI/server/SQL/nginx/identity file touched, no Node at
+install time, no generic JS verifier, no new bundle format, no `cfg(target_os)`.
+`check_ui`'s UI-entry check was left in place as DevServer's launch prerequisite,
+as the finding directs.

@@ -740,10 +740,12 @@ test('production provider replacement settings', async () => {
     expect(refused.status).toBeLessThan(500);
     expect((await connections()).ids).toEqual(ids);
   }
+  // Activation retires the connection alice signed in through, so the page rendered for
+  // her own action already reflects the server's answer: her session has ended.
   const activated = await alice.go(0, `${settings}?/activate`, {
     form: { revision: revision!, recoveryApiKey: journey.replacementOwnerKey }
   });
-  expect(activated.status).toBe(200);
+  expect(activated.status).toBe(401);
   for (const seen of alice.seen) expect(seen).not.toContain(journey.replacementOwnerKey);
 
   // The retired connection's session ends at once on every replica.

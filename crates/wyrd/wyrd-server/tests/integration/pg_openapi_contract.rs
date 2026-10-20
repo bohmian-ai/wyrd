@@ -337,9 +337,10 @@ async fn identity_connection_operations_publish_their_contract() {
     for (path, method, statuses) in operations {
         let operation = &document["paths"][path][method];
         assert!(operation.is_object(), "missing {method} {path}");
-        assert!(
-            operation.get("security").is_none(),
-            "{method} {path} must require the Wyrd access token"
+        assert_eq!(
+            operation.get("security"),
+            Some(&token_or_browser_session()),
+            "{method} {path} must require the Wyrd access token or the tenant browser session"
         );
         for status in statuses {
             assert_eq!(
@@ -584,9 +585,10 @@ async fn local_transfer_operations_publish_their_binary_contract() {
         (upload, ["400", "404", "409"].as_slice()),
         (download, &["400", "404"]),
     ] {
-        assert!(
-            operation.get("security").is_none(),
-            "a local transfer inherits the document's authentication requirement"
+        assert_eq!(
+            operation.get("security"),
+            Some(&token_or_browser_session()),
+            "a local transfer requires the Wyrd access token or the tenant browser session"
         );
         for status in ["401", "403", "500", "503"].iter().chain(specific) {
             let response = &operation["responses"][*status];

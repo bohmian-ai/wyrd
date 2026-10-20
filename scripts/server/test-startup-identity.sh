@@ -13,7 +13,8 @@
 startup_journey=identity
 source "$(dirname "${BASH_SOURCE[0]}")/startup-common.sh"
 readonly app_pw=app_pw_startup platform_pw=platform_pw_startup forwarder="$app-idp"
-trap 'status=$?; docker rm -f "$forwarder" >/dev/null 2>&1; (exit "$status"); cleanup' EXIT
+# Forwarder removal is best effort; the shared cleanup always runs with the original status.
+trap 'status=$?; docker rm -f "$forwarder" >/dev/null 2>&1 || true; cleanup "$status"' EXIT
 
 serving_env=(
   -e "WYRD_DATABASE_URL=postgres://wyrd_tenant:${app_pw}@${pg}:5432/wyrd"
@@ -58,7 +59,7 @@ docker run -d --name "$forwarder" --network "container:$app" --entrypoint node "
 
 echo "== production_ui_nginx_journey at $http"
 cd "$root"
-WYRD_UI_NGINX_JOURNEY="$(printf '{"origin":"%s","admin_key":"%s","app":"%s","forwarder":"%s"}' \
+WYRD_UI_JOURNEY="$(printf '{"origin":"%s","admin_key":"%s","app":"%s","forwarder":"%s"}' \
   "$http" "$api_key" "$app" "$forwarder")" \
   cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture \
   -E 'test(=identity_ui_e2e::production_ui_nginx_journey)'

@@ -700,7 +700,7 @@ async fn published_origin(app: &str) -> String {
 ///
 /// `scripts/server/test-startup-identity.sh` builds the image, serves tenant
 /// `acme`, and hands this journey the origin and setup credential in
-/// `WYRD_UI_NGINX_JOURNEY`. The journey activates a Keycloak connection with
+/// `WYRD_UI_JOURNEY`. The journey activates a Keycloak connection with
 /// the credential, then as a browser begins SSO on the sign-in page, signs in
 /// at Keycloak, completes Wyrd's callback, uses the session on pages and
 /// directly on `/v1`, is refused a replayed callback and foreign-origin
@@ -712,7 +712,7 @@ async fn published_origin(app: &str) -> String {
 #[ignore = "requires the official image; run via `mise run test:identity:ui:container`"]
 async fn production_ui_nginx_journey() {
     let fixture: Value = serde_json::from_str(
-        &std::env::var("WYRD_UI_NGINX_JOURNEY")
+        &std::env::var("WYRD_UI_JOURNEY")
             .expect("run via `mise run test:identity:ui:container`"),
     )
     .expect("the fixture is JSON");

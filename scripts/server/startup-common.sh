@@ -17,8 +17,9 @@ mkdir -p "$root/target"
 readonly work="$(mktemp -d "$root/target/$run_id.XXXXXX")"
 passed=()
 
+# Exits with the status it is given, else the status the EXIT trap fired with.
 cleanup() {
-  local status=$?
+  local status=${1:-$?}
   if [[ $status -ne 0 ]]; then
     docker logs "$app" >"$root/target/$run_id-app.log" 2>&1 || true
     echo "--- app logs (full log: target/$run_id-app.log)"; tail -n 80 "$root/target/$run_id-app.log"

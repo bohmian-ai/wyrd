@@ -153,6 +153,22 @@ test('TASK-003: Validated portable rendering', async () => {
   // A result that does not match its definition is an error, never a blank chart.
   expect(shapeChart({ ...timeseries, y: ['model'] } as ChartInput, series)).toMatchObject({ state: 'error', problem: { code: 'WYRD_UI_CHART_SHAPE', detail: 'y column "model" is Utf8' } });
   expect(shapeChart(timeseries, { ...series, rows: [] }).state).toBe('empty');
+  // A duplicated name binds its first column, for validation and drawing alike.
+  const v = (data_type: string) => ({ name: 'v', data_type, nullable: false });
+  const textFirst: QueryResult = { columns: [v('Utf8'), v('Int64')], rows: [['bad', 3]], terminal: terminal(1) };
+  const numberFirst: QueryResult = { columns: [v('Int64'), v('Utf8')], rows: [[3, 'bad']], terminal: terminal(1) };
+  const statOf = { type: 'stat', sql: 'SELECT 1', y: ['v'] } as const;
+  expect(shapeChart(statOf, textFirst)).toMatchObject({ state: 'error', problem: { detail: 'y column "v" is Utf8' } });
+  expect(shapeChart(statOf, numberFirst).state).toBe('populated');
+  const firstStat = render(Chart, { input: statOf, result: shapeChart(statOf, numberFirst) });
+  expect(firstStat.container.querySelector('.stat')).toHaveTextContent('3');
+  firstStat.unmount();
+  const at = { name: 'at', data_type: 'Timestamp(Microsecond, None)', nullable: false };
+  const lineOf = { type: 'timeseries', sql: 'SELECT 1', x: 'at', y: ['v'], series: 'model' } as const;
+  const model = (data_type: string) => ({ name: 'model', data_type, nullable: false });
+  expect(shapeChart(lineOf, { columns: [at, model('Int64'), model('Utf8'), v('Float64')], rows: [], terminal: terminal(0) })).toMatchObject({ state: 'error', problem: { detail: 'series column "model" is Int64' } });
+  expect(shapeChart(lineOf, { columns: [{ ...at, data_type: 'Utf8' }, at, model('Utf8'), v('Float64')], rows: [], terminal: terminal(0) })).toMatchObject({ state: 'error', problem: { detail: 'x column "at" is Utf8' } });
+  expect(shapeChart({ type: 'bar', sql: 'SELECT 1', x: 'v', y: ['n'] }, { columns: [v('Int64'), v('Utf8'), { name: 'n', data_type: 'Int64', nullable: false }], rows: [[1, 'a', 2]], terminal: terminal(1) })).toMatchObject({ state: 'error', problem: { detail: 'x column "v" is Int64' } });
 
   // CardHeader: exact identity, newest-first versions, lifecycle status, copy feedback and tabs.
   const writeText = vi.fn(async () => {});
@@ -318,6 +334,38 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   expect(view.getByRole('button', { name: 'Reset range' })).toBeInTheDocument();
   pending[3]({ ok: true, value: series });
   await waitFor(() => expect(view.container.querySelector('[data-panel="a"] .legend')).not.toBeNull());
+
+  // An explicit panel range wins over the view's, before and after a brush and its reset.
+  const OWN = { from: '2026-10-19T00:00:00Z', to: '2026-10-19T06:00:00Z' };
+  const mixed = recording(() => ({ ok: true, value: series }));
+  const mixedDoc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'own', component: 'Chart', input: { ...timeseries, range: OWN } }, { id: 'shared', component: 'Chart', input: timeseries }] };
+  const both = render(WyrdView, { doc: mixedDoc, executor: mixed.executor });
+  const binds = () => mixed.calls.slice(-2).map((call) => (call.request as Extract<WireRequest, { op: 'bifrost.query' }>).params);
+  await waitFor(() => expect(mixed.calls).toHaveLength(2));
+  expect(binds()).toEqual([[OWN.from, OWN.to], [RANGE.from, RANGE.to]]);
+  await waitFor(() => expect(both.container.querySelector('[data-panel="shared"] svg.plot')).not.toBeNull());
+  const sharedPlot = both.container.querySelector('[data-panel="shared"] svg.plot') as SVGSVGElement;
+  sharedPlot.getBoundingClientRect = plot.getBoundingClientRect;
+  await fireEvent.pointerDown(sharedPlot, { clientX: 100, pointerId: 1 });
+  await fireEvent.pointerMove(sharedPlot, { clientX: 400, pointerId: 1 });
+  await fireEvent.pointerUp(sharedPlot, { clientX: 400, pointerId: 1 });
+  await waitFor(() => expect(mixed.calls).toHaveLength(4));
+  const [brushedOwn, brushedShared] = binds();
+  expect(brushedOwn).toEqual([OWN.from, OWN.to]);
+  expect(brushedShared).not.toEqual([RANGE.from, RANGE.to]);
+  await fireEvent.click(both.container.querySelector('.range button')!);
+  await waitFor(() => expect(mixed.calls).toHaveLength(6));
+  expect(binds()).toEqual([[OWN.from, OWN.to], [RANGE.from, RANGE.to]]);
+  both.unmount();
+  // A relative panel range resolves against the clock, not the view's bounds.
+  vi.useFakeTimers({ now: Date.parse('2026-10-20T12:00:00Z'), toFake: ['Date'] });
+  try {
+    const relative = recording(() => ({ ok: true, value: series }));
+    const own = await loadChart({ ...timeseries, range: { last: '1h' } }, { executor: relative.executor, range: RANGE });
+    expect(own.executed?.params).toEqual(['2026-10-20T11:00:00.000Z', '2026-10-20T12:00:00.000Z']);
+  } finally {
+    vi.useRealTimers();
+  }
 
   // Host intents: pending blocks a duplicate, and a refusal stays visible.
   let answer: (state: { state: 'denied'; problem: typeof denied }) => void = () => {};

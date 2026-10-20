@@ -16,6 +16,7 @@ import {
   type WireRequest
 } from './contract.js';
 import type { ZodType } from 'zod';
+import { columnIndex } from './plot.js';
 import {
   components,
   type AbsoluteRange,
@@ -31,7 +32,7 @@ export * from './schemas.js';
 /** What every loader receives from its host. */
 export interface LoadContext {
   readonly executor: Executor;
-  /** The panel's range, already resolved once for the whole view load. */
+  /** The view's range, already resolved once for the whole load; a panel's own range wins over it. */
   readonly range?: AbsoluteRange;
   /** Aborted when the panel's input or range changes, it is removed, or its host leaves. */
   readonly signal?: AbortSignal;
@@ -121,12 +122,12 @@ function shapeError(detail: string): Loaded<never> {
 
 /**
  * Check `result` against the chart type's shape rules (REQ-025); a mismatch is
- * a panel error, never a blank chart.
+ * a panel error, never a blank chart. A duplicated name is checked at the
+ * column the plot draws: the first with that name.
  */
 export function shapeChart(input: ChartInput, result: QueryResult): Loaded<QueryResult> {
-  const types = new Map(result.columns.map((column) => [column.name, column.data_type]));
   const need = (name: string, kind: RegExp, role: string): string | undefined => {
-    const type = types.get(name);
+    const type = result.columns[columnIndex(result, name)]?.data_type;
     if (type === undefined) return `${role} column "${name}" is not in the result`;
     if (!kind.test(type)) return `${role} column "${name}" is ${type}`;
     return undefined;
@@ -155,9 +156,9 @@ export function shapeChart(input: ChartInput, result: QueryResult): Loaded<Query
   return { state: 'populated', data: result };
 }
 
-/** Load one chart: bind the range, run the authored SQL unchanged, check its shape. */
+/** Load one chart: bind its own range or else the view's, run the authored SQL unchanged, check its shape. */
 export async function loadChart(input: ChartInput, context: LoadContext): Promise<ChartProps> {
-  const range = context.range ?? (input.range && resolveRange(input.range));
+  const range = input.range ? resolveRange(input.range) : context.range;
   const params = chartParams(input.sql, range);
   if (!Array.isArray(params)) return { input, result: { state: 'error', problem: params } };
   const executed = { sql: input.sql, params };

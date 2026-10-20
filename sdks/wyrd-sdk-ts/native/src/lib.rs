@@ -30,12 +30,13 @@ use napi_derive::napi;
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt::Display;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use wyrd_client::bifrost::Bifrost;
 use wyrd_client::bifrost::Correlation;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
+use wyrd_queue::json_result::{DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, JsonResultBuilder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AlterTableRequest, BifrostQueryRequest, QueryParam};
@@ -118,12 +119,32 @@ impl NativeQueryParam {
     }
 }
 
+impl NativeQueryStep {
+    /// Projects one stable Wyrd error onto a failed step's structured fields.
+    fn failure(projected: &WyrdError) -> Self {
+        let problem = projected.as_problem_json();
+        Self {
+            ipc: None,
+            terminal_json: None,
+            error_code: Some(projected.code().to_owned()),
+            error_status: Some(u32::from(projected.status())),
+            error_title: Some(problem_field(&problem, "title", projected.title())),
+            error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
+            error_remediation: Some(projected.remediation().to_owned()),
+            error_details_json: problem
+                .get("details")
+                .and_then(|value| serde_json::to_string(value).ok()),
+        }
+    }
+}
+
 /// One raw native iterator step consumed by the TypeScript Arrow facade.
 #[napi(object)]
 pub struct NativeQueryStep {
     /// Complete Arrow IPC stream containing exactly one record batch.
     pub ipc: Option<Buffer>,
-    /// Serialized validated terminal, present only on the final step.
+    /// Serialized validated terminal, present only on the final step; from
+    /// `collect`, the whole bounded `{columns, rows, terminal}` result.
     pub terminal_json: Option<String>,
     /// Stable SDK error code for a failed native step.
     pub error_code: Option<String>,
@@ -1282,6 +1303,7 @@ impl NativeBifrostQueryStream {
         Self {
             request_id,
             stream: Arc::new(AsyncMutex::new(Some(Box::new(stream)))),
+            closing: Arc::new(Notify::new()),
             terminal_json: Arc::new(Mutex::new(None)),
             schema_ipc: Arc::new(Mutex::new(None)),
         }
@@ -1295,6 +1317,9 @@ pub struct NativeBifrostQueryStream {
     request_id: String,
     /// Mutable Rust query stream serialized across JavaScript `next` calls.
     stream: Arc<AsyncMutex<Option<Box<QueryResultStream>>>>,
+    /// Signalled by [`Self::close`] before it waits for the stream lock, so a
+    /// [`Self::collect`] holding that lock stops draining instead of blocking it.
+    closing: Arc<Notify>,
     /// Validated serialized terminal retained after the Rust stream is released.
     terminal_json: Arc<Mutex<Option<String>>>,
     /// Schema-only Arrow IPC stream retained after the Rust stream is released.
@@ -1393,27 +1418,93 @@ impl NativeBifrostQueryStream {
                         napi::Error::from_reason("terminal lock poisoned".to_owned())
                     })? = Some(terminal);
                 }
-                let projected = wyrd_spec::error::WyrdError::from(&error);
-                let problem = projected.as_problem_json();
-                Ok(NativeQueryStep {
-                    ipc: None,
-                    terminal_json: None,
-                    error_code: Some(projected.code().to_owned()),
-                    error_status: Some(u32::from(projected.status())),
-                    error_title: Some(problem_field(&problem, "title", projected.title())),
-                    error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
-                    error_remediation: Some(projected.remediation().to_owned()),
-                    error_details_json: problem
-                        .get("details")
-                        .and_then(|value| serde_json::to_string(value).ok()),
-                })
+                Ok(NativeQueryStep::failure(&WyrdError::from(&error)))
             }
         }
     }
 
+    /// Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
+    ///
+    /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB.
+    /// The projection is [`JsonResultBuilder`], the same owner the server's MCP
+    /// `bifrost.query` tool builds through, so both surfaces return the same
+    /// value for the same result. The stream is released when this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a step carrying the stable Wyrd error for a failed, incomplete,
+    /// or malformed stream and for a result past `max_rows` or `max_bytes`, and
+    /// a napi error when the stream is already closed or [`Self::close`] stops
+    /// the drain.
+    #[napi]
+    pub async fn collect(
+        &self,
+        max_rows: Option<u32>,
+        max_bytes: Option<u32>,
+    ) -> Result<NativeQueryStep> {
+        let mut stream_slot = self.stream.lock().await;
+        let mut stream = stream_slot
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("query stream is closed".to_owned()))?;
+        let mut result = JsonResultBuilder::new(
+            usize::try_from(max_rows.unwrap_or(DEFAULT_MAX_ROWS)).unwrap_or(usize::MAX),
+            max_bytes
+                .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
+                .unwrap_or(usize::MAX),
+        );
+        let mut columns = false;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = self.closing.notified() => {
+                    return Err(napi::Error::from_reason("query stream is closed".to_owned()));
+                }
+                next = stream.next_batch() => next,
+            };
+            let batch = match next {
+                Ok(batch) => batch,
+                Err(error) => return Ok(NativeQueryStep::failure(&WyrdError::from(&error))),
+            };
+            let schema = if columns { None } else { stream.schema() };
+            columns |= schema.is_some();
+            let done = batch.is_none();
+            let accepted = schema
+                .map_or(Ok(()), |schema| result.accept_schema(schema))
+                .and_then(|()| batch.map_or(Ok(()), |batch| result.accept_batch(&batch)));
+            if let Err(error) = accepted {
+                return Ok(NativeQueryStep::failure(&error));
+            }
+            if done {
+                break;
+            }
+        }
+        let Some(terminal) = stream.terminal() else {
+            return Ok(NativeQueryStep::failure(&WyrdError::from(
+                &BifrostClientError::IncompleteQueryStream,
+            )));
+        };
+        match result.finish(terminal) {
+            Ok(value) => Ok(NativeQueryStep {
+                ipc: None,
+                terminal_json: Some(value.to_string()),
+                error_code: None,
+                error_status: None,
+                error_title: None,
+                error_detail: None,
+                error_remediation: None,
+                error_details_json: None,
+            }),
+            Err(error) => Ok(NativeQueryStep::failure(&error)),
+        }
+    }
+
     /// Drops the response stream so Rust transport cancellation propagates.
+    ///
+    /// A running [`Self::collect`] is signalled first, so it releases the
+    /// stream lock instead of draining the rest of the result.
     #[napi]
     pub async fn close(&self) {
+        self.closing.notify_one();
         *self.stream.lock().await = None;
     }
 

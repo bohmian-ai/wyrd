@@ -10,17 +10,16 @@
 //! and error projection.
 
 use std::pin::pin;
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::json::writer::{EncoderOptions, make_encoder};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use futures_util::StreamExt as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
-use wyrd_queue::variant::WyrdJsonEncoderFactory;
+use wyrd_queue::json_result::JsonResultBuilder;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -43,29 +42,9 @@ pub(crate) const QUERY: &str = "bifrost.query";
 /// a runaway agent prompt is refused before it reaches the SQL floor at all.
 pub(crate) const MAX_SQL_BYTES: usize = 65_536;
 
-/// Rows returned when a caller names no `max_rows`.
-pub(crate) const DEFAULT_MAX_ROWS: u32 = 1_000;
-
-/// Largest `max_rows` an agent caller may ask for.
-///
-/// Deliberately far below the server's own million-row sync ceiling: an MCP
-/// result is one JSON value an agent has to hold in a context window, so the
-/// binding constraint here is the reader, not the engine.
-pub(crate) const MAX_ROWS_CEILING: u32 = 10_000;
-
-/// Serialized result bytes returned when a caller names no `max_bytes`.
-pub(crate) const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-/// Largest `max_bytes` an agent caller may ask for, well under the server's 256 MiB.
-pub(crate) const MAX_BYTES_CEILING: usize = 16 * 1024 * 1024;
-
-/// Compact-JSON bytes the result object costs before any content is charged.
-///
-/// `{"columns":`, `,"rows":`, the row array's `[` and `]`, `,"terminal":`, and
-/// the closing `}` are structural and always present, so they are charged once
-/// up front and the columns, each row plus its separating comma, and the
-/// terminal are charged as they are produced.
-pub(crate) const STRUCTURED_OVERHEAD_BYTES: usize = 11 + 8 + 2 + 12 + 1;
+pub(crate) use wyrd_queue::json_result::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, MAX_BYTES_CEILING, MAX_ROWS_CEILING,
+};
 
 /// JSON Schema of [`QueryArguments`] as every agent surface advertises it.
 ///
@@ -281,7 +260,6 @@ impl BoundedQuery {
             settlement,
             max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
             max_bytes: arguments.max_bytes,
-            bytes: STRUCTURED_OVERHEAD_BYTES,
             #[cfg(feature = "test-support")]
             stall: self
                 .state
@@ -307,8 +285,6 @@ struct ResultCollector {
     max_rows: usize,
     /// Exact compact-JSON byte ceiling for `{columns, rows, terminal}`.
     max_bytes: usize,
-    /// Exact bytes charged so far, starting at the fixed structural overhead.
-    bytes: usize,
     /// Deterministic post-schema hold used only by cancellation journeys.
     #[cfg(feature = "test-support")]
     stall: Option<Arc<QueryStreamStall>>,
@@ -355,11 +331,10 @@ impl ResultCollector {
         observed: &mut Option<QueryTerminalFrame>,
     ) -> Result<JsonValue, WyrdError> {
         let mut ipc = QueryIpcDecoder::new();
-        let mut columns: Option<Vec<JsonValue>> = None;
+        let mut result = JsonResultBuilder::new(self.max_rows, self.max_bytes);
         let mut schema: Option<SchemaRef> = None;
-        let mut rows: Vec<JsonValue> = Vec::new();
         let mut decoded_rows = 0_u64;
-        let mut terminal: Option<JsonValue> = None;
+        let mut terminal: Option<QueryTerminalFrame> = None;
         loop {
             let next = tokio::select! {
                 biased;
@@ -382,12 +357,10 @@ impl ResultCollector {
                 QueryStreamFrame::Schema(accepted) if schema.is_none() && terminal.is_none() => {
                     match ipc.accept_schema(&accepted.arrow_ipc_schema) {
                         Ok(accepted) => {
-                            let projected = project_columns(&accepted);
-                            if let Err(error) = self.charge(&projected) {
+                            if let Err(error) = result.accept_schema(&accepted) {
                                 stream.request_cancel();
                                 return Err(error);
                             }
-                            columns = Some(projected);
                             schema = Some(accepted);
                             #[cfg(feature = "test-support")]
                             if let Some(stall) = self.stall.take() {
@@ -417,7 +390,7 @@ impl ResultCollector {
                         return Err(ValaError::QueryStreamProtocol.into());
                     };
                     decoded_rows = count;
-                    if let Err(error) = self.retain(&mut rows, &decoded) {
+                    if let Err(error) = result.accept_batch(&decoded) {
                         stream.request_cancel();
                         return Err(error);
                     }
@@ -439,7 +412,7 @@ impl ResultCollector {
                         stream.request_cancel();
                         return Err(super::service::arrow_decode_error(error));
                     }
-                    terminal = Some(project_terminal(&frame));
+                    terminal = Some(frame.clone());
                     *observed = Some(frame);
                 }
                 _ => {
@@ -449,149 +422,19 @@ impl ResultCollector {
                 }
             }
         }
-        let (Some(columns), Some(terminal)) = (columns, terminal) else {
+        let Some(terminal) = terminal else {
             stream.request_cancel();
             return Err(ValaError::QueryStreamIncomplete.into());
         };
-        if let Err(error) = self.charge(&terminal) {
-            stream.request_cancel();
-            return Err(error);
-        }
-        Ok(serde_json::json!({
-            "columns": columns,
-            "rows": rows,
-            "terminal": terminal,
-        }))
+        result
+            .finish(&terminal)
+            .inspect_err(|_| stream.request_cancel())
     }
-
-    /// Append one decoded batch's rows as positional JSON arrays.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValaError::QueryResultTooLarge`] when the batch would carry the
-    /// result past the caller's row ceiling, and [`WyrdError::Internal`] when a
-    /// column has no Arrow JSON encoder.
-    fn retain(&mut self, rows: &mut Vec<JsonValue>, batch: &RecordBatch) -> Result<(), WyrdError> {
-        if rows.len().saturating_add(batch.num_rows()) > self.max_rows {
-            return Err(ValaError::QueryResultTooLarge.into());
-        }
-        let schema = batch.schema();
-        let options =
-            EncoderOptions::default().with_encoder_factory(Arc::new(WyrdJsonEncoderFactory));
-        let mut encoders = Vec::with_capacity(batch.num_columns());
-        for (field, array) in schema.fields().iter().zip(batch.columns()) {
-            encoders.push(
-                make_encoder(field, array.as_ref(), &options).map_err(|error| {
-                    WyrdError::Internal {
-                        message: format!("{QUERY} cannot encode column {}: {error}", field.name()),
-                        details: serde_json::json!({ "tool": QUERY }),
-                    }
-                })?,
-            );
-        }
-        let mut buffer = Vec::new();
-        for index in 0..batch.num_rows() {
-            let mut row = Vec::with_capacity(encoders.len());
-            for encoder in &mut encoders {
-                if encoder.is_null(index) {
-                    row.push(JsonValue::Null);
-                    continue;
-                }
-                buffer.clear();
-                encoder.encode(index, &mut buffer);
-                row.push(
-                    serde_json::from_slice(&buffer).map_err(|error| WyrdError::Internal {
-                        message: format!(
-                            "{QUERY} produced an unreadable Arrow JSON value: {error}"
-                        ),
-                        details: serde_json::json!({ "tool": QUERY }),
-                    })?,
-                );
-            }
-            let row = JsonValue::Array(row);
-            if !rows.is_empty() {
-                self.charge_bytes(1)?;
-            }
-            self.charge(&row)?;
-            rows.push(row);
-        }
-        Ok(())
-    }
-
-    /// Charge one value's exact compact-JSON length against the budget.
-    ///
-    /// The value is serialized into a temporary buffer purely to measure it, so
-    /// the caller can refuse it before retaining it: an overflow must never
-    /// leave a partially built result that could be mistaken for a short one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WyrdError::Internal`] when the value cannot be serialized, and
-    /// [`ValaError::QueryResultTooLarge`] when charging it exceeds the ceiling.
-    fn charge<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), WyrdError> {
-        let measured = serde_json::to_vec(value).map_err(|error| WyrdError::Internal {
-            message: format!("{QUERY} could not measure its own result: {error}"),
-            details: serde_json::json!({ "tool": QUERY }),
-        })?;
-        self.charge_bytes(measured.len())
-    }
-
-    /// Charge an exact byte count, refusing overflow of the count or ceiling.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValaError::QueryResultTooLarge`] when the running count would
-    /// overflow or would exceed the caller's byte ceiling.
-    fn charge_bytes(&mut self, amount: usize) -> Result<(), WyrdError> {
-        let charged = self
-            .bytes
-            .checked_add(amount)
-            .ok_or(ValaError::QueryResultTooLarge)?;
-        if charged > self.max_bytes {
-            return Err(ValaError::QueryResultTooLarge.into());
-        }
-        self.bytes = charged;
-        Ok(())
-    }
-}
-
-/// Project the accepted Arrow schema as ordered `{name, data_type, nullable}`.
-///
-/// The schema is accepted exactly once, so columns occur once in the result no
-/// matter how many batches follow. Duplicate column names are preserved rather
-/// than deduplicated, which is why rows are positional arrays: an object row
-/// model cannot represent a result the engine can legally produce.
-fn project_columns(schema: &Schema) -> Vec<JsonValue> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            serde_json::json!({
-                "name": field.name(),
-                "data_type": field.data_type().to_string(),
-                "nullable": field.is_nullable(),
-            })
-        })
-        .collect()
-}
-
-/// Project the settled terminal as the evidence an agent can act on.
-///
-/// The Arrow end-of-stream delta is deliberately absent: it is stream framing
-/// the collector already consumed to prove the stream closed, not a value.
-fn project_terminal(frame: &QueryTerminalFrame) -> JsonValue {
-    serde_json::json!({
-        "outcome": frame.outcome,
-        "query_class": frame.query_class,
-        "row_count": frame.row_count,
-        "warnings": frame.warnings,
-        "source_completion": frame.source_completion,
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BYTES_CEILING, ResultCollector, STRUCTURED_OVERHEAD_BYTES};
+    use super::{MAX_BYTES_CEILING, ResultCollector};
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
@@ -773,7 +616,6 @@ mod tests {
                     settlement: None,
                     max_rows: 10,
                     max_bytes: MAX_BYTES_CEILING,
-                    bytes: STRUCTURED_OVERHEAD_BYTES,
                     #[cfg(feature = "test-support")]
                     stall: None,
                 };
@@ -810,7 +652,6 @@ mod tests {
                 settlement: None,
                 max_rows: 10,
                 max_bytes,
-                bytes: STRUCTURED_OVERHEAD_BYTES,
                 #[cfg(feature = "test-support")]
                 stall: None,
             };

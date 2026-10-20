@@ -28,7 +28,6 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
-#[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;

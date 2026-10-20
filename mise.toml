@@ -1353,10 +1353,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm install --frozen-lockfile"
 
 [tasks."ts:build"]
-description = "Build the public wyrd-ai napi addon (sdks/wyrd-sdk-ts/native) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
+description = "Build the public wyrd-ai napi addon (sdks/wyrd-sdk-ts/native) in the WYRD_PROFILE Cargo profile (default dev) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
 depends = ["ts:install"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec napi build --platform --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
+run = "pnpm exec napi build --platform $([ \"${WYRD_PROFILE:-dev}\" = dev ] || echo --profile \"$WYRD_PROFILE\") --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (sdks/wyrd-sdk-ts/native-testing) into sdks/wyrd-sdk-ts/testing; feeds the integration lane only (slice 13a)"

@@ -107,3 +107,37 @@ mise exec -- git diff --check
 ```
 
 Perform a bounded signed-geometry browser spot-check with existing browser tooling. No new harness/dependency or full journey/release aggregate. Record exact RED failure, GREEN outcome, final commands and limits. Later review must reassess the complete cumulative original task and preserve FIND IDs.
+
+## Implementation evidence
+
+Commits: `966c32b53` (FIND-003-1/2), `6c73a0f3f` (FIND-003-3/4), `cbc8edd60` (negative bar labels clear of category axis), `238a0310d` (FIND-003-5), `0bb0422f8` (FIND-003-6), `003629cb3` (FIND-003-7).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-003-1 explicit panel `range` wins over view/brush range | `loaders.ts` `loadChart`: `input.range ? resolveRange(input.range) : context.range` | `TASK-003: Validated portable rendering` (two panels, brush + reset, fake clock) | PASS |
+| FIND-003-2 duplicate columns bind one authority (first match) | `loaders.ts` `shapeChart` `need()` via `plot.ts` `columnIndex` | same test, duplicate-column case | PASS |
+| FIND-003-3 signed line and bar geometry valid | `Chart.svelte` signed `y0/y1`, `barDomain`, `barY`, zero baseline, below-bar negative labels with reserved floor | same test signed cases; browser `signed.mjs`: no NaN/Infinity attrs, 0 negative sizes, 0 panel problems, labels clear of axis | PASS |
+| FIND-003-4 fold only above 20 series (19 + other) | `plot.ts` `MAX_SERIES = 20`; `Chart.svelte` 4 strokes × 4 markers × 5 dashes | same test, 5/20/21 series | PASS |
+| FIND-003-5 version/tab controls honor action states | `CardHeader.svelte` `blocked()`, disabled + `aria-busy`, select resets to `cardRef.version`; shared `ActionNote.svelte` | `TASK-003: Dependent loads and safe actions` (direct and through WyrdView) | PASS |
+| FIND-003-6 abort during stream acquisition closes stream, never succeeds | `node.ts` `bifrost.query`: abort check after acquire and after collect | `Node query acquisition cancellation` | PASS |
+| FIND-003-7 local problems and endpoint bodies are canonical | `scripts/catalog.ts` generates `problems.json` from `wyrd-spec/schemas/ui_problem_examples.json`; `contract.ts` `wyrdProblem`; `loaders.ts`, `mcp.ts`, `view.ts`, `WyrdView.svelte`, both `load/+server.ts` | `Canonical UI problem projections`; `mise run codegen:check` (drift) | PASS |
+
+RED observed before each fix: range/duplicate assertions; 4 vs 5 series fold; CardHeader controls enabled while pending; Node test timed out collecting after abort; `WYRD_UI_*` code returned. The signed-geometry RED was reproduced by the reviewer and not separately re-observed here.
+
+Commands (all green):
+
+```bash
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Dependent loads and safe actions$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Node query acquisition cancellation$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Canonical UI problem projections$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts   # 10 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check                             # 0 errors, 0 warnings
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui --filter @wyrd/example-ui-app check  # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui --filter @wyrd/example-ui-app build
+mise run codegen:check
+git diff --check
+```
+
+Non-goals held: no generated file hand-edited, no new dependency, no test skipped or weakened; earlier `WYRD_UI_*` expectations were replaced with the canonical `WYRD_SPEC_400_VALIDATION` identity the finding requires. Limit: proof ran on macOS arm64 only.

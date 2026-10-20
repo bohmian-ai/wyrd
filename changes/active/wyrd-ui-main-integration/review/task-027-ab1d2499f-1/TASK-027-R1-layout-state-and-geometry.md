@@ -78,3 +78,33 @@ mise exec -- git diff --check
 ```
 
 Use the existing gallery/AppBridge browser capability for the bounded focus/capture and mixed-grid checks. Record actual viewport, fixture/action and measured rows/boxes; followup-review.md identifies the existing artifact proof, not a new test harness to build. If authored schema/catalog changes become necessary, justify within approved behavior and run mise run codegen:check; none is currently required by the selected correction. Do not require repository aggregates, release/Linux builds or full real-server journey suites. Later task review reassesses the complete cumulative original task and these stable FIND IDs.
+
+## Implementation evidence
+
+Commits: `b512c2221` (FIND-027-1/2), `84d5dd22e` (FIND-027-3).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-027-1 every completed edit is reported against a non-echoing host | `WyrdView.svelte` `kept`/`draft` as `$state.raw`; `commit()` reports `{...kept, [draft.id]: draft.layout}` | `TASK-027: Layout editing` (two edits, second callback carries both; unplaced stays unplaced; no reload) | PASS |
+| FIND-027-2 Escape ends a held pointer gesture; later moves/release change nothing | `WyrdView.svelte` `drag()` registers `release` (listeners + pointer capture), `cancel()` calls it; window Escape listener; teardown effect | `TASK-027: Pointer edit cancellation`; browser `escape.mjs` at 1440: grip focused/unfocused and corner unfocused all restore on Escape, release is inert, fresh resize commits h 8→9 | PASS |
+| FIND-027-3 auto panels occupy `rowsFor(height)` rows; row pitch fixed at 40px + 12px | `layout.ts` `rowsFor`, `place(layouts, heights)`; `WyrdView.svelte` `bind:offsetHeight`, `align-self: start`, `grid-auto-rows: 40px` (auto when narrow) | `TASK-027: Grid placement` (72.19→2 rows no push; 294→6 pushes y4 to 6; 0/2000→1/39; DOM spans); browser `geometry.mjs`/`settle.mjs` | PASS |
+
+Browser measurements (Playwright, 1200px light and dark): tracks 40px; 72.19px header → 2 rows, later panel top 208; tall 298px chart → 6 rows, later panel row 7 top 312; loading→loaded 5→6 rows; width 740 header 3→4 rows; every top a multiple of 52, no overlap, no horizontal overflow; 375px stacks at content height.
+
+RED observed before each fix: second callback missing the earlier edit; gesture revived after Escape; auto `h` stayed 1 instead of 2.
+
+Commands (all green):
+
+```bash
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Layout editing$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Grid placement$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Layout document contract$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Narrow views$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Pointer edit cancellation$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts   # 10 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check                             # 0 errors, 0 warnings
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+git diff --check
+```
+
+Non-goals held: layout document contract unchanged, catalog components stay size-agnostic, no new dependency. Limit: proof ran on macOS arm64 only.

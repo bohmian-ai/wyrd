@@ -66,3 +66,26 @@ mise exec -- git diff --check
 ```
 
 Run codegen:check only if generated inputs/wiring actually change; neither selected correction requires that. No broad aggregates, Linux release bundles or full user-journey suites belong to this remediation. Outstanding Linux/live degraded proof stays unverified at its owning stage. Stop for any genuinely new product/API/security/durable decision rather than expanding scope. Later review reassesses the complete cumulative original task and both R1/R2, preserving stable FIND IDs.
+
+## Implementation Evidence
+
+Commits `192440670` (FIND-003-8) and `13b1cf005` (FIND-003-9) on `c2bbd8e47`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Plain pinned Node 26.2.0 links `wyrd-ai-ui/loaders` and `/mcp` and runs a catalog-backed validation | `packages/ui/src/lib/contract.ts:19` `with { type: 'json' }`; emitted unchanged in `dist/contract.js` | Direct smoke command (cwd `crates/wyrd/wyrd-server/wyrd-ui`) exits 0; RED before fix: `ERR_IMPORT_ATTRIBUTE_MISSING` | PASS |
+| Native smoke lives in an existing package verification owner | Root `package.json` `test` script runs the same smoke between `pnpm package` and `vitest run` | With the attribute removed, `pnpm test … -t '^Canonical UI problem projections$'` fails on `ERR_IMPORT_ATTRIBUTE_MISSING` before Vitest; restored, passes | PASS |
+| Aggregate caption differs from every retained authored caption, including authored qualification text | `packages/ui/src/lib/plot.ts` `timeSeries` overflow: `other`, else `other (aggregate)`, else `other (aggregate N)` | `TASK-003: Validated portable rendering`: authored `other`=21 and `other (aggregate)`=20 plus s1..s19 → 20 unique captions/polylines, aggregate `other (aggregate 2)`=3, distinct tooltip and `aria-label`; RED before fix: Svelte `each_key_duplicate` | PASS |
+| Rerender with changed ranking/cardinality shows current captions and values | Same producer | Rerender: small authored `other` folds into an unqualified `other`=3.5; three groups keep real `other` | PASS |
+| Existing 5/20/21 and fold-total checks retained | Unchanged loop | Same test | PASS |
+
+Commands (all exit 0, macOS arm64):
+
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui package` then the exact direct Node smoke from this task, cwd `crates/wyrd/wyrd-server/wyrd-ui`: no output, exit 0.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'`: 1 passed, 9 skipped.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Canonical UI problem projections$'`: 1 passed, 9 skipped.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`: 0 errors, 0 warnings (package and app).
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`: built.
+- `mise exec -- git diff --check`: clean.
+
+No generated input changed, so `codegen:check` was not run. Non-goals stayed excluded: no handwritten catalog, loader, dependency, schema or renderer key change. Limit: macOS arm64 only.

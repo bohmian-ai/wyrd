@@ -75,3 +75,37 @@ mise exec -- git diff --check
 ```
 
 Supplement with bounded existing-browser non-echo blur/Enter and breakpoint/capture sequences, retaining their callback/state evidence. No codegen, server journeys, release/Linux builds or repository aggregates are required for this unchanged schema/API write set. Record exact focused commands and expected RED/GREEN, including any newly named test's anchored selector if chosen. Stop for a real material product/API/durable decision rather than broadening remediation. Next review must audit the complete cumulative original task with prior ledgers and both R1/R2.
+
+## Implementation Evidence
+
+Commits `509d0f035` (FIND-027-2), `05ac2c682` (FIND-027-4) and `850cdb7a5` (test typing) on `c2bbd8e47`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Every completion ends the held producer, before draft/parse early returns | `WyrdView.svelte` `commit()` calls `release?.()` first | `TASK-027: Pointer edit cancellation`: non-echo host with a retained sibling edit; blur and Enter during held move and corner each report once, later move/up inert, sibling edit kept; completion before first move reports nothing and later events are inert; a fresh corner gesture completes once. RED before fix: preview moved after blur (`4 / span 6` vs `2 / span 6`) | PASS |
+| Losing editability (narrow or no `onlayout`) cancels the preview before controls disappear, emitting nothing | `$effect.pre` cancelling when `!editable` | Same test: focused/unfocused move and corner through 1000→500→1000 px with release while narrow, and `onlayout` removed/restored via `rerender`: no callback, no `.editing`, kept layout restored. With the effect removed: stale preview `6 / span 9` vs `3 / span 9` | PASS |
+| Kept edits survive a host re-passing the same document | Reset keyed on `given = $derived(doc)` rather than the reparsed result | `rerender({ onlayout })` keeps completed edits (earlier failed: `1 / span 6` vs `3 / span 9`) | PASS |
+| `constructor`/`toString`/`__proto__` IDs place, edit and validate like normal IDs | `Object.hasOwn` at retained layout selection, callback overlay and measured-height read | `TASK-027: Grid placement`: special-ID document places identically to a renamed one. `TASK-027: Layout editing`: editing a normal sibling keeps special layouts (and absence) and validates; each special ID completes and cancels; final document validates with own `__proto__.layout` | PASS |
+| Measured heights become reactive own entries for any ID | `heights` is `$state.raw` replaced whole via `bind:offsetHeight={null, setter}` | Grid placement: unplaced `__proto__` at 294 px → follower `7 / span 4`; after 400 px + resize notify → `1 / span 8` and `9 / span 4`. A reads-only repair (deep proxy write) fails: `5 / span 4` vs `7 / span 4` | PASS |
+
+Test support: `vitest-setup.ts`'s existing ResizeObserver stub now records its observers and `ResizeObserver.notify()` reports them, so jsdom can drive a width change mid-gesture. It is not a new harness.
+
+Browser proof: Playwright's installed headless Chromium 1248, driven over CDP with trusted mouse and key events against the dev gallery page. A non-echo `mountView` host contained ids `a`, `constructor`, `__proto__` (unplaced) and `after`. The Chrome extension browser could not reach the local server.
+
+| Sequence | Callbacks | Observation |
+|---|---|---|
+| Keyboard sibling edit (`constructor`) | 0→1 | — |
+| Held move/corner + Tab, then move 220 px + release | +1 each | Row unchanged after release, no `.editing`, each callback carries sibling `1/6` |
+| Held move/corner + Enter, then move + release | +1 each | Same |
+| Tab before any move, then move + release | +0 | Rows unchanged |
+| Held focused move / unfocused corner, 1200→600 px, release while narrow, →1200 px | +0 | Grips 4→0→4; rows return to kept `3 / span 8`; no `.editing` |
+| `__proto__` content set to 400 px | +0 | `__proto__` `11 / span 5`→`11 / span 9`, follower `16`→`20` |
+
+Commands (all exit 0, macOS arm64):
+
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Layout editing$'`, `'^TASK-027: Pointer edit cancellation$'`, `'^TASK-027: Grid placement$'`, `'^TASK-027: Narrow views$'`: each 1 passed, 9 skipped.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts`: 10 passed.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`: 0 errors, 0 warnings. `build`: built. Example app `--filter @wyrd/example-ui-app check`: 0 errors.
+- `mise exec -- git diff --check`: clean.
+
+Schemas, public API, the geometry module and hosts are unchanged; no dependency was added. The browser cannot remove `onlayout` from a static `mountView`, so that path is proved in jsdom only. Limit: macOS arm64 only.

@@ -1450,11 +1450,13 @@ mod tests {
     /// results of one run attribution share a single summary frame stamped
     /// with that pair and scoped to the Cards verified, the capture writes its
     /// row and span frames under the call's pair and admitting request, and
-    /// the summary frame is submitted last although it was staged first.
+    /// the summary frame is submitted last although it was staged first. The
+    /// capture's two frames share a phase and arrive in either order.
     ///
     /// # Panics
     ///
-    /// Panics when the frames, their order, rows, or attribution differ.
+    /// Panics when the frames, the summary's position, rows, or attribution
+    /// differ.
     #[tokio::test]
     async fn writes_group_by_destination_under_their_attribution() {
         let scribe = Arc::new(RecordingScribe::default());
@@ -1472,10 +1474,11 @@ mod tests {
         settle(&outbox).await;
 
         let received = scribe.received();
-        let frames = received
+        let mut frames = received
             .iter()
             .map(|frame| (frame.table.as_str(), frame.rows))
             .collect::<Vec<_>>();
+        frames[..2].sort_unstable();
         assert_eq!(
             frames,
             [
@@ -1634,19 +1637,16 @@ mod tests {
         outbox.stage(tenant, capture(tenant));
         settle(&outbox).await;
 
-        let tables = scribe
+        // Either capture frame may arrive first and take the refusal, so the
+        // first slice leaves one frame and the second writes both.
+        let mut tables = scribe
             .received()
             .iter()
             .map(|frame| frame.table.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            tables,
-            [
-                "vala.traces.spans",
-                "vala.gateway.calls",
-                "vala.traces.spans"
-            ]
-        );
+        assert_eq!(tables.len(), 3, "{tables:?}");
+        tables[1..].sort_unstable();
+        assert_eq!(tables[1..], ["vala.gateway.calls", "vala.traces.spans"]);
         assert_eq!(scribe.attempts(), 4, "the rejected frame is never retried");
     }
 
@@ -1852,14 +1852,15 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `frames` carry every one of `tasks` item rows exactly once and
-    /// in order, in more than one item frame within the small ceiling's
-    /// budget, and end with the one summary.
+    /// Asserts `frames` carry every one of `features` item rows exactly once,
+    /// in more than one item frame within the small ceiling's budget, and end
+    /// with the one summary. Item frames are in flight together, so rows are
+    /// compared without order.
     ///
     /// # Panics
     ///
-    /// Panics when a row is missing, repeated, misordered, or a frame is over
-    /// budget or out of order.
+    /// Panics when a row is missing or repeated, a frame is over budget, or
+    /// the summary is not last.
     fn assert_bounded_detail(frames: &[Received], features: usize) {
         let tables = frames
             .iter()
@@ -1886,11 +1887,9 @@ mod tests {
         let expected = (0..features)
             .map(|feature| format!("f{feature:04}"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            detail_features(frames),
-            expected,
-            "every row once, in order"
-        );
+        let mut features = detail_features(frames);
+        features.sort_unstable();
+        assert_eq!(features, expected, "every row once");
     }
 
     /// A Scribe that acknowledges through `inner` but reports the
@@ -1945,7 +1944,7 @@ mod tests {
 
     /// Proves a multi-row verification detail larger than one frame under a lowered
     /// Scribe ceiling reaches the local Scribe as bounded frames carrying
-    /// every row once, in order, before the summary, and that after a lost
+    /// every row once before the summary, and that after a lost
     /// ACK the identical slice resubmits identical frame ids.
     ///
     /// # Panics
@@ -1968,11 +1967,10 @@ mod tests {
         settle(&outbox).await;
 
         let submitted = recording.submitted();
-        assert_eq!(
-            submitted[2..4],
-            submitted[..2],
-            "the retry resubmits the identical frames"
-        );
+        let (mut first, mut retry) = (submitted[..2].to_vec(), submitted[2..4].to_vec());
+        first.sort_unstable();
+        retry.sort_unstable();
+        assert_eq!(retry, first, "the retry resubmits the identical frames");
         let frames = retained(recording.received());
         assert_eq!(
             frames.len(),
@@ -2293,11 +2291,13 @@ mod tests {
             .into_iter()
             .partition(|frame| frame.tenant == tenant);
         assert_bounded_detail(&mine, DETAIL_FEATURES);
+        let mut others = others
+            .iter()
+            .map(|frame| frame.table.as_str())
+            .collect::<Vec<_>>();
+        others.sort_unstable();
         assert_eq!(
-            others
-                .iter()
-                .map(|frame| frame.table.as_str())
-                .collect::<Vec<_>>(),
+            others,
             ["vala.gateway.calls", "vala.traces.spans"],
             "the other tenant's capture is written"
         );

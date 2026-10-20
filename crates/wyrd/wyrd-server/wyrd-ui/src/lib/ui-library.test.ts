@@ -66,43 +66,7 @@ import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, typ
 import { mountView, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import catalog from 'wyrd-ai-ui/catalog.json';
-
-/** A terminal for a complete result of `rows` rows. */
-function terminal(rows: number, outcome: 'success' | 'degraded' = 'success'): QueryResult['terminal'] {
-  return {
-    outcome,
-    query_class: 'interactive',
-    row_count: rows,
-    warnings: outcome === 'degraded' ? ['live_tail_unavailable'] : [],
-    source_completion: []
-  };
-}
-
-const series: QueryResult = {
-  columns: [
-    { name: 'at', data_type: 'Timestamp(Microsecond, None)', nullable: false },
-    { name: 'model', data_type: 'Utf8', nullable: false },
-    { name: 'p95', data_type: 'Float64', nullable: true }
-  ],
-  rows: [
-    ['2026-10-20T10:00:00', 'a', 120],
-    ['2026-10-20T10:00:00', 'b', 80],
-    ['2026-10-20T11:00:00', 'a', 140],
-    ['2026-10-20T11:00:00', 'b', null]
-  ],
-  terminal: terminal(4)
-};
-const timeseries: ChartInput = { type: 'timeseries', title: 'Latency', sql: 'SELECT at, model, p95 FROM t WHERE at >= $1::timestamptz AND at < $2::timestamptz', unit: 'ms', x: 'at', y: ['p95'], series: 'model' };
-const card: CardRef = { kind: 'Model', name: 'ranker', version: '1.4.2', space: 'search' };
-const registered = {
-  apiVersion: 'wyrd/v1',
-  kind: 'Model',
-  metadata: { name: 'ranker', space: 'search', version: '1.4.2', uid: 'card_01HX' },
-  spec: {}
-} as never;
-const summary = (version: string, status = 'active') => ({ version, status, name: 'ranker', kind: 'Model', space: 'search' }) as never;
-const denied = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
-const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-20T12:00:00Z' };
+import { card, denied, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 
 /** An executor answering each read with `answer` and recording every request and signal. */
 function recording(answer: (request: WireRequest) => WireResult | Promise<WireResult>) {

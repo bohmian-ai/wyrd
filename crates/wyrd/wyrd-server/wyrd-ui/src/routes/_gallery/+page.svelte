@@ -41,9 +41,9 @@
     title: 'Ranker overview',
     range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' },
     panels: [
-      { id: 'header', component: 'CardHeader', input: { cardRef: card }, layout: { x: 0, y: 0, w: 12, h: 3 } },
-      { id: 'latency', component: 'Chart', input: timeseries, layout: { x: 0, y: 3, w: 8, h: 8 } },
-      { id: 'broken', component: 'Chart', input: { type: 'stat' }, layout: { x: 8, y: 3, w: 4, h: 4 } },
+      { id: 'header', component: 'CardHeader', input: { cardRef: card }, layout: { x: 0, y: 0, w: 12, h: 4 } },
+      { id: 'latency', component: 'Chart', input: timeseries, layout: { x: 0, y: 4, w: 8, h: 8 } },
+      { id: 'broken', component: 'Chart', input: { type: 'stat' }, layout: { x: 8, y: 4, w: 4, h: 4 } },
       { id: 'unplaced', component: 'Chart', input: { ...timeseries, title: 'Unplaced: full width at content height' } }
     ]
   });

@@ -147,8 +147,8 @@ rows = Bifrost().sql(
 print(rows.to_polars())
 ```
 
-To run Wyrd locally, start with [Set up Wyrd](https://bohmian-ai.github.io/wyrd/get-started/setup/),
-then [Verify your first agent](https://bohmian-ai.github.io/wyrd/get-started/quickstart/).
+To run Wyrd locally, start with [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/),
+then [Verify your first agent](https://docs.bohmian.ai/wyrd/get-started/quickstart/).
 
 ## What the heck are you waiting for??????
 

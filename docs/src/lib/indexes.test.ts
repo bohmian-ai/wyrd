@@ -35,7 +35,7 @@ describe('machine-readable indexes follow published pages', () => {
       const start = text.slice(text.indexOf('## Start here'));
       expect(sitePaths(start).slice(0, 2)).toEqual(['/get-started/setup/', '/get-started/quickstart/']);
       expect(text).toContain('wyrd.guide {"topic":"start"}');
-      expect(text).not.toContain('](https://bohmian-ai.github.io');
+      expect(text).not.toContain('](https://docs.bohmian.ai');
     }
   });
 

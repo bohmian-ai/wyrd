@@ -1,7 +1,7 @@
 # TASK-005 — Card browsing and definition component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-024, REQ-020, AC-006, AC-007, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.

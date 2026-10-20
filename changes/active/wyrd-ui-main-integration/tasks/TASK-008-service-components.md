@@ -1,7 +1,7 @@
 # TASK-008 — Service signal and chart authoring component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md).
 Mapped obligations: REQ-030, REQ-023, REQ-025, REQ-020, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: REQ-023 correlation (including verification results) and REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.

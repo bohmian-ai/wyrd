@@ -1,7 +1,7 @@
 # TASK-009 — Change Request and repository component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).
 Mapped obligations: REQ-030, REQ-029, REQ-020, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: REQ-029 separately approved and shipped CR/repository/webhook/verifier-folder read/write contracts with SDK/MCP projections. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.

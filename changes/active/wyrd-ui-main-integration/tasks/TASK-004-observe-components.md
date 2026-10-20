@@ -1,7 +1,7 @@
 # TASK-004 — Observe component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-022, REQ-028, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.

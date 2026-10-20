@@ -770,6 +770,101 @@ test('TASK-027: Pointer edit cancellation', async () => {
   expect(box()).toEqual(['1 / span 8', '1 / span 7']);
   expect(onlayout).toHaveBeenCalledOnce();
   view.unmount();
+
+  // A host that never echoes: every completion of a held gesture ends it, so later movement and release are inert.
+  const quiet = vi.fn();
+  const held = render(WyrdView, { doc: laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 } }), executor: chart.executor, onlayout: quiet });
+  const heldGrip = held.getByRole('button', { name: 'Move or resize a' });
+  const heldCorner = panel(held.container, 'a').querySelector('.corner')!;
+  const at = () => [panel(held.container, 'a').style.gridColumn, panel(held.container, 'a').style.gridRow];
+  const sibling = held.getByRole('button', { name: 'Move or resize b' });
+  sibling.focus();
+  await fireEvent.keyDown(sibling, { key: 'ArrowDown' });
+  await fireEvent.keyDown(sibling, { key: 'Enter' });
+  expect(quiet).toHaveBeenCalledOnce();
+  const ends = [(grip: HTMLElement) => grip.blur(), (grip: HTMLElement) => fireEvent.keyDown(grip, { key: 'Enter' })];
+  for (const [index, finish] of ends.entries()) {
+    for (const handle of [heldGrip, heldCorner]) {
+      const before = quiet.mock.calls.length;
+      heldGrip.focus();
+      await fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0, pointerId: 10 + index });
+      await fireEvent.pointerMove(handle, { clientX: 0, clientY: 52, pointerId: 10 + index });
+      await finish(heldGrip);
+      await tick();
+      expect(quiet).toHaveBeenCalledTimes(before + 1);
+      const settled = at();
+      expect(panel(held.container, 'a').classList.contains('editing')).toBe(false);
+      await fireEvent.pointerMove(handle, { clientX: 0, clientY: 156, pointerId: 10 + index });
+      expect(at()).toEqual(settled);
+      await fireEvent.pointerUp(handle, { clientX: 0, clientY: 156, pointerId: 10 + index });
+      expect(at()).toEqual(settled);
+      expect(quiet).toHaveBeenCalledTimes(before + 1);
+      // Each callback keeps the sibling's earlier edit.
+      expect(quiet.mock.lastCall![0].panels[1].layout).toEqual({ x: 8, y: 1, w: 4, h: 6 });
+    }
+  }
+  // Completing before any movement reports nothing and leaves nothing listening.
+  const steady = at();
+  heldGrip.focus();
+  await fireEvent.pointerDown(heldGrip, { button: 0, clientX: 0, clientY: 0, pointerId: 20 });
+  heldGrip.blur();
+  await fireEvent.pointerMove(heldGrip, { clientX: 0, clientY: 104, pointerId: 20 });
+  await fireEvent.pointerUp(heldGrip, { clientX: 0, clientY: 104, pointerId: 20 });
+  expect(at()).toEqual(steady);
+  const settledCalls = quiet.mock.calls.length;
+  expect(settledCalls).toBe(5);
+  // A fresh gesture afterwards still completes exactly once.
+  await fireEvent.pointerDown(heldCorner, { button: 0, clientX: 0, clientY: 0, pointerId: 21 });
+  await fireEvent.pointerMove(heldCorner, { clientX: 0, clientY: 52, pointerId: 21 });
+  await fireEvent.pointerUp(heldCorner, { clientX: 0, clientY: 52, pointerId: 21 });
+  expect(quiet).toHaveBeenCalledTimes(settledCalls + 1);
+
+  // Losing editing mid-gesture, by narrowing or by the host dropping its handler, discards only the preview.
+  const kept = at();
+  const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1000);
+  const notify = () => (ResizeObserver as unknown as { notify(): void }).notify();
+  try {
+    notify();
+    await tick();
+    for (const focused of [true, false]) {
+      for (const corner of [false, true]) {
+        const grip = held.getByRole('button', { name: 'Move or resize a' });
+        const handle = corner ? panel(held.container, 'a').querySelector('.corner')! : grip;
+        if (focused) grip.focus();
+        await fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0, pointerId: 30 });
+        await fireEvent.pointerMove(handle, { clientX: 0, clientY: 104, pointerId: 30 });
+        expect(at()).not.toEqual(kept);
+        width.mockReturnValue(500);
+        notify();
+        await tick();
+        expect(held.queryByRole('button', { name: /Move or resize/ })).toBeNull();
+        await fireEvent.pointerMove(handle, { clientX: 0, clientY: 156, pointerId: 30 });
+        await fireEvent.pointerUp(handle, { clientX: 0, clientY: 156, pointerId: 30 });
+        width.mockReturnValue(1000);
+        notify();
+        await tick();
+        expect(at()).toEqual(kept);
+        expect(held.container.querySelector('.editing')).toBeNull();
+        expect(quiet).toHaveBeenCalledTimes(settledCalls + 1);
+      }
+    }
+    for (const focused of [true, false]) {
+      const grip = held.getByRole('button', { name: 'Move or resize a' });
+      if (focused) grip.focus();
+      await fireEvent.pointerDown(grip, { button: 0, clientX: 0, clientY: 0, pointerId: 40 });
+      await fireEvent.pointerMove(grip, { clientX: 0, clientY: 104, pointerId: 40 });
+      await held.rerender({ onlayout: undefined });
+      expect(held.queryByRole('button', { name: /Move or resize/ })).toBeNull();
+      await fireEvent.pointerUp(grip, { clientX: 0, clientY: 104, pointerId: 40 });
+      await held.rerender({ onlayout: quiet });
+      expect(at()).toEqual(kept);
+      expect(held.container.querySelector('.editing')).toBeNull();
+      expect(quiet).toHaveBeenCalledTimes(settledCalls + 1);
+    }
+  } finally {
+    width.mockRestore();
+  }
+  held.unmount();
 });
 
 test('TASK-027: Narrow views', () => {

@@ -5,6 +5,8 @@ points without searching crate internals.
 
 - `examples/python/` contains Python examples.
 - `examples/rust/` contains Rust examples.
+- `examples/quickstart/` is the docsite Quickstart: one YAML file and one
+  script that verify a passing and a failing reply on a local server.
 - `examples/gateway-setup/` sets up named provider deployments with the
   installed CLI on a local server.
 - `examples/support-desk/` is the canonical verified Service, the same story

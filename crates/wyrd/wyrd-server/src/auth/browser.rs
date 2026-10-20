@@ -532,7 +532,7 @@ mod tests {
         );
         let found = session_cookies(&headers);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].0.as_ref().map(|slug| slug.as_str()), Some("acme"));
+        assert_eq!(found[0].0.as_ref().map(wyrd_spec::TenantSlug::as_str), Some("acme"));
         assert_eq!(found[0].1, "a.1");
         assert!(found[1].0.is_none());
     }

@@ -270,7 +270,7 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
         created
             .headers
             .get(header::CACHE_CONTROL)
-            .map(|v| v.as_bytes()),
+            .map(axum::http::HeaderValue::as_bytes),
         Some(b"no-store".as_slice())
     );
     assert_eq!(created.body["tenant"], json!(acme));

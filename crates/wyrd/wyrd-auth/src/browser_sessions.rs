@@ -68,6 +68,11 @@ pub struct CreatedBrowserSession {
 }
 
 impl std::fmt::Debug for CreatedBrowserSession {
+    /// Formats the resolved session and omits the cookie value, so logging a
+    /// created session never discloses the only copy of its secret.
+    ///
+    /// # Errors
+    /// Returns the formatter's own error when writing to it fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreatedBrowserSession")
             .field("session", &self.session)
@@ -85,6 +90,11 @@ pub struct BegunBrowserLogin {
 }
 
 impl std::fmt::Debug for BegunBrowserLogin {
+    /// Formats the provider authorization URL and omits the login-transaction
+    /// binding, which only the browser may hold.
+    ///
+    /// # Errors
+    /// Returns the formatter's own error when writing to it fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BegunBrowserLogin")
             .field("authorization_url", &self.authorization_url)
@@ -103,6 +113,11 @@ pub struct BrowserSessions {
 }
 
 impl std::fmt::Debug for BrowserSessions {
+    /// Formats only the type name; the issuer's signing key and the store
+    /// handles it composes are never written.
+    ///
+    /// # Errors
+    /// Returns the formatter's own error when writing to it fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserSessions").finish_non_exhaustive()
     }
@@ -127,6 +142,10 @@ impl BrowserSessions {
     /// so a provider redirect replayed into another browser completes
     /// nothing. The redirect URI is the callback on `origin`. Nothing is
     /// audited: initiation evaluates no principal permission.
+    ///
+    /// The login state commits before the binding reaches the browser. When
+    /// that response is lost the state simply expires unused; the browser
+    /// begins a new sign-in, which binds fresh state.
     ///
     /// # Errors
     /// Returns the refusals of [`HumanConnections::begin_bound`]: the one
@@ -164,6 +183,12 @@ impl BrowserSessions {
     /// stores only the new session's digest, bound to the key's credential
     /// id, and commits; one allowed `auth.login` event is then staged. A
     /// refusal for a known tenant stages its denied exchange event.
+    ///
+    /// The session commits before its cookie value reaches the browser, and
+    /// only its digest is stored, so a value lost in delivery cannot be
+    /// reconstructed. The orphaned session grants nothing to anyone without
+    /// the value and expires on its absolute deadline; retrying recovery
+    /// creates a fresh session.
     ///
     /// # Errors
     /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key or
@@ -497,6 +522,9 @@ fn session_invalid() -> WyrdError {
     }
 }
 
+/// Unit tests of the pure cookie-routing and permission-projection helpers;
+/// store-backed session behavior is proven by the server's browser-session
+/// integration tests.
 #[cfg(test)]
 mod tests {
     use wyrd_runtime::{Permission, PermissionSet};

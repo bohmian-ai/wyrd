@@ -8,6 +8,16 @@
 //! `Origin` to equal the origin the request arrived at exactly; the provider
 //! callback relies on its bound one-use login transaction instead. Every
 //! response is `no-store`.
+//!
+//! Each mutation commits its durable state before its `Set-Cookie` is
+//! delivered. A lost response therefore leaves committed state the browser
+//! never learns of, with the consequences each owner documents: unused login
+//! state expires and a new sign-in replaces it
+//! ([`BrowserSessions::begin`]); a session undelivered from recovery or the
+//! provider callback cannot be recovered from its digest, and retrying
+//! recovery or signing in again creates a fresh one
+//! ([`BrowserSessions::recover`]); and a repeated logout is safe
+//! ([`BrowserSessions::logout`]).
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
@@ -520,6 +530,8 @@ pub async fn logout(
     ))
 }
 
+/// Unit tests of the store-free cookie parsing, origin check and cookie
+/// attribute helpers.
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};

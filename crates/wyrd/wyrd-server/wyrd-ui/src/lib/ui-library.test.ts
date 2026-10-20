@@ -113,6 +113,14 @@ test('TASK-003: Validated portable rendering', async () => {
   const bar = render(Chart, { input: { type: 'bar', sql: 'SELECT 1', x: 'model', y: ['runs'] }, result: { state: 'populated', data: bars } });
   expect(bar.getByRole('img', { name: 'Bar chart: a 3, b 12' })).toBeInTheDocument();
   bar.unmount();
+  // Dense bars never overprint: values drop and category text thins to a stride, and every bar keeps its full title.
+  const dense = render(Chart, { input: { type: 'bar', sql: 'SELECT 1', x: 'model', y: ['runs'] }, result: { state: 'populated', data: { ...bars, rows: Array.from({ length: 48 }, (_, index) => [`model-${index}`, index]), terminal: terminal(48) } } });
+  const axis = dense.container.querySelectorAll('text.axis').length;
+  expect(dense.container.querySelectorAll('text.value')).toHaveLength(0);
+  expect(axis).toBeGreaterThan(0);
+  expect(axis).toBeLessThan(48);
+  expect(dense.container.querySelectorAll('rect.bar title')).toHaveLength(48);
+  dense.unmount();
   const stat = render(Chart, { input: { type: 'stat', sql: 'SELECT 1', unit: 'runs' }, result: { state: 'populated', data: { columns: [{ name: 'n', data_type: 'Int64', nullable: false }], rows: [['12400']], terminal: terminal(1) } } });
   expect(stat.container.querySelector('.stat')).toHaveTextContent('12,400runs');
   stat.unmount();

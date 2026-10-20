@@ -112,18 +112,36 @@
 
   const bars = $derived(data && input.type === 'bar' && result.state === 'populated' ? barRows(data, input.x, input.y) : []);
   const barMax = $derived(Math.max(0, ...bars.flatMap((row) => row.values.map((value) => value ?? 0))) || 1);
-  /** One drawn bar per category × `y`, positioned across the plot width. */
+  /** Width of one 10px Fragment Mono glyph, for fitting bar text without measuring. */
+  const GLYPH = 6;
+  /** Longest category text drawn under a bar; the full name stays in the tooltip and aria-label. */
+  const MAX_CHARS = 16;
+  /**
+   * One drawn bar per category × `y`, positioned across the plot width. Values
+   * are drawn only when every value fits its slot, and category text is thinned
+   * to every `stride`-th bar and clamped inside the plot, so dense results never
+   * overprint.
+   */
   const barCells = $derived.by(() => {
     if (input.type !== 'bar') return [];
     const ys = input.y;
     const cells = bars.flatMap((row) =>
-      row.values.map((value, position) => ({ label: ys.length > 1 ? `${row.label} · ${ys[position]}` : row.label, value }))
+      row.values.map((value, position) => {
+        const label = ys.length > 1 ? `${row.label} · ${ys[position]}` : row.label;
+        const text = label.length > MAX_CHARS ? `${label.slice(0, MAX_CHARS - 1)}…` : label;
+        return { label, text, value, shown: value === null ? '—' : fmtNumber(value) };
+      })
     );
     const slot = (W - PAD.left - PAD.right) / Math.max(1, cells.length);
     const width = Math.min(48, slot * 0.7);
+    const values = Math.max(...cells.map((cell) => cell.shown.length)) * GLYPH + 4 <= slot;
+    const stride = Math.ceil((Math.max(...cells.map((cell) => cell.text.length)) * GLYPH + 8) / slot);
     return cells.map((cell, index) => {
       const height = ((cell.value ?? 0) / barMax) * (H - PAD.top - PAD.bottom);
-      return { ...cell, x: PAD.left + index * slot + (slot - width) / 2, width, y: H - PAD.bottom - height, height };
+      const x = PAD.left + index * slot + (slot - width) / 2;
+      const half = (cell.text.length * GLYPH) / 2;
+      const labelX = index % stride === 0 ? Math.min(Math.max(x + width / 2, half), W - half) : undefined;
+      return { ...cell, x, width, y: H - PAD.bottom - height, height, values, labelX };
     });
   });
 
@@ -238,13 +256,13 @@
           class="plot bars"
           viewBox="0 0 {W} {H}"
           role="img"
-          aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : fmtNumber(cell.value)}${unitLabel}`).join(', ')}"
+          aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
         >
           <line class="grid" x1="0" x2={W} y1={H - PAD.bottom} y2={H - PAD.bottom} />
           {#each barCells as cell, index (index)}
-            <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height} />
-            <text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.value === null ? '—' : fmtNumber(cell.value)}</text>
-            <text class="axis" x={cell.x + cell.width / 2} y={H - 4} text-anchor="middle">{cell.label}</text>
+            <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
+            {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.shown}</text>{/if}
+            {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
           {/each}
         </svg>
       {:else if input.type === 'stat'}

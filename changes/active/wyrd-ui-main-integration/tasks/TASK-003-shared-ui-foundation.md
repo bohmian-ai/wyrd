@@ -136,3 +136,41 @@ Stop for a changed public contract, credential/security or durable ownership req
 - [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../AGENTS.md), [design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-design.md).
 - [Execution](../../../../changes/implementation-execution.md), [TDD](../../../../changes/spec-driven-development.md), [testing](../../../../TESTING.md).
 - [Bifrost contracts](../../../../architecture/bifrost-design.md), [security](../../../../architecture/wyrd-security-posture.md), [deployment/release](../../../../architecture/operations/deployment-and-release.md).
+
+## Implementation Evidence
+
+Commits: `9e8e14998`, `0bc456a07`, `695ca914d`, `0ccdeef86`, `26f881d6f`, `b596bfe6b`, `2091a1d09`, `56a6e3bee`, `090920617`, `e8b0c42f2`, `7acf4b55e`.
+
+Reuse map, as revalidated:
+- **Typed binds on MCP.** `QueryArguments` and `to_request` in `src/mcp/bifrost.rs` were extended with the shared `QueryParam`. No new route was added.
+- **Bounded positional result.** This projection moved once into `wyrd_queue::json_result::JsonResultBuilder`, and both MCP `collect` and the TypeScript SDK `collect` call it.
+- **Session-bound BFF.** It reads through `WyrdClient.forBrowserSession` with the Rust-owned session from TASK-001-R1. One gap needed a fix: `Bifrost::connect_with` dialed gRPC ingest even for a browser-session client, and that client is HTTP-only. A browser-session client now gets the existing `query_only` shape through a single private constructor, `from_sink`/`read_only`.
+- **Executors.** `nodeExecutor` wraps the SDK and `mcpExecutor` wraps `App.callServerTool` (MCP `Client.callTool` in tests). Live tests reuse the SDK's `serverTest`/`declared`/`fixture`. Component tests and the gallery share `ui-fixtures.ts`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Six approved exports build from package contents; browser exports never import wyrd-ai/native code | `packages/ui/package.json` exports; `nodeExecutor` only under the Node export | `pnpm check`, `pnpm build` (UI + package + example); scenario 1 export assertions | PASS |
+| Catalog generated and drift-checked; only component input/action schemas define dispatch | `packages/ui/scripts/catalog.ts`; `validatePanel`/`validateIntent` in `loaders.ts` | `mise run codegen:check`; scenarios 1 and 3 | PASS |
+| Chart schema errors and query failures visible; Open in Query keeps exact SQL and typed binds | `shapeChart`, `chartParams`, `ChartProps.executed` | Scenario 1 (T1 states), scenario 3, T4 tool-call assertion on `params [from,to]` | PASS |
+| CardHeader keeps exact versions, paging/version failures, copied identity, declared actions | `loadCardHeader`, `CardHeader.svelte` | Scenarios 1 and 3; T5 header populated/denied | PASS |
+| Six reads identical across SDK and MCP; malformed binds, duplicate names/nulls, ceilings, cancellation, authorization | `ui-library.integration.test.ts` "Identical authorized reads" | Scenario 2 live command: 1 passed | PASS |
+| T4 built HTML behind AppBridge; T5 Node populated/empty/denied; BFF cross-tenant and malformed inputs expose no credential or tenant; custom app has no credentials | `packages/ui/dist/wyrd-view.html`, `routes/t/[tenantKey]/ui/load/+server.ts`, `examples/ui-app` | Scenario 4 live command: 1 passed | PASS |
+| Browser-session Bifrost connects without an ingest channel | `bifrost/facade.rs::connect_with`, `client.rs::is_browser_session` | `wyrd-client` lib `client::tests::browser_session_bifrost_connects_without_an_ingest_channel` (fails with the branch disabled, passes with it); `wyrd-client` lib 265/265 | PASS |
+| MCP parameter argument/schema assertions; positional-result regression kept | `mcp/bifrost.rs` tests; `query/collect.rs` | `query_schema_is_closed_bounded_and_has_no_path_selector`, `query_result_is_positional_and_counts_exact_structured_json_bytes`: passed | PASS |
+| `scripts/build.sh` production closure ships the real wyrd-ai addon and runtime deps | `bundle()`: `ts:build` in the bundle profile, then `npm pack` of the SDK, `pnpm add --no-optional`, and the host `.node` beside the SDK entry; `ts:build` honours non-dev `WYRD_PROFILE` | `WYRD_PROFILE=dev scripts/build.sh bundle` on darwin-arm64: exit 0, `import("wyrd-ai")` loads; release/ui has `apache-arrow`, the packed SDK, and the host addon, with no registry addon | PASS (darwin-arm64) |
+| Gates | — | `fmt`, `lints`, `check:deps`, `codegen:check`, `ts:napi:check`, `ts:pack:check`, UI `pnpm test` (33/33), `git diff --check` | PASS |
+
+Exact commands run:
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'`
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Dependent loads and safe actions$'`
+- The scenario 2 and scenario 4 `with-test-postgres.sh` commands above.
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes)'`
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector)'`
+- `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=client::tests::browser_session_bifrost_connects_without_an_ingest_channel)'`
+
+Material limits (unverified, not passes):
+- **Degraded terminals.** Degraded-terminal parity is not produced by a live server. Scenario 2 proves success, failure, and limit terminals live. Degraded projection rests on the shared `JsonResultBuilder::finish`, which both surfaces call.
+- **Linux bundles and images.** The production closure was proven on darwin-arm64 only. Linux x86_64/arm64 bundles and the debian/rocky images are proven by the release workflow's `scripts/build.sh bundle` and image jobs. They were not run locally.
+- **Human visual checkpoint: PENDING.** Nobody has yet inspected `/_gallery` (Chart, CardHeader and every primitive in light and dark, desktop and mobile), the two custom-app example pages, or the AppBridge artifact. Every owned component stays unaccepted until that inspection is recorded.
+
+Non-goals stayed excluded: no per-component routes, generic write dispatcher, A2UI adapter, saved-view store, Ask service, production MCP registration (TASK-011), or npm publishing.

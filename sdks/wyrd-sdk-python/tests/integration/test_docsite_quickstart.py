@@ -12,6 +12,7 @@ import contextlib
 import io
 import runpy
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -43,51 +44,48 @@ def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def test_docsite_quickstart_verifies_and_repeats(reader: Path) -> None:
+@pytest.fixture
+def server(reader: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WyrdTestServer]:
+    """A server the reader's script reaches as the tenant administrator `wyrd server dev` saves."""
     with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
-        with pytest.MonkeyPatch.context() as env:
-            # The reader acts as the tenant administrator `wyrd server dev` saves.
+        with monkeypatch.context() as env:
             env.setenv("WYRD_SERVER_URL", server.base_url)
             env.setenv("WYRD_GRPC_URL", server.grpc_url)
             env.setenv("WYRD_API_KEY", server.tenant_admin_key())
-            for _ in range(2):
-                script, printed = run_quickstart(reader)
-                passed, failed = script["results"]
-
-                assert (passed.verdict, failed.verdict) == ("passed", "failed")
-                for result in (passed, failed):
-                    assert (result.subject.kind.name, result.subject.name) == (
-                        "Service",
-                        "support-reply",
-                    )
-                    assert (result.verifier.name, str(result.verifier.version)) == (
-                        "refund-limit",
-                        "1.0.0",
-                    )
-                    assert result.subject.uid is not None and result.verifier.uid is not None
-                [kept], [broken] = passed.requirements, failed.requirements
-                assert (kept["id"], kept["outcome"]) == ("within-limit", "passed")
-                assert (broken["id"], broken["outcome"], broken["actual"]) == (
-                    "within-limit",
-                    "failed",
-                    250,
-                )
-                assert broken["reason"] in printed
-                assert "passed" in printed and "failed" in printed
+            yield server
 
 
-def test_docsite_quickstart_refuses_insufficient_authority(reader: Path) -> None:
-    with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
-        with pytest.MonkeyPatch.context() as env:
-            env.setenv("WYRD_SERVER_URL", server.base_url)
-            env.setenv("WYRD_GRPC_URL", server.grpc_url)
-            env.setenv("WYRD_API_KEY", server.tenant_admin_key())
-            run_quickstart(reader)
+def test_docsite_quickstart_verifies_and_repeats(reader: Path, server: WyrdTestServer) -> None:
+    for _ in range(2):
+        script, printed = run_quickstart(reader)
+        passed, failed = script["results"]
 
-        # The subject is declared and pulled; this caller may read it but not run its Verifier.
-        viewer = server.bootstrap_service(["viewer"], name="quickstart-viewer")
-        client = WyrdClient(server_url=server.base_url, credential=viewer, grpc_url=server.grpc_url)
-        state = WyrdState.from_path(reader / ".wyrd-bundle", client)
-        with pytest.raises(WyrdError) as raised:
-            state.run().observe.verify("refund-limit", {"refund": 40})
-        assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+        assert (passed.verdict, failed.verdict) == ("passed", "failed")
+        for result in (passed, failed):
+            assert (result.subject.kind.name, result.subject.name) == ("Service", "support-reply")
+            assert (result.verifier.name, str(result.verifier.version)) == ("refund-limit", "1.0.0")
+            assert result.subject.uid is not None and result.verifier.uid is not None
+            assert str(result.subject) in printed and str(result.verifier) in printed
+        [kept], [broken] = passed.requirements, failed.requirements
+        assert (kept["id"], kept["outcome"]) == ("within-limit", "passed")
+        assert (broken["id"], broken["outcome"], broken["actual"]) == (
+            "within-limit",
+            "failed",
+            250,
+        )
+        assert f"passed: {kept['reason']}" in printed
+        assert f"failed: {broken['reason']}" in printed
+
+
+def test_docsite_quickstart_refuses_insufficient_authority(
+    reader: Path, server: WyrdTestServer
+) -> None:
+    run_quickstart(reader)
+
+    # The subject is declared and pulled; this caller may read it but not run its Verifier.
+    viewer = server.bootstrap_service(["viewer"], name="quickstart-viewer")
+    client = WyrdClient(server_url=server.base_url, credential=viewer, grpc_url=server.grpc_url)
+    state = WyrdState.from_path(reader / ".wyrd-bundle", client)
+    with pytest.raises(WyrdError) as raised:
+        state.run().observe.verify("refund-limit", {"refund": 40})
+    assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"

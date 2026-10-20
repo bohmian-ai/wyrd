@@ -4,6 +4,14 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
+      "version": {
+        "type": "string",
+        "const": "wyrd.view/v1"
+      },
+      "catalogId": {
+        "type": "string",
+        "const": "wyrd.ui/v1"
+      },
       "title": {
         "type": "string",
         "minLength": 1
@@ -72,6 +80,8 @@
       }
     },
     "required": [
+      "version",
+      "catalogId",
       "range",
       "panels"
     ],

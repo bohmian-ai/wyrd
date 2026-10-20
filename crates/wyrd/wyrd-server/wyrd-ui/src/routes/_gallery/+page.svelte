@@ -35,6 +35,8 @@
   const table = { ...series, terminal: terminal(4, 'degraded') };
   const versions = { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } as const;
   const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
     title: 'Ranker overview',
     range: { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' },
     panels: [

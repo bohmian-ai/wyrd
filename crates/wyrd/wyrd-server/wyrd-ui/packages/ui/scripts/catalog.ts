@@ -2,11 +2,11 @@
 // Usage: node scripts/catalog.ts [--check]   (--check exits non-zero on drift)
 import { readFileSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
-import { components, ViewDocumentSchema } from '../src/lib/schemas.ts';
+import { CATALOG_ID, components, ViewDocumentSchema } from '../src/lib/schemas.ts';
 
 const path = new URL('../src/lib/catalog.json', import.meta.url);
 const catalog = {
-  catalogId: 'wyrd.ui/v1',
+  catalogId: CATALOG_ID,
   view: z.toJSONSchema(ViewDocumentSchema),
   components: Object.fromEntries(
     Object.entries(components).map(([name, spec]) => [

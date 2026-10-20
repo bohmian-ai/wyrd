@@ -125,7 +125,9 @@
     const [low, high] = [Math.min(0, ...values), Math.max(0, ...values)];
     return high > low ? { low, high } : { low: 0, high: 1 };
   });
-  const barY = (value: number) => H - PAD.bottom - ((value - barDomain.low) / (barDomain.high - barDomain.low)) * (H - PAD.top - PAD.bottom);
+  /** With negative bars, one value line stays clear below the lowest bar so it never meets the category text. */
+  const barFloor = $derived(H - PAD.bottom - (barDomain.low < 0 ? 14 : 0));
+  const barY = (value: number) => barFloor - ((value - barDomain.low) / (barDomain.high - barDomain.low)) * (barFloor - PAD.top);
   /** Width of one 10px Fragment Mono glyph, for fitting bar text without measuring. */
   const GLYPH = 6;
   /** Longest category text drawn under a bar; the full name stays in the tooltip and aria-label. */

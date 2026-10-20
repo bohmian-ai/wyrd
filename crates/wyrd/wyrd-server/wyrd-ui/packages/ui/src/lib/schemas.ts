@@ -181,12 +181,19 @@ export const PanelSchema = z
   .object({ id: z.string().min(1), component: z.string().min(1), input: z.unknown() })
   .strict();
 
+/** The catalog every view document is validated against. */
+export const CATALOG_ID = 'wyrd.ui/v1';
+/** The view-document format version. */
+export const VIEW_VERSION = 'wyrd.view/v1';
+
 /**
  * A view document: catalog panels under one range, resolved once per load so
  * every panel reads the same bounds. A panel that fails validation fails alone.
  */
 export const ViewDocumentSchema = z
   .object({
+    version: z.literal(VIEW_VERSION),
+    catalogId: z.literal(CATALOG_ID),
     title: z.string().min(1).optional(),
     range: RangeSchema,
     panels: z

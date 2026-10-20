@@ -205,6 +205,8 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
 test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) => {
   // T4: the built HTML renders a view document through host tools/call alone.
   const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
     title: 'Ranker',
     range: { from: '2026-10-19T00:00:00Z', to: '2026-10-19T12:00:00Z' },
     panels: [

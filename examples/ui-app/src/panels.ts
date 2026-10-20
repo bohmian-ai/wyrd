@@ -20,6 +20,8 @@ GROUP BY 1 ORDER BY 1`,
 
 /** The same panels as a view document, as an agent would author it. */
 export const dashboard = {
+  version: 'wyrd.view/v1',
+  catalogId: 'wyrd.ui/v1',
   title: 'Support desk',
   range,
   panels: [

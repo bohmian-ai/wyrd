@@ -82,7 +82,7 @@ test('TASK-003: Validated portable rendering', async () => {
   // Every catalog component and its declared states are generated, with view-document shape.
   expect(Object.keys(catalog.components)).toEqual(['Chart', 'CardHeader']);
   expect(catalog.components.Chart.emits.map((action) => action.name)).toEqual(['chart.range', 'chart.open_in_query']);
-  expect(catalog.view.required).toEqual(['range', 'panels']);
+  expect(catalog.view.required).toEqual(['version', 'catalogId', 'range', 'panels']);
 
   // Timeseries: one line per series value, each with a distinct dash and marker in the legend.
   const plot = render(Chart, { input: timeseries, result: { state: 'populated', data: series } });
@@ -228,6 +228,8 @@ test('TASK-003: Validated portable rendering', async () => {
     mode: 'light',
     executor,
     doc: {
+      version: 'wyrd.view/v1',
+      catalogId: 'wyrd.ui/v1',
       title: 'Ranker',
       range: RANGE,
       panels: [
@@ -242,7 +244,12 @@ test('TASK-003: Validated portable rendering', async () => {
   mounted.destroy();
   expect(host.childElementCount).toBe(0);
   host.remove();
-  expect(validateView({ range: { last: '6x' }, panels: [] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '6x' }, panels: [] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  // A document from another format version or catalog is refused, never half-rendered.
+  const panels = [{ id: 'a', component: 'Chart', input: timeseries }];
+  expect(validateView({ version: 'wyrd.view/v2', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validateView({ version: 'wyrd.view/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).not.toHaveProperty('code');
 });
 
 test('TASK-003: Dependent loads and safe actions', async () => {
@@ -276,7 +283,7 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   // A relative range resolves once per view load; every panel binds the same bounds.
   const pending: ((result: WireResult) => void)[] = [];
   const held = recording(() => new Promise<WireResult>((resolve) => pending.push(resolve)));
-  const doc = { range: { last: '6h' }, panels: [{ id: 'a', component: 'Chart', input: timeseries }, { id: 'b', component: 'Chart', input: { ...timeseries, title: 'B' } }] };
+  const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '6h' }, panels: [{ id: 'a', component: 'Chart', input: timeseries }, { id: 'b', component: 'Chart', input: { ...timeseries, title: 'B' } }] };
   const onaction = vi.fn();
   const view = render(WyrdView, { doc, executor: held.executor, onaction });
   await waitFor(() => expect(held.calls).toHaveLength(2));
@@ -286,7 +293,7 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   expect(Date.parse(first[1]) - Date.parse(first[0])).toBe(6 * 3_600_000);
 
   // A replaced document aborts in-flight loads and a late result is never accepted.
-  await view.rerender({ doc: { range: RANGE, panels: [{ id: 'a', component: 'Chart', input: { ...timeseries, title: 'Replaced' } }] }, executor: held.executor, onaction });
+  await view.rerender({ doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'a', component: 'Chart', input: { ...timeseries, title: 'Replaced' } }] }, executor: held.executor, onaction });
   await waitFor(() => expect(held.calls).toHaveLength(3));
   expect(held.calls[0].signal?.aborted).toBe(true);
   expect(held.calls[1].signal?.aborted).toBe(true);

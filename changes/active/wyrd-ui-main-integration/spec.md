@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 10
+revision: 12
 status: approved
 ---
 
@@ -25,6 +25,14 @@ with Rust-owned opaque browser sessions and write the remediation task after
 rejecting additional UI deployment secrets and environment variables. This is
 approval of that decision and its necessary implementation/task scope; it is
 not a claim that revision-9 implementation or visual acceptance passed.
+
+Revision 11 records the caller's explicit approval of the two primary deployed
+journeys and request for `$wyrd-plan` on 2026-10-20. Conventional UI and
+agent-harness MCP App investigations are required; AskPanel/Ask service are
+deferred, and saved views are an independent deferred capability. This revision
+changes scope, acceptance and ordering only. TASK-003's foundation obligations,
+existing session remediation, and prior immutable review subjects remain intact.
+No implementation, browser-host compatibility or journey PASS is implied.
 
 Original baseline: `d3ce50626a8e380475c0561d8d53144c212e8603`. On the caller's
 instruction, destination branch `wyrd-ui-main-integration` was fast-forwarded
@@ -246,7 +254,8 @@ implementor never sees two versions of anything.
 
 - **REQ-007 — Shell.** The shipped UI shell is the canvas shell (REQ-021):
   left rail, top bar with breadcrumb, time picker, Live toggle, drawer, and
-  the rail's "Find or ask" entry that opens the Ask panel. It is built new
+  no Ask entry or embedded conversation in this delivery. AskPanel is deferred
+  by revision 11. It is built new
   from the canvas `Main` board; nothing from the old shell is kept.
 - **REQ-008 — Card inventory.** The Cards page, built from `CardInventory`
   (REQ-030) to the canvas: search, filter, and navigation over current
@@ -313,7 +322,7 @@ implementor never sees two versions of anything.
   together. A gallery checkpoint must cover keyboard/focus behavior, touch
   interaction, long content, and narrow-container overflow where applicable.
   Pause before beginning the next dependent slice until the human has inspected
-  the current slice. Every inventory component must be fully implemented, tested,
+  the current slice. Every in-scope inventory component must be fully implemented, tested,
   and visually accepted on desktop and mobile before the library ships or
   conventional pages begin. Fixture-only progress cannot satisfy that gate.
 
@@ -476,18 +485,20 @@ not protocol authority.
   Verifiers, not Claims. A Repos page manages webhook connections and the
   `wyrd.toml` path. No CR server contract exists on main; live CR pages wait
   for that separately specified server contract and the UI never owns CR state.
-- **REQ-030 — The component library and the four UI use cases.** The
-  component library is the most important deliverable of this change. Every
-  component works in all four UI use cases. "The four UI use cases" means
-  exactly these four, wherever this packet uses the phrase; they are not Card
-  kinds, workspaces, or personas:
+- **REQ-030 — The component library and its UI hosts.** The
+  component library is the most important deliverable of this change. Every in-scope component works in use cases 1–3 below. The fourth host is
+  retained as future context, not a delivery or acceptance dependency. References
+  in unchanged TASK-003 material to four-host foundation proof retain their
+  existing renderer/BFF checks; they do not require an Ask service. The two
+  primary deployed journeys are conventional UI and agent-harness MCP Apps
+  (REQ-034/035); custom-app portability remains required.
 
   | # | Use case | Who produces the view | How it is drawn | Who supplies the data |
   |---|---|---|---|---|
   | 1 | Shipped UI (conventional) | Wyrd writes the page | SvelteKit page; data loads run in the BFF | BFF, with the signed-in browser session's credential |
   | 2 | A user builds their own UI with an agent (e.g. Claude) | The agent writes Svelte code using `wyrd-ai-ui`, or writes a view document | The user's own app | The user's server, with the user's own Wyrd credential |
   | 3 | MCP App ("why did this fail? show me") | A Wyrd MCP tool returns a view document | The MCP client hosting the chat (Claude, VS Code, ChatGPT, …) draws `wyrd-ai-ui` inside its sandboxed iframe | The MCP App calls Wyrd's existing read tools as the same MCP caller |
-  | 4 | Runtime UI in Wyrd (A2UI-style) | An agent answers a question in the Ask panel | The same view-document renderer, inside the shipped UI | BFF, with the signed-in browser session's credential |
+  | 4 (deferred) | Runtime UI in Wyrd (A2UI-style) | An agent answers a question in the Ask panel | The same view-document renderer, inside the shipped UI | BFF, with the signed-in browser session's credential |
 
   **Package.** One new npm package, `wyrd-ai-ui`, in
   `crates/wyrd/wyrd-server/wyrd-ui/packages/ui/`, built with
@@ -517,7 +528,7 @@ not protocol authority.
   there. A loader is therefore split in two:
   - shared request planning, dependent-read sequencing, and result shaping are
     plain TypeScript with no imports from `wyrd-ai`, live in
-    `wyrd-ai-ui/loaders`, and run in all four use cases;
+    `wyrd-ai-ui/loaders`, and run in all in-scope hosts;
   - the part that actually fetches is an executor, one per place the code
     runs: Node.js uses `wyrd-ai` (`wyrd-ai-ui/node`); the MCP App uses MCP
     `tools/call` (`wyrd-ai-ui/mcp`); the shipped UI's browser calls the BFF.
@@ -666,7 +677,7 @@ not protocol authority.
   - MCP executor (`wyrd-ai-ui/mcp`): calls the MCP tools above through the
     ext-apps `App.callServerTool`, so reads run as the MCP caller with that
     caller's scopes. It makes no network request of its own.
-  - In the shipped UI's browser (Ask panel, gallery), the renderer uses a BFF
+  - In the shipped UI's browser (gallery and view-document consumers), the renderer uses a BFF
     endpoint `POST /t/[tenantKey]/ui/load` that takes `{component, input}`,
     runs the loader with the Node executor, and returns props. Credentials
     never reach the browser.
@@ -715,19 +726,19 @@ not protocol authority.
     "title": "Why refund answers failed on Tuesday",
     "range": {"from": "2026-10-14T00:00:00Z", "to": "2026-10-15T00:00:00Z"},
     "panels": [
-      {"id": "p1", "component": "Chart", "width": "full",
+      {"id": "p1", "component": "Chart", "layout": {"x": 0, "y": 0, "w": 8, "h": 6},
        "input": {"type": "timeseries", "sql": "SELECT …", "x": "t", "y": ["failed"]}},
-      {"id": "p2", "component": "VerificationResult", "width": "full",
+      {"id": "p2", "component": "VerificationResult", "layout": {"x": 8, "y": 0, "w": 4, "h": 6},
        "input": {"resultId": "…"}}
     ]
   }
   ```
   - `range` is either absolute `{from, to}` or relative `{last: "6h"}`
     (REQ-031). Panels inherit it unless their input sets one.
-  - `width` is `full` or `half`. Panels render in order. There is no other
-    layout language.
+  - Layout (REQ-036): a panel's optional `layout` places it on the view grid.
+    It is the only layout language; there is no `width` field.
   - A view document never contains query results, props, credentials, or
-    tokens. It is re-run as whoever views it (REQ-031).
+    tokens. It is re-run as whoever views it, including an unsaved view.
   - Validation: `version` and `catalogId` match; every `component` exists in
     the catalog; every `input` validates against that component's schema.
     An invalid panel renders an error naming the component and the failed
@@ -776,14 +787,13 @@ not protocol authority.
     `connectDomains`. Display modes: inline and fullscreen.
   - spec: MCP Apps 2026-01-26 (`modelcontextprotocol/ext-apps`).
 
-  **Use case 4 — Ask panel.** The rail's "Find or ask" opens the Ask panel on
-  every page. The user's question goes to the BFF, which calls a server Ask
-  endpoint that returns a text answer plus a view document; `WyrdView`
-  renders it through the BFF load endpoint; "Save" stores it as a saved view
-  (REQ-031). No Ask/agent endpoint exists on main (the Gateway's
-  `/v1/chat/completions` is model access, not an agent); the Ask endpoint is
-  a platform prerequisite specified separately. Until it ships, the Ask panel
-  is built and tested against fixture answers.
+  **Use case 4 — Ask panel (deferred).** A future AskPanel would send a
+  question to a separately approved agent-backed server endpoint and render its
+  text-plus-view answer. This change does not implement that endpoint, an
+  embedded agent runtime, conversation UI, or fixture AskPanel. The user's
+  existing harness owns conversation and model execution for use case 3.
+  Neither Ask nor saving is needed to generate, inspect, update or discard an
+  unsaved MCP App view.
 
   **Component inventory.** These are the components the approved canvas
   needs. "Prereq" means the data source is a platform prerequisite not yet
@@ -816,7 +826,7 @@ not protocol authority.
   | `ChartEditor` | ServiceCharts | `{cardRef, chartId?}` | `ServiceSpec.charts` | REQ-025 |
   | `ChangeRequestList`, `ChangeHeader`, `SubjectsTable`, `RevisionList`, `ActivityFeed`, `ChangeVerifierList`, `RequestVerificationForm`, `ReviewSubmission`, `Participants` | Changes, ChangeDetail, ChangeVerification | `{crId, revision?}` | none on main | REQ-029 |
   | `RepositoryList`, `WyrdTomlView`, `VerifierFolderTable` | Repos | `{repo}` | none on main | REQ-029 |
-  | `AskPanel` | rail entry (all pages) | `{question}` | Ask endpoint | Ask endpoint |
+  | `AskPanel` (deferred; excluded from shipping inventory) | future rail entry | future contract | none required in this change | separate future scope |
 
   (*Verify means Verify, VerifySession, VerifyDrift.) Primitives used inside
   these, also in `wyrd-ai-ui` but not in the catalog: `EmptyState`,
@@ -852,10 +862,16 @@ not protocol authority.
     data. Prereq components defer T5 until their prerequisite ships; they remain
     fixture-ready, not production-complete, and hold the full-library shipping
     gate until their real loading/actions and applicable T5 proof pass.
-  - T6 page journey: added when the page is assembled.
+  - T6 page journey: added when the page is assembled; REQ-034 requires a real
+    browser navigating the deployed page, not only imported handlers or jsdom.
   Fixtures for `populated` and `empty` are recorded from T5 runs by a script
   and checked in; `error` and prereq fixtures are hand-written and labeled.
-  No test calls a live model.
+  T1–T6 and deterministic MCP/browser regressions call no live model. REQ-035
+  adds a separate, explicitly invoked live-agent journey using existing local
+  readiness configuration. It is outside default tests, `gate` and unattended
+  CI; absence of credentials, a compatible host or browser is BLOCKED, not PASS.
+  Integrated change acceptance requires its recorded evidence. One successful
+  stochastic run establishes that run only, not a reliability claim.
 
   **Gallery (visualized).** A dev-only route `/_gallery` in the shipped app
   renders every catalog component in every state, light and dark, through
@@ -882,12 +898,15 @@ not protocol authority.
      `CompositionGraph`, Prompt, Model, `CardInventory`); Query; Verify
      (`VerifierGraph`, `VerificationResult`, `RequirementDetail`,
      `DriftFeatureTable`, `VerificationBindings`, `AttentionList`); Service
-     (`SignalBreakdownTable`, `ChartEditor`); Changes and Repos; `AskPanel`.
+     (`SignalBreakdownTable`, `ChartEditor`); Changes and Repos. AskPanel
+     and saved-view controls are deferred and excluded from this shipping gate.
   4. MCP App: resources capability, `ui://wyrd/view`, `ui.show_view`,
-     `ui.catalog`.
+     `ui.catalog`, and the complete REQ-035 agent investigation journey.
   5. Only then the conventional pages (REQ-007 to REQ-019, REQ-021,
      REQ-024 to REQ-029), each assembled from finished components with its
-     T6 journey. A page whose prerequisite has not shipped waits for it.
+     real-browser T6 journey (REQ-034). A page whose prerequisite has not
+     shipped waits for it. Other platform prerequisites remain blocking; only
+     Ask/saved views are removed from this delivery gate.
 
   The complete self-contained browser artifact needed for T4 is built during
   foundation/library verification against the fixture host. Step 4 registers
@@ -912,8 +931,50 @@ not protocol authority.
     requirement id, then queries `vala.drift.result_features` filtered by
     that Verifier and requirement id. No schema change.
 
-- **REQ-031 — Saved views (platform prerequisite).** A saved view is a view
-  document (REQ-030), never stored data. It is a tenant-scoped server resource,
+- **REQ-036 — View layout: placed, resizable panels.** A view document
+  lays its panels out on a grid the way a dashboard does, and a reader can
+  resize and move them. The layout lives in the document; the components do
+  not know their size.
+  - Grid: 12 columns spanning the view's width; rows are 40 CSS px. A panel's
+    `layout` is `{x, y, w, h}` in whole grid units: `0 ≤ x ≤ 11`,
+    `1 ≤ w ≤ 12`, `x + w ≤ 12`, `y ≥ 0`, `1 ≤ h ≤ 48`. A value outside these
+    bounds fails document validation.
+  - A panel without `layout` spans all 12 columns at its content height and
+    is placed below every panel before it in document order. Documents may
+    mix placed and unplaced panels.
+  - Panels never overlap on screen: where two layouts collide, the later
+    panel in document order moves down until it is clear. The document is
+    not rewritten by rendering.
+  - Components fill the box they are given. Content taller than its panel
+    scrolls inside the panel; it never draws over a neighbour. No catalog
+    component entry gains a size input; only the catalog's published
+    view-document schema gains `layout`.
+  - Narrow views: when the view is narrower than 720 CSS px, panels render as
+    one full-width column in `(y, x)` order and keep their `h`; resize and
+    move are off.
+  - Editing: `WyrdView` makes layout editable only when its host passes a
+    layout handler. Then a reader resizes a panel from its lower-right corner
+    and moves it by its drag handle; both snap to the grid, both have
+    keyboard equivalents (move with arrow keys, resize with Shift+arrow keys
+    on the focused handle, Escape cancels), and each completed change calls
+    the handler with the whole updated document. Without a handler, layout is
+    read-only. Hosts decide what to keep; reloading a document shows its
+    written layout.
+  - Persistence: none in this revision. Saving an edited layout arrives with
+    saved views (REQ-031); `ServiceSpec.charts` (REQ-025) gains no layout
+    field. In an MCP App, edits last for that render only.
+  - A2UI export (REQ-030) emits panels in `(y, x)` order and may drop
+    `layout`; layout never blocks that mapping.
+  - Non-goals: adding, removing or duplicating panels from the view;
+    collapsible rows; per-viewer layout memory; layout in the shipped pages
+    (use case 1), whose pages own their own layout.
+
+- **REQ-031 — Saved views (deferred, independent future capability).** A saved view is a view
+  document (REQ-030), never stored data. The remaining paragraph preserves
+  future product intent only: no saved-view backend, controls, sharing action or
+  SDK/MCP projection is required by this revision. Saving is independent of Ask
+  and does not block either primary journey. A future approved change must
+  define its server contracts before implementation. It is a tenant-scoped server resource,
   not a Card kind, readable and writable through HTTP and MCP so agents and every
   UI host share it. Each has an owner principal and visibility `private` or
   `tenant`; it is neither versioned nor reviewed. Opening it re-runs every panel
@@ -924,6 +985,61 @@ not protocol authority.
   chart that must be governed with its Service is promoted into
   `ServiceSpec.charts` (REQ-025), where it is versioned and reviewed in Change
   Requests.
+
+- **REQ-034 — Primary conventional UI journey.** TASK-012 establishes real
+  browser automation of the deployed production BFF and Rust server using
+  repository-managed Postgres, public login and session boundaries. Each
+  assembled page extends it with its actual user workflow: sign in, navigate,
+  inspect real data, interact, and verify the resulting visible state and server
+  reads. Time-aware pages exercise range changes and no stale overwrite;
+  identity-aware pages preserve exact Card versions and links. Cover populated,
+  empty, denied/error and cross-tenant refusal without fabricated domain data.
+  Browser navigation, JavaScript, focus/keyboard and applicable mobile behavior
+  must execute in a real engine, which may run headlessly. HTTP-client cookie
+  simulation, jsdom, imported handlers and screenshots alone are supporting
+  proof, not completion. Preserve per-page human inspection. TASK-013–026 own
+  page-specific closure; TASK-012 does not manufacture pages to test them early.
+
+- **REQ-035 — Primary agent-harness MCP App investigation journey.** A user
+  completes an unsaved investigation in an MCP App-capable agent harness with
+  no visit to the conventional Wyrd UI and no application-building step:
+
+  1. Ask a natural-language question. The real agent discovers `ui.catalog` and
+     valid component inputs and calls `ui.show_view` with its generated document.
+  2. The actual returned resource/document renders in the harness's sandboxed
+     browser app; its reads reach the real server as that viewer.
+  3. Send a follow-up in the same conversation. The agent uses that context to
+     refine the investigation and return an updated view; inspect its rendering.
+  4. Change the time range in the app (including chart brushing where applicable).
+     Inspect the new bounds in actual reads and visible results, consistent
+     bounds across affected panels and no acceptance of superseded results.
+  5. Exercise empty results, permission denials, query errors and malformed panel
+     inputs with honest visible outcomes, sibling isolation, tenant separation
+     and no credential exposure. Deterministic deployed-host companion tests may
+     force these failures; natural-language discovery/follow-up remain live-agent
+     proof. Do not require a model to reproduce every injected negative case.
+
+  TASK-011 owns this outcome. Reuse the existing coding-agent readiness owner
+  for local configuration, checkout docs, owned `wyrd server dev`, agent process
+  deadlines/cancellation, credential isolation and sanitized reports. Extend it
+  for actual conversation turns and connect its actual MCP results to a real
+  browser-capable App host using the existing ext-apps bridge. Do not implement
+  a production chat service or agent runtime in Wyrd. Browser and agent drivers
+  must belong to the same connected test session; manually copied documents,
+  hardcoded model outputs, fixture AppBridge answers, or independent CLI and
+  browser runs cannot satisfy this journey.
+
+  Record the exercised host/agent versions, source identity, conversation turns,
+  actual tool requests/results, browser interactions, visible outcomes and
+  authorized server evidence with secrets removed. Claim only exercised hosts.
+  Do not assume Claude Code/Codex CLI execution implies MCP App rendering. An
+  external host may be used only through its supported automation/extension
+  boundary. A minimal repository test host is acceptable only when it connects
+  the real agent conversation and real MCP connection to the actual AppBridge
+  lifecycle in a browser; it proves that host, not compatibility with an
+  untested commercial client. Host wiring/runner layout are reversible test
+  choices; missing supported integration blocks the live journey rather than
+  authorizing a replacement production harness or security bypass.
 
 ## Invariants, constraints, and non-goals
 
@@ -955,6 +1071,10 @@ not protocol authority.
   to select tests. No new environment variable solely for tests, including
   `WYRD_IDENTITY_TARGET`, `WYRD_IDENTITY_FILTER`, or `WYRD_STARTUP_FILTER`.
   Existing legitimate settings may be reused only for demonstrated consumers.
+  REQ-034/035 authorize the minimal test-only real-browser dependency and host
+  automation needed for those journeys, not a new test framework, production
+  setting or environment selector. Reuse the existing readiness CLI/local
+  configuration and ordinary runner selectors; provider credentials remain local.
 - **INV-005 — TASK-001 exclusions.** TASK-001 ends at packaged/installed/launched
   UI, official container routing, lifecycle, REQ-033 server-owned browser
   sessions, and real login proof. Revision 10 authorizes the necessary auth,
@@ -1025,8 +1145,11 @@ not protocol authority.
 | AC-008 | Query, traces, logs, and metrics each read current canonical data, respect authorization/time bounds, and do not present failed/partial reads as success | Existing Bifrost/identity fixtures and narrow UI consumer journeys, terminal/cancellation regressions, separate page inspections |
 | AC-009 | Verification screens show generic requirements/verdicts/evidence and correct subject/Verifier/execution identities; summaries agree with those retained facts | Real generic verification-to-UI journey and focused projection tests; separate verification and summary checkpoints |
 | AC-010 | All original draft/reference bytes remain available with provenance; every task is self-contained, source-backed, narrowly verified, and visually inspectable; independent task readiness findings are resolved or surfaced | Preservation hashes, evidence inventory, obligation/task map and independent plan-readiness-reviewer findings/dispositions |
-| AC-011 | Every inventory component is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
+| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
 | AC-012 | Rust-owned opaque sessions support SSO and recovery, reject tampering/expiry/revocation/tenant mismatch and CSRF, preserve safe metadata/settings/chooser/logout, continue across two replicas/restarts, and require no additional deploy secret/env/service; old credential cookies require re-login | Real two-replica native and nginx browser journey, SQL/session negative tests, served cookie-auth contract, source/config audit and unchanged bearer/device/platform regressions |
+| AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-012 browser foundation and TASK-013–026 focused real-browser journeys, plus per-page human acceptance |
+| AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-011 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
+| AC-015 | A view document places panels on the 12-column grid; with a host layout handler a reader resizes and moves panels by pointer and keyboard with grid snapping and no overlap, the handler receives the whole updated document, charts fill their resized panels, narrow views stack, and a document without `layout` renders as before; out-of-range layouts fail validation | REQ-036; unit tests for schema bounds, collision resolution and handler output; real-browser gallery and AppBridge artifact evidence at desktop and mobile in light and dark; recorded human gallery acceptance |
 
 Task planning must choose exact focused commands from inspected current owners;
 the evidence document identifies known commands and coverage gaps. No build,
@@ -1079,6 +1202,15 @@ implementation-owned. Revision-9 readiness and task-review reports retain their
 original subject and verdict, not an inferred approval of revision 10. The new
 remediation and its independent review are still required; no implementation,
 platform/runtime pass or human visual acceptance is claimed by this edit.
+
+Revision 11 records the caller's explicit acceptance of the proposal and
+`$wyrd-plan` request on 2026-10-20. REQ-034/035 and AC-013/014 define the two
+primary automated journeys; deferred AskPanel/REQ-031 no longer hold the library,
+MCP or conventional-page gate. All other in-scope prerequisites and human visual
+checkpoints remain. TASK-003 production scope and existing tests are preserved;
+new deployed-browser/conversation acceptance belongs downstream. Existing
+review verdicts are not rewritten. A host lacking supported integration is a
+reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
@@ -1142,11 +1274,28 @@ platform/runtime pass or human visual acceptance is claimed by this edit.
   caller's explicit instruction to revise the spec and write that task; no
   implementation or review PASS is claimed.
 
-Authorities: `AGENTS.md`; `AGENTS.md`;
-`architecture/wyrd-design.md`; `architecture/wyrd-design.md`;
+- Revision 11 (2026-10-20): caller explicitly accepts the two primary journey
+  proposal and requests task planning. Defers AskPanel/Ask service and independent
+  saved views, removes their shipping dependencies, adds real-browser page and
+  multi-turn agent/MCP App acceptance, and permits the isolated opt-in live-model
+  lane through existing readiness ownership. TASK-003 remains unchanged in
+  scope. This approval concerns the stated outcomes, not implementation success
+  or compatibility with an untested host.
+
+- Revision 12 (2026-10-20): caller asks for Grafana-style panel
+  layout after inspecting the chart foundation. Replaces the view document's
+  `width: full | half` ordering with REQ-036: a per-panel grid `layout`,
+  reader resize/move inside `WyrdView` behind a host layout handler, and no
+  persistence until saved views (REQ-031). Components stay size-agnostic and
+  no catalog component entry changes. Adds AC-015. Builds on uncommitted revision 11
+  without changing it. Approved by the caller's explicit "yes" to the
+  revision as written; no implementation is claimed.
+
+Authorities: `AGENTS.md`; `architecture/agent-rules.md`;
+`architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;
 `architecture/bifrost-design.md`; `architecture/wyrd-security-posture.md`;
 `architecture/operations/deployment-and-release.md`;
-`changes/spec-driven-development.md`;
-`TESTING.md`; repository `wyrd-ui`
+`architecture/references/languages/spec-driven-development.md`;
+`architecture/references/languages/testing-workflows.md`; repository `wyrd-ui`
 guidance for styling. These are repository-relative authority paths, not copies
 of skill instructions.

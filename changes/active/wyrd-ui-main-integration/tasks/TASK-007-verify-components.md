@@ -1,7 +1,7 @@
 # TASK-007 — Generic verification component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md).
 Mapped obligations: REQ-030, REQ-018, REQ-026, REQ-027, REQ-020, AC-009, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: Separately specified non-sensitive requirement-outcome read contract; REQ-023 for Service-filter variants; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.

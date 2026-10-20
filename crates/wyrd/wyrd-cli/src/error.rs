@@ -233,6 +233,25 @@ pub enum WyrdCliError {
         detail: String,
     },
 
+    /// The newest release is already extracted locally but lacks part of its
+    /// runnable payload, so installing would only reactivate it.
+    #[error(
+        "server installation {} is incomplete ({detail}); remove that directory, then rerun `wyrd server install` to download it again",
+        dir.display()
+    )]
+    #[wyrd_error(
+        code = "WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE",
+        status = 409,
+        title = "Server installation incomplete",
+        remediation = "Remove the named version directory, then rerun `wyrd server install`; nothing was activated."
+    )]
+    ServerInstallIncomplete {
+        /// Extracted version directory that is not runnable.
+        dir: std::path::PathBuf,
+        /// Which payload part is missing or empty.
+        detail: String,
+    },
+
     /// The newest server release does not share this CLI's compatible version line.
     #[error("wyrd CLI {cli} cannot run wyrd-server {server}")]
     #[wyrd_error(
@@ -423,6 +442,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::Io { .. }
             | WyrdCliError::Output { .. }
             | WyrdCliError::ServerReleaseUnverified { .. }
+            | WyrdCliError::ServerInstallIncomplete { .. }
             | WyrdCliError::McpHostInstall { .. } => WyrdError::Internal { message, details },
         }
     }

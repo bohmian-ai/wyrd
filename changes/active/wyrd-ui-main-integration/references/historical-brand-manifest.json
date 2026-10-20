@@ -1,0 +1,140 @@
+[
+  {
+    "path": "references/historical-brand/README.md",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "edff2c18207c6a3d96f2db0cca70a595147c26f1589348bf1a0781f7d8631ab4"
+  },
+  {
+    "path": "references/historical-brand/cards.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "1dc09869a1e22bf1e57aef4fdc1a86d7c5b7d78f38d13d772032b71b4df46377"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/compare.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/compare.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "f58138cb6bd3dbb80bb4c8d20dd5216057a9ef5330074c64b91de1bc68c83187"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/mobile.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/mobile.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "eded33cd8088cd517d0d5fa09b50b6c9ab25dd7958f08f721b41976bf97a3842"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/outputs.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/outputs.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "3c5128145e660756bd062fe7ce3ad8ddb41458b8fe3f31f5a493dd86053d09a9"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/overview.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/overview.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "7887fa9c8512f2d5981f26cd1210ce1f66a24450f5a96360b11425ab2282aac1"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/runs.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/runs.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "71ad619761e527f1b0f06208d350865425404619a7bc70b7b38f953d9c59ee13"
+  },
+  {
+    "path": "references/historical-brand/cards/experiment/versions.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/versions.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "6e185356f44fe2c8412b41b945afe982023d9bbcfd223cf237b4913ca0775c21"
+  },
+  {
+    "path": "references/historical-brand/cards/service/composition.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/service/composition.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "c3af44fd5c466120fa446da7c042376702fa1b1e55e84742e2ed2cd3c4bbdc88"
+  },
+  {
+    "path": "references/historical-brand/cards/service/definition.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/service/definition.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "f39fa702e801734a268162c92637818ce88f5f2a3d9ee2913adcf8e0d9eed481"
+  },
+  {
+    "path": "references/historical-brand/cards/service/mobile.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/service/mobile.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "70ff07cd672117c96057e80d27e7d076dde4a172c449231f2f58fbfdc886347d"
+  },
+  {
+    "path": "references/historical-brand/cards/service/overview.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/service/overview.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "b821102065afb8915457f260c42b5cf34099b24a7402f6c60a22583276c5d04e"
+  },
+  {
+    "path": "references/historical-brand/changes.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/changes.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "26303feb540c43a7a434fdc8ccfae349a726ee089e77e6ac4ef943e93381b3d4"
+  },
+  {
+    "path": "references/historical-brand/changes/mobile.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/changes/mobile.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "693dc157964be76097ddad0a46aef667d513a83a398560ae69066a36da7b4c14"
+  },
+  {
+    "path": "references/historical-brand/changes/new.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/changes/new.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "0398e9ddc23a50691f6d32bd788bfbce4f06652f599ad51885e3068c58369435"
+  },
+  {
+    "path": "references/historical-brand/changes/review.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/changes/review.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "8ce31c28dfc2ddc56c844977f0674247535b15eb66682d5440cd89cc229cdb95"
+  },
+  {
+    "path": "references/historical-brand/changes/verification.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/changes/verification.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "6d532b4caa97b6832fe664612304ab8086d67872eec7fecf5de1521077cf422a"
+  },
+  {
+    "path": "references/historical-brand/golden-CR-04.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-CR-04.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "26df4954af50197fdf5c5d2cf29492089512fa024eb5b2359ac82080a8733030"
+  },
+  {
+    "path": "references/historical-brand/golden-O-04.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-04.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "c6833f08e7eeb8f27916cad17da4a707c087f5be6602bf04b89e181dd5f71ee2"
+  },
+  {
+    "path": "references/historical-brand/golden-O-09.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-09.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "c463ae23c3cb6c7fa474ac3a8705b8ffaeac69ae44ca1890752e4404d1092365"
+  },
+  {
+    "path": "references/historical-brand/home.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/home.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "2682772369fec353768522bd01f96d8c112c6c498b3c80b15bb56756685e74ea"
+  },
+  {
+    "path": "references/historical-brand/mobile.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "9a7f282b75f77f0cbf5c9b0ec32ddc0fa7244ca290a8fa22d42310a4ef6e45ae"
+  },
+  {
+    "path": "references/historical-brand/observe.svg",
+    "source_path": "crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/observe.svg",
+    "source_commit": "7bfc3a8a282daf490a1ee649ce9fe74382d4fd35",
+    "sha256": "b42c9a48f09c1d358a27f771144742b5b6e4fdede4c0549aa73fdf393c0e9b2c"
+  }
+]

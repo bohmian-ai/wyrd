@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Verification result</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 12px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#1f2230}
+.btn.primary{background:#7a8cff;border-color:#7a8cff;color:#0b0c12;font-weight:600}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.panel{background:#12141c;border:1px solid #252838;border-radius:2px}
+.ph{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #252838}
+.pb{padding:14px 16px}
+.kind{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;background:#1a2040;border:1px solid #3a4170;color:#c7cdff;font:11px "Fragment Mono",monospace;letter-spacing:.04em;text-transform:uppercase;border-radius:2px}
+.ok{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3dbe5a;color:#3dbe5a;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.bad{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #e2484d;color:#e2484d;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.neutral{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3a3d4f;color:#8f92a5;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px;font:12px "Fragment Mono",monospace}
+.kv dt{color:#8f92a5}.kv dd{margin:0;color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab{padding:10px 2px;margin-right:22px;color:#8f92a5;font:13px "Familjen Grotesk",sans-serif}
+.tab[aria-current]{color:#e6e4da;box-shadow:inset 0 -2px 0 #7a8cff}
+.vital{padding:14px 16px;display:flex;flex-direction:column;gap:4px;border-right:1px solid #252838;min-width:0}
+.vital:last-child{border-right:0}
+.vv{font:600 22px "Familjen Grotesk",sans-serif;color:#e6e4da}
+.vs{font:11px "Fragment Mono",monospace;color:#8f92a5}
+table{width:100%;border-collapse:collapse;font:12px "Fragment Mono",monospace}
+th{text-align:left;font-weight:400;color:#8f92a5;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:8px 16px;border-bottom:1px solid #252838}
+td{padding:9px 16px;border-bottom:1px solid #1c1f2c;color:#e6e4da}
+tr:last-child td{border-bottom:0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;background:#1a1d28;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;color:#e6e4da;white-space:nowrap}
+.node{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#12141c;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;min-width:0}
+.node small{color:#8f92a5;font-size:10.5px}
+.node.self{border:2px solid #7a8cff;background:#141933}
+.edge{font:10.5px "Fragment Mono",monospace;color:#8f92a5;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.row{display:grid;align-items:center;gap:12px;padding:0 14px;min-height:34px;border-bottom:1px solid #1c1f2c;font:12px "Fragment Mono",monospace;color:#e6e4da}
+.row:hover{background:#1a1d28}.row.sel{background:#141933;box-shadow:inset 3px 0 0 #7a8cff}
+.rh{display:grid;align-items:center;gap:12px;padding:0 14px;height:30px;border-bottom:1px solid #252838;font:10.5px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.facet{display:flex;align-items:center;gap:8px;padding:3px 0;font:12px "Fragment Mono",monospace;color:#c9c7be}
+.facet b{font-weight:400;color:#e6e4da}.facet span:last-child{margin-left:auto;color:#8f92a5}
+</style>
+</helmet>
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif;">
+  <header style="display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid #252838; background: #0e1017;">
+    <span class="mono" style="font-size: 11px; padding: 3px 8px; background: #7a8cff; color: #0b0c12; font-weight: 600;">WYRD</span>
+    <nav aria-label="Primary" style="display: flex; gap: 2px;"><a href="Home.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Home</a><a href="Model.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Cards</a><a href="Main.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Observe</a><a href="Verify.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#e6e4da;background:#1a2040">Verify</a><a href="#" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Changes</a><a href="Query.dc.html" style="font:13px 'Familjen Grotesk',sans-serif;padding:6px 10px;border-radius:2px;color:#8f92a5;background:transparent">Query</a></nav>
+    <span class="mono" style="font-size: 12px; color: #8f92a5; margin-left: 12px;">Verify / support-answer-quality</span>
+    <span style="margin-left: auto; display: flex; gap: 8px; align-items: center;"><span class="chip">⌕ Find a Card…  <kbd style="color:#8f92a5">⌘K</kbd></span><span class="chip">ui-live ▾</span><span class="chip">alice ▾</span></span>
+  </header>
+  <section style="padding:18px 24px 16px;border-bottom:1px solid #252838;background:linear-gradient(180deg,#10121a 0%,#0b0c12 100%)">
+    <div class="mono vs" style="margin-bottom:8px"><a href="Verify.dc.html">Verify</a> / support-answer-quality / ex-4f1a…90c2</div>
+    <div style="display:flex;align-items:flex-start;gap:16px"><div style="flex:1;display:flex;flex-direction:column;gap:7px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h1 style="margin:0;font-size:26px;font-weight:600">support-answer-quality</h1><span class="bad">✕ failed · 3 of 4 requirements</span></div>
+      <p style="margin:0;font-size:15px;color:#c9c7be">Checks a support reply against the ticket and the refund policy it relies on.</p>
+      <div class="mono" style="font-size:11.5px;color:#8f92a5;display:flex;gap:16px;flex-wrap:wrap"><span>subject <a href="Agent.dc.html">support-desk-agent</a> · Service <a href="#">support-desk</a></span><span>run <a href="#">run-7c1e02</a></span><span>submit · completed in 3.9s</span><span>decide all</span><span>Verifier v1.2.0 · <a href="#">definition</a></span></div></div>
+      <div style="display:flex;gap:8px"><a class="btn" href="Main.dc.html">Open trace ↗</a><a class="btn" href="Query.dc.html">Open in Query ↗</a></div></div>
+  </section>
+  <div style="display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:16px;padding:16px 24px 24px">
+    <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+      <div class="panel"><div class="ph"><span class="h">Requirements</span><span class="vs">in declaration order · inconclusive never counts as a pass</span></div>
+        <div class="rh" style="grid-template-columns:130px minmax(0,1fr) 70px 110px 96px"><span>Requirement</span><span>Statement</span><span>Check</span><span>Step</span><span>Outcome</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px 110px 96px"><span>has_answer</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">The reply contains a non-empty answer</span><span class="vs">assert</span><span class="vs">—</span><span class="ok">✓ passed</span></div><div class="row sel" style="grid-template-columns:130px minmax(0,1fr) 70px 110px 96px"><span>grounded</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Every claim in the answer is supported by the policy</span><span class="vs">agent</span><span class="vs">—</span><span class="bad">✕ failed</span></div><div style="padding:12px 14px 14px 28px;border-bottom:1px solid #1c1f2c;background:#10121a;display:flex;flex-direction:column;gap:10px"><div style="font-size:14px;color:#e6e4da">“The answer promises a 30-day refund window; the cited policy page allows 14 days.”</div><dl class="kv" style="margin:0"><dt>actual</dt><dd>refund_window_days = 30</dd><dt>citations</dt><dd><span class="chip">policy · page 3</span> <span class="chip">ticket · /answer/body</span></dd><dt>judged by</dt><dd>Agent <a href="Agent.dc.html">policy-judge</a> v3 · Prompt <a href="Prompt.dc.html">grounded-judge</a> v2 · route gateway/claude-sonnet-5</dd></dl></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px 110px 96px"><span>cites_policy</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">The answer links the policy section it relies on</span><span class="vs">assert</span><span class="vs">draft</span><span class="ok">✓ passed</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px 110px 96px"><span>refund_window</span><span style="color:#c9c7be;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Promised refund window ≤ policy window</span><span class="vs">code</span><span class="vs">refund_calc</span><span class="ok">✓ passed</span></div></div>
+      <div class="panel"><div class="ph"><span class="h">Steps</span><span class="vs">prepared evidence · 3.72s of 3.9s</span></div>
+        <div class="rh" style="grid-template-columns:130px 70px minmax(0,1fr) 64px 80px"><span>Step</span><span>Action</span><span>Timeline</span><span style="text-align:right">Time</span><span>Status</span></div><div class="row" style="grid-template-columns:130px 70px minmax(0,1fr) 64px 80px"><span>policy_text</span><span class="vs">extract</span><span style="position:relative;height:8px;background:#1a1d28"><span style="position:absolute;left:0%;width:9%;top:0;bottom:0;background:#4d5ef0"></span></span><span class="vs" style="text-align:right">0.38s</span><span class="ok">✓ ok</span></div><div class="vs" style="padding:0 14px 8px 154px;border-bottom:1px solid #1c1f2c">pdf → 14 pages · extraction v2</div><div class="row" style="grid-template-columns:130px 70px minmax(0,1fr) 64px 80px"><span>draft</span><span class="vs">agent</span><span style="position:relative;height:8px;background:#1a1d28"><span style="position:absolute;left:9%;width:74%;top:0;bottom:0;background:#4d5ef0"></span></span><span class="vs" style="text-align:right">3.10s</span><span class="ok">✓ ok</span></div><div class="vs" style="padding:0 14px 8px 154px;border-bottom:1px solid #1c1f2c">support-drafter v5 · tools fs.read ×3, bifrost.query ×1 · 1 attempt</div><div class="row" style="grid-template-columns:130px 70px minmax(0,1fr) 64px 80px"><span>refund_calc</span><span class="vs">code</span><span style="position:relative;height:8px;background:#1a1d28"><span style="position:absolute;left:83%;width:6%;top:0;bottom:0;background:#4d5ef0"></span></span><span class="vs" style="text-align:right">0.24s</span><span class="ok">✓ ok</span></div><div class="vs" style="padding:0 14px 8px 154px;border-bottom:1px solid #1c1f2c">python · sha256 7be0…c41d</div></div>
+      <div class="panel"><div class="ph"><span class="h">This Verifier · last 24h</span><div role="group" style="display:inline-flex"><button class="btn" aria-pressed="true" style="height:26px;background:#1a2040;border-color:#3a4170">requirement</button><button class="btn" aria-pressed="false" style="height:26px;margin-left:-1px;color:#8f92a5">subject</button><button class="btn" aria-pressed="false" style="height:26px;margin-left:-1px;color:#8f92a5">run</button></div></div>
+        <div class="rh" style="grid-template-columns:130px minmax(0,1fr) 70px"><span>Requirement</span><span>Pass rate · 1,240 results</span><span style="text-align:right">Rate</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px"><span>has_answer</span><span style="position:relative;height:6px;background:#1a1d28"><span style="position:absolute;left:0;width:100%;top:0;bottom:0;background:#4d5ef0"></span></span><span style="text-align:right;color:#4d5ef0">100%</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px"><span>grounded</span><span style="position:relative;height:6px;background:#1a1d28"><span style="position:absolute;left:0;width:74%;top:0;bottom:0;background:#e2484d"></span></span><span style="text-align:right;color:#e2484d">74%</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px"><span>cites_policy</span><span style="position:relative;height:6px;background:#1a1d28"><span style="position:absolute;left:0;width:91%;top:0;bottom:0;background:#4d5ef0"></span></span><span style="text-align:right;color:#4d5ef0">91%</span></div><div class="row" style="grid-template-columns:130px minmax(0,1fr) 70px"><span>refund_window</span><span style="position:relative;height:6px;background:#1a1d28"><span style="position:absolute;left:0;width:97%;top:0;bottom:0;background:#4d5ef0"></span></span><span style="text-align:right;color:#4d5ef0">97%</span></div></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+      <aside class="panel"><div class="ph"><span class="h">Evidence</span><span class="vs">pinned at execution</span></div>
+        <div class="pb"><dl class="kv" style="margin:0"><dt>ticket</dt><dd>json · sha256 9a1c…e27f</dd><dt>policy</dt><dd>media · pdf · 212 KB · sha256 41d8…0b3a</dd><dt>conversation</dt><dd>trace <a href="Main.dc.html">7f2a…c013</a></dd></dl></div></aside>
+      <aside class="panel"><div class="ph"><span class="h">Provenance</span></div>
+        <div class="pb"><dl class="kv" style="margin:0"><dt>execution</dt><dd>ex-4f1a…90c2</dd><dt>status</dt><dd>completed · 1 attempt</dd><dt>binding</dt><dd>support-desk · verified_by[0]</dd><dt>for / by</dt><dd>alice / alice</dd><dt>on failure</dt><dd>page-support-oncall · delivered</dd></dl></div></aside>
+      <aside class="panel"><div class="ph"><span class="h">Other results · run-7c1e02</span><span class="vs">96</span></div><div class="row" style="grid-template-columns:70px minmax(0,1fr) 96px"><span class="vs">20:58:33</span><span class="vs">support-desk-agent · 4 of 4</span><span class="ok">✓ passed</span></div><div class="row" style="grid-template-columns:70px minmax(0,1fr) 96px"><span class="vs">20:57:51</span><span class="vs">support-desk-agent · 2 of 3 applicable</span><span class="bad">✕ failed</span></div><div class="row" style="grid-template-columns:70px minmax(0,1fr) 96px"><span class="vs">20:57:02</span><span class="vs">support-desk-agent · 4 of 4</span><span class="ok">✓ passed</span></div><div class="row" style="grid-template-columns:70px minmax(0,1fr) 96px"><span class="vs">20:56:40</span><span class="vs">support-desk-agent · 3 of 4</span><span class="bad">✕ failed</span></div></aside>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

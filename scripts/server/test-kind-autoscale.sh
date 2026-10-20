@@ -108,7 +108,7 @@ oracle_pods() { k get pods -l app=wyrd-oracle -o jsonpath='{range .items[*]}{.me
 hpa_desires() { [[ "$(hpa_field .status.desiredReplicas)" == "$1" ]]; }
 
 echo "== build: server binary and the official image"
-image_id="$("$root/scripts/build.sh" image ubuntu wyrd:kind)"
+image_id="$("$root/scripts/build.sh" image debian wyrd:kind)"
 [[ $image_id == sha256:* ]] || fail "the official build reported no immutable image ID: $image_id"
 source_commit="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_id")"
 # The config digest is the image ID containerd reports inside kind, whichever

@@ -2,10 +2,8 @@
 //!
 //! A `wyrd-cli` refresh token is single-use: each refresh rotates it, and
 //! presenting a rotated one revokes the rest of its rotation chain (RFC 9700
-//! §4.14.2). A
-//! `wyrd-ui` refresh token belongs to a confidential client and does not
-//! rotate: each refresh mints only an access token until the session's
-//! absolute lifetime ends.
+//! §4.14.2). Browsers hold Rust-owned browser sessions instead of refresh
+//! tokens, so a row issued to the retired `wyrd-ui` client is refused.
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
@@ -20,8 +18,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    active_refresh, consume_active_refresh, lock_refresh_family, refresh_by_hash,
-    revoke_refresh_chain,
+    consume_active_refresh, lock_refresh_family, refresh_by_hash, revoke_refresh_chain,
 };
 
 use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, auth_event, principal_kind_tag};
@@ -108,10 +105,7 @@ impl RefreshTokens {
     ///    issuance takes. A replay of an ancestor therefore classifies and
     ///    revokes only after a concurrent rotation of the current row has
     ///    committed or rolled back, so its successor cannot escape containment.
-    /// 4. A `wyrd-ui` row: `active_refresh` under the lock; an active row mints
-    ///    an access token only and the row stays as it is; anything else →
-    ///    `NotFound`.
-    /// 5. Otherwise `consume_active_refresh` — atomic `UPDATE … RETURNING`
+    /// 4. `consume_active_refresh` — atomic `UPDATE … RETURNING`
     ///    under the lock.
     ///    - Active → mint successor pair, insert with `rotated_from`, audit, return OK.
     ///    - Rotated → reuse detected; the row's chain is revoked through
@@ -151,24 +145,6 @@ impl RefreshTokens {
             return Err(RefreshError::NotFound);
         }
         lock_refresh_family(conn, &stored.principal_kind, stored.principal_id).await?;
-
-        if let Some(session) = session
-            && session.client == OAuthClientId::WyrdUi
-        {
-            let Some(active) = active_refresh(conn, &hash).await? else {
-                return Err(RefreshError::NotFound);
-            };
-            return Ok(self
-                .issuer
-                .issue_human_access(
-                    conn,
-                    active.principal_id,
-                    Some(active.id),
-                    session.connection,
-                    request_id,
-                )
-                .await?);
-        }
 
         let Some(active) = consume_active_refresh(conn, &hash).await? else {
             // The presented row exists but is no longer active. Only a
@@ -318,8 +294,8 @@ mod pg_tests {
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        active_refresh, insert_human_refresh_token, insert_refresh_token, insert_role,
-        insert_service_account, list_user_roles, refresh_by_hash, replace_idp_user_roles,
+        insert_human_refresh_token, insert_refresh_token, insert_role, insert_service_account,
+        list_user_roles, refresh_by_hash, replace_idp_user_roles,
     };
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
@@ -688,9 +664,8 @@ mod pg_tests {
     ///
     /// The replayed row's successor is retired with `reuse_detected` and one
     /// containment audit names the replayed row, while an independent CLI
-    /// login and a non-rotating `wyrd-ui` session of the same principal stay
-    /// active (RFC 9700 §4.14.2 contains the compromised chain, not every
-    /// login of the user).
+    /// login of the same principal stays active (RFC 9700 §4.14.2 contains
+    /// the compromised chain, not every login of the user).
     ///
     /// # Panics
     /// Panics when seeding fails, the replay is not refused as reuse, the
@@ -730,7 +705,6 @@ mod pg_tests {
         for (hash, rotated_from, client) in [
             ("hash-successor", Some(replayed), OAuthClientId::WyrdCli),
             ("hash-other-cli", None, OAuthClientId::WyrdCli),
-            ("hash-ui-session", None, OAuthClientId::WyrdUi),
         ] {
             insert_human_refresh_token(
                 &mut conn,
@@ -759,7 +733,6 @@ mod pg_tests {
         for (hash, expected) in [
             ("hash-successor", Some("reuse_detected")),
             ("hash-other-cli", None),
-            ("hash-ui-session", None),
         ] {
             let row = refresh_by_hash(&mut conn, hash)
                 .await
@@ -932,74 +905,6 @@ mod pg_tests {
         let containments =
             staged_credentials(&audit, tenant, REFRESH_FAMILY_REVOKE_OPERATION, None).len();
         assert_eq!(containments, 0, "no theft is recorded");
-    }
-
-    /// `active_refresh` resolves only an active row of the bound tenant.
-    ///
-    /// Tenant selection is the `TenantConn` RLS binding alone: a row with the
-    /// same hash in another tenant is invisible, and a revoked or expired row
-    /// of this tenant is not active.
-    ///
-    /// # Panics
-    /// Panics when seeding fails or a row resolves across a tenant or after
-    /// revocation or expiry.
-    #[tokio::test]
-    async fn active_refresh_resolves_only_this_tenants_active_row() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let other = fixture
-            .seed_additional_tenant("active-refresh-other")
-            .await
-            .expect("second tenant seeds");
-
-        let mut other_conn = fixture
-            .tenant_conn_for(other)
-            .await
-            .expect("other conn opens");
-        seed_active_refresh(&mut other_conn, "service", Uuid::new_v4(), "hash-shared").await;
-        seed_active_refresh(
-            &mut other_conn,
-            "service",
-            Uuid::new_v4(),
-            "hash-other-only",
-        )
-        .await;
-        other_conn.commit().await.expect("other tenant commits");
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let active = seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-active").await;
-        let shared = seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-shared").await;
-        let expired =
-            seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-expired").await;
-        sqlx::query(
-            "UPDATE wyrd.auth_refresh_tokens SET revoked_at = now(), revoked_reason = 'logout'
-              WHERE id = $1",
-        )
-        .bind(shared)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("row revokes");
-        sqlx::query(
-            "UPDATE wyrd.auth_refresh_tokens SET expires_at = now() - interval '1 hour'
-              WHERE id = $1",
-        )
-        .bind(expired)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("row expires");
-
-        for (hash, expected, why) in [
-            ("hash-active", Some(active), "this tenant's active row"),
-            (
-                "hash-shared",
-                None,
-                "revoked here, active in another tenant",
-            ),
-            ("hash-expired", None, "expired"),
-            ("hash-other-only", None, "another tenant's row"),
-        ] {
-            let resolved = active_refresh(&mut conn, hash).await.expect("lookup");
-            assert_eq!(resolved.map(|row| row.id), expected, "{why}");
-        }
     }
 
     /// The rotation's audited grant names the refresh row it consumed.

@@ -47,6 +47,7 @@ test('request hook rejects expiry and disabled local identity before tenant load
     route: { id: '/t/[tenantKey]' },
     cookies,
     setHeaders: vi.fn(),
+    url: new URL('http://localhost/t/acme'),
     request: new Request('http://localhost/t/acme', { method: 'POST' }),
     isDataRequest: false
   } as unknown as Parameters<typeof handle>[0]['event'];

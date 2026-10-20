@@ -92,6 +92,25 @@ Unsuffixed `WYRD_DB_*` variables tune the tenant pool. `_MIGRATOR` and
 pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
+## Browser-session deployment
+
+First-party UI sessions are Rust-owned and persisted by digest in the existing
+Postgres database. Node forwards the selected tenant's opaque cookie and public
+origin; it needs no separate OAuth client credential or cookie-encryption key.
+No UI-specific environment variable, secret file, bootstrap step, session
+service, Redis instance or sticky routing is required. This does not remove
+existing server signing/sealing keys, database credentials or external-provider
+client configuration.
+
+Every replica uses the existing database authority. Replacing either a Rust or
+Node container, or restarting a native installation, preserves unexpired,
+unrevoked sessions without sharing new Node secrets. Expiry and revocation are
+checked server-side; unavailable Postgres produces an unavailable response,
+never an anonymous or cached success. Headless server, CLI and SDK deployments
+require no UI-session configuration. Production TLS and host-only Secure/
+HttpOnly/SameSite cookies remain required; the existing loopback-only native
+development exception does not authorize public plaintext deployment.
+
 ## Database logins and connection budget
 
 | Login | Lifetime | Purpose |
@@ -212,19 +231,24 @@ declared compatibility interval before surge starts. Overlap is permitted only
 when both manifests mutually accept the other version for every shared
 contract. Missing or one-sided compatibility fails closed.
 
-The official images (`docker/official/{ubuntu,debian,rocky}/Dockerfile`) run
-`wyrd-server` behind nginx, which proxies HTTP on 8080 and gRPC on 50051 to
-the server's loopback listeners. Each copies a Linux server bundle and
-compiles nothing. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
-for ubuntu, debian, and rocky on amd64 and ubuntu and debian on arm64, each
-built on a native runner from the bundle its build job recorded, then the
-multi-arch tags `<distro>-<version>` and `<distro>-latest`, with ubuntu also
-as `<version>` and `latest`. The ubuntu and debian images carry the bundle
-built on ubuntu-22.04; rocky carries the one built on rockylinux:9, so each
-runs on its image's glibc.
+The official images (`docker/official/{debian,rocky}/Dockerfile`) run
+`wyrd-server`, the production UI's Node BFF, and nginx; the exit of any one
+stops the container. nginx serves HTTP on 8080, proxying the server's routes
+(`/v1`, `/v1beta`, `/auth`, `/platform`, `/mcp`, `/.well-known`,
+`/openapi.json`, `/healthz`, `/readyz`) to the server's loopback listener and
+every other path to the BFF, and gRPC on 50051. Each copies a Linux server
+bundle and compiles nothing; the image supplies Node.js from the pinned
+official Node image. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
+for debian on amd64 and arm64 and rocky on amd64 only, each built on a native
+runner from the bundle its build job recorded, then the multi-arch tags
+`<distro>-<version>` and `<distro>-latest`, with debian also as `<version>` and
+`latest`. The gnu bundles build in the `docker/builder/ubuntu-22.04` image and
+the rocky bundle in `docker/builder/rockylinux-9`, so each links against the
+oldest glibc it supports (2.35 and 2.34) whichever host or runner builds it,
+and runs on its image's newer or equal glibc.
 
 No Wyrd image has been published yet. Until the first release, image
-acceptance builds the ubuntu image on Linux with `scripts/build.sh image` from
+acceptance builds the debian image on Linux with `scripts/build.sh image` from
 the reviewed commit and pins that exact build by its immutable local image ID,
 recording the ID and source commit. The first release repeats the same image
 journeys against the published registry digest named in its manifest.
@@ -249,10 +273,14 @@ journeys against the published registry digest named in its manifest.
 
 ## Local server bundles
 
-Each release publishes `wyrd-server-<target>.tar.gz` for
-`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-`x86_64-unknown-linux-gnu-rocky`, and `aarch64-unknown-linux-gnu`, each built
-by `scripts/build.sh bundle` and holding `wyrd-server`, plus
+Native local servers run on three targets: `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`; Intel macOS is
+not supported. Each release publishes `wyrd-server-<target>.tar.gz` for those
+targets and for `x86_64-unknown-linux-gnu-rocky`, which only the rocky image
+uses, each built by `scripts/build.sh bundle` (Linux bundles through
+`scripts/build.sh bundle-in <builder>`) and holding `wyrd-server` and the
+production UI under `ui/` (its adapter-node build, `package.json`, and
+production `node_modules`; no Node.js executable), plus
 `checksums.txt` and `checksums.txt.sig`: a raw Ed25519 signature over the
 checksums made with the `WYRD_RELEASE_SIGNING_KEY` release secret.
 Publication refuses a secret whose public half differs from the key the CLI
@@ -260,7 +288,12 @@ embeds (`crates/wyrd/wyrd-cli/src/server/release-signing-key.pem`).
 `wyrd server install` selects the highest stable, non-draft `v<semver>`
 release, refuses one outside the CLI's caret-compatible version line, and
 verifies the signature and bundle digest before extracting into a staging
-directory that becomes runnable only by an atomic rename and link swap.
+directory that becomes runnable only by an atomic rename and link swap; a
+bundle without the server or the UI payload never replaces the current
+installation. `wyrd server dev` runs the UI on the system Node.js (26 or
+newer) at `WYRD_UI_BIND` (default `127.0.0.1:3000`), whose address is the
+browser's public origin; the BFF forwards the browser's `/auth` requests to
+the server.
 Rotating the signing key requires a CLI release that embeds the new key.
 `wyrd server dev` runs the installed bundle with inputs resolved as argument,
 environment, saved `[dev]` setting, then prompt, saves them before any tenant

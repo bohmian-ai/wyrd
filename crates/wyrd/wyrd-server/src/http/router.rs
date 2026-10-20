@@ -32,8 +32,9 @@ use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::{
     require_authenticated, require_bifrost_authenticated, require_otlp_authenticated,
+    require_tenant_authenticated,
 };
-use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
+use crate::http::openapi::{BrowserSessionAddon, ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
@@ -70,7 +71,7 @@ pub fn build_router(state: AppState) -> Router {
         state.clone(),
         require_otlp_authenticated,
     ));
-    let v1_group = OpenApiRouter::new()
+    let tenant_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(cards_router())
         .merge(principals_router())
@@ -81,8 +82,17 @@ pub fn build_router(state: AppState) -> Router {
         .merge(gateway_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            require_authenticated,
-        ))
+            require_tenant_authenticated,
+        ));
+    // The routes whose layer also accepts a browser session, read from the
+    // registrations that mount them, so the document offers the cookie there
+    // and nowhere else.
+    let browser_session_paths = [&tenant_group, &bifrost_group]
+        .into_iter()
+        .flat_map(|group| group.get_openapi().paths.paths.keys())
+        .map(|path| format!("/v1{path}"))
+        .collect();
+    let v1_group = tenant_group
         .merge(otlp_group)
         .merge(bifrost_group)
         .fallback(v1_not_found);
@@ -118,9 +128,13 @@ pub fn build_router(state: AppState) -> Router {
         .merge(gateway_ingress_router(&state))
         .nest("/v1", v1_group)
         .split_for_parts();
-    // The document-wide modifiers run after composition because both of them
-    // read the assembled paths.
+    // The document-wide modifiers run after composition because they read the
+    // assembled paths.
     SecurityAddon.modify(&mut document);
+    BrowserSessionAddon {
+        paths: browser_session_paths,
+    }
+    .modify(&mut document);
     ProblemMediaAddon.modify(&mut document);
     let document = Arc::new(document);
 

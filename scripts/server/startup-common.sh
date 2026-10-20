@@ -17,8 +17,9 @@ mkdir -p "$root/target"
 readonly work="$(mktemp -d "$root/target/$run_id.XXXXXX")"
 passed=()
 
+# Exits with the status it is given, else the status the EXIT trap fired with.
 cleanup() {
-  local status=$?
+  local status=${1:-$?}
   if [[ $status -ne 0 ]]; then
     docker logs "$app" >"$root/target/$run_id-app.log" 2>&1 || true
     echo "--- app logs (full log: target/$run_id-app.log)"; tail -n 80 "$root/target/$run_id-app.log"
@@ -51,8 +52,38 @@ start_app() {
   fail "app never became ready through nginx: $(curl -sS "$http/readyz" 2>&1)"
 }
 
+# The production UI at nginx's public origin, as a browser uses it: the
+# authorization server's device page answers there, and API-key recovery
+# sign-in with tenant acme's key opens the tenant's page.
+ui_sign_in() {
+  local key=$1 jar="$work/ui-cookies" answer
+  curl -fsS -H 'accept: text/html' "$http/" | grep -qi '<html' || fail "UI root through nginx"
+  curl -fsS "$http/auth/device?tenant=acme" | grep -q 'Approve a Wyrd CLI login' \
+    || fail "device page at the UI origin through nginx"
+  answer="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$jar" \
+    -H "origin: $http" -H 'accept: text/html' --data-urlencode "apiKey=$key" \
+    "$http/t/acme/login/api-key")"
+  [[ $answer == "303 $http/t/acme" ]] || fail "API-key sign-in through nginx: $answer"
+  [[ "$(curl -sS -o /dev/null -w '%{http_code}' -b "$jar" -H 'accept: text/html' "$http/t/acme")" == 200 ]] \
+    || fail "signed-in tenant page through nginx"
+}
+
+# One child's unsolicited exit ends the container: the BFF is killed and the
+# entrypoint must stop wyrd-server and nginx with it.
+ui_exit_stops_app() {
+  # The bracket keeps this probe's own command lines from matching.
+  docker exec "$app" sh -c 'for p in /proc/[0-9]*; do
+    tr "\0" " " <"$p/cmdline" 2>/dev/null | grep -q "ui/build/[i]ndex.js" && kill "${p#/proc/}"
+  done; true'
+  for _ in $(seq 1 60); do
+    docker inspect -f '{{.State.Running}}' "$app" | grep -q false && return 0
+    sleep 1
+  done
+  fail "the container kept running after its UI exited"
+}
+
 echo "== build: server binary and the official image"
-image="$("$root/scripts/build.sh" image ubuntu "$tag")"
+image="$("$root/scripts/build.sh" image debian "$tag")"
 [[ $image == sha256:* ]] || fail "the official build reported no immutable image ID: $image"
 source_commit="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
 echo "image: $image source: $source_commit" | tee "$root/target/startup-$startup_journey-image-provenance.txt"

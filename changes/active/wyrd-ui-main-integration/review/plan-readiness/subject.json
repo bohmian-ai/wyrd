@@ -1,0 +1,9 @@
+{
+  "gate": "Spec",
+  "spec_revision": 5,
+  "spec_sha256": "51b2c18833e0854ca4e3b40f9209cb30636912a38afe533f571d6739157710f4",
+  "reviewed_source_commit": "8651b96fd0c049ab5e63b0606c98326af1fc8848",
+  "source_baseline": "committed HEAD; local trace-summary removal preserved separately",
+  "task_coverage": null,
+  "reason": "No replacement task packet exists; invalid archived tasks excluded"
+}

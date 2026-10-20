@@ -303,8 +303,9 @@ jobs:
         working-directory: crates/wyrd/wyrd-server/wyrd-ui
         run: node brand/gen-theme.mjs --check
 
-  # The official ubuntu image built the way the startup lanes and kind build
-  # it, then both startup journeys against it, on Linux x86 and arm.
+  # The official debian image built the way release builds it (its bundle in
+  # the ubuntu-22.04 builder, not on this runner), then both startup journeys
+  # against it, on Linux x86 and arm.
   image:
     name: image (${{ matrix.os }})
     needs: changes

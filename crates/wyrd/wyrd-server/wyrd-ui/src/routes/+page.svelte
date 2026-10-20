@@ -1,8 +1,5 @@
 <script lang="ts">
   import type { PageProps } from './$types';
-  import TenantChooser from '$lib/components/app/TenantChooser.svelte';
-  import StateBlock from '$lib/components/StateBlock.svelte';
-  import Panel from '$lib/components/Panel.svelte';
   import { toggleMode, theme } from '$lib/theme.svelte';
   import logo from '../../brand/logo.svg?inline';
   const webLeft = [0.1, 0.26, 0.42, 0.58, 0.74, 0.9];
@@ -11,6 +8,12 @@
   let { data, form }: PageProps = $props();
   let issue = $derived(form?.problem ?? data.problem);
   let reauthentication = $derived(form?.reauthentication ?? data.reauthentication);
+  let search = $state('');
+  let matches = $derived(
+    (data.session?.tenants ?? []).filter((tenant) =>
+      `${tenant.name} ${tenant.key}`.toLowerCase().includes(search.toLowerCase())
+    )
+  );
 </script>
 
 <svelte:head><title>{data.session ? 'Your workspace' : 'Sign in'} · Wyrd</title></svelte:head>
@@ -40,7 +43,10 @@
   <div class="entry-content">
     {#if issue}
       <div class="login-error" role="alert">
-        <StateBlock state={issue.status >= 500 ? 'error' : 'unauthorized'} title={issue.status >= 500 ? 'Sign-in unavailable' : issue.title} detail={issue.status >= 500 ? 'Please try again later.' : issue.remediation} />
+        <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
+          <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
+          <p>{issue.status >= 500 ? 'Please try again later.' : issue.remediation}</p>
+        </div>
         <details class="error-details"><summary>Technical details</summary><code>{issue.code}</code></details>
       </div>
     {/if}
@@ -61,7 +67,17 @@
     {:else if data.session.tenants.length === 0}
       <p class="access-help">Ask your workspace administrator to grant you access to a tenant.</p>
     {:else}
-      <Panel><TenantChooser session={data.session} /></Panel>
+      <div class="chooser">
+        <label class="visually-hidden" for="tenant-search">Search tenants</label>
+        <input id="tenant-search" class="app-input" placeholder="⌕ filter tenants" type="search" bind:value={search} />
+        <form method="POST" action="/?/switch">
+          {#each matches as tenant (tenant.key)}
+            <button class="app-control" type="submit" name="tenantKey" value={tenant.key}>{tenant.name}</button>
+          {:else}
+            <p role="status">No matching tenants.</p>
+          {/each}
+        </form>
+      </div>
     {/if}
   </div>
   </div>
@@ -214,6 +230,41 @@
   }
   .access-help {
     text-align: center;
+  }
+  .chooser,
+  .chooser form {
+    display: grid;
+    gap: 8px;
+  }
+  .chooser {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+  }
+  .chooser input {
+    background: var(--surface-2);
+    border-color: transparent;
+    font-weight: 400;
+  }
+  .chooser button {
+    text-align: left;
+    border: 0;
+    border-bottom: 1px solid var(--border-soft);
+    border-radius: 0;
+    font-weight: 400;
+    padding: 12px;
+  }
+  .chooser button:hover,
+  .chooser button:focus-visible {
+    background: var(--declare-soft);
+  }
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   p {
     font: 12px/18px var(--font-sans);

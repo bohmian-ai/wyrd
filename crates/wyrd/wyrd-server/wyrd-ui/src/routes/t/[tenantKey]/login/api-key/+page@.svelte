@@ -1,6 +1,5 @@
 <script lang="ts">
   import type { PageProps } from './$types';
-  import StateBlock from '$lib/components/StateBlock.svelte';
   import logo from '../../../../../../brand/logo.svg?inline';
   let { data, form }: PageProps = $props();
   let issue = $derived(form?.problem ?? data.problem);
@@ -16,7 +15,11 @@
     <h1>Sign in to {data.tenant.key}</h1>
     {#if issue}
       <div role="alert">
-        <StateBlock state={issue.status >= 500 ? 'error' : 'unauthorized'} title={issue.status >= 500 ? 'Sign-in unavailable' : issue.title} detail={issue.status >= 500 ? 'Please try again later.' : issue.remediation} code={issue.code} />
+        <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
+          <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
+          <p>{issue.status >= 500 ? 'Please try again later.' : issue.remediation}</p>
+          <code>{issue.code}</code>
+        </div>
       </div>
     {/if}
     {#if !issue || issue.status < 500}

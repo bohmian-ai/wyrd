@@ -1,12 +1,4 @@
-import { dev } from '$app/environment';
-import {
-  localAuthEnabled,
-  mockCookie,
-  mockDataEnabled,
-  loginScenario,
-  loginScenarioCookie,
-  mockTenantKey
-} from '$lib/server/development';
+import { localAuthEnabled, loginScenario, loginScenarioCookie } from '$lib/server/development';
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject, sessionCookie, sessionLifetime, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
@@ -25,8 +17,8 @@ export const load: PageServerLoad = async ({ locals, request, fetch, url }) => {
         )
       : null;
   if (destination && !reauthentication && request.method === 'GET') redirect(302, destination);
-  // Mock data needs no server; otherwise sign-in is useless while Wyrd is down.
-  const upstream = locals.mockData || (await serverReady(fetch)) ? null : problem('upstream');
+  // Sign-in is useless while Wyrd is down.
+  const upstream = (await serverReady(fetch)) ? null : problem('upstream');
   return {
     session: locals.session ? sessions.metadata(locals.session) : null,
     problem: url.searchParams.get('login') === 'failed' ? problem('unauthenticated') :
@@ -34,7 +26,7 @@ export const load: PageServerLoad = async ({ locals, request, fetch, url }) => {
         ? upstream
         : (locals.sessionProblem ?? upstream),
     reauthentication,
-    localAuth: localAuthEnabled() && locals.mockData,
+    localAuth: localAuthEnabled(),
     // Production sign-in is per tenant at /t/{tenantKey}/login; this page only routes there.
     tenantEntry: !localAuthEnabled()
   };
@@ -49,40 +41,8 @@ export const actions: Actions = {
       return fail(400, { problem: problem('validation'), reauthentication: null });
     redirect(303, `/t/${encodeURIComponent(key.trim())}/login`);
   },
-  mockData: async ({ request, cookies }) => {
-    if (!dev || request.headers.get('origin') !== new URL(request.url).origin)
-      return fail(403, { problem: problem('denied'), reauthentication: null });
-    const data = await request.formData();
-    try {
-      const enabled = data.get('enabled');
-      if (enabled !== 'true' && enabled !== 'false') reject('denied');
-      const destination = data.get('returnTo');
-      if (
-        typeof destination !== 'string' ||
-        !destination.startsWith('/') ||
-        destination.startsWith('//') ||
-        destination.includes('\\')
-      )
-        reject('denied');
-      cookies.set(mockCookie, enabled, {
-        path: '/',
-        httpOnly: true,
-        sameSite: 'strict',
-        secure: new URL(request.url).protocol === 'https:'
-      });
-      redirect(303, destination);
-    } catch (cause) {
-      if (isHttpError(cause))
-        return fail(cause.status, { problem: safeProblem(cause), reauthentication: null });
-      throw cause;
-    }
-  },
   loginScenario: async ({ request, cookies }) => {
-    if (
-      !dev ||
-      !mockDataEnabled(cookies) ||
-      request.headers.get('origin') !== new URL(request.url).origin
-    )
+    if (!localAuthEnabled() || request.headers.get('origin') !== new URL(request.url).origin)
       return fail(403, { problem: problem('denied'), reauthentication: null });
     try {
       const data = await request.formData();
@@ -109,20 +69,15 @@ export const actions: Actions = {
     if (!localAuthEnabled() || request.headers.get('origin') !== new URL(request.url).origin) {
       return fail(403, { problem: problem('denied'), reauthentication: null });
     }
-    if (!mockDataEnabled(cookies))
-      return fail(502, { problem: problem('upstream'), reauthentication: null });
     const scenario = loginScenario(cookies);
-    const tenantKey = mockTenantKey();
-    if (
-      scenario === 'single' &&
-      !sessions.principal.memberships.some((member) => member.key === tenantKey)
-    )
+    const tenantKey = sessions.principal.memberships[0]?.key;
+    if (scenario === 'single' && !tenantKey)
       return fail(403, { problem: problem('denied'), reauthentication: null });
     const previous = cookies.get(sessionCookie);
     if (previous) sessions.remove(previous);
     const id = sessions.create(
       Date.now(),
-      scenario === 'single' ? [tenantKey] : scenario === 'none' ? [] : undefined
+      scenario === 'single' ? [tenantKey!] : scenario === 'none' ? [] : undefined
     );
     cookies.set(sessionCookie, id, {
       path: '/',
@@ -152,9 +107,9 @@ export const actions: Actions = {
       throw cause;
     }
   },
-  reauthenticate: async ({ locals, request, cookies }) => {
+  reauthenticate: async ({ locals, request }) => {
     try {
-      if (!localAuthEnabled() || !mockDataEnabled(cookies) || !locals.session)
+      if (!localAuthEnabled() || !locals.session)
         reject('unauthenticated');
       const data = await request.formData();
       const key = data.get('tenantKey');

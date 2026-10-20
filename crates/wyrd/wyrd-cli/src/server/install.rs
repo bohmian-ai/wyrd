@@ -184,26 +184,36 @@ impl ServerInstaller {
 
     /// The active installation, if one exists.
     ///
-    /// Reads the `current` link; a missing link, unparsable version, or
-    /// missing executable means no usable installation.
-    #[must_use]
-    pub fn installed(&self) -> Option<InstalledServer> {
-        let link = std::fs::read_link(self.root.join("current")).ok()?;
-        let version = Version::parse(link.file_name()?.to_str()?).ok()?;
-        let installed = InstalledServer {
-            dir: self.version_dir(&version),
-            version,
+    /// Reads the `current` link; a missing link or unparsable version means
+    /// no installation. Reads nothing over the network.
+    ///
+    /// # Errors
+    /// Returns [`WyrdCliError::ServerInstallIncomplete`] when `current`
+    /// names a version directory failing [`check_payload`], whose recovery
+    /// is removing it, since [`Self::install`] would only refuse it again.
+    pub fn installed(&self) -> Result<Option<InstalledServer>, WyrdCliError> {
+        let Some(version) = std::fs::read_link(self.root.join("current"))
+            .ok()
+            .and_then(|link| Version::parse(link.file_name()?.to_str()?).ok())
+        else {
+            return Ok(None);
         };
-        installed.binary().is_file().then_some(installed)
+        let dir = self.version_dir(&version);
+        match check_payload(&dir) {
+            Ok(()) => Ok(Some(InstalledServer { version, dir })),
+            Err(detail) => Err(WyrdCliError::ServerInstallIncomplete { dir, detail }),
+        }
     }
 
     /// Install the newest stable release and make it the active installation.
     ///
     /// Selects the highest stable, non-draft `v<semver>` release, refuses it
     /// unless it shares this CLI's compatible version line, then downloads,
-    /// verifies, extracts, and activates it. An already-extracted version is
-    /// activated without downloading again. Directories it creates on the
-    /// way to `versions/` are private to the user.
+    /// verifies, extracts, and activates it. An already-extracted version that
+    /// passes [`check_payload`] is activated without downloading again; one
+    /// that fails it is refused and left in place for the user to remove.
+    /// Directories it creates on the way to `versions/` are private to the
+    /// user.
     ///
     /// # Errors
     /// - [`WyrdCliError::ServerReleaseUnavailable`]: listing or download
@@ -213,6 +223,8 @@ impl ServerInstaller {
     /// - [`WyrdCliError::ServerReleaseUnverified`]: the checksums are
     ///   missing or not signed by the release key, the bundle digest differs,
     ///   or the bundle does not extract to a runnable server.
+    /// - [`WyrdCliError::ServerInstallIncomplete`]: that version is already
+    ///   extracted but not runnable.
     /// - [`WyrdCliError::Io`]: local filesystem failure.
     ///
     /// Every failure, including cancellation, leaves the previous `current`
@@ -226,7 +238,11 @@ impl ServerInstaller {
             });
         }
         let dir = self.version_dir(&version);
-        if !dir.join("wyrd-server").is_file() {
+        if dir.exists() {
+            if let Err(detail) = check_payload(&dir) {
+                return Err(WyrdCliError::ServerInstallIncomplete { dir, detail });
+            }
+        } else {
             let versions = self.root.join("versions");
             // The root lies in the Wyrd config directory, which the saved
             // login refuses when others can write it, so whatever this
@@ -423,11 +439,12 @@ fn digest_for(checksums: &[u8], name: &str) -> Result<String, WyrdCliError> {
         .ok_or_else(|| unverified(format!("{CHECKSUMS} has no digest for {name}")))
 }
 
-/// Extract a verified bundle into `dest` with the system `tar`.
+/// Extract a verified bundle into `dest` with the system `tar` and require
+/// the result to pass [`check_payload`].
 ///
 /// # Errors
 /// Returns [`WyrdCliError::ServerReleaseUnverified`] when `tar` fails or
-/// the result holds no `wyrd-server` file, and [`WyrdCliError::Io`] when
+/// the result is not a runnable payload, and [`WyrdCliError::Io`] when
 /// `dest` cannot be created or `tar` cannot start.
 fn extract(bundle: &Path, dest: &Path) -> Result<(), WyrdCliError> {
     std::fs::create_dir_all(dest).map_err(io)?;
@@ -438,12 +455,85 @@ fn extract(bundle: &Path, dest: &Path) -> Result<(), WyrdCliError> {
         .arg(dest)
         .status()
         .map_err(io)?;
-    if !status.success() || !dest.join("wyrd-server").is_file() {
-        return Err(unverified(
-            "bundle did not extract to a runnable server".to_owned(),
-        ));
+    if !status.success() {
+        return Err(unverified("bundle did not extract".to_owned()));
+    }
+    check_payload(dest).map_err(|detail| {
+        unverified(format!(
+            "bundle did not extract to a runnable server: {detail}"
+        ))
+    })
+}
+
+/// Modules the pinned adapter-node build generates at the top of `ui/build`:
+/// the listener entry, the handler it serves, and the env and shim support
+/// both import.
+const UI_MODULES: [&str; 4] = [
+    "ui/build/index.js",
+    "ui/build/handler.js",
+    "ui/build/env.js",
+    "ui/build/shims.js",
+];
+
+/// The one rule deciding whether an extracted version directory is a
+/// runnable installation, applied to fresh extractions, cached versions
+/// before activation, and the active installation.
+///
+/// `scripts/build.sh bundle` stages the `wyrd-server` binary and the
+/// adapter-node production UI: a module `ui/package.json`, the non-empty
+/// generated [`UI_MODULES`], at least one generated server chunk under
+/// `ui/build/server`, the client manifest `ui/build/client/_app/version.json`,
+/// and an installed `ui/node_modules/<name>/package.json` for every declared
+/// production dependency. These static layout checks reject empty markers
+/// and partial payloads; loading the JavaScript stays with the launch-time
+/// Node and the build's own smoke import.
+///
+/// # Errors
+/// Returns a description of the first missing, empty, or malformed part.
+fn check_payload(dir: &Path) -> Result<(), String> {
+    let required = |file: &str| {
+        if std::fs::metadata(dir.join(file)).is_ok_and(|meta| meta.is_file() && meta.len() > 0) {
+            Ok(())
+        } else {
+            Err(format!("{file} is missing or empty"))
+        }
+    };
+    required("wyrd-server")?;
+    UI_MODULES.into_iter().try_for_each(required)?;
+    required("ui/build/client/_app/version.json")?;
+    if !contains_file(&dir.join("ui/build/server")) {
+        return Err("ui/build/server has no generated server chunks".to_owned());
+    }
+    let package = std::fs::read(dir.join("ui/package.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .ok_or_else(|| "ui/package.json is missing or not JSON".to_owned())?;
+    if package.get("type").and_then(serde_json::Value::as_str) != Some("module") {
+        return Err("ui/package.json does not declare an ES module package".to_owned());
+    }
+    let dependencies = package
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::keys);
+    for name in dependencies {
+        let installed = format!("ui/node_modules/{name}/package.json");
+        if !dir.join(&installed).is_file() {
+            return Err(format!("production dependency {name} is not installed"));
+        }
     }
     Ok(())
+}
+
+/// Whether `dir` holds a regular file at any depth; unreadable entries
+/// count as absent.
+fn contains_file(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.is_file() || (path.is_dir() && contains_file(&path))
+        })
+    })
 }
 
 /// A [`WyrdCliError::ServerReleaseUnavailable`] carrying `detail`.

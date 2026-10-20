@@ -40,14 +40,64 @@ struct MockRelease {
     assets: Vec<(String, Vec<u8>)>,
 }
 
-/// Build a gzipped server bundle whose `wyrd-server` prints `version`.
+/// Production UI files `scripts/build.sh bundle` stages from the pinned
+/// adapter-node build, as `(path, contents)` under the bundle root: the
+/// module package declaring its external production dependencies, those
+/// dependencies' installed packages, the generated entry and support
+/// modules, the generated server chunks they import, and the client
+/// version manifest.
+const UI_PAYLOAD: [(&str, &str); 10] = [
+    (
+        "ui/package.json",
+        r#"{"name":"wyrd-ui","private":true,"type":"module","dependencies":{"@fontsource/fragment-mono":"5.3.0","jose":"6.2.12"}}"#,
+    ),
+    (
+        "ui/node_modules/@fontsource/fragment-mono/package.json",
+        r#"{"name":"@fontsource/fragment-mono","version":"5.3.0"}"#,
+    ),
+    (
+        "ui/node_modules/jose/package.json",
+        r#"{"name":"jose","version":"6.2.12","type":"module"}"#,
+    ),
+    (
+        "ui/build/index.js",
+        "import { h as handler } from './server/chunks/handler-B.js';\nimport { env } from './env.js';\nimport './shims.js';\n",
+    ),
+    (
+        "ui/build/handler.js",
+        "import './shims.js';\nexport { h as handler } from './server/chunks/handler-B.js';\n",
+    ),
+    (
+        "ui/build/env.js",
+        "export const env = (name) => process.env[name];\n",
+    ),
+    ("ui/build/shims.js", "import 'node:buffer';\n"),
+    (
+        "ui/build/server/chunks/handler-B.js",
+        "export const h = () => {};\n",
+    ),
+    (
+        "ui/build/server/chunks/manifest.js-C.js",
+        "export const manifest = {};\n",
+    ),
+    ("ui/build/client/_app/version.json", r#"{"version":"1"}"#),
+];
+
+/// Build a gzipped server bundle whose `wyrd-server` prints `version` and
+/// whose `ui/` holds the complete production payload [`UI_PAYLOAD`], after
+/// `edit` alters the staged content root.
 ///
 /// # Panics
 /// Panics when the scratch directory or system `tar` fails.
-fn bundle(version: &str) -> Vec<u8> {
+fn bundle_with(version: &str, edit: impl Fn(&Path)) -> Vec<u8> {
     let work = tempfile::tempdir().expect("scratch directory");
     let content = work.path().join("content");
-    std::fs::create_dir_all(content.join("ui/build")).expect("bundle layout");
+    for (file, contents) in UI_PAYLOAD {
+        let file = content.join(file);
+        std::fs::create_dir_all(file.parent().expect("payload file parent")).expect("UI layout");
+        std::fs::write(file, contents).expect("UI payload file");
+    }
+    edit(&content);
     let binary = content.join("wyrd-server");
     std::fs::write(&binary, format!("#!/bin/sh\necho wyrd-server {version}\n")).expect("binary");
     std::fs::set_permissions(
@@ -66,6 +116,49 @@ fn bundle(version: &str) -> Vec<u8> {
         .expect("tar runs");
     assert!(status.success(), "tar packs the bundle");
     std::fs::read(archive).expect("bundle bytes")
+}
+
+/// A complete bundle of `version`.
+///
+/// # Panics
+/// Panics when [`bundle_with`] does.
+fn bundle(version: &str) -> Vec<u8> {
+    bundle_with(version, |_| {})
+}
+
+/// Remove the bundle-relative file or directory `file` under `content`.
+///
+/// # Panics
+/// Panics when it does not exist or cannot be removed.
+fn remove(content: &Path, file: &str) {
+    let path = content.join(file);
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).expect("remove payload directory");
+    } else {
+        std::fs::remove_file(path).expect("remove payload file");
+    }
+}
+
+/// Extract a complete bundle of `version` straight into `versions/<version>`
+/// under `root`, as an earlier install would have, after `edit` alters it.
+///
+/// # Panics
+/// Panics when the directory cannot be created or `tar` fails.
+fn cache(root: &Path, version: &str, edit: impl Fn(&Path)) {
+    let dir = root.join("versions").join(version);
+    std::fs::create_dir_all(&dir).expect("cached version directory");
+    let archive = root.join(format!(".cache-{version}.tar.gz"));
+    std::fs::write(&archive, bundle(version)).expect("cached bundle");
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&dir)
+        .status()
+        .expect("tar runs");
+    assert!(status.success(), "tar extracts the cached bundle");
+    std::fs::remove_file(archive).expect("remove cached bundle");
+    edit(&dir);
 }
 
 /// A correctly signed release of `version` for [`TARGET`].
@@ -135,9 +228,12 @@ fn installer(server: &MockServer, root: &Path, cli_version: &str) -> ServerInsta
 /// Run the active installation's `wyrd-server` and return what it printed.
 ///
 /// # Panics
-/// Panics when no installation is active or the binary does not run.
+/// Panics when no complete installation is active or the binary does not run.
 fn run_installed(installer: &ServerInstaller) -> String {
-    let installed = installer.installed().expect("an active installation");
+    let installed = installer
+        .installed()
+        .expect("a complete active installation")
+        .expect("an active installation");
     let output = Command::new(installed.binary())
         .output()
         .expect("installed server runs");
@@ -149,7 +245,8 @@ fn run_installed(installer: &ServerInstaller) -> String {
 /// and an incompatible newest release is refused before download. The
 /// install root lies in a config directory that does not exist yet, which
 /// installation creates private to the user whatever the umask, so a saved
-/// login can later be stored there.
+/// login can later be stored there. A complete cached version activates
+/// without downloading its bundle again.
 ///
 /// # Panics
 /// Panics when a different release is selected, the refusal differs, or the
@@ -202,10 +299,45 @@ async fn server_install_selects_latest_stable() {
     assert_eq!(refused.code(), "WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE");
     assert!(refused.to_string().contains("0.2.3"), "{refused}");
     assert_eq!(run_installed(&incompatible), "wyrd-server 0.2.3");
+
+    let offline = MockServer::start().await;
+    let mut listed = signed_release("v0.2.4");
+    listed.assets.retain(|(name, _)| !name.ends_with(".tar.gz"));
+    mount(&offline, &[listed]).await;
+    cache(&root, "0.2.4", |_| {});
+    let reuse = installer(&offline, &root, "0.2.1");
+    let reused = reuse
+        .install()
+        .await
+        .expect("a complete cached version activates without a download");
+    assert_eq!(reused.version, Version::new(0, 2, 4));
+    assert_eq!(run_installed(&reuse), "wyrd-server 0.2.4");
+}
+
+/// Assert `refused` is the incomplete-installation refusal naming
+/// `versions/<version>` under `root` and telling the user to remove it.
+///
+/// # Panics
+/// Panics when the code, named directory, or recovery differs.
+fn assert_incomplete(refused: &wyrd_cli::error::WyrdCliError, root: &Path, version: &str) {
+    assert_eq!(
+        refused.code(),
+        "WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE",
+        "{refused}"
+    );
+    let message = refused.to_string();
+    let dir = root.join("versions").join(version);
+    assert!(message.contains(&dir.display().to_string()), "{message}");
+    assert!(message.contains("remove"), "{message}");
 }
 
 /// Each failed update fails closed with a stable code and leaves the prior
-/// verified installation active and runnable.
+/// verified installation active and runnable, including correctly signed
+/// bundles whose production UI is absent, empty markers, or missing its
+/// generated support modules or a production dependency. Incomplete cached
+/// versions are refused before activation and kept, an incomplete active
+/// version is no installation, and each refusal's recovery (removing the
+/// named version, then installing) succeeds.
 ///
 /// # Panics
 /// Panics when a failure is accepted, its code differs, or the previous
@@ -238,20 +370,48 @@ async fn server_install_preserves_previous_on_failure() {
         let bytes = &mut release.assets[0].1;
         bytes.truncate(bytes.len() / 2);
     };
-    let not_runnable = |release: &mut MockRelease| {
-        let bytes = b"not a gzip archive".to_vec();
+    let resign = |release: &mut MockRelease, bytes: Vec<u8>| {
         let sums = format!("{:x}  {name}\n", Sha256::digest(&bytes)).into_bytes();
         release.assets[2].1 = signing_key().sign(&sums).to_bytes().to_vec();
         release.assets[0].1 = bytes;
         release.assets[1].1 = sums;
     };
-    let cases: [(&str, &Corruption<'_>); 6] = [
+    let not_runnable = |release: &mut MockRelease| resign(release, b"not a gzip archive".to_vec());
+    let signed_payload = |release: &mut MockRelease, edit: &dyn Fn(&Path)| {
+        resign(release, bundle_with("0.2.1", edit));
+    };
+    let no_ui =
+        |release: &mut MockRelease| signed_payload(release, &|content| remove(content, "ui"));
+    let empty_markers = |release: &mut MockRelease| {
+        signed_payload(release, &|content| {
+            remove(content, "ui");
+            std::fs::create_dir_all(content.join("ui/build")).expect("marker layout");
+            std::fs::create_dir_all(content.join("ui/node_modules")).expect("marker layout");
+            std::fs::write(content.join("ui/package.json"), "{}").expect("marker package");
+            std::fs::write(content.join("ui/build/index.js"), "").expect("marker entry");
+        });
+    };
+    let no_server_chunks = |release: &mut MockRelease| {
+        signed_payload(release, &|content| remove(content, "ui/build/server"));
+    };
+    let no_handler = |release: &mut MockRelease| {
+        signed_payload(release, &|content| remove(content, "ui/build/handler.js"));
+    };
+    let no_dependency = |release: &mut MockRelease| {
+        signed_payload(release, &|content| remove(content, "ui/node_modules/jose"));
+    };
+    let cases: [(&str, &Corruption<'_>); 11] = [
         ("WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE", &missing_target),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &unsigned),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &altered_sums),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &altered_bytes),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &truncated),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &not_runnable),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &no_ui),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &empty_markers),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &no_server_chunks),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &no_handler),
+        ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &no_dependency),
     ];
     for (code, corrupt) in cases {
         let server = MockServer::start().await;
@@ -273,6 +433,44 @@ async fn server_install_preserves_previous_on_failure() {
     let refused = update.install().await.expect_err("no releases listed");
     assert_eq!(refused.code(), "WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE");
     assert_eq!(run_installed(&update), "wyrd-server 0.2.0");
+
+    let newer = MockServer::start().await;
+    mount(&newer, &[signed_release("v0.2.1")]).await;
+    let update = installer(&newer, root.path(), "0.2.0");
+    let cached = root.path().join("versions/0.2.1");
+    let incomplete_caches: [&dyn Fn(&Path); 2] = [&|dir| remove(dir, "ui"), &|dir| {
+        remove(dir, "ui/node_modules");
+    }];
+    for edit in incomplete_caches {
+        cache(root.path(), "0.2.1", edit);
+        let refused = update
+            .install()
+            .await
+            .expect_err("an incomplete cached version is not activated");
+        assert_incomplete(&refused, root.path(), "0.2.1");
+        assert_eq!(run_installed(&update), "wyrd-server 0.2.0");
+        assert!(
+            cached.join("wyrd-server").is_file(),
+            "the refused cache is kept"
+        );
+        std::fs::remove_dir_all(&cached).expect("follow the recovery");
+    }
+    update.install().await.expect("recovered install");
+    assert_eq!(run_installed(&update), "wyrd-server 0.2.1");
+
+    remove(&cached, "ui/build/server");
+    let refused = update
+        .installed()
+        .expect_err("an incomplete active version is not an installation");
+    assert_incomplete(&refused, root.path(), "0.2.1");
+    let refused = update
+        .install()
+        .await
+        .expect_err("reinstall does not reactivate the incomplete version");
+    assert_incomplete(&refused, root.path(), "0.2.1");
+    std::fs::remove_dir_all(&cached).expect("follow the recovery");
+    update.install().await.expect("recovered install");
+    assert_eq!(run_installed(&update), "wyrd-server 0.2.1");
 
     let home = tempfile::tempdir().expect("installed CLI config home");
     let closed = std::net::TcpListener::bind("127.0.0.1:0")

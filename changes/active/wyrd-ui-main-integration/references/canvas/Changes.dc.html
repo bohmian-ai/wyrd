@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Change Requests</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&amp;family=Fragment+Mono&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c12}
+a{color:#7a8cff;text-decoration:none}a:hover{color:#a9b4ff}
+.mono{font-family:"Fragment Mono",ui-monospace,monospace}
+.btn{height:34px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 12px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#e6e4da;font:13px "Familjen Grotesk",sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#1f2230}
+.btn.primary{background:#7a8cff;border-color:#7a8cff;color:#0b0c12;font-weight:600}
+.h{font:11px "Fragment Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:#8f92a5}
+.panel{background:#12141c;border:1px solid #252838;border-radius:2px}
+.ph{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #252838}
+.pb{padding:14px 16px}
+.kind{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;background:#1a2040;border:1px solid #3a4170;color:#c7cdff;font:11px "Fragment Mono",monospace;letter-spacing:.04em;text-transform:uppercase;border-radius:2px}
+.ok{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3dbe5a;color:#3dbe5a;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.bad{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #e2484d;color:#e2484d;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.neutral{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #3a3d4f;color:#8f92a5;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px;font:12px "Fragment Mono",monospace}
+.kv dt{color:#8f92a5}.kv dd{margin:0;color:#e6e4da;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab{padding:10px 2px;margin-right:22px;color:#8f92a5;font:13px "Familjen Grotesk",sans-serif}
+.tab[aria-current]{color:#e6e4da;box-shadow:inset 0 -2px 0 #7a8cff}
+.vital{padding:14px 16px;display:flex;flex-direction:column;gap:4px;border-right:1px solid #252838;min-width:0}
+.vital:last-child{border-right:0}
+.vv{font:600 22px "Familjen Grotesk",sans-serif;color:#e6e4da}
+.vs{font:11px "Fragment Mono",monospace;color:#8f92a5}
+table{width:100%;border-collapse:collapse;font:12px "Fragment Mono",monospace}
+th{text-align:left;font-weight:400;color:#8f92a5;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:8px 16px;border-bottom:1px solid #252838}
+td{padding:9px 16px;border-bottom:1px solid #1c1f2c;color:#e6e4da}
+tr:last-child td{border-bottom:0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;background:#1a1d28;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;color:#e6e4da;white-space:nowrap}
+.node{display:flex;flex-direction:column;gap:3px;padding:9px 12px;background:#12141c;border:1px solid #252838;border-radius:2px;font:12px "Fragment Mono",monospace;min-width:0}
+.node small{color:#8f92a5;font-size:10.5px}
+.node.self{border:2px solid #7a8cff;background:#141933}
+.edge{font:10.5px "Fragment Mono",monospace;color:#8f92a5;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.wait{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px dashed #5a5e78;color:#b4b7c9;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.run{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid #7a8cff;color:#a9b4ff;font:11px "Fragment Mono",monospace;border-radius:2px;white-space:nowrap}
+.code{font:12px/1.7 "Fragment Mono",monospace;background:#0e1017;border:1px solid #252838;padding:12px 14px;margin:0;color:#e6e4da;white-space:pre;overflow-x:auto}
+.grp td{background:#151826}
+.sub{color:#8f92a5;font-size:11px}
+</style>
+</helmet>
+<div style="display:flex;flex-wrap:wrap;background:#0b0c12"><aside aria-label="Primary" style="flex:0 0 212px;box-sizing:border-box;background:#0e1017;border-right:1px solid #252838;display:flex;flex-direction:column;gap:2px;padding:14px 10px"><div style="display:flex;align-items:center;justify-content:space-between;padding:0 6px 12px"><span style="font:600 11px 'Fragment Mono',monospace;padding:3px 8px;background:#7a8cff;color:#0b0c12">WYRD</span><button aria-label="Collapse navigation" style="background:transparent;border:0;color:#8f92a5;cursor:pointer;width:28px;height:28px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path></svg></button></div><button style="display:flex;align-items:center;gap:8px;height:32px;margin-bottom:10px;padding:0 10px;background:#12141c;border:1px solid #252838;border-radius:2px;color:#8f92a5;font:12px 'Fragment Mono',monospace;cursor:pointer">⌕ Find or ask… <kbd style="margin-left:auto;color:#8f92a5">⌘K</kbd></button><a href="Home.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 11l9-7 9 7v9h-6v-6H9v6H3z"></path></svg>Home</a><a href="Service.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16"></rect><path d="M4 9h16"></path></svg>Cards</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"></path></svg>Observe</a><a href="Verify.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12l5 5L20 7"></path></svg>Verify</a><a href="Query.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"></ellipse><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"></path></svg>Query</a><div aria-hidden="true" style="height:1px;background:#1c1f2c;margin:8px 4px"></div><a href="Changes.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#e6e4da;background:#1a2040;box-shadow:inset 2px 0 0 #7a8cff"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="6" r="2"></circle><circle cx="6" cy="18" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 8v8M8 6h3a5 5 0 0 1 5 5"></path></svg>Changes<span style="margin-left:auto;font:11px 'Fragment Mono',monospace;padding:0 6px;border:1px solid #3a4170;color:#c7cdff">2</span></a><div style="margin-top:auto;display:flex;flex-direction:column;gap:2px"><a href="Repos.dc.html" style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:2px;font:13px 'Familjen Grotesk',sans-serif;color:#8f92a5;background:transparent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9L7 7M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"></path></svg>Settings</a><div style="display:flex;align-items:center;gap:8px;padding:10px 10px 0;border-top:1px solid #1c1f2c;margin-top:8px;font:12px 'Fragment Mono',monospace;color:#e6e4da"><span style="width:22px;height:22px;border-radius:50%;background:#1a2040;display:inline-flex;align-items:center;justify-content:center;color:#c7cdff">a</span><span style="display:flex;flex-direction:column"><span>alice</span><span style="color:#8f92a5;font-size:11px">ui-live ▾</span></span></div></div></aside><div style="flex:999 1 560px;min-width:0">
+<div style="min-height: 1000px; background: #0b0c12; color: #e6e4da; font-family: 'Familjen Grotesk', sans-serif;">
+  <header style="display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid #252838; background: #0e1017; min-height: 34px;">
+    <span class="mono" style="font-size: 12px; color: #8f92a5;">Changes</span>
+  </header>
+  <section style="padding: 22px 24px 0; display:flex; flex-direction:column; gap:14px;">
+    <div style="display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap">
+      <div style="flex:1 1 480px;min-width:0"><h1 style="margin:0;font-size:28px;font-weight:600">Change Requests</h1>
+      <p style="margin:6px 0 0;color:#c9c7be;font-size:15px">Revisions, evidence and Verifier results across pull requests and repositories.</p></div>
+      <a class="btn" href="Repos.dc.html">Repositories</a><a class="btn primary" href="ChangeDetail.dc.html">+ New Change Request</a>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <label style="flex:1 1 420px;min-width:0;height:34px;box-sizing:border-box;display:flex;align-items:center;gap:10px;padding:0 10px;background:#12141c;border:1px solid #3a4170;border-radius:2px">
+        <span class="mono" style="font-size:12px;color:#8f92a5">FILTER</span>
+        <input class="mono" aria-label="Filter Change Requests" value="is:open involves:@me" style="flex:1;min-width:0;background:transparent;border:0;outline:0;color:#e6e4da;font-size:12px"></label>
+      <button class="btn" aria-pressed="true" style="background:#1a2040;border-color:#3a4170">Open 4</button><button class="btn">Closed 31</button>
+      <button class="btn">Needs my review 2</button><button class="btn">Repository ▾</button><button class="btn">Service ▾</button>
+    </div>
+  </section>
+  <div style="padding: 16px 24px 32px; display:flex; flex-direction:column; gap:12px">
+    <div class="panel" style="overflow-x:auto"><table><tr><th>Change</th><th>Linked work</th><th>Revision</th><th>Verification</th><th>Updated</th></tr><tr><td><a href="ChangeDetail.dc.html" style="color:#e6e4da;font:600 14px 'Familjen Grotesk',sans-serif">Ground refund answers in the 14-day policy</a><div class="sub" style="margin-top:3px">CR-142 · <span class="ok" style="padding:0 5px">open</span></div></td><td class="sub">support-desk#418 · prompt-library#77</td><td class="sub">revision 5</td><td><div style="display:flex;flex-direction:column;gap:6px"><span aria-hidden="true" style="display:flex;gap:2px;width:120px;height:6px"><span style="flex:5;background:#3dbe5a"></span><span style="flex:1;background:#e2484d"></span><span style="flex:1;background:#7a8cff"></span><span style="flex:1;background:#3a3d4f"></span></span><span class="sub">4/6 Verifiers</span><span><span class="bad">✕ 1 failed</span> <span class="wait">1 waiting on evidence</span></span></div></td><td class="sub">alice · 12m</td></tr><tr><td><a href="#" style="color:#e6e4da;font:600 14px 'Familjen Grotesk',sans-serif">Distil sim-slow-6 model to cut p95 latency</a><div class="sub" style="margin-top:3px">CR-141 · <span class="ok" style="padding:0 5px">open</span></div></td><td class="sub">sim-services#203</td><td class="sub">revision 2</td><td><div style="display:flex;flex-direction:column;gap:6px"><span aria-hidden="true" style="display:flex;gap:2px;width:120px;height:6px"><span style="flex:2;background:#3dbe5a"></span><span style="flex:2;background:#7a8cff"></span><span style="flex:1;background:#3a3d4f"></span></span><span class="sub">2/5 Verifiers</span><span><span class="run">● 2 running</span></span></div></td><td class="sub">dan · 40m</td></tr><tr><td><a href="#" style="color:#e6e4da;font:600 14px 'Familjen Grotesk',sans-serif">Add PII redaction step to the gateway</a><div class="sub" style="margin-top:3px">CR-139 · <span class="ok" style="padding:0 5px">open</span></div></td><td class="sub">wyrd-gateway#88 · infra#12 · sdk-python#301 · sdk-ts#97</td><td class="sub">revision 6</td><td><div style="display:flex;flex-direction:column;gap:6px"><span aria-hidden="true" style="display:flex;gap:2px;width:120px;height:6px"><span style="flex:9;background:#3dbe5a"></span></span><span class="sub">9/9 Verifiers</span><span><span class="ok">✓ verified</span></span></div></td><td class="sub">carol · 3h</td></tr><tr><td><a href="#" style="color:#e6e4da;font:600 14px 'Familjen Grotesk',sans-serif">Raise drift threshold for sim-drifting-4</a><div class="sub" style="margin-top:3px">CR-138 · <span class="ok" style="padding:0 5px">open</span></div></td><td class="sub"><span class="sub">no linked work yet · description only</span></td><td class="sub">revision 1</td><td><div style="display:flex;flex-direction:column;gap:6px"><span aria-hidden="true" style="display:flex;gap:2px;width:120px;height:6px"><span style="flex:3;background:#3a3d4f"></span></span><span class="sub">0/3 Verifiers</span><span><span class="wait">waiting on a subject</span></span></div></td><td class="sub">erin · 1d</td></tr><tr><td><a href="#" style="color:#e6e4da;font:600 14px 'Familjen Grotesk',sans-serif">Retire the support-desk v1 prompt</a><div class="sub" style="margin-top:3px">CR-135 · <span class="neutral" style="padding:0 5px">closed</span></div></td><td class="sub">support-desk#401</td><td class="sub">revision 3</td><td><div style="display:flex;flex-direction:column;gap:6px"><span aria-hidden="true" style="display:flex;gap:2px;width:120px;height:6px"><span style="flex:6;background:#3dbe5a"></span></span><span class="sub">6/6 Verifiers</span><span><span class="ok">✓ verified · completed</span></span></div></td><td class="sub">alice · 4d</td></tr></table></div>
+    <p class="mono" style="margin:0;font-size:12px;color:#8f92a5">A pull request on a connected repository opens a Change Request when none is linked. To join an existing one, put <span style="color:#e6e4da">Wyrd-Change: CR-142</span> in the PR body, or link it from the Change Request.</p>
+  </div>
+</div>
+</div></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

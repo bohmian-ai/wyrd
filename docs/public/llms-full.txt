@@ -266,8 +266,6 @@ The code is the same app in Python, Rust, and TypeScript. This page runs the Pyt
 - An OpenAI API key with access to `gpt-4o` (the agent) and `gpt-6-luna` (the policy judge).
 - Python 3.11+ and `git`.
 
-**Version:** This page describes Wyrd 0.2.0, built from this repository. The published packages are 0.1.1; see [Set up Wyrd](/wyrd/get-started/setup/) before mixing them.
-
 ## 1. Get the example
 
 ```bash

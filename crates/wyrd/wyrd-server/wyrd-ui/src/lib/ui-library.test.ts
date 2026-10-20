@@ -66,7 +66,7 @@ import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, typ
 import { mountView, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import catalog from 'wyrd-ai-ui/catalog.json';
-import { card, denied, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
+import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 
 /** An executor answering each read with `answer` and recording every request and signal. */
 function recording(answer: (request: WireRequest) => WireResult | Promise<WireResult>) {
@@ -412,6 +412,46 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   answer({ state: 'denied', problem: denied });
   expect(await view.findByRole('alert')).toHaveTextContent('Forbidden (WYRD_AUTH_403_FORBIDDEN)');
   view.unmount();
+
+  // CardHeader version and tab controls show their host-reported state and never send during pending.
+  const tabs = [{ id: 'overview', label: 'Overview' }, { id: 'runs', label: 'Runs' }];
+  const listed = { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1')], truncated: false } } } } as const;
+  const headerAction = vi.fn();
+  const controls = render(CardHeader, { input: { cardRef: card, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': { state: 'pending' }, 'card.tab': { state: 'pending' } } });
+  const select = controls.getByRole('combobox', { name: 'Version' }) as HTMLSelectElement;
+  expect(select).toBeDisabled();
+  expect(controls.getByRole('button', { name: 'Runs' })).toBeDisabled();
+  for (const [state, text] of [
+    [{ state: 'denied', problem: denied }, 'Forbidden (WYRD_AUTH_403_FORBIDDEN)'],
+    [{ state: 'error', problem: { code: 'WYRD_SPEC_500_INTERNAL', title: 'Internal error' } }, 'Internal error (WYRD_SPEC_500_INTERNAL)'],
+    [{ state: 'unavailable', reason: 'No navigation here' }, 'No navigation here'],
+    [{ state: 'success', message: 'Opened 1.4.1' }, 'Opened 1.4.1']
+  ] as const) {
+    await controls.rerender({ input: { cardRef: card, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': state, 'card.tab': state } });
+    expect(controls.getAllByText(text)).toHaveLength(2);
+    expect(select.disabled).toBe(state.state === 'unavailable');
+  }
+  // A refused or pending change leaves the selection on the version the host passed.
+  await fireEvent.change(select, { target: { value: '1.4.1' } });
+  expect(headerAction).toHaveBeenCalledExactlyOnceWith({ name: 'card.version', input: { card_ref: { ...card, version: '1.4.1' } } });
+  expect(select.value).toBe('1.4.2');
+  await fireEvent.click(controls.getByRole('button', { name: 'Runs' }));
+  expect(headerAction).toHaveBeenLastCalledWith({ name: 'card.tab', input: { tab: 'runs' } });
+  expect(controls.getByRole('button', { name: 'Overview' })).toHaveAttribute('aria-current', 'page');
+  controls.unmount();
+  // Through a view, a version change reaches the host once and its refusal shows.
+  let refuse: (state: { state: 'denied'; problem: typeof denied }) => void = () => {};
+  const viewAction = vi.fn(() => new Promise((resolve) => (refuse = resolve)));
+  const headed = render(WyrdView, { doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'h', component: 'CardHeader', input: { cardRef: card } }] }, executor: fixtureExecutor, onaction: viewAction });
+  await waitFor(() => expect(headed.getByRole('combobox', { name: 'Version' })).toBeEnabled());
+  const viewSelect = headed.getByRole('combobox', { name: 'Version' });
+  await fireEvent.change(viewSelect, { target: { value: '1.4.1' } });
+  await fireEvent.change(viewSelect, { target: { value: '1.4.1' } });
+  expect(viewAction).toHaveBeenCalledOnce();
+  refuse({ state: 'denied', problem: denied });
+  expect(await headed.findByText('Forbidden (WYRD_AUTH_403_FORBIDDEN)')).toBeInTheDocument();
+  expect((viewSelect as HTMLSelectElement).value).toBe('1.4.2');
+  headed.unmount();
 
   // Hosts validate intents against the catalog's action schemas.
   expect(validateIntent('Chart', { name: 'chart.range', input: { from: RANGE.to, to: RANGE.from } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: 'Chart chart.range input.to: from must precede to' });

@@ -4,10 +4,11 @@
   its own state, so a failed listing never hides the Card itself.
 -->
 <script lang="ts">
-  import type { ActionProps, CardRef } from '../contract.js';
+  import type { ActionProps, ActionState, CardRef } from '../contract.js';
   import type { CardHeaderProps } from '../loaders.js';
   import { fmtCardRef, fmtInstant, parseInstant } from '../format.js';
   import ActionButton from './ActionButton.svelte';
+  import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
 
@@ -32,6 +33,10 @@
   /** The newest listed version; the select marks it `current`. */
   const newest = $derived(items[0]?.version);
   const unavailable = { state: 'unavailable', reason: 'This host offers no navigation' } as const;
+  const versionState = $derived(actions['card.version']);
+  const tabState = $derived(actions['card.tab']);
+  /** A pending or unavailable action takes no further input, so an intent is never sent twice. */
+  const blocked = (state: ActionState | undefined) => state?.state === 'pending' || state?.state === 'unavailable';
 
   /** Local clipboard feedback; copying is not a host action. */
   let copied = $state<'Copied' | 'Copy failed' | undefined>();
@@ -54,10 +59,15 @@
           <span class="kind"><span aria-hidden="true">●</span> {card.kind}</span>
           <label class="version">
             <span class="visually-hidden">Version</span>
+            <!-- The selection always shows the version the host passed; a chosen one shows once the host renders it. -->
             <select
-              disabled={!onaction || versions?.state !== 'populated'}
+              disabled={!onaction || versions?.state !== 'populated' || blocked(versionState)}
+              aria-busy={versionState?.state === 'pending' ? 'true' : undefined}
               value={input.cardRef.version}
-              onchange={(event) => onaction?.({ name: 'card.version', input: { card_ref: { ...ref, version: event.currentTarget.value } } })}
+              onchange={(event) => {
+                onaction?.({ name: 'card.version', input: { card_ref: { ...ref, version: event.currentTarget.value } } });
+                event.currentTarget.value = input.cardRef.version;
+              }}
             >
               {#each items as item (item.version)}
                 <option value={item.version}>v{item.version}{item.version === newest ? ' · current' : ''}</option>
@@ -67,6 +77,7 @@
               {/if}
             </select>
           </label>
+          <ActionNote state={versionState} />
           {#if current}<span class="status"><StatusPill tone={TONES[current.status]} label={current.status} /></span>{/if}
         </div>
         <p class="meta">
@@ -106,10 +117,12 @@
           <button
             type="button"
             aria-current={tab.id === (input.tab ?? input.tabs[0].id) ? 'page' : undefined}
-            disabled={!onaction}
+            disabled={!onaction || blocked(tabState)}
+            aria-busy={tabState?.state === 'pending' ? 'true' : undefined}
             onclick={() => onaction?.({ name: 'card.tab', input: { tab: tab.id } })}>{tab.label}</button
           >
         {/each}
+        <ActionNote state={tabState} />
       </nav>
     {/if}
   </header>
@@ -238,6 +251,7 @@
   nav {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 0 22px;
   }
   nav button {

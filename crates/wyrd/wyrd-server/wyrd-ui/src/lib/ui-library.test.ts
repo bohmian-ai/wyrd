@@ -122,6 +122,28 @@ test('TASK-003: Validated portable rendering', async () => {
     expect(many.getByRole('status')).toHaveTextContent(count > 20 ? 'other: 3 ms' : 'm1: 1 ms');
     many.unmount();
   }
+  // Authored series named "other" keep their values; the aggregate's caption stays distinct from every one of them.
+  const grouped = (groups: [string, number][]): QueryResult => ({ ...series, rows: groups.map(([name, value]) => ['2026-10-20T10:00:00Z', name, value]), terminal: terminal(groups.length) });
+  const captions = (view: ReturnType<typeof render>) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+  const taken: [string, number][] = [['other', 21], ['other (aggregate)', 20], ...Array.from({ length: 19 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
+  const named = render(Chart, { input: timeseries, result: { state: 'populated', data: grouped(taken) } });
+  expect(captions(named)).toHaveLength(20);
+  expect(new Set(captions(named)).size).toBe(20);
+  expect(captions(named).slice(0, 2)).toEqual(['other', 'other (aggregate)']);
+  expect(captions(named).at(-1)).toBe('other (aggregate 2)');
+  expect(named.container.querySelectorAll('svg.plot polyline')).toHaveLength(20);
+  expect(named.getByRole('application').getAttribute('aria-label')).toContain('other, other (aggregate), s19');
+  await fireEvent.focus(named.getByRole('application'));
+  expect(named.getByRole('status')).toHaveTextContent(/other: 21 ms.*other \(aggregate\): 20 ms.*other \(aggregate 2\): 3 ms/);
+  // A smaller authored "other" folds into the aggregate, which then needs no qualifier; at five series it keeps its own line.
+  await named.rerender({ result: { state: 'populated', data: grouped([...taken.slice(2), ['x', 30], ['y', 40], ['other', 0.5]]) } });
+  expect(captions(named)).toHaveLength(20);
+  expect(captions(named).slice(0, 2)).toEqual(['y', 'x']);
+  expect(captions(named).at(-1)).toBe('other');
+  expect(named.getByRole('status')).toHaveTextContent('other: 3.5 ms');
+  await named.rerender({ result: { state: 'populated', data: grouped([['other', 21], ['s1', 1], ['s2', 2]]) } });
+  expect(captions(named)).toEqual(['other', 's1', 's2']);
+  named.unmount();
 
   // Signed values draw finite geometry around a zero baseline.
   const signed = (values: number[]): QueryResult => ({

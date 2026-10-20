@@ -463,6 +463,22 @@ async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   }
 }
 
+/** One result column, in engine order; names may repeat. `data_type` is the Arrow type's display. */
+export interface QueryColumn {
+  readonly name: string;
+  readonly data_type: string;
+  readonly nullable: boolean;
+}
+
+/** A complete bounded query result: positional rows, returned only after a valid terminal. */
+export interface BoundedQueryResult {
+  readonly columns: readonly QueryColumn[];
+  readonly rows: readonly (readonly unknown[])[];
+  readonly terminal: Omit<QueryTerminal, "arrow_ipc_eos" | "error" | "outcome"> & {
+    readonly outcome: Exclude<QueryTerminal["outcome"], "failed">;
+  };
+}
+
 /**
  * One running query's Arrow batches, iterated as they arrive.
  *
@@ -588,6 +604,29 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     }
     this.#done = true;
     return { done: true, value: undefined };
+  }
+
+  /**
+   * Read the whole result as one bounded JSON value with positional rows.
+   *
+   * Rows are encoded by the same Rust projection the server's MCP
+   * `bifrost.query` tool uses, so both return the same value for one result.
+   * Returned only after the validated terminal; a result past either ceiling
+   * fails as `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and is never truncated.
+   * {@link BifrostQueryStream.return} during collection stops it.
+   *
+   * @param options - Row ceiling (default 1000) and serialized byte ceiling (default 4 MiB).
+   * @returns The complete `{columns, rows, terminal}` result.
+   * @throws {@link WyrdError} for a failed or oversized query; the stream is closed either way.
+   */
+  async collect(options: { maxRows?: number; maxBytes?: number } = {}): Promise<BoundedQueryResult> {
+    this.#done = true;
+    const step = await this.#native.collect(options.maxRows, options.maxBytes);
+    const error = projectedError(step);
+    if (error !== undefined) {
+      throw error;
+    }
+    return JSON.parse(step.terminalJson as string) as BoundedQueryResult;
   }
 
   /**

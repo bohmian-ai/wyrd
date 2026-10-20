@@ -242,8 +242,10 @@ official Node image. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
 for debian on amd64 and arm64 and rocky on amd64 only, each built on a native
 runner from the bundle its build job recorded, then the multi-arch tags
 `<distro>-<version>` and `<distro>-latest`, with debian also as `<version>` and
-`latest`. The debian images carry the bundle built on ubuntu-22.04; rocky
-carries the one built on rockylinux:9, so each runs on its image's glibc.
+`latest`. The gnu bundles build in the `docker/builder/ubuntu-22.04` image and
+the rocky bundle in `docker/builder/rockylinux-9`, so each links against the
+oldest glibc it supports (2.35 and 2.34) whichever host or runner builds it,
+and runs on its image's newer or equal glibc.
 
 No Wyrd image has been published yet. Until the first release, image
 acceptance builds the debian image on Linux with `scripts/build.sh image` from
@@ -275,7 +277,8 @@ Native local servers run on three targets: `aarch64-apple-darwin`,
 `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`; Intel macOS is
 not supported. Each release publishes `wyrd-server-<target>.tar.gz` for those
 targets and for `x86_64-unknown-linux-gnu-rocky`, which only the rocky image
-uses, each built by `scripts/build.sh bundle` and holding `wyrd-server` and the
+uses, each built by `scripts/build.sh bundle` (Linux bundles through
+`scripts/build.sh bundle-in <builder>`) and holding `wyrd-server` and the
 production UI under `ui/` (its adapter-node build, `package.json`, and
 production `node_modules`; no Node.js executable), plus
 `checksums.txt` and `checksums.txt.sig`: a raw Ed25519 signature over the

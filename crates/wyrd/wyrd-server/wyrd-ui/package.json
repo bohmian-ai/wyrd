@@ -9,7 +9,7 @@
     "build": "pnpm package && vite build",
     "preview": "vite preview",
     "check": "pnpm package && pnpm --filter wyrd-ai-ui check && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test": "pnpm package && vitest run",
+    "test": "pnpm package && node --input-type=module -e 'import assert from \"node:assert/strict\"; const loaders = await import(\"wyrd-ai-ui/loaders\"); const mcp = await import(\"wyrd-ai-ui/mcp\"); assert.equal(loaders.chartParams(\"SELECT $1\", undefined).code, \"WYRD_SPEC_400_VALIDATION\"); assert.equal(typeof mcp.mcpExecutor, \"function\");' && vitest run",
     "tokens": "node brand/gen-theme.mjs"
   },
   "devDependencies": {

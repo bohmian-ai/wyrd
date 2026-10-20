@@ -16,7 +16,7 @@ import type {
   VerificationExecutionState
 } from 'wyrd-ai';
 
-import problems from './problems.json';
+import problems from './problems.json' with { type: 'json' };
 
 export type { CardRef, CardSummary, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
 

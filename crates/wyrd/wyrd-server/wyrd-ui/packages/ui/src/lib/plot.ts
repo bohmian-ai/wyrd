@@ -11,8 +11,8 @@ export interface Series {
   readonly points: readonly { readonly x: number; readonly y: number }[];
 }
 
-/** Series past this count fold into one summed "other" series (four line styles exist). */
-export const MAX_SERIES = 4;
+/** Series past this count fold into one summed "other" series (REQ-025). */
+export const MAX_SERIES = 20;
 
 /** Position of the first column named `name`. */
 export function columnIndex(result: QueryResult, name: string): number {

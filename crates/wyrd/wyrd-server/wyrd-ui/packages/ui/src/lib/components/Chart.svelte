@@ -26,13 +26,15 @@
   const H = $derived(Math.max(160, boxHeight));
   /** Tick labels sit above their gridline at the left; the gutter keeps the first points clear of them. */
   const PAD = { left: 32, right: 6, top: 16, bottom: 22 };
-  /** Position-indexed series styles: colour, dash and marker always differ together. */
-  const STYLES = [
-    { stroke: 'var(--declare)', dash: '', marker: 'square' },
-    { stroke: 'var(--observe)', dash: '6 3', marker: 'circle' },
-    { stroke: 'var(--text)', dash: '2 3', marker: 'triangle' },
-    { stroke: 'var(--muted)', dash: '8 2 2 2', marker: 'diamond' }
-  ] as const;
+  const STROKES = ['var(--declare)', 'var(--observe)', 'var(--text)', 'var(--muted)'] as const;
+  const MARKERS = ['square', 'circle', 'triangle', 'diamond'] as const;
+  const DASHES = ['', '6 3', '2 3', '8 2 2 2', '1 4'] as const;
+  /**
+   * The style of series `index`. Colour and marker cycle by four and dash by
+   * five, so every one of the twenty series pairs a dash with a marker no other
+   * series has, and series stay distinct without colour.
+   */
+  const style = (index: number) => ({ stroke: STROKES[index % 4], marker: MARKERS[index % 4], dash: DASHES[index % 5] });
 
   const data = $derived(result.state === 'populated' || result.state === 'empty' ? result.data : undefined);
   const degraded = $derived(data?.terminal.outcome === 'degraded');
@@ -43,9 +45,10 @@
   const xs = $derived([...new Set(lines.flatMap((line) => line.points.map((point) => point.x)))].sort((a, b) => a - b));
   const bounds = $derived.by(() => {
     const ys = lines.flatMap((line) => line.points.map((point) => point.y));
-    const low = Math.min(0, ...ys);
-    const high = Math.max(...ys);
-    return { x0: xs[0], x1: xs[xs.length - 1], y0: low, y1: niceCeil(high > low ? high : low + 1) };
+    const [low, high] = [Math.min(0, ...ys), Math.max(0, ...ys)];
+    // Zero always shows; each signed side rounds outward, and an all-zero plot still spans one unit.
+    const y0 = low < 0 ? -niceCeil(-low) : 0;
+    return { x0: xs[0], x1: xs[xs.length - 1], y0, y1: high > 0 ? niceCeil(high) : y0 < 0 ? 0 : 1 };
   });
   const sx = (x: number) =>
     PAD.left + (bounds.x1 > bounds.x0 ? ((x - bounds.x0) / (bounds.x1 - bounds.x0)) * (W - PAD.left - PAD.right) : 0);
@@ -64,7 +67,7 @@
     }));
   });
 
-  /** The smallest round step × 10ⁿ at or above `value`, so the halfway gridline lands on a round number too. */
+  /** The smallest round step × 10ⁿ at or above a positive `value`, so the halfway gridline lands on a round number too. */
   function niceCeil(value: number): number {
     const power = 10 ** Math.floor(Math.log10(value));
     return ([1, 2, 3, 4, 5, 6, 8, 10].find((step) => step * power >= value) ?? 10) * power;
@@ -102,7 +105,7 @@
     onaction({ name: 'chart.range', input: { from: new Date(from).toISOString(), to: new Date(to).toISOString() } });
   }
 
-  function marker(kind: (typeof STYLES)[number]['marker'], x: number, y: number): string {
+  function marker(kind: (typeof MARKERS)[number], x: number, y: number): string {
     switch (kind) {
       case 'square':
         return `M${x - 3},${y - 3}h6v6h-6z`;
@@ -116,13 +119,20 @@
   }
 
   const bars = $derived(data && input.type === 'bar' && result.state === 'populated' ? barRows(data, input.x, input.y) : []);
-  const barMax = $derived(Math.max(0, ...bars.flatMap((row) => row.values.map((value) => value ?? 0))) || 1);
+  /** The bar value domain, always including zero; an all-zero chart spans one unit. */
+  const barDomain = $derived.by(() => {
+    const values = bars.flatMap((row) => row.values.map((value) => value ?? 0));
+    const [low, high] = [Math.min(0, ...values), Math.max(0, ...values)];
+    return high > low ? { low, high } : { low: 0, high: 1 };
+  });
+  const barY = (value: number) => H - PAD.bottom - ((value - barDomain.low) / (barDomain.high - barDomain.low)) * (H - PAD.top - PAD.bottom);
   /** Width of one 10px Fragment Mono glyph, for fitting bar text without measuring. */
   const GLYPH = 6;
   /** Longest category text drawn under a bar; the full name stays in the tooltip and aria-label. */
   const MAX_CHARS = 16;
   /**
-   * One drawn bar per category × `y`, positioned across the plot width. Values
+   * One drawn bar per category × `y`, positioned across the plot width and
+   * spanning from the zero baseline up for positive values or down for negative ones. Values
    * are drawn only when every value fits its slot, and category text is thinned
    * to every `stride`-th bar and clamped inside the plot, so dense results never
    * overprint.
@@ -142,11 +152,12 @@
     const values = Math.max(...cells.map((cell) => cell.shown.length)) * GLYPH + 4 <= slot;
     const stride = Math.ceil((Math.max(...cells.map((cell) => cell.text.length)) * GLYPH + 8) / slot);
     return cells.map((cell, index) => {
-      const height = ((cell.value ?? 0) / barMax) * (H - PAD.top - PAD.bottom);
+      const value = cell.value ?? 0;
+      const [y, bottom] = [barY(Math.max(0, value)), barY(Math.min(0, value))];
       const x = PAD.left + index * slot + (slot - width) / 2;
       const half = (cell.text.length * GLYPH) / 2;
       const labelX = index % stride === 0 ? Math.min(Math.max(x + width / 2, half), W - half) : undefined;
-      return { ...cell, x, width, y: H - PAD.bottom - height, height, values, labelX };
+      return { ...cell, x, width, y, height: bottom - y, valueY: value < 0 ? bottom + 12 : y - 4, values, labelX };
     });
   });
 
@@ -218,14 +229,14 @@
               <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
             {/each}
             {#each lines as line, index (line.label)}
-              {@const style = STYLES[index]}
+              {@const look = style(index)}
               <polyline
                 points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
-                stroke={style.stroke}
-                stroke-dasharray={style.dash}
+                stroke={look.stroke}
+                stroke-dasharray={look.dash}
               />
               {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
-                <path class="marker" d={marker(style.marker, sx(point.x), sy(point.y))} fill={style.stroke} />
+                <path class="marker" d={marker(look.marker, sx(point.x), sy(point.y))} fill={look.stroke} />
               {/each}
             {/each}
             {#if focused !== undefined && xs[focused] !== undefined}
@@ -248,11 +259,11 @@
         {/if}
         <ul class="legend">
           {#each lines as line, index (line.label)}
-            {@const style = STYLES[index]}
+            {@const look = style(index)}
             <li>
               <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
-                <line x1="0" x2="24" y1="4" y2="4" stroke={style.stroke} stroke-dasharray={style.dash} />
-                <path d={marker(style.marker, 12, 4)} fill={style.stroke} />
+                <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
+                <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
               </svg>
               {line.label}
             </li>
@@ -266,10 +277,10 @@
             role="img"
             aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
           >
-            <line class="grid" x1="0" x2={W} y1={H - PAD.bottom} y2={H - PAD.bottom} />
+            <line class="grid" x1="0" x2={W} y1={barY(0)} y2={barY(0)} />
             {#each barCells as cell, index (index)}
               <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
-              {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.y - 4} text-anchor="middle">{cell.shown}</text>{/if}
+              {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.valueY} text-anchor="middle">{cell.shown}</text>{/if}
               {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
             {/each}
           </svg>

@@ -27,17 +27,20 @@ Match the code or message you see below. This page covers server installation, l
 
 | Failed stage | Recovery |
 | --- | --- |
-| Input or listener | Set the database URL or choose an available loopback address, then rerun. |
+| Input or listener | Supply every input the message lists (an unattended run lists all of them before doing anything), or choose an available loopback address, then rerun. |
 | Migration | Check connectivity and that the migration login owns the database objects. Rerun with the same database. |
 | Readiness | Read the server's diagnostics, correct its configuration, and rerun. Production hardening still applies when `APP_ENV=production`. |
-| Local persistence | Restore safe directory/file permissions and rerun. A key already saved before an endpoint-write failure is retained. |
-| Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant. Use explicit platform tenant administration recovery if the one-time key was lost. |
+| Local persistence | Restore safe directory/file permissions and rerun. Settings are saved before the tenant is created, so a failure there issues no key; a key already saved before an endpoint-write failure is retained. |
+| Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant on its own. If the one-time key was lost, rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set and confirm rotation, or follow the steps below. |
+| Gateway | Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the changes may have committed. Inspect with `wyrd gateway deployment list`, then rerun; reapplying the same named document is safe. Or pass `--skip-gateway`. |
 
 If the platform root exists but tenant creation failed, rerun `wyrd server dev` with the stored `WYRD_PLATFORM_CREDENTIAL` set. Retries never recover or reissue a credential on their own.
 
 ### Recover a lost tenant credential
 
-A failed `server dev` stops its server, so recovery starts the installed server directly.
+On a terminal, `wyrd server dev` does this for you: with `WYRD_PLATFORM_CREDENTIAL` set, it asks before rotating the tenant administrator's key through the platform and saves the new one. Unattended runs never rotate a key; they stop with this guidance.
+
+To recover by hand: a failed `server dev` stops its server, so recovery starts the installed server directly.
 
 1. Start the installed server with the same database URL.
 
@@ -57,7 +60,7 @@ A failed `server dev` stops its server, so recovery starts the installed server 
 
    The new credential prints once.
 4. Under `umask 077`, write it to `[default].api_key` in `credentials.toml`, and delete any old `access_token` and `access_expires_at` values. Confirm the file mode is `0600`.
-5. Stop the directly started server, then rerun `wyrd server dev --tenant acme`.
+5. Stop the directly started server, then rerun `wyrd server dev`.
 
 ## Database
 

@@ -948,7 +948,11 @@ fn resolve_schema<'a>(document: &'a Value, schema: &'a Value) -> &'a Value {
 
 /// Every gateway administration operation publishes its common and
 /// route-specific refusals as `application/problem+json` `WyrdProblem` bodies,
-/// and only the credential routes that can conflict publish a 409.
+/// and only the routes that can meet a credential conflict publish a 409. The
+/// composite apply publishes its typed request and response.
+///
+/// # Panics
+/// Panics when the test server fails or an operation's contract differs.
 #[tokio::test]
 async fn gateway_operations_publish_problem_json_refusals() {
     let server = WyrdTestServer::start_in_process()
@@ -957,7 +961,8 @@ async fn gateway_operations_publish_problem_json_refusals() {
     let document = served_document(&server).await;
     let credential = "/v1/admin/gateway/provider-credentials/{name}";
     let deployment = "/v1/admin/gateway/provider-deployments/{name}";
-    let operations: [(&str, &str, &[&str]); 17] = [
+    let collection = "/v1/admin/gateway/provider-deployments";
+    let operations: [(&str, &str, &[&str]); 18] = [
         (credential, "put", &["400", "409"]),
         (credential, "get", &["400", "404"]),
         ("/v1/admin/gateway/provider-credentials", "get", &[]),
@@ -969,7 +974,8 @@ async fn gateway_operations_publish_problem_json_refusals() {
         (credential, "delete", &["400", "409"]),
         (deployment, "put", &["400"]),
         (deployment, "get", &["400", "404"]),
-        ("/v1/admin/gateway/provider-deployments", "get", &[]),
+        (collection, "get", &[]),
+        (collection, "post", &["400", "409"]),
         (deployment, "delete", &["400"]),
         ("/v1/admin/gateway/fallback-policy", "put", &["400"]),
         ("/v1/admin/gateway/fallback-policy", "get", &[]),
@@ -984,7 +990,7 @@ async fn gateway_operations_publish_problem_json_refusals() {
         let responses = &document["paths"][path][method]["responses"];
         assert_eq!(
             responses.get("409").is_some(),
-            path == credential && specific.contains(&"409"),
+            specific.contains(&"409"),
             "{method} {path} publishes 409 only for reachable credential conflicts"
         );
         for status in ["401", "403", "503", "default"].iter().chain(specific) {
@@ -995,6 +1001,16 @@ async fn gateway_operations_publish_problem_json_refusals() {
             );
         }
     }
+
+    let apply = &document["paths"][collection]["post"];
+    assert_eq!(
+        apply["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ProviderDeploymentsApply"
+    );
+    assert_eq!(
+        apply["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ProviderDeploymentsApplied"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

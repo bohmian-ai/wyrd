@@ -1,5 +1,5 @@
-apiVersion: wyrd/hydrated-bundle/v1
-hydration: metadata
+apiVersion: wyrd/bundle/v1
+mode: metadata
 root:
   kind: Data
   name: dataset

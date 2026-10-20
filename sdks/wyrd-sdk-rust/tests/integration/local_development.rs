@@ -1,5 +1,5 @@
 //! A developer runs Wyrd locally with only the administrator key `wyrd
-//! setup` printed: they register and hydrate an assistant, invoke a model
+//! setup` printed: they declare and pull an assistant, invoke a model
 //! through the Gateway, observe and verify a Run, export its spans through
 //! `start_telemetry`, and query the evidence back. No key is
 //! issued and nothing is flushed on the server's behalf.
@@ -30,7 +30,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
-use crate::support::{Deployment, hydrate, register};
+use crate::support::{Deployment, declare, pull};
 
 /// One evidence row: which Card it is attributed to.
 #[derive(Debug, Deserialize)]
@@ -103,10 +103,10 @@ pub struct Worked {
 pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     configure_gateway(client).await;
     let cards = Cards::connect_with(client).await.expect("handle connects");
-    register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-    register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
-    let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
-    let bundle = hydrate(&cards, &assistant.root).await;
+    declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+    declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+    let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+    let bundle = pull(&cards, &assistant.root).await;
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
         .expect("the bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
@@ -308,10 +308,10 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
         .deployment
         .client(secrecy::ExposeSecret::expose_secret(&key));
     let cards = Cards::connect_with(&client).await.expect("handle connects");
-    register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
-    register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
-    let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
-    let bundle = hydrate(&cards, &assistant.root).await;
+    declare(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+    declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+    let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+    let bundle = pull(&cards, &assistant.root).await;
     let state =
         WyrdState::from_path_with(bundle.path().join("bundle"), client).expect("the bundle loads");
     tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
@@ -333,7 +333,7 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
 async fn cli_bootstrap_saved_config_connects() {
     let client = WyrdClient::from_global().expect("saved endpoint and credential");
     let cards = Cards::connect_with(&client).await.expect("handle connects");
-    let receipt = register(&cards, "cards/gateway_inference/ask-prompt.yaml").await;
+    let receipt = declare(&cards, "cards/gateway_inference/ask-prompt.yaml").await;
     let card = cards
         .get(wyrd_ai::cards::CardSelector::exact(receipt.root))
         .await

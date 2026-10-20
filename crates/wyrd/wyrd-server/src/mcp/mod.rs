@@ -178,7 +178,7 @@ impl ServerHandler for WyrdMcpHandler {
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.protocol_version = WYRD_MCP_PROTOCOL_VERSION;
-        info.instructions = Some("Use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries.".to_owned());
+        info.instructions = Some(r#"New to Wyrd? Call wyrd.guide {"topic":"start"} for the Declare -> Observe -> Verify workflow on an application you own, then use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries."#.to_owned());
         info
     }
 
@@ -328,12 +328,6 @@ impl WyrdMcpHandler {
             cards::LIST => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.mcp_list_cards(caller, request.arguments)
-                    .await
-                    .map_err(wyrd_error_to_mcp)
-            }
-            cards::GET_BY_REF => {
-                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                self.mcp_get_card_by_ref(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }

@@ -1,4 +1,4 @@
-//! Exact Card graph resolution for local hydration.
+//! Exact Card graph resolution for local pull.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,7 +9,7 @@ use wyrd_spec::{
     registry::{ArtifactInventoryResponse, GetCardResponse},
 };
 
-use super::CardGraphHydrator;
+use super::CardGraphPuller;
 use crate::cards::{CardSelector, engine::RegistryEngine, reads};
 
 /// One fully resolved Card and the registry metadata needed to materialize it.
@@ -204,7 +204,7 @@ impl<'a> GraphTraversal<'a> {
         }
         let uid = entry.card_ref.uid.as_ref().ok_or_else(|| {
             graph_error(
-                "hydration requires UID-bearing relationship references",
+                "pull requires UID-bearing relationship references",
                 &entry.card_ref,
             )
         })?;
@@ -275,7 +275,7 @@ impl<'a> GraphTraversal<'a> {
     }
 }
 
-impl CardGraphHydrator {
+impl CardGraphPuller {
     /// Resolves a selector and every reachable typed outbound relationship.
     ///
     /// A versionless selector is first converted to an exact root. Traversal validates
@@ -430,7 +430,7 @@ pub(super) fn graph_error(message: &str, card_ref: &CardRef) -> WyrdError {
     }
 }
 
-/// Hydration graph resolution.
+/// Pull graph resolution.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

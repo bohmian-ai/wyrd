@@ -9,38 +9,36 @@ credential resolve from the ambient chain exactly as the executable does.
 """
 
 from wyrd._wyrd.testing.cli import (
+    CheckCard,
+    CheckDiagnostic,
+    CheckReport,
     IssueKeyResponse,
-    LoadOutput,
     McpHostReport,
     McpInstallReport,
-    PlanCard,
-    PlanDiagnostic,
-    PlanReport,
-    apply,
+    declare,
+    declare_check,
     delete_provider_credential,
     mcp_install,
-    plan,
     put_provider_credential,
     revoke_provider_credential,
 )
 
-from ._commands import get, issue_key, load
+from ._commands import get, issue_key, pull
 
 __all__ = [
+    "CheckCard",
+    "CheckDiagnostic",
+    "CheckReport",
     "IssueKeyResponse",
-    "LoadOutput",
     "McpHostReport",
     "McpInstallReport",
-    "PlanCard",
-    "PlanDiagnostic",
-    "PlanReport",
-    "apply",
+    "declare",
+    "declare_check",
     "delete_provider_credential",
     "get",
     "issue_key",
-    "load",
     "mcp_install",
-    "plan",
+    "pull",
     "put_provider_credential",
     "revoke_provider_credential",
 ]

@@ -17,7 +17,7 @@ Each language exports five steps and a runnable main:
 
 | Step | What it does |
 |---|---|
-| `deploy` | Registers and hydrates the Service, which creates `tickets`. Turns on gateway metadata capture and checks that the Agent's model is deployed. |
+| `deploy` | Declares and pulls the Service, which creates `tickets`. Turns on gateway metadata capture and checks that the Agent's model is deployed. |
 | `check` | Verifies one answer immediately with `verify` and returns its result. The main checks "You have a guaranteed refund.", which fails `no-refund-promise`. |
 | `serve` | Answers 100 questions, each in its own Agent Run inside a `support-desk.request` span. For each one it invokes the Agent through the gateway, records the ticket, and `submit`s `policy-check` in the background, keeping the execution ID. Every tenth question asks for a refund, and its answer fails. |
 | `wait_for_verdicts` | Resumes every execution by its ID and waits for its result. |

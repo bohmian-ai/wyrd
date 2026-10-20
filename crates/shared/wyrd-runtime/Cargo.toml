@@ -21,7 +21,7 @@ wyrd-spec = { path = "../../wyrd-spec", version = "0.2.0" }
 [dev-dependencies]
 workspace-hack.workspace = true
 serde_json = { workspace = true }
-wyrd-semver = { path = "../wyrd-semver", version = "0.2.0" }
+wyrd-semver = { path = "../wyrd-semver" }
 
 [lints]
 workspace = true

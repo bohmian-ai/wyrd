@@ -46,8 +46,8 @@ vala-bifrost-redux = { workspace = true, features = ["test-support"] }
 wyrd-sql = { workspace = true }
 arrow = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
-wyrd-spec = { workspace = true }
-wyrd-runtime = { workspace = true }
+wyrd-spec = { path = "../../wyrd-spec" }
+wyrd-runtime = { path = "../../shared/wyrd-runtime" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
@@ -59,7 +59,7 @@ sqlx = { workspace = true }
 wiremock = { workspace = true }
 # Content-addresses the frames the grouped media journey uploads.
 sha2 = { workspace = true }
-wyrd-telemetry = { workspace = true, features = ["test-support"] }
+wyrd-telemetry = { path = "../../shared/wyrd-telemetry", features = ["test-support"] }
 
 [lints]
 workspace = true

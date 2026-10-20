@@ -1156,8 +1156,8 @@ pub enum WyrdError {
     #[wyrd_error(
         code = "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
         status = 400,
-        title = "Hydrated bundle is missing artifact payloads",
-        remediation = "Run wyrd get without --metadata-only and load the complete bundle."
+        title = "Card bundle is missing artifact payloads",
+        remediation = "Run wyrd pull for the intended root Card with --output-dir <dir> and without --metadata-only, then load that directory."
     )]
     SdkUnhydratedArtifact {
         /// Human-readable error message.
@@ -1201,7 +1201,7 @@ pub enum WyrdError {
         code = "WYRD_SDK_400_INVALID_STATE_BUNDLE",
         status = 400,
         title = "Invalid WyrdState bundle",
-        remediation = "Regenerate the bundle with wyrd get and load the complete output."
+        remediation = "Pull the intended root Card again with wyrd pull --output-dir <dir>, then load that complete directory."
     )]
     SdkInvalidStateBundle {
         /// Human-readable error message.
@@ -1486,7 +1486,7 @@ pub enum WyrdError {
         code = "WYRD_REGISTRY_404_CARD_NOT_FOUND",
         status = 404,
         title = "No card matches the supplied identity",
-        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is registered in the current tenant."
+        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant."
     )]
     RegistryCardNotFound {
         /// Human-readable error message.
@@ -1522,13 +1522,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Re-apply with the same identity but a different spec_hash; same-version cards are immutable.
+    /// Re-declare with the same identity but a different spec_hash; same-version cards are immutable.
     #[error("[WYRD_REGISTRY_409_SPEC_DRIFT] {message}")]
     #[wyrd_error(
         code = "WYRD_REGISTRY_409_SPEC_DRIFT",
         status = 409,
-        title = "Re-apply with the same identity but a different spec_hash; same-version cards are immutable",
-        remediation = "Bump `metadata.version` to publish a new spec, or revert your spec to match the registered version."
+        title = "Re-declare with the same identity but a different spec_hash; same-version cards are immutable",
+        remediation = "Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version."
     )]
     RegistrySpecDrift {
         /// Human-readable error message.
@@ -1612,7 +1612,7 @@ pub enum WyrdError {
         code = "WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED",
         status = 400,
         title = "Idempotency key required",
-        remediation = "Provide a stable Idempotency-Key header and retry the registration."
+        remediation = "Provide a stable Idempotency-Key header and retry the declaration."
     )]
     RegistryIdempotencyKeyRequired {
         /// Human-readable error message.
@@ -1682,7 +1682,7 @@ pub enum WyrdError {
         code = "WYRD_REGISTRY_400_UPLOAD_INTERRUPTED",
         status = 400,
         title = "Upload interrupted",
-        remediation = "Retry the upload while the registration operation remains pending."
+        remediation = "Retry the upload while the declaration operation remains pending."
     )]
     RegistryUploadInterrupted {
         /// Human-readable error message.
@@ -1718,13 +1718,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A pending registration operation has expired.
+    /// A pending declaration operation has expired.
     #[error("[WYRD_REGISTRY_410_OPERATION_EXPIRED] {message}")]
     #[wyrd_error(
         code = "WYRD_REGISTRY_410_OPERATION_EXPIRED",
         status = 410,
-        title = "Registration operation expired",
-        remediation = "Start a new registration with a new idempotency key."
+        title = "Declaration operation expired",
+        remediation = "Start a new declaration with a new idempotency key."
     )]
     RegistryOperationExpired {
         /// Human-readable error message.
@@ -1907,7 +1907,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
         status = 404,
         title = "Verification target not found",
-        remediation = "Use an active Verifier Card UID and an active subject Card UID registered in the caller's tenant."
+        remediation = "Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant."
     )]
     VerificationTargetNotFound {
         /// Human-readable error message.
@@ -2150,7 +2150,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER",
         status = 400,
         title = "Unbound Verifier peer",
-        remediation = "Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or register the shared Verifier separately."
+        remediation = "Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or declare the shared Verifier separately."
     )]
     SpecUnboundVerifierPeer {
         /// Human-readable error message.
@@ -2178,7 +2178,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_403_PRINCIPAL_ORPHANED",
         status = 403,
         title = "The backing Service or Agent card has been soft-deleted",
-        remediation = "Re-register the card or use a different principal to obtain a token."
+        remediation = "Re-declare the card or use a different principal to obtain a token."
     )]
     PrincipalOrphaned {
         /// Human-readable error message.
@@ -2392,7 +2392,7 @@ pub enum WyrdError {
         code = "WYRD_MODEL_400_MISSING_SIGNATURE",
         status = 400,
         title = "Missing model signature",
-        remediation = "Pass signature fields explicitly or build a ModelSignature before registration."
+        remediation = "Pass signature fields explicitly or build a ModelSignature before declaration."
     )]
     ModelMissingSignature {
         /// Human-readable error message.

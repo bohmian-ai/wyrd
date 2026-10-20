@@ -34,7 +34,6 @@ mod pg_tests {
         "principals.list_credentials",
         "cards.get",
         "cards.list",
-        "cards.get_by_ref",
         "verification.get_binding",
         "verification.get_execution",
         "operator_connections.list",
@@ -56,6 +55,7 @@ mod pg_tests {
         "operator_connections.disable",
         "gateway.put_provider_credential",
         "gateway.put_provider_deployment",
+        "gateway.apply_provider_deployments",
         "gateway.put_fallback_policy",
         "gateway.put_governance_policy",
         "gateway.put_capture_policy",
@@ -126,7 +126,10 @@ mod pg_tests {
             let info = self.agent.peer_info().ok_or("server discovery info")?;
             let instructions = info.instructions.as_deref().ok_or("server instructions")?;
             assert!(instructions.contains("tools/list"));
-            assert!(instructions.contains("wyrd.guide"));
+            assert!(
+                instructions.contains(r#"wyrd.guide {"topic":"start"}"#),
+                "first contact leads to onboarding: {instructions}"
+            );
             // Protocol 2026-07-28 requires cache metadata; strict clients
             // reject a list result without it.
             let page = self.agent.list_tools(None).await?;
@@ -155,7 +158,18 @@ mod pg_tests {
                 ADVERTISED_TOOLS.len(),
                 "the checked catalog is the complete every-scope catalog"
             );
-            for name in ["cards.list", "cards.get_by_ref", "wyrd.guide"] {
+            // Declaration, bundle pull, local check, and file upload stay CLI
+            // and SDK operations; onboarding adds no MCP write capability.
+            for tool in &tools {
+                for owned_elsewhere in ["declare", "pull", "check", "upload", "get_by_ref"] {
+                    assert!(
+                        !tool.name.contains(owned_elsewhere),
+                        "{} is not an MCP capability",
+                        tool.name
+                    );
+                }
+            }
+            for name in ["cards.list", "cards.get", "wyrd.guide"] {
                 let tool = tools
                     .iter()
                     .find(|tool| tool.name == name)
@@ -178,7 +192,7 @@ mod pg_tests {
         /// # Errors
         /// Returns a malformed guide, missing tool, or failed query example.
         async fn topics(&self, tools: &[Tool]) -> Result<(), McpJourneyError> {
-            for topic in ["overview", "cards", "verification", "bifrost_sql"] {
+            for topic in ["start", "overview", "cards", "verification", "bifrost_sql"] {
                 let guide = self.read("wyrd.guide", json!({ "topic": topic })).await?;
                 assert_eq!(guide["topic"], topic);
                 let steps = guide["steps"].as_array().ok_or("guide has steps")?;
@@ -196,6 +210,48 @@ mod pg_tests {
                         self.execute_sql_example(example).await?;
                     }
                 }
+            }
+            self.onboarding().await
+        }
+
+        /// The onboarding topic names the final CLI and SDK workflow and its docs.
+        ///
+        /// Reads `wyrd.guide {"topic":"start"}` through the live MCP session,
+        /// joins its string steps, and requires every term an agent needs to
+        /// go from setup through declare, pull, observe, and verify readback.
+        ///
+        /// # Errors
+        /// Returns the MCP transport or tool failure from the guide read, or a
+        /// shape error when the `start` topic has no `steps` array.
+        ///
+        /// # Panics
+        /// Panics when the joined steps omit any taught term.
+        async fn onboarding(&self) -> Result<(), McpJourneyError> {
+            let guide = self.read("wyrd.guide", json!({ "topic": "start" })).await?;
+            let steps = guide["steps"]
+                .as_array()
+                .ok_or("start has steps")?
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for taught in [
+                "llms-full.txt",
+                "wyrd server dev",
+                "wyrd mcp install --host",
+                "wyrd declare",
+                "--check",
+                "wyrd get",
+                "wyrd pull",
+                "WyrdState",
+                "shutdown",
+                "verify",
+                "submit",
+                "verification.get_execution",
+                "vala.verification.results",
+                "Model Card",
+            ] {
+                assert!(steps.contains(taught), "start teaches {taught}: {steps}");
             }
             Ok(())
         }

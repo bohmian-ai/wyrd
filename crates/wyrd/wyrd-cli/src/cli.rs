@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::auth::AuthCommand;
-use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
+use crate::card::{DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs};
 use crate::gateway::GatewayCommand;
 use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
@@ -37,12 +37,13 @@ impl Cli {
     /// the derive-catalogued local CLI error.
     pub async fn dispatch(self) -> Result<std::process::ExitCode, crate::error::CliBoundaryError> {
         match self.command {
-            Command::Plan(args) => crate::card::dispatch_plan(args).map_err(Into::into),
-            Command::Apply(args) => crate::card::dispatch_apply(args).await.map_err(Into::into),
+            Command::Declare(args) => crate::card::dispatch_declare(args)
+                .await
+                .map_err(Into::into),
             Command::Get(args) => crate::card::dispatch_get(args).await.map_err(Into::into),
+            Command::Pull(args) => crate::card::dispatch_pull(args).await.map_err(Into::into),
             Command::Latest(args) => crate::card::dispatch_latest(args).await.map_err(Into::into),
             Command::List(args) => crate::card::dispatch_list(args).await.map_err(Into::into),
-            Command::Load(args) => crate::card::dispatch_load(args).await.map_err(Into::into),
             Command::Delete(args) => crate::card::dispatch_delete(args).await.map_err(Into::into),
             Command::Auth(command) => crate::auth::dispatch(command).await.map_err(Into::into),
             Command::Platform(command) => {
@@ -65,20 +66,19 @@ impl Cli {
 /// Top-level CLI verbs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Load and validate a local card tree without contacting a server.
-    Plan(PlanArgs),
-    /// Register a local card tree and run its artifact lifecycle.
-    Apply(ApplyArgs),
-    /// Hydrate a selected Card and its reachable graph into --output-dir;
+    /// Declare a local Card tree and run its artifact lifecycle; --check
+    /// validates the local files without contacting a server.
+    Declare(DeclareArgs),
+    /// Read one Card envelope without downloading artifacts.
+    Get(GetArgs),
+    /// Pull a selected Card and its reachable graph into --output-dir;
     /// complete artifact downloads are the default and --metadata-only writes
     /// an inspectable, non-runnable bundle.
-    Get(GetArgs),
+    Pull(PullArgs),
     /// Resolve the latest active card version by name.
     Latest(LatestArgs),
     /// List card summaries with typed server-side filters.
     List(ListArgs),
-    /// Load a card and materialize its artifacts.
-    Load(LoadArgs),
     /// Soft-delete one exact card.
     Delete(DeleteArgs),
     /// Authenticate with a Wyrd server (login, refresh, issue-key).

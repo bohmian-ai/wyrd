@@ -44,11 +44,11 @@ SUPPORTED_KINDS = [
 # re-exports them under their public SDK names.
 WIRE_ROOTS = [
     # Registry.
-    "CardRegistrationOutcome",
+    "CardDeclarationOutcome",
     "CardSummary",
     "ListCardsRequest",
     "ListCardsResponse",
-    "RegistrationReceipt",
+    "DeclarationReceipt",
     # Bifrost.
     "BifrostQueryRequest",
     "BifrostTableDescription",

@@ -1,12 +1,12 @@
-//! Optional registration progress events for caller-owned presentation.
+//! Optional declaration progress events for caller-owned presentation.
 
 use std::sync::Arc;
 
 use wyrd_spec::registry::RelativeArtifactPath;
 
-/// A registration lifecycle phase that does not report byte progress.
+/// A declaration lifecycle phase that does not report byte progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrationPhase {
+pub enum DeclarationPhase {
     /// Local input is being validated and lowered to the wire request.
     Preparing,
     /// The composite card request is being submitted to the server.
@@ -15,17 +15,17 @@ pub enum RegistrationPhase {
     Uploading,
     /// The server is verifying and completing uploaded artifacts.
     Completing,
-    /// The saga is checking that every registered Card is Active.
+    /// The saga is checking that every declared Card is Active.
     Verifying,
     /// Best-effort cleanup is running after a failed saga stage.
     CleaningUp,
 }
 
-/// Typed progress emitted by the registration saga.
+/// Typed progress emitted by the declaration saga.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistrationProgressEvent {
+pub enum DeclarationProgressEvent {
     /// The saga entered a non-upload lifecycle phase.
-    Phase(RegistrationPhase),
+    Phase(DeclarationPhase),
     /// One artifact became eligible for an active progress row.
     ArtifactStarted {
         /// Stable artifact identity within the registration request.
@@ -51,5 +51,5 @@ pub enum RegistrationProgressEvent {
     },
 }
 
-/// Thread-safe callback owned by the registration caller.
-pub type RegistrationProgressSink = Arc<dyn Fn(RegistrationProgressEvent) + Send + Sync + 'static>;
+/// Thread-safe callback owned by the declaration caller.
+pub type DeclarationProgressSink = Arc<dyn Fn(DeclarationProgressEvent) + Send + Sync + 'static>;

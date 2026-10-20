@@ -8,22 +8,22 @@ mod download_progress;
 mod engine;
 mod error;
 mod handle;
-mod hydrate;
 mod progress;
+mod pull;
 mod reads;
 mod saga;
 
 pub use engine::RegistryContext;
-pub use handle::{CardSelector, Cards, LoadedCard};
-pub use hydrate::{
-    CardGraphHydrator, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
-    HydrationMode, HydrationSummary,
+pub use handle::{CardSelector, Cards};
+pub use progress::{DeclarationPhase, DeclarationProgressEvent, DeclarationProgressSink};
+pub use pull::{
+    BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode, CardGraphPuller,
+    PullSummary,
 };
-pub use progress::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
 pub use wyrd_spec::envelope::CardKind;
 pub use wyrd_spec::reference::CardRef;
 pub use wyrd_spec::registry::{
-    CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,
+    CardSummary, DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
 /// Public surface shape of the `cards` module.

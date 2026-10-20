@@ -1,0 +1,18 @@
+{
+  "name": "@wyrd/example-support-desk-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.20.0",
+    "openai": "^7.17.0",
+    "wyrd-ai": "workspace:*",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3"
+  }
+}

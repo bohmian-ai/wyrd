@@ -4,15 +4,22 @@
 Both files live in docs/public/ so the static site serves them under the
 deploy base (GitHub Pages project subpath /wyrd/).
 
-llms.txt       - compact index for agents: the home page, then every sidebar
-                 page, grouped and ordered exactly as the sidebar shows them.
-                 Derived from the content on disk, so it never advertises a
-                 route the build does not serve.
-llms-full.txt  - the same page index under the full-reference heading.
+llms.txt       - compact index for agents: where to start, the home page, then
+                 every sidebar page, grouped and ordered exactly as the sidebar
+                 shows them. Derived from the content on disk, so it never
+                 advertises a route the build does not serve.
+llms-full.txt  - every sidebar page's readable body in the same order, with
+                 embedded source resolved by scripts/page_text.mjs through the
+                 site build's own <CodeFromFile> rules.
+
+Links are root-relative under the deploy base, so the same files work from the
+published site and from a locally served build.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 
@@ -21,11 +28,17 @@ CONTENT_DIR = DOCS_ROOT / "src" / "content" / "docs"
 PUBLIC_DIR = DOCS_ROOT / "public"
 
 # Production origin for the docs site: GitHub Pages serves the repository's
-# project subpath. BASE must always match svelte.config.js `paths.base` so
-# emitted URLs do not 404 on Pages.
+# project subpath. BASE must always match svelte.config.js `paths.base`; every
+# emitted link is BASE-relative so a local build under the same base serves it.
 ORIGIN = "https://bohmian-ai.github.io"
 BASE = "/wyrd"
 SITE = f"{ORIGIN}{BASE}"
+
+# The onboarding route, in reading order: the canonical start for agents.
+START = [
+    ("get-started/setup", "run a local server you keep running, and connect MCP hosts"),
+    ("get-started/quickstart", "declare, observe, and verify the support-desk Service"),
+]
 
 SUMMARY = (
     "Wyrd is open-source AI assurance and verification infrastructure. Verify AI "
@@ -44,7 +57,7 @@ SECTIONS = [
 ]
 TOPICS = ["Declare", "Observe", "Verify"]
 
-Page = tuple[str, str, str, str]  # (section, slug, title, description)
+Page = tuple[str, str, str, str, Path]  # (section, slug, title, description, file)
 
 
 def slug_for(path: Path) -> str:
@@ -114,13 +127,31 @@ def sidebar_pages() -> list[Page]:
             slug,
         )
         ranked.append(
-            (key, (section, slug, fm.get("title", slug), fm.get("description", "")))
+            (key, (section, slug, fm.get("title", slug), fm.get("description", ""), path))
         )
     return [page for _key, page in sorted(ranked)]
 
 
 def url_for(slug: str) -> str:
-    return f"{SITE}/" if not slug else f"{SITE}/{slug}/"
+    return f"{BASE}/" if not slug else f"{BASE}/{slug}/"
+
+
+def render_start() -> list[str]:
+    """The canonical start route, for an agent that reads only the top."""
+    titles = {slug: title for _section, slug, title, _description, _path in sidebar_pages()}
+    lines = [
+        "## Start here",
+        "",
+        "Declare -> Observe -> Verify an application you own, in this order. "
+        "A connected Wyrd MCP server teaches the same route through "
+        '`wyrd.guide {"topic":"start"}`.',
+        "",
+    ]
+    for slug, purpose in START:
+        lines.append(f"- [{titles[slug]}]({url_for(slug)}): {purpose}.")
+    lines.append(f"- [Error catalog]({url_for('api/errors')}): every stable error code and its remediation.")
+    lines.append("")
+    return lines
 
 
 def render_pages_index() -> list[str]:
@@ -136,7 +167,7 @@ def render_pages_index() -> list[str]:
         if not entries:
             continue
         lines += [f"## {section}", ""]
-        for _section, slug, title, description in entries:
+        for _section, slug, title, description, _path in entries:
             suffix = f": {description}" if description else ""
             lines.append(f"- [{title}]({url_for(slug)}){suffix}")
         lines.append("")
@@ -145,24 +176,47 @@ def render_pages_index() -> list[str]:
 
 def render_llms_txt() -> str:
     lines = ["# Wyrd", "", f"> {SUMMARY}", ""]
+    lines += render_start()
     lines += render_pages_index()
     lines += [
         "## Machine-readable reference",
         "",
-        f"- [llms-full.txt]({SITE}/llms-full.txt): this index as the full machine-readable reference.",
+        f"- [llms-full.txt]({url_for('')}llms-full.txt): every page below in full, with its embedded YAML and code.",
         "",
     ]
     return "\n".join(lines)
 
 
+def page_bodies(pages: list[Page]) -> list[str]:
+    """Each page's plain-Markdown body, rendered by the site's own embed rules."""
+    rendered = subprocess.run(
+        ["node", "scripts/page_text.mjs", *(str(page[4]) for page in pages)],
+        cwd=DOCS_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(rendered.stdout)
+
+
 def render_llms_full() -> str:
+    pages = sidebar_pages()
     lines = [
         "# Wyrd — full machine-readable reference",
         "",
-        "Generated from the docs content tree.",
+        f"> {SUMMARY}",
+        "",
+        f"Every published docs page in sidebar order, generated from the docs content "
+        f"tree. Links are relative to the docs base {BASE}/ (published at {SITE}/). "
+        f"The page index is [llms.txt]({url_for('')}llms.txt).",
         "",
     ]
-    lines += render_pages_index()
+    lines += render_start()
+    for (_section, slug, title, description, _path), body in zip(pages, page_bodies(pages)):
+        lines += [f"# {title}", "", f"Page: {url_for(slug)}", ""]
+        if description:
+            lines += [f"> {description}", ""]
+        lines += [body, ""]
     return "\n".join(lines)
 
 

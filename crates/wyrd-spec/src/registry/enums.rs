@@ -1,4 +1,4 @@
-//! Registration lifecycle enums.
+//! Declaration lifecycle enums.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,27 +7,27 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CardLifecycleStatus {
-    /// Registration is waiting for artifact upload and verification.
+    /// Declaration is waiting for artifact upload and verification.
     Pending,
     /// Card is available for use.
     Active,
     /// Card has been superseded by a newer version.
     Deprecated,
-    /// Registration failed and awaits cleanup or retry.
+    /// Declaration failed and awaits cleanup or retry.
     Failed,
-    /// Registration expired before completion.
+    /// Declaration expired before completion.
     Expired,
     /// Card was soft-deleted.
     Deleted,
 }
 
-/// Result of a registration write.
+/// Result of a declaration write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum RegistrationOutcomeKind {
-    /// A new registration row was created.
-    Registered,
+pub enum DeclarationOutcomeKind {
+    /// A new Card version was declared.
+    Declared,
     /// The same idempotent request was replayed.
     IdempotentNoop,
     /// An active card with identical content already exists.
@@ -36,7 +36,7 @@ pub enum RegistrationOutcomeKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardLifecycleStatus, RegistrationOutcomeKind};
+    use super::{CardLifecycleStatus, DeclarationOutcomeKind};
     use crate::error::WyrdError;
 
     #[test]
@@ -46,7 +46,7 @@ mod tests {
             "\"pending\""
         );
         assert_eq!(
-            serde_json::to_string(&RegistrationOutcomeKind::IdempotentNoop).unwrap(),
+            serde_json::to_string(&DeclarationOutcomeKind::IdempotentNoop).unwrap(),
             "\"idempotent_noop\""
         );
     }

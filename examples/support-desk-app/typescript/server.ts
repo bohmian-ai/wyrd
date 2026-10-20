@@ -129,19 +129,22 @@ export function supportApi(support: Support) {
 }
 
 if (import.meta.main) {
-  // WYRD_SERVER_URL and WYRD_API_KEY say which server to use and who the app is.
+  // ANCHOR: startup
+  // WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd server dev` saved, say which server to use and who the app is.
   const client = WyrdClient.connect();
-  // The registered Service, hydrated by `npm run deploy`.
+  // The declared Service, pulled by `npm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
   await state.startBifrost(); // writes tickets to Bifrost
   await state.startTelemetry(); // exports spans to Wyrd
+  // ANCHOR_END: startup
   const server = supportApi({ state, client, gateway: gateway(client) });
   server.listen(Number(process.env.PORT ?? 3000), "127.0.0.1", () => {
     const { port } = server.address() as AddressInfo;
     console.log(`support-desk listening on http://127.0.0.1:${port}`);
   });
 
-  // Flush every span and row before exiting.
+  // ANCHOR: shutdown
+  // Flush every span and row before exiting: shutdown flushes the provider startTelemetry installed, then drains the writer.
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, async () => {
       server.close();
@@ -149,4 +152,5 @@ if (import.meta.main) {
       process.exit(0);
     });
   }
+  // ANCHOR_END: shutdown
 }

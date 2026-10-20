@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
-use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
@@ -61,7 +61,7 @@ impl Tenant {
         std::fs::write(root.join("service.yaml"), SERVICE)?;
         let admin = connect(&setup.api_key, None)?;
         let cards = Cards::connect_with(&admin).await?;
-        let service = Box::pin(cards.register_from_path(&root.join("service.yaml"))).await?;
+        let service = Box::pin(cards.declare_from_path(&root.join("service.yaml"))).await?;
         let issued: IssueKeyResponse = admin
             .request_json(
                 Method::POST,
@@ -74,10 +74,10 @@ impl Tenant {
             )
             .await?;
         let bundle = root.join("bundle");
-        Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
+        Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
             &CardSelector::exact(service.root),
             &bundle,
-            HydrationMode::Complete,
+            BundleMode::Complete,
         ))
         .await?;
         Ok(Self {

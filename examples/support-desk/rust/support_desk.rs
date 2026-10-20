@@ -2,7 +2,7 @@
 //! records each ticket, and checks every answer against its refund policy
 //! with the `support/policy-check` Verifier.
 //!
-//! [`deploy`] registers the checked-in Cards under `service/`, which ensures
+//! [`deploy`] declares the checked-in Cards under `service/`, which ensures
 //! the declared `vala.datasets.tickets` table, turns on metadata capture, and
 //! checks the Agent's model is deployed. [`serve`] answers every question in
 //! its own Agent Run with [`answer`], which calls the model through the Wyrd
@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
-use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_ai::cards::{BundleMode, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
 use wyrd_ai::observe::Run;
 use wyrd_ai::otel::start_telemetry;
@@ -40,19 +40,19 @@ pub fn service_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/support-desk/service")
 }
 
-/// The deployed support desk: its registration and loaded Card graph.
+/// The deployed support desk: its declaration and loaded Card graph.
 pub struct Desk {
-    /// Every Card the Service registered.
-    pub receipt: RegistrationReceipt,
+    /// Every Card the Service declared.
+    pub receipt: DeclarationReceipt,
     /// The hydrated Service.
     pub state: WyrdState,
 }
 
 impl Desk {
-    /// The registered UID of the Card named `name`.
+    /// The declared UID of the Card named `name`.
     ///
     /// # Panics
-    /// Panics when the Service registered no such Card.
+    /// Panics when the Service declared no such Card.
     #[must_use]
     pub fn uid(&self, name: &str) -> String {
         self.receipt
@@ -60,7 +60,7 @@ impl Desk {
             .iter()
             .find(|outcome| outcome.card_ref.name.as_str() == name)
             .and_then(|outcome| outcome.card_ref.uid.as_ref())
-            .unwrap_or_else(|| panic!("{name} is registered"))
+            .unwrap_or_else(|| panic!("{name} is declared"))
             .to_string()
     }
 }
@@ -99,11 +99,11 @@ fn policy_check(answer: &str) -> Inputs {
     ])
 }
 
-/// Register and hydrate the Service into `bundle`, capture gateway call
+/// Declare and pull the Service into `bundle`, capture gateway call
 /// metadata, and check the Agent's model is deployed.
 ///
 /// # Errors
-/// Returns the registration refusal, including
+/// Returns the declaration refusal, including
 /// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` for an incompatible existing
 /// `tickets` table, and `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` naming the exact
 /// gateway deployment to configure when the Agent's gateway route names a
@@ -111,13 +111,13 @@ fn policy_check(answer: &str) -> Inputs {
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     let cards = Cards::connect_with(client).await?;
     let receipt = cards
-        .register_from_path(service_dir().join("support-desk.yaml"))
+        .declare_from_path(service_dir().join("support-desk.yaml"))
         .await?;
     cards
-        .hydrate(
+        .pull(
             CardSelector::exact(receipt.root.clone()),
             bundle,
-            HydrationMode::Complete,
+            BundleMode::Complete,
         )
         .await?;
     let state = WyrdState::from_path_with(bundle, client.clone())?;

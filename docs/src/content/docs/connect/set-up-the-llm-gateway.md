@@ -131,38 +131,19 @@ Calling from another framework or language? [Make gateway requests from a framew
 
 ## Add more providers
 
-`wyrd gateway deployment put` also takes a JSON list. This one gives each built-in provider its own named deployment:
+`wyrd gateway deployment put` also takes one document holding credentials and deployments together. This one gives each built-in provider its own named deployment, and each credential names the environment variable holding its key instead of the key:
 
-```json
-[
-  {
-    "name": "openai-prod",
-    "adapter": "openai",
-    "auth": { "bearer": { "credential": "openai-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "claude-prod",
-    "adapter": "anthropic",
-    "auth": { "api_key_header": { "header": "x-api-key", "credential": "anthropic-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "gemini-team",
-    "adapter": "gemini",
-    "auth": { "api_key_header": { "header": "x-goog-api-key", "credential": "gemini-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "judge-pool",
-    "adapter": "jev",
-    "auth": { "bearer": { "credential": "jev-key" } },
-    "capabilities": ["system_one"]
-  }
-]
+<CodeFromFile file="examples/gateway-setup/gateway.json" lang="json" title="gateway.json" />
+
+Export the four variables and apply it:
+
+```bash
+wyrd gateway deployment put --file gateway.json
 ```
 
-Put one credential per provider first (`openai-key`, `anthropic-key`, `gemini-key`, `jev-key`), as in step 2 with that provider's name and key. Save the list as `gateway.json` and apply it with `wyrd gateway deployment put --file gateway.json`. The list applies in order. If one entry fails, for example because its credential doesn't exist, the entries after it are not attempted and the command exits non-zero. Fix the entry and apply the whole list again.
+The CLI reads each `local_env` variable and sends its value once, as an encrypted-at-rest managed secret; the variable name is never stored. The server applies every credential and deployment in one transaction: if any is refused, for example a deployment naming a credential that doesn't exist, nothing is applied and the command exits non-zero. Applying it again converges, and deployments the document doesn't name are left alone. `wyrd server dev --gateway-file gateway.json` applies the same document at startup, and a first interactive `wyrd server dev` builds one like it from the keys it finds.
+
+Credentials stored separately, as in step 2, work too: a document without `credentials`, a single deployment, or a JSON list of deployments refers to them by name. A list applies in order; if one entry fails, the entries after it are not attempted.
 
 Each adapter serves its provider's own request format on its own route:
 
@@ -173,7 +154,7 @@ Each adapter serves its provider's own request format on its own route:
 | `gemini` | `POST /v1beta/models/gemini-team/gemini-2.5-flash:generateContent` | In the path | `generateContent`, `streamGenerateContent` |
 | `jev` | `POST /v1/systemone` | `model: "judge-pool/jev-latest"` | System One evaluation requests only. Jev deployments don't serve chat, tools, or streaming. |
 
-The `examples/gateway-setup` directory in the Wyrd repository holds this exact `gateway.json` plus the commands that apply it. The full request and response schemas are in the server's OpenAPI document at `GET /openapi.json`.
+The `examples/gateway-setup` directory in the Wyrd repository holds this `gateway.json` plus the commands that apply it. The full request and response schemas are in the server's OpenAPI document at `GET /openapi.json`.
 
 ## When a call is refused
 

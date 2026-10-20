@@ -8,7 +8,7 @@ import { z } from "zod";
 
 import type { ReceivedRequest, Reply } from "./http-receiver.js";
 import { configureGateway } from "./local-development.js";
-import { type RegisteredRef, fixture, registered, serverTest } from "./server.js";
+import { type DeclaredRef, fixture, declared, serverTest } from "./server.js";
 
 /** The Verdict the local judge returns for every answer: passed, citing the whole answer. */
 export const AGREES =
@@ -54,15 +54,15 @@ export const JudgeCall = z.object({
   card_uid: z.string().nullable(),
 });
 
-/** The registered assistant Service, its hydrated bundle, and its own key. */
+/** The declared assistant Service, its Card bundle, and its own key. */
 export interface Assistant {
   readonly bundle: string;
   readonly key: string;
   readonly principal: string;
-  readonly service: RegisteredRef;
-  readonly answerCheck: RegisteredRef;
-  readonly answerJudged: RegisteredRef;
-  readonly agent: RegisteredRef;
+  readonly service: DeclaredRef;
+  readonly answerCheck: DeclaredRef;
+  readonly answerJudged: DeclaredRef;
+  readonly agent: DeclaredRef;
 }
 
 /** The hydrated assistant, with its server calls fixed to `client`. */
@@ -91,20 +91,20 @@ export async function registerAssistant(client: WyrdClient): Promise<Assistant> 
   await configureGateway(client);
   await (await Gateway.connect({ client })).putCapturePolicy({ mode: "metadata", payload_fields: [] });
   const cards = await Cards.connect({ client });
-  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-  const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
+  await cards.declareFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  await cards.declareFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+  const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
-  await cards.hydrate(receipt.root, bundle);
+  await cards.pull(receipt.root, bundle);
   const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" }, { client });
   return {
     bundle,
     key: issued.key,
     principal: issued.principal_id,
-    service: registered(receipt),
-    answerCheck: registered(receipt, "answer-check"),
-    answerJudged: registered(receipt, "answer-judged"),
-    agent: registered(receipt, "assistant-agent"),
+    service: declared(receipt),
+    answerCheck: declared(receipt, "answer-check"),
+    answerJudged: declared(receipt, "answer-judged"),
+    agent: declared(receipt, "assistant-agent"),
   };
 }
 

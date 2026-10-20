@@ -455,29 +455,29 @@ pub enum AuditErrorCode {
     ValidationFailed,
 }
 
-/// Closed card-registration operation names.
+/// Closed Card declaration operation names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum CardRegistrationOperation {
-    /// A card was registered.
-    Register,
+pub enum CardDeclarationOperation {
+    /// A Card was declared.
+    Declare,
     /// A card was updated.
     Update,
     /// A card was deleted.
     Delete,
 }
 
-/// Closed card-registration outcomes.
+/// Closed Card declaration outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum CardRegistrationOutcome {
+pub enum CardDeclarationOutcome {
     /// A new card was created.
     Created,
-    /// The registration was an idempotent no-op.
+    /// The declaration was an idempotent no-op.
     IdempotentNoop,
-    /// The registration was deduplicated.
+    /// The declaration was deduplicated.
     Deduplicated,
 }
 
@@ -759,16 +759,16 @@ pub enum AuditDetail {
         /// Stable denial reason, present only for a denial.
         deny_reason: Option<AuditErrorCode>,
     },
-    /// Card registration metadata.
-    CardRegistration {
-        /// Registered card UID.
+    /// Card declaration metadata.
+    CardDeclaration {
+        /// Declared Card UID.
         card_uid: CardUid,
-        /// Registered card kind.
+        /// Declared Card kind.
         card_kind: CardKind,
-        /// Registration operation.
-        operation: CardRegistrationOperation,
-        /// Registration outcome, when applicable.
-        outcome: Option<CardRegistrationOutcome>,
+        /// Declaration operation.
+        operation: CardDeclarationOperation,
+        /// Declaration outcome, when applicable.
+        outcome: Option<CardDeclarationOutcome>,
         /// Prior spec hash, when applicable.
         before_spec_hash: Option<SpecHash>,
         /// Resulting spec hash, when applicable.
@@ -1347,8 +1347,8 @@ mod tests {
                 r#"{"delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check","outcome":"denied"}"#,
             ),
             (
-                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","operation":"register","kind":"card_registration","card_kind":"Agent","outcome":"created","before_spec_hash":null}"#,
-                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","before_spec_hash":null,"card_kind":"Agent","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","kind":"card_registration","operation":"register","outcome":"created"}"#,
+                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","operation":"declare","kind":"card_declaration","card_kind":"Agent","outcome":"created","before_spec_hash":null}"#,
+                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","before_spec_hash":null,"card_kind":"Agent","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","kind":"card_declaration","operation":"declare","outcome":"created"}"#,
             ),
             (
                 r#"{"scope_members":[{"kind":"Agent","name":"worker","version":"1.0.0","space":"prod"}],"root_card_ref":{"space":"prod","name":"root","version":"1.0.0","kind":"Agent"},"scope_hash":"scope-digest","mint_kind":"refresh","kind":"card_scope_mint","scope_member_count":1,"failure_code":null}"#,

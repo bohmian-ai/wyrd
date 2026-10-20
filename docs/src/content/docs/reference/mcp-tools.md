@@ -33,15 +33,14 @@ Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain do
 | --- | --- | --- | --- |
 | `wyrd.guide` | Read; authenticated | `{topic}` → `{topic, steps, examples}` | Static guidance; reads no tenant data and grants no permission |
 
-`topic` is one of `overview`, `cards`, `verification`, `bifrost_sql`. Each example contains `tool`, `purpose`, and an `arguments` object. Replace angle-bracket placeholders with discovered identities and adjust example time windows. The guide is a workflow aid; `tools/list` remains the current schema authority.
+`topic` is one of `start`, `overview`, `cards`, `verification`, `bifrost_sql`. `start` teaches an unfamiliar coding agent the Declare → Observe → Verify workflow on its own application: the CLI commands and SDK operations it runs from a shell, the docs to read, and the server evidence that shows it is done. The server's initialization `instructions` point new agents to it. Each example contains `tool`, `purpose`, and an `arguments` object. Replace angle-bracket placeholders with discovered identities and adjust example time windows. The guide is a workflow aid; `tools/list` remains the current schema authority.
 
 ## Cards and verification
 
 | Tool | Effect / permission | Input → output | Purpose |
 | --- | --- | --- | --- |
 | `cards.list` | Read; `cards:read` | List filters and optional cursor → `{items, next_cursor}` | Discover metadata summaries by kind, name, space, version range, lifecycle status, or metadata filter |
-| `cards.get_by_ref` | Read; `cards:read` | `{card_ref}` → `{card, created_at, updated_at}` | Resolve exact kind, name, version, and space |
-| `cards.get` | Read; `cards:read` | `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card when you already have its kind and UID |
+| `cards.get` | Read; `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card by exact kind, name, version, and space, or by kind and UID; pass exactly one form |
 | `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and latest admitted `last_execution_id` |
 | `verification.get_execution` | Read; `cards:read` | `{execution_id}` → execution status | Inspect state, result, error, and Operator dispatches of one execution |
 | `verification.evidence` | Execute; `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan presigned uploads for evidence files the tenant does not already hold |
@@ -111,6 +110,7 @@ Gateway tools address resources in the authenticated tenant by exact `name`. The
 | `gateway.get_capture_policy` | Read; `gateway:read` | `{}` → versioned capture policy | Read payload capture configuration |
 | `gateway.put_provider_credential` | Write; `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate an operator/external binding or write-only managed secret |
 | `gateway.put_provider_deployment` | Write; `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
+| `gateway.apply_provider_deployments` | Write; `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Create or rotate credentials and create or replace deployments in one transaction; secrets are write-only |
 | `gateway.put_fallback_policy` | Write; `gateway:write` | FallbackPolicy → fallback policy | Replace routing fallback |
 | `gateway.put_governance_policy` | Write; `gateway:write` | GovernancePolicy → governance policy | Replace limits, budgets, pricing |
 | `gateway.put_capture_policy` | Write; `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace payload capture configuration |

@@ -12,6 +12,7 @@ pub mod auth;
 mod card;
 mod cli;
 mod client;
+pub mod declaration;
 pub mod error;
 pub mod gateway;
 pub mod load;
@@ -21,9 +22,10 @@ mod operator_connection;
 mod platform;
 mod principal;
 pub mod query;
-pub mod registration;
 /// `wyrd server`: verified installation of official server releases.
 pub mod server;
+#[cfg(unix)]
+mod terminal;
 
 use clap::{Parser, error::ErrorKind};
 
@@ -40,7 +42,9 @@ pub use cli::{Cli, Command};
 /// does. No credential is ever a string argument.
 pub mod commands {
     pub use crate::auth::issue_key::issue_key;
-    pub use crate::card::{LoadOutput, PlanCard, PlanReport, SelectorArgs, apply, get, load, plan};
+    pub use crate::card::{
+        CheckCard, CheckReport, SelectorArgs, declare, declare_check, get, pull,
+    };
     pub use crate::gateway::{
         delete_provider_credential, put_provider_credential, revoke_provider_credential,
     };
@@ -50,8 +54,8 @@ pub mod commands {
 
 // Re-export the public loader API
 pub use load::{
-    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, RegistrationInput,
-    Severity, SourceSpan, build_registration_input, build_submissions, emit_json, load,
+    AuthoredCard, CardSubmission, DeclarationInput, Diagnostic, LoadError, LoadedCard, LoadedTree,
+    Severity, SourceSpan, build_declaration_input, build_submissions, emit_json, load,
 };
 
 /// Parse and run the CLI using the same dispatcher and error formatter as the
@@ -64,28 +68,127 @@ where
     std::process::ExitCode::from(run_cli_code(args).await)
 }
 
+/// Whether `args` request machine output with `--format json`.
+///
+/// Read from the raw arguments, before `--`, so a usage failure that never
+/// parses still learns the requested mode. In JSON mode stdout carries only
+/// the command's one result and stderr only its one error document.
+pub fn json_requested<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<std::ffi::OsStr>,
+{
+    let mut previous_format = false;
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return false;
+        }
+        if (previous_format && arg == "json") || arg == "--format=json" {
+            return true;
+        }
+        previous_format = arg == "--format";
+    }
+    false
+}
+
+/// Install the `wyrd` executable's tracing subscriber.
+///
+/// Human mode logs to stderr at `warn` unless `RUST_LOG` selects otherwise.
+/// JSON mode keeps stdout and stderr for its one result or error document:
+/// without a valid `RUST_LOG` it logs nothing, and a `RUST_LOG` selection is
+/// appended without color to `<wyrd config dir>/logs/cli.log`, so requested
+/// diagnostics are retained outside both machine streams. Only the binary
+/// calls this; in-process embedders own their own subscriber.
+///
+/// # Errors
+/// Returns [`error::WyrdCliError::Io`] when JSON mode's requested log cannot
+/// be resolved or opened. No command has run.
+pub fn install_tracing(json: bool) -> Result<(), error::WyrdCliError> {
+    use tracing_subscriber::EnvFilter;
+
+    let requested = EnvFilter::try_from_default_env();
+    if !json {
+        tracing_subscriber::fmt()
+            .with_env_filter(requested.unwrap_or_else(|_| EnvFilter::new("warn")))
+            .with_writer(std::io::stderr)
+            .init();
+        return Ok(());
+    }
+    let Ok(filter) = requested else {
+        return Ok(());
+    };
+    let path = wyrd_client::environment::Environment::Process
+        .config_dir()
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "cannot resolve the Wyrd config directory for the RUST_LOG diagnostic log: set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME, or unset RUST_LOG",
+            )
+        })
+        .map(|dir| dir.join("logs").join("cli.log"));
+    let file = path
+        .and_then(|path| open_diagnostic_log(&path))
+        .map_err(|source| error::WyrdCliError::Io { source })?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .init();
+    Ok(())
+}
+
+/// Open `path` for appending diagnostics, creating it and its directory.
+///
+/// Shared by JSON mode's CLI tracing log and `server dev`'s diagnostic log, so
+/// both keep machine streams clean the same way.
+///
+/// # Errors
+/// Propagates directory creation and open failures.
+pub(crate) fn open_diagnostic_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Parse and run the CLI, returning its numeric process exit code for language
 /// bindings and other embedding surfaces.
+///
+/// With `--format json`, a parse failure is the one
+/// [`error::WyrdCliError::Usage`] document on stderr, like every other
+/// failure; help and version output are unchanged.
 pub async fn run_cli_code<I, T>(args: I) -> u8
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let json = json_requested(&args);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
-            let success = matches!(
+            if matches!(
                 error.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            );
-            let _ = error.print();
-            return if success { 0 } else { 64 };
+            ) {
+                let _ = error.print();
+                return 0;
+            }
+            if json {
+                error::CliBoundaryError::from(error::WyrdCliError::usage(&error)).print(true);
+            } else {
+                let _ = error.print();
+            }
+            return 64;
         }
     };
     match cli.dispatch().await {
         Ok(code) => code_to_u8(code),
         Err(error) => {
-            error.print();
+            error.print(json);
             error.exit_code()
         }
     }
@@ -109,7 +212,23 @@ fn code_to_u8(code: std::process::ExitCode) -> u8 {
 /// Exit-code contract tests for the shared native and Python CLI entrypoint.
 #[cfg(test)]
 mod tests {
-    use super::{code_to_u8, run_cli_code};
+    use super::{code_to_u8, json_requested, run_cli_code};
+
+    /// Only an exact `--format json` before `--` selects machine output.
+    ///
+    /// Covers both spellings, a different format value, a lookalike value,
+    /// and a `--format json` after `--`, which belongs to a child command.
+    ///
+    /// # Panics
+    /// Panics when any of those argument lists is classified the other way.
+    #[test]
+    fn json_mode_is_read_from_raw_arguments() {
+        assert!(json_requested(["wyrd", "get", "--format", "json"]));
+        assert!(json_requested(["wyrd", "get", "--format=json"]));
+        assert!(!json_requested(["wyrd", "query", "--format", "jsonl"]));
+        assert!(!json_requested(["wyrd", "get", "--format", "text"]));
+        assert!(!json_requested(["wyrd", "x", "--", "--format", "json"]));
+    }
 
     /// Preserve the process codes explicitly used by shared CLI dispatch.
     #[test]

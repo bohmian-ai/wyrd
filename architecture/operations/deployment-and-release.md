@@ -292,6 +292,10 @@ newer) at `WYRD_UI_BIND` (default `127.0.0.1:3000`), whose address is the
 browser's public origin; the BFF forwards the browser's `/auth` requests to
 the server.
 Rotating the signing key requires a CLI release that embeds the new key.
+`wyrd server dev` runs the installed bundle with inputs resolved as argument,
+environment, saved `[dev]` setting, then prompt, saves them before any tenant
+key is issued, and pins storage and Bifrost data to absolute paths so a restart
+from any directory reuses the same tenant, key, and data.
 
 ## Release evidence
 

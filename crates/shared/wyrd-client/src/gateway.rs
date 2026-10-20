@@ -33,7 +33,7 @@ use crate::WyrdClient;
 /// Route prefix for provider credentials.
 const CREDENTIALS: &str = "/v1/admin/gateway/provider-credentials";
 /// Route prefix for provider deployments.
-const DEPLOYMENTS: &str = "/v1/admin/gateway/provider-deployments";
+pub(crate) const DEPLOYMENTS: &str = "/v1/admin/gateway/provider-deployments";
 /// Singleton fallback-policy route.
 const FALLBACK: &str = "/v1/admin/gateway/fallback-policy";
 /// Singleton governance-policy route.

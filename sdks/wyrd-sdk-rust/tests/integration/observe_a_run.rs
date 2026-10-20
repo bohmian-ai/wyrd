@@ -13,7 +13,7 @@ use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, hydrate, register};
+use crate::support::{Deployment, declare, pull};
 
 /// One `vala.drift.observations` row, as read back.
 #[derive(Debug, PartialEq, Deserialize)]
@@ -33,20 +33,20 @@ struct DriftRow {
 }
 
 /// A deployment with the observed Service registered and hydrated, and the
-/// hydrated bundle's directory.
+/// Card bundle's directory.
 ///
 /// # Panics
 /// Panics when registration or hydration fails.
 async fn observed() -> (Deployment, TempDir) {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
-    register(&cards, "cards/observe_a_run/observed-model.yaml").await;
-    let service = register(&cards, "cards/observe_a_run/observed-service.yaml").await;
-    let bundle = hydrate(&cards, &service.root).await;
+    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let service = declare(&cards, "cards/observe_a_run/observed-service.yaml").await;
+    let bundle = pull(&cards, &service.root).await;
     (deployment, bundle)
 }
 
-/// The hydrated bundle under `dir`, loaded offline.
+/// The Card bundle under `dir`, loaded offline.
 ///
 /// # Panics
 /// Panics when the bundle does not load.
@@ -54,7 +54,7 @@ fn state(dir: &TempDir) -> WyrdState {
     WyrdState::from_path(dir.path().join("bundle")).expect("bundle loads offline")
 }
 
-/// The hydrated bundle under `dir`, loaded with its server calls fixed to
+/// The Card bundle under `dir`, loaded with its server calls fixed to
 /// `client`.
 ///
 /// # Panics
@@ -147,9 +147,9 @@ async fn custom_drift_judges_the_submitted_window_on_schedule() {
         Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
             .await;
     let cards = deployment.cards().await;
-    register(&cards, "cards/observe_a_run/observed-model.yaml").await;
-    let service = register(&cards, "cards/observe_a_run/observed-service.yaml").await;
-    let dir = hydrate(&cards, &service.root).await;
+    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let service = declare(&cards, "cards/observe_a_run/observed-service.yaml").await;
+    let dir = pull(&cards, &service.root).await;
     let state = state_as(&dir, service_client(&deployment, &dir).await);
     state.start_bifrost().await.expect("Bifrost starts");
     state

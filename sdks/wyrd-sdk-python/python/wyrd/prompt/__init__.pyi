@@ -2212,7 +2212,7 @@ class Prompt:
         ...
 
 class PromptReference:
-    """An Agent's prompt slot: a registered Prompt Card or an inline ``Prompt``.
+    """An Agent's prompt slot: a declared Prompt Card or an inline ``Prompt``.
 
     Attributes:
         kind: ``"card"`` or ``"inline"`` for references built here;
@@ -2229,7 +2229,7 @@ class PromptReference:
 
     @staticmethod
     def card(name: str, version: str, *, space: str, uid: str | None = ...) -> PromptReference:
-        """Reference a registered Prompt Card.
+        """Reference a declared Prompt Card.
 
         Args:
             name: the card name.
@@ -2333,7 +2333,7 @@ class PromptCardMetadata:
 class PromptCard:
     """A local Prompt Card: a ``Prompt`` plus card identity, labels, and annotations.
 
-    It saves and loads card envelopes as local files; registration belongs to
+    It saves and loads card envelopes as local files; declaration belongs to
     the client. Identity fields are validated when the card is serialized or
     turned into a ``CardRef``, not when they are assigned.
 
@@ -2346,7 +2346,7 @@ class PromptCard:
         prompt: the card's prompt; assigning it replaces the stored prompt.
         model_settings: a copy of the prompt's typed settings, or ``None``
             when the request carries none.
-        ref: the card's exact ``CardRef``, carrying its registered version
+        ref: the card's exact ``CardRef``, carrying its declared version
             and UID; the value ``as_card_ref()`` returns.
         content_hash: the hash of the validated ``spec`` body.
         parameters: the text variables the prompt declares.

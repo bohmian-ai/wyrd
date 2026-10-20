@@ -16,13 +16,13 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
 
-from ...cards import CardRef, RegistrationReceipt
+from ...cards import CardRef, DeclarationReceipt
 from ...client import WyrdClient
 from ...gateway import ProviderCredentialView
-from ._commands import get, issue_key, load
+from ._commands import get, issue_key, pull
 
-class PlanCard:
-    """One Card a plan would register, identified as authored."""
+class CheckCard:
+    """One Card a check would declare, identified as authored."""
 
     @property
     def kind(self) -> str:
@@ -41,8 +41,8 @@ class PlanCard:
         """Authored version, or ``None`` when the server assigns one."""
         ...
 
-class PlanDiagnostic:
-    """One non-fatal loader diagnostic in a plan."""
+class CheckDiagnostic:
+    """One non-fatal loader diagnostic in a check."""
 
     @property
     def code(self) -> str:
@@ -61,32 +61,20 @@ class PlanDiagnostic:
         """Human-readable problem detail."""
         ...
 
-class PlanReport:
-    """Deterministic local registration plan returned by ``plan``."""
+class CheckReport:
+    """Deterministic local check report returned by ``declare_check``."""
 
     @property
     def ok(self) -> bool:
         """Whether the tree loaded and resolved; always ``True`` when returned."""
         ...
     @property
-    def cards(self) -> list[PlanCard]:
-        """Cards the tree would register, in registration order."""
+    def cards(self) -> list[CheckCard]:
+        """Cards the tree would declare, in declaration order."""
         ...
     @property
-    def diagnostics(self) -> list[PlanDiagnostic]:
+    def diagnostics(self) -> list[CheckDiagnostic]:
         """Non-fatal loader diagnostics."""
-        ...
-
-class LoadOutput:
-    """Result of ``load``: the exact Card the selector resolved to."""
-
-    @property
-    def card_ref(self) -> CardRef:
-        """Exact reference of the loaded Card."""
-        ...
-    @property
-    def materialized(self) -> bool:
-        """Whether the artifacts were materialized; always ``True`` when returned."""
         ...
 
 class IssueKeyResponse:
@@ -156,14 +144,14 @@ class McpInstallReport:
         """One outcome per distinct selected host."""
         ...
 
-def plan(path: str | PathLike[str]) -> PlanReport:
-    """Validate a local Card tree without contacting a server (``wyrd plan``).
+def declare_check(path: str | PathLike[str]) -> CheckReport:
+    """Validate a local Card tree without contacting a server (``wyrd declare --check``).
 
     Args:
         path: A Card file or a Card tree directory.
 
     Returns:
-        The planned Cards and non-fatal loader diagnostics.
+        The checked Cards and non-fatal loader diagnostics.
 
     Raises:
         WyrdError: ``WYRD_LOADER_400_INVALID_ENVELOPE`` with the loader
@@ -171,15 +159,15 @@ def plan(path: str | PathLike[str]) -> PlanReport:
     """
     ...
 
-def apply(path: str | PathLike[str], *, client: WyrdClient | None = None) -> RegistrationReceipt:
-    """Register a local Card tree and return its receipt (``wyrd apply``).
+def declare(path: str | PathLike[str], *, client: WyrdClient | None = None) -> DeclarationReceipt:
+    """Declare a local Card tree and return its receipt (``wyrd declare``).
 
     Args:
         path: A Card file or a Card tree directory.
         client: The principal to act as. Omitted, the ambient chain.
 
     Returns:
-        The registration receipt.
+        The declaration receipt.
 
     Raises:
         WyrdError: For invalid local input, a missing credential, or the
@@ -265,20 +253,19 @@ def delete_provider_credential(name: str, *, client: WyrdClient | None = None) -
     ...
 
 __all__ = [
+    "CheckCard",
+    "CheckDiagnostic",
+    "CheckReport",
     "IssueKeyResponse",
-    "LoadOutput",
     "McpHostReport",
     "McpInstallReport",
-    "PlanCard",
-    "PlanDiagnostic",
-    "PlanReport",
-    "apply",
+    "declare",
+    "declare_check",
     "delete_provider_credential",
     "get",
     "issue_key",
-    "load",
     "mcp_install",
-    "plan",
+    "pull",
     "put_provider_credential",
     "revoke_provider_credential",
 ]

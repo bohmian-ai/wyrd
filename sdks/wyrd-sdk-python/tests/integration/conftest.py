@@ -39,9 +39,9 @@ from .support import (
     Watch,
     binding_ids,
     client_of,
-    download,
+    declare,
     hydrated,
-    register,
+    pull,
     service_key,
 )
 from .test_local_development import configure_gateway
@@ -99,7 +99,7 @@ INVESTIGATE = {
         for id, tool, arguments in (
             (
                 "call-card",
-                "cards.get_by_ref",
+                "cards.get",
                 {
                     "card_ref": {
                         "kind": "Service",
@@ -336,12 +336,12 @@ def registered_assistant(
     """
     cards = Cards(client)
     configure_gateway(client)
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    registered = declare(cards, "cards/verify_in_real_time/assistant.yaml")
     if fitted_by is not None:
         fitted_by.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
-    return download(cards, "assistant", destination)
+    return pull(cards, "assistant", destination)
 
 
 @pytest.fixture(scope="session")
@@ -359,10 +359,10 @@ def assistant(assistant_bundle: Path, assistant_key: str) -> WyrdState:
 @pytest.fixture
 def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path) -> WyrdState:
     """A Service whose bound ``tier-drift`` baseline can never be fitted, acting as its own key."""
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    register(cards, "cards/verify_in_real_time/latency-model.yaml")
-    register(cards, "cards/verify_in_real_time/unfitted-assistant.yaml")
-    bundle = download(cards, "unfitted-assistant", tmp_path)
+    declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+    declare(cards, "cards/verify_in_real_time/latency-model.yaml")
+    declare(cards, "cards/verify_in_real_time/unfitted-assistant.yaml")
+    bundle = pull(cards, "unfitted-assistant", tmp_path)
     return hydrated(bundle, WyrdClient(credential=service_key("unfitted-assistant")))
 
 
@@ -391,15 +391,15 @@ def watching(
             }
         )
         cards = Cards(admin)
-        register(cards, "cards/latency_baseline/latency-baseline.yaml")
-        registered = register(cards, f"cards/scheduled_drift_alerts_operator/{service}.yaml")
+        declare(cards, "cards/latency_baseline/latency-baseline.yaml")
+        registered = declare(cards, f"cards/scheduled_drift_alerts_operator/{service}.yaml")
         if fitted:
             server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
         key = cli.issue_key(
             kind="Service", name=service, version="1.0.0", space="default", client=admin
         ).key
-        state = WyrdState.from_path(download(cards, service, tmp_path), client_of(server, key))
+        state = WyrdState.from_path(pull(cards, service, tmp_path), client_of(server, key))
         state.start_bifrost()
         [binding_id] = binding_ids(cards, root)
         try:
@@ -434,9 +434,9 @@ def observed_bundle(
     wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
     """The ``observed-service`` graph, registered and downloaded."""
-    register(cards, "cards/observe_a_run/observed-model.yaml")
-    register(cards, "cards/observe_a_run/observed-service.yaml")
-    return download(cards, "observed-service", tmp_path_factory.mktemp("observed"))
+    declare(cards, "cards/observe_a_run/observed-model.yaml")
+    declare(cards, "cards/observe_a_run/observed-service.yaml")
+    return pull(cards, "observed-service", tmp_path_factory.mktemp("observed"))
 
 
 @pytest.fixture(scope="session")

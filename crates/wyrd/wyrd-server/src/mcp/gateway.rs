@@ -21,7 +21,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
     GatewayCapturePolicyWrite, GatewayContractError, GatewayFallbackPolicy,
-    GatewayGovernancePolicy, ProviderCredentialWrite, ProviderDeployment,
+    GatewayGovernancePolicy, ProviderCredentialWrite, ProviderDeployment, ProviderDeploymentsApply,
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 
@@ -57,6 +57,9 @@ pub(super) const PUT_CREDENTIAL: &str = "gateway.put_provider_credential";
 /// Wire name of the provider deployment create-or-replace.
 pub(super) const PUT_DEPLOYMENT: &str = "gateway.put_provider_deployment";
 
+/// Wire name of the atomic credential-and-deployment apply.
+pub(super) const APPLY_DEPLOYMENTS: &str = "gateway.apply_provider_deployments";
+
 /// Wire name of the fallback policy replacement.
 pub(super) const PUT_FALLBACK: &str = "gateway.put_fallback_policy";
 
@@ -83,7 +86,7 @@ pub(super) const DELETE_GOVERNANCE: &str = "gateway.delete_governance_policy";
 
 /// Every gateway tool in catalog order: reads, replacements, then destructive
 /// operations.
-pub(super) const TOOLS: [&str; 17] = [
+pub(super) const TOOLS: [&str; 18] = [
     LIST_CREDENTIALS,
     LIST_DEPLOYMENTS,
     GET_FALLBACK,
@@ -93,6 +96,7 @@ pub(super) const TOOLS: [&str; 17] = [
     GET_DEPLOYMENT,
     PUT_CREDENTIAL,
     PUT_DEPLOYMENT,
+    APPLY_DEPLOYMENTS,
     PUT_FALLBACK,
     PUT_GOVERNANCE,
     PUT_CAPTURE,
@@ -248,6 +252,20 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Create or replace a provider deployment. Newly admitted calls observe the change. \
              Requires gateway write permission.",
             schema_of::<ProviderDeployment>(),
+            Effect::Replace,
+            Permission::gateway_write(),
+        ),
+        (
+            APPLY_DEPLOYMENTS,
+            "Apply gateway provider deployments",
+            "Create or rotate provider credentials and create or replace the deployments that \
+             use them in one tenant transaction: every named resource commits or none does, \
+             and unnamed resources are untouched. Credentials take the same sources as the \
+             credential put; a managed secret is sealed into a tenant-encrypted envelope \
+             before it is stored and only redacted views are returned. Every submitted \
+             credential must be referenced by a submitted deployment. Requires gateway write \
+             permission.",
+            schema_of::<ProviderDeploymentsApply>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -474,6 +492,12 @@ impl WyrdMcpHandler {
                 gateway.put_deployment(caller, &name, deployment).await
             })
             .await),
+            APPLY_DEPLOYMENTS => {
+                Ok(
+                    structured(async { gateway.apply_deployments(caller, body(arguments)?).await })
+                        .await,
+                )
+            }
             PUT_FALLBACK => {
                 Ok(
                     structured(async { gateway.put_fallback(caller, body(arguments)?).await })
@@ -608,6 +632,15 @@ mod tests {
 
     /// Proves the catalog advertises every gateway tool once, in order, with
     /// object input schemas and effect annotations matching its operation.
+    ///
+    /// # Panics
+    /// Panics when the advertised names or order differ from [`TOOLS`], when
+    /// a tool lacks annotations, has effect hints that disagree with its
+    /// read/destructive operation, or a non-object input schema, when the
+    /// credential write (index 7) lacks its description, a required storage
+    /// claim, or still denies accepting secrets, and when the collection
+    /// apply (index 9) or the name-keyed tool at index 14 has a different
+    /// schema title or required fields.
     #[test]
     fn gateway_catalog_annotates_every_administration_operation() {
         let tools = descriptors();
@@ -655,8 +688,9 @@ mod tests {
             "put-credential description still denies accepting any secret value: \
              {put_credential_description}"
         );
+        assert_eq!(tools[9].input_schema["title"], "ProviderDeploymentsApply");
         assert_eq!(
-            tools[13].input_schema["required"],
+            tools[14].input_schema["required"],
             serde_json::json!(["name"])
         );
     }

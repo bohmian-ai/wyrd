@@ -8,7 +8,7 @@ mod identity_e2e;
 mod identity_ui_e2e;
 /// Rust-owned opaque browser sessions through `/auth/browser`.
 mod pg_browser_sessions;
-mod pg_card_registration_route;
+mod pg_card_declaration_route;
 // Inspects recovered WAL state through `replay_wal_directory`, which exists only
 // under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
 // forwards it.

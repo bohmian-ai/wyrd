@@ -25,7 +25,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_loader::{build_registration_input, load};
+use wyrd_loader::{build_declaration_input, load};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
@@ -33,7 +33,7 @@ use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
-use wyrd_spec::registry::RegistrationReceipt;
+use wyrd_spec::registry::DeclarationReceipt;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
@@ -82,8 +82,7 @@ impl Support {
         else {
             panic!("user bootstrap returned a machine principal");
         };
-        let (receipt, service) =
-            register(&server, &admin, "verify_in_real_time/support.yaml").await;
+        let (receipt, service) = declare(&server, &admin, "verify_in_real_time/support.yaml").await;
         let uid = |name: &str| {
             receipt
                 .outcomes
@@ -384,19 +383,19 @@ impl Support {
     }
 }
 
-/// Register the Service fixture at `fixture` under `fixtures/cards/` as
+/// Declare the Service fixture at `fixture` under `fixtures/cards/` as
 /// `admin`, credential it as an editor, and exchange its API key, which
 /// records the Service's activity.
 ///
-/// Returns the registration receipt and the Service's access token.
+/// Returns the declaration receipt and the Service's access token.
 ///
 /// # Panics
-/// Panics when loading, registration, or the credential exchange fails.
-async fn register(
+/// Panics when loading, declaration, or the credential exchange fails.
+async fn declare(
     server: &WyrdTestServer,
     admin: &str,
     fixture: &str,
-) -> (RegistrationReceipt, String) {
+) -> (DeclarationReceipt, String) {
     let receipt = register_card(server, admin, fixture).await;
     let machine = server
         .credential_registered_service(&receipt.root, &["editor"])
@@ -413,12 +412,12 @@ async fn register(
 ///
 /// # Panics
 /// Panics when loading or registration fails.
-async fn register_card(server: &WyrdTestServer, admin: &str, fixture: &str) -> RegistrationReceipt {
+async fn register_card(server: &WyrdTestServer, admin: &str, fixture: &str) -> DeclarationReceipt {
     let path = format!(
         "{}/../../../fixtures/cards/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
-    let input = build_registration_input(load(std::path::Path::new(&path)).expect("loads"))
+    let input = build_declaration_input(load(std::path::Path::new(&path)).expect("loads"))
         .expect("registration input builds");
     Cards::connect_with(&client(
         server.base_url().expect("bound server has a URL"),
@@ -426,9 +425,9 @@ async fn register_card(server: &WyrdTestServer, admin: &str, fixture: &str) -> R
     ))
     .await
     .expect("handle connects")
-    .register(&input)
+    .declare(&input)
     .await
-    .expect("the Card registers")
+    .expect("the Card declares")
 }
 
 /// Assemble the production HTTP client the registry saga runs over.
@@ -916,7 +915,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         "observe_a_run/observed-model.yaml",
     )
     .await;
-    let (observed, _) = register(
+    let (observed, _) = declare(
         &support.server,
         &support.admin,
         "observe_a_run/observed-service.yaml",

@@ -36,7 +36,7 @@ arrow-schema = { workspace = true }
 serde_json = { workspace = true }
 parquet-variant = { workspace = true }
 parquet-variant-json = { workspace = true }
-wyrd-spec = { workspace = true }
+wyrd-spec = { path = "../../wyrd-spec" }
 async-trait = { workspace = true }
 
 [lints]

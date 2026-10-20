@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
-use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
+use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::state::WyrdState;
 use wyrd_client::{GlobalConfig, WyrdClient};
@@ -129,11 +129,11 @@ impl Tenant {
         write_graph(&directory)?;
         let admin = connect(SERVER_URL, &setup.api_key)?;
         let cards = Cards::connect_with(&admin).await?;
-        let verifier = Box::pin(cards.register_from_path(&directory.join("assert.yaml")))
+        let verifier = Box::pin(cards.declare_from_path(&directory.join("assert.yaml")))
             .await?
             .root;
         let verifier = uid(verifier.uid.as_ref())?;
-        let service = Box::pin(cards.register_from_path(&directory.join("service.yaml"))).await?;
+        let service = Box::pin(cards.declare_from_path(&directory.join("service.yaml"))).await?;
         let issued: IssueKeyResponse = admin
             .request_json(
                 Method::POST,
@@ -147,10 +147,10 @@ impl Tenant {
             .await
             .map_err(|error| format!("issuing the Service key: {error}"))?;
         let bundle = directory.join("bundle");
-        Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
+        Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
             &CardSelector::exact(service.root.clone()),
             &bundle,
-            HydrationMode::Complete,
+            BundleMode::Complete,
         ))
         .await
         .map_err(|error| format!("hydrating the Service bundle: {error}"))?;

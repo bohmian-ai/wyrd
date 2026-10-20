@@ -1,26 +1,34 @@
-[
-  {
-    "name": "openai-prod",
-    "adapter": "openai",
-    "auth": { "bearer": { "credential": "openai-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "claude-prod",
-    "adapter": "anthropic",
-    "auth": { "api_key_header": { "header": "x-api-key", "credential": "anthropic-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "gemini-team",
-    "adapter": "gemini",
-    "auth": { "api_key_header": { "header": "x-goog-api-key", "credential": "gemini-key" } },
-    "capabilities": ["chat_completions"]
-  },
-  {
-    "name": "judge-pool",
-    "adapter": "jev",
-    "auth": { "bearer": { "credential": "jev-key" } },
-    "capabilities": ["system_one"]
-  }
-]
+{
+  "credentials": [
+    { "name": "openai-key", "provider": "openai", "source": { "local_env": "OPENAI_API_KEY" } },
+    { "name": "anthropic-key", "provider": "anthropic", "source": { "local_env": "ANTHROPIC_API_KEY" } },
+    { "name": "gemini-key", "provider": "gemini", "source": { "local_env": "GOOGLE_API_KEY" } },
+    { "name": "jev-key", "provider": "jev", "source": { "local_env": "TYPESAFE_API_KEY" } }
+  ],
+  "deployments": [
+    {
+      "name": "openai-prod",
+      "adapter": "openai",
+      "auth": { "bearer": { "credential": "openai-key" } },
+      "capabilities": ["chat_completions"]
+    },
+    {
+      "name": "claude-prod",
+      "adapter": "anthropic",
+      "auth": { "api_key_header": { "header": "x-api-key", "credential": "anthropic-key" } },
+      "capabilities": ["chat_completions"]
+    },
+    {
+      "name": "gemini-team",
+      "adapter": "gemini",
+      "auth": { "api_key_header": { "header": "x-goog-api-key", "credential": "gemini-key" } },
+      "capabilities": ["chat_completions"]
+    },
+    {
+      "name": "judge-pool",
+      "adapter": "jev",
+      "auth": { "bearer": { "credential": "jev-key" } },
+      "capabilities": ["system_one"]
+    }
+  ]
+}

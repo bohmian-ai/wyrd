@@ -33,7 +33,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_loader::{build_registration_input, load};
+use wyrd_loader::{build_declaration_input, load};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{
     AcceptedAuthority, BifrostPermissionScope, BifrostTableScope, DelegationStep, Permission,
@@ -97,7 +97,7 @@ impl Registered {
             "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: hosted-evidence\n  version: 1.0.0\n  space: default\nartifacts:\n  - relative_path: notes.txt\n    content_type: text/plain\n  - relative_path: check.py\n    content_type: text/x-python\nspec:\n  artifact_kind: dataset\n",
         )
         .expect("card writes");
-        let input = build_registration_input(load(&card).expect("loader tree builds"))
+        let input = build_declaration_input(load(&card).expect("loader tree builds"))
             .expect("registration input builds");
         let server = Box::pin(WyrdTestServer::start_bound())
             .await
@@ -115,7 +115,7 @@ impl Registered {
         ))
         .await
         .expect("handle connects");
-        let receipt = Box::pin(cards.register(&input))
+        let receipt = Box::pin(cards.declare(&input))
             .await
             .expect("the Artifact registers");
         Self {

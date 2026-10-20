@@ -17,8 +17,10 @@ use serde::Serialize;
 use wyrd_client::transport::HttpConfig;
 use wyrd_spec::error::WyrdError;
 
+pub(crate) use hosts::selected;
 pub use hosts::{McpHost, McpHostReport, McpHostStatus};
 
+use crate::card::{OutputFormat, print_json};
 use crate::client::map_client_error;
 use crate::error::{CliBoundaryError, WyrdCliError};
 use hosts::{HostInstaller, prompt_selection};
@@ -46,6 +48,10 @@ pub struct InstallArgs {
     /// command. Omitted, the host follows the global client endpoint.
     #[arg(long)]
     server: Option<String>,
+    /// Output encoding; `json` prints one per-host installation report and never
+    /// prompts, so it requires `--host`.
+    #[arg(long, default_value_t)]
+    format: OutputFormat,
 }
 
 /// Arguments for `wyrd mcp proxy`.
@@ -165,20 +171,21 @@ impl McpCommand {
 }
 
 impl InstallArgs {
-    /// Select hosts, install them, and print one line per host.
+    /// Select hosts, install them, and print one line per host or, with
+    /// `--format json`, the whole report.
     ///
-    /// Explicit `--host` values win; otherwise an interactive terminal is
-    /// offered the detected hosts, and a non-interactive run fails through
-    /// [`install`] without editing anything.
+    /// Explicit `--host` values win; otherwise an interactive text-mode
+    /// terminal is offered the detected hosts, and a JSON or non-interactive
+    /// run fails through [`install`] without editing anything.
     ///
     /// # Errors
     /// Returns [`install`]'s errors, [`WyrdCliError::McpHostSelection`] when
     /// no host is detected for the prompt, [`WyrdCliError::Io`] when the
     /// prompt cannot be read, and [`WyrdCliError::McpHostInstall`] naming
-    /// every host that was not connected.
+    /// every host that was not connected and carrying the whole report.
     fn run(self) -> Result<ExitCode, WyrdCliError> {
         let mut hosts = self.hosts;
-        if hosts.is_empty() && io::stdin().is_terminal() {
+        if hosts.is_empty() && self.format == OutputFormat::Text && io::stdin().is_terminal() {
             let detected = HostInstaller::from_process(None).detected();
             if detected.is_empty() {
                 return Err(WyrdCliError::McpHostSelection {
@@ -193,42 +200,78 @@ impl InstallArgs {
             }
         }
         let report = installed(&hosts, self.server.as_deref())?;
-        let mut failed = Vec::new();
-        for outcome in &report.hosts {
+        match self.format {
+            OutputFormat::Text => report.print_text(),
+            OutputFormat::Json if report.failed().is_empty() => print_json(&report)?,
+            OutputFormat::Json => {}
+        }
+        report.into_result()?;
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+impl McpInstallReport {
+    /// Names of the selected hosts that were not connected.
+    fn failed(&self) -> Vec<&'static str> {
+        self.hosts
+            .iter()
+            .filter(|outcome| outcome.detail.is_some())
+            .map(|outcome| outcome.host.name())
+            .collect()
+    }
+
+    /// Print one line per host: its failure reason, or its status and file.
+    pub(crate) fn print_text(&self) {
+        for outcome in &self.hosts {
             let name = outcome.host.name();
             match (&outcome.detail, &outcome.path) {
-                (Some(detail), _) => {
-                    println!("{name}: {detail}");
-                    failed.push(name);
-                }
+                (Some(detail), _) => println!("{name}: {detail}"),
                 (None, Some(path)) => println!("{name}: {} {}", outcome.status, path.display()),
                 (None, None) => println!("{name}: {}", outcome.status),
             }
         }
+    }
+
+    /// Keep a fully connected report, or refuse naming every failed host.
+    ///
+    /// # Errors
+    /// Returns [`WyrdCliError::McpHostInstall`], carrying this report, when
+    /// any selected host was not connected.
+    pub(crate) fn into_result(self) -> Result<Self, WyrdCliError> {
+        let failed = self.failed();
         if failed.is_empty() {
-            Ok(ExitCode::SUCCESS)
+            Ok(self)
         } else {
             Err(WyrdCliError::McpHostInstall {
                 hosts: failed.join(", "),
+                report: self,
             })
         }
     }
 }
 
 /// Offer the existing host installer after a local deployment is usable.
-/// Scripts select no hosts implicitly; no detected hosts is a harmless skip.
+/// Explicit `hosts` install without a question; otherwise detected hosts are
+/// offered only when the caller's resolved policy is `interactive`, so
+/// unattended runs select none implicitly. No detected hosts, or no host
+/// chosen, is a harmless skip returning `None`. The report may hold failed
+/// hosts; the caller renders it, then refuses through
+/// [`McpInstallReport::into_result`].
 ///
 /// # Errors
-/// Returns the same per-host failures as independent MCP installation.
-pub(crate) async fn offer_local(hosts: &[McpHost], server: &str) -> Result<(), WyrdCliError> {
+/// Returns the same selection and server errors as independent installation.
+pub(crate) async fn offer_local(
+    hosts: &[McpHost],
+    server: &str,
+    interactive: bool,
+) -> Result<Option<McpInstallReport>, WyrdCliError> {
     if hosts.is_empty()
-        && (!io::stdin().is_terminal()
+        && (!interactive
             || HostInstaller::from_process(Some(server))
                 .detected()
                 .is_empty())
     {
-        println!("MCP setup skipped; connect a host later with wyrd mcp install.");
-        return Ok(());
+        return Ok(None);
     }
     let mut chosen = hosts.to_vec();
     #[cfg(unix)]
@@ -240,14 +283,8 @@ pub(crate) async fn offer_local(hosts: &[McpHost], server: &str) -> Result<(), W
         .await
         .map_err(|source| WyrdCliError::Io { source })?;
         if chosen.is_empty() {
-            println!("No host selected; nothing changed.");
-            return Ok(());
+            return Ok(None);
         }
     }
-    InstallArgs {
-        hosts: chosen,
-        server: Some(server.to_owned()),
-    }
-    .run()?;
-    Ok(())
+    installed(&chosen, Some(server)).map(Some)
 }

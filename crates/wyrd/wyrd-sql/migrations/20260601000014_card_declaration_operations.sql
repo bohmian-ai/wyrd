@@ -1,9 +1,9 @@
--- Idempotency state for card registration.
+-- Idempotency state for card declaration.
 --
 -- The operation row is committed with the card and audit row before any
 -- storage backend call. Replays use this row to resume post-commit work.
 
-CREATE TABLE wyrd.card_registration_operations (
+CREATE TABLE wyrd.card_declaration_operations (
     operation_id       UUID PRIMARY KEY,
     data_tenant_id     UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
     sub_principal_id   UUID NOT NULL,
@@ -15,13 +15,13 @@ CREATE TABLE wyrd.card_registration_operations (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT card_registration_operations_status_check
+    CONSTRAINT card_declaration_operations_status_check
         CHECK (status IN ('pending', 'committed', 'expired')),
-    CONSTRAINT card_registration_operations_idempotency_key_unique
+    CONSTRAINT card_declaration_operations_idempotency_key_unique
         UNIQUE (data_tenant_id, sub_principal_id, act_principal_id, idempotency_key),
-    CONSTRAINT card_registration_operations_operation_tenant_unique
+    CONSTRAINT card_declaration_operations_operation_tenant_unique
         UNIQUE (operation_id, data_tenant_id),
-    CONSTRAINT card_registration_operations_no_url
+    CONSTRAINT card_declaration_operations_no_url
         CHECK (stored_response IS NULL OR stored_response::text !~* (
             '"(' ||
             'put_' || 'url' || '|' ||
@@ -35,20 +35,20 @@ CREATE TABLE wyrd.card_registration_operations (
         ))
 );
 
-CREATE INDEX card_registration_operations_sweep_idx
-    ON wyrd.card_registration_operations (status, updated_at)
+CREATE INDEX card_declaration_operations_sweep_idx
+    ON wyrd.card_declaration_operations (status, updated_at)
     WHERE status = 'pending';
 
-ALTER TABLE wyrd.card_registration_operations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wyrd.card_registration_operations FORCE ROW LEVEL SECURITY;
+ALTER TABLE wyrd.card_declaration_operations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wyrd.card_declaration_operations FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY tenant_isolation ON wyrd.card_registration_operations
+CREATE POLICY tenant_isolation ON wyrd.card_declaration_operations
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-CREATE POLICY operator_access ON wyrd.card_registration_operations TO CURRENT_USER
+CREATE POLICY operator_access ON wyrd.card_declaration_operations TO CURRENT_USER
     USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
--- Registration lifecycle state and pending-card bookkeeping.
+-- Declaration lifecycle state and pending-card bookkeeping.
 
 ALTER TABLE wyrd.cards
     DROP CONSTRAINT cards_status_check,
@@ -75,7 +75,7 @@ CREATE INDEX idx_cards_spec_hash
     WHERE status = 'active';
 
 ALTER TABLE wyrd.cards
-    ADD COLUMN registration_operation_id UUID,
+    ADD COLUMN declaration_operation_id UUID,
     ADD COLUMN pending_since TIMESTAMPTZ,
     ADD COLUMN finalized_at TIMESTAMPTZ,
     ADD COLUMN card_blob_uri TEXT,
@@ -83,16 +83,16 @@ ALTER TABLE wyrd.cards
 
 ALTER TABLE wyrd.cards
     ADD CONSTRAINT cards_tenant_uid_unique UNIQUE (data_tenant_id, card_uid),
-    ADD CONSTRAINT cards_registration_operation_fk
-        FOREIGN KEY (registration_operation_id, data_tenant_id)
-        REFERENCES wyrd.card_registration_operations (operation_id, data_tenant_id)
+    ADD CONSTRAINT cards_declaration_operation_fk
+        FOREIGN KEY (declaration_operation_id, data_tenant_id)
+        REFERENCES wyrd.card_declaration_operations (operation_id, data_tenant_id)
         ON DELETE SET NULL;
 
 CREATE INDEX cards_pending_sweep_idx
     ON wyrd.cards (data_tenant_id, status, pending_since)
     WHERE status = 'pending';
 
--- Per-artifact registration expectations and post-commit initialization state.
+-- Per-artifact declaration expectations and post-commit initialization state.
 
 CREATE TABLE wyrd.card_artifact_manifest (
     manifest_id        UUID PRIMARY KEY,

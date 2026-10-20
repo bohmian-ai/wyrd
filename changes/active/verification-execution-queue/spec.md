@@ -377,7 +377,7 @@ All exist today; new tables above are proposed additions within this chain.
 | `20261016000000_verifier_executions.sql` | Reconcile names, strict terminal/executable shapes, payload clearing, full BRIN, fillfactor and origin constraints; remove historical observation cancellation/exemption assumptions. |
 | `20261018000000_verification_group_pending.sql` | Preserve pending cadence; introduce compact group-state table, tenant-qualified binding ownership and forced RLS; revise affected terminal/input/group constraints. |
 | `20261019000000_verification_refused_shape.sql` | Distinguish strict pre-admission refusal from scrubbed accepted terminal history, without historical observation columns. |
-| `20261021000000_verifier_execution_batches.sql` | Queue/record closure in both batch functions, lock order, replay, payload capture and group fallback. |
+| `20261022000000_verifier_execution_batches.sql` | Queue/record closure in both batch functions, lock order, replay, payload capture and group fallback. |
 
 `20261003000000_verifier_run_results.sql` and
 `20261008000000_drop_verifier_run_results.sql` describe transient result storage;

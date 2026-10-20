@@ -93,7 +93,7 @@ stays unrelaxed.
 
 Runtime changes made to reach the target:
 - **Direct load.** The new `wyrd.verification_target` function (migration
-  `20261020000000`, owner `queries/verification_target.rs`) reads both Cards
+  `20261021000000`, owner `queries/verification_target.rs`) reads both Cards
   and the SYSTEM principal in one autocommit statement. It replaces five round
   trips. The shape follows Oracle's table cut. It is allowlisted as a
   statement-tenant owner in `scripts/check_tenant_isolation.py`.
@@ -167,7 +167,7 @@ Changes:
 - **Batched completion.** `VerifierExecutionQueue::complete_many` settles many
   completions in one round trip through `wyrd.complete_verifier_executions`.
   Lease renewal goes through `wyrd.renew_verifier_leases`. Both are added in
-  migration `20261021000000`. Each function updates one row at a time by
+  migration `20261022000000`. Each function updates one row at a time by
   `execution_id`, in `execution_id` order. Unapplied rows fall back to
   `complete` in the same transaction. Dispatch insertion is shared through
   `insert_dispatches`.
@@ -283,7 +283,7 @@ the per-row write cost on `verifier_executions` is what bounds it.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| Direct verify p99 overhead < 1 ms, ≥ 1,000 samples, 0 refusals | `verification/completions.rs`, `claims.rs`, migration `20261021000000` | bench34 case 1 | PASS |
+| Direct verify p99 overhead < 1 ms, ≥ 1,000 samples, 0 refusals | `verification/completions.rs`, `claims.rs`, migration `20261022000000` | bench34 case 1 | PASS |
 | Background submit: no refusals, backlog drained within 60 s | same | bench32 case 2: 0 client errors, longest drain 51.1 s | PASS |
 | Bifrost does not regress | no Bifrost change | `bench:bifrost:write-capacity` | PASS |
 

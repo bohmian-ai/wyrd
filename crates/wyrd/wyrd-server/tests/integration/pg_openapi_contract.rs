@@ -28,6 +28,24 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
+/// The served name of the tenant browser-session cookie scheme.
+const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";
+
+/// The requirement of an operation that accepts the access token or, without
+/// one, a browser session.
+fn token_or_browser_session() -> Value {
+    serde_json::json!([{ WYRD_ACCESS_TOKEN_SCHEME: [] }, { BROWSER_SESSION_SCHEME: [] }])
+}
+
+/// The OTLP export operations, which keep their own bearer-only layer inside `/v1`.
+const OTLP_PATHS: [&str; 3] = ["/v1/traces", "/v1/metrics", "/v1/logs"];
+
+/// Whether `path` may offer the browser session: only a `/v1` operation
+/// other than OTLP export.
+fn browser_session_surface(path: &str) -> bool {
+    path.starts_with("/v1/") && !OTLP_PATHS.contains(&path)
+}
+
 /// The OAuth client endpoints: each identifies its client by the public
 /// form's `client_id`.
 const OAUTH_CLIENT_OPERATIONS: [&str; 3] =
@@ -391,11 +409,53 @@ async fn tenant_login_operations_publish_their_contract() {
         document["paths"]["/auth/authorize"].is_null(),
         "/auth/authorize is retired"
     );
-    let login = &document["paths"]["/auth/browser/login"]["post"];
-    assert_eq!(login["security"], serde_json::json!([{}]));
+    for (path, method, statuses) in [
+        (
+            "/auth/browser/login",
+            "post",
+            &["200", "401", "403", "503"][..],
+        ),
+        (
+            "/auth/browser/api-key",
+            "post",
+            &["200", "401", "403", "503"][..],
+        ),
+        ("/auth/browser/session", "get", &["200", "401", "503"][..]),
+        ("/auth/browser/logout", "post", &["204", "403", "503"][..]),
+    ] {
+        let operation = &document["paths"][path][method];
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{}]),
+            "{method} {path} is reached before a session is proved"
+        );
+        for status in statuses {
+            assert!(
+                operation["responses"][status].is_object(),
+                "{method} {path} documents {status}: {operation}"
+            );
+        }
+    }
+    for path in [
+        "/auth/browser/login",
+        "/auth/browser/api-key",
+        "/auth/browser/logout",
+    ] {
+        assert!(
+            document["paths"][path]["post"]["responses"]["403"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("WYRD_AUTH_403_ORIGIN_REFUSED")),
+            "{path} documents its Origin refusal"
+        );
+    }
+    let session = &document["paths"]["/auth/browser/session"]["get"];
     assert!(
-        login["responses"]["200"].is_object(),
-        "the browser login begins: {login}"
+        session["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|parameter| parameter["name"] == "tenant" && parameter["in"] == "query"),
+        "session metadata takes the optional tenant filter: {session}"
     );
     assert!(
         document["paths"]["/.well-known/oauth-authorization-server"]["get"].is_object(),
@@ -638,11 +698,10 @@ async fn every_problem_response_declares_its_media_type_and_stable_code() {
 /// Authentication is a property of the whole surface, so the requirement is
 /// declared once on the document and inherited. An operation a caller reaches
 /// before it can have a session clears the requirement beside its own handler
-/// with `security(())`, which is the only override the contract permits: a
-/// per-operation requirement naming some *other* caller scheme would be a
-/// second authentication story, and there is only one header. The one
-/// exception is OAuth client authentication: the OAuth client endpoints offer
-/// confidential HTTP Basic beside the empty requirement.
+/// with `security(())`. The only other override is the browser-session
+/// cookie, offered as an alternative to — never instead of — the access token,
+/// and only on the protected tenant `/v1` HTTP surface: MCP, OTLP, the platform
+/// plane and gateway inference stay bearer-only.
 #[tokio::test]
 async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     let server = WyrdTestServer::start_in_process()
@@ -659,12 +718,41 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         "the document requires the scheme by default"
     );
 
+    let cookie = &document["components"]["securitySchemes"][BROWSER_SESSION_SCHEME];
+    assert_eq!(cookie["type"], "apiKey");
+    assert_eq!(cookie["in"], "cookie");
+    assert_eq!(cookie["name"], "wyrd_session_{tenant}");
+    let described = cookie["description"].as_str().unwrap_or_default();
+    for refusal in [
+        "WYRD_AUTH_403_ORIGIN_REFUSED",
+        "WYRD_SPEC_400_VALIDATION",
+        "WYRD_AUTH_401_INVALID_TOKEN",
+    ] {
+        assert!(
+            described.contains(refusal),
+            "the cookie scheme documents {refusal}"
+        );
+    }
+
     let mut cleared = BTreeSet::new();
+    let mut cookie_paths = BTreeSet::new();
+    let mut bearer_only_v1 = BTreeSet::new();
     for (path, item) in document["paths"].as_object().expect("paths object") {
         for (method, operation) in item.as_object().expect("path item is an object") {
             let Some(overridden) = operation.get("security") else {
+                if path.starts_with("/v1/") {
+                    bearer_only_v1.insert(path.clone());
+                }
                 continue;
             };
+            if overridden == &token_or_browser_session() {
+                assert!(
+                    browser_session_surface(path),
+                    "{method} {path} offers the browser session outside the tenant HTTP surface"
+                );
+                cookie_paths.insert(path.clone());
+                continue;
+            }
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
             assert!(
@@ -678,6 +766,21 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         !cleared.is_empty(),
         "sign-in and credential exchange cannot themselves require a session"
     );
+    for path in ["/v1/identity/oidc/connections", "/v1/cards"] {
+        assert!(
+            cookie_paths.contains(path),
+            "{path} accepts a browser session"
+        );
+    }
+    // OTLP export and gateway inference keep their own bearer-only layers;
+    // `unauthenticated_requests_match_each_operation_declared_security` proves
+    // each documented requirement against the served behavior.
+    for path in OTLP_PATHS
+        .into_iter()
+        .chain(["/v1/chat/completions", "/v1/messages"])
+    {
+        assert!(bearer_only_v1.contains(path), "{path} stays bearer-only");
+    }
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -1726,14 +1829,19 @@ async fn no_yaml_projection_is_routed() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The operations that carry their own `security` key are exactly the ones an
-/// anonymous caller can reach.
+/// The operations that clear their `security` requirement are exactly the
+/// ones an anonymous caller can reach, and the ones that offer the browser
+/// session are exactly the ones that read it.
 ///
 /// This is the behavioural replacement for the hand-written anonymous-path
 /// list: each operation's own declaration is the input, and the assembled
 /// server's answer to a credential-free request is the proof. Every other
 /// operation must refuse with `WYRD_AUTH_401_UNAUTHENTICATED`, which is also
-/// what proves it is mounted behind the default-deny layer.
+/// what proves it is mounted behind the default-deny layer. Each protected
+/// operation is then sent a dead tenant session cookie: one documenting the
+/// cookie alternative must judge it (`WYRD_AUTH_401_INVALID_TOKEN` for a safe
+/// method, `WYRD_AUTH_403_ORIGIN_REFUSED` for a mutation without `Origin`), and
+/// a bearer-only one must ignore it and stay unauthenticated.
 #[tokio::test]
 async fn unauthenticated_requests_match_each_operation_declared_security() {
     let server = WyrdTestServer::start_in_process()
@@ -1742,6 +1850,7 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
     let document = served_document(&server).await;
 
     let mut cleared = 0_usize;
+    let mut browser_probes = 0_usize;
     let mut defects: Vec<String> = Vec::new();
     for (path, item) in document["paths"].as_object().expect("paths object") {
         for method in METHODS {
@@ -1767,7 +1876,9 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                 String::new()
             };
 
-            if operation.get("security").is_some() {
+            let security = operation.get("security");
+            let accepts_cookie = security == Some(&token_or_browser_session());
+            if security.is_some() && !accepts_cookie {
                 cleared += 1;
                 if code == "WYRD_AUTH_401_UNAUTHENTICATED" {
                     defects.push(format!(
@@ -1781,10 +1892,49 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                      answered {status} ({code}) without a token"
                 ));
             }
+            if security.is_some() && !accepts_cookie {
+                continue;
+            }
+
+            let probed = server
+                .oneshot(
+                    Request::builder()
+                        .method(method.to_uppercase().as_str())
+                        .uri(&uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(
+                            header::COOKIE,
+                            "wyrd_session_test-tenant-1=test-tenant-1.dead",
+                        )
+                        .body(Body::from("{}"))
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            let probed_status = probed.status();
+            let probed_code = refusal_code(&problem_json(probed).await);
+            let expected = match (accepts_cookie, method) {
+                (false, _) => (StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_UNAUTHENTICATED"),
+                (true, "get" | "head" | "options") => {
+                    (StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_INVALID_TOKEN")
+                }
+                (true, _) => (StatusCode::FORBIDDEN, "WYRD_AUTH_403_ORIGIN_REFUSED"),
+            };
+            if (probed_status, probed_code.as_str()) != expected {
+                defects.push(format!(
+                    "{method} {path} (cookie alternative documented: {accepts_cookie}) answered \
+                     {probed_status} ({probed_code}) to a dead session cookie, not {expected:?}"
+                ));
+            }
+            browser_probes += usize::from(accepts_cookie);
         }
     }
 
     assert!(cleared > 0, "some operations clear the requirement");
+    assert!(
+        browser_probes > 0,
+        "some operations accept a browser session"
+    );
     assert!(defects.is_empty(), "{}", defects.join("\n"));
 
     server.shutdown().await.expect("server shuts down");

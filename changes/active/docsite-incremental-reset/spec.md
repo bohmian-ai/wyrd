@@ -1,6 +1,6 @@
 ---
 id: SPEC-docsite-incremental-reset
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -200,14 +200,37 @@ the relevant documentation checks and publication triggers. A source-backed
 snippet or generated-reference change must not leave deployed content stale
 merely because its source lies outside `docs/`.
 
+### REQ-007 — Fix ergonomic gaps the first journey exposes
+
+Rebuilding the docs is also an ergonomics review. When a tutorial needs
+ceremony a developer should not have to write, fix the owning SDK or server
+surface in this change rather than documenting the workaround.
+
+The first such fix: `WyrdState.from_path` accepts an authored Card YAML file
+as well as a pulled bundle. Given a Card file, it loads and resolves the file's
+reference graph locally, declares it (idempotently for unchanged Cards), and
+returns a hydrated state for the declared root, so the Quickstart is:
+
+```python
+from wyrd import WyrdState
+
+state = WyrdState.from_path("support-reply.yaml")
+run = state.run()
+```
+
+Bundle loading keeps its current offline behavior. Declaration from a Card
+file is a server write under the caller's normal declaration authority, and
+the public documentation says so. The capability lives in the shared Rust
+client owner and is projected to the Python, Rust, and TypeScript SDKs.
+
 ## Invariants, boundaries, and non-goals
 
 - **INV-001:** Retain the approved Wyrd brand, landing visual language,
   SvelteKit/mdsvex/Pagefind/Shiki foundation, responsive behavior, both themes,
   and WCAG 2.2 AA accessibility. No site redesign or platform migration.
-- **INV-002:** Server contracts, SDK semantics, CLI behavior, tenancy, and
-  Bifrost behavior are unchanged. A missing capability is a blocker or a later
-  feature, never a documentation-driven server workaround.
+- **INV-002:** Tenancy, authorization, and Bifrost behavior are unchanged.
+  SDK, CLI, and server ergonomics may change under REQ-007 through their owning
+  crates and contracts, never as a documentation-only workaround.
 - **INV-003:** Preserve Wyrd vocabulary, exact component identities,
   authorization requirements, redaction, and non-blocking audit semantics.
   Do not invent routes, aliases, compatibility contracts, or durable Run state.
@@ -228,13 +251,14 @@ merely because its source lies outside `docs/`.
 | AC-004 | Production discovery contains only published pages and valid destinations. | Built route, navigation, search, links, and machine-index evidence, including removal of Setup/Quickstart in a test fixture. |
 | AC-005 | Retained concepts, references, and operations claims have appropriate source or runtime evidence; unproven pages are withdrawn. | Page disposition evidence, generated drift checks, relevant catalog/procedure proof. |
 | AC-006 | Brand, accessibility, and existing site behavior remain intact. | Existing docs tests, keyboard/responsive/both-theme review, `mise run docs:check`. |
+| AC-008 | The Quickstart script hydrates its state directly from the authored subject YAML, and bundle loading is unchanged. | SDK journeys for Card-file and bundle loading in each first-class SDK; the Quickstart journey and released walkthrough using the new form once released. |
 | AC-007 | Local snippet and generated-source changes reach docs verification/publication, and the old broad content authority is superseded on approval. | CI/task dependency inspection, updated product/contributor guidance and packet status. |
 
 Use the narrowest existing journey lanes for changed executable examples and
 `mise run docs:check` for site verification. Planning identifies exact focused
 commands from the selected source/tests; this spec does not invent test names.
-A green site build alone does not close AC-002. No new product capability is
-introduced, and no unrelated repository-wide gate is required merely to draft
+A green site build alone does not close AC-002. REQ-007 changes follow the
+repository's normal journey and contract gates, and no unrelated repository-wide gate is required merely to draft
 or approve this specification.
 
 ## Expensive-to-reverse decisions
@@ -258,6 +282,10 @@ artifacts blocks publication and must be reported.
 
 ## Revision history and authority
 
+- **Revision 4 — 2026-10-20 — directed by the user:** Nothing found while
+  rebuilding the docs is out of scope; add REQ-007 and AC-008 so
+  `WyrdState.from_path` also accepts an authored Card YAML file, and relax
+  INV-002 to allow owner-crate ergonomic fixes.
 - **Revision 3 — 2026-10-20 — directed by the user:** Author the subject and
   Verifier as two YAML files joined by a relative path reference instead of
   one multi-document file, whose only working link is the loader-internal

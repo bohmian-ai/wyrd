@@ -1,5 +1,7 @@
 //! Generated OpenAPI document for the public HTTP surface.
 
+use std::collections::BTreeSet;
+
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{Content, OpenApi as OpenApiDocument};
 use utoipa::{Modify, OpenApi};
@@ -49,6 +51,71 @@ impl Modify for SecurityAddon {
             WYRD_ACCESS_TOKEN_SCHEME,
             Vec::<String>::new(),
         )]);
+    }
+}
+
+/// Name the contract gives the tenant browser-session cookie scheme.
+pub(crate) const BROWSER_SESSION_SCHEME: &str = "wyrdBrowserSession";
+
+/// Declares the browser-session cookie as the alternative to the access token
+/// on exactly the routes whose authentication layer accepts it.
+///
+/// Only the protected tenant `/v1` HTTP routes authenticate a browser session
+/// (`require_tenant_authenticated` and the Bifrost layer); MCP, OTLP, the
+/// platform plane and gateway inference stay bearer-only. The router collects
+/// those routes' paths from the same registrations that mount them, so this
+/// modifier never keeps a second list. Each such operation that inherits the
+/// document requirement is given two alternatives — the access token, or the
+/// session cookie — and an operation that clears its requirement is left alone.
+pub(crate) struct BrowserSessionAddon {
+    /// Served paths of the operations that accept a browser session.
+    pub(crate) paths: BTreeSet<String>,
+}
+
+impl Modify for BrowserSessionAddon {
+    /// Register the cookie scheme and offer it beside the access token on
+    /// every collected operation that has no requirement of its own.
+    fn modify(&self, openapi: &mut OpenApiDocument) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            BROWSER_SESSION_SCHEME,
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                "wyrd_session_{tenant}",
+                "Opaque tenant browser session set by `/auth/callback` or \
+                 `POST /auth/browser/api-key`, named by the tenant's route key. Used only \
+                 when no `X-Wyrd-Access-Token` is sent: an explicit token always wins and \
+                 never falls back to the cookie. Exactly one session cookie may be sent \
+                 (`400 WYRD_SPEC_400_VALIDATION` otherwise). Any method but GET, HEAD and \
+                 OPTIONS must carry this deployment's exact `Origin` \
+                 (`403 WYRD_AUTH_403_ORIGIN_REFUSED` otherwise). A dead session is \
+                 `401 WYRD_AUTH_401_INVALID_TOKEN`.",
+            ))),
+        );
+        let alternatives = vec![
+            SecurityRequirement::new(WYRD_ACCESS_TOKEN_SCHEME, Vec::<String>::new()),
+            SecurityRequirement::new(BROWSER_SESSION_SCHEME, Vec::<String>::new()),
+        ];
+        for (path, item) in &mut openapi.paths.paths {
+            if !self.paths.contains(path) {
+                continue;
+            }
+            for operation in [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.patch.as_mut(),
+                item.head.as_mut(),
+                item.options.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if operation.security.is_none() {
+                    operation.security = Some(alternatives.clone());
+                }
+            }
+        }
     }
 }
 

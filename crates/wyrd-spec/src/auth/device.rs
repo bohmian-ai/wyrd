@@ -18,7 +18,8 @@ use crate::ids::TenantSlug;
 /// the client's `client_id`.
 ///
 /// `tenant` is the one extension parameter: pre-login routing context only,
-/// exactly as for `GET /auth/authorize`; it never becomes tenant authority.
+/// exactly as for `POST /auth/browser/login`; it never becomes tenant
+/// authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct DeviceAuthorizationRequest {

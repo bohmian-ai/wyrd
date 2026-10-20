@@ -2,6 +2,7 @@
 
 mod admin;
 mod attribution;
+mod browser;
 mod card_scope;
 mod device;
 mod human_connection;
@@ -22,6 +23,10 @@ pub use admin::{
     IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
 };
 pub use attribution::Attribution;
+pub use browser::{
+    BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
+    BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
+};
 pub use card_scope::CardScope;
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
@@ -31,8 +36,8 @@ pub use human_connection::{
 };
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{
-    AbsoluteUrl, CallbackQuery, ClientAuthorization, ConnectionTester, IssuerUrl,
-    LoginInitResponse, LoginInitiation, ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
+    AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,
+    ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
 };
 pub use permission_scope::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,

@@ -24,7 +24,7 @@ test('auth forwarding sends the browser request to the configured server under t
   const request = new Request('http://127.0.0.1:3000/auth/token?x=1', {
     method: 'POST',
     headers: {
-      cookie: 'wyrd_login=abc',
+      cookie: 'wyrd_session_acme=s; wyrd_login=abc; theme=dark',
       'content-type': 'application/x-www-form-urlencoded',
       host: 'evil.test',
       'x-forwarded-host': 'evil.test',
@@ -56,7 +56,7 @@ test('auth forwarding returns redirects, cookies, and errors unchanged without f
     headers.append('set-cookie', 'b=2; HttpOnly');
     return new Response(null, { status: 303, headers });
   });
-  const url = new URL('http://ui.example/auth/authorize?tenant=acme');
+  const url = new URL('http://ui.example/auth/callback?state=s');
   const moved = await forwardAuth(new Request(url), url, redirect.fetcher);
   expect(moved.status).toBe(303);
   expect(moved.headers.get('location')).toBe('https://idp.example/authorize?state=s');
@@ -76,7 +76,7 @@ test('auth forwarding returns redirects, cookies, and errors unchanged without f
 });
 
 test('an unreachable or misconfigured server is the upstream problem', async () => {
-  const url = new URL('http://ui.example/auth/authorize');
+  const url = new URL('http://ui.example/auth/callback');
   const down = (async () => {
     throw new TypeError('connection refused');
   }) as unknown as typeof fetch;

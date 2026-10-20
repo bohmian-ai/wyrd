@@ -8,6 +8,7 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod browser_sessions;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod login_state;
@@ -27,6 +28,10 @@ pub mod workload_bindings;
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
 };
+pub use browser_sessions::{
+    BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
+    revoke_browser_session,
+};
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,
     deny_device_authorization, insert_device_authorization, pending_device_authorization,
@@ -39,17 +44,13 @@ pub use human_connections::{
     promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
     sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
-pub use login_state::{
-    LoginState, RedeemedCode, consume_login_state, insert_login_state, issue_authorization_code,
-    redeem_authorization_code,
-};
+pub use login_state::{LoginState, consume_login_state, insert_login_state};
 pub use principal_directory::{
     AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
 };
 pub use refresh_tokens::{
-    active_refresh, consume_active_refresh, insert_human_refresh_token, lock_refresh_family,
-    refresh_by_hash, refresh_issuance_instant, revoke_refresh, revoke_refresh_chain,
-    revoke_refresh_family,
+    consume_active_refresh, insert_human_refresh_token, lock_refresh_family, refresh_by_hash,
+    refresh_issuance_instant, revoke_refresh, revoke_refresh_chain, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{

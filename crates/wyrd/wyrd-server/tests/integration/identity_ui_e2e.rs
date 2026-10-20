@@ -14,10 +14,17 @@
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
 //! journey drives both BFFs over HTTP like a browser behind a TCP load
 //! balancer, reaching every `/auth/*` route only through a BFF's public
-//! origin; no Vitest mock stands in for the BFF or the server.
+//! origin; no Vitest mock stands in for the BFF or the server. Rust owns every
+//! browser session in Postgres; the BFFs hold none, so the journey also signs
+//! in on one replica, uses the session on the other, and on a BFF replica it
+//! starts only after sign-in.
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
-//! it visibly; `mise run test:identity:journey` builds the UI and runs it.
+//! it visibly; `mise run test:identity:ui` builds the UI and runs it.
+//!
+//! `production_ui_nginx_journey` drives the same browser flow through the
+//! official image's nginx public origin instead; its lane,
+//! `mise run test:identity:ui:container`, builds and serves that image.
 //!
 //! Every connection is activated as a deployment would: staged, tested
 //! through one real provider sign-in returned to the server's callback, and
@@ -390,24 +397,23 @@ async fn sso_tenant(
 /// The production UI journey over two BFF replicas in front of two Wyrd
 /// replicas.
 ///
-/// Access tokens live 30 seconds, so a BFF renews each session's cached
-/// access token with its refresh token (or API key) through the ordinary
-/// token endpoint every half minute. A deactivated or replaced connection
-/// stops renewal at once, but each BFF keeps a session's issued token until
-/// its expiry, and the first use afterwards ends the session.
+/// Each browser session is an opaque Rust-owned cookie the server resolves
+/// on every request, so logout, deactivation, and connection replacement end
+/// a session at once on every replica; no BFF caches a token to outlive them.
 ///
 /// # Panics
 /// Panics when any setup step fails or the Vitest journey does not pass.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:journey`"]
+#[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:ui`"]
 async fn production_ui_bff_journey() {
     let host = format!("localhost:{}", free_port());
     let origin = format!("http://{host}");
-    let builder =
-        || WyrdTestServerBuilder::default().with_access_ttl(chrono::Duration::seconds(30));
-    let srv = builder().start_bound().await.expect("server starts");
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
-    let replica = Box::pin(srv.start_bound_replica(builder()))
+    let replica = Box::pin(srv.start_bound_replica(WyrdTestServerBuilder::default()))
         .await
         .expect("server replica starts");
     let replica_url = replica
@@ -536,4 +542,326 @@ async fn production_ui_bff_journey() {
         status.success(),
         "the production UI journey failed: {status}"
     );
+}
+
+/// One answer a [`NginxBrowser`] observed, redirects unfollowed.
+struct Visit {
+    /// The response status.
+    status: reqwest::StatusCode,
+    /// The `Location` header, when one was sent.
+    location: Option<String>,
+    /// Every raw `Set-Cookie` header.
+    set_cookies: Vec<String>,
+    /// The response body as text.
+    body: String,
+}
+
+/// A browser at the official image's nginx public origin: a host-only cookie
+/// jar that follows no redirect, so every `Set-Cookie` and `Location` nginx
+/// returns is observed. Cookies are sent to every path, as the jar ignores
+/// cookie paths: the deployment itself must select what each owner reads.
+struct NginxBrowser {
+    /// Redirect-free HTTP client.
+    client: reqwest::Client,
+    /// The public origin every request goes to.
+    origin: String,
+    /// Live cookies by name.
+    cookies: std::collections::BTreeMap<String, String>,
+}
+
+impl NginxBrowser {
+    /// A browser with an empty jar at `origin`.
+    ///
+    /// # Panics
+    /// Panics when the HTTP client cannot be built.
+    fn new(origin: &str) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("client builds"),
+            origin: origin.to_owned(),
+            cookies: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Visit `path` on the public origin: a `GET`, or with `form` a form
+    /// `POST` sent from `origin` (the page's own origin unless given). Applies
+    /// every returned cookie to the jar, deleting `Max-Age=0` ones.
+    ///
+    /// # Panics
+    /// Panics when the request fails.
+    async fn go(
+        &mut self,
+        path: &str,
+        form: Option<&[(&str, &str)]>,
+        origin: Option<&str>,
+    ) -> Visit {
+        let url = format!("{}{path}", self.origin);
+        let mut request = match form {
+            Some(fields) => self
+                .client
+                .post(&url)
+                .header("origin", origin.unwrap_or(&self.origin))
+                .form(fields),
+            None => self.client.get(&url),
+        }
+        .header("accept", "text/html");
+        if !self.cookies.is_empty() {
+            let jar = self
+                .cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            request = request.header("cookie", jar);
+        }
+        let response = request.send().await.expect("nginx answers");
+        let status = response.status();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let set_cookies: Vec<String> = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        for raw in &set_cookies {
+            let pair = raw.split(';').next().unwrap_or_default();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if value.is_empty() || raw.to_ascii_lowercase().contains("max-age=0") {
+                self.cookies.remove(name);
+            } else {
+                self.cookies.insert(name.to_owned(), value.to_owned());
+            }
+        }
+        let body = response.text().await.unwrap_or_default();
+        Visit {
+            status,
+            location,
+            set_cookies,
+            body,
+        }
+    }
+}
+
+/// Run `docker restart` on one container.
+///
+/// # Panics
+/// Panics when Docker refuses.
+fn docker_restart(container: &str) {
+    let status = Command::new("docker")
+        .args(["restart", container])
+        .stdout(Stdio::null())
+        .status()
+        .expect("docker runs");
+    assert!(status.success(), "docker restart {container}: {status}");
+}
+
+/// The public origin nginx is published on after a restart, which may move
+/// the ephemeral host port, once it is ready again.
+///
+/// # Panics
+/// Panics when the port cannot be read or nginx never becomes ready.
+async fn published_origin(app: &str) -> String {
+    let output = Command::new("docker")
+        .args(["port", app, "8080/tcp"])
+        .output()
+        .expect("docker runs");
+    let published = String::from_utf8_lossy(&output.stdout);
+    let origin = format!(
+        "http://{}",
+        published.lines().next().expect("nginx is published").trim()
+    );
+    let client = reqwest::Client::new();
+    for _ in 0..180 {
+        if client
+            .get(format!("{origin}/readyz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return origin;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("the restarted app never became ready at {origin}");
+}
+
+/// Real provider sign-in through the official Debian image's nginx public
+/// origin, where nginx sends `/auth/*` and `/v1` straight to Rust and every
+/// page to the BFF.
+///
+/// `scripts/server/test-startup-identity.sh` builds the image, serves tenant
+/// `acme`, and hands this journey the origin and setup credential in
+/// `WYRD_UI_NGINX_JOURNEY`. The journey activates a Keycloak connection with
+/// the credential, then as a browser begins SSO on the sign-in page, signs in
+/// at Keycloak, completes Wyrd's callback, uses the session on pages and
+/// directly on `/v1`, is refused a replayed callback and foreign-origin
+/// mutations, keeps the session across a container restart, and logs out.
+///
+/// # Panics
+/// Panics when the fixture is missing or any step fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the official image; run via `mise run test:identity:ui:container`"]
+async fn production_ui_nginx_journey() {
+    let fixture: Value = serde_json::from_str(
+        &std::env::var("WYRD_UI_NGINX_JOURNEY")
+            .expect("run via `mise run test:identity:ui:container`"),
+    )
+    .expect("the fixture is JSON");
+    let field = |name: &str| {
+        fixture[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("fixture names {name}"))
+            .to_owned()
+    };
+    let (origin, admin_key, app, forwarder) = (
+        field("origin"),
+        field("admin_key"),
+        field("app"),
+        field("forwarder"),
+    );
+    let host = origin.trim_start_matches("http://").to_owned();
+    activate_connection(
+        &origin,
+        &host,
+        &admin_key,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
+
+    // Sign-in begins at the BFF's page, which sets Rust's login binding for the callback alone.
+    let mut browser = NginxBrowser::new(&origin);
+    let home = browser.go("/t/acme", None, None).await;
+    assert_eq!(home.location.as_deref(), Some("/t/acme/login"));
+    let page = browser.go("/t/acme/login", None, None).await;
+    assert!(
+        page.body.contains("Sign in with SSO"),
+        "the sign-in page renders"
+    );
+    let begun = browser.go("/t/acme/login?/sso", Some(&[]), None).await;
+    assert_eq!(
+        begun.status,
+        reqwest::StatusCode::SEE_OTHER,
+        "{}",
+        begun.body
+    );
+    let authorization: reqwest::Url = begun
+        .location
+        .as_deref()
+        .expect("sign-in redirects to the provider")
+        .parse()
+        .expect("provider URL parses");
+    assert!(authorization.as_str().starts_with(&keycloak_issuer()));
+    assert!(
+        begun
+            .set_cookies
+            .iter()
+            .any(|raw| raw.starts_with("wyrd_login=") && raw.contains("Path=/auth/callback")),
+        "the login binding is scoped to the callback: {:?}",
+        begun.set_cookies
+    );
+
+    // Keycloak returns to Wyrd's callback on nginx's origin, which signs the browser in.
+    let callback = format!("{origin}/auth/callback");
+    let returned = provider_sign_in(
+        &authorization,
+        KEYCLOAK_ALICE.0,
+        KEYCLOAK_ALICE.1,
+        &callback,
+    )
+    .await;
+    let completion = format!("/auth/callback?{}", returned.query().unwrap_or_default());
+    let signed_in = browser.go(&completion, None, None).await;
+    assert_eq!(
+        signed_in.status,
+        reqwest::StatusCode::SEE_OTHER,
+        "{}",
+        signed_in.body
+    );
+    assert_eq!(signed_in.location.as_deref(), Some("/t/acme"));
+    assert!(!browser.cookies.contains_key("wyrd_login"));
+    let session = browser
+        .cookies
+        .get("wyrd_session_acme")
+        .expect("the tenant session is set")
+        .clone();
+
+    // The callback is one-use.
+    let replay = browser.go(&completion, None, None).await;
+    assert_eq!(replay.status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        replay.body.contains("WYRD_AUTH_400_INVALID_STATE"),
+        "{}",
+        replay.body
+    );
+    assert!(replay.set_cookies.is_empty());
+
+    // The session serves pages through the BFF and `/v1` directly at Rust.
+    let settings = browser.go("/t/acme/settings", None, None).await;
+    assert_eq!(settings.status, reqwest::StatusCode::OK);
+    assert!(
+        !settings.body.contains(&session),
+        "page data never carries the session"
+    );
+    let connections = browser
+        .go("/v1/identity/oidc/connections", None, None)
+        .await;
+    assert_eq!(
+        connections.status,
+        reqwest::StatusCode::OK,
+        "{}",
+        connections.body
+    );
+    assert!(connections.body.contains(&keycloak_issuer()));
+
+    // Foreign-origin mutations are refused at both owners.
+    let evil = Some("http://evil.test");
+    let refused = browser
+        .go("/v1/identity/oidc/candidate/test", Some(&[]), evil)
+        .await;
+    assert_eq!(refused.status, reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        refused.body.contains("WYRD_AUTH_403_ORIGIN_REFUSED"),
+        "{}",
+        refused.body
+    );
+    let csrf = browser
+        .go("/t/acme/settings?/deactivate", Some(&[]), evil)
+        .await;
+    assert_eq!(csrf.status, reqwest::StatusCode::FORBIDDEN);
+
+    // The session outlives a restart of the whole container: Rust keeps it in Postgres.
+    // The forwarder shares the app's network namespace, so it restarts after it.
+    docker_restart(&app);
+    docker_restart(&forwarder);
+    browser.origin = published_origin(&app).await;
+    let restarted = browser.go("/t/acme/settings", None, None).await;
+    assert_eq!(
+        restarted.status,
+        reqwest::StatusCode::OK,
+        "{}",
+        restarted.body
+    );
+
+    // Logout revokes this session at once and clears its cookie.
+    let logout = browser
+        .go("/?/logout", Some(&[("tenantKey", "acme")]), None)
+        .await;
+    assert_eq!(logout.location.as_deref(), Some("/t/acme/login"));
+    assert!(!browser.cookies.contains_key("wyrd_session_acme"));
+    browser
+        .cookies
+        .insert("wyrd_session_acme".to_owned(), session);
+    let ended = browser.go("/t/acme", None, None).await;
+    assert_eq!(ended.location.as_deref(), Some("/t/acme/login"));
+    assert!(!browser.cookies.contains_key("wyrd_session_acme"));
 }

@@ -1,94 +1,134 @@
-import { createHash } from 'node:crypto';
 import type { Cookies } from '@sveltejs/kit';
-import * as client from 'openid-client';
-import { decodeJwt } from 'jose';
 import { serverUrl } from '../upstream';
+import { problemKind } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
 
 const sessionPrefix = 'wyrd_session_';
-const loginCookie = 'wyrd_login';
-const loginLifetimeSeconds = 5 * 60;
-/**
- * Application-session bound for both credential kinds. The refresh token is
- * opaque to this client (RFC 6749 §1.5); the server's refusal ends it sooner.
- */
-const sessionLifetimeSeconds = 12 * 60 * 60;
-/** Renew a cached access token this long before it expires. */
-const renewalMarginMs = 5_000;
 const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
-const apiKeyTokenType = 'urn:wyrd:oauth:token-type:api_key';
 
-/** What the session cookie holds: the tenant and the credential that renews it. */
-type Sealed = { tenant: string; kind: 'refresh' | 'api_key'; credential: string };
-type Login = { tenant: string; verifier: string; state: string };
-/** Server-issued access token claims the BFF projects; authority stays with the server. */
-type Claims = {
-  exp: number;
-  principal: { id: string; tenant_id: string };
-  permissions: { resource: string; action: string | { any_of: string[] } }[];
+/** The server's safe metadata of one live tenant browser session (`BrowserSessionView`). */
+type View = {
+  tenant: string;
+  tenant_id: string;
+  tenant_name: string;
+  principal_id: string;
+  permissions: string[];
+  expires_at: string;
 };
-type Access = { token: string; expiresAt: number; claims: Claims };
 
-/** HttpOnly, SameSite=Lax cookie options, `Secure` exactly when the browser reached the BFF over `https:`. */
-const cookieOptions = (url: URL, maxAge: number) =>
-  ({
-    path: '/',
-    httpOnly: true,
-    secure: url.protocol === 'https:',
-    sameSite: 'lax',
-    maxAge
-  }) as const;
+type Call = { method: 'GET' | 'POST'; cookie?: string; body?: unknown };
 
-/** The JSON cookie `value`, or `null` when it is absent or not JSON. */
-function parse<T>(value: string | undefined): T | null {
-  if (!value) return null;
+/**
+ * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
+ * browser at `url`: the trusted public origin goes as `Origin` and the
+ * forwarded host and scheme, and only the cookie the caller selected is sent.
+ * An unreachable server is the stable `upstream` problem.
+ */
+async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
   try {
-    return JSON.parse(value) as T;
+    return await fetch(new URL(path, serverUrl()), {
+      method,
+      headers: {
+        origin: url.origin,
+        'x-forwarded-host': url.host,
+        'x-forwarded-proto': url.protocol.slice(0, -1),
+        ...(cookie ? { cookie } : {}),
+        ...(body === undefined ? {} : { 'content-type': 'application/json' })
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(30_000)
+    });
   } catch {
-    return null;
+    reject('upstream');
   }
 }
 
-/** `resource:action` names of the token's permissions, the shape the UI gates on. */
-function permissionNames(claims: Claims): string[] {
-  return claims.permissions.flatMap(({ resource, action }) =>
-    (typeof action === 'string' ? [action] : action.any_of).map((a) => `${resource}:${a}`)
-  );
+/** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
+async function refuse(response: Response): Promise<never> {
+  reject(await problemKind(response));
 }
 
 /**
- * One signed-in tenant session of this request. The access token stays in a
- * private field: the object cannot be serialized into page data.
+ * Apply every `Set-Cookie` the server answered to the browser's cookie jar
+ * with the server's own attributes; a `Max-Age=0` cookie is deleted. The
+ * cookie values are the server's and are never inspected here.
+ */
+export function relayCookies(response: Response, cookies: Cookies): void {
+  for (const header of response.headers.getSetCookie()) {
+    const [pair, ...attributes] = header.split(';').map((part) => part.trim());
+    const split = pair.indexOf('=');
+    if (split <= 0) continue;
+    const name = pair.slice(0, split);
+    const value = pair.slice(split + 1);
+    const options: Parameters<Cookies['set']>[2] = {
+      path: '/',
+      httpOnly: false,
+      secure: false,
+      encode: (raw: string) => raw
+    };
+    let maxAge: number | undefined;
+    for (const attribute of attributes) {
+      const [key, setting = ''] = attribute.split('=');
+      switch (key.toLowerCase()) {
+        case 'path':
+          options.path = setting;
+          break;
+        case 'max-age':
+          maxAge = Number(setting);
+          break;
+        case 'httponly':
+          options.httpOnly = true;
+          break;
+        case 'secure':
+          options.secure = true;
+          break;
+        case 'samesite':
+          options.sameSite = setting.toLowerCase() as 'lax' | 'strict' | 'none';
+          break;
+      }
+    }
+    if (maxAge === 0) cookies.delete(name, options);
+    else cookies.set(name, value, { ...options, maxAge });
+  }
+}
+
+/**
+ * One signed-in tenant session of this request. The session cookie value
+ * stays in a private field: the object cannot be serialized into page data.
  */
 export class BrowserSession {
-  readonly #token: string;
+  readonly #cookie: string;
   readonly #url: URL;
 
-  /** `url` is the browser's request URL; `/v1` calls forward its host and scheme. */
+  /** `cookie` is the tenant's `name=value` session cookie; `url` the browser's request URL. */
   constructor(
     readonly tenantKey: string,
-    access: Access,
+    view: View,
+    cookie: string,
     url: URL
   ) {
-    this.#token = access.token;
+    this.#cookie = cookie;
     this.#url = url;
-    this.principalId = access.claims.principal.id;
-    this.tenantId = access.claims.principal.tenant_id;
-    this.permissions = permissionNames(access.claims);
-    this.expiresAt = access.expiresAt;
+    this.tenantName = view.tenant_name;
+    this.principalId = view.principal_id;
+    this.tenantId = view.tenant_id;
+    this.permissions = view.permissions;
+    this.expiresAt = Date.parse(view.expires_at);
   }
 
+  readonly tenantName: string;
   readonly principalId: string;
   readonly tenantId: string;
   readonly permissions: string[];
   readonly expiresAt: number;
 
-  /** Tenant context bound from the server-issued token; the UI maps no roles. */
+  /** Tenant context from the server's session metadata; the UI maps no roles. */
   context(): TenantContext {
     return {
       tenant: {
         key: this.tenantKey,
-        name: this.tenantKey,
+        name: this.tenantName,
         tenantId: this.tenantId,
         permissions: this.permissions
       },
@@ -98,114 +138,46 @@ export class BrowserSession {
   }
 
   /**
-   * Call a Wyrd `/v1` API as this session's principal, forwarding the
-   * browser's host and scheme so the server derives the public origin (an
-   * identity connection's callback) from them.
+   * Call a Wyrd `/v1` API as this session's principal with only this tenant's
+   * session cookie and the trusted origin; the server authorizes every call.
    */
-  async api(method: string, path: string, body?: unknown): Promise<Response> {
-    try {
-      return await fetch(new URL(`/v1${path}`, serverUrl()), {
-        method,
-        headers: {
-          'x-wyrd-access-token': `Bearer ${this.#token}`,
-          'x-forwarded-host': this.#url.host,
-          'x-forwarded-proto': this.#url.protocol.slice(0, -1),
-          ...(body === undefined ? {} : { 'content-type': 'application/json' })
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(30_000)
-      });
-    } catch {
-      reject('upstream');
-    }
+  api(method: string, path: string, body?: unknown): Promise<Response> {
+    return call(`/v1${path}`, this.#url, {
+      method: method as Call['method'],
+      cookie: this.#cookie,
+      body
+    });
   }
 }
 
 /**
- * The BFF as the public OAuth client `wyrd-ui` of Wyrd's authorization
- * server, built on `openid-client`: authorization code + PKCE sign-in,
- * refresh, RFC 8693 API-key exchange (OIDC-off), and RFC 7009 revocation.
- *
- * It needs no secret and no discovery: the browser is sent to
- * `/auth/authorize` on the origin it reached the BFF at, and the token and
- * revocation endpoints are called on `WYRD_SERVER_URL`. Each tenant's session
- * is one HttpOnly cookie holding the refresh token (or API key) the server
- * validates on every renewal, so every replica reads it with no server-side
- * store. Access tokens are cached in memory by credential hash; a miss renews
- * through the token endpoint.
+ * The BFF's projection of Rust-owned browser sessions. Rust creates,
+ * resolves, and revokes every session and sets every cookie; this class only
+ * calls the `/auth/browser/*` operations server to server for the browser and
+ * relays the cookies they answer. It holds no tokens, no secrets, and no
+ * cache, so every replica behaves the same.
  */
 export class BrowserSessions {
-  readonly #access = new Map<string, Access>();
-
-  /** The `wyrd-ui` client of the authorization server the browser reached at `origin`. */
-  private configuration(origin: string): client.Configuration {
-    const server = serverUrl();
-    const configuration = new client.Configuration(
-      {
-        issuer: origin,
-        authorization_endpoint: new URL('/auth/authorize', origin).toString(),
-        token_endpoint: new URL('/auth/token', server).toString(),
-        revocation_endpoint: new URL('/auth/revoke', server).toString()
-      },
-      'wyrd-ui',
-      undefined,
-      client.None()
-    );
-    // The authorization endpoint is the browser's own origin, `http:` when the
-    // deployment is served that way; serverUrl() admits plaintext only for loopback.
-    client.allowInsecureRequests(configuration);
-    return configuration;
-  }
-
   /** Cookie name for one tenant's session; refuses keys that are not tenant slugs. */
   cookieName(tenantKey: string): string {
     if (!tenantKeyPattern.test(tenantKey)) reject('notFound');
     return sessionPrefix + tenantKey;
   }
 
-  /** Begin sign-in: a PKCE + state login cookie and the authorization request URL. */
+  /** Begin SSO sign-in: the server sets the login cookie and returns the provider URL. */
   async begin(tenantKey: string, url: URL, cookies: Cookies): Promise<string> {
     this.cookieName(tenantKey);
-    const verifier = client.randomPKCECodeVerifier();
-    const state = client.randomState();
-    const login: Login = { tenant: tenantKey, verifier, state };
-    cookies.set(loginCookie, JSON.stringify(login), cookieOptions(url, loginLifetimeSeconds));
-    return client
-      .buildAuthorizationUrl(this.configuration(url.origin), {
-        redirect_uri: new URL('/login/callback', url.origin).toString(),
-        code_challenge: await client.calculatePKCECodeChallenge(verifier),
-        code_challenge_method: 'S256',
-        state,
-        tenant: tenantKey
-      })
-      .toString();
+    const response = await call('/auth/browser/login', url, {
+      method: 'POST',
+      body: { tenant: tenantKey }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
+    const begun = (await response.json()) as { authorization_url: string };
+    return begun.authorization_url;
   }
 
-  /**
-   * Redeem the authorization response at `url` with this browser's login
-   * cookie and set the tenant session cookie. Always clears the login cookie;
-   * any failure sets no session and returns to that tenant's sign-in.
-   */
-  async complete(url: URL, cookies: Cookies): Promise<string> {
-    const login = parse<Login>(cookies.get(loginCookie));
-    cookies.delete(loginCookie, { path: '/' });
-    if (!login) return '/?login=failed';
-    const failed = `/t/${encodeURIComponent(login.tenant)}/login?login=failed`;
-    try {
-      const tokens = await client.authorizationCodeGrant(
-        this.configuration(url.origin),
-        url,
-        { pkceCodeVerifier: login.verifier, expectedState: login.state }
-      );
-      if (!tokens.refresh_token) return failed;
-      await this.establish(login.tenant, 'refresh', tokens.refresh_token, tokens, url, cookies);
-    } catch {
-      return failed;
-    }
-    return `/t/${encodeURIComponent(login.tenant)}`;
-  }
-
-  /** OIDC-off sign-in: exchange an operator API key (RFC 8693) and keep it in the session cookie. */
+  /** Recovery sign-in: the server verifies the API key and sets the tenant session cookie. */
   async signInWithApiKey(
     tenantKey: string,
     apiKey: string,
@@ -213,123 +185,59 @@ export class BrowserSessions {
     cookies: Cookies
   ): Promise<string> {
     this.cookieName(tenantKey);
-    const tokens = await this.exchange(apiKey, url.origin);
-    if (!tokens) reject('unauthenticated');
-    await this.establish(tenantKey, 'api_key', apiKey, tokens, url, cookies);
+    const response = await call('/auth/browser/api-key', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, api_key: apiKey }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
     return `/t/${encodeURIComponent(tenantKey)}`;
   }
 
-  private async establish(
-    tenant: string,
-    kind: Sealed['kind'],
-    credential: string,
-    tokens: client.TokenEndpointResponse,
-    url: URL,
-    cookies: Cookies
-  ): Promise<void> {
-    this.cache(credential, tokens.access_token);
-    const sealed: Sealed = { tenant, kind, credential };
-    cookies.set(
-      this.cookieName(tenant),
-      JSON.stringify(sealed),
-      cookieOptions(url, sessionLifetimeSeconds)
-    );
-  }
-
-  private hash(credential: string): string {
-    return createHash('sha256').update(credential, 'utf8').digest('hex');
-  }
-
-  private cache(credential: string, token: string): Access {
-    const claims = decodeJwt(token) as unknown as Claims;
-    const access = { token, expiresAt: claims.exp * 1000, claims };
-    const now = Date.now();
-    for (const [key, value] of this.#access) if (value.expiresAt <= now) this.#access.delete(key);
-    // ponytail: bounded per-replica cache; a miss only costs one renewal.
-    if (this.#access.size >= 10_000) this.#access.delete(this.#access.keys().next().value!);
-    this.#access.set(this.hash(credential), access);
-    return access;
-  }
-
-  /** Exchange an API key for an access token; `null` when the server refuses it. */
-  private async exchange(apiKey: string, origin: string) {
-    try {
-      return await client.genericGrantRequest(
-        this.configuration(origin),
-        'urn:ietf:params:oauth:grant-type:token-exchange',
-        { subject_token: apiKey, subject_token_type: apiKeyTokenType }
-      );
-    } catch (cause) {
-      if (cause instanceof client.ResponseBodyError) return null;
-      reject('upstream');
-    }
-  }
-
-  /** A live access token for `sealed`: cached, or renewed; `null` when the server refuses renewal. */
-  private async access(sealed: Sealed, origin: string): Promise<Access | null> {
-    const cached = this.#access.get(this.hash(sealed.credential));
-    if (cached && cached.expiresAt - renewalMarginMs > Date.now()) return cached;
-    if (sealed.kind === 'api_key') {
-      const tokens = await this.exchange(sealed.credential, origin);
-      return tokens && this.cache(sealed.credential, tokens.access_token);
-    }
-    try {
-      const tokens = await client.refreshTokenGrant(this.configuration(origin), sealed.credential);
-      return this.cache(sealed.credential, tokens.access_token);
-    } catch (cause) {
-      if (cause instanceof client.ResponseBodyError) return null;
-      reject('upstream');
-    }
-  }
-
-  private sealed(tenantKey: string, cookies: Cookies): Sealed | null {
-    const sealed = parse<Sealed>(cookies.get(this.cookieName(tenantKey)));
-    return sealed?.tenant === tenantKey ? sealed : null;
-  }
-
   /**
-   * This tenant's session, renewed through the server when its cached access
-   * token is missing or expiring. Returns `null` (and clears the cookie) when
-   * there is none, it does not parse, it belongs to another tenant, or the
-   * server refuses to renew it.
+   * This tenant's session, resolved by the server from this tenant's cookie
+   * alone. Returns `null` (and clears the cookie) when there is none or the
+   * server says it is not live; a server outage is the `upstream` problem.
    */
   async read(tenantKey: string, url: URL, cookies: Cookies): Promise<BrowserSession | null> {
     const name = this.cookieName(tenantKey);
-    if (!cookies.get(name)) return null;
-    const sealed = this.sealed(tenantKey, cookies);
-    const access = sealed && (await this.access(sealed, url.origin));
-    if (!access) {
+    const value = cookies.get(name);
+    if (!value) return null;
+    const cookie = `${name}=${value}`;
+    const response = await call(`/auth/browser/session?tenant=${tenantKey}`, url, {
+      method: 'GET',
+      cookie
+    });
+    relayCookies(response, cookies);
+    if (response.status === 401) {
       cookies.delete(name, { path: '/' });
       return null;
     }
-    return new BrowserSession(tenantKey, access, url);
+    if (!response.ok) reject('upstream');
+    const { sessions } = (await response.json()) as { sessions: View[] };
+    const view = sessions.find((session) => session.tenant === tenantKey);
+    if (!view) reject('upstream');
+    return new BrowserSession(tenantKey, view, cookie, url);
   }
 
   /**
-   * Sign out of this tenant: always clear its cookie and cached access token,
-   * then revoke its refresh token (RFC 7009) best-effort. A revocation failure
-   * is logged without token values and does not fail the logout.
+   * Sign out of this tenant: the server revokes only this session and clears
+   * its cookie. A refusal or outage is reported, so a failed sign-out is
+   * never mistaken for a successful one.
    */
   async logout(tenantKey: string, url: URL, cookies: Cookies): Promise<void> {
-    const sealed = this.sealed(tenantKey, cookies);
-    cookies.delete(this.cookieName(tenantKey), { path: '/' });
-    if (!sealed) return;
-    this.#access.delete(this.hash(sealed.credential));
-    // An operator API key is never revoked by signing out of the UI.
-    if (sealed.kind !== 'refresh') return;
-    try {
-      await client.tokenRevocation(this.configuration(url.origin), sealed.credential, {
-        token_type_hint: 'refresh_token'
-      });
-    } catch (cause) {
-      console.warn('wyrd-ui logout: refresh token revocation failed', {
-        tenant: tenantKey,
-        error: cause instanceof Error ? cause.name : 'unknown'
-      });
-    }
+    const name = this.cookieName(tenantKey);
+    const value = cookies.get(name);
+    const response = await call('/auth/browser/logout', url, {
+      method: 'POST',
+      cookie: value ? `${name}=${value}` : undefined,
+      body: { tenant: tenantKey }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
   }
 
-  /** Switch to `target`: its own session when the server still renews it, else its sign-in. */
+  /** Switch to `target`: its own session when the server still resolves it, else its sign-in. */
   async switch(target: string, url: URL, cookies: Cookies): Promise<string> {
     const base = `/t/${encodeURIComponent(target)}`;
     return (await this.read(target, url, cookies)) ? base : `${base}/login`;
@@ -337,21 +245,28 @@ export class BrowserSessions {
 
   /**
    * Safe page metadata: the current tenant plus every other tenant whose
-   * session cookie names that tenant. Cookies that do not parse or name
-   * another tenant are cleared and never rendered.
+   * session the server still resolves. Every session cookie is presented to
+   * the one operation that accepts several; the server clears dead ones.
    */
-  async metadata(session: BrowserSession, cookies: Cookies): Promise<SessionMetadata> {
-    const tenants = [session.tenantKey];
-    for (const { name } of cookies.getAll()) {
-      const key = name.slice(sessionPrefix.length);
-      if (!name.startsWith(sessionPrefix) || key === session.tenantKey) continue;
-      if (tenantKeyPattern.test(key) && this.sealed(key, cookies)) tenants.push(key);
-      else cookies.delete(name, { path: '/' });
-    }
+  async metadata(session: BrowserSession, url: URL, cookies: Cookies): Promise<SessionMetadata> {
+    const presented = cookies
+      .getAll()
+      .filter(({ name }) => name.startsWith(sessionPrefix))
+      .map(({ name, value }) => `${name}=${value}`)
+      .join('; ');
+    const response = await call('/auth/browser/session', url, {
+      method: 'GET',
+      cookie: presented
+    });
+    relayCookies(response, cookies);
+    const live = response.ok ? ((await response.json()) as { sessions: View[] }).sessions : [];
+    const tenants = [{ key: session.tenantKey, name: session.tenantName }];
+    for (const view of live)
+      if (view.tenant !== session.tenantKey) tenants.push({ key: view.tenant, name: view.tenant_name });
     return {
       subject: { id: session.principalId, name: session.principalId },
       expiresAt: session.expiresAt,
-      tenants: tenants.map((key) => ({ key, name: key }))
+      tenants
     };
   }
 }

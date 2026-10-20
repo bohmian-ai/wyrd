@@ -99,15 +99,21 @@
   /** Ends the held pointer gesture, if any, without completing it. */
   let release: (() => void) | undefined;
 
+  /** The document itself; a host re-passing the same one keeps local edits. */
+  const given = $derived(doc);
   // A new document drops local edits; leaving ends a held gesture.
   $effect.pre(() => {
-    void parsed;
+    void given;
     untrack(() => {
       cancel();
       kept = {};
     });
   });
   $effect(() => () => release?.());
+  // Narrowing or a host dropping its handler ends editing: the preview goes before its controls do.
+  $effect.pre(() => {
+    if (!editable) untrack(cancel);
+  });
 
   const layouts = $derived(
     parsed.success ? parsed.data.panels.map((panel) => (draft?.id === panel.id ? draft.layout : (kept[panel.id] ?? panel.layout))) : []
@@ -143,11 +149,13 @@
   }
 
   /**
-   * Keeps the draft on screen and reports the document with every completed
-   * edit, so a host that never passes it back still holds all of them.
+   * Ends any held pointer gesture, keeps the draft on screen and reports the
+   * document with every completed edit, so a host that never passes it back
+   * still holds all of them.
    * Collision and measured heights are rendering only and never reported.
    */
   function commit() {
+    release?.();
     if (!draft || !parsed.success) return;
     const done = { ...kept, [draft.id]: draft.layout };
     draft = undefined;

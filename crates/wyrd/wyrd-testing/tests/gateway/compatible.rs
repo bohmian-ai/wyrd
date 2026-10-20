@@ -13,32 +13,12 @@ use wiremock::{Mock, ResponseTemplate};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_testing::Bootstrap;
+use wyrd_testing::gateway_capture::GatewayCapture;
 
 use crate::harness::{Journey, PROVIDER_KEY, assert_provider_credentials, openai_code, tokens};
 
-/// Chat Completions stream whose last frames carry the finish reason, usage,
-/// and the `[DONE]` sentinel.
-const CHAT_EVENTS: &str = concat!(
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"h\"}}]}\n\n",
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"i\"},\"finish_reason\":\"stop\"}]}\n\n",
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n",
-    "data: [DONE]\n\n",
-);
-
 /// Chat Completions stream that stops before any choice finishes.
 const CHAT_TRUNCATED: &str = "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"h\"}}]}\n\n";
-
-/// Buffered Chat Completions answer the mock returns for a non-streaming call.
-fn completion() -> Value {
-    json!({
-        "id": "chatcmpl-0",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "gpt-4o",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
-    })
-}
 
 /// One Chat Completions request body, streaming when `stream` is set.
 fn chat(stream: bool, marker: &str) -> Value {
@@ -85,13 +65,16 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("\"stream\":true"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(CHAT_EVENTS, "text/event-stream"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            GatewayCapture::chat_events("chatcmpl-1", 2),
+            "text/event-stream",
+        ))
         .with_priority(2)
         .mount(&journey.upstream)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .with_priority(3)
         .mount(&journey.upstream)
         .await;
@@ -113,7 +96,7 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
     assert_eq!(stream.headers()["content-type"], "text/event-stream");
     assert_eq!(
         stream.text().await.expect("complete stream"),
-        CHAT_EVENTS,
+        GatewayCapture::chat_events("chatcmpl-1", 2),
         "a complete provider stream relays unchanged, sentinel included"
     );
 
@@ -157,7 +140,7 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
     );
     assert_eq!(
         during_outage.json::<Value>().await.expect("answer json"),
-        completion(),
+        GatewayCapture::completion(),
         "the answer relays unchanged while capture cannot publish"
     );
     journey
@@ -225,7 +208,7 @@ async fn managed_secret_rotation_survives_server_restart() {
     let journey = Journey::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .mount(&journey.upstream)
         .await;
     journey
@@ -361,7 +344,10 @@ async fn invoke(journey: &Journey) {
         )
         .await;
     assert_eq!(answer.status().as_u16(), 200);
-    assert_eq!(answer.json::<Value>().await.expect("answer"), completion());
+    assert_eq!(
+        answer.json::<Value>().await.expect("answer"),
+        GatewayCapture::completion()
+    );
 }
 
 /// Asserts the upstream received exactly `keys` as bearer credentials, in

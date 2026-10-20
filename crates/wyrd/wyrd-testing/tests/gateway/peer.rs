@@ -31,23 +31,12 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::server::WyrdTestServer;
 use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 
 use crate::harness::{PROVIDER_KEY, api_key, exchange};
-
-/// Buffered Chat Completions answer the mock upstream returns.
-fn completion() -> Value {
-    json!({
-        "id": "chatcmpl-peer",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "gpt-4o",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
-    })
-}
 
 /// Puts one gateway administration document at `route` on `base` as `admin`.
 ///
@@ -210,7 +199,7 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .mount(&upstream)
         .await;
     let cluster = WyrdTestCluster::start_spec(
@@ -321,7 +310,10 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         .and_then(|value| value.to_str().ok())
         .expect("the answer carries its request id")
         .to_owned();
-    assert_eq!(answer.json::<Value>().await.expect("answer"), completion());
+    assert_eq!(
+        answer.json::<Value>().await.expect("answer"),
+        GatewayCapture::completion()
+    );
 
     let deadline = Instant::now() + Duration::from_secs(30);
     for table in ["vala.gateway.calls", "vala.traces.spans"] {

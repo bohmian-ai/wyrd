@@ -12,6 +12,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
 use wyrd_telemetry::{TelemetryConfig, init_test_capture};
 use wyrd_testing::Bootstrap;
+use wyrd_testing::gateway_capture::GatewayCapture;
 
 use crate::harness::{
     ANTHROPIC_EVENTS, ANTHROPIC_TRUNCATED, GEMINI_EVENTS, GEMINI_TRUNCATED, INVOKER_ROLE, Journey,
@@ -508,18 +509,6 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     );
 }
 
-/// Buffered Chat Completions answer the mock upstream returns.
-fn completion() -> Value {
-    json!({
-        "id": "chatcmpl-key",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "gpt-4o",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
-    })
-}
-
 /// Restricts the deployment `provider` [`Journey::deploy`] stored, which
 /// authenticates with `header`, to the single model `model`, so any other
 /// model on it is unservable and only its fallback can answer.
@@ -693,7 +682,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     let answer = json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP", "index": 0}], "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2, "totalTokenCount": 9}, "modelVersion": "gemini-2.5-flash"});
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .mount(&journey.upstream)
         .await;
     Mock::given(method("POST"))
@@ -1160,7 +1149,7 @@ async fn gateway_api_keys_remain_rejected_outside_ingress() {
     let journey = Journey::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .mount(&journey.upstream)
         .await;
     journey

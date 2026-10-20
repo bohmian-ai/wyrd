@@ -21,32 +21,13 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
 use wyrd_testing::capacity::Histogram;
+use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::Metrics;
 
 use crate::harness::{Journey, openai_code, refusal, tokens};
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
 const PROJECTION: &str = "acme-first/m";
-
-/// Buffered Chat Completions answer the healthy deployment returns.
-fn completion() -> Value {
-    json!({
-        "id": "chatcmpl-1",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "m",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
-    })
-}
-
-/// Chat Completions stream ending with its finish reason, usage, and the
-/// `[DONE]` sentinel.
-const CHAT_EVENTS: &str = concat!(
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n",
-    "data: [DONE]\n\n",
-);
 
 /// How long the timed upstream holds every answer, so provider wait is
 /// distinguishable from the gateway's own work.
@@ -131,7 +112,7 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
     for prefix in ["/first", "/second"] {
         Mock::given(method("POST"))
             .and(path(format!("{prefix}/v1/chat/completions")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
             .with_priority(2)
             .mount(&journey.upstream)
             .await;
@@ -171,7 +152,7 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
     );
     assert_eq!(
         answered.json::<Value>().await.expect("answer json"),
-        completion(),
+        GatewayCapture::completion(),
         "the sibling deployment's answer is the caller's"
     );
     assert_eq!(
@@ -230,14 +211,14 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         .and(path("/held/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(completion())
+                .set_body_json(GatewayCapture::completion())
                 .set_delay(Duration::from_mins(1)),
         )
         .mount(&journey.upstream)
         .await;
     Mock::given(method("POST"))
         .and(path("/prompt/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
         .mount(&journey.upstream)
         .await;
     deploy_compatible(&journey, "acme-held", "/held").await;
@@ -288,7 +269,7 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
     );
     assert_eq!(
         answered.json::<Value>().await.expect("answer json"),
-        completion()
+        GatewayCapture::completion()
     );
 }
 
@@ -315,7 +296,10 @@ async fn gateway_capacity_metrics_cover_buffered_and_streamed_calls() {
         .and(body_string_contains("\"stream\":true"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_raw(CHAT_EVENTS, "text/event-stream")
+                .set_body_raw(
+                    GatewayCapture::chat_events("chatcmpl-1", 2),
+                    "text/event-stream",
+                )
                 .set_delay(UPSTREAM_DELAY),
         )
         .with_priority(1)
@@ -325,7 +309,7 @@ async fn gateway_capacity_metrics_cover_buffered_and_streamed_calls() {
         .and(path("/timed/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(completion())
+                .set_body_json(GatewayCapture::completion())
                 .set_delay(UPSTREAM_DELAY),
         )
         .with_priority(2)

@@ -1,9 +1,29 @@
-//! A bound server whose gateway captures calls answered by a mock upstream.
+//! A bound server whose gateway captures calls answered by a mock upstream,
+//! and the upstream answers gateway journeys and capacity benchmarks share.
 //!
 //! `vala.gateway.calls` accepts only the reserved gateway capture principal,
 //! so a journey that needs real call rows drives a real chat completion
 //! through the gateway against a local `wiremock` provider.
+//!
+//! Every answer an `OpenAI`-compatible upstream gives is built here: the
+//! buffered completion ([`GatewayCapture::completion`], or a sized one), and
+//! the Chat Completions stream ([`GatewayCapture::chat_events`]) whose
+//! frames [`PacedUpstream`] writes one at a time. `wiremock` returns one
+//! whole body after one delay, so it cannot pace a stream; [`PacedUpstream`]
+//! is the bounded local provider that does, recording when it sent each
+//! frame.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -51,6 +71,55 @@ impl GatewayCapture {
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
             "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
         })
+    }
+
+    /// A buffered Chat Completions answer whose message content is
+    /// `content_bytes` bytes, for answers of a chosen size.
+    pub fn sized_completion(content_bytes: usize) -> Value {
+        let mut completion = Self::completion();
+        completion["choices"][0]["message"]["content"] = json!("x".repeat(content_bytes));
+        completion
+    }
+
+    /// The frames of one Chat Completions stream with id `id`, each one
+    /// complete server-sent event: `chunks` data events of one content
+    /// character each (the first naming the assistant role, the last
+    /// finishing with `stop`), then a usage event and the `[DONE]` sentinel.
+    pub fn chat_event_frames(id: &str, chunks: usize) -> Vec<String> {
+        let mut frames: Vec<String> = (0..chunks)
+            .map(|index| {
+                let delta = if index == 0 {
+                    json!({"role": "assistant", "content": "x"})
+                } else {
+                    json!({"content": "x"})
+                };
+                let finish = (index + 1 == chunks).then_some("stop");
+                let chunk = json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "gpt-4o",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                });
+                format!("data: {chunk}\n\n")
+            })
+            .collect();
+        let usage = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
+        });
+        frames.push(format!("data: {usage}\n\n"));
+        frames.push("data: [DONE]\n\n".to_owned());
+        frames
+    }
+
+    /// One whole Chat Completions stream: [`Self::chat_event_frames`] joined.
+    pub fn chat_events(id: &str, chunks: usize) -> String {
+        Self::chat_event_frames(id, chunks).concat()
     }
 
     /// Start a bound server whose gateway providers resolve to a mock
@@ -222,4 +291,173 @@ impl GatewayCapture {
         };
         Ok(self.server.exchange_api_key(&api_key).await?)
     }
+}
+
+/// How [`PacedUpstream`] answers: each answer's delays and stream length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pacing {
+    /// Wait before a buffered answer's headers and body.
+    pub buffered_delay: Duration,
+    /// Content bytes of a buffered answer.
+    pub buffered_bytes: usize,
+    /// Wait before a stream's headers and first data event.
+    pub stream_delay: Duration,
+    /// Data events of a stream.
+    pub chunks: usize,
+    /// Wait between consecutive data events of a stream.
+    pub chunk_interval: Duration,
+}
+
+/// Monotonic send times [`PacedUpstream`] recorded, by call marker.
+type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
+
+/// What every [`PacedUpstream`] connection shares.
+#[derive(Clone)]
+struct Paced {
+    /// The answer shape.
+    pacing: Pacing,
+    /// Frame send times of calls not yet taken.
+    sends: Sends,
+    /// Calls whose send times may be held at once; a later call is answered
+    /// but not recorded.
+    bound: usize,
+}
+
+/// A bounded local `OpenAI`-compatible provider that actually delays its
+/// headers and paces its stream body, one data event per write.
+///
+/// It serves `POST /v1/chat/completions` under any path prefix. The call's
+/// marker is its first message's content, which the caller makes unique. A
+/// buffered call waits [`Pacing::buffered_delay`] and answers a sized
+/// completion; a `stream: true` call waits [`Pacing::stream_delay`], then
+/// writes [`GatewayCapture::chat_event_frames`] with the marker as its id,
+/// [`Pacing::chunk_interval`] apart. Just before handing each data event (or
+/// the buffered body) to the connection it records [`Instant::now`] under
+/// the marker; a handed frame is not proof of receipt. Nothing else is
+/// recorded, and at most `bound` calls' times are held until
+/// [`Self::take`] removes them. Dropping it stops serving.
+pub struct PacedUpstream {
+    /// The bound address.
+    address: SocketAddr,
+    /// Recorded send times.
+    sends: Sends,
+    /// The serving task.
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl PacedUpstream {
+    /// Binds a loopback port and serves `pacing`, holding at most `bound`
+    /// calls' send times.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn start(pacing: Pacing, bound: usize) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let sends: Sends = Arc::default();
+        let router = Router::new()
+            .route("/{*path}", post(answer))
+            .with_state(Paced {
+                pacing,
+                sends: Arc::clone(&sends),
+                bound,
+            });
+        let serving = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::error!(%error, "the paced upstream stopped serving");
+            }
+        });
+        Ok(Self {
+            address,
+            sends,
+            serving,
+        })
+    }
+
+    /// The base URL every path prefix hangs off.
+    pub fn uri(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Removes and returns the send times recorded for `marker`: one for a
+    /// buffered answer, one per data event for a stream, in send order.
+    pub fn take(&self, marker: &str) -> Vec<Instant> {
+        self.sends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(marker)
+            .unwrap_or_default()
+    }
+
+    /// Calls whose send times are held, for bounding evidence.
+    pub fn held(&self) -> usize {
+        self.sends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Drops every held send time, between measured windows.
+    pub fn clear(&self) {
+        self.sends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+impl Drop for PacedUpstream {
+    /// Stops serving.
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+impl Paced {
+    /// Records one send for `marker` now, unless `bound` calls are held.
+    fn record(&self, marker: &str) {
+        let mut sends = self.sends.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(times) = sends.get_mut(marker) {
+            times.push(Instant::now());
+        } else if sends.len() < self.bound {
+            sends.insert(marker.to_owned(), vec![Instant::now()]);
+        }
+    }
+}
+
+/// Answers one chat completion as [`PacedUpstream`] documents; a body that
+/// is not a JSON chat request is refused with `400`.
+async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "not json").into_response();
+    };
+    let marker = request["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let pacing = paced.pacing;
+    if request["stream"] != Value::Bool(true) {
+        tokio::time::sleep(pacing.buffered_delay).await;
+        let completion = GatewayCapture::sized_completion(pacing.buffered_bytes).to_string();
+        paced.record(&marker);
+        return ([(CONTENT_TYPE, "application/json")], completion).into_response();
+    }
+    tokio::time::sleep(pacing.stream_delay).await;
+    let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);
+    let events = async_stream::stream! {
+        for (index, frame) in frames.into_iter().enumerate() {
+            if index > 0 && index < pacing.chunks {
+                tokio::time::sleep(pacing.chunk_interval).await;
+            }
+            if index < pacing.chunks {
+                paced.record(&marker);
+            }
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(frame));
+        }
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(events),
+    )
+        .into_response()
 }

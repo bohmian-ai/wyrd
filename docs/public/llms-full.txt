@@ -2,7 +2,7 @@
 
 > Wyrd is open-source AI assurance and verification infrastructure. Verify AI systems before and after release, with verdicts you can trace, reproduce, and audit.
 
-Every published docs page in sidebar order, generated from the docs content tree. Links are relative to the docs base /wyrd/ (published at https://bohmian-ai.github.io/wyrd/). The page index is [llms.txt](/wyrd/llms.txt).
+Every published docs page in sidebar order, generated from the docs content tree. Links are relative to the docs base /wyrd/ (published at https://docs.bohmian.ai/wyrd/). The page index is [llms.txt](/wyrd/llms.txt).
 
 ## Start here
 

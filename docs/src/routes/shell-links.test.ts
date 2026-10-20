@@ -19,6 +19,7 @@ vi.mock('$app/state', () => app);
 vi.mock('$app/navigation', () => ({ afterNavigate: () => {} }));
 
 const { default: Landing } = await import('./+page.svelte');
+const { load: landingData } = await import('./+page.server');
 const { default: Layout } = await import('./+layout.svelte');
 const { default: ErrorPage } = await import('./+error.svelte');
 const { allSlugs } = await import('$lib/content');
@@ -39,7 +40,7 @@ function deadLinks(links: string[]): string[] {
 
 describe('landing and shell actions reach real destinations', () => {
   it('landing links only to published pages', () => {
-    expect(deadLinks(internalLinks(Landing))).toEqual([]);
+    expect(deadLinks(internalLinks(Landing, { data: landingData() }))).toEqual([]);
   });
 
   it('home shell header and footer link only to published pages', () => {

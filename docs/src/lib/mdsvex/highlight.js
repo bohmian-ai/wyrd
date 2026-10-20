@@ -52,14 +52,25 @@ export function codeBlock(code, lang = 'text', title, marked) {
       }
     }
   ];
-  let html;
-  try {
-    html = highlighter.codeToHtml(code, { lang, theme: WYRD_THEME, transformers });
-  } catch {
-    html = highlighter.codeToHtml(code, { lang: 'text', theme: WYRD_THEME, transformers });
-  }
+  const html = highlight(code, lang, transformers);
   const titleAttr = title ? ` title="${title}"` : '';
   return `<CodeBlock lang="${lang}"${titleAttr} html={\`${escapeSvelte(html)}\`} />`;
+}
+
+/**
+ * Shiki HTML for `code` on the Wyrd theme; an unknown language falls back to
+ * plain text. Pages outside mdsvex, such as the landing page, render the
+ * result through `<CodeBlock html>` themselves.
+ * @param {string} code
+ * @param {string} lang
+ * @param {import('shiki').ShikiTransformer[]} [transformers]
+ */
+export function highlight(code, lang, transformers = []) {
+  try {
+    return highlighter.codeToHtml(code, { lang, theme: WYRD_THEME, transformers });
+  } catch {
+    return highlighter.codeToHtml(code, { lang: 'text', theme: WYRD_THEME, transformers });
+  }
 }
 
 /**

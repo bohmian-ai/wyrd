@@ -1603,11 +1603,12 @@ mod tests {
 
         let submitted = scribe.submitted();
         assert_eq!(submitted.len(), 4, "the whole slice is submitted twice");
-        assert_eq!(
-            submitted[..2],
-            submitted[2..],
-            "the retry keeps every identity"
-        );
+        // The two frames are in flight together, so each attempt submits
+        // them in whichever order their encodings finish.
+        let (mut first, mut retry) = (submitted[..2].to_vec(), submitted[2..].to_vec());
+        first.sort_unstable();
+        retry.sort_unstable();
+        assert_eq!(first, retry, "the retry keeps every identity");
         let held = retained(scribe.received())
             .iter()
             .map(|frame| frame.batch_id)

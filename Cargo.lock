@@ -9960,6 +9960,7 @@ dependencies = [
  "signature",
  "simd-adler32",
  "simdutf8",
+ "sketches-ddsketch",
  "slab",
  "smallvec",
  "spin 0.9.8",

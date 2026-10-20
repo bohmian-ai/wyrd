@@ -114,6 +114,7 @@ sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"]
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+sketches-ddsketch = { version = "0.3", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["any", "chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
@@ -244,6 +245,7 @@ sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"]
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+sketches-ddsketch = { version = "0.3", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["any", "chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }

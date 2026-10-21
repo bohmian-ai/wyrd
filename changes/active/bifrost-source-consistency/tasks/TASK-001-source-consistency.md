@@ -405,3 +405,36 @@ fresh correctness/capacity evidence; it does not reopen or close PR #189.
 - [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md).
 - [Bifrost design](../../../../architecture/bifrost-design.md), [Wyrd design](../../../../architecture/wyrd-design.md).
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+
+## Implementation Evidence
+
+Base: `1c5edf729` (merge of PR #189). Baseline capacity at `21f7f2f40`,
+artifacts preserved under `../bsc-baseline/{write,verification,query}-artifacts`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 rows once across publication, incl. last live partition removed | `vala-sql` migration `20261021000000_bifrost_publication_revision.sql` (trigger-advanced revision, read in the cut statement); `Oracle::selection_holds` + repin loop in `classify_one_build`; retained `LiveCaptures` | `published::source_transitions_preserve_exact_rows` (asserts one repin via cut-read count); `scribe::tail_rpc::tests::active_rollover_during_capture_is_read_once`, `a_generation_staged_before_the_shard_settles_is_read_once`, `an_open_live_read_keeps_staged_runs_across_publication`; `pg_oracle_membership::file_list_publications_advance_the_table_revision` (replay and rollback advance nothing) | PASS |
+| AC-002 invalid/abandoned captures never succeed; resources released | capture id bound into `ScribeProviderCut` and the assignment-authority digest; Scribe-wide `RetainedCaptures`; `RegistryTailStreamDiscovery::admit/release`; lost capture fails (`live.rs` into_stream) | `published::unvalidated_captures_fail_before_rows_and_release_resources` (moved revision → retry, lost capture → Failed, cancel → released, failed listing → Degraded, zero retained after each); `tail_rpc::tests::a_capture_is_opened_only_by_its_query`, `an_unreleased_capture_expires_at_its_deadline`; uncertainty: `hot_source::tests::a_publishing_generation_refuses_capture_until_it_settles` (an unknown commit outcome cannot be forced through real Postgres from a journey); `distributed::live_query_terminal_failure_matrix`; `peer_network::*` (21 journeys) | PASS |
+| AC-003 late group evidence in verdict | no group change; Bifrost fix only | `verify_in_real_time::grouped_executions_include_late_evidence` | PASS |
+| AC-004 one read protocol, no stale race promise | notification cut cache, `bifrost_cut` trigger, pre-row degrade and `is_availability_loss` removed; docs updated in `bifrost-design.md`, `wyrd-design.md`, `olap-serving.md`, `analytical-operations-reliability.md`, product docs; supersession note on long-horizon spec | `distributed::tenant_scoped_cut_is_one_statement_and_one_bounded_retry`; `docs:check`; diff | PASS |
+| AC-005 inclusive report limits | `verification/report.rs` (p99 bucket ≤ 0.0005 s), `query/workload.rs` `p99_at_most_ms`, `query/report.rs` (3-decimal output, strict limits kept elsewhere) | `verification::report::tests::direct_overhead_judges_p99_only` (RED: 0.9 ms bucket was accepted), `queued_latency_is_reported_not_judged`, `query::report::tests::sweep_and_errors_are_judged` (RED: 1,001 µs was accepted; 999/1,000 pass, strict p95 kept) | PASS |
+| AC-006 final capacity | — | pending, see below | PENDING |
+
+Acquisition retries are counted on the query profile as `Oracle.selection_retries`
+(`oracle_query_profile_count_total{event}`); a retry now reuses the query's one
+profile instead of emitting a second.
+
+Lanes: `fmt`, `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`,
+`test:bifrost:unit:rust:inner` (225 passed, under `with-test-postgres.sh`),
+`test:bifrost:integration:{redux,sql,server}`, `docs:check`, `git diff --check` — all exit 0.
+Span-permit regression `scribe_outbox::tests::sustained_scribe_outage_caps_tenant_spans` passed.
+
+### Diagnoses
+
+- **Symptom:** `unvalidated_captures…` failed "cancelled read: the Scribe producer never paused". **Evidence:** `observe_live_production_for_test` holds only before a second batch (`tail_rpc.rs`). **Cause:** only one live row (one batch) existed. **Fix site:** the new journey's fixture appends a second live row; no shared owner changed.
+- **Symptom:** follower tests failed "Scribe live-tail snapshot failed" then `TailReadError::Binding`. **Cause:** a nil capture id, then a `vala.`-prefixed wire namespace that `binding_from_wire` rejects. **Fix site:** test helper `reading_capture` takes a real capture with the stripped namespace.
+- **Symptom:** a capture listed through one `tail_service()` could not be opened through another. **Cause:** each `tail_service()` built its own capture table. **Fix site:** one `RetainedCaptures` owned by `ScribeImpl`, shared by every instance.
+- **Symptom:** unit lane mass-failed "test DB env unset". **Cause:** `:inner` lane run without the Postgres wrapper. **Fix:** rerun under `with-test-postgres.sh`; no code change.
+
+Non-goals held: no public query/SDK input, dependency, feature, second scanner,
+unavailable-writer recovery or compatibility path was added.

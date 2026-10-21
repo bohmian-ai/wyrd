@@ -76,7 +76,7 @@ def self_check() -> None:
                  "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest"]:
         assert FORBIDDEN.match(line), line
     for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.3.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.3.0 --locked",
-                 "uv run quickstart.py", "uv run wyrd server dev"]:
+                 "uv run quickstart.py", "uv run wyrd init"]:
         assert not FORBIDDEN.match(line), line
 
 

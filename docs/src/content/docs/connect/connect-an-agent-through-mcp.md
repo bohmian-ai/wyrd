@@ -10,7 +10,7 @@ status: runnable
 
 `wyrd mcp install` adds Wyrd to your coding agent's MCP servers. The agent then launches `wyrd mcp proxy`, which serves your Wyrd server's tools over stdio and signs each request with your ordinary Wyrd credential. The agent's configuration file never holds that credential.
 
-If you ran [`wyrd server dev`](/get-started/setup/) and accepted its offer to connect agents, those agents are already connected with a saved credential. Restart them and skip to [step 4](#4-check-the-connection).
+If you ran [`wyrd init`](/get-started/setup/) and accepted its offer to connect agents, those agents are already connected with a saved credential. Restart them and skip to [step 4](#4-check-the-connection).
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ For a deployed server with single sign-on, sign in. The saved login applies only
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-For the local server, `wyrd server dev` already saved the tenant key in `credentials.toml`; skip to step 2. For any other server where you hold an API key, such as the `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), put the key in `credentials.toml` in your Wyrd config directory, readable only by you. It is used for every server you have no saved login for. This overwrites the file, so check that it holds no key you still need:
+For the local server, `wyrd init` already saved the tenant key in `credentials.toml`; skip to step 2. For any other server where you hold an API key, such as the `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), put the key in `credentials.toml` in your Wyrd config directory, readable only by you. It is used for every server you have no saved login for. This overwrites the file, so check that it holds no key you still need:
 
 ```bash
 umask 077
@@ -73,7 +73,7 @@ Only the agents you choose change, and only their `wyrd` entry. Running the comm
 
 ## 3. Choose the server
 
-Without `--server`, the agent follows your global client endpoint: `[client].http_url` in `config.toml`, which `wyrd server dev` sets to `http://127.0.0.1:8080`, else `WYRD_SERVER_URL`, else `http://localhost:8080`.
+Without `--server`, the agent follows your global client endpoint: `[client].http_url` in `config.toml`, which `wyrd init` sets to `http://127.0.0.1:8080`, else `WYRD_SERVER_URL`, else `http://localhost:8080`.
 
 To point an agent at a deployed server, pass it explicitly:
 

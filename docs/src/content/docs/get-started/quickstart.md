@@ -97,4 +97,4 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/reference/verifier-card/) lists every field you can declare.
+[Choose your path](/get-started/choose-your-path/) for the guides that fit your role. [How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/reference/verifier-card/) lists every field you can declare.

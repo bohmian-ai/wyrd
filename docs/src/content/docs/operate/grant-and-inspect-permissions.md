@@ -12,7 +12,7 @@ Grant a role to give a principal more access, revoke it to take access away, and
 
 ## Prerequisites
 
-- A credential with the `admin` role, such as the tenant `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), or the key `wyrd server dev` saved.
+- A credential with the `admin` role, such as the tenant `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), or the key `wyrd init` saved.
 - The principal's ID. `wyrd principal list` shows it.
 
 If you are not sure which role you need, [Identity and authorization](/understand/identity-and-authorization/#roles-and-permissions) lists what each built-in role allows.

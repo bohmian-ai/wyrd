@@ -45,7 +45,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 1. Start a local server and leave it running in its own terminal:
 
    ```bash
-   wyrd server dev --tenant acme
+   wyrd init --tenant acme
    ```
 
    This saves the server URL and an admin credential for the `acme` tenant. Every later command reads them; you export nothing.
@@ -142,7 +142,7 @@ Export the four variables and apply it:
 wyrd gateway deployment put --file gateway.json
 ```
 
-The CLI reads each `local_env` variable and sends its value once, as an encrypted-at-rest managed secret; the variable name is never stored. The server applies every credential and deployment in one transaction: if any is refused, for example a deployment naming a credential that doesn't exist, nothing is applied and the command exits non-zero. Applying it again converges, and deployments the document doesn't name are left alone. `wyrd server dev --gateway-file gateway.json` applies the same document at startup, and a first interactive `wyrd server dev` builds one like it from the keys it finds.
+The CLI reads each `local_env` variable and sends its value once, as an encrypted-at-rest managed secret; the variable name is never stored. The server applies every credential and deployment in one transaction: if any is refused, for example a deployment naming a credential that doesn't exist, nothing is applied and the command exits non-zero. Applying it again converges, and deployments the document doesn't name are left alone. `wyrd init --gateway-file gateway.json` applies the same document at startup, and a first interactive `wyrd init` builds one like it from the keys it finds.
 
 Credentials stored separately, as in step 2, work too: a document without `credentials`, a single deployment, or a JSON list of deployments refers to them by name. A list applies in order; if one entry fails, the entries after it are not attempted.
 
@@ -166,6 +166,6 @@ Every refusal is a JSON problem with a stable `code`. A refused call is never se
 | `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | No deployment with that name serves this operation | Check the name with `wyrd gateway deployment list`. Check that the deployment's `capabilities` include the operation, for example `chat_completions`. |
 | `WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE` | The deployment's credential is revoked or missing, or the provider couldn't be reached | Run `wyrd gateway credential get anthropic-key`. A revoked name can't be reused: put the key under a new name, point the deployment's `auth.credential` at it, and apply the deployment again. |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The caller's Wyrd credential isn't allowed this model or action. A key scoped to `openai-prod/gpt-4o` can't call `claude-prod`, for example. | Use a principal with the needed role, or have a tenant admin grant it. |
-| `WYRD_CLIENT_401_NO_CREDENTIALS` | Your client found no Wyrd credential | Start `wyrd server dev`, or set `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`. |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` | Your client found no Wyrd credential | Start `wyrd init`, or set `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`. |
 
 `wyrd gateway credential revoke <name>` is permanent. Every deployment using that credential stops serving right away, and the name can't be put again.

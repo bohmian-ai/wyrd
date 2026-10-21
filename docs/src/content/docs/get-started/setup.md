@@ -1,13 +1,13 @@
 ---
 title: Set up Wyrd
-description: Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
+description: Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, start a local server with wyrd init, and add Wyrd to your project with your coding agent or by hand.
 pillar: wyrd
 section: Get started
 order: 2
 status: runnable
 ---
 
-Install Wyrd, start a local server, and leave it running. Your code finds the server on its own.
+Install Wyrd, start a local server with `wyrd init`, and leave it running. Your code finds the server on its own. Then add Wyrd to your project with your coding agent, or by hand.
 
 ## What you need
 
@@ -60,22 +60,22 @@ In its own terminal, in `quickstart`:
 <Tab label="Interactive">
 
 ```bash
-wyrd server dev
+wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers.
+When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. To set up with your coding agent, accept the offer to connect it. Decline the other offers.
 
 </Tab>
 <Tab label="Programmatic">
 
 ```bash
 export WYRD_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
-wyrd server dev --tenant acme --non-interactive
+wyrd init --tenant acme --non-interactive
 ```
 
 It never prompts. If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready, for scripts and agents.
 
-<Aside type="note" title="wyrd server dev options">
+<Aside type="note" title="wyrd init options">
 
 | Option | Meaning |
 | --- | --- |
@@ -114,6 +114,33 @@ wyrd list
 
 An empty list means you're connected.
 
+## Add Wyrd to your project
+
+<Tabs>
+<Tab label="Agent-assisted">
+
+When `wyrd init` connected a coding agent, it prints the command that starts that agent on the setup prompt in this directory. Run it in a second terminal, in `quickstart`.
+
+For an agent without such a command, start it in `quickstart` and paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
+
+The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear.
+
+<Aside type="note" title="The setup prompt">
+
+<CodeFromFile file="crates/wyrd-spec/src/setup-prompt.md" lang="markdown" title="setup prompt" />
+
+Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI's release.
+
+</Aside>
+
+</Tab>
+<Tab label="Manual">
+
+Follow [Run your first verification](/get-started/quickstart/). It is the same steps the setup prompt gives an agent.
+
+</Tab>
+</Tabs>
+
 ## If it fails
 
 | You see | Fix |
@@ -124,4 +151,4 @@ An empty list means you're connected.
 
 ## Next
 
-[Run your first verification](/get-started/quickstart/).
+[Run your first verification](/get-started/quickstart/), then [choose your path](/get-started/choose-your-path/).

@@ -16,8 +16,13 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 ## Get started
 
 - [What Wyrd does](/wyrd/get-started/introduction/): Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
-- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
+- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, start a local server with wyrd init, and add Wyrd to your project with your coding agent or by hand.
 - [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
+- [Choose your path](/wyrd/get-started/choose-your-path/): The pages to read next, in order, for adding Wyrd to an application, attributing deployed workloads, or running Wyrd for a team.
+
+## Connect
+
+- [Integrate Wyrd with FastAPI](/wyrd/connect/integrate-fastapi/): Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
 
 ## Operate
 

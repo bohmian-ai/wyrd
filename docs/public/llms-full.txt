@@ -179,9 +179,9 @@ The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call the same 
 
 Page: /wyrd/get-started/setup/
 
-> Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
+> Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, start a local server with wyrd init, and add Wyrd to your project with your coding agent or by hand.
 
-Install Wyrd, start a local server, and leave it running. Your code finds the server on its own.
+Install Wyrd, start a local server with `wyrd init`, and leave it running. Your code finds the server on its own. Then add Wyrd to your project with your coding agent, or by hand.
 
 ## What you need
 
@@ -227,21 +227,21 @@ In its own terminal, in `quickstart`:
 **Interactive**
 
 ```bash
-wyrd server dev
+wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers.
+When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. To set up with your coding agent, accept the offer to connect it. Decline the other offers.
 
 **Programmatic**
 
 ```bash
 export WYRD_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
-wyrd server dev --tenant acme --non-interactive
+wyrd init --tenant acme --non-interactive
 ```
 
 It never prompts. If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready, for scripts and agents.
 
-**wyrd server dev options:**
+**wyrd init options:**
 
 | Option | Meaning |
 | --- | --- |
@@ -275,6 +275,132 @@ wyrd list
 
 An empty list means you're connected.
 
+## Add Wyrd to your project
+
+**Agent-assisted**
+
+When `wyrd init` connected a coding agent, it prints the command that starts that agent on the setup prompt in this directory. Run it in a second terminal, in `quickstart`.
+
+For an agent without such a command, start it in `quickstart` and paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
+
+The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear.
+
+**The setup prompt:**
+
+````markdown title="setup prompt"
+Add Wyrd to this project and confirm one verification end to end. A person
+started a local Wyrd server with `wyrd init` and connected you to its MCP
+server. Do not start, stop, or restart that server.
+
+Follow these steps in order. Stop at the first step that fails and report the
+step, the Wyrd error `code` when one is printed or returned, otherwise the
+tool's own diagnostic. Never print, copy, or write a credential, and never
+write a machine-specific path into a project file.
+
+1. Confirm the server. Call the Wyrd MCP tool `wyrd.guide` with
+   `{"topic": "start"}`, then `cards.list` with `{"limit": 1}`. Both must
+   succeed. If no Wyrd MCP tool is available, ask the person to connect this
+   host with `wyrd mcp install --host <host>` and reload it.
+
+2. Choose the language. Read the project manifest in the current directory:
+   `pyproject.toml` is Python, `Cargo.toml` is Rust, and `package.json` is
+   TypeScript. When none or more than one is present, or the project uses
+   another language, ask the person to choose Python, Rust, or TypeScript
+   before changing any file.
+
+3. Install the SDK at the release of the `wyrd` CLI. Run `wyrd --version`;
+   it prints `wyrd <version>`. Install exactly that version with the
+   project's own package tool:
+
+   - Python: `uv add "wyrd-ai==<version>"`
+   - Rust: `cargo add wyrd-ai@<version> tokio --features tokio/full`
+   - TypeScript: `npm install wyrd-ai@<version>`
+
+   If that exact version is unavailable, stop and report it. Never install
+   another version.
+
+4. Write the example. Before writing, check whether `support-reply.yaml`,
+   `no-refund-promise.yaml`, or the program file already exists. If one does
+   and its content differs, show the difference and ask before replacing it.
+   Leave every other project file unchanged.
+
+   Save this Verifier as `no-refund-promise.yaml`:
+
+   ```yaml
+   apiVersion: wyrd/v1
+   kind: Verifier
+   metadata:
+     name: no-refund-promise
+     version: 1.0.0
+     space: default
+   spec:
+     inputs:
+       answer: { type: json }
+     requirements:
+       - id: no-refund-promise
+         statement: The answer never promises a guaranteed refund
+         check:
+           kind: assert
+           path: inputs.answer
+           operator: not_contains
+           expected: guaranteed refund
+   ```
+
+   Save this Service beside it as `support-reply.yaml`:
+
+   ```yaml
+   apiVersion: wyrd/v1
+   kind: Service
+   metadata:
+     name: support-reply
+     version: 1.0.0
+     space: default
+   spec:
+     verified_by:
+       - verifier: ./no-refund-promise.yaml
+   ```
+
+   Write the program for the chosen language from the "Run your first
+   verification" page of the Wyrd documentation for this release
+   (`get-started/quickstart/` in `llms-full.txt`): `quickstart.py` for
+   Python, `src/main.rs` for Rust, or `quickstart.ts` for TypeScript. It
+   declares the Service with `WyrdState.declare("support-reply.yaml")`, opens
+   one Run, and verifies two answers with
+   `run.observe.verify("no-refund-promise", ...)`. It needs no model or
+   provider key.
+
+5. Run it from the directory holding both YAML files, with the project's own
+   tool: `uv run quickstart.py`, `cargo run`, or `node quickstart.ts`. It
+   prints one `passed` and one `failed` verdict, each naming its subject as
+   `default/Service/support-reply@1.0.0#<uid>`. A `failed` verdict is a
+   result, not an error.
+
+6. Confirm the stored evidence through MCP. Call `cards.get` with
+   `{"card_ref": {"kind": "Service", "space": "default", "name":
+   "support-reply", "version": "1.0.0"}}` and read its `uid`. Then call
+   `bifrost.query` with this SQL, replacing `<uid>`:
+
+   ```sql
+   SELECT result_id, run_id, card_uid, verdict FROM vala.verification.results WHERE card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+   ```
+
+   Rows become queryable shortly after the server publishes them; repeat the
+   query for up to a minute before reporting none. Done means at least one
+   `passed` and one `failed` row with the same `run_id`.
+
+7. Report the Service identity
+   `default/Service/support-reply@1.0.0#<uid>`, the `run_id`, and both
+   verdicts. Then point the person to the Wyrd documentation's
+   "Choose your path" page for the next step.
+
+````
+
+Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI's release.
+
+**Manual**
+
+Follow [Run your first verification](/wyrd/get-started/quickstart/). It is the same steps the setup prompt gives an agent.
+
 ## If it fails
 
 | You see | Fix |
@@ -285,7 +411,7 @@ An empty list means you're connected.
 
 ## Next
 
-[Run your first verification](/wyrd/get-started/quickstart/).
+[Run your first verification](/wyrd/get-started/quickstart/), then [choose your path](/wyrd/get-started/choose-your-path/).
 
 # Run your first verification
 
@@ -474,7 +600,183 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
+[Choose your path](/wyrd/get-started/choose-your-path/) for the guides that fit your role. [How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
+
+# Choose your path
+
+Page: /wyrd/get-started/choose-your-path/
+
+> The pages to read next, in order, for adding Wyrd to an application, attributing deployed workloads, or running Wyrd for a team.
+
+Pick the path that matches what you are doing next. Each lists its pages in order.
+
+## Add Wyrd to an application
+
+For AI engineers putting the SDK in a service.
+
+1. [Run your first verification](/wyrd/get-started/quickstart/)
+2. [Integrate Wyrd with FastAPI](/wyrd/connect/integrate-fastapi/)
+3. [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/)
+4. [How verification works](/wyrd/understand/how-verification-works/)
+5. [Verifier Card](/wyrd/reference/verifier-card/)
+
+## Deploy and attribute workloads
+
+For platform teams running services that report to Wyrd under their own identity.
+
+1. [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/)
+2. [Identity and authorization](/wyrd/understand/identity-and-authorization/)
+3. [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/)
+4. [MCP tools](/wyrd/reference/mcp-tools/)
+
+## Run Wyrd for a team
+
+For operators of a shared Wyrd server.
+
+1. [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/)
+2. [Verification runtime limits](/wyrd/reference/verification-runtime-limits/)
+3. [Bifrost](/wyrd/understand/bifrost/)
+4. [Identity and authorization](/wyrd/understand/identity-and-authorization/)
+
+# Integrate Wyrd with FastAPI
+
+Page: /wyrd/connect/integrate-fastapi/
+
+> Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
+
+Add `WyrdMiddleware` to a FastAPI app. It starts your Service's state when the app starts, opens one Run for each request, and drains queued evidence when the app stops.
+
+## What you capture
+
+- One Run per HTTP request or WebSocket connection. Every verification and observation the request makes shares that Run's `run_id`.
+- Spans your OpenTelemetry instrumentation records inside the Run, tagged with its `wyrd.run_id` and `wyrd.card_uid`.
+
+## Before you start
+
+- The server from [Set up Wyrd](/wyrd/get-started/setup/), running.
+- The `support-reply` Service from [Run your first verification](/wyrd/get-started/quickstart/), declared.
+
+## Install
+
+```bash
+uv add "wyrd-ai[otel]==0.3.0" fastapi uvicorn
+```
+
+Pull the Service into the app's directory. Do this at build or deploy time, not when the app starts:
+
+```bash
+uv run wyrd pull --space default --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+## Usage
+
+Save the app as `app.py`:
+
+```python title="app.py"
+"""A FastAPI app that verifies each support answer it receives under its own Run.
+
+It serves the Quickstart's ``support-reply`` Service, pulled once at deploy time:
+
+    wyrd pull --space default --kind Service --name support-reply --version 1.0.0 \
+      --output-dir .wyrd-bundle
+    uv run uvicorn app:app
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
+from wyrd.state import WyrdState
+
+# Load the pulled Service; this reads local files only.
+state = WyrdState.from_path(".wyrd-bundle")
+
+app = FastAPI()
+# Start the state with the app, drain it at shutdown, and open one Run per request.
+app.add_middleware(WyrdMiddleware, state=state)
+
+class Reply(BaseModel):
+    answer: str
+
+@app.post("/replies")
+async def check_reply(reply: Reply, request: Request) -> dict[str, str]:
+    # This request's Run, opened by the middleware.
+    run = request.scope[RUN_SCOPE_KEY]
+    # Verification waits for the verdict, so it runs off the event loop.
+    result = await asyncio.to_thread(run.observe.verify, "no-refund-promise", answer=reply.answer)
+    return {"run_id": run.run_id, "verdict": result.verdict}
+
+```
+
+Run it:
+
+```bash
+uv run uvicorn app:app
+```
+
+At startup the middleware starts the state's writer and telemetry before the app starts. At shutdown it waits for the app's own shutdown, then drains, so evidence the app records while stopping is kept. Each request's Run is at `request.scope["wyrd.run"]`.
+
+## Verify it worked
+
+In a second terminal, send an answer that breaks the requirement:
+
+```bash
+curl -s localhost:8000/replies -H 'content-type: application/json' -d '{"answer": "You have a guaranteed refund."}'
+```
+
+The reply names the request's Run and a `failed` verdict. A second request returns a different `run_id`.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| Startup fails with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | Your app installs its own tracer provider: pass `telemetry=False` and add `wyrd.otel.span_exporter(client)` to that provider |
+| Startup fails with an `ImportError` naming `otel` | Install `wyrd-ai[otel]`, or pass `telemetry=False` |
+| `WYRD_SDK_400_BIFROST_NOT_STARTED` when the app records | The server runs without lifespan: leave Uvicorn's `--lifespan` at `auto` or set it to `on` |
+| `WYRD_SDK_404_UNKNOWN_ALIAS` on every request | `alias` returned a name the bundle does not have |
+
+## Advanced
+
+### Choose the Card per request
+
+By default each Run observes the root Service. Pass `alias`, a function that receives the ASGI scope and returns a Card alias from the bundle, or `None` for the Service. An alias the bundle lacks fails the request before your handler runs.
+
+### Your own OpenTelemetry instrumentation
+
+Add `WyrdMiddleware` after OpenTelemetry's ASGI or FastAPI instrumentation, so Wyrd's middleware is outermost and the instrumentation's spans start inside the Run. The middleware creates no spans of its own. If your app owns its tracer provider, pass `telemetry=False`: the app installs, exports, and flushes that provider, and calls `wyrd.otel.install_run_correlation(provider)` once to tag spans with the Run.
+
+### Gunicorn
+
+Run Gunicorn with Uvicorn workers:
+
+```bash
+uv add gunicorn
+uv run gunicorn app:app --workers 2 --worker-class uvicorn.workers.UvicornWorker
+```
+
+Each worker runs the app's lifespan on its own, so each worker starts and drains its own writer and telemetry. Lifespan must stay enabled; without it nothing starts and nothing drains.
+
+A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`, one that exceeds `--graceful-timeout`, or a failed drain can lose queued rows. A failed drain is logged with its Wyrd error code and reported to the server as a failed shutdown.
+
+## Reference
+
+`WyrdMiddleware(app, *, state, telemetry=True, alias=None)`, from `wyrd.integrations.asgi`:
+
+| Argument | Meaning |
+| --- | --- |
+| `app` | The ASGI app to wrap; `add_middleware` passes it. |
+| `state` | A loaded `WyrdState`. The middleware never declares or registers Cards. |
+| `telemetry` | Whether startup calls `state.start_telemetry()`. Default `True`. |
+| `alias` | Function from the ASGI scope to the Card alias each Run observes. Default: the root Service. |
+
+Startup or shutdown failures are reported to the server with the Wyrd error code. Other ASGI connection types pass through unchanged.
+
+## Next
+
+[Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
 
 # Configure the verification runtime
 

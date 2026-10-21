@@ -122,7 +122,9 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
 ) -> None:
     run_quickstart(reader)
     verifier = reader / "no-refund-promise.yaml"
-    verifier.write_text(verifier.read_text().replace("expected: guaranteed refund", "expected: guaranteed"))
+    verifier.write_text(
+        verifier.read_text().replace("expected: guaranteed refund", "expected: guaranteed")
+    )
 
     with pytest.raises(WyrdError) as drifted:
         WyrdState.declare("support-reply.yaml")

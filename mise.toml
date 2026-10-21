@@ -1149,12 +1149,6 @@ run = [
 description = "Build and run wyrd-server on :8080"
 run = ["cargo build -p wyrd-server", "scripts/postgres/dev-server.sh"]
 
-[tasks.quickstart]
-description = "Run the docsite Quickstart twice against a fresh local server"
-depends = ["py:setup"]
-env = { WYRD_LOG = "error" }
-run = "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python pytest -s -m integration tests/integration/test_docsite_quickstart.py"
-
 [tasks."cli:init"]
 description = "Establish this deployment's platform administrative root and print its credential once"
 run = "cargo run --locked -p wyrd-server -- init"

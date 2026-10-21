@@ -27,13 +27,13 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::registry::ListCardsRequest;
 use wyrd_utils::secret::read_secret_file;
 
-use crate::server::{InstalledServer, ServerInstaller, compatible};
 use crate::card::OutputFormat;
 use crate::client::map_client_error;
 use crate::error::WyrdCliError;
 use crate::gateway::{AuthoringApply, DeploymentFile, apply_deployments_with};
 use crate::mcp::{self, McpHost, McpInstallReport};
 use crate::platform::credential::PlatformEndpoint;
+use crate::server::{InstalledServer, ServerInstaller, compatible};
 #[cfg(unix)]
 use crate::terminal::Terminal;
 

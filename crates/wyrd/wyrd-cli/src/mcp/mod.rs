@@ -237,7 +237,11 @@ impl McpInstallReport {
     /// initial prompt, otherwise where to get the prompt to paste. Nothing is
     /// launched.
     pub(crate) fn print_handoff(&self, prompt: &str) {
-        for outcome in self.hosts.iter().filter(|outcome| outcome.status.connected()) {
+        for outcome in self
+            .hosts
+            .iter()
+            .filter(|outcome| outcome.status.connected())
+        {
             match outcome.host.launch(prompt) {
                 Some(command) => println!(
                     "Start {} on the setup prompt in this directory:\n{command}",

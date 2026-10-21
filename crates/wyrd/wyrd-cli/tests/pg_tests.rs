@@ -1416,7 +1416,10 @@ async fn guided_init_lifecycle_and_prompt() {
     let host = ().serve(proxy.stdio()).await.expect("host initializes");
     let listed = host.list_all_prompts().await.expect("prompts list");
     assert_eq!(
-        listed.iter().map(|listed| listed.name.as_str()).collect::<Vec<_>>(),
+        listed
+            .iter()
+            .map(|listed| listed.name.as_str())
+            .collect::<Vec<_>>(),
         ["setup"]
     );
     assert!(listed[0].arguments.as_deref().is_none_or(<[_]>::is_empty));
@@ -1435,9 +1438,16 @@ async fn guided_init_lifecycle_and_prompt() {
             .description
             .is_some_and(|description| description.contains(env!("CARGO_PKG_VERSION")))
     );
-    assert!(host.get_prompt(GetPromptRequestParams::new("start")).await.is_err());
+    assert!(
+        host.get_prompt(GetPromptRequestParams::new("start"))
+            .await
+            .is_err()
+    );
     let mut with_arguments = GetPromptRequestParams::new("setup");
-    with_arguments.arguments = Some(serde_json::Map::from_iter([("language".to_owned(), json!("rust"))]));
+    with_arguments.arguments = Some(serde_json::Map::from_iter([(
+        "language".to_owned(),
+        json!("rust"),
+    )]));
     assert!(host.get_prompt(with_arguments).await.is_err());
     host.cancel().await.expect("host disconnects");
     local.stop("-INT").await;

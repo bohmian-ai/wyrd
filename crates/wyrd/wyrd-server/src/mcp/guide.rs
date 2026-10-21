@@ -52,11 +52,18 @@ pub(super) fn prompt_descriptor() -> Prompt {
 pub(super) fn prompt(request: &GetPromptRequestParams) -> Result<GetPromptResult, ErrorData> {
     if request.name != SETUP_PROMPT_NAME {
         return Err(ErrorData::invalid_params(
-            format!("unknown prompt `{}`; the only prompt is `{SETUP_PROMPT_NAME}`", request.name),
+            format!(
+                "unknown prompt `{}`; the only prompt is `{SETUP_PROMPT_NAME}`",
+                request.name
+            ),
             None,
         ));
     }
-    if request.arguments.as_ref().is_some_and(|arguments| !arguments.is_empty()) {
+    if request
+        .arguments
+        .as_ref()
+        .is_some_and(|arguments| !arguments.is_empty())
+    {
         return Err(ErrorData::invalid_params(
             format!("the `{SETUP_PROMPT_NAME}` prompt takes no arguments"),
             None,

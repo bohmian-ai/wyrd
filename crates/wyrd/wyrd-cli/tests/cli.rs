@@ -93,10 +93,18 @@ fn guided_init_print_prompt_is_offline() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("--print-prompt"));
     let root = principal_journey::run_cli_with_env(&["--help"], &environment);
     let root = String::from_utf8(root.stdout).expect("UTF-8 help");
-    assert!(root.lines().any(|line| line.trim_start().starts_with("init ")));
+    assert!(
+        root.lines()
+            .any(|line| line.trim_start().starts_with("init "))
+    );
     let server = principal_journey::run_cli_with_env(&["server", "--help"], &environment);
     let server = String::from_utf8(server.stdout).expect("UTF-8 help");
-    assert!(!server.lines().any(|line| line.trim_start().starts_with("dev")), "{server}");
+    assert!(
+        !server
+            .lines()
+            .any(|line| line.trim_start().starts_with("dev")),
+        "{server}"
+    );
 }
 
 /// Every path beneath `root`, relative to it, with its file contents.

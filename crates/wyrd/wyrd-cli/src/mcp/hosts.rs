@@ -779,15 +779,24 @@ mod tests {
     /// support differs.
     #[test]
     fn launch_preserves_the_setup_prompt_literally() {
-        let prompt = format!("{}it's $HOME `id` \\ \"q\"", wyrd_spec::mcp::setup_prompt("1.2.3"));
-        let command = McpHost::ClaudeCode.launch(&prompt).expect("Claude Code launches");
+        let prompt = format!(
+            "{}it's $HOME `id` \\ \"q\"",
+            wyrd_spec::mcp::setup_prompt("1.2.3")
+        );
+        let command = McpHost::ClaudeCode
+            .launch(&prompt)
+            .expect("Claude Code launches");
         let quoted = command.strip_prefix("claude ").expect("program first");
         let echoed = std::process::Command::new("sh")
             .args(["-c", &format!("printf %s {quoted}")])
             .output()
             .expect("sh runs");
         assert_eq!(String::from_utf8(echoed.stdout).expect("UTF-8"), prompt);
-        assert!(McpHost::Codex.launch(&prompt).is_some_and(|c| c.starts_with("codex '")));
+        assert!(
+            McpHost::Codex
+                .launch(&prompt)
+                .is_some_and(|c| c.starts_with("codex '"))
+        );
         assert!(McpHost::Cursor.launch(&prompt).is_none());
     }
 

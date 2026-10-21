@@ -1,7 +1,7 @@
 ---
 id: SPEC-bifrost-source-consistency
 revision: 1
-status: draft
+status: approved
 ---
 
 # Reliable Bifrost reads after PR #189
@@ -236,10 +236,9 @@ remain caller-owned actions; PR #189 is already merged.
 
 ## Status, history and authority
 
-Revision 1 remains draft. This edit improves explanation and organization;
-it does not change the proposed protocol, limits or performance targets. Human
-approval is still required before implementation. No technical decision is
-intentionally deferred.
+Revision 1 was explicitly approved by the maintainer on 2026-10-21. Approval
+covers the proposed protocol, limits, performance targets and verification
+obligations. No technical decision is intentionally deferred.
 
 The [long-horizon specification, revision 21](../long-horizon-verification/spec.md)
 continues to govern existing grouping functionality. Approval of this change
@@ -249,7 +248,7 @@ and product prose accordingly, preserving historical evidence and that packet.
 
 | Revision | Status | Change |
 | --- | --- | --- |
-| 1 | draft | Reliable source acquisition and scoped deletion; clarified for maintainer review and execution from merged main in a new worktree. PR #189's merge changes delivery context only, not behavior, scope, targets or proof. |
+| 1 | approved | Reliable source acquisition and scoped deletion; clarified for maintainer review and execution from merged main in a new worktree. PR #189's merge changes delivery context only, not behavior, scope, targets or proof. Explicitly approved by the maintainer on 2026-10-21. |
 
 - [Repository standards](../../../AGENTS.md), [agent rules](../../../architecture/agent-rules.md).
 - [Wyrd design](../../../architecture/wyrd-design.md), [Bifrost design](../../../architecture/bifrost-design.md).

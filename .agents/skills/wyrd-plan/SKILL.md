@@ -1,14 +1,15 @@
 ---
 name: wyrd-plan
-description: Turn an approved Wyrd specification into a small set of outcome-complete implementation tasks without prescribing reversible implementation details.
+description: Turn an approved Wyrd specification into a small set of maintainer-readable, outcome-complete implementation tasks without prescribing reversible implementation details.
 ---
 
 # Wyrd Plan
 
-Produce the minimum task set an implementation agent needs to begin without
-making a product, public API, architecture, security, compatibility,
-cross-service, concurrency-semantics, or persistent-data decision. Stop planning
-at that point.
+Produce the minimum task set the maintainer can understand and an implementation
+agent can execute without making a product, public API, architecture, security,
+compatibility, cross-service, concurrency-semantics, or persistent-data decision.
+The maintainer must understand the proposed work, invariants and proof without
+reading code or the author conversation. Stop planning when both needs are met.
 
 Do not use this skill for review remediation. Validated implementation findings
 go directly to `$wyrd-implement`; a finding that changes approved behavior goes
@@ -21,6 +22,8 @@ Require an explicitly approved `changes/active/<slug>/spec.md`. Read `AGENTS.md`
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
 [implementation execution](../../../architecture/references/languages/implementation-execution.md),
 and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
+Follow the shared maintainer-approval and independent-comprehension guidance in
+spec-driven development.
 Load only applicable architecture references. Follow CodeGraph instructions and
 inspect the owners, consumers, tests, manifests, and `mise.toml` tasks needed to
 identify real boundaries and credible verification.
@@ -32,10 +35,11 @@ inventing it.
 ## Decompose by outcome
 
 Before writing tasks, trace each capability through its existing owners,
-callers, and tests. Each task includes this compact source-backed table:
-
-| Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
-|---|---|---|---|---|---|
+callers, and tests. Record source-backed reuse evidence in the task's
+implementation reference: existing owner/symbol, inspected callers/tests,
+missing behavior, selected extension, and justification for new machinery when
+needed. Use short entries or a compact table; do not force long symbols and
+several independent explanations into a wide six-column table.
 
 Compare whole workflows, not only leaf calls. Extending an existing owner is
 the default. A new graph store, traversal, loader, parser, transport, validator,
@@ -51,7 +55,10 @@ phases, mechanical updates, or arbitrary size targets.
 
 Collectively map every required `REQ-*`, `INV-*`, and `AC-*` obligation. Preserve
 the user journeys and language surfaces required by `AGENTS.md`, but do not
-pre-design test fixtures or private production structure.
+pre-design test fixtures or private production structure. Keep the mapping in
+metadata and one acceptance/proof table; explain outcomes in ordinary prose.
+Use one scenario per distinct behavior, with a small case table for equivalent
+variations. Do not meet a scenario-count target by bundling unrelated promises.
 
 Classify each task's proof before writing it:
 
@@ -72,12 +79,14 @@ only sections that are demonstrably inapplicable:
 ```markdown
 ## Outcome and Value
 
-The observable outcome and mapped spec obligations.
+What changes, why it matters, and one concrete before/after example where
+useful. Explain the outcome without requiring the reader to follow spec IDs.
 
-## Owners, Scope, Consumers, and Prohibited Changes
+## What Changes and What Must Stay True
 
-Required boundaries, likely owners and consumers, invariants, and explicit
-non-goals. Paths are guidance, not a private implementation allowlist.
+Scope, important invariants and the failures they prevent, material costs,
+required ownership boundaries, and explicit non-goals. Define specialist terms
+when first needed. Leave source inventories to the implementation reference.
 
 ## Approach
 
@@ -87,10 +96,12 @@ Three to seven high-level implementation steps.
 
 ### Scenario 1 — <observable behavior>
 
-**Behavior.** <Success, failure, or edge behavior and mapped obligations.>
+**Behavior.** <Concrete trigger, success/failure/edge behavior, and the invariant
+it protects. Explain the expected result for each distinct case.>
 
 **RED.** <The smallest focused test and the expected failure that proves the
-behavior is missing. If the test is named, include its exact focused command.>
+behavior is missing. Say what the test exercises and asserts. For a named test,
+link to its exact focused command in Verification and Evidence.>
 
 **GREEN.** <The minimum cohesive behavior needed to pass this scenario and the
 earlier scenarios that must be rerun.>
@@ -100,12 +111,16 @@ tests remain green.>
 
 ## Acceptance Criteria
 
-Concrete success, failure, edge, and regression behavior.
+One mapping from spec obligations to concrete success, failure, edge and
+regression observations. Explain which proof establishes each important rule
+and what result would violate it; IDs and command references are supplementary.
 
-## Expected Write Set and Consumer Closure
+## Implementation Reference
 
-Likely production, consumer, contract, generated, and test surfaces. Paths are
-guidance, not an implementation allowlist.
+Source-backed reuse evidence and likely production, consumer, contract,
+generated and test changes. Combine owner and file inventories here rather
+than repeat them in several sections. Paths are guidance, not an implementation
+allowlist.
 
 ## Verification and Evidence
 
@@ -114,7 +129,8 @@ named-test commands (including the task's own journey tests by exact
 selector) plus only the owner lanes, boundary checks, and format/lint checks
 covering the task's write set. Do not list full user-journey suites, every
 language surface, or broad aggregates such as `mise run gate` in a task; those
-run once on the integrated candidate at change review.
+run once on the integrated candidate at change review. Record each command once
+with a descriptive name, purpose and expected evidence; link from scenarios.
 
 ## Material Stop Conditions
 
@@ -136,9 +152,12 @@ scenario blocks and add the non-TDD proof for the remaining obligations under
 Add compact metadata for task ID, approved spec revision, mapped obligations,
 and real dependencies. Every specifically named test, existing or planned,
 includes its exact focused repository-native command. Confirm its package,
-target, and selector from the current test owner; do not invent a command from
-an assumed path. The implementer still owns the smallest suitable fixture
-structure.
+target, runner and setup from the current test owner; confirm existing selectors
+from source. Mark a new test name as planned, and require the implementer to
+confirm its actual selector after adding it, before RED. Do not invent a target
+or setup from an assumed path. The implementer still owns the smallest suitable
+fixture structure. Commands may live once in Verification and Evidence, with
+descriptive links from the relevant scenarios; do not duplicate long shell blocks.
 
 Do not specify helper functions, private methods, variable names, exact loops,
 local control flow, private module structure, test fixture structure, or exact
@@ -149,6 +168,8 @@ Before handoff, confirm that every acceptance criterion has an owner and a
 credible proof, every non-goal remains excluded, dependencies are real, and no
 expensive-to-reverse decision is unresolved. Recheck the reuse map against the
 task: it must not require replacement machinery without the stated evidence.
+Complete the shared independent comprehension pass over the spec and proposed
+tasks together, repair missing explanations, and preserve approved semantics.
 A task that adds or changes
 executable behavior, scenarios, or logic is invalid when any scenario lacks an
 explicit `Behavior`, `RED`, `GREEN`, or `REFACTOR` block; do not return
@@ -156,4 +177,7 @@ explicit `Behavior`, `RED`, `GREEN`, or `REFACTOR` block; do not return
 not implement, approve, merge, or issue a separate readiness verdict.
 
 Return `TASKS_PROPOSED`, `PLAN_BLOCKED`, or `SPEC_REVISION_REQUIRED`, followed
-only by task paths and any material blocker.
+by task paths and a short maintainer summary: what changes, the important
+invariants and costs, how the work will be verified, and any material blocker
+or remaining comprehension-review limitation. Keep the status vocabulary and
+approval boundaries unchanged.

@@ -1,11 +1,12 @@
 ---
 name: wyrd-spec
-description: Define or revise a human-approved Wyrd change specification covering intent, observable behavior, constraints, and expensive-to-reverse decisions while preserving implementation freedom.
+description: Define or revise a maintainer-readable, human-approved Wyrd change specification covering intent, observable behavior, constraints, and expensive-to-reverse decisions while preserving implementation freedom.
 ---
 
 # Wyrd Spec
 
-Turn human intent into a decision-complete behavioral specification. The agent
+Turn human intent into a behavioral specification the maintainer can understand
+and approve without reading code or the author conversation. The agent
 may draft and research, but only explicit human approval makes a revision
 authoritative. Do not create implementation tasks or edit implementation code;
 hand an approved specification to `$wyrd-plan`.
@@ -15,6 +16,8 @@ hand an approved specification to `$wyrd-plan`.
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [Wyrd design](../../../architecture/wyrd-design.md), and
 [Wyrd doctrine](../../../architecture/wyrd-doctrine.mdx). Read
+[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
+including its maintainer-approval and independent-comprehension guidance. Read
 [Bifrost design](../../../architecture/bifrost-design.md) when the change touches
 Bifrost. Start at [the reference router](../../../architecture/references/README.md)
 and completely read only the applicable references. Follow CodeGraph
@@ -53,10 +56,12 @@ mechanism part of the contract.
 ## Write and approve the specification
 
 For an active change, write `changes/active/<slug>/spec.md` on the caller's
-change branch. Use proportionate Markdown containing:
+change branch. Lead with the problem, proposed behavior and rationale; show one
+concrete before/after example where useful. Explain costs, alternatives and
+limits before reference-level detail. Use proportionate Markdown containing:
 
 1. spec ID, revision, and `draft | approved | superseded` status;
-2. objective and user value;
+2. problem, proposed change, user value and rationale;
 3. requirements and externally observable behavior;
 4. constraints, invariants, scope, and non-goals;
 5. expensive-to-reverse decisions and required boundaries;
@@ -65,8 +70,11 @@ change branch. Use proportionate Markdown containing:
 8. revision history and materially relevant authority links.
 
 Use stable `REQ-*`, `INV-*`, and `AC-*` IDs where traceability helps. Keep them
-atomic enough to map to tasks and evidence without turning the specification
-into a test inventory or implementation plan. An approved revision has no open
+atomic: each states one principal promise and the failure it prevents. Explain
+acceptance as the situation exercised and the expected observation, with IDs
+mapped once rather than repeated through the prose. Follow the shared writing
+guidance without turning the specification into a test inventory or
+implementation plan. An approved revision has no open
 product, public API, architecture, security, compatibility, concurrency,
 cross-service, or persistent-data decision.
 
@@ -75,12 +83,18 @@ revision to `approved` only after explicit human approval. A later material edit
 increments the revision and returns it to `draft`. Git staging and commits still
 require caller authorization.
 
+Before presenting the draft for approval, complete the shared independent
+comprehension pass over the current packet and repair missing explanations.
+This checks understanding; it does not grant approval or implementation readiness.
+
 If implementation or review proves an approved decision wrong, draft the
 smallest semantic revision, cite the conflicting evidence, and stop affected
 work until the human approves it.
 
 ## Handoff
 
-Return the spec path, revision, status, one-sentence outcome, and any exact
-approval or blocking decision. Never claim implementation readiness merely
+Return the spec path, revision and status with a short maintainer summary:
+what changes and why, the important invariants and costs, how they will be
+verified, and the exact approval or blocking decision. Disclose any remaining
+comprehension-review limitation. Never claim implementation readiness merely
 because the specification is approved.

@@ -374,11 +374,28 @@ from its physical root. A successful terminal means the published cut completed
 and each selected online Scribe supplied the rows required by the completed
 DataFusion plan. A plan that stops consuming a live child (for example, at
 `LIMIT`) cancels and drops it without draining to a footer; unexpected EOF of
-a still-needed stream fails. Success does not prove every acknowledged write
-was included. Publication between cut pinning and live scan opening can omit
-or duplicate rows. This best-effort tradeoff also applies to verification
-judgments. The terminal distinguishes success, known live-source degradation,
-and failure; clients accept rows only after a valid terminal.
+a still-needed stream fails. Success means each row identity the selected
+sources held is returned once: a publication never makes a row disappear or
+repeat, and verification judgments inherit that guarantee. Oracle selects
+sources before execution. It pins the cut, which carries each Scribe node's
+publication revision for every table, and asks every frozen Scribe for a live
+capture retained under the query's attempt identity until the query deadline.
+Each capture reports, from the same critical section that decided which
+generations it still serves, the revision that Scribe's last locally completed
+publication committed at. A reported revision above the cut's, or a stale
+writer epoch, discards the selection — its captures are released and the cut
+is evicted from the cache — and Oracle repins from Postgres and rebuilds under
+the same deadline before admission, so no row of a discarded selection is
+produced. One node's publications commit in revision order, so a cut at least
+as new as every report holds every row the captures stopped serving. Each live fragment
+reads only its own capture, named in its signed assignment; Scribe refuses a
+foreign, substituted, released, or expired capture, and a capture lost after
+acceptance fails the query rather than opening fresh live data. Captures are
+released when the query's plan is dropped, on success, failure, or
+cancellation, and expire at the deadline otherwise. A Scribe that cannot list a
+table's streams at all is known live-source degradation. The terminal
+distinguishes success, that degradation, and failure; clients accept rows only
+after a valid terminal.
 
 ## Ingest: Scribe
 
@@ -730,8 +747,9 @@ backpressure but never spool the complete result. A caller may process frames
 incrementally, but the result is usable only after a valid terminal; frames
 preceding a failure terminal are invalid as a complete query result. Frames
 that do not match the owning attempt identity are rejected before egress.
-Protocol duplication is forbidden; publication overlap may still duplicate a
-row across published and live sources under the accepted best-effort contract.
+Protocol duplication is forbidden, and source selection is validated before
+execution, so publication overlap never duplicates a row across published and
+live sources.
 
 ### Admission and memory
 
@@ -898,17 +916,17 @@ Snapshot preparation has no admission gate of its own. One tenant-scoped
 autocommit statement on the bounded runtime PostgreSQL pool, binding its own
 tenant, resolves every referenced table and returns each catalog metadata
 pointer with its hot rows. The statement is read-only: it takes no lock,
-writes no row, and nothing is released at the query's terminal. Each Oracle
-node caches the returned cuts per table and serves them only while it is
-listening on the `bifrost_cut` channel, which a `vala.file_list` trigger
-notifies in every committing transaction that changes a table's hot
-candidates; a lost listener clears the cache. A Forge rewrite's terminal
-transition sends the same notification in its transaction, so warm nodes stop
-reading the files it replaced. Expiry and manifest rewrites send nothing,
-because the older pointer returns the same rows from the same files. A cached cut serves a query only when it was read no earlier than the
-query deadline minus `max_query_deadline_ms`, so snapshot retention still
-covers it. Delivery follows commit, so the cache adds its notification
-latency to the publication race below. Oracle
+writes no row, and nothing is released at the query's terminal. Oracle serves
+cuts from a cache kept fresh by the `bifrost_cut` notification channel; it
+serves cached cuts only while listening, and a query never accepts a cut
+older than its own deadline bound. The cache is not trusted for correctness:
+the statement also returns each table's per-node publication revisions from
+`vala.bifrost_table_publication_revisions`, which a `vala.file_list` insert
+trigger advances in the publishing transaction, and live-source selection
+validates the cached cut against the revisions Scribes report. A warm query
+therefore issues no catalog statement. An identical replay inserts no row and
+advances nothing, a rolled-back publication leaves the revision unchanged,
+and a restarted Scribe loads its node's revisions before serving captures. Oracle
 then reads the selected metadata documents directly and concurrently; a
 document missing after a catalog move reacquires the whole cut once, and a
 second `NotFound` is terminal. All of this waits within the leader deadline,
@@ -919,7 +937,8 @@ Every query carries one execution profile, the analog of `ClickHouse`
 `ProfileEvents`. The leader's own steps — `cut_read`, `cut_materialize`,
 `scribe_listing`, `provider_setup`, `physical_planning`, `admission`, and
 `audit_bind` — are `DataFusion` `Time` metrics timed with
-the same scoped guards operators use, and every operator of the executed root
+the same scoped guards operators use, `selection_retries` counts selections
+discarded by validation, and every operator of the executed root
 contributes its own `DataFusion` metrics. The profile is emitted once, after
 the leader settles every descendant fragment, as `oracle_query_profile_nanoseconds_total{event}`,
 `oracle_query_profile_count_total{event}`, and `oracle_query_profiles_total`,

@@ -59,10 +59,12 @@ Every Oracle query, including a Verifier's, pins one published cut across the
 selected Iceberg snapshot and committed hot objects, then discovers relevant
 online Scribes for live rows. It never opens another node's local staged files
 and does not query WAL in normal operation. The request has no source or
-freshness selector. A successful result includes the selected online live
-sources but may omit or duplicate rows during publication overlap; known live
-loss before rows yields a degraded result. The same tradeoff applies to
-verification judgments.
+freshness selector. Each online Scribe retains a live capture for the query;
+each capture reports its Scribe's latest completed publication revision, and
+Oracle evicts and repins a cached cut older than any report before execution, so a successful result returns each selected
+row once across publication. A capture lost after acceptance fails the query;
+a Scribe whose streams cannot be listed yields a degraded result. The same
+guarantee applies to verification judgments.
 
 Oracle runs the pinned `datafusion-distributed` planner once. A normal
 DataFusion physical root selects the interactive admission and terminal path;

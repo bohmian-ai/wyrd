@@ -1,7 +1,7 @@
 //! Judges each measured step against AC-009 and renders the report.
 //!
 //! A direct `verify` row is PASS or FAIL: the server's verification
-//! overhead p99 strictly under 1 ms from at least [`MIN_SAMPLES`]
+//! overhead p99 at or under 500 µs from at least [`MIN_SAMPLES`]
 //! observations, with no refusal, no wrong verdict, and peak server memory
 //! below the limit less [`MEMORY_HEADROOM_BYTES`]. A `submit` row only
 //! reports its latencies (`-`), and fails only on a refusal, a backlog that
@@ -23,9 +23,9 @@ use crate::verification::run::{
 /// stay below the server's memory limit less this.
 const MEMORY_HEADROOM_BYTES: u64 = 1 << 30;
 
-/// Direct overhead p99 every direct window must stay strictly under; a p99
-/// in the `le="0.001"` bucket cannot prove it.
-const P99_LIMIT_SECONDS: f64 = 0.001;
+/// Direct overhead p99 every direct window must stay at or under; a p99 in
+/// the `le="0.0005"` bucket proves it and any higher bucket cannot.
+const P99_LIMIT_SECONDS: f64 = 0.0005;
 
 /// Direct overhead observations a window needs before its p99 judges.
 const MIN_SAMPLES: f64 = 1_000.0;
@@ -245,7 +245,7 @@ impl Report {
 
 /// Why a direct window fails: any refusal or wrong verdict, memory near the
 /// limit, fewer than [`MIN_SAMPLES`] overhead observations, or an overhead
-/// p99 bucket bound not strictly under [`P99_LIMIT_SECONDS`].
+/// p99 bucket bound above [`P99_LIMIT_SECONDS`].
 fn direct_miss(measured: &Measured, memory_limit: u64) -> Option<String> {
     let overhead = measured.usage.telemetry.histogram((OVERHEAD, &[DIRECT]));
     let p99 = overhead.percentiles().p99;
@@ -256,8 +256,8 @@ fn direct_miss(measured: &Measured, memory_limit: u64) -> Option<String> {
                 overhead.count
             ))
         } else {
-            p99.is_none_or(|p99| p99 >= P99_LIMIT_SECONDS)
-                .then(|| format!("overhead p99 <= {} ms is not < 1 ms", bound_ms(p99)))
+            p99.is_none_or(|p99| p99 > P99_LIMIT_SECONDS)
+                .then(|| format!("overhead p99 <= {} ms exceeds 0.5 ms", bound_ms(p99)))
         }
     })
 }
@@ -370,9 +370,9 @@ mod tests {
         }
     }
 
-    /// A direct window passes only with p99 overhead strictly under 1 ms from
-    /// at least 1,000 samples and no refusal or wrong verdict; p95 is
-    /// reported, never judged.
+    /// A direct window passes only with p99 overhead at or under 500 µs from
+    /// at least 1,000 samples and no refusal or wrong verdict; the next
+    /// histogram bucket above 500 µs fails, and p95 is reported, never judged.
     ///
     /// # Panics
     ///
@@ -382,15 +382,15 @@ mod tests {
         assert_eq!(
             direct_miss(&window(1_000.0, 0.0009, 5.0), LIMIT),
             None,
-            "p99 under 0.9 ms passes"
+            "p99 in le=0.0005 passes"
         );
         assert!(
             direct_miss(&window(999.0, 0.0009, 0.0), LIMIT).is_some(),
             "999 samples cannot judge"
         );
         assert!(
-            direct_miss(&window(1_000.0, 0.001, 20.0), LIMIT).is_some(),
-            "p99 in le=0.001 fails"
+            direct_miss(&window(1_000.0, 0.0009, 20.0), LIMIT).is_some(),
+            "p99 in le=0.0009, the next bucket, fails"
         );
         assert!(
             direct_miss(&Measured::default(), LIMIT).is_some(),

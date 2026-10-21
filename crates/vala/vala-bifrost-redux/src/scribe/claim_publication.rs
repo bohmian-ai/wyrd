@@ -110,7 +110,8 @@ impl ClaimPublisher {
         self.hot_sources = Some(hot_sources);
     }
 
-    /// Moves every published member's authority to the committed hot objects.
+    /// Moves every published member's authority to the committed hot objects
+    /// and raises the table's reported revision to `publication_revision`.
     ///
     /// This runs between the fenced commit and retirement, and the order is
     /// what makes retirement safe: once a member is `Published` no further
@@ -127,6 +128,7 @@ impl ClaimPublisher {
         &self,
         request: &PublishClaimRequest<'_>,
         object_identities: &[String],
+        publication_revision: i64,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -159,10 +161,127 @@ impl ClaimPublisher {
             })
             .collect::<Vec<_>>();
         hot_sources
-            .advance_all_atomic(&seal_key, &transitions)
+            .advance_all_atomic(&seal_key, &transitions, publication_revision)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("move complete claim authority to its hot objects: {error}"),
             })
+    }
+
+    /// Raises the registry's reported publication revisions to every one
+    /// this node has committed.
+    ///
+    /// Runs where a commit's revision was never advanced in memory: at boot,
+    /// before captures are served, and when a committed claim is finished
+    /// from its durable records. Without it a capture would stop serving the
+    /// committed generations while still reporting a revision a cut lacking
+    /// their rows satisfies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the read fails or the registry lock is
+    /// poisoned.
+    pub(crate) async fn restore_publication_revisions(&self) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let revisions = self.reconciler.node_publication_revisions().await?;
+        hot_sources
+            .restore_publication_revisions(revisions)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("restore this node's publication revisions: {error}"),
+            })
+    }
+
+    /// Reports whether any of `claim`'s generations is still registered
+    /// under an authority other than `Published`.
+    ///
+    /// Such a commit never ran [`Self::advance_published`], so its revision
+    /// was never raised in memory and must be read before the generations
+    /// are released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry lock is poisoned.
+    fn missed_published_advance(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(false);
+        };
+        let key = claim.key();
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        for member in claim.members() {
+            let authority = hot_sources
+                .authority(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(
+                        member.id().shard(),
+                        member.id().generation(),
+                    ),
+                )
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("read a committed claim member's authority: {error}"),
+                })?;
+            if authority.is_some_and(|authority| {
+                !matches!(
+                    authority,
+                    crate::scribe::hot_source::HotAuthority::Published { .. }
+                )
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Marks, or with `begin` false clears, the claim's generations as
+    /// possibly committed in the catalog.
+    ///
+    /// Marked immediately before the fenced commit is attempted, so no live
+    /// capture can lease the members' staged runs while the catalog may
+    /// already serve the same rows. The advance to `Published` clears the
+    /// mark; a commit known not to have landed clears it here; an outcome
+    /// that stays unknown leaves it set until recovery settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the mark,
+    /// which means a member's generation is unknown to it.
+    fn mark_publication(
+        &self,
+        request: &PublishClaimRequest<'_>,
+        begin: bool,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let key = request.claim.key();
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        let generations: Vec<_> = request
+            .claim
+            .members()
+            .iter()
+            .map(|member| {
+                crate::scribe::hot_source::GenerationOrdinal::new(
+                    member.id().shard(),
+                    member.id().generation(),
+                )
+            })
+            .collect();
+        if begin {
+            hot_sources.begin_publication(&seal_key, &generations)
+        } else {
+            hot_sources.abandon_publication(&seal_key, &generations)
+        }
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("mark the claim's publication in the authority registry: {error}"),
+        })
     }
 
     /// Releases one published member's authority from the pod registry.
@@ -329,9 +448,13 @@ impl ClaimPublisher {
                 &claims,
             )
             .await?;
+        self.mark_publication(&request, true)?;
         let (outcome, ambiguity) = match self.reconciler.publish(&rows).await {
             ScribePublicationOutcome::Committed(outcome) => (outcome, None),
-            ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+            ScribePublicationOutcome::KnownNotCommitted(error) => {
+                self.mark_publication(&request, false)?;
+                return Err(error);
+            }
             ScribePublicationOutcome::UnknownCommitOutcome(error) => {
                 // The transaction may already hold these rows. Leaving that
                 // undecided is the one outcome this pod cannot carry: a
@@ -346,13 +469,15 @@ impl ClaimPublisher {
                     ScribePublicationOutcome::Committed(outcome) => {
                         (outcome, Some(error.to_string()))
                     }
+                    // The retry is replay-exact, so its refusal settles
+                    // nothing about the first attempt: the mark stays.
                     ScribePublicationOutcome::UnknownCommitOutcome(_)
                     | ScribePublicationOutcome::KnownNotCommitted(_) => return Err(error),
                 }
             }
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
-        self.advance_published(&request, &object_identities)?;
+        self.advance_published(&request, &object_identities, outcome.publication_revision)?;
         self.retire_members(&request, &outcome.commit_key, &object_identities, &records)
             .await?;
         self.mover.cleanup_published(&claims).await?;
@@ -597,6 +722,9 @@ impl ClaimPublisher {
                     stranded.state().label()
                 ),
             });
+        }
+        if self.missed_published_advance(claim)? {
+            self.restore_publication_revisions().await?;
         }
         let surviving = surviving.iter().collect::<Vec<_>>();
         self.recover_terminal_members(key, &surviving).await?;

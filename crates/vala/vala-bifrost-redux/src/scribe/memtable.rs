@@ -748,32 +748,6 @@ impl Memtable {
         Ok(buckets.keys().cloned().collect())
     }
 
-    /// Returns, for one tenant table, every live bucket or generation's
-    /// partition with the bytes `scope` reads from it.
-    ///
-    /// The bucket and generation selection is the live read's own
-    /// ([`Self::readable_sources`]), so a listing sizes exactly what the read
-    /// later scans. Each batch is pruned by its recorded bounds against the
-    /// scope's filters and a kept batch counts its covered Arrow bytes; a
-    /// source whose batches are all pruned still reports with zero bytes,
-    /// because its partition is still live. The result may repeat a partition;
-    /// the caller sums per partition.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
-    pub fn live_bytes_for_table(
-        &self,
-        tenant: DataTenantId,
-        table: &crate::catalog::TableRef,
-        scope: &crate::scan_sizing::ScanScope,
-    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
-        Ok(self
-            .readable_sources(tenant, table, None)?
-            .iter()
-            .map(|source| (source.partition_day, source.scoped_bytes(scope)))
-            .collect())
-    }
-
     /// Snapshot age-expired buckets held by this shard's memtable.
     ///
     /// Under batch-spread routing a shard may hold buckets for any (tenant,
@@ -871,6 +845,7 @@ impl Memtable {
     ///
     /// Returns [`ScribeError::Internal`] when the requested range is inverted,
     /// or when locks, column selection, or Arrow projection fail.
+    #[cfg(test)]
     pub(crate) fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
@@ -909,6 +884,7 @@ impl Memtable {
     ///
     /// Returns an internal error when locks, column selection, or Arrow
     /// projection fail.
+    #[cfg(test)]
     fn collect_readable_batches(
         &self,
         tenant: DataTenantId,
@@ -933,25 +909,52 @@ impl Memtable {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
+    #[cfg(test)]
     fn readable_sources(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
         partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
     ) -> Result<Vec<ReadableSource>, ScribeError> {
-        let selects = |seal_key: &SealKey| {
-            seal_key.tenant == tenant
-                && seal_key.table == *table
-                && partitions.is_none_or(|range| range.contains(&seal_key.partition))
-        };
+        let guards = self.read_guards()?;
+        let mut sources = Vec::new();
+        self.select_sources(&guards, tenant, table, partitions, &mut sources);
+        drop(guards);
+        Ok(sources)
+    }
+
+    /// Read-locks both maps, writable first, the order freeze locks them in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
+    fn read_guards(&self) -> Result<MemtableReadGuards<'_>, ScribeError> {
         let writable = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
         let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut sources = Vec::new();
+        Ok((writable, immutable))
+    }
 
+    /// Appends the live-selection rule's sources under `guards` to `sources`.
+    ///
+    /// Every writable bucket and every immutable generation not yet
+    /// [`ImmutableState::Durable`] is captured by reference.
+    fn select_sources(
+        &self,
+        (writable, immutable): &MemtableReadGuards<'_>,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+        partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
+        sources: &mut Vec<ReadableSource>,
+    ) {
+        let selects = |seal_key: &SealKey| {
+            seal_key.tenant == tenant
+                && seal_key.table == *table
+                && partitions.is_none_or(|range| range.contains(&seal_key.partition))
+        };
         for (seal_key, bucket) in writable.iter() {
             if selects(seal_key) {
                 sources.push(bucket.readable_source());
@@ -973,9 +976,6 @@ impl Memtable {
                 }
             }
         }
-        drop(immutable);
-        drop(writable);
-        Ok(sources)
     }
 
     /// Return all readable batches for a table, preserving the old unit-test
@@ -1657,12 +1657,214 @@ impl FrozenMemtable {
     }
 }
 
+/// Both memtable maps, read-locked together for one consistent selection.
+type MemtableReadGuards<'a> = (
+    std::sync::RwLockReadGuard<'a, HashMap<SealKey, MemtableBucket>>,
+    std::sync::RwLockReadGuard<'a, HashMap<SealKey, Vec<ImmutableEntry>>>,
+);
+
+/// One coherent whole-table live capture over a pod's memtables and staged
+/// runs.
+///
+/// Taken while every memtable's maps are read-locked, with the staged half
+/// leased in the same registry critical section that decides which memory
+/// generations stay readable. A freeze must write-lock the memtable it
+/// detaches from, so no row can move from a writable bucket to staged runs
+/// between the two halves, and each generation is served by exactly one of
+/// its memory copy, its staged runs, or a published object. The capture keeps
+/// its batches by reference and its staged runs leased until the last holder
+/// drops it; each read filters and projects it without re-reading live state.
+#[derive(Debug)]
+pub(crate) struct LiveCapture {
+    /// Memory sources the capture serves, in memtable order.
+    memory: Vec<ReadableSource>,
+    /// Lease over the staged members the memory half did not serve.
+    staged: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+    /// Revision of this node's last locally completed publication of the
+    /// table, read with the staged boundary; 0 without a registry.
+    publication_revision: i64,
+}
+
+impl LiveCapture {
+    /// Captures one tenant table across `memtables` and `registry`.
+    ///
+    /// Returns `None`, holding nothing, while the registry refuses the table
+    /// because a publication outcome is unsettled (see
+    /// [`crate::scribe::hot_source::ScribeHotSourceRegistry::capture_staged`]).
+    /// Without a registry there is no staged boundary and the capture is the
+    /// memory half alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a memtable lock or the registry
+    /// lock is poisoned.
+    pub(crate) fn take<'a>(
+        memtables: impl IntoIterator<Item = &'a Memtable>,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+        registry: Option<&Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
+    ) -> Result<Option<Self>, ScribeError> {
+        let memtables: Vec<&Memtable> = memtables.into_iter().collect();
+        let guards = memtables
+            .iter()
+            .map(|memtable| memtable.read_guards())
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut memory = Vec::new();
+        for (memtable, guards) in memtables.iter().zip(&guards) {
+            memtable.select_sources(guards, tenant, table, None, &mut memory);
+        }
+        #[cfg(test)]
+        if let Some(hook) = CAPTURE_SELECTED.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        let mut publication_revision = 0;
+        let staged = if let Some(registry) = registry {
+            let served = memory
+                .iter()
+                .filter_map(|source| source.generation.map(|g| (source.partition_day, g)))
+                .collect();
+            let Some(capture) =
+                registry
+                    .capture_staged(tenant, table, &served)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("capture the staged members of a live-tail read: {error}"),
+                    })?
+            else {
+                return Ok(None);
+            };
+            memory.retain(|source| {
+                source.generation.is_none_or(|generation| {
+                    !capture
+                        .superseded
+                        .contains(&(source.partition_day, generation))
+                })
+            });
+            publication_revision = capture.publication_revision;
+            Some(Arc::new(capture.lease))
+        } else {
+            None
+        };
+        drop(guards);
+        Ok(Some(Self {
+            memory,
+            staged,
+            publication_revision,
+        }))
+    }
+
+    /// Returns the revision of this node's last locally completed
+    /// publication of the table as of the capture.
+    ///
+    /// The Oracle compares it against its cut: a higher revision means the
+    /// cut predates a publication whose rows the capture no longer serves.
+    pub(crate) fn publication_revision(&self) -> i64 {
+        self.publication_revision
+    }
+
+    /// Reports whether the capture holds no memory source and no staged run.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.memory.is_empty()
+            && self
+                .staged
+                .as_ref()
+                .is_none_or(|lease| lease.sources().is_empty())
+    }
+
+    /// Returns each captured partition once, sorted, with the bytes `scope`
+    /// reads from its memory batches and staged-run row groups.
+    pub(crate) fn partition_bytes(
+        &self,
+        scope: &crate::scan_sizing::ScanScope,
+    ) -> Vec<(crate::catalog::layout::TimePartition, u64)> {
+        let mut partitions =
+            std::collections::BTreeMap::<crate::catalog::layout::TimePartition, u64>::new();
+        let memory = self
+            .memory
+            .iter()
+            .map(|source| (source.partition_day, source.scoped_bytes(scope)));
+        let staged = self.staged.iter().flat_map(|lease| {
+            lease
+                .sources()
+                .iter()
+                .map(|source| (source.key.partition, source.footers.scoped_bytes(scope)))
+        });
+        for (partition, bytes) in memory.chain(staged) {
+            let total = partitions.entry(partition).or_default();
+            *total = total.saturating_add(bytes);
+        }
+        partitions.into_iter().collect()
+    }
+
+    /// Reads one partition range of the capture: its memory batches projected
+    /// to `required_columns`, its staged run paths in merge order, and the
+    /// lease that keeps those runs on disk.
+    ///
+    /// The caller must hold the returned lease for as long as it reads any
+    /// returned run path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the column-selection error unchanged, or an internal error
+    /// when Arrow projection fails.
+    pub(crate) fn read(
+        &self,
+        partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
+        required_columns: &[String],
+    ) -> Result<CapturedRead, ScribeError> {
+        let mut batches = Vec::new();
+        for source in &self.memory {
+            if partitions.contains(&source.partition_day) {
+                source.project(required_columns, &mut batches)?;
+            }
+        }
+        let runs = self
+            .staged
+            .iter()
+            .flat_map(|lease| lease.sources())
+            .filter(|source| partitions.contains(&source.key.partition))
+            .flat_map(|source| source.runs.iter().cloned())
+            .collect();
+        Ok(CapturedRead {
+            batches,
+            runs,
+            lease: self.staged.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot hook run by [`LiveCapture::take`] on this thread between its
+    /// memory selection and its staged lease, with every guard still held.
+    static CAPTURE_SELECTED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms `hook` to run inside the next capture taken on this thread, at the
+/// point a concurrent rollover would split its memory and staged halves.
+#[cfg(test)]
+pub(crate) fn on_capture_selected_for_test(hook: Box<dyn FnOnce()>) {
+    CAPTURE_SELECTED.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+/// One partition range read from a [`LiveCapture`].
+#[derive(Debug)]
+pub(crate) struct CapturedRead {
+    /// Memory batches projected to the read's columns.
+    pub(crate) batches: Vec<ReadableBatch>,
+    /// Staged run paths, in merge order.
+    pub(crate) runs: Vec<std::path::PathBuf>,
+    /// Lease keeping `runs` on disk while the read holds it.
+    pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+}
+
 /// One bucket's or generation's batches, captured under the memtable read
 /// locks and projected only after they are released.
 ///
 /// Capturing copies reference-counted batches and bounds and each append's
 /// WAL position, never row data, so the locks are held for a few pointer
 /// copies per batch.
+#[derive(Debug)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.
     schema: SchemaRef,
@@ -1713,12 +1915,17 @@ impl ReadableSource {
     /// Returns the column-selection error unchanged, or an internal error
     /// when Arrow projection fails.
     fn project(
-        self,
+        &self,
         required_columns: &[String],
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
-        for (index, (batch, wal_lsn_max)) in self.batches.iter().zip(self.wal_lsns).enumerate() {
+        for (index, (batch, wal_lsn_max)) in self
+            .batches
+            .iter()
+            .zip(self.wal_lsns.iter().copied())
+            .enumerate()
+        {
             let batch = batch
                 .project(&projection)
                 .map_err(|error| ScribeError::Internal {

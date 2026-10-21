@@ -1308,6 +1308,27 @@ impl PersistenceRuntime {
             .await
     }
 
+    /// Raises the hot-source registry's reported publication revisions to
+    /// every one this node committed in an earlier process.
+    ///
+    /// Runs before WAL replay opens readiness, so no capture that omits a
+    /// restored `Published` generation reports a revision older than the
+    /// commit that published it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the revisions cannot be read.
+    pub(crate) async fn restore_publication_revisions(&self) -> Result<(), ScribeError> {
+        let Some(staging) = self
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.staging.as_ref())
+        else {
+            return Ok(());
+        };
+        staging.restore_publication_revisions().await
+    }
+
     /// Resumes every durable claimed or publishing claim before readiness.
     ///
     /// Publication-manifest recovery runs first, so this driver either replays
@@ -1819,6 +1840,22 @@ impl ScribePublicationReconciler {
             #[cfg(any(test, feature = "test-support"))]
             faults,
         }
+    }
+
+    /// Reads every table publication revision this node has committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the read fails.
+    pub(crate) async fn node_publication_revisions(
+        &self,
+    ) -> Result<Vec<((wyrd_spec::DataTenantId, crate::catalog::TableRef), i64)>, ScribeError> {
+        file_list_writer::node_publication_revisions(
+            &self.operator_pool,
+            self.actor_stream.node_id.as_uuid(),
+        )
+        .await
+        .map_err(ScribeError::from)
     }
 
     /// Reports whether the test fault injector refuses the next claim

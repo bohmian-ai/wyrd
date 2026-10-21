@@ -31,7 +31,6 @@ use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, Pr
 use crate::scribe::profile::GroupStages;
 use crate::scribe::routing::shard_for;
 use crate::scribe::stream_identity::StreamIdentity;
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
 use crate::scribe::wal::{WalHandle, WalWriter};
 
 type WalSegmentsByKey = HashMap<
@@ -903,28 +902,20 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
-    /// Returns every live partition of one tenant table, per memtable source,
-    /// with the bytes `scope` reads from it.
+    /// Returns every shard's memtable for one coherent live capture.
     ///
-    /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
-    /// rows. An owner inserts rows before it acknowledges them but republishes
-    /// its inspection snapshot only afterwards, so discovery from published
-    /// snapshots could omit the partition of an already acknowledged write.
-    /// Only `table`'s sources are collected; the caller sums per partition.
+    /// A capture reads the memtables directly instead of asking the shard
+    /// owners, so a query never waits behind an owner's queued writes. An
+    /// owner inserts rows before it acknowledges them, so every acknowledged
+    /// row is visible to a capture taken after the acknowledgement.
     ///
     /// # Errors
-    /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
-    pub(crate) fn active_live_bytes_for_table(
-        &self,
-        tenant: DataTenantId,
-        table: &crate::catalog::TableRef,
-        scope: &crate::scan_sizing::ScanScope,
-    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
-        let mut partitions = Vec::new();
-        for memtable in &self.memtables {
-            partitions.extend(memtable.live_bytes_for_table(tenant, table, scope)?);
+    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down.
+    pub(crate) fn memtables(&self) -> Result<&[Arc<Memtable>], ScribeError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ScribeError::IngressClosed);
         }
-        Ok(partitions)
+        Ok(&self.memtables)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.
@@ -1151,47 +1142,6 @@ impl ScribeShardRuntime {
             });
         }
         Ok(())
-    }
-
-    /// Reads every shard's readable memtable rows for one live-tail request.
-    ///
-    /// Reads the memtables directly instead of asking the shard owners, so a
-    /// query never waits behind an owner's queued writes. Each memtable read
-    /// holds both of its maps for one consistent cut, and an owner inserts rows
-    /// before it acknowledges them, so every acknowledged row is visible. The
-    /// result is one flat list of per-partition-day batches in shard order.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down,
-    /// or the memtable error when a projection cannot be read.
-    pub(crate) fn snapshot(
-        &self,
-        request: &FetchLiveTailRequest,
-    ) -> Result<Vec<HotBatch>, ScribeError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(ScribeError::IngressClosed);
-        }
-        let mut merged = Vec::new();
-        for memtable in &self.memtables {
-            merged.extend(
-                memtable
-                    .readable_batches_for_range(
-                        request.binding.tenant,
-                        &request.binding.table_ref,
-                        request.start_partition,
-                        request.end_partition,
-                        &request.required_columns,
-                    )?
-                    .into_iter()
-                    .map(|readable| HotBatch {
-                        partition_day: readable.partition_day,
-                        generation: readable.generation,
-                        rows: readable.batch,
-                        statistics: readable.statistics,
-                    }),
-            );
-        }
-        Ok(merged)
     }
 
     /// Queue one age/pressure flush request per fixed shard owner.

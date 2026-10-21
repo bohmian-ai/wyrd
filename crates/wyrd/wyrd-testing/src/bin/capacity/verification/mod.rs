@@ -16,7 +16,7 @@
 //!
 //! 1. Direct `verify`: judged on the server's verification overhead (the
 //!    request's arrival until its result is staged, less the Verifier's own
-//!    blocks) p99 strictly under 1 ms; reports the Verifier's time, the
+//!    blocks) p99 at or under 500 µs; reports the Verifier's time, the
 //!    phases, and what the client adds.
 //! 2. Background `submit`: reported only: submit time, queue wait, the queued
 //!    run's overhead and Verifier time, trigger to terminal, throughput, and

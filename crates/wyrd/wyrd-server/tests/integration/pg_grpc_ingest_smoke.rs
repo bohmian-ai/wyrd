@@ -153,6 +153,11 @@ fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
 fn list_request(binding: TenantTableBinding) -> Request<ListActiveStreamsRequest> {
     Request::new(ListActiveStreamsRequest {
         binding: Some(binding.into()),
+        query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        expires_at_unix_ms: u64::try_from(
+            (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
+        )
+        .expect("a future deadline is positive"),
         ..Default::default()
     })
 }
@@ -769,9 +774,15 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
         connect_peer_channel(bind, &authority).await,
     ));
     let streams = remote
-        .list_active_streams(tail_binding(tenant), &ScanScope::default())
+        .list_active_streams(
+            tail_binding(tenant),
+            &ScanScope::default(),
+            uuid::Uuid::new_v4(),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+        )
         .await
-        .expect("authorized discovery lists the seeded partition");
+        .expect("authorized discovery lists the seeded partition")
+        .streams;
     assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");
     assert_eq!(
         streams[0].stream.node_id.as_uuid(),

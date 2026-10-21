@@ -396,7 +396,7 @@ impl Report {
             measured.percentile_ms(95.0),
             measured.percentile_ms(99.0),
         ) {
-            (Some(p50), Some(p95), Some(p99)) => format!("{p50:.1}/{p95:.1}/{p99:.1}"),
+            (Some(p50), Some(p95), Some(p99)) => format!("{p50:.3}/{p95:.3}/{p99:.3}"),
             _ => "-".to_owned(),
         };
         let errors = if measured.errors.is_empty() {
@@ -508,8 +508,14 @@ fn missed(target: &Target, measured: &Measured) -> Option<String> {
         if let Some(ceiling) = ceiling {
             let actual = measured.percentile_ms(percentile).unwrap_or(f64::INFINITY);
             if actual >= ceiling {
-                return Some(format!("{name} {actual:.1} ms >= {ceiling} ms"));
+                return Some(format!("{name} {actual:.3} ms >= {ceiling} ms"));
             }
+        }
+    }
+    if let Some(limit) = target.p99_at_most_ms {
+        let actual = measured.percentile_ms(99.0).unwrap_or(f64::INFINITY);
+        if actual > limit {
+            return Some(format!("p99 {actual:.3} ms > {limit} ms"));
         }
     }
     if let Some(floor) = target.min_qps
@@ -574,11 +580,11 @@ mod tests {
     use crate::query::workload::{Case, Fixture};
     use num_traits::ToPrimitive;
 
-    /// A point with the selective latencies and rate.
-    fn point(clients: usize, latency_ms: u64, queries: u64) -> Measured {
+    /// A point with `queries` requests of `latency_us` each in one second.
+    fn point(clients: usize, latency_us: u64, queries: u64) -> Measured {
         Measured {
             clients,
-            latencies_us: vec![latency_ms * 1_000; queries.to_usize().unwrap_or(0)],
+            latencies_us: vec![latency_us; queries.to_usize().unwrap_or(0)],
             usage: Usage {
                 seconds: 1.0,
                 ..Usage::default()
@@ -587,9 +593,9 @@ mod tests {
         }
     }
 
-    /// A selective sweep passes on one-client latency plus its busiest
-    /// point's rate, a small-aggregate sweep when one point meets the whole
-    /// target, and an error fails a row whatever its latency.
+    /// A selective sweep passes on one-client p99 at or under 1,000 µs plus
+    /// its busiest point's rate, a small-aggregate sweep when one point meets
+    /// the whole target, and an error fails a row whatever its latency.
     ///
     /// # Panics
     ///
@@ -599,26 +605,50 @@ mod tests {
         let mut report = Report::new(Fixture::standard(), "test host".to_owned(), 16 << 30);
         report.sweep(
             Case::Selective,
-            &[point(1, 5, 150), point(16, 12, 1_300), point(64, 90, 1_280)],
+            &[
+                point(1, 999, 150),
+                point(16, 12_000, 1_300),
+                point(64, 90_000, 1_280),
+            ],
         );
         assert_eq!(report.rows[3].verdict, Verdict::Pass);
         assert_eq!(
             report.rows[3].reason,
             "latency met at 1 client; peak 1300.0 qps at 16 clients"
         );
-        report.sweep(Case::Selective, &[point(1, 8, 150), point(16, 12, 1_300)]);
-        assert_eq!(report.rows[6].reason, "1 client: p50 8.0 ms >= 7 ms");
-        report.sweep(Case::Selective, &[point(1, 5, 150), point(16, 12, 1_000)]);
-        assert_eq!(report.rows[9].reason, "peak 1000.0 qps < 1200");
+        report.sweep(
+            Case::Selective,
+            &[point(1, 1_000, 150), point(16, 12_000, 1_300)],
+        );
+        assert_eq!(report.rows[6].verdict, Verdict::Pass, "1,000 µs passes");
+        report.sweep(
+            Case::Selective,
+            &[point(1, 1_001, 150), point(16, 12_000, 1_300)],
+        );
+        assert_eq!(report.rows[9].reason, "1 client: p99 1.001 ms > 1 ms");
+        report.sweep(
+            Case::Selective,
+            &[point(1, 1_000, 150), point(16, 12_000, 1_000)],
+        );
+        assert_eq!(report.rows[12].reason, "peak 1000.0 qps < 1200");
         report.sweep(
             Case::SmallAggregate,
-            &[point(1, 10, 90), point(4, 15, 270), point(64, 180, 370)],
+            &[
+                point(1, 10_000, 90),
+                point(4, 15_000, 270),
+                point(64, 180_000, 370),
+            ],
         );
-        assert_eq!(report.rows[13].reason, "met at 4 clients");
+        assert_eq!(report.rows[16].reason, "met at 4 clients");
+        report.sweep(Case::SmallAggregate, &[point(4, 100_000, 270)]);
+        assert_eq!(
+            report.rows[17].reason, "p95 100.000 ms >= 100 ms",
+            "other ceilings stay strict"
+        );
         report.rows.retain(|row| row.verdict != Verdict::Fail);
         assert!(report.passed());
 
-        let mut failing = point(1, 100, 10);
+        let mut failing = point(1, 100_000, 10);
         failing.errors.insert("wrong-result".to_owned(), 1);
         report.query(Case::TableAggregate, &failing);
         assert_eq!(

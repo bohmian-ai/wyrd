@@ -152,6 +152,12 @@ pub struct PinnedSealedTable {
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
     pub estimated_bytes: u64,
+    /// The table's publication revision per Scribe node, read in the same
+    /// statement snapshot as `hot_files`; a node absent here has revision 0.
+    ///
+    /// Oracle compares it with the revision each Scribe reports with its live
+    /// capture and keeps the selection only when no Scribe reports more.
+    pub publication_revisions: std::collections::HashMap<uuid::Uuid, i64>,
 }
 
 /// Immutable file metadata retained from one pinned Iceberg manifest entry.
@@ -449,6 +455,23 @@ impl BifrostCatalog {
         self.cut_cache.watch(self.postgres.pool(), shutdown).await;
     }
 
+    /// Drops `table`'s cached cut so the next read reaches Postgres.
+    ///
+    /// Oracle calls it when a captured Scribe reports a publication revision
+    /// above the cut's: that cut predates rows the Scribe no longer serves
+    /// live. A table that cannot be bound has no cached cut and is ignored.
+    pub fn evict_cut(&self, tenant: DataTenantId, table: &TableRef) {
+        if let Ok(binding) = TenantTableBinding::resolve((tenant, table.clone())) {
+            self.cut_cache.evict(
+                tenant,
+                &CutTableRef {
+                    namespace_name: &binding.logical_namespace,
+                    table_name: &binding.table_name,
+                },
+            );
+        }
+    }
+
     /// Materializes one table of a read cut.
     ///
     /// Reads the exact metadata document the cut returned — from the
@@ -485,6 +508,7 @@ impl BifrostCatalog {
             ));
         }
         let table_uid = TableUid::from_bytes(acquired.identity.table_uid);
+        let publication_revisions = acquired.publication_revisions;
         let identifier = binding.table_ident();
         // A fault reads a document that does not exist, through the same
         // `FileIO`, so the reacquisition sees the production error shape.
@@ -556,6 +580,7 @@ impl BifrostCatalog {
             hot_files,
             hot_manifest_digest,
             estimated_bytes,
+            publication_revisions,
         })
     }
 

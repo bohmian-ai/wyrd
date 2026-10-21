@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 
+use crate::catalog::layout::TimePartition;
 use crate::scan_sizing::{ScanScope, ScanSizer};
 use crate::scribe::assembly::StagedMemberId;
 use crate::scribe::seal_key::SealKey;
@@ -258,6 +259,8 @@ pub struct StagedSource {
     pub runs: Vec<PathBuf>,
     /// Encoded bytes the runs occupy.
     pub bytes: u64,
+    /// Validated run footers, which size the member for one scan scope.
+    pub footers: RunFooters,
     /// Inclusive WAL bounds the member covers.
     pub wal: (WalLsn, WalLsn),
 }
@@ -316,7 +319,55 @@ struct KeyAuthorities {
     by_generation: HashMap<GenerationOrdinal, HotAuthority>,
     /// Readers currently holding each generation's staged runs open.
     leases: HashMap<GenerationOrdinal, usize>,
+    /// Generations whose publication may have committed in the catalog while
+    /// their authority here still names the staged runs.
+    ///
+    /// Marked before the fenced commit is attempted and cleared only once the
+    /// outcome is settled here: by the advance to `Published`, by release, or
+    /// by a commit known not to have landed. A capture refuses to read a table
+    /// while any of its generations is marked, because both the published
+    /// file and the staged runs may then serve the same rows.
+    publishing: std::collections::HashSet<GenerationOrdinal>,
 }
+
+impl KeyAuthorities {
+    /// Clears the publication marks of `generations`, reporting whether any
+    /// mark was removed.
+    fn settle(&mut self, generations: impl IntoIterator<Item = GenerationOrdinal>) -> bool {
+        let mut settled = false;
+        for generation in generations {
+            settled |= self.publishing.remove(&generation);
+        }
+        settled
+    }
+
+    /// Reports whether this key holds no generation and no publication mark.
+    fn is_empty(&self) -> bool {
+        self.by_generation.is_empty() && self.publishing.is_empty()
+    }
+}
+
+/// One coherent staged half of a live capture.
+///
+/// Taken in the same registry critical section that decides which memtable
+/// generations the capture may still read, so a generation is served by
+/// exactly one of its memory copy, its staged runs, or a published object.
+#[derive(Debug)]
+pub struct StagedCapture {
+    /// Lease over the staged members the memory half did not already serve.
+    pub lease: StagedSourceLease,
+    /// Memory-served generations whose authority is already a published
+    /// object; the capture must drop their memory copy.
+    pub superseded: std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
+    /// The table revision this node's last locally completed publication
+    /// committed at, read in the same critical section: every generation
+    /// the capture omits as published is covered by a cut at least this new.
+    pub publication_revision: i64,
+}
+
+/// Highest committed publication revision this node has advanced per tenant
+/// table.
+type PublicationRevisions = HashMap<(wyrd_spec::ids::DataTenantId, crate::catalog::TableRef), i64>;
 
 /// Pod-wide registry of where every live generation's rows are readable.
 #[derive(Debug, Default)]
@@ -325,6 +376,17 @@ pub struct ScribeHotSourceRegistry {
     state: Mutex<HashMap<SealKey, KeyAuthorities>>,
     /// Signalled whenever a lease is released, so cleanup can wait on it.
     released: tokio::sync::Notify,
+    /// Signalled whenever a publication mark is cleared, so a capture
+    /// refused by one can retry.
+    settled: tokio::sync::Notify,
+    /// Each table's revision as of this node's last locally completed
+    /// publication, never decreasing.
+    ///
+    /// Locked only while `state` is held, so a capture reads the revision
+    /// in the same critical section that decides which generations it
+    /// still serves, and an advance to `Published` raises it in the same
+    /// critical section that stops serving them.
+    revisions: Mutex<PublicationRevisions>,
 }
 
 impl ScribeHotSourceRegistry {
@@ -382,12 +444,16 @@ impl ScribeHotSourceRegistry {
         next: HotAuthority,
     ) -> Result<(), HotSourceError> {
         let mut state = self.lock()?;
-        let current = state
-            .get_mut(key)
-            .and_then(|authorities| authorities.by_generation.get_mut(&generation))
-            .ok_or(HotSourceError::Unregistered {
-                generation: generation.get(),
-            })?;
+        let authorities = state.get_mut(key).ok_or(HotSourceError::Unregistered {
+            generation: generation.get(),
+        })?;
+        let current =
+            authorities
+                .by_generation
+                .get_mut(&generation)
+                .ok_or(HotSourceError::Unregistered {
+                    generation: generation.get(),
+                })?;
         if next.stage() <= current.stage() {
             return Err(HotSourceError::Backwards {
                 generation: generation.get(),
@@ -395,16 +461,23 @@ impl ScribeHotSourceRegistry {
                 to: next.label(),
             });
         }
+        let published = matches!(next, HotAuthority::Published { .. });
         *current = next;
+        if published && authorities.settle([generation]) {
+            self.settled.notify_waiters();
+        }
         Ok(())
     }
 
-    /// Atomically advances every named generation under one seal key.
+    /// Atomically advances every named generation under one seal key, the
+    /// moves of one committed publication at `publication_revision`.
     ///
     /// The registry prevalidates the complete set while holding its one state
-    /// lock, then applies every move. An exact replay is idempotent; a missing
-    /// generation, backwards move, or same-stage identity contradiction leaves
-    /// the complete set unchanged.
+    /// lock, then applies every move and raises the table's revision to
+    /// `publication_revision` in the same critical section. An exact replay is
+    /// idempotent; a missing generation, backwards move, or same-stage
+    /// identity contradiction leaves the complete set and the revision
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -414,8 +487,10 @@ impl ScribeHotSourceRegistry {
         &self,
         key: &SealKey,
         transitions: &[(GenerationOrdinal, HotAuthority)],
+        publication_revision: i64,
     ) -> Result<(), HotSourceError> {
         let mut state = self.lock()?;
+        let mut revisions = self.lock_revisions()?;
         let authorities = state.get_mut(key).ok_or_else(|| {
             transitions.first().map_or(
                 HotSourceError::Unregistered { generation: 0 },
@@ -455,6 +530,85 @@ impl ScribeHotSourceRegistry {
             {
                 *current = next.clone();
             }
+        }
+        let revision = revisions
+            .entry((key.tenant, key.table.clone()))
+            .or_default();
+        *revision = (*revision).max(publication_revision);
+        drop(revisions);
+        let published = transitions
+            .iter()
+            .filter(|(_, next)| matches!(next, HotAuthority::Published { .. }))
+            .map(|(generation, _)| *generation);
+        if authorities.settle(published) {
+            self.settled.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// Marks generations whose fenced publication is about to be attempted.
+    ///
+    /// From this call until the outcome is settled here, the catalog may
+    /// already serve these generations' rows while their authority still
+    /// names the staged runs, so [`Self::capture_staged`] refuses their table.
+    /// The mark is cleared by the advance to `Published`, by release, or by
+    /// [`Self::abandon_publication`]; an unresolved outcome leaves it set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Unregistered`] when a generation is unknown,
+    /// which leaves no mark, and [`HotSourceError::Poisoned`] on a poisoned
+    /// lock.
+    pub fn begin_publication(
+        &self,
+        key: &SealKey,
+        generations: &[GenerationOrdinal],
+    ) -> Result<(), HotSourceError> {
+        let mut state = self.lock()?;
+        let unregistered = |generation: GenerationOrdinal| HotSourceError::Unregistered {
+            generation: generation.get(),
+        };
+        let authorities = state.get_mut(key).ok_or_else(|| {
+            generations.first().map_or(
+                HotSourceError::Unregistered { generation: 0 },
+                |generation| unregistered(*generation),
+            )
+        })?;
+        if let Some(missing) = generations
+            .iter()
+            .find(|generation| !authorities.by_generation.contains_key(generation))
+        {
+            return Err(unregistered(*missing));
+        }
+        authorities.publishing.extend(generations.iter().copied());
+        Ok(())
+    }
+
+    /// Clears publication marks for a commit known not to have landed.
+    ///
+    /// The staged runs remain the generations' only durable authority, so a
+    /// capture may read them again. Clearing an unmarked generation is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn abandon_publication(
+        &self,
+        key: &SealKey,
+        generations: &[GenerationOrdinal],
+    ) -> Result<(), HotSourceError> {
+        let mut state = self.lock()?;
+        let Some(authorities) = state.get_mut(key) else {
+            return Ok(());
+        };
+        let settled = authorities.settle(generations.iter().copied());
+        if authorities.is_empty() {
+            state.remove(key);
+        }
+        drop(state);
+        if settled {
+            self.settled.notify_waiters();
         }
         Ok(())
     }
@@ -497,8 +651,13 @@ impl ScribeHotSourceRegistry {
             .by_generation
             .remove(&generation)
             .unwrap_or(HotAuthority::Memtable);
-        if authorities.by_generation.is_empty() {
+        let settled = authorities.settle([generation]);
+        if authorities.is_empty() {
             state.remove(key);
+        }
+        drop(state);
+        if settled {
+            self.settled.notify_waiters();
         }
         Ok(released)
     }
@@ -564,8 +723,41 @@ impl ScribeHotSourceRegistry {
             return Ok(());
         };
         authorities.by_generation.remove(&generation);
-        if authorities.by_generation.is_empty() {
+        let settled = authorities.settle([generation]);
+        if authorities.is_empty() {
             state.remove(key);
+        }
+        drop(state);
+        if settled {
+            self.settled.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// Raises each table's revision to one an earlier process of this node
+    /// committed, before this process serves any capture.
+    ///
+    /// A restarted Scribe no longer holds the generations it published
+    /// before, so without this it would report a lower revision than a cut
+    /// that lacks those rows needs to be caught by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn restore_publication_revisions(
+        &self,
+        restored: impl IntoIterator<
+            Item = (
+                (wyrd_spec::ids::DataTenantId, crate::catalog::TableRef),
+                i64,
+            ),
+        >,
+    ) -> Result<(), HotSourceError> {
+        let _state = self.lock()?;
+        let mut revisions = self.lock_revisions()?;
+        for (table, publication_revision) in restored {
+            let revision = revisions.entry(table).or_default();
+            *revision = (*revision).max(publication_revision);
         }
         Ok(())
     }
@@ -674,91 +866,83 @@ impl ScribeHotSourceRegistry {
         }))
     }
 
-    /// Returns one tenant table's keys whose staged runs still own readable
-    /// rows, each with the bytes `scope` reads from those runs.
+    /// Takes the staged half of one coherent whole-table live capture.
     ///
-    /// Each member is sized by [`RunFooters::scoped_bytes`].
+    /// The caller holds the memory half's memtable read guards and passes the
+    /// immutable generations that half serves, keyed by partition. In one
+    /// registry critical section this then decides every generation's single
+    /// source: a served generation whose authority is already a published
+    /// object is reported as superseded so its memory copy is dropped; any
+    /// other served generation stays in memory and its staged runs are skipped;
+    /// and every unserved staged generation is leased. Sources are ordered by
+    /// partition and then generation so a reader scans rows in age order.
     ///
-    /// # Errors
-    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
-    pub(crate) fn staged_bytes_for_table(
-        &self,
-        tenant: wyrd_spec::ids::DataTenantId,
-        table: &crate::catalog::TableRef,
-        scope: &ScanScope,
-    ) -> Result<Vec<(SealKey, u64)>, HotSourceError> {
-        Ok(self
-            .lock()?
-            .iter()
-            .filter(|(key, _)| key.tenant == tenant && key.table == *table)
-            .filter_map(|(key, authorities)| {
-                let mut staged = authorities
-                    .by_generation
-                    .values()
-                    .filter_map(|authority| match authority {
-                        HotAuthority::StagedRun { footers, .. } => {
-                            Some(footers.scoped_bytes(scope))
-                        }
-                        _ => None,
-                    })
-                    .peekable();
-                staged.peek()?;
-                Some((key.clone(), staged.fold(0_u64, u64::saturating_add)))
-            })
-            .collect())
-    }
-
-    /// Returns every staged member readable for one table in a partition range.
-    ///
-    /// This is the read side of the staged boundary: a generation whose Arrow
-    /// has been released is served from exactly these runs until its claim
-    /// publishes. Results are ordered by partition and then generation so a
-    /// reader scans rows in age order, and a generation that is still memtable
-    /// or already published contributes nothing here — one authority per
-    /// generation, never two.
+    /// Returns `None`, leasing nothing, while any generation of the table is
+    /// marked by [`Self::begin_publication`]: its rows may then be served by
+    /// both a published file and its staged runs, and no choice between them
+    /// is provably right. The caller waits for [`Self::publication_settled`]
+    /// and captures again.
     ///
     /// # Errors
     ///
     /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
-    pub fn staged_sources(
-        self: &std::sync::Arc<Self>,
+    pub fn capture_staged(
+        self: &Arc<Self>,
         tenant: wyrd_spec::ids::DataTenantId,
         table: &crate::catalog::TableRef,
-        start: crate::catalog::layout::TimePartition,
-        end: crate::catalog::layout::TimePartition,
-    ) -> Result<StagedSourceLease, HotSourceError> {
+        served: &std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
+    ) -> Result<Option<StagedCapture>, HotSourceError> {
         let mut state = self.lock()?;
+        let publication_revision = self
+            .lock_revisions()?
+            .get(&(tenant, table.clone()))
+            .copied()
+            .unwrap_or(0);
+        let selected = |key: &SealKey| key.tenant == tenant && key.table == *table;
+        if state
+            .iter()
+            .any(|(key, authorities)| selected(key) && !authorities.publishing.is_empty())
+        {
+            return Ok(None);
+        }
         let mut sources = Vec::new();
-        let mut held = Vec::new();
+        let mut superseded = std::collections::HashSet::new();
         for (key, authorities) in state.iter() {
-            if key.tenant != tenant || key.table != *table {
-                continue;
-            }
-            if key.partition < start || key.partition > end {
+            if !selected(key) {
                 continue;
             }
             for (generation, authority) in &authorities.by_generation {
+                if served.contains(&(key.partition, *generation)) {
+                    if matches!(authority, HotAuthority::Published { .. }) {
+                        superseded.insert((key.partition, *generation));
+                    }
+                    continue;
+                }
                 let HotAuthority::StagedRun {
                     member,
                     runs,
                     bytes,
+                    footers,
                     wal,
-                    ..
                 } = authority
                 else {
                     continue;
                 };
-                held.push((key.clone(), *generation));
                 sources.push(StagedSource {
                     key: key.clone(),
                     generation: *generation,
                     member: *member,
                     runs: runs.clone(),
                     bytes: *bytes,
+                    footers: footers.clone(),
                     wal: *wal,
                 });
             }
         }
+        let held: Vec<_> = sources
+            .iter()
+            .map(|source| (source.key.clone(), source.generation))
+            .collect();
         for (key, generation) in &held {
             let authorities = state.entry(key.clone()).or_default();
             let count = authorities.leases.entry(*generation).or_default();
@@ -771,11 +955,23 @@ impl ScribeHotSourceRegistry {
                 .cmp(&right.key.partition)
                 .then(left.generation.cmp(&right.generation))
         });
-        Ok(StagedSourceLease {
-            registry: std::sync::Arc::clone(self),
-            held,
-            sources,
-        })
+        Ok(Some(StagedCapture {
+            lease: StagedSourceLease {
+                registry: Arc::clone(self),
+                held,
+                sources,
+            },
+            superseded,
+            publication_revision,
+        }))
+    }
+
+    /// Returns a future that completes once a publication mark is cleared.
+    ///
+    /// Create it before the capture attempt it follows: a mark cleared after
+    /// creation and before the first poll still completes it.
+    pub fn publication_settled(&self) -> tokio::sync::futures::Notified<'_> {
+        self.settled.notified()
     }
 
     /// Waits until no reader still holds one generation's staged runs open.
@@ -861,6 +1057,21 @@ impl ScribeHotSourceRegistry {
                 .values()
                 .all(HotAuthority::is_durable)
         }))
+    }
+
+    /// Locks the publication revisions; callers already hold `state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] when a previous holder panicked.
+    fn lock_revisions(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, PublicationRevisions>, HotSourceError> {
+        self.revisions
+            .lock()
+            .map_err(|error| HotSourceError::Poisoned {
+                detail: error.to_string(),
+            })
     }
 
     /// Locks the registry, converting a poisoned lock into a typed error.
@@ -997,7 +1208,7 @@ mod tests {
         let transitions = vec![(first, published.clone()), (second, published.clone())];
 
         assert!(matches!(
-            registry.advance_all_atomic(&key, &transitions),
+            registry.advance_all_atomic(&key, &transitions, 1),
             Err(HotSourceError::Unregistered { generation: 2 })
         ));
         assert_eq!(
@@ -1012,10 +1223,10 @@ mod tests {
             .restore_durable(&key, second, staged())
             .expect("missing staged member restores under the same identity");
         registry
-            .advance_all_atomic(&key, &transitions)
+            .advance_all_atomic(&key, &transitions, 1)
             .expect("the complete retry publishes atomically");
         registry
-            .advance_all_atomic(&key, &transitions)
+            .advance_all_atomic(&key, &transitions, 1)
             .expect("exact replay is idempotent success");
         for generation in [first, second] {
             assert_eq!(
@@ -1135,14 +1346,14 @@ mod tests {
         );
     }
 
-    /// A staged read sees exactly the generations the staged boundary owns, in
-    /// age order, scoped to the requested table and partition range.
+    /// A staged capture sees exactly the generations the staged boundary owns,
+    /// in age order, scoped to the requested tenant table.
     ///
     /// # Panics
     ///
     /// Panics when a fixture registration or transition is refused.
     #[test]
-    fn staged_sources_are_scoped_ordered_and_exclude_other_authorities() {
+    fn staged_captures_are_scoped_ordered_and_exclude_other_authorities() {
         let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
         let key = seal_key();
         let next_day = SealKey::new(
@@ -1197,10 +1408,12 @@ mod tests {
             )
             .expect("generation publishes");
 
-        let sources = registry
-            .staged_sources(key.tenant, &key.table, key.partition, next_day.partition)
-            .expect("locked");
-        let named: Vec<(TimePartition, u64)> = sources
+        let capture = registry
+            .capture_staged(key.tenant, &key.table, &std::collections::HashSet::new())
+            .expect("locked")
+            .expect("no publication is marked");
+        let named: Vec<(TimePartition, u64)> = capture
+            .lease
             .sources()
             .iter()
             .map(|source| (source.key.partition, source.generation.get()))
@@ -1212,8 +1425,75 @@ mod tests {
                 (key.partition, 2),
                 (next_day.partition, 3),
             ],
-            "only staged generations of the requested table and range are readable, oldest first"
+            "only staged generations of the requested table are readable, oldest first"
         );
+    }
+
+    /// A generation whose publication may have committed refuses capture of
+    /// its table until the outcome settles, and a served generation that is
+    /// already published is reported as superseded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture transition is refused or a capture is taken or
+    /// refused contrary to the publication mark.
+    #[tokio::test]
+    async fn a_publishing_generation_refuses_capture_until_it_settles() {
+        let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
+        let key = seal_key();
+        let generation = GenerationOrdinal::new(0, 1);
+        registry
+            .register_memtable(&key, generation)
+            .expect("generation registers");
+        registry
+            .advance(&key, generation, staged())
+            .expect("generation stages");
+        let none = std::collections::HashSet::new();
+        registry
+            .begin_publication(&key, &[generation])
+            .expect("publication is marked");
+        let settled = registry.publication_settled();
+        assert!(
+            registry
+                .capture_staged(key.tenant, &key.table, &none)
+                .expect("locked")
+                .is_none(),
+            "a possibly committed publication refuses capture"
+        );
+        registry
+            .abandon_publication(&key, &[generation])
+            .expect("the commit did not land");
+        settled.await;
+        assert_eq!(
+            registry
+                .capture_staged(key.tenant, &key.table, &none)
+                .expect("locked")
+                .expect("an abandoned publication no longer refuses")
+                .lease
+                .sources()
+                .len(),
+            1
+        );
+
+        registry
+            .begin_publication(&key, &[generation])
+            .expect("publication is marked again");
+        registry
+            .advance(
+                &key,
+                generation,
+                HotAuthority::Published {
+                    object_keys: vec!["objects/one.parquet".to_owned()],
+                },
+            )
+            .expect("generation publishes");
+        let served = std::collections::HashSet::from([(key.partition, generation)]);
+        let capture = registry
+            .capture_staged(key.tenant, &key.table, &served)
+            .expect("locked")
+            .expect("publication settled by the advance");
+        assert!(capture.lease.sources().is_empty());
+        assert_eq!(capture.superseded, served, "the memory copy is superseded");
     }
 
     /// A resolved staged read leases its members until the reader drops them.
@@ -1254,13 +1534,17 @@ mod tests {
             .expect("generation stages");
 
         let lease = registry
-            .staged_sources(key.tenant, &key.table, key.partition, key.partition)
-            .expect("locked");
+            .capture_staged(key.tenant, &key.table, &std::collections::HashSet::new())
+            .expect("locked")
+            .expect("no publication is marked")
+            .lease;
         assert_eq!(lease.sources().len(), 1);
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
         let second = registry
-            .staged_sources(key.tenant, &key.table, key.partition, key.partition)
-            .expect("locked");
+            .capture_staged(key.tenant, &key.table, &std::collections::HashSet::new())
+            .expect("locked")
+            .expect("no publication is marked")
+            .lease;
         assert_eq!(second.sources().len(), 1);
         assert_eq!(
             registry.leases(&key, generation).expect("locked"),

@@ -350,8 +350,29 @@ impl Journey {
         rows
     }
 
-    /// The batches `sql` reads from `vala.gateway.calls` as the tenant of
-    /// `inspector`, once they hold at least `expected` rows.
+    /// Every row `sql` reads as the tenant of `inspector`, as one JSON object
+    /// per row, once at least `expected` rows have landed; see
+    /// [`Self::captured`].
+    ///
+    /// # Panics
+    /// Panics when the rows do not land, the query fails, or a row cannot be
+    /// rendered as JSON.
+    pub(crate) async fn captured_json(
+        &self,
+        inspector: &SecretString,
+        sql: &str,
+        expected: usize,
+    ) -> Vec<Value> {
+        let mut writer = arrow::json::ArrayWriter::new(Vec::new());
+        for batch in self.captured(inspector, sql, expected).await {
+            writer.write(&batch).expect("captured rows write as JSON");
+        }
+        writer.finish().expect("captured rows finish");
+        serde_json::from_slice(&writer.into_inner()).expect("rows are JSON")
+    }
+
+    /// The batches `sql` reads as the tenant of `inspector`, once they hold
+    /// at least `expected` rows.
     ///
     /// Settles the Scribe outbox and flushes Bifrost before every read, so a
     /// staged capture becomes visible without sleeping on a guess.

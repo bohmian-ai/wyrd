@@ -14,19 +14,25 @@
 //! `wyrd_server::components::gateway::pg_invocation_tests::gateway_onboards_compatible_provider_at_runtime`,
 //! which drives the same handlers over real HTTP dispatch.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use secrecy::SecretString;
 use serde_json::{Value, json};
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
 use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::Metrics;
 
-use crate::harness::{Journey, api_key, openai_code, refusal};
+use crate::harness::{INVOKER_ROLE, Journey, api_key, openai_code, refusal};
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
 const PROJECTION: &str = "acme-first/m";
@@ -588,6 +594,213 @@ async fn deploy_at(journey: &Journey, admin: &str, name: &str, base_url: &str) {
         .await;
 }
 
+/// Calls each per-client key of
+/// [`gateway_capacity_paces_streams_isolates_tenants_and_recovers`] makes in
+/// its concurrent two-tenant phase.
+const CALLS_PER_CLIENT: usize = 3;
+
+/// One tenant's view of the concurrent phase: the client that reads its
+/// rows, and the verified principal each answered call's request ran under.
+struct TenantCalls {
+    /// Owning tenant.
+    tenant: DataTenantId,
+    /// Administrator key whose real client reads the tenant's captures.
+    inspector: SecretString,
+    /// Principal of every answered concurrent call, by its `wyrd-request-id`.
+    callers: BTreeMap<String, String>,
+}
+
+/// Bootstraps `count` caller services named `{prefix}-{index}` in `tenant`
+/// holding `roles`, and exchanges each one's own API key for a token.
+///
+/// # Panics
+/// Panics when bootstrap or exchange fails.
+async fn per_client_tokens(
+    journey: &Journey,
+    tenant: DataTenantId,
+    prefix: &str,
+    roles: &[&str],
+    count: usize,
+) -> Vec<(String, String)> {
+    let mut tokens = Vec::new();
+    for index in 0..count {
+        let caller = journey
+            .server
+            .bootstrap_service_in_tenant(tenant, &format!("{prefix}_{index}"), roles)
+            .await
+            .expect("caller bootstraps");
+        let token = journey
+            .server
+            .exchange_api_key(caller.api_key().expect("a service has a key"))
+            .await
+            .expect("caller key exchanges");
+        tokens.push((caller.id().to_string(), token));
+    }
+    tokens
+}
+
+/// Sends [`CALLS_PER_CLIENT`] buffered calls as each `(principal, token)`
+/// client, all concurrently, and returns the principal of each answered
+/// call by the `wyrd-request-id` the server stamped on it.
+///
+/// # Panics
+/// Panics when a call is not answered or carries no request ID.
+async fn concurrent_calls(
+    journey: &Journey,
+    clients: &[(String, String)],
+    label: &str,
+) -> BTreeMap<String, String> {
+    let calls = clients
+        .iter()
+        .enumerate()
+        .flat_map(|(client, (id, token))| {
+            (0..CALLS_PER_CLIENT).map(move |call| async move {
+                let response = journey
+                    .post(
+                        "/v1/chat/completions",
+                        &[("authorization", format!("Bearer {token}"))],
+                        &marked("acme-first/m", &format!("{label}-{client}-{call}"), false),
+                    )
+                    .await;
+                assert_eq!(response.status().as_u16(), 200, "concurrent call answers");
+                let request = response.headers()["wyrd-request-id"]
+                    .to_str()
+                    .expect("request ID is text")
+                    .to_owned();
+                response.json::<Value>().await.expect("concurrent answer");
+                (request, id.clone())
+            })
+        });
+    futures_util::future::join_all(calls)
+        .await
+        .into_iter()
+        .collect()
+}
+
+/// Asserts `own`'s real client reads exactly its answered concurrent calls,
+/// each with the subject and actor of the key that made it and never the
+/// no-caller marker, and their attempt spans under the same pair, while
+/// none of `other`'s call or trace identities appear. Returns `own`'s call
+/// IDs.
+///
+/// # Panics
+/// Panics when a row is missing, duplicated, misattributed, or foreign.
+async fn assert_tenant_calls(
+    journey: &Journey,
+    own: &TenantCalls,
+    other: &TenantCalls,
+    retained: usize,
+) -> BTreeSet<String> {
+    let marker = PLATFORM_AUDIT_PRINCIPAL.to_string();
+    let rows = journey
+        .captured_json(
+            &own.inspector,
+            "SELECT call_id, request_id, sub_principal_id, act_principal_id \
+             FROM vala.gateway.calls",
+            retained,
+        )
+        .await;
+    assert_eq!(
+        rows.len(),
+        retained,
+        "no omitted or duplicate captured call"
+    );
+    let mut calls = BTreeMap::new();
+    for row in &rows {
+        let (sub, act) = (
+            row["sub_principal_id"].as_str(),
+            row["act_principal_id"].as_str(),
+        );
+        assert!(
+            sub == act && sub.is_some() && sub != Some(marker.as_str()),
+            "{row}"
+        );
+        let request = row["request_id"].as_str().expect("request ID");
+        assert!(!other.callers.contains_key(request), "foreign call {row}");
+        if let Some(caller) = own.callers.get(request) {
+            assert_eq!(
+                sub,
+                Some(caller.as_str()),
+                "the row names its calling key: {row}"
+            );
+            let call = row["call_id"].as_str().expect("call ID").replace('-', "");
+            assert!(calls.insert(call, caller.clone()).is_none(), "{row}");
+        }
+    }
+    assert_eq!(
+        calls.len(),
+        own.callers.len(),
+        "every concurrent call is captured once"
+    );
+
+    let spans = journey
+        .captured_json(
+            &own.inspector,
+            "SELECT trace_id, sub_principal_id, act_principal_id FROM vala.traces.spans",
+            retained,
+        )
+        .await;
+    let mut traced = BTreeSet::new();
+    for span in &spans {
+        let trace = span["trace_id"].as_str().expect("trace ID").to_owned();
+        if let Some(caller) = calls.get(&trace) {
+            assert_eq!(span["sub_principal_id"], json!(caller), "{span}");
+            assert_eq!(span["act_principal_id"], json!(caller), "{span}");
+            traced.insert(trace);
+        }
+    }
+    assert_eq!(
+        traced.len(),
+        calls.len(),
+        "every concurrent call has its span"
+    );
+    calls.into_keys().collect()
+}
+
+/// The live data file paths of `tenant`'s physical `vala.gateway.calls`
+/// table, relative to the warehouse, with that table's location and
+/// canonical object prefix.
+///
+/// # Panics
+/// Panics when the binding resolves to nothing or the table, its manifest
+/// list, or a manifest cannot be read.
+async fn calls_data_files(
+    journey: &Journey,
+    tenant: DataTenantId,
+) -> (String, String, Vec<String>) {
+    let binding =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Gateway, "calls")))
+            .expect("the calls table binds");
+    let catalog = journey.server.bifrost_catalog().iceberg_catalog();
+    let table = catalog
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the tenant's calls table loads");
+    let location = table.metadata().location().to_owned();
+    let mut paths = Vec::new();
+    if let Some(snapshot) = table.metadata().current_snapshot() {
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("manifest list");
+        for manifest in manifests.entries() {
+            let manifest = manifest
+                .load_manifest(table.file_io())
+                .await
+                .expect("manifest");
+            paths.extend(
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.is_alive())
+                    .map(|entry| entry.data_file().file_path().to_owned()),
+            );
+        }
+    }
+    (location, binding.object_prefix, paths)
+}
+
 /// One Chat Completions request for `model` whose first message is the
 /// paced upstream's call `marker`.
 fn marked(model: &str, marker: &str, stream: bool) -> Value {
@@ -609,8 +822,12 @@ fn marked(model: &str, marker: &str, stream: bool) -> Value {
 /// sends are at least the chunk interval apart. A second tenant limited to one
 /// concurrent call holds one slow call, so every concurrent extra call is
 /// refused with the configured limit code before dispatch; once it answers,
-/// lower-rate calls succeed. Each tenant's administrator reads exactly its
-/// own answered calls' captures, and no refused call is captured.
+/// lower-rate calls succeed. With the limit lifted, two caller keys in each
+/// tenant then call concurrently. After drain and flush, each tenant's real
+/// client reads exactly its own answered calls, no refused call, and every
+/// concurrent call once with its own key's subject and actor and its attempt
+/// span under the same pair; neither tenant's call or trace identities reach
+/// the other, and each tenant's rows live only in its own physical table.
 ///
 /// # Panics
 /// Panics when a status, timing, stream, refusal, or capture expectation
@@ -619,7 +836,7 @@ fn marked(model: &str, marker: &str, stream: bool) -> Value {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
     let journey = Journey::start().await;
-    let paced = PacedUpstream::start(PACED, 16)
+    let paced = PacedUpstream::start(PACED, 32)
         .await
         .expect("paced upstream binds");
     Mock::given(method("POST"))
@@ -786,15 +1003,102 @@ async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
         recovered.json::<Value>().await.expect("recovered answer");
     }
 
+    journey
+        .put_as(
+            &other_admin,
+            "governance-policy",
+            json!({"limits": [], "budgets": [], "pricing": [], "unknown_cost": "allow_unpriced"}),
+        )
+        .await;
+    let first_tenant = journey.server.data_tenant_id();
+    let first_clients =
+        per_client_tokens(&journey, first_tenant, "capacity_first", &[INVOKER_ROLE], 2).await;
+    let other_clients = per_client_tokens(&journey, other, "capacity_other", &["admin"], 2).await;
+    let (first_callers, other_callers) = tokio::join!(
+        concurrent_calls(&journey, &first_clients, "first"),
+        concurrent_calls(&journey, &other_clients, "other"),
+    );
+    let concurrent = 2 * CALLS_PER_CLIENT;
+    assert_eq!(
+        (first_callers.len(), other_callers.len()),
+        (concurrent, concurrent)
+    );
+    let first = TenantCalls {
+        tenant: first_tenant,
+        inspector,
+        callers: first_callers,
+    };
+    let second = TenantCalls {
+        tenant: other,
+        inspector: other_key,
+        callers: other_callers,
+    };
+
     journey.drain_calls().await;
     assert_eq!(
-        journey.captured_calls(&inspector, 2).await.len(),
-        2,
-        "the first tenant reads only its own two calls"
+        journey
+            .captured_calls(&first.inspector, 2 + concurrent)
+            .await
+            .len(),
+        2 + concurrent,
+        "the first tenant reads only its own calls"
     );
     assert_eq!(
-        journey.captured_calls(&other_key, 3).await.len(),
-        3,
-        "the second tenant reads its three answered calls and no refusal"
+        journey
+            .captured_calls(&second.inspector, 3 + concurrent)
+            .await
+            .len(),
+        3 + concurrent,
+        "the second tenant reads its answered calls and no refusal"
     );
+    let first_ids = assert_tenant_calls(&journey, &first, &second, 2 + concurrent).await;
+    let other_ids = assert_tenant_calls(&journey, &second, &first, 3 + concurrent).await;
+    assert!(
+        first_ids.is_disjoint(&other_ids),
+        "call and trace identities are disjoint"
+    );
+
+    let (first_location, first_prefix, first_files) =
+        calls_data_files(&journey, first.tenant).await;
+    let (other_location, other_prefix, other_files) =
+        calls_data_files(&journey, second.tenant).await;
+    assert_ne!(
+        first_prefix, other_prefix,
+        "each tenant binds its own prefix"
+    );
+    assert_ne!(
+        first_location, other_location,
+        "each tenant has its own table"
+    );
+    for (tenant, location, prefix, files, foreign) in [
+        (
+            first.tenant,
+            &first_location,
+            &first_prefix,
+            &first_files,
+            &other_prefix,
+        ),
+        (
+            second.tenant,
+            &other_location,
+            &other_prefix,
+            &other_files,
+            &first_prefix,
+        ),
+    ] {
+        assert!(
+            location.ends_with(prefix.as_str()) && prefix.contains(&tenant.to_string()),
+            "{location} is {tenant}'s own prefix {prefix}"
+        );
+        assert!(
+            !files.is_empty(),
+            "the tenant's rows are published in {location}"
+        );
+        for file in files {
+            assert!(
+                file.starts_with(prefix.as_str()) && !file.starts_with(foreign.as_str()),
+                "{file} lives only under {prefix}"
+            );
+        }
+    }
 }

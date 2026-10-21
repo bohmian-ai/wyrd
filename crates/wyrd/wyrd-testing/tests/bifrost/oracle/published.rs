@@ -1712,3 +1712,344 @@ async fn prove_time_range_reads(
     );
     Ok(())
 }
+
+/// Bound on every source transition the source-consistency journeys wait for.
+const SOURCE_TRANSITION_BOUND: Duration = Duration::from_mins(1);
+
+/// Returns how many live captures the cluster's Scribes currently retain.
+///
+/// # Errors
+///
+/// Returns an error when a Scribe pod composes no tail service.
+fn retained_captures(cluster: &WyrdTestCluster) -> Result<usize, JourneyError> {
+    let mut retained = 0;
+    for server in cluster.servers() {
+        if let Some(scribe) = server.state().bifrost_ingest() {
+            retained += scribe.tail_service().retained_captures_for_test();
+        }
+    }
+    Ok(retained)
+}
+
+/// Waits until every Scribe has released every capture.
+///
+/// A capture is released by a task its query's last plan spawns on drop, so
+/// release follows the terminal shortly rather than synchronously.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when a capture is still retained at the
+/// bound.
+async fn captures_released(cluster: &WyrdTestCluster, case: &str) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + SOURCE_TRANSITION_BOUND;
+    loop {
+        let retained = retained_captures(cluster)?;
+        if retained == 0 {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{case}: {retained} captures were never released").into());
+        }
+        tokio::time::sleep(crate::distributed::SETTLEMENT_INTERVAL).await;
+    }
+}
+
+/// Drains one public query stream and returns its ids once it succeeds.
+///
+/// # Errors
+///
+/// Returns an error when the stream fails or ends other than `Success`.
+async fn drained_ids(
+    mut stream: wyrd_client::bifrost::QueryResultStream,
+) -> Result<Vec<i64>, JourneyError> {
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let column = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or("query result id column is not Int64")?;
+        ids.extend(column.iter().flatten());
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != wyrd_spec::vala::api::QueryTerminalOutcome::Success {
+        return Err(format!("the query ended {:?}", terminal.error).into());
+    }
+    Ok(ids)
+}
+
+/// Requires `ids` to be exactly `expected`, each identity once, in any order.
+///
+/// Sorting without deduplicating keeps a repeated identity visible, so a
+/// source read twice fails as surely as a source read never.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when an identity is missing or repeated.
+fn expect_exact(case: &str, mut ids: Vec<i64>, expected: &[i64]) -> Result<(), JourneyError> {
+    ids.sort_unstable();
+    if ids != expected {
+        return Err(format!("{case}: expected each of {expected:?} once, saw {ids:?}").into());
+    }
+    Ok(())
+}
+
+/// A source change never changes which rows a query returns.
+///
+/// Node 0's Scribe owns every row; node 1's Oracle reads them over the peer
+/// network, so each capture crosses the real private plane. Rows are
+/// appended one batch at a time, then moved into published files at three
+/// points of a query's life:
+///
+/// - before the query reads its cut, so the file alone supplies them;
+/// - while the query holds its pinned cut, before it captures the live
+///   sources — the publication removes the table's last live partition, so
+///   the capture is empty and validation must reject the selection and
+///   repin exactly once;
+/// - after the selection is validated, while the Scribe is paused between
+///   batches of an open read, so the retained capture keeps serving them.
+///
+/// Every case returns each acknowledged identity exactly once, and every
+/// capture is released when its query ends.
+///
+/// # Panics
+///
+/// Panics when any case loses or repeats an identity.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn source_transitions_preserve_exact_rows() {
+    prove_source_transitions()
+        .await
+        .expect("every source transition preserves exact rows");
+}
+
+/// Drives the three publication timings of
+/// [`source_transitions_preserve_exact_rows`].
+///
+/// # Errors
+///
+/// Returns a cluster, client, ingest, flush, or query error, or an error
+/// naming the case whose rows or retries differ.
+async fn prove_source_transitions() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("source_transitions");
+    let fqn = format!("vala.bifrost.{table}");
+    let sql = format!("SELECT id FROM {fqn}");
+    let writer_node = cluster.server(0).ok_or("missing node 0")?;
+    register_table(writer_node, tenant, &table).await?;
+    let writer = client(writer_node, "source-transitions-writer").await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let reader_node = cluster.server(1).ok_or("missing node 1")?;
+    let reader = client(reader_node, "source-transitions-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+
+    // 1. Published before the cut is read.
+    for id in 1..=3 {
+        crate::distributed::append_live_row(&writer, &fqn, id, None).await?;
+    }
+    writer_node.flush_bifrost().await?;
+    expect_exact(
+        "published before the cut",
+        query_ids(&reader, &fqn, None).await?,
+        &[1, 2, 3],
+    )?;
+
+    // 2. Published while the query holds its pinned cut, before capture.
+    for id in 11..=13 {
+        crate::distributed::append_live_row(&writer, &fqn, id, None).await?;
+    }
+    let engine = reader_node
+        .state()
+        .bifrost_query()
+        .map(|query| Arc::clone(query.engine()))
+        .ok_or("node 1 composes no Oracle")?;
+    let context = query_context(tenant)?;
+    let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
+        context.request_id.clone(),
+    ));
+    engine.bind_preparation_pause_for_test(Some(Arc::clone(&pause)))?;
+    vala_bifrost_redux::catalog::reset_cut_reads_for_test();
+    let held = crate::distributed::held_query_ids(&engine, context, sql.clone());
+    let publish = async {
+        tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
+            while pause.observed_deadline_ms().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "the query never reached its post-pin hold")?;
+        writer_node.flush_bifrost().await?;
+        pause.release();
+        Ok::<_, JourneyError>(())
+    };
+    let (ids, published) = tokio::join!(held, publish);
+    engine.bind_preparation_pause_for_test(None)?;
+    published?;
+    expect_exact("published during acquisition", ids?, &[1, 2, 3, 11, 12, 13])?;
+    let cut_reads = vala_bifrost_redux::catalog::reset_cut_reads_for_test();
+    if cut_reads != 2 {
+        return Err(format!(
+            "published during acquisition: expected one repin after the moved revision, \
+             saw {cut_reads} cut reads"
+        )
+        .into());
+    }
+    captures_released(&cluster, "published during acquisition").await?;
+
+    // 3. Published after validation, while an open read is paused.
+    for id in 21..=23 {
+        crate::distributed::append_live_row(&writer, &fqn, id, None).await?;
+    }
+    let stream =
+        crate::distributed::open_paused_live_query(&query, &sql, "published after validation")
+            .await?;
+    let drain = tokio::spawn(drained_ids(stream));
+    writer_node.flush_bifrost().await?;
+    vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test().release();
+    expect_exact(
+        "published after validation",
+        drain.await??,
+        &[1, 2, 3, 11, 12, 13, 21, 22, 23],
+    )?;
+    captures_released(&cluster, "published after validation").await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A selection that is invalid, refused, lost, or abandoned never becomes a
+/// successful read, and every capture it took is released.
+///
+/// Node 0's Scribe owns live rows; node 1's Oracle reads them. In turn:
+///
+/// - a selection whose publication revision moved during acquisition is
+///   discarded and repinned before any row, so the query still succeeds;
+/// - a capture lost when its fragment opens fails the query with no row
+///   accepted, and no fresh live read replaces it;
+/// - a query cancelled while its open read is paused stops its Scribe
+///   producer;
+/// - a listing that fails on one table releases nothing it holds.
+///
+/// After each case the Scribe retains no capture. A foreign or substituted
+/// capture reference is refused at the Scribe by
+/// `scribe::tail_rpc::tests::a_capture_is_opened_only_by_its_query`, and an
+/// unreleased capture expires by
+/// `scribe::tail_rpc::tests::an_unreleased_capture_expires_at_its_deadline`,
+/// because neither needs cross-boundary state to observe; a publication whose outcome is unknown refuses
+/// capture by `scribe::hot_source::tests::a_publishing_generation_refuses_capture_until_it_settles`,
+/// because an unknown commit outcome cannot be forced through a real
+/// Postgres commit from a journey.
+///
+/// # Panics
+///
+/// Panics when a case reaches another terminal or leaks a capture.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn unvalidated_captures_fail_before_rows_and_release_resources() {
+    prove_unvalidated_captures()
+        .await
+        .expect("unvalidated captures fail and release");
+}
+
+/// Drives the cases of
+/// [`unvalidated_captures_fail_before_rows_and_release_resources`].
+///
+/// # Errors
+///
+/// Returns a cluster, client, ingest, or query error, or an error naming the
+/// case whose terminal or retained captures differ.
+async fn prove_unvalidated_captures() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("unvalidated_captures");
+    let fqn = format!("vala.bifrost.{table}");
+    let sql = format!("SELECT id FROM {fqn}");
+    let writer_node = cluster.server(0).ok_or("missing node 0")?;
+    register_table(writer_node, tenant, &table).await?;
+    let writer = client(writer_node, "unvalidated-captures-writer").await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let reader_node = cluster.server(1).ok_or("missing node 1")?;
+    let reader = client(reader_node, "unvalidated-captures-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    for id in 1..=3 {
+        crate::distributed::append_live_row(&writer, &fqn, id, None).await?;
+    }
+
+    // A moved revision is retried before output under the same deadline.
+    let engine = reader_node
+        .state()
+        .bifrost_query()
+        .map(|query| Arc::clone(query.engine()))
+        .ok_or("node 1 composes no Oracle")?;
+    let context = query_context(tenant)?;
+    let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
+        context.request_id.clone(),
+    ));
+    engine.bind_preparation_pause_for_test(Some(Arc::clone(&pause)))?;
+    for id in 4..=5 {
+        crate::distributed::append_live_row(&writer, &fqn, id, None).await?;
+    }
+    let held = crate::distributed::held_query_ids(&engine, context, sql.clone());
+    let publish = async {
+        tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
+            while pause.observed_deadline_ms().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "the query never reached its post-pin hold")?;
+        // Publishes 1..=5 while 6 stays live, so the moved revision is
+        // detected with a non-empty capture.
+        writer_node.flush_bifrost().await?;
+        crate::distributed::append_live_row(&writer, &fqn, 6, None).await?;
+        pause.release();
+        Ok::<_, JourneyError>(())
+    };
+    let (ids, published) = tokio::join!(held, publish);
+    engine.bind_preparation_pause_for_test(None)?;
+    published?;
+    expect_exact("moved revision", ids?, &[1, 2, 3, 4, 5, 6])?;
+    captures_released(&cluster, "moved revision").await?;
+
+    // A capture lost when its fragment opens fails the query before a row.
+    wyrd_server::oracle::arm_scribe_fragment_fault_for_test(
+        wyrd_server::oracle::ScribeFragmentFault::UnavailableBeforeRows,
+    );
+    let lost = crate::distributed::observe_query(&reader, &sql).await?;
+    crate::distributed::expect_failed("capture lost at open", &lost)?;
+    if lost.ids.iter().any(|id| *id >= 6) {
+        return Err(format!(
+            "capture lost at open: live rows were accepted {:?}",
+            lost.ids
+        )
+        .into());
+    }
+    captures_released(&cluster, "capture lost at open").await?;
+
+    // Cancelling a query with a paused open read releases its capture. The
+    // producer pauses before its second batch, so a second live row exists.
+    crate::distributed::append_live_row(&writer, &fqn, 7, None).await?;
+    let stream = crate::distributed::open_paused_live_query(&query, &sql, "cancelled read").await?;
+    if retained_captures(&cluster)? == 0 {
+        return Err("cancelled read: the open query retains no capture".into());
+    }
+    drop(stream);
+    vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test().release();
+    captures_released(&cluster, "cancelled read").await?;
+
+    // A listing failure fails over to the listing-time degrade and leaks
+    // nothing it captured.
+    reader_node.set_tail_discovery_unavailable_for_test(true);
+    let degraded = crate::distributed::observe_query(&reader, &sql).await;
+    reader_node.set_tail_discovery_unavailable_for_test(false);
+    let degraded = degraded?;
+    if degraded.outcome != wyrd_spec::vala::api::QueryTerminalOutcome::Degraded {
+        return Err(format!(
+            "failed listing: expected Degraded, saw {:?}",
+            degraded.outcome
+        )
+        .into());
+    }
+    captures_released(&cluster, "failed listing").await?;
+    cluster.shutdown().await?;
+    Ok(())
+}

@@ -66,7 +66,7 @@ use crate::support::*;
 const SETTLEMENT_POLLS: usize = 300;
 
 /// Interval between polls for a settled Oracle graph.
-const SETTLEMENT_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const SETTLEMENT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which physical pruning signal a topology's follower cut can actually move.
 enum PruningExpectation {
@@ -1049,7 +1049,7 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
 /// # Errors
 ///
 /// Returns an error when the client cannot connect or ingest refuses the row.
-async fn append_live_row(
+pub(crate) async fn append_live_row(
     client: &WyrdClient,
     table: &str,
     id: i64,
@@ -1352,10 +1352,10 @@ const LIVE_HOLD: Duration = Duration::from_secs(31);
 ///
 /// The query deadline is the read's one timeout; the 30-second default would
 /// end the held read on its own.
-const LIVE_DEADLINE_MS: i64 = 120_000;
+pub(crate) const LIVE_DEADLINE_MS: i64 = 120_000;
 
 /// Bound on waiting for a paused, cancelled, or dropped live read to settle.
-const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
+pub(crate) const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Returns the query-memory bytes the writer Scribe's follower views hold.
 ///
@@ -1436,7 +1436,7 @@ async fn await_live_released(cluster: &WyrdTestCluster, case: &str) -> Result<()
 ///
 /// Returns an error when the query cannot open, the producer never pauses, or
 /// the first batch never reaches the Oracle live source.
-async fn open_paused_live_query(
+pub(crate) async fn open_paused_live_query(
     query: &wyrd_client::Bifrost,
     sql: &str,
     case: &str,
@@ -1683,15 +1683,15 @@ async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), Journ
 }
 
 /// How one matrix query ended, as a public client observed it.
-struct ObservedQuery {
+pub(crate) struct ObservedQuery {
     /// Ids the client received before the stream ended.
-    ids: Vec<i64>,
+    pub(crate) ids: Vec<i64>,
     /// Whether the client raised an error instead of ending cleanly.
-    rejected: bool,
+    pub(crate) rejected: bool,
     /// Terminal outcome, `Failed` for an early typed refusal.
-    outcome: QueryTerminalOutcome,
+    pub(crate) outcome: QueryTerminalOutcome,
     /// Terminal warnings; empty for an early refusal.
-    warnings: Vec<QueryWarning>,
+    pub(crate) warnings: Vec<QueryWarning>,
 }
 
 /// Runs `sql` to its end and records what the client observed.
@@ -1704,7 +1704,10 @@ struct ObservedQuery {
 ///
 /// Returns client or Arrow errors that carry no terminal, and an error when a
 /// cleanly ended stream has no terminal frame.
-async fn observe_query(client: &WyrdClient, sql: &str) -> Result<ObservedQuery, JourneyError> {
+pub(crate) async fn observe_query(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<ObservedQuery, JourneyError> {
     observe_query_within(client, sql, None).await
 }
 
@@ -1792,7 +1795,7 @@ fn expect_degraded(case: &str, observed: &ObservedQuery) -> Result<(), JourneyEr
 ///
 /// Returns an error naming `case` when the query did not fail or the client
 /// ended the stream cleanly.
-fn expect_failed(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
+pub(crate) fn expect_failed(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
     if observed.outcome != QueryTerminalOutcome::Failed || !observed.rejected {
         return Err(format!(
             "{case}: expected a rejected Failed query, saw {:?} rejected={} {:?}",
@@ -1836,15 +1839,15 @@ fn table_parquet_files(
 /// One table holds published ids 1..=3 and live ids 101..=103 on node 0's
 /// Scribe; node 1 reads. Each fault is driven at the boundary that owns it:
 ///
-/// - an unavailable stream listing, and a selected Scribe refused before its
-///   first row, each yield `Degraded` with `LiveTailUnavailable` and only the
-///   published rows;
+/// - an unavailable stream listing yields `Degraded` with
+///   `LiveTailUnavailable` and only the published rows;
 /// - one stale listing restarts the attempt once on a refrozen roster and
 ///   returns every row, while a second stale listing on the refrozen roster
 ///   degrades rather than mixing cuts;
 /// - a listing held past the query deadline is cancelled with the query, which
 ///   fails within the deadline, and the next query succeeds;
-/// - a Scribe lost after its first row, a stream without its footer, a
+/// - a Scribe lost before or after its first row — its retained capture is
+///   never reopened underneath the query — a stream without its footer, a
 ///   rejected peer ticket, a refused follower lease, and a real live snapshot
 ///   over its signed batch ceiling each yield `Failed`, and the client
 ///   rejects the stream instead of accepting preceding rows;
@@ -1944,12 +1947,7 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
             ),
         ] {
             arm_scribe_fragment_fault_for_test(fault);
-            let observed = observe_query(&reader, &sql).await?;
-            if fault == ScribeFragmentFault::UnavailableBeforeRows {
-                expect_degraded(case, &observed)?;
-            } else {
-                expect_failed(case, &observed)?;
-            }
+            expect_failed(case, &observe_query(&reader, &sql).await?)?;
         }
     }
 
@@ -4415,10 +4413,11 @@ async fn settle_query(
 
 /// Proves the cut is one tenant-scoped statement with one bounded retry.
 ///
-/// A cold query over one table or over a two-table join reads its whole cut
-/// in exactly one statement; the same query warm is served from the node's
-/// cut cache in none. One injected metadata `NotFound` after the cached read
-/// costs exactly one Postgres reread and the query succeeds; a second
+/// A query over one table or over a two-table join reads its whole cut in
+/// exactly one fresh statement, repeated or not: the cut's publication
+/// revision is what live captures are validated against, so no cut is cached.
+/// One injected metadata `NotFound` after the read costs exactly one Postgres
+/// reread and the query succeeds; a second
 /// consecutive `NotFound` is terminal. A caller not granted the table is
 /// refused before any metadata read, so an armed fault stays unconsumed. Another tenant's lookup of the same name
 /// fails exactly as a never-registered name does, exposing no identity.
@@ -4444,10 +4443,10 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
 
     reset_cut_reads_for_test();
     for (case, sql, statements) in [
-        ("cold one-table", &one, 1),
-        ("warm one-table", &one, 0),
-        ("cold join", &join, 1),
-        ("warm join", &join, 0),
+        ("first one-table", &one, 1),
+        ("repeated one-table", &one, 1),
+        ("first join", &join, 1),
+        ("repeated join", &join, 1),
     ] {
         settle_query(&server, query_context(tenant)?, sql).await?;
         assert_eq!(
@@ -4457,12 +4456,11 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
         );
     }
 
-    // Both cuts are now cached, so each count below is Postgres rereads only.
     inject_metadata_not_found_for_test(1);
     settle_query(&server, query_context(tenant)?, &join).await?;
     assert_eq!(
         reset_cut_reads_for_test(),
-        1,
+        2,
         "one missing metadata document costs exactly one reread"
     );
 
@@ -4471,7 +4469,7 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
     assert!(terminal.is_err(), "a second NotFound is terminal");
     assert_eq!(
         reset_cut_reads_for_test(),
-        1,
+        2,
         "the terminal NotFound is not retried again"
     );
 
@@ -4507,11 +4505,16 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
         matches!(refused, Err(BifrostError::QueryForbidden)),
         "an ungranted table is refused: {refused:?}"
     );
-    settle_query(&server, query_context(tenant)?, &one).await?;
     assert_eq!(
         reset_cut_reads_for_test(),
         1,
-        "the refused query read no metadata, so the armed fault fell to the next query"
+        "the refused query read its cut once and no metadata"
+    );
+    settle_query(&server, query_context(tenant)?, &one).await?;
+    assert_eq!(
+        reset_cut_reads_for_test(),
+        2,
+        "the armed fault fell to the next query, which reread once"
     );
 
     let neighbour = server.seed_tenant(&unique_table("cut_neighbour")).await?;
@@ -4625,7 +4628,7 @@ async fn held_query_maintenance_pass(server: &WyrdTestServer) -> Result<(), Jour
 /// # Errors
 /// Returns a query, decode, or terminal error, or an error when the terminal
 /// is not a success.
-async fn held_query_ids(
+pub(crate) async fn held_query_ids(
     engine: &Oracle,
     context: AuthorizedQueryContext,
     sql: String,

@@ -1582,4 +1582,37 @@ pub(crate) mod tests {
             assert!(service.open_capture(&foreign).is_err());
         }
     }
+
+    /// An unreleased capture expires at its query deadline and is never
+    /// reopened, so a lost release leaks nothing past the query.
+    ///
+    /// # Panics
+    /// Panics when the capture outlives its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreleased_capture_expires_at_its_deadline() {
+        let StagedGenerationFixture {
+            service,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        let capture = capture_of(&service, &request.binding).await;
+        let deadline = std::time::Duration::from_secs(1);
+        let capture_id = service
+            .retain(
+                request.query_id,
+                request.binding.clone(),
+                capture,
+                tokio::time::Instant::now() + deadline,
+            )
+            .expect("the capture is retained");
+        let request = super::FetchLiveTailRequest {
+            capture_id,
+            ..request
+        };
+        assert!(service.open_capture(&request).is_ok());
+        tokio::time::sleep(deadline * 2).await;
+        assert_eq!(service.retained_captures_for_test(), 0);
+        assert!(service.open_capture(&request).is_err());
+    }
 }

@@ -6,11 +6,15 @@
 //!   `mise run bench:bifrost:client-queue`.
 //! - `verification-capacity` ([`verification`]): the verification runtime and
 //!   engine, through `mise run bench:verification:capacity`.
+//! - `gateway-overhead` ([`gateway`]): the AI gateway's server overhead,
+//!   through `mise run bench:gateway:overhead`.
 //!
 //! Each workload starts its own release server, keeps its own flags, report,
 //! and output directory, and exits nonzero when a row fails.
 
 mod client_queue;
+mod flags;
+mod gateway;
 mod query;
 mod verification;
 
@@ -26,9 +30,10 @@ async fn main() -> ExitCode {
         Some("query-capacity") => Box::pin(query::main(arguments)).await,
         Some("client-queue") => Box::pin(client_queue::main(arguments)).await,
         Some("verification-capacity") => Box::pin(verification::main(arguments)).await,
+        Some("gateway-overhead") => Box::pin(gateway::overhead(arguments)).await,
         other => {
             eprintln!(
-                "capacity: expected query-capacity, client-queue, or verification-capacity, got {other:?}"
+                "capacity: expected query-capacity, client-queue, verification-capacity, or gateway-overhead, got {other:?}"
             );
             ExitCode::FAILURE
         }

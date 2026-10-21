@@ -568,6 +568,17 @@ cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server 
 scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" verification-capacity "$@"' _
 '''
 
+[tasks."bench:gateway:overhead"]
+description = "Opt-in benchmark (the capacity binary's gateway-overhead workload) of the AI gateway's server overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint and binary identity; compare only matching hosts), with one tenant's openai_compatible deployments against an instant local upstream and one wyrd_sk_ key per closed-loop client, driving raw HTTP/1.1 keep-alive POST /v1/chat/completions. Case 1 chat (about 1 KiB buffered) and case 2 chat-stream (32 data events then [DONE]) at 1, 4, 16 and 64 clients with metadata capture; case 3 chat-capture (64 KiB in and out, payload capture) at 16 and 64. 2 s warmup and 10 s windows. Each row is judged on server wyrd_gateway_overhead_seconds p99 < 1 ms from >=1,000 samples at every handoff point (TARGET at <=500 us), zero refusals or invalid answers, one staged capture per arrival with no drop or outbox loss, and memory headroom; each step's drain (within 60 s) and the shutdown have their own loss-free rows. Client roundtrip percentiles (completion; stream headers and first event) and client-added means are reported. `-- --case 1,2,3`, `--clients 1,4,16,64` (intersected with each case's matrix) and `--no-profile` select steps and skip profiling. Always builds with frame pointers into target/profiling and, unless --no-profile, records each window with perf under target/gateway-overhead/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Writes target/gateway-overhead/. Fails on any FAIL row. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
+scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" gateway-overhead "$@"' _
+'''
+
 [tasks."bench:bifrost:client-queue"]
 description = "Opt-in benchmark (AC-041, the capacity binary's client-queue workload): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, on the whole host (report.json's envelope carries the host fingerprint), started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-client-queue/. Part of no gate or verify lane."
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }

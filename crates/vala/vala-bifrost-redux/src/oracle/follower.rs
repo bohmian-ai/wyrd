@@ -155,6 +155,12 @@ where
     T: FollowerSourceResolver + ?Sized,
 {
     /// Delegates to the one injected process resolver allocation.
+    ///
+    /// Adds no state, retry, or cancellation behavior of its own: dropping
+    /// this future drops the inner resolution under that resolver's contract.
+    ///
+    /// # Errors
+    /// Returns the inner resolver's [`FollowerResolutionError`] unchanged.
     async fn resolve(
         &self,
         target_role: ClusterRole,

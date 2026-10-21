@@ -7,8 +7,8 @@ description: Opinionated, question-scaled advice and research on Wyrd product ch
 
 Give advice by default, then make explicitly requested bounded changes. This
 skill is the conversational front door for Wyrd product and technical judgment;
-reusable knowledge is selected through the table under "Route knowledge
-progressively".
+reusable knowledge lives in
+`architecture/references/` and is selected through its canonical router.
 
 ## Advisory contract
 
@@ -23,7 +23,8 @@ progressively".
 - Ask at most one material question at a time, and only when its answer could
   change the recommendation. Continue with a stated assumption when it cannot.
 - Use Wyrd doctrine for architecture claims. Treat `architecture/wyrd-design.md`
-  as the protocol authority, including its Doctrine section; never invent a compatibility alias or legacy noun.
+  as the protocol authority and `architecture/wyrd-doctrine.mdx` as the public
+  rationale; never invent a compatibility alias or legacy noun.
 - Obtain repository facts through a bounded read-only repository scout. Label
   repository facts separately from design advice.
 - Obtain unstable external facts through a bounded read-only source scout.
@@ -76,9 +77,10 @@ on stable doctrine already loaded in the conversation. State that assumption.
 
 ## Route knowledge progressively
 
-For delegated local research, have the assigned scout pick from the table
-below. Load every selected reference completely and use the smallest complete
-set for the question; load each matching row for a mixed concern. Do not
+For delegated local research, have the assigned scout start at
+[the canonical reference router](../../../architecture/references/README.md).
+Load every selected reference completely and use the smallest complete set for
+the question; use the router's compound examples for mixed concerns. Do not
 copy the corpus into the answer. Each reference's Wyrd anchors and primary
 grounding guide any necessary repository or upstream follow-up.
 
@@ -88,23 +90,26 @@ grounding guide any necessary repository or upstream follow-up.
 | [Bifrost authority](../../../architecture/bifrost-design.md) | Scribe, Oracle, Forge, analytical storage, resources, or public query/ingest behavior |
 | [Security posture](../../../architecture/wyrd-security-posture.md) | Authentication, authorization, credentials, tenant security, audit integrity, or external-network trust |
 | [Operations authority](../../../architecture/operations/README.md) | Deployment, release, capacity, backup, recovery, SLOs, or incidents |
-| [Repository rules](../../../AGENTS.md) | Card vocabulary, locked boundaries, ownership, dependency direction, or contract placement |
-| [Implementation execution](../../../changes/implementation-execution.md) | Execution authority, adaptation, verification recovery, or completion evidence |
-| [Rust](../../../agent_docs/rust.md) | Rust ownership, async, traits, allocation, or API shape |
-| [Python SDK](../../../sdks/wyrd-sdk-python/AGENTS.md) | PyO3 classes, GIL, lifetimes, conversion, module registration, exports, stubs, or typing |
-| [TypeScript guide](../../../sdks/wyrd-sdk-ts/AGENTS.md) | TypeScript SDK, declarations, or napi boundaries |
-| [Testing](../../../TESTING.md) | User journeys, integration tests, unit tests, or repository verification |
-| [Agent surfaces](../../../agent_docs/agent-surfaces.md) | MCP, agent-facing contracts, structured validation, or audit |
-| [Errors](../../../agent_docs/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
-| [Vala architecture](references/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain choices |
-| [Telemetry observations](references/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
-| [Evaluation](references/evaluation.md) | Verifiers, judge quality, scoring, or evidence |
-| [Drift monitoring](references/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
-| [OLAP serving](references/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
-| [Iceberg](references/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
-| [DataFusion](references/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
-| [Arrow analytical interop](references/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
-| [Analytical operations reliability](references/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
+| [Positioning and vocabulary](../../../architecture/references/doctrine/positioning-and-vocabulary.md) | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| [Architecture constraints](../../../architecture/references/doctrine/architecture-constraints.md) | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| [Architecture patterns](../../../architecture/references/architecture/patterns.md) | Ownership, contract placement, or server/client/storage/provider/audit structure |
+| [Implementation execution](../../../architecture/references/languages/implementation-execution.md) | Execution authority, adaptation, verification recovery, or completion evidence |
+| [Rust core](../../../architecture/references/languages/rust-core.md) | Rust ownership, async, traits, allocation, or API shape |
+| [PyO3 boundaries](../../../architecture/references/languages/pyo3-boundaries.md) | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| [Python API and stubs](../../../architecture/references/languages/python-api-and-stubs.md) | Python exports, stubs, package layout, or typing |
+| [TypeScript guide](../../../architecture/references/languages/typescript-guide.md) | TypeScript SDK, declarations, or napi boundaries |
+| [Testing workflows](../../../architecture/references/languages/testing-workflows.md) | User journeys, integration tests, unit tests, or repository verification |
+| [Agent harness](../../../architecture/references/languages/agent-harness.md) | MCP, agent-facing contracts, structured validation, or audit |
+| [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain choices |
+| [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Verifiers, judge quality, scoring, or evidence |
+| [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| [DataFusion](../../../architecture/references/domain/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
+| [Arrow analytical interop](../../../architecture/references/domain/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| [Analytical operations reliability](../../../architecture/references/domain/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
 
 ## Answer shape
 

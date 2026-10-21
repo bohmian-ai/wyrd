@@ -71,7 +71,7 @@ async fn quickstart_verifies_and_repeats() {
         .expect("test server starts");
     let dir = tempfile::tempdir().expect("reader directory creates");
     let config = tempfile::tempdir().expect("config directory creates");
-    for file in ["refund-limit.yaml", "support-reply.yaml"] {
+    for file in ["no-refund-promise.yaml", "support-reply.yaml"] {
         std::fs::copy(Path::new(QUICKSTART).join(file), dir.path().join(file))
             .expect("Card file copies");
     }
@@ -103,7 +103,7 @@ async fn quickstart_verifies_and_repeats() {
             .map(|entry| entry.expect("entry reads").file_name())
             .collect();
         files.sort();
-        assert_eq!(files, ["refund-limit.yaml", "support-reply.yaml"]);
+        assert_eq!(files, ["no-refund-promise.yaml", "support-reply.yaml"]);
         printed
     })
     .expect("the quickstart task joins");
@@ -121,13 +121,13 @@ async fn quickstart_verifies_and_repeats() {
         panic!("the quickstart prints two verdicts: {first}");
     };
     assert_eq!(passed, "passed: the comparison held");
-    assert_eq!(failed, "failed: operator LessThanOrEquals returned false");
+    assert_eq!(failed, "failed: operator NotContains returned false");
     assert!(
         subject.starts_with("  subject:  default/Service/support-reply@1.0.0#"),
         "{first}"
     );
     assert!(
-        verifier.starts_with("  verifier: default/Verifier/refund-limit@1.0.0#"),
+        verifier.starts_with("  verifier: default/Verifier/no-refund-promise@1.0.0#"),
         "{first}"
     );
     assert_eq!((failed_subject, failed_verifier), (subject, verifier));

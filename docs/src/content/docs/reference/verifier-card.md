@@ -30,7 +30,7 @@ spec:
 | `steps` | list of [steps](#steps) | `[]` | Work that prepares evidence before requirements run |
 | `requirements` | list of [requirements](#requirements) | `[]` | What must be true; each has one check |
 | `decide` | [`all` or `{pass_rate: {threshold}}`](#decide) | `all` | How requirement outcomes become the verdict |
-| `context_capture` | object | none | What run context to keep with the result |
+| `context_capture` | `full`, `hash`, or `redact` | `full` | How a check's `actual` value is stored: as extracted, as its SHA-256 hex digest, or omitted |
 
 Step and requirement `id`s share one namespace.
 
@@ -44,6 +44,8 @@ A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. `jso
 | `media` | `formats` (required), `max_bytes` | A file in one of `formats`, no larger than `max_bytes` |
 | `trace` | none | The run's trace spans |
 | `samples` | `features` (required) | Feature values over a window, for drift checks |
+
+A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order. `samples` and source slots are always required.
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
 
@@ -67,7 +69,7 @@ A step's result is `steps.<id>.output`.
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/reference/extraction-output/) gives for its format |
 | `agent` | `agent`, `inputs`, `workspace` | The Agent's response, shaped by its Prompt `response_format` |
-| `code` | `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
+| `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
 - `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to references. Tools are in [Agent tools and authorization](/reference/agent-tools-and-authorization/).
@@ -168,10 +170,12 @@ A citation names the original slot, never an extract step. An invalid citation i
 
 ## Decide
 
-| Value | Passes when |
+| Value | Verdict |
 | --- | --- |
-| `all` | Every applicable requirement passes |
-| `{pass_rate: {threshold}}` | At least `threshold` of applicable requirements pass; `threshold` is above 0 and at most 1 |
+| `all` | `failed` if any requirement fails; otherwise `inconclusive` if any is inconclusive; otherwise `passed` |
+| `{pass_rate: {threshold}}` | `passed` when the passed share of applicable requirements, inconclusive ones included in the count, reaches `threshold`; `threshold` is above 0 and at most 1 |
+
+`not_applicable` requirements are excluded. With no applicable requirement, the verdict is `inconclusive`.
 
 ## Rejections
 

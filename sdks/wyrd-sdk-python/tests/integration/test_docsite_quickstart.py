@@ -2,7 +2,7 @@
 
 ``examples/quickstart`` holds a Verifier, the Service that references it, and
 ``quickstart.py``, one script that declares them with ``WyrdState.declare`` and verifies a passing
-and a failing refund. The journey copies the files to an empty directory and
+and a failing answer. The journey copies the files to an empty directory and
 runs the script against a real server, twice.
 """
 
@@ -73,25 +73,25 @@ def test_docsite_quickstart_verifies_and_repeats(reader: Path, server: WyrdTestS
             True,
         )
         assert (verifier.name, str(verifier.version), verifier.uid is not None) == (
-            "refund-limit",
+            "no-refund-promise",
             "1.0.0",
             True,
         )
         assert printed == (
             f"passed: the comparison held\n  subject:  {subject}\n  verifier: {verifier}\n"
-            f"failed: operator LessThanOrEquals returned false\n"
+            f"failed: operator NotContains returned false\n"
             f"  subject:  {subject}\n  verifier: {verifier}\n"
         )
         [broken] = script["result"].requirements
         assert (broken["id"], broken["outcome"], broken["actual"]) == (
-            "within-limit",
+            "no-refund-promise",
             "failed",
-            250,
+            "You have a guaranteed refund.",
         )
         identities.add((str(subject), str(verifier)))
         assert sorted(path.name for path in reader.iterdir()) == [
+            "no-refund-promise.yaml",
             "quickstart.py",
-            "refund-limit.yaml",
             "support-reply.yaml",
         ], "the reader manages no bundle"
         assert list((reader.parent / "tmp").iterdir()) == [], "a metadata-only state keeps no files"
@@ -111,7 +111,7 @@ def test_docsite_quickstart_refuses_insufficient_authority(
         WyrdState.declare("support-reply.yaml", client)
     state = WyrdState.from_path(reader.parent / "bundle", client)
     with pytest.raises(WyrdError) as verified:
-        state.run().observe.verify("refund-limit", {"refund": 40})
+        state.run().observe.verify("no-refund-promise", answer="Your refund request is approved.")
 
     assert declared.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert verified.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -121,8 +121,8 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
     reader: Path, server: WyrdTestServer
 ) -> None:
     run_quickstart(reader)
-    verifier = reader / "refund-limit.yaml"
-    verifier.write_text(verifier.read_text().replace("expected: 100", "expected: 50"))
+    verifier = reader / "no-refund-promise.yaml"
+    verifier.write_text(verifier.read_text().replace("expected: guaranteed refund", "expected: guaranteed"))
 
     with pytest.raises(WyrdError) as drifted:
         WyrdState.declare("support-reply.yaml")

@@ -31,7 +31,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | --- | --- | --- | --- |
 | `wyrd.guide` | Any caller | `{topic}` → `{topic, steps, examples}` | Static workflow guidance |
 
-`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; replace angle-bracket placeholders with discovered values.
+`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; angle-bracket placeholders stand for discovered values.
 
 ## Cards and verification
 
@@ -45,7 +45,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. Pass `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
@@ -66,7 +66,7 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 | `max_bytes` | 4 MiB | 16 MiB |
 | `deadline_ms` | Server policy | 4,294,967,295 ms; minimum 1 |
 
-Use one DataFusion SQL `SELECT` with fully qualified names and a `LIMIT`. Rows are positional arrays in `columns` order. Trust a result only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
+`sql` is one DataFusion SQL `SELECT` with fully qualified table names. Rows are positional arrays in `columns` order. A result is complete only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
 
 ## Principal credentials
 
@@ -114,9 +114,9 @@ Gateway tools address resources by exact `name` and never call a model.
 
 A managed secret is write-only. A credential still referenced by a deployment cannot be deleted.
 
-## If it fails
+## Errors
 
-A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem; read its `code` and remediation.
+A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem with `code` and remediation.
 
 | Code | Cause |
 | --- | --- |

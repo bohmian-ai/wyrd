@@ -9,7 +9,7 @@ import { wyrdCode, WYRD_THEME } from '../shiki-theme.js';
 // `<CodeFromFile>` embeds both become a `<CodeBlock>` carrying pre-highlighted
 // HTML, so neither the highlighter nor any embedded source reaches the browser.
 
-const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
+export const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 
 // One shared Shiki highlighter on the token-driven Wyrd code theme.
 const highlighter = await createHighlighter({

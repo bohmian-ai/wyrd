@@ -24,7 +24,10 @@ const COMPONENT = /<\/?(Tabs|Tab|LangTabs|LangTab|Aside|Steps|WyrdDiagram|WyrdSe
 export function pageText(source) {
   const body = source.replace(/^---\n[\s\S]*?\n---\n/, '').replace(/<script\b[\s\S]*?<\/script>\n?/g, '');
   const { code } = embedCodeFromFile(body, fence);
-  return outsideFences(code, (prose) => prose.replace(COMPONENT, component).replace(/\]\(\/(?!\/)/g, `](${BASE}/`))
+  return outsideFences(code, (prose) => prose
+      .replace(COMPONENT, component)
+      .replace(/[ \t]+$/gm, '')
+      .replace(/\]\(\/(?!\/)/g, `](${BASE}/`))
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

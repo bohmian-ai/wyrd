@@ -72,7 +72,7 @@
       <div>
         <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">One support agent and one Verifier, one step per tab: declare what a ticket must contain, hand the ticket to the verification engine, and read the verdict.</p>
+        <p class="sub">One support agent and one Verifier, one step per tab: declare what an answer must never say, verify two answers, and read the verdict.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
@@ -82,14 +82,14 @@
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks.</p>
+            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks. Declare both with <code>wyrd declare support-reply.yaml</code>, or from your code with <code>WyrdState.declare</code>.</p>
             <Tabs>
               <Tab label="Service"><CodeBlock lang="yaml" {...data.declare.service} /></Tab>
               <Tab label="Verifier"><CodeBlock lang="yaml" {...data.declare.verifier} /></Tab>
             </Tabs>
           </Tab>
           <Tab label="02 Observe">
-            <p class="step">Inside a Run, hand the agent's ticket to the verification engine. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <p class="step">Declare, start a Run, and verify two answers. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
               {#each data.observe as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
@@ -97,11 +97,8 @@
             </LangTabs>
           </Tab>
           <Tab label="03 Verify">
-            <p class="step">The verdict cites the evidence it judged. A failed check is a result, not an exception.</p>
-            <Tabs>
-              <Tab label="Real time"><CodeBlock lang="json" {...data.verify.realtime} /></Tab>
-              <Tab label="Background"><CodeBlock lang="json" {...data.verify.background} /></Tab>
-            </Tabs>
+            <p class="step">The failing answer's verdict names the requirement, the reason, and the value it judged. A failed check is a result, not an exception.</p>
+            <CodeBlock lang="json" {...data.verify} />
           </Tab>
         </Tabs>
       </div>

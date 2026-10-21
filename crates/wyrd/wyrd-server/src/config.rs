@@ -2291,7 +2291,9 @@ impl WyrdServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
-    /// Socket address to bind the HTTP listener.
+    /// Socket address to bind the HTTP listener. Defaults to
+    /// `127.0.0.1:8080`; a server reached without a same-host proxy must
+    /// set a routable or wildcard address through `WYRD_SERVER_BIND`.
     #[serde(default = "default_http_bind")]
     pub bind: SocketAddr,
 }
@@ -2757,8 +2759,10 @@ fn within(path: &str, prefix: &str) -> bool {
 // Default helpers (private)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Default HTTP listener: loopback, so an unconfigured server is reachable
+/// only from its own host and a deployment opts in to wider exposure.
 fn default_http_bind() -> SocketAddr {
-    "0.0.0.0:8080"
+    "127.0.0.1:8080"
         .parse()
         .expect("static HTTP bind address is valid")
 }
@@ -3367,8 +3371,8 @@ impl WyrdServerConfig {
             });
         }
 
-        // 1. HTTP and gRPC bind addresses must differ.
-        if serves_api && self.http.bind == self.grpc.bind {
+        // 1. HTTP and gRPC bind addresses must not overlap.
+        if serves_api && binds_overlap(self.http.bind, self.grpc.bind) {
             return Err(ConfigError::BindCollision {
                 bind: self.http.bind,
             });
@@ -3385,7 +3389,10 @@ impl WyrdServerConfig {
                               no room for the auto-computed metrics port (http_port + 1)"
                                 .to_owned(),
                     })?;
-            if serves_api && (metrics_bind == self.http.bind || metrics_bind == self.grpc.bind) {
+            if serves_api
+                && (binds_overlap(metrics_bind, self.http.bind)
+                    || binds_overlap(metrics_bind, self.grpc.bind))
+            {
                 return Err(ConfigError::BindCollision { bind: metrics_bind });
             }
         }
@@ -5137,6 +5144,32 @@ minimum_slots = 2
         });
     }
 
+    /// An unconfigured HTTP listener stays on loopback, and a wildcard gRPC
+    /// bind on the same port overlaps it and is refused before startup.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the default is not `127.0.0.1:8080` or the overlap passes
+    /// validation.
+    #[test]
+    fn http_bind_defaults_to_loopback_and_wildcard_overlap_collides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("WYRD_GRPC_BIND", Some("0.0.0.0:8080"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            assert_eq!(
+                cfg.http.bind,
+                "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+            );
+            cfg.bifrost.oracle.allow_unapproved_profile = true;
+            cfg.apply_env_overrides().expect("apply succeeds");
+            let err = cfg.validate().expect_err("wildcard overlap must fail");
+            assert!(
+                matches!(err, ConfigError::BindCollision { .. }),
+                "expected BindCollision, got {err:?}"
+            );
+        });
+    }
+
     // ── 4. Same-port collision triggers BindCollision ─────────────────────────
 
     #[test]
@@ -5790,8 +5823,8 @@ minimum_slots = 2
 
     #[test]
     fn metrics_bind_collision_with_http_invalid() {
-        // The default HTTP bind is 0.0.0.0:8080, gRPC is 127.0.0.1:50051.
-        // Set metrics.bind to the HTTP port explicitly to trigger a collision.
+        // The default HTTP bind is 127.0.0.1:8080, gRPC is 127.0.0.1:50051.
+        // A wildcard metrics bind on the HTTP port overlaps it and collides.
         let toml = r#"
             [metrics]
             bind = "0.0.0.0:8080"

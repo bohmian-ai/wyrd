@@ -7,7 +7,12 @@ agents. Frontmatter, generated pages, and site commands are in
 
 ## Page types
 
-Every page is one of three types. Pick it before writing.
+Every page is one of four types. Pick it before writing.
+
+**Landing** (the introduction)
+
+- What Wyrd is in one paragraph, one tested example, and where to start.
+- No procedure and no exhaustive lists.
 
 **Guide** (Get started, Build and verify, Connect, Operate)
 
@@ -17,18 +22,27 @@ Every page is one of three types. Pick it before writing.
 - Covers only the behavior needed to finish the task. Does not enumerate
   options, flags, or every case.
 - Shows how the reader knows each important step worked.
+- Runs project code and the CLI through the reader's tool: `uv run`,
+  `cargo run`, `npx`. Never asks the reader to activate an environment.
 - Ends with a call to action under `## Next`.
 
 **Concept** (Understand)
 
 - Explains how something behaves and why, in detail.
-- Third person. No "you", no imperative steps.
-- Links to reference for exhaustive lists.
+- Third person. Use "you" only for a reader action the behavior depends on;
+  no imperative steps or imperative headings.
+- Opens with two sentences before any heading: what it is, then why it
+  matters.
+- Links to reference inline, where an exhaustive list would otherwise go.
 
 **Reference** (Reference, API)
 
 - Enumerates every field, option, limit, and error.
 - Third person, neutral. Generated from source where a generator exists.
+- One table or section per contract. At most one example block per
+  contract; a nested wire shape may use one `typescript` type block instead
+  of a table. Prose states only facts a table cannot hold.
+- Failures go under `## Errors` as a table of condition and result.
 
 ## What a guide leaves out
 
@@ -41,7 +55,9 @@ Every page is one of three types. Pick it before writing.
 - **Failures from other tasks.** End a guide with `## If it fails`: a two-column
   table (`You see` | `Fix`) of the failures this page's own steps commonly
   produce, at most about four rows. Everything else goes to troubleshooting.
-  An error a step triggers on purpose, to teach something, stays in that step.
+  An error a step triggers on purpose, to teach something, stays in that step;
+  show its printed output only when a test captures that text. `## If it
+  fails` is for guides only.
 - **Terms the page does not need.** Introduce a Wyrd term only at the step
   that uses it, in one sentence. Use the term from `PRODUCT.md` and never a
   synonym.
@@ -52,15 +68,17 @@ Copy the named page when writing a new one of the same shape.
 
 | Shape | Sections | Copy |
 | --- | --- | --- |
+| Landing | One paragraph → one example (its YAML, the program, and its output) → how it fits → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
 | Install | What you need (minimum versions table) → install, one command per language in `<LangTabs>` → start or check → `## If it fails` → `## Next` | `get-started/setup.md` |
 | Quickstart or guide | One-sentence goal → numbered `##` steps, each with its files, command, and output → `## If it fails` → `## Next` | `get-started/quickstart.md` |
-| Concept | What it is (two sentences) → one example → behavior → links | — |
+| Concept | What it is (two sentences) → one example → behavior → links | `understand/how-verification-works.md` |
 | Reference | One table or section per contract; no narrative | `reference/verifier-card.md` |
 
 ## Examples
 
 - Embed code with `<CodeFromFile file="examples/...">` from a file a journey
-  test runs. Do not hand-write a snippet a reader will copy.
+  test runs. Do not hand-write a snippet a reader will copy. Language tabs
+  showing the same scenario count as one example.
 - Explain code with short comments in the example file, at the line they
   describe. Prose after a block covers only its output and what to do next.
 - Show the output a command prints when it confirms success, in a `text` block

@@ -1359,7 +1359,7 @@ read for that group. Distinct later snapshots may overlap earlier executions.
 
 Source lists share execution ordering, with null for a missing outcome or an
 absent selected value. A visible result whose execution's input is not visible
-is a read caught mid-publication: the snapshot pins nothing and the pending row
+is an input not yet readable: the snapshot pins nothing and the pending row
 remains for retry. More than five minutes past the current due time, by
 PostgreSQL's `statement_timestamp()`, the scheduler instead records one terminal
 `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` group execution through the refusal
@@ -1694,9 +1694,10 @@ deployment target.
 Every Bifrost query, including a Verifier's query, uses the same query service
 and published-plus-live source behavior. The request exposes no visibility,
 freshness, or query-class choice. Oracle selects Interactive or Analytical
-automatically from the one DataFusion physical plan. Live coverage is best
-effort; a successful query is not proof that every acknowledged write was
-included. `bifrost-design.md` owns the failure and publication-overlap details.
+automatically from the one DataFusion physical plan. A successful query returns
+each row its selected published and online live sources hold exactly once,
+including rows published while it runs; an unreachable Scribe yields a degraded
+terminal. `bifrost-design.md` owns the source-selection and failure details.
 
 ### Coordination clock
 

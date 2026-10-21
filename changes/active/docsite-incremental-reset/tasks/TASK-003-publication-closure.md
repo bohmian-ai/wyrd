@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-docsite-incremental-reset
-spec_revision: 2
+spec_revision: 7
 requirements: [REQ-001, REQ-002, REQ-004, REQ-005, INV-001, INV-002, INV-003, INV-004, INV-005, AC-001, AC-003, AC-004, AC-005, AC-006]
 depends_on: [TASK-002]
 parent_task:
@@ -210,7 +210,7 @@ Choosing draft instead of conditional retention is explicitly in scope.
 
 ## Authority Links
 
-- [Approved spec revision 2 and exact disposition table](../spec.md)
+- [Approved spec revision 7 and exact disposition table](../spec.md)
 - [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Bifrost authority](../../../../architecture/bifrost-design.md)

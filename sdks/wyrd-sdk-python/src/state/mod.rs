@@ -28,7 +28,7 @@ use wyrd_spec::registry::{
     DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
-use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
+use wyrd_client::state::{DeclareOptions, TelemetryFlushFailure, WyrdState};
 
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
@@ -52,21 +52,6 @@ pub struct PyCardEnvelope {
     /// Stable aliases resolving to this exact Card; nonempty for hydrated
     /// state and empty for a registry read, which belongs to no graph.
     aliases: Vec<String>,
-}
-
-/// Immutable Python descriptor for one verified local artifact.
-#[pyclass(module = "wyrd.state", name = "HydratedArtifact", frozen)]
-pub struct PyHydratedArtifact {
-    /// Manifest-relative artifact path.
-    relative_path: String,
-    /// Confined absolute local payload path.
-    local_path: PathBuf,
-    /// Verified base64-encoded SHA-256 digest supplied by the manifest.
-    sha256: String,
-    /// Verified payload length.
-    size_bytes: u64,
-    /// Optional declared media type.
-    content_type: Option<String>,
 }
 
 /// Python wrapper for a locally hydrated `WyrdState`.
@@ -151,24 +136,60 @@ impl PyWyrdState {
                 None => WyrdState::from_path(&path),
             })
             .map_err(WyrdPyError::from)?;
-        let config = PythonStateHydrator::normalize_config(
-            py,
-            &inner,
-            interfaces,
-            load_kwargs,
-            trusted_artifact_hashes,
-        )?;
-        let hydrated = PythonStateHydrator::new(&inner, config).hydrate(py)?;
-        Ok(Self {
-            inner,
-            envelopes: hydrated.envelopes,
-            agents: hydrated.agents,
-            prompts: hydrated.prompts,
-            models: hydrated.models,
-            data: hydrated.data,
-            telemetry: OnceLock::new(),
-            telemetry_setup: Mutex::new(()),
-        })
+        Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
+    }
+
+    /// Declare a Card file and return its eagerly hydrated state, ready to run.
+    ///
+    /// The online counterpart of `from_path`: the file and the files its
+    /// `./path` references name are declared under the registry's usual
+    /// version rules, the declared root's complete graph is pulled and
+    /// validated, and Python holders are hydrated exactly as `from_path`
+    /// hydrates them. The declaration, the pull, and every later server call
+    /// run as one client. Without `bundle_dir`, the bundle stays private:
+    /// its metadata is deleted before this returns, and artifact payloads
+    /// stay until the state, its runs, and every Model or Data holder drop.
+    ///
+    /// ```python
+    /// from wyrd import WyrdState
+    ///
+    /// state = WyrdState.declare("support-reply.yaml")
+    /// run = state.run()
+    /// ```
+    ///
+    /// # Arguments
+    /// * `path` - The root Service Card file.
+    /// * `client` - The `WyrdClient` every call runs as, or `None` for the
+    ///   ambient chain.
+    /// * `bundle_dir` - A caller-owned directory to publish the bundle to,
+    ///   which persists and loads offline with `from_path`.
+    /// * `interfaces` - Model and Data interfaces keyed by alias.
+    /// * `load_kwargs` - Loader options keyed by alias.
+    /// * `trusted_artifact_hashes` - Trusted artifact manifest hashes keyed by alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader, registry, and pull errors `WyrdState::declare_with`
+    /// documents, then `from_path`'s hydration errors. A failure after the
+    /// registry accepted the declaration leaves it committed.
+    #[staticmethod]
+    #[pyo3(signature = (path, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
+    fn declare(
+        py: Python<'_>,
+        path: PathBuf,
+        client: Option<PyRef<'_, PyWyrdClient>>,
+        bundle_dir: Option<PathBuf>,
+        interfaces: Option<&Bound<'_, PyMapping>>,
+        load_kwargs: Option<&Bound<'_, PyMapping>>,
+        trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
+    ) -> CardPyResult<Self> {
+        let options = DeclareOptions {
+            client: client.map(|client| client.inner().clone()),
+            bundle_dir,
+        };
+        let inner = crate::trace::block_on(py, WyrdState::declare_with(path, options))
+            .map_err(WyrdPyError::from)?;
+        Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
 
     /// Install the global OpenTelemetry tracer provider exporting spans to
@@ -402,41 +423,6 @@ impl PyWyrdState {
     fn card_ref(&self, alias: &str) -> CardPyResult<CardRefPy> {
         Ok(CardRefPy(self.inner.card_ref(alias)?.clone()))
     }
-    /// Return verified artifact descriptors without reading payload bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns artifact lookup, Python allocation, or tuple allocation errors.
-    fn artifacts(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyAny>> {
-        let card_ref = self.inner.card_ref(alias)?.clone();
-        let items = self
-            .inner
-            .artifacts(alias)?
-            .iter()
-            .map(|artifact| {
-                Py::new(
-                    py,
-                    PyHydratedArtifact {
-                        relative_path: artifact.relative_path().to_owned(),
-                        local_path: artifact.local_path().to_path_buf(),
-                        sha256: artifact.sha256().to_owned(),
-                        size_bytes: artifact.size_bytes(),
-                        content_type: artifact.content_type().map(str::to_owned),
-                    },
-                )
-                .map_err(|_| WyrdPyError::from(WyrdError::SdkRuntimeHydrationFailed {
-                    message: "Python artifact allocation failed".to_owned(),
-                    details: serde_json::json!({"alias": alias, "card_ref": card_ref, "stage": "python_allocation", "reason": "artifact allocation failed"}),
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        PyTuple::new(py, items)
-            .map(|tuple| tuple.unbind().into_any())
-            .map_err(|_| WyrdPyError::from(WyrdError::SdkRuntimeHydrationFailed {
-                message: "Python artifact tuple allocation failed".to_owned(),
-                details: serde_json::json!({"alias": alias, "card_ref": card_ref, "stage": "python_allocation", "reason": "artifact tuple allocation failed"}),
-            }))
-    }
     /// Return the eagerly loaded Model holder selected by alias.
     ///
     /// # Errors
@@ -527,6 +513,39 @@ impl PyWyrdState {
 }
 
 impl PyWyrdState {
+    /// Hydrate every Python holder of a loaded native state and publish it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapping, Card-kind, trust, loader, and Python allocation
+    /// errors `from_path` documents; nothing is published on failure.
+    fn hydrated(
+        py: Python<'_>,
+        inner: WyrdState,
+        interfaces: Option<&Bound<'_, PyMapping>>,
+        load_kwargs: Option<&Bound<'_, PyMapping>>,
+        trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
+    ) -> CardPyResult<Self> {
+        let config = PythonStateHydrator::normalize_config(
+            py,
+            &inner,
+            interfaces,
+            load_kwargs,
+            trusted_artifact_hashes,
+        )?;
+        let hydrated = PythonStateHydrator::new(&inner, config).hydrate(py)?;
+        Ok(Self {
+            inner,
+            envelopes: hydrated.envelopes,
+            agents: hydrated.agents,
+            prompts: hydrated.prompts,
+            models: hydrated.models,
+            data: hydrated.data,
+            telemetry: OnceLock::new(),
+            telemetry_setup: Mutex::new(()),
+        })
+    }
+
     /// Flush completed spans from the provider `start_telemetry` installed.
     ///
     /// Calls the managed handle's `force_flush`, which waits at most the SDK's
@@ -774,35 +793,6 @@ impl PyCardEnvelope {
     /// Returns the serializer error when the envelope cannot be represented.
     fn model_dump_json(&self) -> CardPyResult<String> {
         Ok(serde_json::to_string(&self.card)?)
-    }
-}
-
-#[pymethods]
-impl PyHydratedArtifact {
-    /// Return the manifest-relative artifact path.
-    #[getter]
-    fn relative_path(&self) -> &str {
-        &self.relative_path
-    }
-    /// Return the absolute confined payload path.
-    #[getter]
-    fn local_path(&self) -> PathBuf {
-        self.local_path.clone()
-    }
-    /// Return the verified base64-encoded SHA-256 digest.
-    #[getter]
-    fn sha256(&self) -> &str {
-        &self.sha256
-    }
-    /// Return the verified payload length.
-    #[getter]
-    fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-    /// Return the declared media type, when present.
-    #[getter]
-    fn content_type(&self) -> Option<&str> {
-        self.content_type.as_deref()
     }
 }
 
@@ -3567,23 +3557,21 @@ impl From<ListCardsResponse> for PyCardList {
 ///
 /// The Python package exposes this native module through `wyrd.state`. During
 /// extension initialisation, declaration adds the `WyrdState` runtime handle
-/// first, followed by its immutable `CardEnvelope` and `HydratedArtifact`
-/// projections. Keeping these classes together ensures that a hydrated local
-/// bundle can be projected without importing the server-facing card registry;
+/// first, followed by its immutable `CardEnvelope` projection. Keeping these
+/// classes together ensures that a hydrated local bundle can be projected
+/// without importing the server-facing card registry;
 /// the declaration itself performs no bundle loading, filesystem access, or
 /// network work.
 ///
 /// # Errors
 ///
 /// Returns a [`CardPyResult`] error when `PyO3` cannot allocate or mutate the
-/// module while registering `PyWyrdState`, `PyCardEnvelope`, or
-/// `PyHydratedArtifact`. In particular, failures from each corresponding
-/// `add_class` call (such as Python allocation errors or a duplicate/incompatible
+/// module while registering `PyWyrdState` or `PyCardEnvelope`. In
+/// particular, failures from each corresponding `add_class` call (such as Python allocation errors or a duplicate/incompatible
 /// class entry) are propagated unchanged to the extension initialiser.
 pub fn register_state(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyWyrdState>()?;
     module.add_class::<PyCardEnvelope>()?;
-    module.add_class::<PyHydratedArtifact>()?;
     Ok(())
 }
 

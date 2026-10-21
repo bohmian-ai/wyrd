@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::WyrdClient;
 use crate::bifrost::{Bifrost, BifrostOptions, QueueConfig, TableConfig};
+use crate::cards::{CardSelector, Cards};
 use crate::observe::Run;
 use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
 use base64::Engine;
@@ -34,17 +35,23 @@ use wyrd_spec::registry::{
 use wyrd_spec::registry::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
 
 /// One verified artifact payload in a local `WyrdState` bundle.
+///
+/// Internal inventory: load-time validation checks each payload against it,
+/// and the trusted-manifest hash is rebuilt from it. It is not public API.
 #[derive(Debug, Clone)]
-pub struct HydratedArtifact {
+struct HydratedArtifact {
     /// Server-declared relative path within the Card artifact directory.
     relative_path: String,
     /// Canonical absolute path to the verified local payload.
     local_path: PathBuf,
     /// Server-declared base64-encoded SHA-256 digest.
+    #[cfg(feature = "internal")]
     sha256: String,
     /// Verified payload byte length.
+    #[cfg(feature = "internal")]
     size_bytes: u64,
     /// Optional server-declared MIME type.
+    #[cfg(feature = "internal")]
     content_type: Option<String>,
 }
 
@@ -166,38 +173,6 @@ pub enum HydratedCard<'a> {
     Envelope(&'a Card),
 }
 
-impl HydratedArtifact {
-    /// Return the server-owned relative artifact path.
-    #[must_use]
-    pub fn relative_path(&self) -> &str {
-        &self.relative_path
-    }
-
-    /// Return the absolute, bundle-confined local payload path.
-    #[must_use]
-    pub fn local_path(&self) -> &Path {
-        &self.local_path
-    }
-
-    /// Return the base64-encoded SHA-256 digest.
-    #[must_use]
-    pub fn sha256(&self) -> &str {
-        &self.sha256
-    }
-
-    /// Return the verified payload byte size.
-    #[must_use]
-    pub fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    /// Return the optional artifact content type.
-    #[must_use]
-    pub fn content_type(&self) -> Option<&str> {
-        self.content_type.as_deref()
-    }
-}
-
 /// Immutable indexes for a validated hydrated Card bundle.
 ///
 /// `HydratedStateIndex` owns the exact-reference, alias, and artifact maps
@@ -220,6 +195,7 @@ struct HydratedStateIndex {
     #[cfg(feature = "internal")]
     aliases_by_ref: BTreeMap<String, Vec<String>>,
     /// Verified artifact metadata grouped by canonical exact-reference key.
+    #[cfg(feature = "internal")]
     artifacts_by_ref: BTreeMap<String, Vec<HydratedArtifact>>,
     /// Confined artifact directories grouped by canonical exact-reference key.
     #[cfg(feature = "internal")]
@@ -249,6 +225,7 @@ impl HydratedStateIndex {
         let mut refs_by_key = BTreeMap::new();
         #[cfg(feature = "internal")]
         let mut aliases_by_ref = BTreeMap::<String, Vec<String>>::new();
+        #[cfg(feature = "internal")]
         let mut artifacts_by_ref = BTreeMap::new();
         #[cfg(feature = "internal")]
         let mut artifact_dirs_by_ref = BTreeMap::new();
@@ -265,8 +242,8 @@ impl HydratedStateIndex {
                 if let Some(artifact_dir) = item.artifact_dir {
                     artifact_dirs_by_ref.insert(key.clone(), artifact_dir);
                 }
+                artifacts_by_ref.insert(key, item.artifacts);
             }
-            artifacts_by_ref.insert(key, item.artifacts);
         }
         if !cards_by_ref.contains_key(&root_key) {
             return Err(state_bundle_error(
@@ -283,6 +260,7 @@ impl HydratedStateIndex {
             aliases,
             #[cfg(feature = "internal")]
             aliases_by_ref,
+            #[cfg(feature = "internal")]
             artifacts_by_ref,
             #[cfg(feature = "internal")]
             artifact_dirs_by_ref,
@@ -363,6 +341,7 @@ impl HydratedStateIndex {
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated artifact map.
+    #[cfg(feature = "internal")]
     fn artifacts_by_key(&self, key: &str) -> Result<&[HydratedArtifact], WyrdError> {
         self.artifacts_by_ref
             .get(key)
@@ -410,10 +389,10 @@ impl HydratedStateIndex {
             .iter()
             .map(|artifact| {
                 Ok(ArtifactManifestEntry {
-                    relative_path: RelativeArtifactPath::new(artifact.relative_path())?,
-                    sha256: Some(artifact.sha256().to_owned()),
-                    size_bytes: Some(artifact.size_bytes()),
-                    content_type: artifact.content_type().map(str::to_owned),
+                    relative_path: RelativeArtifactPath::new(&artifact.relative_path)?,
+                    sha256: Some(artifact.sha256.clone()),
+                    size_bytes: Some(artifact.size_bytes),
+                    content_type: artifact.content_type.clone(),
                 })
             })
             .collect::<Result<Vec<_>, WyrdError>>()?;
@@ -465,6 +444,20 @@ pub struct WyrdState {
     /// state was created with, else one resolved from the ambient
     /// configuration on first use and kept.
     client: Arc<OnceLock<WyrdClient>>,
+}
+
+/// How [`WyrdState::declare_with`] declares a Card file and prepares its state.
+#[derive(Debug, Clone, Default)]
+pub struct DeclareOptions {
+    /// The client the declaration, the pull, and every later server call of
+    /// the state run as; `None` resolves the ambient client once.
+    pub client: Option<WyrdClient>,
+    /// A caller-owned directory to publish the complete bundle to, which
+    /// persists after the state drops and loads offline with
+    /// [`WyrdState::from_path`]; an existing bundle there is replaced only
+    /// after the new one is complete. `None` loads the graph into memory and
+    /// keeps no files, so artifact payloads are not available locally.
+    pub bundle_dir: Option<PathBuf>,
 }
 
 /// Private filesystem reader for one confined Card bundle root.
@@ -571,6 +564,81 @@ impl WyrdState {
         let state = Self::from_path(path)?;
         let _ = state.client.set(client);
         Ok(state)
+    }
+
+    /// Declare the Card file at `path` and return the state of its graph,
+    /// ready to run, as the ambient client.
+    ///
+    /// The online counterpart of [`Self::from_path`]: one call replaces
+    /// `Cards::declare_from_path`, `Cards::pull`, and `from_path`.
+    ///
+    /// # Arguments
+    /// * `path` - The root Service Card file; its `./path` references are
+    ///   resolved relative to it and declared with it.
+    ///
+    /// # Errors
+    /// As [`Self::declare_with`].
+    pub async fn declare(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
+        Self::declare_with(path, DeclareOptions::default()).await
+    }
+
+    /// Declare the Card file at `path` and return the state of its graph,
+    /// ready to run, with `options`.
+    ///
+    /// The file and the files it references are declared under the
+    /// registry's usual version rules, so an unchanged rerun declares
+    /// nothing new. The declared root's complete graph is then pulled and
+    /// loaded with the same validation as [`Self::from_path`]. The declaration,
+    /// the pull, and every later server call of the state use one client.
+    ///
+    /// Without `bundle_dir`, the bundle is pulled into a temporary directory,
+    /// loaded into memory, and deleted before this returns; artifact payloads
+    /// are not kept, so a graph whose Model or Data payloads must load needs
+    /// `bundle_dir`.
+    ///
+    /// # Arguments
+    /// * `path` - The root Service Card file.
+    /// * `options` - The client and the optional caller-owned bundle directory.
+    ///
+    /// # Errors
+    /// Returns the client's configuration or credential error, the loader's
+    /// `WYRD_LOADER_400_INVALID_ENVELOPE` for an unreadable or invalid Card
+    /// file, the registry's error when it refuses the declaration (for
+    /// example `WYRD_REGISTRY_409_SPEC_DRIFT` or an authorization refusal),
+    /// the pull's error, and [`Self::from_path`]'s errors for the bundle.
+    ///
+    /// # Cancellation
+    /// A failure or a dropped future after the registry accepted the
+    /// declaration leaves the declaration committed, but returns no state
+    /// and removes the temporary directory; a `bundle_dir` keeps its prior
+    /// bundle, as [`crate::cards::Cards::pull`] describes.
+    pub async fn declare_with(
+        path: impl AsRef<Path>,
+        options: DeclareOptions,
+    ) -> Result<Self, WyrdError> {
+        let client = match options.client {
+            Some(client) => client,
+            None => WyrdClient::from_global().map_err(WyrdError::from)?,
+        };
+        let cards = Cards::connect_with(&client).await?;
+        let receipt = cards.declare_from_path(path).await?;
+        let root = CardSelector::exact(receipt.root);
+        if let Some(bundle_dir) = options.bundle_dir {
+            cards.pull(root, &bundle_dir, BundleMode::Complete).await?;
+            return Self::from_path_with(&bundle_dir, client);
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("wyrd-state-")
+            .tempdir()
+            .map_err(|error| {
+                state_bundle_error(
+                    "the temporary state directory cannot be created",
+                    json!({ "source": error.to_string() }),
+                )
+            })?;
+        let bundle = staging.path().join("bundle");
+        cards.pull(root, &bundle, BundleMode::Complete).await?;
+        Self::from_path_with(&bundle, client)
     }
 
     /// Connect this state's one Bifrost writer as the state's client.
@@ -910,20 +978,6 @@ impl WyrdState {
         })
     }
 
-    /// Return verified artifacts for an alias.
-    ///
-    /// # Arguments
-    /// * `alias` - The bundle alias whose verified artifacts are listed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias or an
-    /// invalid-state-bundle error if the artifact index is inconsistent.
-    pub fn artifacts(&self, alias: &str) -> Result<&[HydratedArtifact], WyrdError> {
-        let key = self.index.resolve_key(alias)?;
-        self.index.artifacts_by_key(key)
-    }
-
     /// Return the confined artifact directory for an alias, when non-empty.
     ///
     /// # Arguments
@@ -1160,20 +1214,6 @@ impl WyrdState {
         self.index.aliases_by_key(key)
     }
 
-    /// Resolve a canonical exact `CardRef` key to its verified artifacts.
-    ///
-    /// # Arguments
-    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-state-bundle error when the key is absent from the
-    /// validated artifact index.
-    #[cfg(feature = "internal")]
-    pub fn artifacts_by_key(&self, key: &str) -> Result<&[HydratedArtifact], WyrdError> {
-        self.index.artifacts_by_key(key)
-    }
-
     /// Resolve a canonical exact `CardRef` key to its artifact directory.
     ///
     /// # Arguments
@@ -1394,15 +1434,16 @@ impl BundleReader<'_> {
             }
         }
 
-        // The directory is validated above either way; only the `internal`
-        // introspection surface (`WyrdState::artifact_dir`) retains it.
+        // The directory and artifacts are validated above either way; only
+        // the `internal` introspection surface retains them.
         #[cfg(not(feature = "internal"))]
-        let _ = artifact_dir;
+        let _ = (artifact_dir, artifacts);
         Ok(LoadedManifestCard {
             key: card_ref.to_string(),
             card_ref,
             card,
             aliases: entry.aliases.clone(),
+            #[cfg(feature = "internal")]
             artifacts,
             #[cfg(feature = "internal")]
             artifact_dir,
@@ -1548,8 +1589,11 @@ impl BundleReader<'_> {
         Ok(HydratedArtifact {
             relative_path: entry.relative_path.clone(),
             local_path: payload,
+            #[cfg(feature = "internal")]
             sha256: entry.sha256.clone(),
+            #[cfg(feature = "internal")]
             size_bytes: expected_size,
+            #[cfg(feature = "internal")]
             content_type: entry.content_type.clone(),
         })
     }
@@ -2062,6 +2106,7 @@ struct LoadedManifestCard {
     /// Manifest aliases validated against their projection files.
     aliases: Vec<String>,
     /// Verified artifacts owned by this Card.
+    #[cfg(feature = "internal")]
     artifacts: Vec<HydratedArtifact>,
     /// Canonical artifact directory when the Card has artifacts.
     #[cfg(feature = "internal")]
@@ -2198,7 +2243,7 @@ pub(crate) mod tests {
         BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
     };
 
-    use super::{HydratedCard, WyrdState};
+    use super::{HydratedArtifact, HydratedCard, WyrdState};
     use wyrd_spec::error::WyrdError;
 
     /// Deterministic payload metadata used to materialize a hydrated artifact
@@ -2666,6 +2711,18 @@ pub(crate) mod tests {
             )
             .expect("fixture artifact rewrite");
         }
+    }
+
+    /// The verified artifact inventory the state indexed for `alias`.
+    ///
+    /// # Panics
+    /// Panics when the alias is unknown or has no indexed inventory.
+    fn artifacts<'s>(state: &'s WyrdState, alias: &str) -> &'s [HydratedArtifact] {
+        let key = state.index.resolve_key(alias).expect("alias resolves");
+        state
+            .index
+            .artifacts_by_key(key)
+            .expect("artifacts resolve")
     }
 
     /// Build a complete Card envelope with identity copied from `card_ref`.
@@ -3259,14 +3316,14 @@ pub(crate) mod tests {
         });
         bundle.write();
         let state = WyrdState::from_path(bundle.path()).expect("artifact graph loads");
-        let model_artifact = &state.artifacts("model").expect("model artifacts resolve")[0];
-        let data_artifact = &state.artifacts("training").expect("data artifacts resolve")[0];
+        let model_artifact = &artifacts(&state, "model")[0];
+        let data_artifact = &artifacts(&state, "training")[0];
         assert_eq!(
-            fs::read(model_artifact.local_path()).expect("model bytes read"),
+            fs::read(&model_artifact.local_path).expect("model bytes read"),
             b"weights"
         );
         assert_eq!(
-            fs::read(data_artifact.local_path()).expect("data bytes read"),
+            fs::read(&data_artifact.local_path).expect("data bytes read"),
             b"training"
         );
         assert_eq!(
@@ -3911,22 +3968,25 @@ pub(crate) mod tests {
     fn artifact_paths_are_absolute_confined_and_verified() {
         let bundle = TestBundle::with_artifact();
         let state = WyrdState::from_path(bundle.path()).expect("complete artifact graph loads");
-        let artifact = &state.artifacts("model").expect("model artifacts resolve")[0];
-        assert!(artifact.local_path().is_absolute());
+        let artifact = &artifacts(&state, "model")[0];
+        assert!(artifact.local_path.is_absolute());
         assert!(
             artifact
-                .local_path()
+                .local_path
                 .starts_with(fs::canonicalize(bundle.path()).expect("fixture root canonicalizes"))
         );
-        assert_eq!(artifact.size_bytes(), 7);
-        assert_eq!(artifact.content_type(), Some("application/octet-stream"));
+        assert_eq!(artifact.size_bytes, 7);
+        assert_eq!(
+            artifact.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
         assert_eq!(
             state
                 .artifact_dir("model")
                 .expect("artifact dir resolves")
                 .expect("artifact dir exists"),
             artifact
-                .local_path()
+                .local_path
                 .parent()
                 .expect("artifact parent exists")
         );

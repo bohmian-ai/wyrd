@@ -1,6 +1,6 @@
 ---
 id: SPEC-docsite-incremental-reset
-revision: 4
+revision: 8
 status: approved
 ---
 
@@ -206,22 +206,88 @@ Rebuilding the docs is also an ergonomics review. When a tutorial needs
 ceremony a developer should not have to write, fix the owning SDK or server
 surface in this change rather than documenting the workaround.
 
-The first such fix: `WyrdState.from_path` accepts an authored Card YAML file
-as well as a pulled bundle. Given a Card file, it loads and resolves the file's
-reference graph locally, declares it (idempotently for unchanged Cards), and
-returns a hydrated state for the declared root, so the Quickstart is:
+The first such fix is the explicitly named `WyrdState.declare(path)`. Given
+an authored subject Card YAML file, it resolves the file's references through
+the existing loader, declares the Cards (idempotently for unchanged Cards),
+and returns a ready state for the exact declared Service root. It composes
+the existing declaration, complete graph pull, and hydration owners; it does
+not introduce another registry, reference resolver, or artifact loader.
+The Quickstart becomes:
 
 ```python
 from wyrd import WyrdState
 
-state = WyrdState.from_path("support-reply.yaml")
+state = WyrdState.declare("support-reply.yaml")
 run = state.run()
 ```
 
-Bundle loading keeps its current offline behavior. Declaration from a Card
-file is a server write under the caller's normal declaration authority, and
-the public documentation says so. The capability lives in the shared Rust
-client owner and is projected to the Python, Rust, and TypeScript SDKs.
+`WyrdState.from_path` remains offline bundle loading; it is not overloaded
+with declaration or network IO. Declaration is a server write under the
+caller's normal authority. The same client is used throughout declaration,
+pull, hydration, and subsequent state operations. Normal read/pull and
+verification permissions remain necessary; declaration does not grant them.
+
+Default declaration keeps no files: the graph is loaded into memory and the
+temporary bundle is deleted before return, including on failure or
+cancellation. It never deletes caller-owned files or undoes committed server
+declarations. Shutdown keeps its existing runtime meaning.
+
+Python callers can explicitly retain an inspectable bundle with
+`WyrdState.declare(path, bundle_dir=".wyrd-bundle")`. Caller-selected bundle
+destinations use the existing staged publication/rollback behavior and are
+not automatically deleted when state is released. Independent default calls
+must not collide or overwrite live state files. Normal explicit-client and
+hydration/trust configuration remain available through language-idiomatic
+projections. The capability lives in `wyrd-client` and is projected to Python,
+Rust, and TypeScript; Python is synchronous, Rust and TypeScript await real IO.
+
+Models and data stay application-owned (REQ-008). A Service with a bound
+assertion Verifier judges supplied JSON without Wyrd loading any model.
+
+Same-version edits remain `WYRD_REGISTRY_409_SPEC_DRIFT` when the existing
+declaration rules require it. Preserve the catalog's instruction to bump
+`metadata.version` or revert the changed spec; do not silently bump, retry
+with another version, or wrap away the stable error. This does not alter the
+existing behavior for authored versions that are intentionally omitted.
+
+Remove the public `WyrdState.artifacts(alias)` accessor and its public-only
+artifact descriptor projections across the three SDKs. Repository callers
+only inspect the accessor in tests; no current application workflow or
+architecture requirement depends on state exposing a downloaded-file
+inventory. Internal Artifact integrity validation remains intact. Tests must continue to prove
+payload integrity at their owning boundaries rather than preserve an unused
+public accessor for test convenience. Do not add a compatibility alias.
+This removes a public SDK surface; unseen downstream callers may require an
+API migration. Removing the accessor does not imply that every framework's
+loaded model/data object is independent of its source files.
+
+### REQ-008 — Own verification, not models or data
+
+Wyrd owns expectations, evidence, judgment, and reaction. It identifies what
+it verifies; it does not package, store, or load models or datasets.
+
+| Kind | Revision 8 |
+| --- | --- |
+| Model | Reference only: `metadata` name/version plus an optional external `uri` (for example an MLflow model). No artifact upload, framework interface, signature, or loading. |
+| Data | Reference only: points at an Artifact Card holding Parquet rows. No interface, splits, or loading. |
+| Experiment, Mcp, Policy, Audit | Removed as Card kinds. Authorization stays role-based; audit stays the system table. |
+| Prompt, Agent, Service, Artifact, Verifier, Trigger, Operator, Source | Kept. Artifact associates artifacts with Verifiers. |
+
+A drift Verifier's `baseline_ref` points at a Data reference; each Verifier
+names its own. The fitter fits from that Data's Parquet. A new baseline is a
+new Data version. Baselines that are queries against a Source (run once by the
+server at declaration and frozen as Parquet) are a later change, not part of
+this revision.
+
+Delete the code that exists only for the removed behavior: `wyrd-interfaces`,
+SDK Model/Data hydration and interface overrides, and Model/Data artifact
+upload, pull, and trust. Artifact upload and integrity remain. Update the
+kind list and positioning wording in `AGENTS.md`, `architecture/wyrd-design.md`,
+`architecture/wyrd-doctrine.mdx`, and
+`architecture/references/doctrine/positioning-and-vocabulary.md`, and
+regenerate the derived contracts. Wyrd has no released compatibility promise
+for these kinds: stored envelopes of removed kinds and of old Model/Data
+shapes are removed by migration, with no compatibility read path or alias.
 
 ## Invariants, boundaries, and non-goals
 
@@ -231,7 +297,7 @@ client owner and is projected to the Python, Rust, and TypeScript SDKs.
 - **INV-002:** Tenancy, authorization, and Bifrost behavior are unchanged.
   SDK, CLI, and server ergonomics may change under REQ-007 through their owning
   crates and contracts, never as a documentation-only workaround.
-- **INV-003:** Preserve Wyrd vocabulary, exact component identities,
+- **INV-003:** Preserve Wyrd vocabulary except as REQ-008 changes it, exact component identities,
   authorization requirements, redaction, and non-blocking audit semantics.
   Do not invent routes, aliases, compatibility contracts, or durable Run state.
 - **INV-004:** Generated material changes through its owning source or
@@ -251,7 +317,8 @@ client owner and is projected to the Python, Rust, and TypeScript SDKs.
 | AC-004 | Production discovery contains only published pages and valid destinations. | Built route, navigation, search, links, and machine-index evidence, including removal of Setup/Quickstart in a test fixture. |
 | AC-005 | Retained concepts, references, and operations claims have appropriate source or runtime evidence; unproven pages are withdrawn. | Page disposition evidence, generated drift checks, relevant catalog/procedure proof. |
 | AC-006 | Brand, accessibility, and existing site behavior remain intact. | Existing docs tests, keyboard/responsive/both-theme review, `mise run docs:check`. |
-| AC-008 | The Quickstart script hydrates its state directly from the authored subject YAML, and bundle loading is unchanged. | SDK journeys for Card-file and bundle loading in each first-class SDK; the Quickstart journey and released walkthrough using the new form once released. |
+| AC-008 | `WyrdState.declare(path)` prepares a ready state from authored YAML in all first-class SDKs; `from_path` remains offline bundle loading. Without `bundle_dir` no files remain after return, failure, or cancellation. Explicit retained bundles work. Reruns preserve existing declaration rules and errors remain actionable. The public `artifacts` accessor is removed. | Rust/Python/TypeScript real-server declaration-to-verification journeys, no-files-left proof, retained-bundle offline regression, export/type checks for accessor removal, and the exact Quickstart journey. Public onboarding switches only after the new API is released and its walkthrough passes. |
+| AC-009 | The Card kinds and code match REQ-008 across server, wire contracts, SDKs, CLI, MCP, and doctrine; a drift Verifier fits from its Data reference's Parquet; removed kinds and Model/Data payload fields are refused with stable errors. | Drift baseline journey on a real server, refusal journeys for a removed kind and a Model payload, migration test over stored envelopes, `codegen:check`, `check:deps`, SDK export/type checks, and a repository search showing no removed kind or `wyrd-interfaces` reference outside history. |
 | AC-007 | Local snippet and generated-source changes reach docs verification/publication, and the old broad content authority is superseded on approval. | CI/task dependency inspection, updated product/contributor guidance and packet status. |
 
 Use the narrowest existing journey lanes for changed executable examples and
@@ -273,8 +340,18 @@ remain implementation choices.
 
 ## Open material decisions
 
-None. Revision 2 was approved by the user on 2026-10-20 with “i agree. write
-the tasks” after agreeing to YAML declarations and a complete Python script.
+None. Revision 8 was directed by the user with “strip the part out now,
+revise the spec”, after agreeing the REQ-008 boundary in conversation. Revision 7 was approved with “agree. update the task”: state owns its
+runtime resources, staging is deleted before return, required backing files
+have a separate owned lifetime, and callers never manage private directories.
+Revision 6 records the user's direction to delete temporary staging
+after loading when it is no longer needed and remove the artifact accessor
+if it lacks an actual use case. Repository research found no application
+consumer or design requirement for that public accessor. Revision 5 records
+the user's explicit correction to `declare`, agreement
+to managed temporary storage with optional `bundle_dir`, and “ok continue”
+after clarifying the boundary for application-owned models. Revision 2 was
+approved on 2026-10-20 with “i agree. write the tasks”.
 Exact artifact versions and page-level
 evidence are implementation validation obligations, not permission to change
 the release-only onboarding requirement; lack of compatible published
@@ -282,6 +359,27 @@ artifacts blocks publication and must be reported.
 
 ## Revision history and authority
 
+- **Revision 8 — 2026-10-20 — directed by the user:** Add REQ-008 and AC-009:
+  Model and Data become references, Experiment/Mcp/Policy/Audit Card kinds are
+  removed, drift baselines are Data references to Parquet Artifacts, and
+  Model/Data packaging code is deleted. `declare` keeps no files without
+  `bundle_dir`; revision 7's state-owned payload storage is withdrawn.
+  Source-query baselines are deferred to a later change.
+- **Revision 7 — 2026-10-20 — approved by the user:** Separate disposable
+  staging from state-owned runtime backing files. Always remove staging before
+  returning a ready state, retain required payloads through dependent SDK
+  lifetimes, avoid forced RAM materialization, and keep persistent bundle
+  output explicit. No new public storage-management API or cache.
+- **Revision 6 — 2026-10-20 — directed by the user:** Clean temporary staging
+  immediately after loading when file dependencies are absent; retain only
+  files still needed. Remove the public state artifact inventory, whose
+  repository uses are test inspection, while preserving internal artifact
+  integrity/trust/loading behavior and documenting the SDK surface removal.
+- **Revision 5 — 2026-10-20 — directed and approved by the user:** Replace
+  revision 4's overloaded `from_path` with `WyrdState.declare`; preserve offline
+  loading. Use temporary hydration storage by default and opt-in retained
+  bundles, share the capability across all SDKs, preserve error/artifact trust
+  semantics, and keep external model ownership independent of verification.
 - **Revision 4 — 2026-10-20 — directed by the user:** Nothing found while
   rebuilding the docs is out of scope; add REQ-007 and AC-008 so
   `WyrdState.from_path` also accepts an authored Card YAML file, and relax

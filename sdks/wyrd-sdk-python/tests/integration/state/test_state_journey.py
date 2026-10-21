@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ EXPECTED_ALIASES = (
     "triage_prompt",
 )
 TRAINING_DATA = pd.DataFrame({"feature": [0.0, 1.0], "label": [0, 1]})
+TYPED_SERVICE = TYPED_STATE_SOURCE / "typed-service.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +74,7 @@ def service(cards: Cards, models: dict[str, CardRef]) -> CardRef:
             PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
         )
     )
-    return cards.declare_from_path(TYPED_STATE_SOURCE / "typed-service.yaml").root
+    return cards.declare_from_path(TYPED_SERVICE).root
 
 
 @pytest.fixture(scope="module")
@@ -129,10 +131,6 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     for alias in state.aliases:
         ref = state.card_ref(alias)
         assert ref.uid is not None and ref.version
-    for alias in ("model_primary", "model_shadow", "default-Data-training-1.0.0"):
-        artifact = state.artifacts(alias)[0]
-        assert artifact.local_path.is_file()
-        assert artifact.local_path.is_relative_to(bundle.resolve())
 
 
 def test_metadata_only_bundle_is_rejected_by_python_state(metadata_bundle: Path) -> None:
@@ -169,4 +167,37 @@ def test_missing_relationship_projection_is_rejected_offline(
     (bundle / "cards" / "root" / "relationships.yaml").unlink()
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
+    assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
+
+
+def test_refused_declaration_keeps_no_files(service: CardRef, private_tmp: Path) -> None:
+    """A state that cannot hydrate is never returned and leaves no files behind."""
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.declare(TYPED_SERVICE)
+    assert caught.value.details["stage"] == "artifact_trust"
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_declared_bundle_dir_persists_and_loads_offline(
+    service: CardRef, trusted: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller's ``bundle_dir`` outlives the state and loads with no server reachable."""
+    state = WyrdState.declare(
+        TYPED_SERVICE, bundle_dir=tmp_path / "bundle", trusted_artifact_hashes=trusted
+    )
+    assert state.root_ref == service
+    del state
+    gc.collect()
+    monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
+
+    offline = WyrdState.from_path(tmp_path / "bundle", trusted_artifact_hashes=trusted)
+
+    assert offline.root_ref == service
+
+
+def test_from_path_never_declares_a_card_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``from_path`` loads bundles only: a Card file is refused without contacting a server."""
+    monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.from_path(TYPED_SERVICE)
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"

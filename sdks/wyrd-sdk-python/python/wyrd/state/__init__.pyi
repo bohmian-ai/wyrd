@@ -77,53 +77,22 @@ class CardEnvelope:
         """
         ...
 
-class HydratedArtifact:
-    """Read-only path and integrity metadata for one verified local artifact.
-
-    Instances come from ``WyrdState.artifacts`` and do not contain payload
-    bytes. Opening ``local_path`` is always an explicit caller action.
-    """
-
-    @property
-    def relative_path(self) -> str:
-        """Return the manifest-relative artifact path."""
-        ...
-
-    @property
-    def local_path(self) -> Path:
-        """Return the absolute path confined beneath the Card bundle."""
-        ...
-
-    @property
-    def sha256(self) -> str:
-        """Return the SHA-256 digest verified while loading the bundle."""
-        ...
-
-    @property
-    def size_bytes(self) -> int:
-        """Return the verified payload length in bytes."""
-        ...
-
-    @property
-    def content_type(self) -> str | None:
-        """Return the declared media type, if present."""
-        ...
-
 class WyrdState:
-    """Offline runtime view of one complete Service Card graph.
+    """Runtime view of one complete Service Card graph.
 
-    ``WyrdState`` validates a bundle produced by ``wyrd pull``, eagerly creates
-    Python Agent/Prompt/Model/Data holders, and shares one holder across every
-    alias for the same exact Card. Construction uses local files only.
+    ``WyrdState.declare`` declares an authored Card file and returns its
+    state; ``WyrdState.from_path`` loads a bundle produced by ``wyrd pull``
+    with local files only. Either eagerly creates Python
+    Agent/Prompt/Model/Data holders and shares one holder across every alias
+    for the same exact Card.
 
     Example:
-        >>> state = WyrdState.from_path("./service-bundle")
+        >>> state = WyrdState.declare("support-reply.yaml")
         >>> state.service.kind
         CardKind.Service
-        >>> state.model("primary_model")
+        >>> offline = WyrdState.from_path("./service-bundle")
+        >>> offline.model("primary_model")
         <ModelCard ...>
-        >>> state.artifacts("primary_model")[0].local_path
-        PosixPath(...)
     """
 
     @staticmethod
@@ -162,6 +131,51 @@ class WyrdState:
             WyrdError: With a stable ``WYRD_SDK_*`` code for invalid bundles,
                 aliases, kinds, conflicting configuration, or holder hydration.
 
+        """
+        ...
+
+    @staticmethod
+    def declare(
+        path: str | Path,
+        client: WyrdClient | None = None,
+        *,
+        bundle_dir: str | Path | None = None,
+        interfaces: Mapping[str, object] | None = None,
+        load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]
+        | None = None,
+        trusted_artifact_hashes: Mapping[str, str] | None = None,
+    ) -> WyrdState:
+        """Declare a Card file and return its eagerly hydrated state.
+
+        The file and the files its ``./path`` references name are declared
+        under the registry's usual version rules, so an unchanged rerun
+        declares nothing new. The declared graph is pulled, validated, and
+        hydrated as ``from_path`` hydrates a bundle. Every call runs as one
+        client. Without ``bundle_dir`` the graph is held in memory and no
+        files are kept, so Model and Data payloads that must load need
+        ``bundle_dir``.
+
+        Args:
+            path: The root Service Card file.
+            client: the ``WyrdClient`` every call runs as. Omitted, the
+                ambient client resolves once.
+            bundle_dir: A directory to publish the complete bundle to. It
+                persists, loads offline with ``from_path``, and replaces a
+                bundle already there only once the new one is complete.
+            interfaces: As for ``from_path``.
+            load_kwargs: As for ``from_path``.
+            trusted_artifact_hashes: As for ``from_path``.
+
+        Returns:
+            A fully hydrated runtime state.
+
+        Raises:
+            WyrdError: ``WYRD_LOADER_400_INVALID_ENVELOPE`` for an unreadable
+                or invalid Card file, the registry's code when it refuses the
+                declaration (such as ``WYRD_REGISTRY_409_SPEC_DRIFT`` or
+                ``WYRD_PERMISSION_403_DENIED_RBAC``), or a ``from_path`` code.
+                A refusal after the registry accepted the declaration leaves
+                it declared.
         """
         ...
 
@@ -418,18 +432,4 @@ class WyrdState:
         """
         ...
 
-    def artifacts(self, alias: str) -> tuple[HydratedArtifact, ...]:
-        """Return verified artifact descriptors without reading payload bytes.
-
-        Args:
-            alias: A friendly alias from this bundle.
-
-        Returns:
-            One verified descriptor per artifact, without payload bytes.
-
-        Raises:
-            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
-        """
-        ...
-
-__all__ = ["CardEnvelope", "HydratedArtifact", "HydratedCard", "WyrdState"]
+__all__ = ["CardEnvelope", "HydratedCard", "WyrdState"]

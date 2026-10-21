@@ -232,7 +232,6 @@ lru = "=0.12.5"
 # Safe macOS host and process readings for the release-server benchmark harness.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 # Safe `proc_pid_rusage` wrapper: lifetime peak footprint of a macOS process.
-libproc = "0.14.11"
 # =55.1.0 matches the managed iceberg-rust arrow-60 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
 # single native universe (no moving branch, no duplicate Arrow/Parquet package);

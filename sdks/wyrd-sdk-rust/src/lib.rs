@@ -108,6 +108,16 @@
 //! let _ = wyrd_ai::state::WyrdState::from_path_with_client;
 //! ```
 //!
+//! A state is a metadata view: it lists no artifact files.
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::state::WyrdState::artifacts;
+//! ```
+//!
+//! ```compile_fail
+//! let _: Option<wyrd_ai::state::HydratedArtifact> = None;
+//! ```
+//!
 //! ```compile_fail
 //! let _ = wyrd_ai::bifrost::TableConfig::describe_from_env;
 //! ```
@@ -227,6 +237,11 @@ mod tests {
         let _ = |path: &std::path::Path| super::state::WyrdState::from_path(path);
         let _ =
             |path: &std::path::Path, client| super::state::WyrdState::from_path_with(path, client);
+        let _ = |path: &'static std::path::Path| super::state::WyrdState::declare(path);
+        let _ = |path: &'static std::path::Path, options| {
+            super::state::WyrdState::declare_with(path, options)
+        };
+        let _ = super::state::DeclareOptions::default;
         let _ = |fqn: &'static str| TableConfig::describe(fqn);
         let _ = |client: &'static super::WyrdClient, fqn: &'static str| {
             TableConfig::describe_with(client, fqn)

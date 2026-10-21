@@ -1,9 +1,9 @@
 """The docsite Quickstart, run as a reader runs them.
 
 ``examples/quickstart`` holds a Verifier, the Service that references it, and
-one script that declares them, pulls the bundle, and verifies a passing and a
-failing refund. The journey copies the files to an empty directory and runs
-the script against a real server, twice.
+one script that declares them with ``WyrdState.declare`` and verifies a passing
+and a failing refund. The journey copies the files to an empty directory and
+runs the script against a real server, twice.
 """
 
 from __future__ import annotations
@@ -31,17 +31,20 @@ def run_quickstart(directory: Path) -> tuple[dict, str]:
     printed = io.StringIO()
     with contextlib.redirect_stdout(printed):
         script = runpy.run_path(str(directory / "quickstart.py"), run_name="__main__")
+    # Shown by `mise run quickstart`, which runs pytest with `-s`.
+    print(printed.getvalue())
     return script, printed.getvalue()
 
 
 @pytest.fixture
 def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """An empty directory holding only the Quickstart's files, as the working directory."""
-    shutil.copytree(EXAMPLE, tmp_path, dirs_exist_ok=True)
-    monkeypatch.chdir(tmp_path)
+    shutil.copytree(EXAMPLE, tmp_path / "quickstart")
+    monkeypatch.chdir(tmp_path / "quickstart")
     # Keep the developer's saved Wyrd config out of the SDK credential chain.
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
-    return tmp_path
+    (tmp_path / "tmp").mkdir()
+    return tmp_path / "quickstart"
 
 
 @pytest.fixture
@@ -52,6 +55,8 @@ def server(reader: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WyrdTestSe
             env.setenv("WYRD_SERVER_URL", server.base_url)
             env.setenv("WYRD_GRPC_URL", server.grpc_url)
             env.setenv("WYRD_API_KEY", server.tenant_admin_key())
+            # The state's private files land here, where the journey can see them.
+            env.setenv("TMPDIR", str(reader.parent / "tmp"))
             yield server
 
 
@@ -83,18 +88,46 @@ def test_docsite_quickstart_verifies_and_repeats(reader: Path, server: WyrdTestS
             250,
         )
         identities.add((str(subject), str(verifier)))
+        assert sorted(path.name for path in reader.iterdir()) == [
+            "quickstart.py",
+            "refund-limit.yaml",
+            "support-reply.yaml",
+        ], "the reader manages no bundle"
+        assert list((reader.parent / "tmp").iterdir()) == [], "a metadata-only state keeps no files"
     assert len(identities) == 1, "the rerun declares nothing new"
 
 
 def test_docsite_quickstart_refuses_insufficient_authority(
     reader: Path, server: WyrdTestServer
 ) -> None:
-    run_quickstart(reader)
-
-    # The subject is declared and pulled; this caller may read it but not run its Verifier.
+    # The administrator keeps a bundle; a viewer may read the subject but not
+    # declare it or run its Verifier.
+    WyrdState.declare("support-reply.yaml", bundle_dir=reader.parent / "bundle")
     viewer = server.bootstrap_service(["viewer"], name="quickstart-viewer")
     client = WyrdClient(server_url=server.base_url, credential=viewer, grpc_url=server.grpc_url)
-    state = WyrdState.from_path(reader / ".wyrd-bundle", client)
-    with pytest.raises(WyrdError) as raised:
+
+    with pytest.raises(WyrdError) as declared:
+        WyrdState.declare("support-reply.yaml", client)
+    state = WyrdState.from_path(reader.parent / "bundle", client)
+    with pytest.raises(WyrdError) as verified:
         state.run().observe.verify("refund-limit", {"refund": 40})
-    assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    assert declared.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert verified.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+
+def test_docsite_quickstart_refuses_changed_content_and_broken_references(
+    reader: Path, server: WyrdTestServer
+) -> None:
+    run_quickstart(reader)
+    verifier = reader / "refund-limit.yaml"
+    verifier.write_text(verifier.read_text().replace("expected: 100", "expected: 50"))
+
+    with pytest.raises(WyrdError) as drifted:
+        WyrdState.declare("support-reply.yaml")
+    verifier.unlink()
+    with pytest.raises(WyrdError) as missing:
+        WyrdState.declare("support-reply.yaml")
+
+    assert drifted.value.code == "WYRD_REGISTRY_409_SPEC_DRIFT"
+    assert missing.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

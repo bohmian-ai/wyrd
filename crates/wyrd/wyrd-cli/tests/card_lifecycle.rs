@@ -973,19 +973,50 @@ mod pg_tests {
                 include_bytes!("fixtures/card_lifecycle/typed_state/data/data.parquet").as_slice(),
             ),
         ] {
-            let artifact = state.artifacts(alias).expect("artifact list resolves");
-            assert_eq!(artifact.len(), 1, "{alias} has one fixture artifact");
-            let artifact = &artifact[0];
+            let (dir, inventory) = published_artifacts(state, alias);
+            assert_eq!(inventory.len(), 1, "{alias} has one fixture artifact");
+            let artifact = &inventory[0];
+            let payload = dir.join(&artifact.relative_path);
             assert_eq!(
-                std::fs::read(artifact.local_path()).expect("artifact bytes read"),
+                std::fs::read(&payload).expect("artifact bytes read"),
                 expected
             );
-            assert_eq!(artifact.size_bytes(), expected.len() as u64);
+            assert_eq!(
+                usize::try_from(artifact.size_bytes).expect("manifest size is non-negative"),
+                expected.len()
+            );
             let expected_digest =
                 base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(expected));
-            assert_eq!(artifact.sha256(), expected_digest);
-            assert!(artifact.local_path().is_file());
+            assert_eq!(artifact.sha256, expected_digest);
+            assert!(payload.is_file());
         }
+    }
+
+    /// The verified payload directory `state` loaded for `alias`, and the
+    /// artifact inventory the pull published beside it.
+    ///
+    /// # Panics
+    /// Panics when the alias has no payload directory or the inventory is
+    /// unreadable.
+    fn published_artifacts(
+        state: &WyrdState,
+        alias: &str,
+    ) -> (PathBuf, Vec<wyrd_spec::registry::BundleArtifactManifest>) {
+        let dir = state
+            .artifact_dir(alias)
+            .expect("alias resolves")
+            .expect("alias has payloads")
+            .to_path_buf();
+        let inventory = std::fs::read_to_string(
+            dir.parent()
+                .expect("payload directory has a Card directory")
+                .join("artifacts.yaml"),
+        )
+        .expect("inventory reads");
+        (
+            dir,
+            serde_yaml::from_str(&inventory).expect("inventory parses"),
+        )
     }
 
     /// Assert exact version and UID identity for every Card represented by an
@@ -2181,28 +2212,28 @@ mod pg_tests {
             ],
         );
 
-        let model_artifacts = state.artifacts("model").expect("model artifacts resolve");
+        let (model_dir, model_artifacts) = published_artifacts(&state, "model");
+        let model_payload = model_dir.join(&model_artifacts[0].relative_path);
         let expected_model_digest = base64::engine::general_purpose::STANDARD
             .encode(sha2::Sha256::digest(b"shared-model-artifact"));
         assert_eq!(model_artifacts.len(), 1);
-        assert_eq!(model_artifacts[0].relative_path(), "model.bin");
+        assert_eq!(model_artifacts[0].relative_path, "model.bin");
         assert_eq!(
-            model_artifacts[0].size_bytes(),
-            b"shared-model-artifact".len() as u64
+            usize::try_from(model_artifacts[0].size_bytes).expect("manifest size is non-negative"),
+            b"shared-model-artifact".len()
         );
-        assert_eq!(model_artifacts[0].sha256(), expected_model_digest);
+        assert_eq!(model_artifacts[0].sha256, expected_model_digest);
         assert_eq!(
-            model_artifacts[0].content_type(),
+            model_artifacts[0].content_type.as_deref(),
             Some("application/octet-stream")
         );
-        assert!(model_artifacts[0].local_path().is_absolute());
+        assert!(model_payload.is_absolute());
         assert!(
-            model_artifacts[0]
-                .local_path()
+            model_payload
                 .starts_with(std::fs::canonicalize(&full_dir).expect("bundle canonicalizes"))
         );
         assert_eq!(
-            std::fs::read(model_artifacts[0].local_path()).expect("verified model artifact reads"),
+            std::fs::read(&model_payload).expect("verified model artifact reads"),
             b"shared-model-artifact",
         );
 

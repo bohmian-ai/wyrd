@@ -3,10 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
-use wyrd_ai::state::{HydratedCard, WyrdState};
-use wyrd_ai::{Card, Spec};
+use wyrd_ai::state::{DeclareOptions, HydratedCard, WyrdState};
+use wyrd_ai::{Card, Spec, VerificationVerdict};
+use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, declare, declared, fixture, pull};
 
@@ -138,14 +140,145 @@ async fn service_graph_declares_and_pulls() {
         state.card("agent").expect("agent resolves").kind,
         CardKind::Agent
     );
-    let artifacts = state.artifacts("model").expect("model artifacts resolve");
-    assert_eq!(artifacts.len(), 1);
-    assert_eq!(artifacts[0].relative_path(), "support-model.bin");
     assert_eq!(
-        std::fs::read(artifacts[0].local_path()).expect("artifact reads"),
+        std::fs::read(
+            bundle
+                .path()
+                .join("bundle/cards/model/artifacts/support-model.bin")
+        )
+        .expect("artifact reads"),
         std::fs::read(fixture("cards/declare_and_pull/support-model.bin")).expect("fixture reads")
     );
     deployment.shutdown().await;
+}
+
+/// The docsite Quickstart's Service file, which references its Verifier file.
+const QUICKSTART: &str = "../examples/quickstart/support-reply.yaml";
+
+/// Declare `path` as `client` with the state kept private.
+///
+/// # Errors
+/// As `WyrdState::declare_with`.
+async fn declare_state(
+    path: &Path,
+    client: wyrd_ai::WyrdClient,
+) -> Result<WyrdState, wyrd_ai::WyrdError> {
+    WyrdState::declare_with(
+        path,
+        DeclareOptions {
+            client: Some(client),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+}
+
+/// One `WyrdState::declare_with` call turns the Quickstart's authored files
+/// into a state that judges a passing and a failing reply; a rerun keeps
+/// its identities, a pinned version with changed content, a broken reference
+/// and a reader are refused with their catalog codes, and an artifact-bearing
+/// graph declares into a ready state or into a caller-owned bundle that loads
+/// offline.
+///
+/// # Panics
+/// Panics when a declaration, verification, or refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn declares_ready_verification_state() {
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+            .await;
+    let quickstart = fixture(QUICKSTART);
+
+    let state = declare_state(&quickstart, deployment.admin())
+        .await
+        .expect("the Quickstart declares");
+    let run = state.run();
+    let passed = run
+        .observe()
+        .verify("refund-limit", json!({ "refund": 40 }))
+        .await
+        .expect("the passing reply is judged");
+    let failed = run
+        .observe()
+        .verify("refund-limit", json!({ "refund": 250 }))
+        .await
+        .expect("the failing reply is judged");
+    assert_eq!(state.root_ref().kind, CardKind::Service);
+    assert_eq!(state.root_ref().name.as_str(), "support-reply");
+    assert_eq!(passed.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(failed.outcome.verdict, VerificationVerdict::Failed);
+    assert_eq!(passed.verifier.name.as_str(), "refund-limit");
+    assert_eq!(passed.verifier, failed.verifier);
+
+    let again = declare_state(&quickstart, deployment.admin())
+        .await
+        .expect("the unchanged Quickstart declares again");
+    assert_eq!(again.root_ref(), state.root_ref());
+
+    let edited = tempfile::tempdir().expect("edit directory creates");
+    for file in ["support-reply.yaml", "refund-limit.yaml"] {
+        let source = std::fs::read_to_string(quickstart.with_file_name(file)).expect("reads");
+        std::fs::write(
+            edited.path().join(file),
+            source.replace("expected: 100", "expected: 50"),
+        )
+        .expect("writes");
+    }
+    let drift = declare_state(
+        &edited.path().join("support-reply.yaml"),
+        deployment.admin(),
+    )
+    .await
+    .expect_err("changed content at the same version is refused");
+    assert_eq!(drift.code(), "WYRD_REGISTRY_409_SPEC_DRIFT");
+
+    std::fs::remove_file(edited.path().join("refund-limit.yaml")).expect("removes");
+    let missing = declare_state(
+        &edited.path().join("support-reply.yaml"),
+        deployment.admin(),
+    )
+    .await
+    .expect_err("a missing referenced file is refused");
+    assert_eq!(missing.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
+
+    let reader = deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await);
+    let refused = declare_state(&quickstart, reader)
+        .await
+        .expect_err("a reader cannot declare");
+    assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let cards = deployment.cards().await;
+    let (_, desk) = declare_desk(&cards).await;
+    let ready = declare_state(&fixture(DESK), deployment.admin())
+        .await
+        .expect("the artifact-bearing desk declares");
+    assert_eq!(ready.root_ref(), &desk.root);
+    assert_eq!(
+        ready.card("model").expect("model resolves").kind,
+        CardKind::Model
+    );
+
+    let kept = tempfile::tempdir().expect("bundle directory creates");
+    let bundle = kept.path().join("bundle");
+    let retained = WyrdState::declare_with(
+        fixture(DESK),
+        DeclareOptions {
+            client: Some(deployment.admin()),
+            bundle_dir: Some(bundle.clone()),
+        },
+    )
+    .await
+    .expect("the desk declares into the caller's bundle");
+    drop(retained);
+    deployment.shutdown().await;
+    let offline = WyrdState::from_path(&bundle).expect("the kept bundle loads offline");
+    assert_eq!(offline.root_ref(), &desk.root);
+    assert_eq!(
+        std::fs::read(bundle.join("cards/model/artifacts/support-model.bin"))
+            .expect("artifact reads"),
+        std::fs::read(fixture("cards/declare_and_pull/support-model.bin")).expect("fixture reads")
+    );
 }
 
 /// The latest Active version of the registered desk resolves to its exact

@@ -1385,15 +1385,6 @@ export interface PullSummary {
   readonly downloaded_artifact_count: number;
 }
 
-/** One verified artifact payload in a local `WyrdState` bundle. */
-export interface HydratedArtifact {
-  readonly relative_path: string;
-  readonly local_path: string;
-  readonly sha256: string;
-  readonly size_bytes: number;
-  readonly content_type: string | null;
-}
-
 /** Card references cross the native boundary as text or serialized JSON. */
 function cardRefText(ref: CardRef | string): string {
   return typeof ref === "string" ? ref : JSON.stringify(ref);
@@ -2727,6 +2718,34 @@ export class WyrdState {
     return state;
   }
 
+  /**
+   * Declare a Card file and return the state of its graph, ready to run.
+   *
+   * The file and the files its `./path` references name are declared under
+   * the registry's usual version rules, so an unchanged rerun declares
+   * nothing new; the declared graph is then pulled and loaded as
+   * {@link WyrdState.fromPath} loads a bundle. Every call runs as one client.
+   * Without `bundleDir` the graph is held in memory and no files are kept.
+   *
+   * @param path - The root Service Card file.
+   * @param options - `client`, whose principal every call runs as (omitted,
+   * the ambient client), and `bundleDir`, a directory the complete bundle is
+   * published to and kept in, loadable offline with {@link WyrdState.fromPath}.
+   * @returns The ready state.
+   * @throws {@link WyrdError} `WYRD_LOADER_400_INVALID_ENVELOPE` for an
+   * unreadable or invalid Card file, the registry's refusal (such as
+   * `WYRD_REGISTRY_409_SPEC_DRIFT` or `WYRD_PERMISSION_403_DENIED_RBAC`), or a
+   * {@link WyrdState.fromPath} error. A refusal after the registry accepted
+   * the declaration leaves it declared.
+   */
+  static async declare(
+    path: string,
+    options: ClientOptions & { readonly bundleDir?: string } = {},
+  ): Promise<WyrdState> {
+    const declared = await wyrdClientNative(clientOf(options)).declareWyrdState(path, options.bundleDir);
+    return new WyrdState(nativeHandle(declared.state, declared.error));
+  }
+
   /** The exact root Card reference. */
   get rootRef(): CardRef {
     return lifecycleValue<CardRef>(this.#native.rootRef());
@@ -2762,17 +2781,6 @@ export class WyrdState {
    */
   cardRef(alias: string): CardRef {
     return lifecycleValue<CardRef>(this.#native.cardRef(alias));
-  }
-
-  /**
-   * The verified local artifacts for an alias.
-   *
-   * @param alias - A bundle alias.
-   * @returns Each artifact's local path and digest; no payload is read.
-   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
-   */
-  artifacts(alias: string): readonly HydratedArtifact[] {
-    return lifecycleValue<HydratedArtifact[]>(this.#native.artifacts(alias));
   }
 
   /**

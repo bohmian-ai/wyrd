@@ -965,10 +965,11 @@ mod pg_tests {
              SELECT gen_random_uuid(), data_tenant_id, namespace, table_name, \
                     file_path || $1, file_size, row_count, min_event_time, \
                     max_event_time, partition_granularity, partition_start, node_id, \
-                    writer_epoch, wal_lsn_max + 1, wal_lsn_max + 1, promotion_record, compacted \
+                    writer_epoch, wal_lsn_max + $2, wal_lsn_max + $2, promotion_record, compacted \
                FROM vala.file_list WHERE file_path = 'a/hot-1.parquet'";
         sqlx::query(republish)
             .bind(".next")
+            .bind(1_i64)
             .execute(&reads.superuser)
             .await
             .expect("the same node publishes again");
@@ -984,6 +985,7 @@ mod pg_tests {
         let mut rolled_back = reads.superuser.begin().await.expect("begin");
         sqlx::query(republish)
             .bind(".uncommitted")
+            .bind(2_i64)
             .execute(&mut *rolled_back)
             .await
             .expect("the uncommitted publication inserts");

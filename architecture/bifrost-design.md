@@ -368,12 +368,17 @@ DataFusion plan. A plan that stops consuming a live child (for example, at
 a still-needed stream fails. Success means each row identity the selected
 sources held is returned once: a publication never makes a row disappear or
 repeat, and verification judgments inherit that guarantee. Oracle selects
-sources before execution. It reads the cut and its publication revisions, asks
-every frozen Scribe for a live capture retained under the query's attempt
-identity until the query deadline, then reads the revisions again. A moved
-revision or a stale writer epoch discards the selection — its captures are
-released — and Oracle repins and rebuilds under the same deadline before
-admission, so no row of a discarded selection is produced. Each live fragment
+sources before execution. It pins the cut, which carries each Scribe node's
+publication revision for every table, and asks every frozen Scribe for a live
+capture retained under the query's attempt identity until the query deadline.
+Each capture reports, from the same critical section that decided which
+generations it still serves, the revision that Scribe's last locally completed
+publication committed at. A reported revision above the cut's, or a stale
+writer epoch, discards the selection — its captures are released and the cut
+is evicted from the cache — and Oracle repins from Postgres and rebuilds under
+the same deadline before admission, so no row of a discarded selection is
+produced. One node's publications commit in revision order, so a cut at least
+as new as every report holds every row the captures stopped serving. Each live fragment
 reads only its own capture, named in its signed assignment; Scribe refuses a
 foreign, substituted, released, or expired capture, and a capture lost after
 acceptance fails the query rather than opening fresh live data. Captures are
@@ -902,12 +907,17 @@ Snapshot preparation has no admission gate of its own. One tenant-scoped
 autocommit statement on the bounded runtime PostgreSQL pool, binding its own
 tenant, resolves every referenced table and returns each catalog metadata
 pointer with its hot rows. The statement is read-only: it takes no lock,
-writes no row, and nothing is released at the query's terminal. Every query
-reads its cut fresh; there is no cut cache. The statement also returns each
-table's publication revision from `vala.bifrost_table_publication_revisions`,
-which a `vala.file_list` insert trigger advances in the publishing transaction.
-An identical replay inserts no row and advances nothing, and a rolled-back
-publication leaves the revision unchanged. Oracle
+writes no row, and nothing is released at the query's terminal. Oracle serves
+cuts from a cache kept fresh by the `bifrost_cut` notification channel; it
+serves cached cuts only while listening, and a query never accepts a cut
+older than its own deadline bound. The cache is not trusted for correctness:
+the statement also returns each table's per-node publication revisions from
+`vala.bifrost_table_publication_revisions`, which a `vala.file_list` insert
+trigger advances in the publishing transaction, and live-source selection
+validates the cached cut against the revisions Scribes report. A warm query
+therefore issues no catalog statement. An identical replay inserts no row and
+advances nothing, a rolled-back publication leaves the revision unchanged,
+and a restarted Scribe loads its node's revisions before serving captures. Oracle
 then reads the selected metadata documents directly and concurrently; a
 document missing after a catalog move reacquires the whole cut once, and a
 second `NotFound` is terminal. All of this waits within the leader deadline,

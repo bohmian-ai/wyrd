@@ -476,9 +476,103 @@ pub(crate) struct RetainedCapture {
     expiry: tokio::task::AbortHandle,
 }
 
-/// Captures retained by one Scribe, keyed by capture id.
-pub(crate) type RetainedCaptures =
-    Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<RetainedCapture>>>>;
+/// Captures retained by one Scribe, shared by every tail service it builds.
+pub(crate) type RetainedCaptures = Arc<CaptureTable>;
+
+/// Lock shards of the capture table; each query touches one shard per
+/// listing, open, and release.
+const CAPTURE_SHARDS: usize = 16;
+
+/// Retained captures keyed by capture id, split across independently locked
+/// shards so concurrent queries do not serialize on one lock.
+///
+/// A removed capture is dropped after its shard lock is released: dropping
+/// one frees its batches and staged lease, which must not stall other
+/// queries on the same shard.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureTable {
+    /// Capture shards selected by the capture id's low bits.
+    shards: [std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<RetainedCapture>>>;
+        CAPTURE_SHARDS],
+}
+
+impl CaptureTable {
+    /// Locks the shard holding `capture_id`.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn shard(
+        &self,
+        capture_id: uuid::Uuid,
+    ) -> Result<
+        std::sync::MutexGuard<'_, std::collections::HashMap<uuid::Uuid, Arc<RetainedCapture>>>,
+        TailReadError,
+    > {
+        let index = (capture_id.as_u128() % CAPTURE_SHARDS as u128) as usize;
+        self.shards[index].lock().map_err(|_| TailReadError::State {
+            detail: "live capture table is poisoned".to_owned(),
+        })
+    }
+
+    /// Retains `capture` under `capture_id`.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn insert(
+        &self,
+        capture_id: uuid::Uuid,
+        capture: Arc<RetainedCapture>,
+    ) -> Result<(), TailReadError> {
+        self.shard(capture_id)?.insert(capture_id, capture);
+        Ok(())
+    }
+
+    /// Returns the retained capture `capture_id` when `owns` accepts it.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn get(
+        &self,
+        capture_id: uuid::Uuid,
+        owns: impl FnOnce(&RetainedCapture) -> bool,
+    ) -> Result<Option<Arc<RetainedCapture>>, TailReadError> {
+        Ok(self
+            .shard(capture_id)?
+            .get(&capture_id)
+            .filter(|retained| owns(retained))
+            .cloned())
+    }
+
+    /// Removes the capture `capture_id` when `owns` accepts it, returning it
+    /// so the caller drops it outside the shard lock.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn remove(
+        &self,
+        capture_id: uuid::Uuid,
+        owns: impl FnOnce(&RetainedCapture) -> bool,
+    ) -> Result<Option<Arc<RetainedCapture>>, TailReadError> {
+        let mut shard = self.shard(capture_id)?;
+        if shard
+            .get(&capture_id)
+            .is_some_and(|retained| owns(retained))
+        {
+            Ok(shard.remove(&capture_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Counts every retained capture.
+    #[cfg(any(test, feature = "test-support"))]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().map_or(0, |captures| captures.len()))
+            .sum()
+    }
+}
 
 /// One listing's partitions and the capture they are read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,26 +813,20 @@ impl FetchLiveTailService {
         let captures = Arc::clone(&self.captures);
         let expiry = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
-            if let Ok(mut captures) = captures.lock() {
-                captures.remove(&capture_id);
-            }
+            let expired = captures.remove(capture_id, |_| true);
+            drop(expired);
             tracing::debug!(%capture_id, "live capture expired");
         })
         .abort_handle();
-        self.captures
-            .lock()
-            .map_err(|_| TailReadError::State {
-                detail: "live capture table is poisoned".to_owned(),
-            })?
-            .insert(
-                capture_id,
-                Arc::new(RetainedCapture {
-                    query_id,
-                    binding,
-                    capture,
-                    expiry,
-                }),
-            );
+        self.captures.insert(
+            capture_id,
+            Arc::new(RetainedCapture {
+                query_id,
+                binding,
+                capture,
+                expiry,
+            }),
+        )?;
         Ok(capture_id)
     }
 
@@ -758,14 +846,9 @@ impl FetchLiveTailService {
         capture_id: uuid::Uuid,
     ) -> Result<(), TailReadError> {
         let binding = binding_from_wire(binding)?;
-        let mut captures = self.captures.lock().map_err(|_| TailReadError::State {
-            detail: "live capture table is poisoned".to_owned(),
-        })?;
-        if captures
-            .get(&capture_id)
-            .is_some_and(|retained| retained.query_id == query_id && retained.binding == binding)
-            && let Some(retained) = captures.remove(&capture_id)
-        {
+        if let Some(retained) = self.captures.remove(capture_id, |retained| {
+            retained.query_id == query_id && retained.binding == binding
+        })? {
             retained.expiry.abort();
         }
         Ok(())
@@ -775,7 +858,7 @@ impl FetchLiveTailService {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn retained_captures_for_test(&self) -> usize {
-        self.captures.lock().map_or(0, |captures| captures.len())
+        self.captures.len()
     }
 
     /// Opens one partition range of a retained capture.
@@ -808,15 +891,12 @@ impl FetchLiveTailService {
         }
         let retained = self
             .captures
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "live capture table is poisoned".to_owned(),
-            })?
-            .get(&request.capture_id)
-            .filter(|retained| {
+            .get(request.capture_id, |retained| {
                 retained.query_id == request.query_id && retained.binding == request.binding
             })
-            .cloned()
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?
             .ok_or_else(|| ScribeError::Internal {
                 detail: "live capture is not retained for this query".to_owned(),
             })?;

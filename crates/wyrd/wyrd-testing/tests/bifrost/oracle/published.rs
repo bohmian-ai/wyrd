@@ -1799,8 +1799,9 @@ fn expect_exact(case: &str, mut ids: Vec<i64>, expected: &[i64]) -> Result<(), J
 /// - before the query reads its cut, so the file alone supplies them;
 /// - while the query holds its pinned cut, before it captures the live
 ///   sources — the publication removes the table's last live partition, so
-///   the capture is empty and validation must reject the selection and
-///   repin exactly once;
+///   the capture is empty and reports a newer publication revision than the
+///   cached cut, so the Oracle evicts that cut and repins exactly once, the
+///   only cut read of the query;
 /// - after the selection is validated, while the Scribe is paused between
 ///   batches of an open read, so the retained capture keeps serving them.
 ///
@@ -1863,8 +1864,20 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
     let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
         context.request_id.clone(),
     ));
+    // Forge keeps promoting case 1's files for a moment, and each promotion
+    // moves the cut; wait until a query is served from the warm cache.
+    tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
+        loop {
+            vala_bifrost_redux::catalog::reset_cut_reads_for_test();
+            query_ids(&reader, &fqn, None).await?;
+            if vala_bifrost_redux::catalog::reset_cut_reads_for_test() == 0 {
+                return Ok::<_, JourneyError>(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| "published during acquisition: the cut never stayed cached")??;
     engine.bind_preparation_pause_for_test(Some(Arc::clone(&pause)))?;
-    vala_bifrost_redux::catalog::reset_cut_reads_for_test();
     let held = crate::distributed::held_query_ids(&engine, context, sql.clone());
     let publish = async {
         tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
@@ -1883,10 +1896,10 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
     published?;
     expect_exact("published during acquisition", ids?, &[1, 2, 3, 11, 12, 13])?;
     let cut_reads = vala_bifrost_redux::catalog::reset_cut_reads_for_test();
-    if cut_reads != 2 {
+    if cut_reads != 1 {
         return Err(format!(
-            "published during acquisition: expected one repin after the moved revision, \
-             saw {cut_reads} cut reads"
+            "published during acquisition: expected the warm cut to cost no read and \
+             its one repin after the Scribe's newer revision one read, saw {cut_reads}"
         )
         .into());
     }

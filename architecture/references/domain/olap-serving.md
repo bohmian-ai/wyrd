@@ -60,8 +60,8 @@ selected Iceberg snapshot and committed hot objects, then discovers relevant
 online Scribes for live rows. It never opens another node's local staged files
 and does not query WAL in normal operation. The request has no source or
 freshness selector. Each online Scribe retains a live capture for the query;
-Oracle validates the cut's publication revisions after capture and repins
-before execution when one moved, so a successful result returns each selected
+each capture reports its Scribe's latest completed publication revision, and
+Oracle evicts and repins a cached cut older than any report before execution, so a successful result returns each selected
 row once across publication. A capture lost after acceptance fails the query;
 a Scribe whose streams cannot be listed yields a degraded result. The same
 guarantee applies to verification judgments.

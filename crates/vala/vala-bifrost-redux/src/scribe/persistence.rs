@@ -1308,6 +1308,27 @@ impl PersistenceRuntime {
             .await
     }
 
+    /// Raises the hot-source registry's reported publication revisions to
+    /// every one this node committed in an earlier process.
+    ///
+    /// Runs before WAL replay opens readiness, so no capture that omits a
+    /// restored `Published` generation reports a revision older than the
+    /// commit that published it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the revisions cannot be read.
+    pub(crate) async fn restore_publication_revisions(&self) -> Result<(), ScribeError> {
+        let Some(staging) = self
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.staging.as_ref())
+        else {
+            return Ok(());
+        };
+        staging.restore_publication_revisions().await
+    }
+
     /// Resumes every durable claimed or publishing claim before readiness.
     ///
     /// Publication-manifest recovery runs first, so this driver either replays

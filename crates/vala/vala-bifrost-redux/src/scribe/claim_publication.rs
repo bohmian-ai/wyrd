@@ -192,6 +192,50 @@ impl ClaimPublisher {
             })
     }
 
+    /// Reports whether any of `claim`'s generations is still registered
+    /// under an authority other than `Published`.
+    ///
+    /// Such a commit never ran [`Self::advance_published`], so its revision
+    /// was never raised in memory and must be read before the generations
+    /// are released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry lock is poisoned.
+    fn missed_published_advance(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(false);
+        };
+        let key = claim.key();
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        for member in claim.members() {
+            let authority = hot_sources
+                .authority(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(
+                        member.id().shard(),
+                        member.id().generation(),
+                    ),
+                )
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("read a committed claim member's authority: {error}"),
+                })?;
+            if authority.is_some_and(|authority| {
+                !matches!(
+                    authority,
+                    crate::scribe::hot_source::HotAuthority::Published { .. }
+                )
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Marks, or with `begin` false clears, the claim's generations as
     /// possibly committed in the catalog.
     ///
@@ -679,7 +723,9 @@ impl ClaimPublisher {
                 ),
             });
         }
-        self.restore_publication_revisions().await?;
+        if self.missed_published_advance(claim)? {
+            self.restore_publication_revisions().await?;
+        }
         let surviving = surviving.iter().collect::<Vec<_>>();
         self.recover_terminal_members(key, &surviving).await?;
         self.stage

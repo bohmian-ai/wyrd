@@ -2513,6 +2513,7 @@ impl ScribeImpl {
                 stream = %self.stream,
                 "Scribe staged publications reconciled before WAL replay"
             );
+            persistence.restore_publication_revisions().await?;
             let resumed = persistence.resume_staging_claims().await?;
             tracing::debug!(
                 resumed,

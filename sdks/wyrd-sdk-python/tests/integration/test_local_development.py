@@ -38,6 +38,7 @@ import pytest
 import tomllib
 from mcp import Client, StdioServerParameters
 from mcp.shared.exceptions import MCPError
+from mcp.types import TextContent
 from opentelemetry import trace
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost
@@ -1191,6 +1192,7 @@ def read_setup_prompt(cli_path: str, home: Path, env: dict[str, str]) -> str:
                     await host.get_prompt(name, arguments)
             [message] = (await host.get_prompt("setup")).messages
             assert message.role == "user"
+            assert isinstance(message.content, TextContent)
             return message.content.text
 
     return asyncio.run(read())

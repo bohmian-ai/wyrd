@@ -339,6 +339,12 @@ foreign-runtime boundary, such as Python async integration, Node loading,
 generated declarations, or idiomatic local authoring helpers. It does not
 duplicate transport or durable behavior.
 
+Framework adapters follow the same rule. The Python ASGI middleware
+(`wyrd.integrations.asgi`) starts and drains an already loaded `WyrdState`
+with the application's lifespan and enters one Run per HTTP request or
+WebSocket connection. It registers nothing, owns no writer, provider, or
+credential, and creates no HTTP spans.
+
 Existing Rust owner crates may retain their optional `python` features during
 this integration. Only `wyrd-sdk-python` enables and aggregates those features;
 the Rust and TypeScript SDKs do not. New or materially relocated Python logic

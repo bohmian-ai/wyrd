@@ -157,7 +157,9 @@ impl OraclePlanner {
     /// The whole pin — cut read, authorization, and materialization — runs
     /// under the leader deadline. Nothing durable is recorded, so a failed or
     /// dropped pin leaves nothing to release. Nothing here derives a class —
-    /// the class comes from the physical root built on top of this cut.
+    /// the class comes from the physical root built on top of this cut. The
+    /// pin times its reads into `profile`, which a selection retry passes
+    /// again so one query emits one profile.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
@@ -168,8 +170,8 @@ impl OraclePlanner {
         tables: &[TableRef],
         deadline: Instant,
         catalog: &Arc<BifrostCatalog>,
+        profile: Arc<super::profile::QueryProfile>,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        let profile = Arc::new(super::profile::QueryProfile::new());
         let cuts = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             Self::read_and_materialize(tables, context, catalog, &profile),

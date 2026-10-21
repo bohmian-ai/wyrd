@@ -296,7 +296,11 @@ impl std::fmt::Debug for LiveDispatch {
     }
 }
 
-/// Records one known live source lost before it yielded a row.
+/// Records that a table's live streams could not be listed.
+///
+/// Only listing loss degrades: a query that never captured a table's live
+/// sources reads it from published files alone. A capture lost after it was
+/// accepted fails the query instead.
 ///
 /// The loss uses the non-partition ordinal, so it sits beside the
 /// participant losses on the same accumulator the terminal reads. A poisoned

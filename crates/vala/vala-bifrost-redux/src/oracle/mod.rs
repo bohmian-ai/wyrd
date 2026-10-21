@@ -1770,7 +1770,13 @@ impl Oracle {
         let snapshot = self.cluster.snapshot();
         let planned = self
             .planner
-            .pin_cut(context, &tables, deadline, &self.catalog)
+            .pin_cut(
+                context,
+                &tables,
+                deadline,
+                &self.catalog,
+                Arc::new(profile::QueryProfile::new()),
+            )
             .await?;
         #[cfg(feature = "test-support")]
         let held = self
@@ -2024,7 +2030,8 @@ impl Oracle {
     /// is terminal. A selection whose publication revisions moved during
     /// acquisition is not an error: its captures are released, the cut is
     /// repinned, and the root rebuilt under the same deadline, all before
-    /// admission, so no row of a discarded selection is ever produced.
+    /// admission, so no row of a discarded selection is ever produced. Each
+    /// retry is counted on the query's one profile as `selection_retries`.
     async fn classify_one_build(
         &self,
         input: ClassifyInput<'_>,
@@ -2049,9 +2056,16 @@ impl Oracle {
                 .iter()
                 .map(|cut| cut.binding.table_ref.clone())
                 .collect::<Vec<_>>();
+            planned.profile.selection_retries.add(1);
             planned = self
                 .planner
-                .pin_cut(context, &tables, deadline, &self.catalog)
+                .pin_cut(
+                    context,
+                    &tables,
+                    deadline,
+                    &self.catalog,
+                    Arc::clone(&planned.profile),
+                )
                 .await?;
         };
         let query_class = exec::query_class_for_root(retained.root.as_ref());

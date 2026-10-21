@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::{
-    ExecutionPlanMetricsSet, MetricBuilder, MetricValue, Time,
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, Time,
 };
 
 use crate::profile::{ProfileFamily, ProfileValue};
@@ -55,6 +55,9 @@ pub(crate) struct QueryProfile {
     pub(crate) admission: Time,
     /// Staging the read decision and binding sources to the retained root.
     pub(crate) audit_bind: Time,
+    /// Selections discarded because a publication revision moved during
+    /// live capture, each followed by a fresh pin under the same profile.
+    pub(crate) selection_retries: Count,
     /// Operator metrics folded from the executed root when its owner released
     /// it.
     ///
@@ -86,6 +89,7 @@ impl QueryProfile {
             scan_sizing: step("scan_sizing"),
             admission: step("admission"),
             audit_bind: step("audit_bind"),
+            selection_retries: MetricBuilder::new(&metrics).global_counter("selection_retries"),
             operators: Mutex::default(),
             metrics,
         }
@@ -168,6 +172,7 @@ mod tests {
         profile
             .cut_read
             .add_duration(std::time::Duration::from_micros(5));
+        profile.selection_retries.add(1);
         let empty = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
             "id",
             DataType::Int64,
@@ -185,6 +190,10 @@ mod tests {
         assert_eq!(
             events.get("Oracle.cut_read"),
             Some(&ProfileValue::Nanoseconds(5_000))
+        );
+        assert_eq!(
+            events.get("Oracle.selection_retries"),
+            Some(&ProfileValue::Count(1))
         );
         assert_eq!(
             events.get("FilterExec.output_rows"),

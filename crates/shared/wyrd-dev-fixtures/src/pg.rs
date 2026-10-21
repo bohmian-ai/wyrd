@@ -208,10 +208,22 @@ impl PgFixture {
     /// Returns [`SqlError`] when the fixture database DSNs cannot be resolved
     /// or either fresh runtime pool graph cannot connect.
     pub async fn fresh_runtime_handles(&self) -> Result<(WyrdPostgres, ValaPostgres), SqlError> {
-        let dsns = self.test_db.resolved_dsns()?;
+        let dsns = self.runtime_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
         let vala = ValaPostgres::connect_from_dsns(&dsns).await?;
         Ok((wyrd, vala))
+    }
+
+    /// The serving DSNs [`Self::fresh_runtime_handles`] connects with, so a
+    /// test can route a process's runtime pools through a network fault
+    /// before connecting them itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the serving DSNs are
+    /// unset or cannot be pointed at the fixture database.
+    pub fn runtime_dsns(&self) -> Result<ResolvedDsns, SqlError> {
+        self.test_db.resolved_dsns()
     }
 
     /// Borrow the RLS-scoped tenant pool.

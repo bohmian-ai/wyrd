@@ -548,6 +548,8 @@ pub struct WyrdTestServerBuilder {
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
     /// Optional bounded drain budget copied into the bound server's config.
     shutdown_drain_for_test: Option<Duration>,
+    /// Proxy every runtime Postgres pool dials instead of the database.
+    postgres_proxy_for_test: Option<Arc<crate::listener_stall::ListenerStallProxy>>,
     /// Whether the bound server composes its verification runtime.
     verification_runtime: bool,
     /// Storage I/O bounds this server's one Bifrost storage owner resolves.
@@ -684,6 +686,7 @@ impl Default for WyrdTestServerBuilder {
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
+            postgres_proxy_for_test: None,
             verification_runtime: false,
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
@@ -4350,6 +4353,21 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Route every runtime Postgres pool this server opens through `proxy`,
+    /// so a journey can silently stall the server's notification listeners
+    /// while its request connections keep flowing.
+    ///
+    /// Only the runtime pools move; fixture setup and the test's own
+    /// superuser reads still dial the database directly.
+    #[must_use]
+    pub fn with_postgres_proxy_for_test(
+        mut self,
+        proxy: Arc<crate::listener_stall::ListenerStallProxy>,
+    ) -> Self {
+        self.postgres_proxy_for_test = Some(proxy);
+        self
+    }
+
     /// Resolve this server's one Bifrost storage owner from explicit I/O bounds.
     ///
     /// The value is both the input to the owner's policy resolution and the
@@ -4783,10 +4801,23 @@ impl WyrdTestServerBuilder {
         // AppState must observe the same pool so query and rewrite admission
         // share accounting rather than silently creating independent budgets.
         let tenant_id = fixture.data_tenant_id();
-        let (runtime_wyrd, runtime_vala) = fixture
-            .fresh_runtime_handles()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let (runtime_wyrd, runtime_vala) = match &self.postgres_proxy_for_test {
+            Some(proxy) => {
+                let dsns = fixture
+                    .runtime_dsns()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+                    .and_then(|dsns| {
+                        proxy
+                            .route(&dsns)
+                            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+                    })?;
+                let wyrd = wyrd_sql::WyrdPostgres::connect_from_dsns(&dsns).await;
+                let vala = vala_sql::ValaPostgres::connect_from_dsns(&dsns).await;
+                wyrd.and_then(|wyrd| Ok((wyrd, vala?)))
+            }
+            None => fixture.fresh_runtime_handles().await,
+        }
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let start = |error: String| WyrdTestServerError::Start(error);
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));

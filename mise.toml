@@ -167,7 +167,7 @@ run = [
   # `wyrd init` launches the installed production UI build.
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile",
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build",
-  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads) | test(=pg_tests::server_dev_keeps_the_gateway_managed_secret_key) | test(=pg_tests::server_dev_saved_settings_survive_working_directory_change)'",
+  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=pg_tests::init_first_run_is_client_ready) | test(=pg_tests::init_repeat_and_partial_failure_preserve_state) | test(=pg_tests::init_selected_mcp_host_reads) | test(=pg_tests::init_keeps_the_gateway_managed_secret_key) | test(=pg_tests::init_saved_settings_survive_working_directory_change) | test(=pg_tests::guided_init_lifecycle_and_prompt)'",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_guided_setup",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_standalone_examples_use_saved_local_setup",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",

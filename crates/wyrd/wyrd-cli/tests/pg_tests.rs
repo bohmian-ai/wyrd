@@ -9,6 +9,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use wyrd_client::bifrost::BifrostOptions;
 
+use rmcp::ServiceExt as _;
+use rmcp::model::{GetPromptRequestParams, Role};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
@@ -25,7 +27,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::reserve_loopback_addr;
 
-use crate::mcp_journey::{list_tables_through_proxy, wyrd};
+use crate::mcp_journey::{Proxy, list_tables_through_proxy, wyrd};
 
 /// A fresh external database, installed artifacts, and one owned CLI process.
 struct LocalDev {
@@ -492,7 +494,7 @@ async fn tenant_slugs(dsn: &SecretString) -> Vec<String> {
 /// or when the stale destination receives a connection.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn server_dev_first_run_is_client_ready() {
+async fn init_first_run_is_client_ready() {
     let mut local = LocalDev::new().await;
     let stale = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -731,7 +733,7 @@ fn json_failure(output: &std::process::Output) -> serde_json::Value {
 /// Panics when a retry changes persisted identity or exposes credentials.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn server_dev_repeat_and_partial_failure_preserve_state() {
+async fn init_repeat_and_partial_failure_preserve_state() {
     let mut local = LocalDev::new().await;
     let current = local.home.path().join("wyrd/server/current");
     let retained = fs::read_link(&current).expect("retained installation");
@@ -1229,7 +1231,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
 /// Panics when the restart changes identity or data, or a refusal has effects.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn server_dev_saved_settings_survive_working_directory_change() {
+async fn init_saved_settings_survive_working_directory_change() {
     let mut local = LocalDev::new().await;
     let fresh = local
         .command()
@@ -1353,7 +1355,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
 /// Panics when host installation, discovery, or the authenticated read fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn server_dev_selected_mcp_host_reads() {
+async fn init_selected_mcp_host_reads() {
     let mut local = LocalDev::new().await;
     let codex = local.home.path().join(".codex");
     fs::create_dir_all(&codex).expect("detected host");
@@ -1368,6 +1370,76 @@ async fn server_dev_selected_mcp_host_reads() {
         list_tables_through_proxy(local.home.path(), &["--server", &endpoint], &[]).await;
     assert!(tools.iter().any(|tool| tool == "bifrost.list_tables"));
     assert_ne!(result.is_error, Some(true));
+    local.stop("-INT").await;
+}
+
+/// Guided handoff around the unchanged bootstrap: a text run with explicit
+/// hosts prints a literal launch command for each connected host that takes
+/// an initial prompt and paste guidance for the rest, then serves until
+/// interrupted. A JSON restart carries the same release prompt as
+/// `setup_prompt`, and an authenticated host reads byte-identical text from
+/// the MCP `setup` prompt through the installed proxy, which refuses other
+/// names and arguments.
+///
+/// # Panics
+/// Panics when bootstrap fails, any surface's prompt differs, a launch
+/// command does not preserve the prompt, or a refused prompt read succeeds.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
+async fn guided_init_lifecycle_and_prompt() {
+    let prompt = wyrd_spec::mcp::setup_prompt(env!("CARGO_PKG_VERSION"));
+    let mut local = LocalDev::new().await;
+    for host in [".codex", ".claude", ".cursor"] {
+        fs::create_dir_all(local.home.path().join(host)).expect("detected host");
+    }
+    local.start(&["codex", "claude-code", "cursor"]).await;
+    let printed = local.stop("-INT").await;
+    let literal = prompt.replace('\'', r"'\''");
+    for program in ["codex", "claude"] {
+        assert!(
+            printed.contains(&format!("{program} '{literal}'")),
+            "{program} launches on the literal prompt: {printed}"
+        );
+    }
+    assert!(
+        printed.contains(
+            "Start Cursor in this directory and paste the output of `wyrd init --print-prompt`"
+        ),
+        "{printed}"
+    );
+
+    local.start_json().await;
+    let ready = local.ready.clone().expect("readiness result");
+    assert_eq!(ready["setup_prompt"], prompt.as_str());
+    let endpoint = format!("http://{}", local.bind);
+    let mut proxy = Proxy::spawn(local.home.path(), &["--server", &endpoint], &[]);
+    let host = ().serve(proxy.stdio()).await.expect("host initializes");
+    let listed = host.list_all_prompts().await.expect("prompts list");
+    assert_eq!(
+        listed.iter().map(|listed| listed.name.as_str()).collect::<Vec<_>>(),
+        ["setup"]
+    );
+    assert!(listed[0].arguments.as_deref().is_none_or(<[_]>::is_empty));
+    let setup = host
+        .get_prompt(GetPromptRequestParams::new("setup"))
+        .await
+        .expect("setup prompt reads");
+    let [message] = setup.messages.as_slice() else {
+        panic!("one prompt message: {setup:?}");
+    };
+    assert_eq!(message.role, Role::User);
+    let text = message.content.as_text().expect("a text prompt");
+    assert_eq!(text.text, prompt);
+    assert!(
+        setup
+            .description
+            .is_some_and(|description| description.contains(env!("CARGO_PKG_VERSION")))
+    );
+    assert!(host.get_prompt(GetPromptRequestParams::new("start")).await.is_err());
+    let mut with_arguments = GetPromptRequestParams::new("setup");
+    with_arguments.arguments = Some(serde_json::Map::from_iter([("language".to_owned(), json!("rust"))]));
+    assert!(host.get_prompt(with_arguments).await.is_err());
+    host.cancel().await.expect("host disconnects");
     local.stop("-INT").await;
 }
 
@@ -1391,7 +1463,7 @@ const SUPPLIED_SEALING_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
 /// call, the retained key, the refusal, or a leak check fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn server_dev_keeps_the_gateway_managed_secret_key() {
+async fn init_keeps_the_gateway_managed_secret_key() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

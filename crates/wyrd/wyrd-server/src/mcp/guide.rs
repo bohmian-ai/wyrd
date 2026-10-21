@@ -1,10 +1,15 @@
-//! Static onboarding and investigation guidance; all authorized evidence
-//! remains in the owning tools.
+//! Static onboarding and investigation guidance, and the guided setup
+//! prompt; all authorized evidence remains in the owning tools.
 
-use rmcp::model::{CallToolResult, Tool};
+use rmcp::model::{
+    CallToolResult, ErrorData, GetPromptRequestParams, GetPromptResult, Prompt, PromptMessage,
+    Role, Tool,
+};
 use serde_json::{Map, Value, json};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::mcp::{GuideExample, GuideRequest, GuideResponse, GuideTopic};
+use wyrd_spec::mcp::{
+    GuideExample, GuideRequest, GuideResponse, GuideTopic, SETUP_PROMPT_NAME, setup_prompt,
+};
 
 use super::principals::{parse_args, tool};
 use super::structured;
@@ -22,6 +27,46 @@ pub(super) fn descriptor() -> Tool {
          placeholders with exact discovered identifiers; consult tools/list for current schemas.",
         true,
     )
+}
+
+/// Describe the argument-free `setup` prompt, labelled with this release.
+pub(super) fn prompt_descriptor() -> Prompt {
+    Prompt::new(
+        SETUP_PROMPT_NAME,
+        Some(format!(
+            "Wyrd {} guided setup: add Wyrd to the current project and confirm one stored verification. Instruction text only; it grants no permission and runs nothing.",
+            env!("CARGO_PKG_VERSION")
+        )),
+        None,
+    )
+}
+
+/// Return the release's setup prompt as one user message.
+///
+/// The text is the same [`setup_prompt`] projection `wyrd init` prints for
+/// this release. Reading it executes no step and reads no tenant state.
+///
+/// # Errors
+/// Returns invalid parameters for any other prompt name or for arguments,
+/// which this prompt does not take.
+pub(super) fn prompt(request: &GetPromptRequestParams) -> Result<GetPromptResult, ErrorData> {
+    if request.name != SETUP_PROMPT_NAME {
+        return Err(ErrorData::invalid_params(
+            format!("unknown prompt `{}`; the only prompt is `{SETUP_PROMPT_NAME}`", request.name),
+            None,
+        ));
+    }
+    if request.arguments.as_ref().is_some_and(|arguments| !arguments.is_empty()) {
+        return Err(ErrorData::invalid_params(
+            format!("the `{SETUP_PROMPT_NAME}` prompt takes no arguments"),
+            None,
+        ));
+    }
+    Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+        Role::User,
+        setup_prompt(env!("CARGO_PKG_VERSION")),
+    )])
+    .with_description(prompt_descriptor().description.unwrap_or_default()))
 }
 
 /// Decode a topic and return bounded static guidance without reading tenant state.
@@ -70,7 +115,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
             vec![
                 "Wyrd verifies an application you own in three steps: Declare its components and Verifiers with the wyrd CLI, Observe it with a Wyrd SDK inside the application, and Verify its behavior through the SDK or this MCP server. MCP teaches, reads Cards and evidence, and runs verification. It does not declare Cards, pull bundles, upload files, or ingest application telemetry or rows; use a shell for those.",
                 "Read the docs before writing code. llms.txt is the page index and llms-full.txt the full text, including every embedded YAML and code example, both under the docs base /wyrd/ (published at https://bohmian-ai.github.io/wyrd/; a locally served docs build uses the same paths). Follow get-started/setup/, then get-started/quickstart/, then the build-and-verify Declare, Observe, and Verify pages. Stable error codes and remediation are listed at api/errors/.",
-                "Setup: the person installs the wyrd CLI, supplies PostgreSQL, and runs wyrd server dev in a terminal or background job they own, waiting for readiness; wyrd server dev --format json prints one readiness line and keeps serving. Do not start, stop, or restart that server yourself. It saves the endpoint and an administrator credential that the CLI and SDKs resolve with no arguments. wyrd mcp install --host <host> --format json connects a host without writing a credential into its configuration; the host must reload or reconnect afterwards.",
+                "Setup: the person installs the wyrd CLI, supplies PostgreSQL, and runs wyrd init in a terminal or background job they own, waiting for readiness; wyrd init --format json prints one readiness line and keeps serving. The MCP prompt setup, and wyrd init --print-prompt, give the guided first-verification steps. Do not start, stop, or restart that server yourself. It saves the endpoint and an administrator credential that the CLI and SDKs resolve with no arguments. wyrd mcp install --host <host> --format json connects a host without writing a credential into its configuration; the host must reload or reconnect afterwards.",
                 "Declare: map the application to one Service Card YAML file with components (an alias and a ref) for its Agent, Prompt, and Model Cards, tables with a JSON schema for each kind of custom row, and verified_by bindings to Verifier Cards. A gateway deployment and model string such as openai/gpt-4o is a route, not a Model Card; declare a Model Card only for model artifacts you own, through its existing artifact workflow, before referring to it. Run wyrd declare <dir> --check --format json, which validates the local files and never contacts the server, then wyrd declare <dir> --format json. Repeating an unchanged declaration is idempotent. The receipt's root is the Service's exact identity; declaring returns no secret and grants no authority.",
                 "Read and pull: wyrd get --kind Service --space <space> --name <name> --version <version>, or cards.get here, reads one Card envelope. wyrd pull --kind Service --uid <root_uid> --output-dir .wyrd-bundle, or the SDK's Cards.pull, writes the complete bundle the application loads. A --metadata-only bundle is inspectable but not runnable.",
                 "Observe: install the Python SDK (pip install \"wyrd-ai[otel]\", plus agents or gateway for those integrations), the Rust wyrd-ai crate, or the TypeScript wyrd-ai package. Load the bundle with WyrdState.from_path, call start_bifrost and start_telemetry, open state.run() for each unit of work, write rows with run.observe.record(<table>, row) matching the declared schema, use run.for_card(<alias>) for a component's view, and call state.shutdown() before exit to flush buffered rows and spans. Recording buffers rows; a row becomes queryable only after the server publishes it.",

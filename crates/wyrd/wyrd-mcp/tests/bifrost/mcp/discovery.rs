@@ -237,7 +237,7 @@ mod pg_tests {
                 .join("\n");
             for taught in [
                 "llms-full.txt",
-                "wyrd server dev",
+                "wyrd init",
                 "wyrd mcp install --host",
                 "wyrd declare",
                 "--check",

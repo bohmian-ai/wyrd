@@ -35,20 +35,45 @@ const MIN_SAMPLES: f64 = 1_000.0;
 /// Server log lines that report an outbox item lost.
 pub const LOSS_MARKERS: [&str; 3] = ["was lost", "items unwritten", "write task failed"];
 
-/// The report table's header.
-const HEADER: &str = "| step | clients | throughput | client p50/p95/p99 ms | errors | server CPU | peak memory | driver CPU | verdict | server evidence |\n|---|---|---|---|---|---|---|---|---|---|";
+/// The overhead report table's header.
+pub const OVERHEAD_HEADER: &str = "| step | clients | throughput | client p50/p95/p99 ms | errors | server CPU | peak memory | driver CPU | verdict | server evidence |\n|---|---|---|---|---|---|---|---|---|---|";
 
 /// A row's judgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub enum Verdict {
     /// Met every target.
     Pass,
     /// Missed a target or saw an error.
     Fail,
+    /// A capacity rate that met every SLO with valid evidence.
+    Sustainable,
+    /// A capacity rate with valid evidence that missed an SLO: exploration,
+    /// not a failure.
+    OutsideSlo,
+    /// A capacity window whose evidence cannot judge it.
+    Invalid,
+}
+
+impl Verdict {
+    /// Whether the row fails the command.
+    pub const fn fails(self) -> bool {
+        matches!(self, Self::Fail | Self::Invalid)
+    }
+
+    /// The rendered verdict.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Sustainable => "SUSTAINABLE",
+            Self::OutsideSlo => "OUTSIDE-SLO",
+            Self::Invalid => "INVALID",
+        }
+    }
 }
 
 /// One report line.
-struct Row {
+pub struct Row {
     /// Step name.
     step: String,
     /// The rendered columns before the verdict.
@@ -62,11 +87,28 @@ struct Row {
 impl Row {
     /// The row of `step`: FAIL with every miss ahead of `evidence` when
     /// `misses` is not empty.
-    fn judged(step: String, cells: String, misses: &[String], evidence: String) -> Self {
-        let (verdict, reason) = if misses.is_empty() {
-            (Verdict::Pass, evidence)
+    pub fn judged(step: String, cells: String, misses: &[String], evidence: String) -> Self {
+        let verdict = if misses.is_empty() {
+            Verdict::Pass
         } else {
-            (Verdict::Fail, format!("{}; {evidence}", misses.join("; ")))
+            Verdict::Fail
+        };
+        Self::new(step, cells, verdict, misses, evidence)
+    }
+
+    /// The row of `step` judged `verdict`, with `misses` ahead of
+    /// `evidence`.
+    pub fn new(
+        step: String,
+        cells: String,
+        verdict: Verdict,
+        misses: &[String],
+        evidence: String,
+    ) -> Self {
+        let reason = if misses.is_empty() {
+            evidence
+        } else {
+            format!("{}; {evidence}", misses.join("; "))
         };
         Self {
             step,
@@ -78,13 +120,12 @@ impl Row {
 
     /// Renders the row as one Markdown table line.
     fn render(&self) -> String {
-        let verdict = match self.verdict {
-            Verdict::Pass => "PASS",
-            Verdict::Fail => "FAIL",
-        };
         format!(
-            "| {} | {} | {verdict} | {} |",
-            self.step, self.cells, self.reason
+            "| {} | {} | {} | {} |",
+            self.step,
+            self.cells,
+            self.verdict.label(),
+            self.reason
         )
     }
 }
@@ -105,36 +146,68 @@ pub struct Shutdown {
 pub struct Report {
     /// The report's heading.
     title: String,
+    /// The table's header lines.
+    header: &'static str,
     /// The server's memory limit, which sets the peak-memory ceiling.
     memory_limit_bytes: u64,
     /// Rows so far.
     rows: Vec<Row>,
     /// One JSON line per measured step: its name, clients, and raw samples.
     samples: String,
+    /// Summary lines after the table.
+    notes: Vec<String>,
 }
 
 impl Report {
     /// Starts an empty report titled `title` (mode, host, build, and
-    /// settings) on a server whose memory limit is `memory_limit_bytes`, and
-    /// prints the title and table header; each row prints as it is judged.
-    pub fn new(title: String, memory_limit_bytes: u64) -> Self {
+    /// settings) with table `header` on a server whose memory limit is
+    /// `memory_limit_bytes`, and prints the title and header; each row
+    /// prints as it is judged.
+    pub fn new(title: String, header: &'static str, memory_limit_bytes: u64) -> Self {
         let report = Self {
             title,
+            header,
             memory_limit_bytes,
             rows: Vec::new(),
             samples: String::new(),
+            notes: Vec::new(),
         };
-        println!("# {}\n\n{HEADER}", report.title);
+        println!("# {}\n\n{header}", report.title);
         report
+    }
+
+    /// The server's memory limit.
+    pub const fn memory_limit_bytes(&self) -> u64 {
+        self.memory_limit_bytes
+    }
+
+    /// Appends `value` as one line of `samples.jsonl`.
+    pub fn sample(&mut self, value: &serde_json::Value) {
+        let _ = writeln!(self.samples, "{value}");
+    }
+
+    /// Prints and keeps `note`, rendered after the table.
+    pub fn note(&mut self, note: String) {
+        println!("{note}");
+        self.notes.push(note);
+    }
+
+    /// `-` for every column between a row's step and its verdict.
+    pub fn blank_cells(&self) -> String {
+        let columns = self
+            .header
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .matches('|')
+            .count();
+        vec!["-"; columns.saturating_sub(4)].join(" | ")
     }
 
     /// Adds an overhead step, judged by [`overhead_misses`], and its drain,
     /// judged by [`drain_misses`].
     pub fn overhead(&mut self, step: &Step) {
-        let _ = writeln!(
-            self.samples,
-            "{}",
-            serde_json::json!({
+        self.sample(&serde_json::json!({
                 "step": step.name,
                 "clients": step.clients,
                 "profiled": step.profile_gaps.is_some(),
@@ -145,8 +218,7 @@ impl Report {
                 "errors": step.samples.errors,
                 "traffic_seconds": step.traffic.seconds,
                 "drain_seconds": step.drain,
-            })
-        );
+        }));
         let misses = overhead_misses(step, self.memory_limit_bytes);
         let evidence = overhead_evidence(step);
         self.push(Row::judged(
@@ -186,7 +258,7 @@ impl Report {
             });
         self.push(Row::judged(
             "shutdown".to_owned(),
-            "- | - | - | - | - | - | -".to_owned(),
+            self.blank_cells(),
             &shutdown_misses(shutdown),
             evidence,
         ));
@@ -197,7 +269,7 @@ impl Report {
     pub fn failed(&mut self, step: &str, reason: String) {
         self.push(Row::judged(
             step.to_owned(),
-            "- | - | - | - | - | - | -".to_owned(),
+            self.blank_cells(),
             &[reason],
             "no evidence".to_owned(),
         ));
@@ -205,7 +277,7 @@ impl Report {
 
     /// Whether every judged row passed.
     pub fn passed(&self) -> bool {
-        self.rows.iter().all(|row| row.verdict == Verdict::Pass)
+        self.rows.iter().all(|row| !row.verdict.fails())
     }
 
     /// Writes every row, as printed, into `output/report.md` and the raw
@@ -215,9 +287,12 @@ impl Report {
     ///
     /// Returns the file write failure.
     pub fn write_to(&self, output: &Path) -> Result<()> {
-        let mut text = format!("# {}\n\n{HEADER}\n", self.title);
+        let mut text = format!("# {}\n\n{}\n", self.title, self.header);
         for row in &self.rows {
             let _ = writeln!(text, "{}", row.render());
+        }
+        for note in &self.notes {
+            let _ = write!(text, "\n{note}\n");
         }
         std::fs::write(output.join("report.md"), text)?;
         std::fs::write(output.join("samples.jsonl"), &self.samples)?;
@@ -225,7 +300,7 @@ impl Report {
     }
 
     /// Prints and appends `row`.
-    fn push(&mut self, row: Row) {
+    pub fn push(&mut self, row: Row) {
         println!("{}", row.render());
         self.rows.push(row);
     }
@@ -248,7 +323,7 @@ pub fn overhead_misses(step: &Step, memory_limit: u64) -> Vec<String> {
     let mut misses = Vec::new();
     for point in points(step.stream) {
         let overhead = step.telemetry.histogram(point.overhead);
-        if !(overhead.count >= MIN_SAMPLES) {
+        if overhead.count.is_nan() || overhead.count < MIN_SAMPLES {
             misses.push(format!(
                 "{} overhead samples {} < {MIN_SAMPLES}",
                 point.name, overhead.count
@@ -298,7 +373,7 @@ pub fn integrity_misses(integrity: &Integrity, arrivals: u64) -> Vec<String> {
         return vec!["a counter reset or was invalid; no delta is evidence".to_owned()];
     }
     let mut misses = Vec::new();
-    if integrity.staged != arrivals as f64 {
+    if (integrity.staged - arrivals as f64).abs() > 0.5 {
         misses.push(format!(
             "{} captures staged for {arrivals} arrivals",
             integrity.staged
@@ -447,7 +522,7 @@ fn integrity(integrity: &Integrity, arrivals: u64) -> String {
 }
 
 /// Raw client samples, microseconds, as `p50/p95/p99` milliseconds.
-fn client(samples_us: &[u64]) -> String {
+pub fn client(samples_us: &[u64]) -> String {
     match Percentiles::raw(samples_us, 1e-3) {
         Percentiles {
             p50: Some(p50),
@@ -463,7 +538,7 @@ fn client(samples_us: &[u64]) -> String {
 /// what the client, transport, and HTTP stack add.
 fn client_extra(samples_us: &[u64], server: &Histogram) -> String {
     match server.mean() {
-        Some(server_mean) if samples_us.len() as f64 == server.count => {
+        Some(server_mean) if (samples_us.len() as f64 - server.count).abs() < 0.5 => {
             let client = samples_us.iter().sum::<u64>() as f64 / samples_us.len() as f64 * 1e-6;
             format!("{:.4}", (client - server_mean) * 1e3)
         }
@@ -472,7 +547,7 @@ fn client_extra(samples_us: &[u64], server: &Histogram) -> String {
 }
 
 /// One histogram as `p50/p95/p99 <= a/b/c ms, mean m ms, xN`.
-fn summary(histogram: &Histogram) -> String {
+pub fn summary(histogram: &Histogram) -> String {
     let Percentiles { p50, p95, p99 } = histogram.percentiles();
     format!(
         "p50/p95/p99 <= {}/{}/{} ms, mean {} ms, x{:.0}",
@@ -492,18 +567,24 @@ fn bound_ms(bound: Option<f64>) -> String {
 }
 
 /// Bytes in GiB.
-fn gib(bytes: u64) -> f64 {
+pub fn gib(bytes: u64) -> f64 {
     bytes as f64 / f64::from(1 << 30)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     use wyrd_testing::capacity::{Histogram, Telemetry, Usage};
 
-    use super::{Shutdown, drain_misses, overhead_misses, shutdown_misses};
+    use super::{Shutdown, Verdict, drain_misses, overhead_misses, shutdown_misses};
+    use crate::gateway::capacity::{Arrived, Backlog, Driven, Load, Measured, Ownership, Slo};
+    use crate::gateway::envelope::{
+        capture_misses, classify, envelope, overload_misses, recovery_misses,
+    };
     use crate::gateway::run::{Integrity, SELECTION, Samples, Step};
+    use crate::gateway::workload::{Outcome, Timed};
 
     /// A memory limit far above every test's peak.
     const LIMIT: u64 = 64 << 30;
@@ -554,6 +635,104 @@ mod tests {
             },
             ..Step::default()
         }
+    }
+
+    /// The release-run SLO bounds, seconds.
+    const SLO: Slo = Slo {
+        answer: Some(0.2),
+        first_token: Some(0.35),
+        chunk_lag: Some(0.05),
+        stream: Some(1.1),
+    };
+
+    /// One answered call of `tenant` completing `ms` after its scheduled
+    /// arrival: a buffered body, or 32 events from 250 ms, 20 ms apart, each
+    /// 5 ms behind its upstream send.
+    fn arrived(tenant: usize, stream: bool, ms: u64) -> Arrived {
+        let scheduled = Instant::now();
+        let at = |ms: u64| scheduled + Duration::from_millis(ms);
+        let (events, sends) = if stream {
+            (
+                (0..32).map(|k| at(250 + 20 * k)).collect(),
+                (0..32).map(|k| at(245 + 20 * k)).collect(),
+            )
+        } else {
+            (Vec::new(), vec![at(ms.saturating_sub(5))])
+        };
+        Arrived {
+            tenant,
+            stream,
+            offset: Duration::ZERO,
+            scheduled,
+            timed: Timed {
+                sent: scheduled,
+                headers: Some(at(if stream { 250 } else { ms })),
+                events,
+                done: at(ms),
+                outcome: Outcome::Answered,
+            },
+            sends,
+        }
+    }
+
+    /// A clean 60 s capacity window at `rate` of `calls`, spread over the
+    /// window, with flat backlog and every capture staged and owned.
+    fn window(rate: f64, mut calls: Vec<Arrived>) -> Measured {
+        let count = calls.len();
+        for (index, call) in calls.iter_mut().enumerate() {
+            call.offset = Duration::from_secs_f64(index as f64 * 60.0 / count as f64);
+        }
+        let mut ownership = vec![Ownership::default(); 4];
+        for call in &calls {
+            let owned = &mut ownership[call.tenant];
+            owned.admissible += 1;
+            if call.timed.outcome.answered() {
+                owned.answered += 1;
+                owned.rows += 1;
+            }
+        }
+        let tenants = calls.iter().map(|call| call.tenant + 1).max().unwrap_or(1);
+        ownership.truncate(tenants);
+        let admitted = ownership.iter().map(|owned| owned.rows).sum::<i64>() as f64;
+        Measured {
+            name: format!("1 buffered {rate}/s"),
+            rate,
+            seconds: 60.0,
+            driven: Driven {
+                scheduled: count as u64,
+                sent: count as u64,
+                lateness_us: vec![100; count],
+                ..Driven::default()
+            },
+            backlog: (0..60)
+                .map(|second| Backlog {
+                    offset: f64::from(second),
+                    in_flight: 10.0,
+                    active: 10.0,
+                    pending: 0.0,
+                })
+                .collect(),
+            calls,
+            traffic: Usage {
+                seconds: 60.0,
+                peak_memory_bytes: 1 << 30,
+                ..Usage::default()
+            },
+            drain: Some(0.5),
+            integrity: Integrity {
+                staged: admitted,
+                written: 1.0,
+                ..Integrity::default()
+            },
+            admitted,
+            ownership,
+            ..Measured::default()
+        }
+    }
+
+    /// `count` answered calls of `tenant` in `stream` mode taking `ms`.
+    fn calls(count: usize, tenant: usize, stream: bool, ms: u64) -> Vec<Arrived> {
+        (0..count).map(|_| arrived(tenant, stream, ms)).collect()
     }
 
     /// Every overhead row requires each point's sample count and strict p99
@@ -628,5 +807,162 @@ mod tests {
             ..clean()
         };
         assert_eq!(shutdown_misses(&unreadable).len(), 1);
+
+        // Capacity: a declared bound passes at equality and fails above it.
+        let buffered = Load::Buffered;
+        let verdict = |measured: &Measured| classify(buffered, measured, &SLO).0;
+        assert_eq!(
+            verdict(&window(50.0, calls(200, 0, false, 150))),
+            Verdict::Sustainable
+        );
+        assert_eq!(
+            verdict(&window(50.0, calls(200, 0, false, 200))),
+            Verdict::Sustainable
+        );
+        assert_eq!(
+            verdict(&window(50.0, calls(200, 0, false, 201))),
+            Verdict::OutsideSlo
+        );
+        // Fewer than 100 completions per tenant/mode is not evidence.
+        assert_eq!(
+            verdict(&window(50.0, calls(99, 0, false, 150))),
+            Verdict::Invalid
+        );
+        // Streams judge first token, chunk lag, and the whole stream.
+        let paced = |ms| {
+            classify(
+                Load::PacedStream,
+                &window(50.0, calls(150, 0, true, ms)),
+                &SLO,
+            )
+        };
+        assert_eq!(paced(1_100).0, Verdict::Sustainable);
+        assert_eq!(paced(1_101).1.len(), 1);
+        // A quiet tenant's miss stays visible though the aggregate passes.
+        let mut mixed = Vec::new();
+        for tenant in 0..4 {
+            mixed.extend(calls(150, tenant, true, 900));
+            mixed.extend(calls(
+                if tenant == 3 { 95 } else { 400 },
+                tenant,
+                false,
+                100,
+            ));
+        }
+        mixed.extend(calls(5, 3, false, 250));
+        let (quiet, misses) = classify(Load::TenantContention, &window(100.0, mixed), &SLO);
+        assert_eq!(quiet, Verdict::OutsideSlo);
+        assert_eq!(misses.len(), 1, "{misses:?}");
+        assert!(
+            misses[0].starts_with("bench-d/buffered answer"),
+            "{misses:?}"
+        );
+        // A missed or capped arrival, or late sends, invalidate the rate.
+        let mut missed = window(50.0, calls(200, 0, false, 150));
+        missed.driven.missed = 1;
+        assert_eq!(verdict(&missed), Verdict::Invalid);
+        let mut capped = window(50.0, calls(200, 0, false, 150));
+        capped.driven.capped = 1;
+        assert_eq!(verdict(&capped), Verdict::Invalid);
+        let mut late = window(50.0, calls(200, 0, false, 150));
+        late.driven.lateness_us = vec![6_000; 200];
+        assert_eq!(verdict(&late), Verdict::Invalid);
+        let mut blind = window(50.0, calls(200, 0, false, 150));
+        blind.backlog.clear();
+        assert_eq!(verdict(&blind), Verdict::Invalid);
+        // Backlog may grow by one second of offered work, not more.
+        let grown = |growth: f64| {
+            let mut measured = window(50.0, calls(200, 0, false, 150));
+            for reading in measured
+                .backlog
+                .iter_mut()
+                .filter(|reading| reading.offset >= 50.0)
+            {
+                reading.pending += growth;
+            }
+            verdict(&measured)
+        };
+        assert_eq!(grown(50.0), Verdict::Sustainable);
+        assert_eq!(grown(51.0), Verdict::OutsideSlo);
+        // A refusal is outside the SLO but needs no capture: captures
+        // reconcile against admitted calls, not offered ones.
+        let mut offered = calls(200, 0, false, 150);
+        offered[0].timed.outcome = Outcome::Refused("WYRD_GATEWAY_429_LIMIT_EXCEEDED".to_owned());
+        let refused = window(50.0, offered);
+        assert_eq!(verdict(&refused), Verdict::OutsideSlo);
+        assert!(capture_misses(&refused, LIMIT).is_empty());
+        // Lost, dropped, unstaged, and misattributed captures each fail.
+        let mut lost = window(50.0, calls(200, 0, false, 150));
+        lost.integrity.lost = 1.0;
+        lost.integrity.dropped = 1.0;
+        assert_eq!(capture_misses(&lost, LIMIT).len(), 2);
+        let mut unstaged = window(50.0, calls(200, 0, false, 150));
+        unstaged.integrity.staged -= 1.0;
+        assert_eq!(capture_misses(&unstaged, LIMIT).len(), 2);
+        let mut moved = window(
+            100.0,
+            [calls(200, 0, false, 150), calls(200, 1, false, 150)].concat(),
+        );
+        moved.ownership[0].rows -= 1;
+        moved.ownership[1].rows += 1;
+        assert_eq!(capture_misses(&moved, LIMIT).len(), 2);
+        // The envelope reports the highest passing tested rate and the first
+        // failing one, never an untested maximum.
+        let (text, found) = envelope(
+            buffered,
+            &[(50.0, Verdict::Sustainable), (100.0, Verdict::OutsideSlo)],
+        );
+        assert!(
+            found
+                && text.contains("highest sustainable tested rate 50/s; first failing rate 100/s"),
+            "{text}"
+        );
+        let (text, found) = envelope(
+            buffered,
+            &[(50.0, Verdict::Sustainable), (100.0, Verdict::Sustainable)],
+        );
+        assert!(
+            found
+                && text
+                    .contains("100/s, the highest tested rate: a lower bound, ceiling unlocated"),
+            "{text}"
+        );
+        let (text, found) = envelope(buffered, &[(50.0, Verdict::Invalid)]);
+        assert!(
+            !found && text.contains("no measured sustainable rate"),
+            "{text}"
+        );
+        // Overload allows only configured admission refusals.
+        let mut refusing = calls(200, 0, false, 150);
+        for call in refusing.iter_mut().take(20) {
+            call.timed.outcome = Outcome::Refused("WYRD_GATEWAY_429_LIMIT_EXCEEDED".to_owned());
+        }
+        let (misses, saturated) = overload_misses(&window(100.0, refusing.clone()), LIMIT);
+        assert!(misses.is_empty() && saturated, "{misses:?}");
+        let (misses, saturated) = overload_misses(&window(100.0, calls(200, 0, false, 150)), LIMIT);
+        assert!(
+            misses.is_empty() && !saturated,
+            "unobserved saturation is not a failure"
+        );
+        for bad in [
+            Outcome::TimedOut,
+            Outcome::Refused("WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE".to_owned()),
+            Outcome::Failed("stream ended without [DONE]".to_owned()),
+        ] {
+            let mut failing = refusing.clone();
+            failing[100].timed.outcome = bad;
+            assert_eq!(overload_misses(&window(100.0, failing), LIMIT).0.len(), 1);
+        }
+        let mut lossy = window(100.0, refusing);
+        lossy.integrity.lost = 1.0;
+        assert!(!overload_misses(&lossy, LIMIT).0.is_empty());
+        // Recovery needs every SLO, enough calls, no refusal, and no loss.
+        let recovered = |measured: &Measured| recovery_misses(buffered, measured, &SLO, LIMIT);
+        assert!(recovered(&window(50.0, calls(200, 0, false, 150))).is_empty());
+        assert!(!recovered(&window(50.0, calls(99, 0, false, 150))).is_empty());
+        assert!(!recovered(&refused).is_empty());
+        let mut lossy = window(50.0, calls(200, 0, false, 150));
+        lossy.integrity.lost = 1.0;
+        assert!(!recovered(&lossy).is_empty());
     }
 }

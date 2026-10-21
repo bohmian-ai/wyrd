@@ -268,16 +268,53 @@ pub struct Step {
     pub profile_gaps: Option<Vec<String>>,
 }
 
-/// One tenant's calls through the real server, profiled per window.
-pub struct Bench<'a> {
-    /// The server, for `/metrics`, resources, and its PID.
+/// Numbers and starts each window's profile, or none without profiling.
+pub struct Profiler<'a> {
+    /// The profiled server, for its PID.
     server: &'a LocalServer,
-    /// The provisioned tenant, holding one key per client.
-    tenant: &'a Tenant,
     /// Where each window's profile lands, or `None` without profiling.
     profiles: Option<PathBuf>,
     /// Windows profiled so far; numbers each profile's directory.
     windows: AtomicUsize,
+}
+
+impl<'a> Profiler<'a> {
+    /// Profiles `server`'s windows under `profiles`, or none when it is
+    /// `None`.
+    pub const fn new(server: &'a LocalServer, profiles: Option<PathBuf>) -> Self {
+        Self {
+            server,
+            profiles,
+            windows: AtomicUsize::new(0),
+        }
+    }
+
+    /// Starts window `name`'s profile under `profiles/NN-<name>/`, unless
+    /// profiling is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profiler start failure or a server that has exited.
+    pub fn start(&self, name: &str) -> Result<Option<Capture>> {
+        let Some(profiles) = &self.profiles else {
+            return Ok(None);
+        };
+        let number = self.windows.fetch_add(1, Ordering::Relaxed);
+        let pid = self.server.pid().ok_or("the profiled server has exited")?;
+        let directory = profiles.join(format!("{number:02}-{}", name.replace(' ', "-")));
+        Ok(Some(Capture::start(pid, 0, PROFILE_HERTZ, &directory)?))
+    }
+}
+
+/// One tenant's closed-loop calls through the real server, profiled per
+/// window.
+pub struct Bench<'a> {
+    /// The server, for `/metrics` and resources.
+    server: &'a LocalServer,
+    /// The provisioned tenant, holding one key per client.
+    tenant: &'a Tenant,
+    /// Each window's profile.
+    profiler: Profiler<'a>,
 }
 
 impl<'a> Bench<'a> {
@@ -291,8 +328,7 @@ impl<'a> Bench<'a> {
         Self {
             server,
             tenant,
-            profiles,
-            windows: AtomicUsize::new(0),
+            profiler: Profiler::new(server, profiles),
         }
     }
 
@@ -312,14 +348,14 @@ impl<'a> Bench<'a> {
         if settle(self.server).await?.is_none() {
             return Err(format!("{name}: warmup did not settle within 60 s").into());
         }
-        let capture = self.profile(name)?;
+        let capture = self.profiler.start(name)?;
         let (traffic, baseline) = Window::open(self.server, SELECTION).await?;
         let samples = self.drive(shape, clients, WINDOW).await?;
         let (traffic, _) = traffic.close(self.server).await?;
         let (draining, _) = Window::open(self.server, Selection::RESOURCES).await?;
         let drain = settle(self.server).await?;
         let (drained, last) = draining.close(self.server).await?;
-        let step = Step {
+        let mut step = Step {
             name: name.to_owned(),
             clients,
             stream: shape.stream,
@@ -331,26 +367,21 @@ impl<'a> Bench<'a> {
             integrity: Integrity::between(&baseline, &last),
             profile_gaps: None,
         };
-        finish(
-            capture,
-            step,
-            &serde_json::json!({"step": name, "clients": clients}),
-        )
-    }
-
-    /// Starts this window's profile, unless profiling is off.
-    ///
-    /// # Errors
-    ///
-    /// Returns the profiler start failure or a server that has exited.
-    pub fn profile(&self, name: &str) -> Result<Option<Capture>> {
-        let Some(profiles) = &self.profiles else {
-            return Ok(None);
-        };
-        let number = self.windows.fetch_add(1, Ordering::Relaxed);
-        let pid = self.server.pid().ok_or("the profiled server has exited")?;
-        let directory = profiles.join(format!("{number:02}-{}", name.replace(' ', "-")));
-        Ok(Some(Capture::start(pid, 0, PROFILE_HERTZ, &directory)?))
+        let metadata = serde_json::json!({"step": name, "clients": clients});
+        let profile = record(capture, &step.telemetry, &metadata)?;
+        pareto(
+            &Evidence {
+                name,
+                calls: step.samples.arrivals,
+                errors: step.samples.error_count(),
+                traffic: &step.traffic,
+                drain: step.drain,
+                telemetry: &step.telemetry,
+            },
+            profile.as_ref(),
+        );
+        step.profile_gaps = profile.as_ref().map(gaps);
+        Ok(step)
     }
 
     /// Runs `clients` closed-loop clients, each with its own connection and
@@ -384,35 +415,50 @@ impl<'a> Bench<'a> {
     }
 }
 
-/// Finishes `capture`, when profiling, with `metadata` plus the step's
-/// breakdown, records its evidence gaps on `step`, and prints the Pareto.
+/// What one measured window's Pareto reads.
+pub struct Evidence<'a> {
+    /// Window name.
+    pub name: &'a str,
+    /// Calls the window sent.
+    pub calls: u64,
+    /// Calls that did not end validated.
+    pub errors: u64,
+    /// Server and driver usage over its traffic.
+    pub traffic: &'a Usage,
+    /// Seconds its drain took, or `None` when it did not settle.
+    pub drain: Option<f64>,
+    /// Server telemetry from its baseline to its final scrape.
+    pub telemetry: &'a Telemetry,
+}
+
+/// Finishes `capture`, when profiling, writing `metadata` plus the
+/// `telemetry` breakdown beside its files.
+///
+/// Blocking: it waits for `perf` to flush and report.
 ///
 /// # Errors
 ///
 /// Returns the profiler finish failure.
-pub fn finish(
+pub fn record(
     capture: Option<Capture>,
-    mut step: Step,
+    telemetry: &Telemetry,
     metadata: &serde_json::Value,
-) -> Result<Step> {
-    let profile = match capture {
-        Some(capture) => {
-            let mut metadata = metadata.clone();
-            metadata["breakdown"] = serde_json::json!(step.telemetry.breakdown);
-            let profile = capture.finish(&metadata)?;
-            step.profile_gaps = Some(
-                [&profile.failure, &profile.off_cpu_failure]
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-                    .collect(),
-            );
-            Some(profile)
-        }
-        None => None,
+) -> Result<Option<Profile>> {
+    let Some(capture) = capture else {
+        return Ok(None);
     };
-    report_pareto(&step, profile.as_ref());
-    Ok(step)
+    let mut metadata = metadata.clone();
+    metadata["breakdown"] = serde_json::json!(telemetry.breakdown);
+    Ok(Some(capture.finish(&metadata)?))
+}
+
+/// Every evidence class `profile` could not collect.
+pub fn gaps(profile: &Profile) -> Vec<String> {
+    [&profile.failure, &profile.off_cpu_failure]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
 }
 
 /// Waits until no gateway call is active and every outbox is empty, and
@@ -446,17 +492,18 @@ pub fn micros(elapsed: Duration) -> u64 {
 /// Component rows are the server's own histograms: total time over the
 /// window per call beside the mean per observation. Components nest and
 /// overlap, so they are read beside client latency, never summed.
-fn report_pareto(step: &Step, profile: Option<&Profile>) {
-    let calls = step.samples.arrivals.max(1) as f64;
+pub fn pareto(evidence: &Evidence<'_>, profile: Option<&Profile>) {
+    let calls = evidence.calls.max(1) as f64;
     eprintln!(
         "runtime pareto, {}: {:.0}/s, {} errors, drain {}",
-        step.name,
-        step.samples.arrivals as f64 / step.traffic.seconds.max(f64::EPSILON),
-        step.samples.error_count(),
-        step.drain
+        evidence.name,
+        evidence.calls as f64 / evidence.traffic.seconds.max(f64::EPSILON),
+        evidence.errors,
+        evidence
+            .drain
             .map_or("timed out".to_owned(), |seconds| format!("{seconds:.1} s")),
     );
-    let mut components: Vec<(&String, &(f64, f64))> = step.telemetry.breakdown.iter().collect();
+    let mut components: Vec<(&String, &(f64, f64))> = evidence.telemetry.breakdown.iter().collect();
     components.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
     for (component, (seconds, count)) in components.iter().take(PARETO_ROWS) {
         eprintln!(
@@ -467,13 +514,13 @@ fn report_pareto(step: &Step, profile: Option<&Profile>) {
         );
     }
     let Some(profile) = profile else {
-        eprintln!("cpu pareto, {}: not profiled (--no-profile)", step.name);
+        eprintln!("cpu pareto, {}: not profiled (--no-profile)", evidence.name);
         return;
     };
-    let cpu_ms = step.traffic.server_cpu_seconds * 1e3 / calls;
+    let cpu_ms = evidence.traffic.server_cpu_seconds * 1e3 / calls;
     eprintln!(
         "cpu pareto, {}: {cpu_ms:.3} ms server CPU per call ({})",
-        step.name,
+        evidence.name,
         profile.directory.display()
     );
     if let Some(failure) = &profile.failure {

@@ -10,6 +10,7 @@
 //! buffered answer's JSON, or a stream's every server-sent event through
 //! `[DONE]` and body EOF. A `200` alone is never success.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -46,10 +47,8 @@ pub enum CapturePolicy {
     Payload,
 }
 
-/// One provisioned tenant: its slug, administrator, and invoking keys.
+/// One provisioned tenant: its administrator and invoking keys.
 pub struct Tenant {
-    /// The `setup` slug.
-    pub slug: String,
     /// The tenant administrator's client.
     admin: WyrdClient,
     /// Machine-principal `wyrd_sk_` keys, one per concurrent caller.
@@ -88,7 +87,6 @@ impl Tenant {
             issued.push(SecretString::from(created.credential.expose().to_owned()));
         }
         Ok(Self {
-            slug: setup.slug.clone(),
             admin,
             keys: issued,
         })
@@ -103,7 +101,7 @@ impl Tenant {
         let write = match policy {
             CapturePolicy::Metadata => GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
-                payload_fields: Default::default(),
+                payload_fields: BTreeSet::default(),
             },
             CapturePolicy::Payload => GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Payload,
@@ -212,6 +210,18 @@ pub enum Outcome {
     TimedOut,
     /// A transport, body, stream, or validation failure.
     Failed(String),
+}
+
+impl Outcome {
+    /// Whether the call ended with a complete, valid answer.
+    pub const fn answered(&self) -> bool {
+        matches!(self, Self::Answered)
+    }
+
+    /// Whether the gateway refused the call with a stable code.
+    pub const fn refused(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
 }
 
 /// One call's monotonic client timings and outcome.

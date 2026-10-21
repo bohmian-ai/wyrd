@@ -39,7 +39,7 @@ SITE = f"{ORIGIN}{BASE}"
 # the steps the sidebar publishes are listed, so a withdrawn step drops out.
 START = [
     ("get-started/setup", "install Wyrd and start a local server you keep running"),
-    ("get-started/quickstart", "declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript"),
+    ("get-started/quickstart", "declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript"),
 ]
 
 SUMMARY = (

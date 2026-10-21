@@ -6,11 +6,11 @@ section: Understand
 order: 3
 ---
 
-An observation is a record of what your declared service actually did, tied to the exact Card version and run that produced it.
+An observation is a record of what a declared service actually did. Each one is tied to the exact Card version and the run that produced it.
 
 ## A run is one invocation
 
-A run is one execution of your service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
+A run is one execution of a service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -44,28 +44,28 @@ await run.observe.record("vala.datasets.tickets", { question, answer });
 </LangTab>
 </LangTabs>
 
-`state` holds the exact Card versions your service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
+`state` holds the exact Card versions the service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
 
 ## Where observations land
 
 Observations go to Bifrost, the Wyrd data plane:
 
-| You record | Lands in |
+| Recorded with | Lands in |
 | --- | --- |
-| `observe.record(table, row)` | Your own `vala.datasets.<name>` table |
+| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
 | `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
 | Drift samples, with `observe.submit` | `vala.drift.observations` |
 | OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
 
-Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE`.
+Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/api/errors/)).
 
 ## Recording is buffered
 
-`observe.*` calls queue the row and return at once. `shutdown` sends everything still queued, so call it before your process exits. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
+`observe.*` calls queue the row; a returned call means the row is queued, not stored. `shutdown` sends everything still queued, so a process that exits without it loses those rows. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
 
 A row the server has stored can take a moment to show up in queries. [Bifrost](/understand/bifrost/) explains why.
 
-## Query the evidence
+## Evidence joins on the run
 
 Observations and verdicts share `run_id`, so one SQL query joins what a run saw to how it was judged:
 

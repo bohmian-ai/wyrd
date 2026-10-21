@@ -13,8 +13,9 @@ automatic handoff.
 
 Require unambiguous base and target commits, the complete active change packet,
 task-review verdicts, execution evidence, and delivery context when supplied.
-Read these directly from the target. Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touches,
-[spec-driven development](../../../changes/spec-driven-development.md),
+Read these directly from the target. Read `AGENTS.md`,
+[agent rules](../../../architecture/agent-rules.md),
+[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
 and applicable architecture and testing references. Follow CodeGraph
 instructions and inspect the complete diff plus enough surrounding code to
 evaluate integrated impact.

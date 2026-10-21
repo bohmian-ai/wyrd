@@ -174,7 +174,7 @@ async fn declare_state(
 }
 
 /// One `WyrdState::declare_with` call turns the Quickstart's authored files
-/// into a state that judges a passing and a failing reply; a rerun keeps
+/// into a state that judges a passing and a failing answer; a rerun keeps
 /// its identities, a pinned version with changed content, a broken reference
 /// and a reader are refused with their catalog codes, and an artifact-bearing
 /// graph declares into a ready state or into a caller-owned bundle that loads
@@ -196,19 +196,22 @@ async fn declares_ready_verification_state() {
     let run = state.run();
     let passed = run
         .observe()
-        .verify("refund-limit", json!({ "refund": 40 }))
+        .verify(
+            "no-refund-promise",
+            json!("Your refund request is approved."),
+        )
         .await
         .expect("the passing reply is judged");
     let failed = run
         .observe()
-        .verify("refund-limit", json!({ "refund": 250 }))
+        .verify("no-refund-promise", json!("You have a guaranteed refund."))
         .await
         .expect("the failing reply is judged");
     assert_eq!(state.root_ref().kind, CardKind::Service);
     assert_eq!(state.root_ref().name.as_str(), "support-reply");
     assert_eq!(passed.outcome.verdict, VerificationVerdict::Passed);
     assert_eq!(failed.outcome.verdict, VerificationVerdict::Failed);
-    assert_eq!(passed.verifier.name.as_str(), "refund-limit");
+    assert_eq!(passed.verifier.name.as_str(), "no-refund-promise");
     assert_eq!(passed.verifier, failed.verifier);
 
     let again = declare_state(&quickstart, deployment.admin())
@@ -217,11 +220,11 @@ async fn declares_ready_verification_state() {
     assert_eq!(again.root_ref(), state.root_ref());
 
     let edited = tempfile::tempdir().expect("edit directory creates");
-    for file in ["support-reply.yaml", "refund-limit.yaml"] {
+    for file in ["support-reply.yaml", "no-refund-promise.yaml"] {
         let source = std::fs::read_to_string(quickstart.with_file_name(file)).expect("reads");
         std::fs::write(
             edited.path().join(file),
-            source.replace("expected: 100", "expected: 50"),
+            source.replace("expected: guaranteed refund", "expected: guaranteed"),
         )
         .expect("writes");
     }
@@ -233,7 +236,7 @@ async fn declares_ready_verification_state() {
     .expect_err("changed content at the same version is refused");
     assert_eq!(drift.code(), "WYRD_REGISTRY_409_SPEC_DRIFT");
 
-    std::fs::remove_file(edited.path().join("refund-limit.yaml")).expect("removes");
+    std::fs::remove_file(edited.path().join("no-refund-promise.yaml")).expect("removes");
     let missing = declare_state(
         &edited.path().join("support-reply.yaml"),
         deployment.admin(),

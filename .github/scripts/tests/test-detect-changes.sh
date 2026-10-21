@@ -164,7 +164,7 @@ check_selection "Python example runs Python checks" "full_gate=false python=true
   "examples/python/demo.py"
 check_selection "docs example Card runs every language's journeys" \
   "full_gate=false docs=true python=true typescript=true ci_lanes~test:examples ci_lanes~py:test:integration ci_lanes~ts:test:integration" \
-  "examples/quickstart/refund-limit.yaml"
+  "examples/quickstart/no-refund-promise.yaml"
 check_selection "docs example Rust program runs the examples journeys only" \
   "full_gate=false python=false typescript=false ci_lanes~test:examples ci_lanes~check:examples" \
   "examples/quickstart/quickstart.rs"

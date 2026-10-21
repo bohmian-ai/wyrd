@@ -1,4 +1,4 @@
-# The subject: a Service verified by refund-limit.
+# The subject: your support agent's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -7,4 +7,4 @@ metadata:
   space: default
 spec:
   verified_by:
-    - verifier: ./refund-limit.yaml
+    - verifier: ./no-refund-promise.yaml

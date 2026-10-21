@@ -23,7 +23,7 @@ A Verifier's Agent calls server built-in tools, named in its `tool_names`. There
 | `fs.search` | Finds matching locations in workspace files | Workspace only |
 | `code.run` | Runs sandboxed Python against the workspace | Workspace only |
 
-Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls`: tool, arguments, output SHA-256, and returned bytes.
+Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
 
 ## Rules
 
@@ -41,7 +41,7 @@ Every call needs both a `tool:invoke` grant and the tool's resource permission. 
 
 The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
 
-## If it fails
+## Errors
 
 | Code | Cause |
 | --- | --- |
@@ -49,3 +49,4 @@ The scope is `all` or one exact tool name, never a pattern. A call runs as the p
 | `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
 | `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
 | `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |

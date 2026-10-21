@@ -46,7 +46,6 @@ To recover by hand: a failed `server dev` stops its server, so recovery starts t
 1. Start the installed server with the same database URL.
 
    ```bash
-   export WYRD_SERVER_BIND=127.0.0.1:8080
    ~/.config/wyrd/server/current/wyrd-server
    ```
 

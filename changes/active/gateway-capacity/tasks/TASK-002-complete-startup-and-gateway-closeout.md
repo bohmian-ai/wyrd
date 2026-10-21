@@ -691,8 +691,7 @@ startup, engine-owned refresh, ordered shutdown and two-tenant attribution
 journeys committed with them. Criteria 5–6 are release benchmark evidence:
 - the revision-2 evidence is recorded;
 - the revision-4 matrix found capture shedding under closed-loop saturation,
-  which led to [revision 5](../spec-revision-5.md) and
-  [TASK-004](TASK-004-capture-loss-under-saturation.md);
+  which led to [revision 5](../spec-revision-5.md);
 - the release matrix rerun on the revision-5 code is deferred at the
   maintainer's request (2026-10-21).
 

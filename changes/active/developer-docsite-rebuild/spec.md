@@ -1,10 +1,19 @@
 ---
 id: SPEC-developer-docsite-rebuild
 revision: 2
-status: approved
+status: superseded
 ---
 
 # Rebuild the Wyrd developer documentation
+
+## Supersession — 2026-10-20
+
+The user approved [SPEC-docsite-incremental-reset revision 2](../docsite-incremental-reset/spec.md),
+which replaces this packet's documentation scope and remaining content work.
+The existing brand, site platform, six-section navigation/depth, and
+accessibility commitments remain authoritative through that specification.
+This packet and its task evidence remain historical context; supersession
+neither claims task completion nor authorizes the deferred guide expansion.
 
 ## Objective and user value
 

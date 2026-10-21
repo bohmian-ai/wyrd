@@ -3594,6 +3594,32 @@ impl RefreshJourney {
         Ok(paths.pop().filter(|_| paths.len() == before))
     }
 
+    /// Call as `caller` until the call reaches `expected` or [`WAIT`]
+    /// passes, and return the last route reached.
+    ///
+    /// An administrative write reaches the snapshot cache only through its
+    /// committed notification, or through the listener noticing a lost
+    /// session and forgetting every snapshot, so a call right after the write
+    /// may still route on the previous snapshot for that latency. A snapshot
+    /// that is never forgotten keeps the old route past the deadline.
+    ///
+    /// # Errors
+    /// Returns a request or recording error from any call.
+    async fn route_after_write(
+        &self,
+        caller: &str,
+        expected: Option<&str>,
+    ) -> Result<Option<String>, ServerJourneyError> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let route = self.call(caller).await?;
+            if route.as_deref() == expected || tokio::time::Instant::now() >= deadline {
+                return Ok(route);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Every path the mock upstream received, oldest first.
     ///
     /// # Errors
@@ -3634,8 +3660,9 @@ impl RefreshJourney {
 ///
 /// Tenant A's administrator stores deployment `acme` and calls it, then
 /// moves it twice: once while the server's change listeners are connected,
-/// and once right after every listener session is terminated. Each call
-/// reaches the newest upstream, so a lost listener leaves no stale snapshot.
+/// and once right after every listener session is terminated. Calls after
+/// each move reach the newest upstream once the write's notification or the
+/// listener's loss is handled, so a lost listener leaves no stale snapshot.
 /// Once the listeners reconnect a further move is still seen. Tenant B
 /// cannot call A's deployment, and B's own `acme` reaches only B's upstream
 /// while A keeps its own.
@@ -3660,16 +3687,22 @@ async fn engine_owned_refresh_preserves_tenant_changes() -> Result<(), ServerJou
         &None::<String>,
     )?;
     journey.deploy(&a, "two").await?;
-    expect_eq("A's moved route", &journey.call(&a).await?, &reaches("two"))?;
+    let two = reaches("two");
+    expect_eq(
+        "A's moved route",
+        &journey.route_after_write(&a, two.as_deref()).await?,
+        &two,
+    )?;
 
     if journey.listeners(true).await? == 0 {
         return Err("startup composed no engine-owned change listener".into());
     }
     journey.deploy(&a, "three").await?;
+    let three = reaches("three");
     expect_eq(
         "A's route after listener loss",
-        &journey.call(&a).await?,
-        &reaches("three"),
+        &journey.route_after_write(&a, three.as_deref()).await?,
+        &three,
     )?;
     let deadline = tokio::time::Instant::now() + WAIT;
     while journey.listeners(false).await? == 0 {
@@ -3679,14 +3712,20 @@ async fn engine_owned_refresh_preserves_tenant_changes() -> Result<(), ServerJou
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     journey.deploy(&a, "four").await?;
+    let four = reaches("four");
     expect_eq(
         "A's route after reconnect",
-        &journey.call(&a).await?,
-        &reaches("four"),
+        &journey.route_after_write(&a, four.as_deref()).await?,
+        &four,
     )?;
 
     journey.deploy(&b, "bee").await?;
-    expect_eq("B's own route", &journey.call(&b).await?, &reaches("bee"))?;
+    let bee = reaches("bee");
+    expect_eq(
+        "B's own route",
+        &journey.route_after_write(&b, bee.as_deref()).await?,
+        &bee,
+    )?;
     expect_eq(
         "A beside B's route",
         &journey.call(&a).await?,

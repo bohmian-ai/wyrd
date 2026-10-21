@@ -1226,6 +1226,78 @@ def test_guided_setup_prompt_surfaces() -> None:
             assert read_setup_prompt(cli_path, home, env) == printed.stdout
 
 
+QUICKSTART_RUNNERS = {
+    "python": lambda root: [sys.executable, "quickstart.py"],
+    "rust": lambda root: [
+        *("mise", "exec", "--", "cargo", "run", "--locked", "-q"),
+        *("--manifest-path", str(root / "Cargo.toml"), "-p", "wyrd-rust-examples"),
+        *("--bin", "quickstart"),
+    ],
+    "typescript": lambda root: ["node", str(root / "examples/quickstart/quickstart.ts")],
+}
+"""Language → the command a reader runs in a directory holding the Quickstart files."""
+
+
+def stored_verdicts(cli_path: str, home: Path, env: dict[str, str], sql: str) -> dict[str, set]:
+    """Find the Service and its stored verdicts as the setup prompt does, through MCP.
+
+    ``sql`` is the prompt's own query; ``<uid>`` becomes the Service UID read
+    with ``cards.get``. Rows are polled for up to a minute and grouped by Run.
+    """
+    proxy = StdioServerParameters(command=cli_path, args=["mcp", "proxy"], env=env, cwd=home)
+    service = {"kind": "Service", "space": "default", "name": "support-reply", "version": "1.0.0"}
+
+    async def read() -> dict[str, set]:
+        async with Client(proxy) as host:
+            card = (await host.call_tool("cards.get", {"card_ref": service})).structured_content
+            query = sql.replace("<uid>", card["card"]["metadata"]["uid"])
+            deadline = time.monotonic() + 60
+            while True:
+                answer = await host.call_tool("bifrost.query", {"sql": query})
+                assert not answer.is_error, answer.structured_content
+                names = [column["name"] for column in answer.structured_content["columns"]]
+                runs: dict[str, set] = {}
+                for values in answer.structured_content["rows"]:
+                    row = dict(zip(names, values, strict=True))
+                    runs.setdefault(row["run_id"], set()).add(row["verdict"])
+                if {"passed", "failed"} in runs.values() or time.monotonic() > deadline:
+                    return runs
+                await asyncio.sleep(0.5)
+
+    return asyncio.run(read())
+
+
+@pytest.mark.local_dev
+@pytest.mark.parametrize("language", QUICKSTART_RUNNERS)
+def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
+    """The manual path the setup prompt also follows stores one Run's two verdicts.
+
+    After ``wyrd init``, the Quickstart program runs from a directory holding
+    only its Card files with the saved local setup and no model key, prints a
+    passed and a failed verdict for the Service, and the prompt's ``cards.get``
+    and ``bifrost.query`` steps find both verdicts under one stored Run.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    example = root / "examples/quickstart"
+    reader = tmp_path / "project"
+    reader.mkdir()
+    for name in ("no-refund-promise.yaml", "support-reply.yaml", "quickstart.py"):
+        shutil.copy(example / name, reader)
+    prompt = subprocess.check_output([cli_path, "init", "--print-prompt"], text=True)
+    sql = prompt.split("```sql\n", 1)[1].split("```", 1)[0].strip()
+    with local_deployment() as (home, env), installed_local_cli(cli_path, home, env, ""):
+        ran = subprocess.run(
+            QUICKSTART_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
+        )
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+        verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]
+        assert verdicts == ["passed", "failed"], ran.stdout
+        assert "  subject:  default/Service/support-reply@1.0.0#" in ran.stdout
+        runs = stored_verdicts(cli_path, home, env, sql)
+        assert {"passed", "failed"} in runs.values(), runs
+
+
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")
 """Standalone example repositories, checked out beside Wyrd or under ``WYRD_EXAMPLES_DIR``."""
 

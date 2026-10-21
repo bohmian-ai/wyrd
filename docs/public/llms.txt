@@ -4,10 +4,10 @@
 
 ## Start here
 
-Declare -> Observe -> Verify an application you own, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
+Set up a local server, then run one verification, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
 
-- [Set up Wyrd](/wyrd/get-started/setup/): run a local server you keep running, and connect MCP hosts.
-- [Verify your first agent](/wyrd/get-started/quickstart/): declare, observe, and verify the support-desk Service.
+- [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
+- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript.
 - [Error catalog](/wyrd/api/errors/): every stable error code and its remediation.
 
 ## Home
@@ -16,9 +16,9 @@ Declare -> Observe -> Verify an application you own, in this order. A connected 
 
 ## Get started
 
-- [What Wyrd verifies](/wyrd/get-started/introduction/): Wyrd checks that an AI system behaves the way its declaration says it should, before and after deployment.
-- [Set up Wyrd](/wyrd/get-started/setup/): Run a Wyrd server on your machine, save its first credential, and make an authenticated request.
-- [Verify your first agent](/wyrd/get-started/quickstart/): Run the support-desk API against your local server, get verdicts from three Verifiers, and query the evidence behind them.
+- [What Wyrd verifies](/wyrd/get-started/introduction/): Wyrd judges what an AI system did against criteria you declared, and ties every judgment to the exact versions involved.
+- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
+- [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then judge a passing and a failing reply from one Python, Rust, or TypeScript program.
 
 ## Build and verify
 

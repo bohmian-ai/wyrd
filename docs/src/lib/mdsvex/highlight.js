@@ -168,7 +168,7 @@ const ANCHOR = /\bANCHOR(_END)?:\s*([\w-]+)/;
  */
 function sliceRegion(src, name, file) {
   const lines = src.split('\n');
-  const at = (end) => lines.findIndex((l) => {
+  const at = (/** @type {boolean} */ end) => lines.findIndex((l) => {
     const m = l.match(ANCHOR);
     return m !== null && m[2] === name && Boolean(m[1]) === end;
   });
@@ -189,7 +189,7 @@ function stripAnchors(body) {
  * @param {string[]} lines
  */
 function dedent(lines) {
-  const indents = lines.filter((l) => l.trim()).map((l) => l.match(/^\s*/)[0].length);
+  const indents = lines.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length);
   const cut = indents.length ? Math.min(...indents) : 0;
   return lines.map((l) => l.slice(cut)).join('\n');
 }

@@ -10448,6 +10448,7 @@ dependencies = [
  "anyhow",
  "axum",
  "reqwest 0.13.4",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",
@@ -10455,6 +10456,7 @@ dependencies = [
  "tracing",
  "workspace-hack",
  "wyrd-ai",
+ "wyrd-testing",
 ]
 
 [[package]]

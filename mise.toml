@@ -1137,6 +1137,11 @@ run = "pnpm start"
 description = "Show Card registration terminal progress rendering"
 run = "cargo run --locked -p wyrd-cli --example declaration_progress"
 
+[tasks."test:examples"]
+description = "Run every docs example's Rust program against a real server, on one Postgres lifecycle"
+depends = ["build:server"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-rust-examples -P journey --run-ignored=all\""
+
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
@@ -1386,10 +1391,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
-description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), and the quickstart's TypeScript reference app"
+description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), the support-desk TypeScript reference app, and the docs examples"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit"]
+run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/examples exec tsc --noEmit"]
 
 [tasks."ts:test:unit"]
 description = "wyrd-ai unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
@@ -1461,8 +1466,8 @@ depends = ["test:bifrost:gate"]
 
 [tasks."gate:rust:journeys"]
 hide = true
-description = "Gate shard: the identity, Rust SDK, and installed-CLI local development journeys"
-depends = ["test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
+description = "Gate shard: the identity, Rust SDK, installed-CLI local development, and docs example journeys"
+depends = ["test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey", "test:examples"]
 
 [tasks."gate:storage"]
 hide = true

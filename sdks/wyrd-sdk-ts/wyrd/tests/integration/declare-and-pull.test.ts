@@ -1,4 +1,5 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -12,6 +13,7 @@ import { fixture, declared, serverTest } from "../support/server.js";
 vi.setConfig({ testTimeout: 60_000 });
 
 const DESK = fixture("cards/declare_and_pull/support-desk.yaml");
+const QUICKSTART = resolve(import.meta.dirname, "../../../../../examples/quickstart");
 
 /** The support desk graph, declared after the artifact-bearing Model it references. */
 const test = serverTest().extend<{
@@ -51,9 +53,27 @@ test("service graph declares and pulls", async ({ cards, desk }) => {
   expect("artifacts" in state).toBe(false);
 });
 
+test("runs the Quickstart script from a directory holding only its Cards", async ({ server: _ }) => {
+  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
+  for (const file of ["refund-limit.yaml", "support-reply.yaml"]) cpSync(join(QUICKSTART, file), join(reader, file));
+  const ref = (kind: string, name: string) => `default/${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
+  const printed = () =>
+    execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
+
+  const first = printed();
+  expect(first).toMatch(
+    new RegExp(
+      `^passed: the comparison held\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "refund-limit")}\\n` +
+        `failed: operator LessThanOrEquals returned false\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "refund-limit")}\\n$`,
+    ),
+  );
+  expect(printed()).toBe(first);
+  expect(readdirSync(reader).sort()).toEqual(["refund-limit.yaml", "support-reply.yaml"]);
+});
+
 test("declares a ready verification state", async ({ server, model: _ }) => {
   const quickstart = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-"));
-  cpSync(resolve(import.meta.dirname, "../../../../../examples/quickstart"), quickstart, { recursive: true });
+  cpSync(QUICKSTART, quickstart, { recursive: true });
   const service = join(quickstart, "support-reply.yaml");
 
   const state = await WyrdState.declare(service);

@@ -37,8 +37,8 @@ SITE = f"{ORIGIN}{BASE}"
 
 # The onboarding route, in reading order: the canonical start for agents.
 START = [
-    ("get-started/setup", "run a local server you keep running, and connect MCP hosts"),
-    ("get-started/quickstart", "declare, observe, and verify the support-desk Service"),
+    ("get-started/setup", "install Wyrd and start a local server you keep running"),
+    ("get-started/quickstart", "declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript"),
 ]
 
 SUMMARY = (
@@ -143,7 +143,7 @@ def render_start() -> list[str]:
     lines = [
         "## Start here",
         "",
-        "Declare -> Observe -> Verify an application you own, in this order. "
+        "Set up a local server, then run one verification, in this order. "
         "A connected Wyrd MCP server teaches the same route through "
         '`wyrd.guide {"topic":"start"}`.',
         "",

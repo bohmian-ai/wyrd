@@ -23,7 +23,7 @@ Wyrd has 14 Card kinds. These are the ones a service declaration uses most:
 
 Not every Card starts in YAML. In a traditional ML workflow, you declare `Data` and `Model` Cards from code as they are produced, with the Python SDK.
 
-The examples on this page use the support-desk Service in `examples/support-desk-app/service/`, the same Cards the [quickstart](/get-started/quickstart/) runs: an agent that answers customer questions, the prompt it runs, three Verifiers that check it, and the judge Agent one of those Verifiers calls.
+The examples on this page use the support-desk Service in `examples/support-desk-app/service/`: an agent that answers customer questions, the prompt it runs, three Verifiers that check it, and the judge Agent one of those Verifiers calls.
 
 ## Every Card has the same shape
 

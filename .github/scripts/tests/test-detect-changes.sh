@@ -68,7 +68,7 @@ check_selection "shared crate includes transitive consumers" \
   "full_gate=false rust_packages~wyrd-skald-runtime rust_packages~wyrd-skald-agent rust_packages~wyrd rust_packages~wyrd-server ci_lanes~test:skald ci_lanes~test:wyrd ci_lanes~test:vala" \
   "crates/skald/skald-cache/src/lib.rs"
 check_selection "dev-dependency consumers are tested but not propagated" \
-  "full_gate=false rust_packages~wyrd-ai rust_packages~wyrd-server rust_packages!wyrd-rust-examples" \
+  "full_gate=false rust_packages~wyrd-cli rust_packages~wyrd-server rust_packages!wyrd-sdk-ts" \
   "crates/wyrd/wyrd-testing/src/lib.rs"
 check_selection "rename inside one crate keeps its closure" \
   "full_gate=false changed_packages=wyrd rust_packages=wyrd ci_lanes~test:wyrd" \
@@ -162,6 +162,12 @@ check_selection "TypeScript SDK change runs TypeScript on both platforms and its
   "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
 check_selection "Python example runs Python checks" "full_gate=false python=true" \
   "examples/python/demo.py"
+check_selection "docs example Card runs every language's journeys" \
+  "full_gate=false docs=true python=true typescript=true ci_lanes~test:examples ci_lanes~py:test:integration ci_lanes~ts:test:integration" \
+  "examples/quickstart/refund-limit.yaml"
+check_selection "docs example Rust program runs the examples journeys only" \
+  "full_gate=false python=false typescript=false ci_lanes~test:examples ci_lanes~check:examples" \
+  "examples/quickstart/quickstart.rs"
 check_selection "identity fixture selects the identity journey" "full_gate=false identity=true" \
   "tests/fixtures/identity/dex-config.yaml"
 

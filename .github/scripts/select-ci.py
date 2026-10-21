@@ -49,8 +49,12 @@ UI = re.compile(
     r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css"
     r"|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
 )
-PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/python/)")
-TYPESCRIPT = re.compile(r"^sdks/wyrd-sdk-ts/")
+# A docs example (examples/<guide>/) is run by every SDK's journeys, so its
+# Card files select both language lanes as well as its program.
+PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/(python/|[^/]+/[^/]+\.(py|ya?ml)$))")
+TYPESCRIPT = re.compile(
+    r"^(sdks/wyrd-sdk-ts/|examples/(package\.json|tsconfig\.json|[^/]+/[^/]+\.(ts|ya?ml)$))"
+)
 # Non-package inputs of the environment-owning journeys; package changes reach
 # them through the closure.
 STORAGE = re.compile(r"^crates/wyrd/wyrd-storage/docker/")
@@ -74,7 +78,7 @@ BIFROST_ONLY = re.compile(
 )
 # Trees whose every file must be owned by a workspace package.
 PACKAGE_TREES = re.compile(
-    r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)"
+    r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/)"
 )
 
 # Packages outside the four Rust families; each has a dedicated owning lane.
@@ -373,6 +377,8 @@ def select(paths, root):
         sel.lane("test:gateway:gate", f"gateway journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & EXAMPLE_PACKAGES):
         sel.lane("check:examples", f"examples build {hits[0]}")
+    if "wyrd-rust-examples" in affected:
+        sel.lane("test:examples", "the docs examples' Rust journeys run wyrd-rust-examples")
     if hits := sorted(affected.keys() & RUST_CLIENT_PACKAGES):
         sel.flag("rust_client", f"{hits[0]} is affected")
     if hits := sorted(affected.keys() & STORAGE_PACKAGES):

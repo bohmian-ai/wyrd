@@ -16,7 +16,7 @@ Your code runs a Verifier now with `verify` and acts on the result, or hands it 
 
 <WyrdSequence name="verification-paths" />
 
-The examples use the `support-desk` service from the [quickstart](/get-started/quickstart/) and its three Verifiers.
+The examples use the `support-desk` Service in `examples/support-desk-app/service/` and its three Verifiers.
 
 ## Four parts of a Verifier
 

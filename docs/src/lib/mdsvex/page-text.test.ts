@@ -11,15 +11,18 @@ describe('pageText', () => {
   it('renders the quickstart with its embedded source bodies and no component markup', () => {
     const text = pageText(page('get-started/quickstart'));
     expect(text).not.toMatch(/^---$/m);
-    expect(text).toContain('```python title="deploy.py"');
-    expect(text).toContain('cards.declare_from_path(');
-    expect(text).toContain('kind: Service');
+    expect(text).toContain('```python title="quickstart.py"\nfrom wyrd import WyrdState');
+    expect(text).toContain('state = WyrdState.declare("support-reply.yaml")');
+    expect(text).toContain('let state = WyrdState::declare("support-reply.yaml").await?;');
+    expect(text).toContain('const state = await WyrdState.declare("support-reply.yaml");');
+    expect(text).toContain('```yaml title="refund-limit.yaml"');
+    expect(text).toContain('verifier: ./refund-limit.yaml');
     expect(text).not.toMatch(/<\/?(CodeFromFile|LangTabs?|Tabs?|Aside)\b/);
     expect(text).not.toContain('ANCHOR');
   });
 
   it('shows every language connecting at startup and draining at exit', () => {
-    for (const slug of ['get-started/quickstart', 'build-and-verify/observe/record-a-run-and-observations']) {
+    for (const slug of ['build-and-verify/observe/record-a-run-and-observations']) {
       const text = pageText(page(slug));
       for (const call of [
         'self.state.start_bifrost()',

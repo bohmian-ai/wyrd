@@ -7,7 +7,7 @@ members = [
     "crates/shared/*",
     "crates/patches/*",
     "crates/wyrd-spec",
-    "examples/rust",
+    "examples",
     "sdks/wyrd-sdk-python",
     "sdks/wyrd-sdk-rust",
     "sdks/wyrd-sdk-ts/native",

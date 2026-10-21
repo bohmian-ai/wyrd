@@ -37,7 +37,7 @@ and their landing and shell links. Also own the four Understand explanations
 those pages link to: Cards, versions, and relationships; How verification
 works; Runs, observations, and retained evidence; and Identity and
 authorization. They publish with the Get started journey. Derive every step from
-`architecture/wyrd-design.md`, `architecture/wyrd-doctrine.mdx`, and current
+`architecture/wyrd-design.md`, and current
 Wyrd contracts (`wyrd-spec` schemas, SDK declarations, CLI). Do not implement
 product behavior, simulate a verdict, invent output or timing, restore old
 articles, or alter the approved visual system.

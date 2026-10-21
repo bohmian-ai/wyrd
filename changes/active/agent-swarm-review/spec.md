@@ -352,12 +352,12 @@ None remain. Resolving OD-001 does not approve the specification as a whole.
 | 2 | draft | Owner resolved OD-001: Option A, mutually exclusive repeat/each with ordered outputs and scoped item binding. Each consumes a list produced by an earlier step in the same execution. Removed tentative syntax wording; no open material decisions remain. Overall specification approval remains outstanding. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
-[agent rules](../../../architecture/agent-rules.md),
+[agent rules](../../../AGENTS.md),
 [Wyrd design](../../../architecture/wyrd-design.md#verifier),
-[doctrine](../../../architecture/wyrd-doctrine.mdx),
+[doctrine](../../../architecture/wyrd-design.md),
 [approved grouping revision 13](../long-horizon-verification/spec.md),
-[reference router](../../../architecture/references/README.md),
-[evaluation](../../../architecture/references/domain/evaluation.md),
-[architecture patterns](../../../architecture/references/architecture/patterns.md),
-[agent harness](../../../architecture/references/languages/agent-harness.md),
-[spec workflow](../../../architecture/references/languages/spec-driven-development.md).
+[reference router](../../../architecture/wyrd-design.md),
+[evaluation](../../../.agents/skills/wyrd-advise/references/evaluation.md),
+[architecture patterns](../../../architecture/wyrd-design.md),
+[agent harness](../../../agent_docs/agent-surfaces.md),
+[spec workflow](../../../changes/spec-driven-development.md).

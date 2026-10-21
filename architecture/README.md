@@ -1,6 +1,6 @@
 # Wyrd Architecture
 
-This directory is the repository-level architecture and engineering authority
+This directory is the repository-level design authority
 for Wyrd. It describes the required system directly. Implementation that
 conflicts with these documents is drift to correct; implementation state,
 delivery sequencing, and decision history belong outside normative
@@ -8,37 +8,33 @@ architecture.
 
 ## Authority map
 
-| Document | Normative responsibility |
+| Document | Owns |
 |---|---|
-| [`wyrd-design.md`](wyrd-design.md) | Wyrd protocol, doctrine, nouns, Card contracts, service boundaries, identity, and public surfaces |
-| [`bifrost-design.md`](bifrost-design.md) | Bifrost table, Scribe, Oracle, Forge, storage, resource, and serving architecture |
-| [`wyrd-security-posture.md`](wyrd-security-posture.md) | Trust boundaries, credentials, authorization, tenant security, audit integrity, and security operations |
-| [`agent-rules.md`](agent-rules.md) | Mandatory repository implementation constraints |
-| [`wyrd-doctrine.mdx`](wyrd-doctrine.mdx) | Public rationale for the protocol and product boundaries |
-| [`operations/`](operations/README.md) | Supported deployment, release, reliability, backup, recovery, SLO, and incident contracts |
-| [`references/`](references/README.md) | Reusable engineering expertise for applying the architecture |
-| [`v1/`](v1/) | Detailed v1 foundation, service, surface, crate, and journey specifications |
+| [`wyrd-design.md`](wyrd-design.md) | Doctrine, nouns, Card contracts, service boundaries, identity, and public surfaces |
+| [`bifrost-design.md`](bifrost-design.md) | Bifrost tables, Scribe, Oracle, Forge, storage, resources, and serving |
+| [`wyrd-security-posture.md`](wyrd-security-posture.md) | Trust boundaries, credentials, permissions, tenant isolation, audit integrity, and security operations |
+| [`operations/`](operations/README.md) | Deployment, release, reliability, backup, recovery, and incidents |
+
+Contributor rules live outside this directory: the root `AGENTS.md`, nested
+`AGENTS.md` files beside the code they govern, and `agent_docs/` topic guides.
+The change workflow lives in `changes/`.
 
 ## Conflict resolution
 
-Apply the narrowest owning authority:
+The narrowest owner wins:
 
-1. `wyrd-design.md` wins for Wyrd doctrine, Cards, wire contracts, and
-   cross-product boundaries.
-2. `bifrost-design.md` wins for Bifrost internals.
-3. `wyrd-security-posture.md` wins for security controls without changing the
-   protocol nouns owned by `wyrd-design.md`.
-4. `operations/` wins for deployment and operational behavior without
-   weakening security or protocol guarantees.
-5. `agent-rules.md` and repository `AGENTS.md` govern implementation shape and
-   contributor behavior.
-6. `references/` explain how to apply those decisions. A reference cannot
-   override an owning architecture document.
+1. `wyrd-design.md` for doctrine, Cards, wire contracts, and cross-product
+   boundaries.
+2. `bifrost-design.md` for Bifrost internals.
+3. `wyrd-security-posture.md` for security controls, without changing protocol
+   nouns.
+4. `operations/` for operational behavior, without weakening security or
+   protocol guarantees.
 
-Generated schemas, OpenAPI, source code, examples, tests, and old design
-artifacts do not override these authorities. Resolve an actual contradiction
-in the owning architecture document instead of introducing aliases or parallel
-contracts.
+Contributor rules govern implementation shape and cannot override these
+documents. Generated schemas, OpenAPI, source code, examples, tests, and old
+design artifacts do not either. Resolve a real contradiction in the owning
+document instead of adding aliases or parallel contracts.
 
 ## Normative writing rules
 

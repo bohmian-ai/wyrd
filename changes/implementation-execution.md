@@ -1,6 +1,6 @@
 # Bounded Implementation Execution
 
-This reference defines the execution discipline for an actionable Wyrd change.
+This file defines the execution discipline for an actionable Wyrd change.
 It covers authority classification, controlled adaptation, verification
 recovery, test integrity, diff audit, and completion evidence without requiring
 a particular request or packet shape.
@@ -21,16 +21,8 @@ a particular request or packet shape.
 
 ## Authority
 
-Apply instructions in this order:
-
-1. current user instructions and explicitly locked outcomes;
-2. applicable `AGENTS.md` files and repository architecture authorities;
-3. the approved change specification revision when the work belongs to a
-   spec-driven change;
-4. the ready implementation or remediation task derived from that revision;
-5. tests that express the mapped specification obligations;
-6. repository conventions consistent with the authorities above;
-7. local implementation preferences.
+Apply instructions in the order defined in
+[spec-driven development](spec-driven-development.md#authority).
 
 The request fixes required behavior, acceptance outcomes, explicitly approved
 public or persisted contracts, prohibited changes, and safety boundaries.
@@ -64,13 +56,9 @@ Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
 structure, or other reversible choices. The implementation agent owns them.
 
-Before adding architectural machinery, revalidate the task's source-backed
-reuse map against existing owners and their complete callers. Record the gap
-and selected extension in existing task evidence. A task's prescribed private
-mechanics do not authorize duplicate graph, traversal, parsing, validation,
-transport, or lifecycle logic. Resolve reversible choices within the established
-owner; route contradictory task instructions to `wyrd-plan`, and material
-approved-contract changes to `wyrd-spec`.
+Before adding architectural machinery, revalidate the task's reuse map as
+defined in
+[reuse evidence](spec-driven-development.md#reuse-evidence-and-task-conflicts).
 
 ## Three execution classes
 
@@ -96,8 +84,6 @@ Proceed, record, and continue:
 - repairing a small pre-existing defect in touched code;
 - provisioning repository-managed local services, migrations, and test
   environment;
-- recording a proven unrelated baseline failure while continuing unaffected
-  proof;
 - recording repository discoveries with the execution evidence.
 
 The expected file list is not a strict whitelist for adjacent private
@@ -155,8 +141,9 @@ Use this order:
 4. If private plumbing or test support is missing, add the smallest in-owner
    support and continue.
 5. If local repository setup is missing, provision it and rerun.
-6. If the failure is unrelated, prove that classification and continue all
-   unaffected work and checks.
+6. If the failure is outside the diff, diagnose and fix it at its owner. A
+   failure you did not cause is still yours; never spend effort proving it
+   predates the change.
 7. If a material change or unavailable external authority is required, finish
    unaffected work and return `BLOCKED`.
 8. Otherwise continue localization and diagnosis.
@@ -214,26 +201,16 @@ test. Do not silently drop features, assertions, negative flows, or consumers.
 
 ## Implementation and test integrity
 
-Follow `AGENTS.md` and the applicable language references. In particular:
+Follow the root and nested `AGENTS.md` files for the touched code. In
+particular:
 
 - preserve operation order, validation, transactions, concurrency,
   cancellation, side effects, errors, and invariants;
-- prefer existing concrete owners and repository patterns;
 - avoid speculative abstractions, dependencies, features, and cleanup;
 - execute behavioral scenarios through the Red-Green-Refactor loop defined in
-  [spec-driven development](spec-driven-development.md), one scenario at a
-  time;
-- map every test to an acceptance criterion;
-- preserve the repository's required rustdoc and struct-centered Rust style.
-- keep tenant SQL behind `TenantConn` or the explicitly authorized
-  `OperatorPool`; a `TenantConn` callee never commits or rolls back;
-- rely on Postgres RLS rather than duplicating tenant predicates on
-  tenant-scoped queries;
-- stage one audit event per evaluated permission decision on the process
-  Scribe outbox, and record engine transitions such as Forge's fenced
-  operator work as lineage, never audit;
-- resolve, screen, and pin user- or tenant-supplied URL destinations before
-  server-side fetches so DNS rebinding cannot bypass SSRF policy.
+  [spec-driven development](spec-driven-development.md#tdd-execution), one
+  scenario at a time;
+- map every test to an acceptance criterion.
 
 Never pass a check by:
 
@@ -252,8 +229,8 @@ is a material blocker.
 
 Run the smallest complete affected surface sequentially:
 
-1. each named narrow test or reproduction through its exact
-   `mise exec -- cargo nextest run ... -E 'test(=...)'` command;
+1. each named narrow test or reproduction through its exact command
+   ([named tests](../TESTING.md#named-tests));
 2. broader affected owner or package task;
 3. applicable integration, contract, codegen, typing, migration, docs, or
    boundary checks;
@@ -261,26 +238,12 @@ Run the smallest complete affected surface sequentially:
 5. `git diff --check`;
 6. final diff inspection.
 
-These focused commands support iteration. When the task selects `mise run gate`
-as its final aggregate, do not repeat its component `mise` lanes in the final
-verification checklist or run them again merely to duplicate the gate. Keep
-exact named-test commands required by the task and any proven lane outside the
-aggregate.
+Lane selection, the `gate` aggregate rule, feature selection, and sequential
+Cargo use are in [`TESTING.md`](../TESTING.md#which-lane-do-i-run).
 
-Use repository `mise run` tasks for module-, crate-, family-, environment-, and
-aggregate-level coverage after inspecting their implementation and setup. Use
-`mise exec --` with `cargo nextest run` for a specifically named Rust test,
-including its explicit package, target, features, and exact test expression.
-Run Cargo-backed work sequentially across agents sharing a target.
-
-Use default features unless the affected behavior explicitly requires optional
-features. Do not use `--all-features` for focused verification unless the
-affected behavior requires the full feature union. Broad feature-union gates
-belong to integrated verification.
-
-When a failure is proven unrelated, continue if it does not prevent required
-proof. If it prevents a mandatory acceptance outcome and no equivalent proof
-exists, return `BLOCKED` only after every unaffected item is complete.
+A red lane blocks completion whoever turned it red. If its fix needs a
+material change, return `BLOCKED` with the diagnosis after every unaffected
+item is complete.
 
 ## Final diff audit
 

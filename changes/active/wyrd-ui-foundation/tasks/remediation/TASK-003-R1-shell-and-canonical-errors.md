@@ -19,7 +19,7 @@ list. Preserve spec revision 6 and all authorization semantics.
 
 Use TASK-003's locked visual authority, product/mobile.svg M-01 and product
 render ledger's mobile navigation contract. Canonical error authority is
-crates/wyrd-spec/src/error.rs and architecture/references/languages/errors.md.
+crates/wyrd-spec/src/error.rs and agent_docs/errors.md.
 
 # Scope and decisions
 

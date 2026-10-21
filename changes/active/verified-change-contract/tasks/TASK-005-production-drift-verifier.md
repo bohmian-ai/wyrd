@@ -195,7 +195,7 @@ SQL, new result fields, backfill, or different insufficient-input semantics.
 - `changes/active/verified-change-contract/architecture/logic/drift.md`
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
 - `architecture/bifrost-design.md`
-- `architecture/references/domain/evaluation.md`
+- `.agents/skills/wyrd-advise/references/evaluation.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

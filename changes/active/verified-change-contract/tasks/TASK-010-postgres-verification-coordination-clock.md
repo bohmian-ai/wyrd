@@ -247,12 +247,11 @@ without introducing another durable clock or queue owner.
 
 - `changes/active/verified-change-contract/spec.md` revision 35
 - `AGENTS.md`
-- `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`
-- `architecture/references/languages/spec-driven-development.md`
-- `architecture/references/languages/implementation-execution.md`
-- `architecture/references/languages/testing-workflows.md`
-- `architecture/references/domain/analytical-operations-reliability.md`
+- `changes/spec-driven-development.md`
+- `changes/implementation-execution.md`
+- `TESTING.md`
+- `.agents/skills/wyrd-advise/references/analytical-operations-reliability.md`
 
 ## Implementation Evidence
 

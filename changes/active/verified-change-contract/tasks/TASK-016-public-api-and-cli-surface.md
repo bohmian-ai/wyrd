@@ -172,7 +172,7 @@ Production and owner proof only; TASK-017 owns all audited client-facing tests a
 - Rust SDK: `sdks/wyrd-sdk-rust/{Cargo.toml,src/lib.rs}`.
 - Python SDK production/package surface: `sdks/wyrd-sdk-python/{Cargo.toml,pyproject.toml,src/**,python/wyrd/**}` and the Rust-native authoring owners it already wraps under `crates/wyrd/wyrd-cards`, `crates/skald/**`, and existing configuration/runtime crates.
 - TypeScript SDK production/package surface: `sdks/wyrd-sdk-ts/{native/**,wyrd/src/**,wyrd/package.json}` plus generated declarations.
-- Architecture: `architecture/wyrd-design.md`, `architecture/wyrd-doctrine.mdx`, and the narrow REQ-201 correction in `architecture/bifrost-design.md`.
+- Architecture: `architecture/wyrd-design.md`, and the narrow REQ-201 correction in `architecture/bifrost-design.md`.
 - Manifests and `mise.toml` only where the Rust SDK CLI feature, packaged executables, generated declarations, or focused owner tests require registration.
 
 ## Dependency, Merge Order, and Bifrost Conflict Resolution
@@ -199,8 +199,8 @@ TASK-016 has no dependency on TASK-017. Merge TASK-016 first; TASK-017 then buil
 ## Authority Links
 
 - [Approved spec revision 64](../spec.md): REQ-188..206 except REQ-192/204; AC-045..058 except AC-048/057.
-- `AGENTS.md`; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`; `architecture/bifrost-design.md`.
-- `architecture/references/languages/spec-driven-development.md`; `architecture/references/languages/implementation-execution.md`; `architecture/references/languages/testing-workflows.md`.
+- `AGENTS.md`; `AGENTS.md`; `architecture/wyrd-design.md`; `architecture/wyrd-design.md`; `architecture/bifrost-design.md`.
+- `changes/spec-driven-development.md`; `changes/implementation-execution.md`; `TESTING.md`.
 - Python exception authority: `changes/active/py-error-refactor/spec.md`.
 
 ## Implementation Evidence

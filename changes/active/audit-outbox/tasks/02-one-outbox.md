@@ -108,7 +108,7 @@ A surface whose correctness requires the audit row to be atomic with its effect.
 
 ## Authority Links
 
-`changes/active/audit-outbox/spec.md`, `AGENTS.md` §2-§6.
+`changes/active/audit-outbox/spec.md`, `AGENTS.md`-§6.
 
 ## Implementation Evidence
 

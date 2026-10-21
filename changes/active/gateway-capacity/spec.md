@@ -290,8 +290,8 @@ and reservation/refusal policy require separate approval outside this packet.
 ## Authorities
 
 [AGENTS.md](../../../AGENTS.md),
-[agent rules](../../../architecture/agent-rules.md),
+[agent rules](../../../AGENTS.md),
 [Wyrd design](../../../architecture/wyrd-design.md),
-[doctrine](../../../architecture/wyrd-doctrine.mdx),
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md).
+[doctrine](../../../architecture/wyrd-design.md),
+[spec-driven development](../../../changes/spec-driven-development.md).
 No Bifrost ingest/storage contract change is authorized.

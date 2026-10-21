@@ -80,7 +80,7 @@ meaning, or another approved outcome.
 ## Authority Links
 
 - [Approved specification, revision 21](../spec.md).
-- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md).
+- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../AGENTS.md).
 - [Wyrd design](../../../../architecture/wyrd-design.md), [Bifrost design](../../../../architecture/bifrost-design.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md); implementation returns evidence, not independent task approval.
 

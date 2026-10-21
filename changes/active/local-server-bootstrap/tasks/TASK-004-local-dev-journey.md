@@ -165,8 +165,8 @@ the local command must add a new durable owner beyond those approved.
 ## Authority Links
 
 `changes/active/local-server-bootstrap/spec.md` revision 2;
-`AGENTS.md` §§2, 8, 9, 11; `architecture/wyrd-design.md`;
-`architecture/references/languages/testing-workflows.md`.
+`AGENTS.md`; `architecture/wyrd-design.md`;
+`TESTING.md`.
 
 ## Implementation Evidence — IMPLEMENTED
 

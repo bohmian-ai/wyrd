@@ -12,12 +12,12 @@ hand an approved specification to `$wyrd-plan`.
 
 ## Establish authority
 
-Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
-[Wyrd design](../../../architecture/wyrd-design.md), and
-[Wyrd doctrine](../../../architecture/wyrd-doctrine.mdx). Read
+Read `AGENTS.md` and the Doctrine section plus the owning sections of
+[Wyrd design](../../../architecture/wyrd-design.md). Read
 [Bifrost design](../../../architecture/bifrost-design.md) when the change touches
-Bifrost. Start at [the reference router](../../../architecture/references/README.md)
-and completely read only the applicable references. Follow CodeGraph
+Bifrost and the [security posture](../../../architecture/wyrd-security-posture.md)
+when it touches identity, authorization, tenancy, or audit. Read the nested
+`AGENTS.md` and `agent_docs/` guides that apply. Follow CodeGraph
 instructions before tracing repository behavior.
 
 Repository authority constrains the specification; implementation drift does

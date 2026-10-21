@@ -37,6 +37,6 @@ None. Explicit provider cache-resource management or a gateway-owned response ca
 
 ## Authority and revision
 
-- `AGENTS.md` §§9–11; `architecture/wyrd-security-posture.md`; `architecture/references/architecture/patterns.md`.
+- `AGENTS.md`; `architecture/wyrd-security-posture.md`; `architecture/wyrd-design.md`.
 - Provider grounding: [OpenAI](https://developers.openai.com/api/docs/guides/prompt-caching), [Anthropic](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), [Gemini](https://ai.google.dev/gemini-api/docs/generate-content/caching), [Vertex](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/context-cache/context-cache-overview), [DeepSeek](https://api-docs.deepseek.com/guides/kv_cache/).
 - Revision 1 — draft, 2026-09-25: provider-managed prompt caching and accurate accounting.

@@ -539,7 +539,7 @@ decisions without changing this specification:
 - [`architecture/wyrd-design.md`](../../../architecture/wyrd-design.md) —
   Source doctrine, Card identity, public surface alignment, and Vala-owned
   vendor read adapters.
-- [`architecture/wyrd-doctrine.mdx`](../../../architecture/wyrd-doctrine.mdx) —
+- [`architecture/wyrd-design.md`](../../../architecture/wyrd-design.md) —
   Wyrd nouns, service boundaries, and external-read posture.
 - [`architecture/bifrost-design.md`](../../../architecture/bifrost-design.md) —
   Oracle planning, query admission, resources, audit WAL, cuts, cancellation,
@@ -547,14 +547,14 @@ decisions without changing this specification:
 - [`architecture/wyrd-security-posture.md`](../../../architecture/wyrd-security-posture.md) —
   Source credential confinement, tenant authority, SSRF defense, and audit
   privacy.
-- [`architecture/references/domain/vala-architecture.md`](../../../architecture/references/domain/vala-architecture.md) —
+- [`.agents/skills/wyrd-advise/references/vala-architecture.md`](../../../.agents/skills/wyrd-advise/references/vala-architecture.md) —
   Vala Source and Bifrost ownership.
-- [`architecture/references/domain/olap-serving.md`](../../../architecture/references/domain/olap-serving.md) —
+- [`.agents/skills/wyrd-advise/references/olap-serving.md`](../../../.agents/skills/wyrd-advise/references/olap-serving.md) —
   tenant-safe analytical serving and fail-closed query behavior.
-- [`architecture/references/domain/datafusion.md`](../../../architecture/references/domain/datafusion.md) —
+- [`.agents/skills/wyrd-advise/references/datafusion.md`](../../../.agents/skills/wyrd-advise/references/datafusion.md) —
   provider authority, truthful pushdown, pinned dependency cone, and
   query-owned resources.
-- [`architecture/references/domain/arrow-analytical-interop.md`](../../../architecture/references/domain/arrow-analytical-interop.md) —
+- [`.agents/skills/wyrd-advise/references/arrow-analytical-interop.md`](../../../.agents/skills/wyrd-advise/references/arrow-analytical-interop.md) —
   schema fidelity, name-based field mapping, bounded batches, and foreign
   memory validation.
 - [Snowflake SQL API](https://docs.snowflake.com/en/developer-guide/sql-api/) —

@@ -87,8 +87,8 @@ produce the approved attributable result without new Wyrd behavior.
 - [Approved specification](../spec.md)
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
-- [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
-- [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+- [Wyrd doctrine](../../../../architecture/wyrd-design.md)
+- [Testing workflow](../../../../TESTING.md)
 
 ## MCP investigation slice evidence
 

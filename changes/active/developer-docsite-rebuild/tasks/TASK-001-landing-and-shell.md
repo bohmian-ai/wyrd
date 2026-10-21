@@ -150,7 +150,7 @@ landing needs to promise an unshipped Wyrd capability to be useful.
 - [Approved specification](../spec.md)
 - [Repository instructions](../../../../AGENTS.md)
 - [Design doctrine](../../../../architecture/wyrd-design.md)
-- [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+- [Testing workflow](../../../../TESTING.md)
 
 ## Implementation Evidence
 

@@ -1142,11 +1142,11 @@ platform/runtime pass or human visual acceptance is claimed by this edit.
   caller's explicit instruction to revise the spec and write that task; no
   implementation or review PASS is claimed.
 
-Authorities: `AGENTS.md`; `architecture/agent-rules.md`;
-`architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;
+Authorities: `AGENTS.md`; `AGENTS.md`;
+`architecture/wyrd-design.md`; `architecture/wyrd-design.md`;
 `architecture/bifrost-design.md`; `architecture/wyrd-security-posture.md`;
 `architecture/operations/deployment-and-release.md`;
-`architecture/references/languages/spec-driven-development.md`;
-`architecture/references/languages/testing-workflows.md`; repository `wyrd-ui`
+`changes/spec-driven-development.md`;
+`TESTING.md`; repository `wyrd-ui`
 guidance for styling. These are repository-relative authority paths, not copies
 of skill instructions.

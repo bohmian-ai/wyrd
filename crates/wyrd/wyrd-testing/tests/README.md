@@ -1,6 +1,6 @@
 # Bifrost user-journey tests
 
-This directory is the **tier-1** surface defined in `AGENTS.md` §11: a real SDK
+This directory is the **tier-1** surface defined in `AGENTS.md`: a real SDK
 driving a real server along a complete user or agent path, client → server →
 client, with no in-process engine fixtures.
 

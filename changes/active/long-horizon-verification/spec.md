@@ -1064,16 +1064,16 @@ pending-row, batching and capacity seams remain.
 | 21 | approved | Owner narrowed REQ-015/AC-009 to the verification runtime. They cover direct and background assertion-only `verify`/`submit` without groups, bursts, or a neighbor tenant, in the new opt-in `bench:verification:capacity`. Direct server overhead p99 < 1 ms is the only judged target, and the redundant p95 < 10 ms is dropped. Background latency is reported only. The per-execution profile measures overhead from HTTP arrival (direct) or claim (queued) less the union of Verifier block intervals. `wyrd_verification_{overhead,verifier,submit}_seconds` replace `wyrd_verification_engine_overhead_seconds` and its wait accounting. The Verifier claim loop becomes pull-based: it claims up to free capacity round-robin across tenants, wakes on submission commit, and keeps the poll as fallback. Owner explicitly approved this revision in chat. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
-[agent rules](../../../architecture/agent-rules.md),
+[agent rules](../../../AGENTS.md),
 [Wyrd design](../../../architecture/wyrd-design.md),
-[doctrine](../../../architecture/wyrd-doctrine.mdx),
+[doctrine](../../../architecture/wyrd-design.md),
 [Bifrost design](../../../architecture/bifrost-design.md),
-[reference router](../../../architecture/references/README.md),
-[evaluation](../../../architecture/references/domain/evaluation.md),
-[architecture patterns](../../../architecture/references/architecture/patterns.md),
-[analytical reliability](../../../architecture/references/domain/analytical-operations-reliability.md),
-[agent harness](../../../architecture/references/languages/agent-harness.md),
-[spec workflow](../../../architecture/references/languages/spec-driven-development.md).
+[reference router](../../../architecture/wyrd-design.md),
+[evaluation](../../../.agents/skills/wyrd-advise/references/evaluation.md),
+[architecture patterns](../../../architecture/wyrd-design.md),
+[analytical reliability](../../../.agents/skills/wyrd-advise/references/analytical-operations-reliability.md),
+[agent harness](../../../agent_docs/agent-surfaces.md),
+[spec workflow](../../../changes/spec-driven-development.md).
 Inputs: [owner decisions](owner-notes.md), [proposal](advise-proposal.md),
 [agreed architecture](architecture-diagram.html). The owner model recorded in revision 3 supersedes the earlier accumulation
 model in these inputs.

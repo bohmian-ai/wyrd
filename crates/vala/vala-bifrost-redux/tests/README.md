@@ -1,6 +1,6 @@
 # Bifrost redux integration topology
 
-This directory is the **tier-2** test surface defined in `AGENTS.md` §11: each
+This directory is the **tier-2** test surface defined in `AGENTS.md`: each
 test exercises one subsystem against its real dependency, without the full
 client → server → client journey.
 

@@ -92,4 +92,4 @@ current behavior.
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
-- [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+- [Testing workflow](../../../../TESTING.md)

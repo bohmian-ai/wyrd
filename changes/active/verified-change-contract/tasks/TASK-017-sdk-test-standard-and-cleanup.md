@@ -148,8 +148,8 @@ TASK-017 depends on TASK-016 and merges second. It writes tests against the exac
 - [Approved spec revision 65](../spec.md): REQ-192, REQ-204, AC-048, AC-057.
 - Authoritative inventory: `../review/sdk-test-audit/summary.md`, `rust.md`, `typescript.md`, `python-integration.md`, `python-unit.md`.
 - Ergonomic reference: `/home/thorrester/Documents/GitHub/opsml/py-opsml/tests/agent/test_promptcard.py`, its `conftest.py`, and `/home/thorrester/Documents/GitHub/opsml/py-opsml/python/opsml/cli/__init__.py` (read-only).
-- `AGENTS.md`; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`; `architecture/bifrost-design.md`.
-- `architecture/references/languages/spec-driven-development.md`; `architecture/references/languages/implementation-execution.md`; `architecture/references/languages/testing-workflows.md`.
+- `AGENTS.md`; `AGENTS.md`; `architecture/wyrd-design.md`; `architecture/wyrd-design.md`; `architecture/bifrost-design.md`.
+- `changes/spec-driven-development.md`; `changes/implementation-execution.md`; `TESTING.md`.
 
 ## Implementation Evidence
 

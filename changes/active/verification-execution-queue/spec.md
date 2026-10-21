@@ -453,17 +453,14 @@ No open material decisions. The owner approved revision 2 as a whole on
 - Revision 1 (2026-10-20): draft queue split and retention packet, one proposed task.
 - Revision 2 (2026-10-20): draft transactional admission, synchronous 422, uniform execution expiry and durable group watermark/baseline; approved by the owner.
 
-Repository authority: `AGENTS.md`, `architecture/agent-rules.md`,
-`architecture/wyrd-design.md` (Verifier, Trigger, Operator, Coordination clock),
-`architecture/wyrd-doctrine.mdx`, `architecture/bifrost-design.md` (verification
-tables, Durability and visibility, Public surface),
-`architecture/references/README.md`,
-`architecture/references/doctrine/architecture-constraints.md`,
-`architecture/references/architecture/patterns.md`,
-`architecture/references/domain/evaluation.md`,
-`architecture/references/domain/analytical-operations-reliability.md`, and
-`architecture/references/languages/` — `spec-driven-development.md`,
-`implementation-execution.md`, `testing-workflows.md`.
+Repository authority: `AGENTS.md`,
+`architecture/wyrd-design.md` (Doctrine, Verifier, Trigger, Operator,
+Coordination clock), `architecture/bifrost-design.md` (verification tables,
+Durability and visibility, Public surface),
+`.agents/skills/wyrd-advise/references/evaluation.md`,
+`.agents/skills/wyrd-advise/references/analytical-operations-reliability.md`,
+`changes/spec-driven-development.md`, `changes/implementation-execution.md`, and
+`TESTING.md`.
 
 Primary technical grounding (checked during drafting):
 [Stripe key replay and pruning](https://docs.stripe.com/api/idempotent_requests),

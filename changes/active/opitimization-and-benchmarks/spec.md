@@ -41,7 +41,7 @@ every later performance change.
 
 **Owner instruction.** Where the architecture and design documents
 (`architecture/*.md`, `architecture/bifrost-design.md`,
-`architecture/wyrd-design.md`, `architecture/wyrd-doctrine.mdx`) constrain this
+`architecture/wyrd-design.md`, `architecture/wyrd-design.md`) constrain this
 work, they do not bind this specification. They may be out of date. They
 describe how the system works today and are context only. This change does not
 edit them. Where an optimization departs from them, the departure is recorded

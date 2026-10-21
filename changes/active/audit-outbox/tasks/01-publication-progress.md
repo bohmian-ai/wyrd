@@ -83,7 +83,7 @@ new state.
 
 ## Authority Links
 
-`changes/active/audit-outbox/spec.md`, `AGENTS.md` §2,
+`changes/active/audit-outbox/spec.md`, `AGENTS.md`,
 `architecture/bifrost-design.md`.
 
 ## Implementation Evidence

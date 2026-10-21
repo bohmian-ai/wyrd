@@ -258,7 +258,11 @@ impl ListenerStallProxy {
         };
         let (client_read, client_write) = inbound.into_split();
         let (server_read, server_write) = outbound.into_split();
-        let downstream = tokio::spawn(Self::downstream(server_read, client_write, Arc::clone(&link)));
+        let downstream = tokio::spawn(Self::downstream(
+            server_read,
+            client_write,
+            Arc::clone(&link),
+        ));
         Self::upstream(client_read, server_write, &shared, &link).await;
         link.client_open.store(false, Ordering::SeqCst);
         downstream.abort();

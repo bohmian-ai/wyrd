@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-docsite-incremental-reset
-spec_revision: 2
+spec_revision: 7
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, INV-001, INV-002, INV-003, INV-004, INV-005, AC-001, AC-002, AC-003, AC-006]
 depends_on: [TASK-001]
 parent_task:
@@ -14,8 +14,8 @@ remediates: []
 
 Introduction → Setup → Quickstart is a complete, short learning path: understand
 Wyrd, start it once, and run the proven YAML/Python example. The pages
-teach the actual released workflow established by TASK-001, with complete code
-and visible results rather than excerpts from an application.
+teach the actual released workflow established by TASK-001 after TASK-005
+ships, with complete code and visible results rather than application excerpts.
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
@@ -41,7 +41,7 @@ model gateway, app server, or later guide is included.
    PostgreSQL, saved connection confirmation, and accurate stop/persistence/
    reset guidance. Clearly distinguish the persistent server terminal from
    the terminal running snippets.
-4. Replace Quickstart with both files shown completely, the command to run
+4. Show both YAML files and the complete Python script, the command to run
    Python, expected pass/fail output, and the meaningful refusal/recovery
    explanation. Explain YAML's reusable declarations and the supplied-evidence
    boundary without requiring users to learn a full application.
@@ -126,7 +126,7 @@ within the approved experience is implementation-owned.
 
 ## Authority Links
 
-- [Approved spec revision 2](../spec.md) and [executable prerequisite](TASK-001-minimal-local-verification.md)
+- [Approved spec revision 7](../spec.md) and [executable prerequisite](TASK-001-minimal-local-verification.md)
 - [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)

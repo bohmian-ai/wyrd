@@ -708,6 +708,21 @@ export declare class NativeWyrdClient {
    */
   cards(): Promise<NativeCardsConnection>
   /**
+   * Declares one Card file and resolves to the ready state of its graph,
+   * as `WyrdState::declare_with` does, with every call run as this client.
+   *
+   * # Arguments
+   *
+   * * `path` - The root Service Card file.
+   * * `bundle_dir` - A caller-owned directory the bundle is published to
+   *   and kept in; omitted, the bundle stays private to the state.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
+   */
+  declareWyrdState(path: string, bundleDir?: string | undefined | null): Promise<NativeWyrdStateDeclaration>
+  /**
    * Loads and validates one Card bundle whose server calls run as this
    * client.
    *
@@ -879,14 +894,6 @@ export declare class NativeWyrdState {
    * Returns a napi error only when the reference cannot be serialized.
    */
   cardRef(alias: string): NativeLifecycleResult
-  /**
-   * Returns the verified local artifacts for an alias.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the artifact list cannot be serialized.
-   */
-  artifacts(alias: string): NativeLifecycleResult
   /**
    * Returns the stored envelope of the Verifier Card an alias names.
    *
@@ -1254,6 +1261,17 @@ export interface NativeWyrdError {
   errorRemediation: string
   /** Serialized JSON-safe structured details, when present. */
   errorDetailsJson?: string
+}
+
+/**
+ * Closed result of declaring one Card file into a state: the ready state or
+ * a catalog error.
+ */
+export interface NativeWyrdStateDeclaration {
+  /** Ready state when the declaration, pull, and load succeeded. */
+  state?: NativeWyrdState
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
 }
 
 /**

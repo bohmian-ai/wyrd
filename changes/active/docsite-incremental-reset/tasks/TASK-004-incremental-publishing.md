@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-docsite-incremental-reset
-spec_revision: 2
+spec_revision: 7
 requirements: [REQ-004, REQ-006, INV-001, INV-002, INV-003, INV-004, INV-005, AC-003, AC-006, AC-007]
 depends_on: [TASK-003]
 parent_task:
@@ -135,9 +135,9 @@ selector and any Python test/task support; SDK Python edits also run
 Do not install released artifacts on every credential-free docs unit run.
 TASK-001/002 retain distinct acquisition proof. Integrated change review owns
 the final aggregate required by AGENTS.md for shared CI/build/test changes;
-it does not become a fifth implementation task or a repeated task-level gate.
+it does not become an additional implementation task or a repeated task-level gate.
 
-### Obligation ownership across the four tasks
+### Obligation ownership across the task packet
 
 | Spec obligation | Owning task(s) | Proof |
 |---|---|---|
@@ -147,8 +147,9 @@ it does not become a fifth implementation task or a repeated task-level gate.
 | REQ-004, AC-003 | TASK-001 sample; TASK-002 embedding; TASK-003 site independence; TASK-004 CI | Same local source executed and displayed, build without application dependency, scoped CI proof |
 | REQ-005, AC-004 | TASK-003 | Omitted-page fixture, production routes/links/nav/search/indexes |
 | REQ-006, AC-007 | TASK-004 | Guidance, source-trigger closure, supersession metadata; deferred outcomes only |
+| REQ-007, AC-008 | TASK-005 capability; TASK-001/002 released follow-through | Three SDK journeys, temporary/persistent lifetime proof, offline/artifact regression |
 | INV-001, AC-006 | TASK-002/003; TASK-004 preserves checks | Existing site, both themes/responsive/keyboard review, docs gate |
-| INV-002, INV-003 | All tasks | No product semantics/contract change; vocabulary, auth, identities and audit reviewed |
+| INV-002, INV-003 | All tasks | Only the approved REQ-007 ergonomic extension; vocabulary, auth, identities and audit preserved |
 | INV-004 | All tasks | Existing checks retained; generated sources regenerated, not hand-edited |
 | INV-005 | All tasks | First three-page rewrite only; no later-guide/all-language/SaaS/template/CLI-selection expansion |
 
@@ -161,7 +162,7 @@ the current selector's source classification are implementation-owned.
 
 ## Authority Links
 
-- [Approved spec revision 2](../spec.md)
+- [Approved spec revision 7](../spec.md)
 - [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)

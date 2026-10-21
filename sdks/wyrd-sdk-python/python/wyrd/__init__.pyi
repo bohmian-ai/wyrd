@@ -20,7 +20,7 @@ from .prompt import (
     ProviderResponse,
     ResponseFormat,
 )
-from .state import CardEnvelope, HydratedArtifact, WyrdState
+from .state import CardEnvelope, WyrdState
 
 __all__ = [
     "AgentCard",
@@ -51,7 +51,6 @@ __all__ = [
     "ToolError",
     "WyrdError",
     "CardEnvelope",
-    "HydratedArtifact",
     "WyrdState",
     "WyrdClient",
     "cards",

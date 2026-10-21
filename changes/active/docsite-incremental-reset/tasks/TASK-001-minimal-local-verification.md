@@ -3,12 +3,23 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-docsite-incremental-reset
-spec_revision: 3
+spec_revision: 7
 requirements: [REQ-002, REQ-003, REQ-004, INV-002, INV-003, INV-004, INV-005, AC-002, AC-003]
-depends_on: []
+depends_on: [TASK-005]
 parent_task:
 remediates: []
 ---
+
+## Revision 7 scope update
+
+[TASK-005](TASK-005-declare-ready-state.md) owns the new shared
+`WyrdState.declare` capability and switches the existing sample to it. This task
+then revalidates the released first journey. Earlier execution evidence below
+is historical proof of the manual declare/pull/load flow, not proof that the
+new API exists or has shipped. Staging is deleted before return; required runtime backing files have a
+separate state-owned lifetime. Explicit `bundle_dir` retains a caller-owned
+inspectable bundle. Existing release/startup blockers
+remain recorded and must not be hidden.
 
 ## Outcome and Value
 
@@ -28,9 +39,10 @@ prerequisites or require a separate deployment script.
 
 The existing CLI owns installation, startup, saved credentials, and connection
 settings. Existing Cards, WyrdState, and observation APIs own declaration,
-hydration, and verification. No new SDK convenience API, server feature,
-transport, credential bypass, custom analytical table, or application runtime
-is authorized. PostgreSQL and the running server remain explicit prerequisites.
+hydration, and verification. TASK-005 owns the approved SDK constructor;
+this task adds no further SDK/server feature, transport, credential bypass,
+custom analytical table, or application runtime. PostgreSQL and the running
+server remain explicit prerequisites.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
@@ -49,8 +61,8 @@ location and private test support remain implementation-owned.
 2. Exercise the proposed clean-install startup, connection, stop/restart,
    persistence, and reset instructions against released artifacts with an
    isolated local configuration. Do not touch a developer's existing database.
-3. Build the two-file example through the ordered scenarios below, reusing
-   existing public SDK behavior and the Python real-server harness.
+3. Validate the three-file example using TASK-005's constructor and the ordered
+   scenarios below, reusing the Python real-server harness.
 4. Record exact invocation, expected output, meaningful errors and recovery,
    and the distinction between supplied evidence and measured application
    behavior for TASK-002. Preserve useful application regression coverage.
@@ -184,14 +196,14 @@ journey aggregate belongs in this task.
 
 - No compatible released set supports the exact journey: finish unaffected
   proof and report a publication blocker; do not substitute source builds.
-- The two-file experience needs SDK/server semantics, new contracts, relaxed
+- The sample needs SDK/server semantics beyond TASK-005, new contracts, relaxed
   permissions, or a new lifecycle owner: report the precise gap for authority.
 - Avoiding an unsupported claim would require changing the agreed tutorial
   outcome rather than correcting its explanation.
 
 ## Authority Links
 
-- [Approved spec revision 2](../spec.md)
+- [Approved spec revision 7](../spec.md)
 - [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)

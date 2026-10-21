@@ -1,11 +1,7 @@
-from wyrd import Cards, WyrdState
+from wyrd import WyrdState
 
-# Declare the Service and the Verifier it references, then pull both into a local bundle.
-cards = Cards()
-receipt = cards.declare_from_path("support-reply.yaml")
-cards.pull(receipt.root, ".wyrd-bundle")
-
-state = WyrdState.from_path(".wyrd-bundle")
+# Declare the Service and the Verifier it references, and get a ready state.
+state = WyrdState.declare("support-reply.yaml")
 run = state.run()
 
 for reply in ({"refund": 40}, {"refund": 250}):

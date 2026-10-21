@@ -1147,20 +1147,13 @@ run = [
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
-# Bifrost detects the node memory limit from cgroups or /proc/meminfo, both of
-# which are Linux-only. On macOS that probe has no source and the server refuses
-# to start rather than guess, so supply the limit here from `hw.memsize`. Linux
-# leaves the variable unset and keeps the real detection path.
-run = [
-  "cargo build -p wyrd-server",
-  """
-  if [ -z "${WYRD_BIFROST_MEMORY_LIMIT_BYTES:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
-    WYRD_BIFROST_MEMORY_LIMIT_BYTES="$(sysctl -n hw.memsize)"
-    export WYRD_BIFROST_MEMORY_LIMIT_BYTES
-  fi
-  scripts/postgres/dev-server.sh
-  """,
-]
+run = ["cargo build -p wyrd-server", "scripts/postgres/dev-server.sh"]
+
+[tasks.quickstart]
+description = "Run the docsite Quickstart twice against a fresh local server"
+depends = ["py:setup"]
+env = { WYRD_LOG = "error" }
+run = "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python pytest -s -m integration tests/integration/test_docsite_quickstart.py"
 
 [tasks."cli:init"]
 description = "Establish this deployment's platform administrative root and print its credential once"

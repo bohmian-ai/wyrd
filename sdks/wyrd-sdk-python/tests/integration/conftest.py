@@ -281,6 +281,14 @@ def serving(delay: float = 0.0) -> Iterator[Receiver]:
         server.shutdown()
 
 
+@pytest.fixture
+def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An empty ``TMPDIR``, where a declared ``WyrdState``'s private files land."""
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    return tmp_path / "tmp"
+
+
 @pytest.fixture(scope="session")
 def receiver() -> Iterator[Receiver]:
     """Serve the session's model provider and Operator hook endpoint."""

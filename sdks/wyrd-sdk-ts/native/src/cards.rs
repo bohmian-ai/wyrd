@@ -4,7 +4,7 @@
 //! strings into Wyrd types and projects results through
 //! [`NativeLifecycleResult`], so failures keep their catalog metadata.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 
 use napi::Env;
@@ -13,7 +13,7 @@ use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, ListCardsRequest};
 use wyrd_client::observe::Run;
-use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
+use wyrd_client::state::{DeclareOptions, TelemetryFlushFailure, WyrdState};
 use wyrd_client::verify::Submission;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
@@ -38,6 +38,16 @@ pub struct NativeCards {
 pub struct NativeCardsConnection {
     /// Connected handle when the connection succeeded.
     pub handle: Option<NativeCards>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
+/// Closed result of declaring one Card file into a state: the ready state or
+/// a catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeWyrdStateDeclaration {
+    /// Ready state when the declaration, pull, and load succeeded.
+    pub state: Option<NativeWyrdState>,
     /// Catalog failure otherwise.
     pub error: Option<NativeWyrdError>,
 }
@@ -71,6 +81,45 @@ impl NativeWyrdClient {
                     error: Some(NativeWyrdError::from_wyrd(&error)),
                 },
             })
+        })
+    }
+
+    /// Declares one Card file and resolves to the ready state of its graph,
+    /// as `WyrdState::declare_with` does, with every call run as this client.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The root Service Card file.
+    /// * `bundle_dir` - A caller-owned directory the bundle is published to
+    ///   and kept in; omitted, the bundle stays private to the state.
+    ///
+    /// # Errors
+    ///
+    /// Never returns a napi error; failures are carried in the result.
+    #[napi]
+    pub fn declare_wyrd_state<'env>(
+        &self,
+        env: &'env Env,
+        path: String,
+        bundle_dir: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeWyrdStateDeclaration>> {
+        let options = DeclareOptions {
+            client: Some(self.client.clone()),
+            bundle_dir: bundle_dir.map(PathBuf::from),
+        };
+        crate::trace::spawn(env, async move {
+            Ok(
+                match Box::pin(WyrdState::declare_with(path, options)).await {
+                    Ok(state) => NativeWyrdStateDeclaration {
+                        state: Some(NativeWyrdState { state: Ok(state) }),
+                        error: None,
+                    },
+                    Err(error) => NativeWyrdStateDeclaration {
+                        state: None,
+                        error: Some(NativeWyrdError::from_wyrd(&error)),
+                    },
+                },
+            )
         })
     }
 
@@ -376,33 +425,6 @@ impl NativeWyrdState {
     #[napi]
     pub fn card_ref(&self, alias: String) -> Result<NativeLifecycleResult> {
         let result = self.read(|state| NativeLifecycleResult::outcome(state.card_ref(&alias)));
-        drop(alias);
-        result
-    }
-
-    /// Returns the verified local artifacts for an alias.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only when the artifact list cannot be serialized.
-    #[napi]
-    pub fn artifacts(&self, alias: String) -> Result<NativeLifecycleResult> {
-        let result = self.read(|state| {
-            NativeLifecycleResult::outcome(state.artifacts(&alias).map(|artifacts| {
-                artifacts
-                    .iter()
-                    .map(|artifact| {
-                        serde_json::json!({
-                            "relative_path": artifact.relative_path(),
-                            "local_path": artifact.local_path(),
-                            "sha256": artifact.sha256(),
-                            "size_bytes": artifact.size_bytes(),
-                            "content_type": artifact.content_type(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            }))
-        });
         drop(alias);
         result
     }

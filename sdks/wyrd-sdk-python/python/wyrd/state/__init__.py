@@ -1,13 +1,12 @@
-"""Offline, fully hydrated Wyrd Card graph and typed holder access.
+"""Fully hydrated Wyrd Card graph and typed holder access.
 
-Load a complete local Service bundle with no registry or network access.
-WyrdState creates one persistent typed holder for each exact Card and shares it
-across every friendly alias. Typed accessors expose those holders by alias;
-artifact descriptors expose confined local paths and integrity metadata, but
-never read payload bytes until the caller explicitly opens a path.
+Declare an authored Card file with ``WyrdState.declare``, or load a complete
+local Service bundle with no registry or network access with
+``WyrdState.from_path``. WyrdState creates one persistent typed holder for each
+exact Card and shares it across every friendly alias.
 """
 
-from .._wyrd.state import CardEnvelope, HydratedArtifact, WyrdState
+from .._wyrd.state import CardEnvelope, WyrdState
 from ._hydrated import HydratedCard
 
-__all__ = ["CardEnvelope", "HydratedArtifact", "HydratedCard", "WyrdState"]
+__all__ = ["CardEnvelope", "HydratedCard", "WyrdState"]

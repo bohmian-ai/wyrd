@@ -321,7 +321,9 @@ exchange that client requires before returning, while a supplied bearer or a
 fresh cached token makes no request and no health probe is added. A handle
 retains that one client, with its renewable token cache, for its lifetime.
 Local loaders (`from_path` / `from_path_with`) are not connected handles and
-stay lazy. Bifrost lists the caller's tables with `list_tables` /
+stay lazy and offline. `WyrdState.declare` is the online constructor: with one
+client it declares a Card file, pulls the declared graph, and returns a ready
+state that keeps no files unless the caller names a bundle directory. Bifrost lists the caller's tables with `list_tables` /
 `listTables`, which returns compact entries, and describes one table's schema
 on demand.
 

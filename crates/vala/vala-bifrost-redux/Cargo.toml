@@ -71,6 +71,7 @@ datafusion-proto = { workspace = true }
 object_store = { workspace = true }
 crc32c = { workspace = true }
 rustix = { workspace = true }
+sysinfo = { workspace = true }
 blake3 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }

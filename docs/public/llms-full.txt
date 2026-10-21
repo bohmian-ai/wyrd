@@ -21,7 +21,25 @@ Your agent, model, or service needs to behave correctly, both before you ship a 
 
 ## An example
 
-A support agent must never promise a guaranteed refund. This Verifier states that requirement, and its check is an assertion:
+A support agent must never promise a guaranteed refund. The Service describes the agent and binds a Verifier, which states that requirement as an assertion:
+
+**support-reply.yaml**
+
+```yaml title="support-reply.yaml"
+# The subject: your support agent's Service, verified by no-refund-promise.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-reply
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./no-refund-promise.yaml
+
+```
+
+**no-refund-promise.yaml**
 
 ```yaml title="no-refund-promise.yaml"
 # The Verifier: a support answer never promises a guaranteed refund.
@@ -45,7 +63,7 @@ spec:
 
 ```
 
-A second file, `support-reply.yaml`, describes the agent's Service and binds this Verifier to it. This program declares both and verifies two answers:
+This program declares both and verifies two answers:
 
 **Python**
 
@@ -133,7 +151,7 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy: see [Author a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/).
+In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
 
 ## How it fits your system
 
@@ -472,7 +490,7 @@ Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_
 
 ## Size the worker pool
 
-`wyrd-server` runs Python in workers it starts from its own binary; no setting is needed. Each process has its own pool.
+`wyrd-server` runs Python in workers it starts from its own binary; there is nothing to install or configure. Each process has its own pool, and a process that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready.
 
 - To run more Python at once, raise `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` and `WYRD_VERIFICATION_MONTY_MAX_WORKERS` together.
 - To give each operation more memory, raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB` with `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, which must exceed it by at least 4 MiB.
@@ -484,7 +502,7 @@ Settings are read at startup; restart to apply a change.
 
 | You see | Fix |
 | --- | --- |
-| `hosted Verifier blocks could not start` | Python workers could not start. Unset `WYRD_VERIFICATION_MONTY_WORKER` or point it at a `wyrd-server` binary |
+| `hosted Verifier blocks could not start` | The first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` Python workers could not start, so the server refused to start; the rest of the message names the cause |
 | `environment variable WYRD_VERIFICATION_... could not be parsed` | Set a positive integer |
 | Two variable names in a startup error | Fix the pair; see [startup rules](/wyrd/reference/verification-runtime-limits/#startup-rules) |
 | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` from `verify` | The process has verification off or no free worker; retry or route to another process |
@@ -765,9 +783,9 @@ Inside a running service, `run.observe.*` writes rows tied to the run and the ex
 
 ## Written versus queryable
 
-A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read recent unpublished rows on a best-effort basis, so a row written seconds ago may not appear yet.
+A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read the recent unpublished rows each Scribe still holds, and a row published while the query runs is returned exactly once.
 
-Every query ends with a status: `success`, `degraded` when recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/wyrd/api/errors/).
+Every query ends with a status: `success`, `degraded` when an unreachable Scribe's recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/wyrd/api/errors/).
 
 ## Next
 
@@ -1267,7 +1285,6 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | Variable | Default | Bounds |
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers: `1` or `0`. Also `[verification] enabled` in TOML |
-| `WYRD_VERIFICATION_MONTY_WORKER` | the running `wyrd-server` | Executable the pool starts as `<path> subprocess` for each Python worker |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
 | `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
 | `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |

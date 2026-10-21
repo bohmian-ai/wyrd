@@ -194,15 +194,15 @@ the dependent slot-sources draft and its group-source decision remain separate.
 ## Authority and revision history
 
 Authorities: [AGENTS.md](../../../AGENTS.md) §§2–3, 9, 11, 14;
-[agent rules](../../../architecture/agent-rules.md);
+[agent rules](../../../AGENTS.md);
 [Wyrd design](../../../architecture/wyrd-design.md) §§Doctrine, Verifier,
 Trigger, Registry lifecycle, Reference forms;
-[doctrine](../../../architecture/wyrd-doctrine.mdx); and the routed references
-[evaluation](../../../architecture/references/domain/evaluation.md),
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-[testing workflows](../../../architecture/references/languages/testing-workflows.md),
-[errors](../../../architecture/references/languages/errors.md), and
-[agent harness](../../../architecture/references/languages/agent-harness.md).
+[doctrine](../../../architecture/wyrd-design.md); and the routed references
+[evaluation](../../../.agents/skills/wyrd-advise/references/evaluation.md),
+[spec-driven development](../../../changes/spec-driven-development.md),
+[testing workflows](../../../TESTING.md),
+[errors](../../../agent_docs/errors.md), and
+[agent harness](../../../agent_docs/agent-surfaces.md).
 The implementation must reflect the additive media pin and digest contract in
 the owning architecture/reference inventory; scheduled authority changes await
 OPEN-001. This draft grants no approval or implementation authority.

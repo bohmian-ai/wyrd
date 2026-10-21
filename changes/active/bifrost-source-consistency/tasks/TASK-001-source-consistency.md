@@ -402,9 +402,9 @@ fresh correctness/capacity evidence; it does not reopen or close PR #189.
 
 - [Specification revision 1](../spec.md).
 - [Original long-horizon specification revision 21](../../long-horizon-verification/spec.md), with this change's approved supersession limited to the named publication/performance obligations.
-- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md).
+- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../AGENTS.md).
 - [Bifrost design](../../../../architecture/bifrost-design.md), [Wyrd design](../../../../architecture/wyrd-design.md).
-- [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+- [Spec-driven development](../../../../changes/spec-driven-development.md), [implementation execution](../../../../changes/implementation-execution.md), [testing workflows](../../../../TESTING.md).
 
 ## Implementation Evidence
 

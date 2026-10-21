@@ -288,8 +288,8 @@ and product prose accordingly, preserving historical evidence and that packet.
 | 2 | approved | Replace the per-query fresh cut read and validation read with the notification cut cache validated by Scribe-reported per-node publication revisions (INV-008). Directed by the maintainer on 2026-10-21 after capacity runs showed the revision 1 read path regressing hot selective latency and throughput. |
 | 1 | superseded | Reliable source acquisition and scoped deletion; clarified for maintainer review and execution from merged main in a new worktree. PR #189's merge changes delivery context only, not behavior, scope, targets or proof. Explicitly approved by the maintainer on 2026-10-21. |
 
-- [Repository standards](../../../AGENTS.md), [agent rules](../../../architecture/agent-rules.md).
+- [Repository standards](../../../AGENTS.md), [agent rules](../../../AGENTS.md).
 - [Wyrd design](../../../architecture/wyrd-design.md), [Bifrost design](../../../architecture/bifrost-design.md).
-- [OLAP serving](../../../architecture/references/domain/olap-serving.md), [analytical reliability](../../../architecture/references/domain/analytical-operations-reliability.md).
-- [Spec-driven development](../../../architecture/references/languages/spec-driven-development.md).
+- [OLAP serving](../../../.agents/skills/wyrd-advise/references/olap-serving.md), [analytical reliability](../../../.agents/skills/wyrd-advise/references/analytical-operations-reliability.md).
+- [Spec-driven development](../../../changes/spec-driven-development.md).
 - [Capacity tasks](../../../mise.toml): `bench:verification:capacity`, `bench:bifrost:write-capacity`, `bench:bifrost:query-capacity`.

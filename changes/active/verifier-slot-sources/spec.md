@@ -229,11 +229,11 @@ No open material decisions remain.
 ## Authority and history
 
 Authorities: [AGENTS.md](../../../AGENTS.md) §§2–3, 9, 11, 14;
-[agent rules](../../../architecture/agent-rules.md);
+[agent rules](../../../AGENTS.md);
 [Wyrd design](../../../architecture/wyrd-design.md);
-[doctrine](../../../architecture/wyrd-doctrine.mdx);
+[doctrine](../../../architecture/wyrd-design.md);
 [Bifrost design](../../../architecture/bifrost-design.md);
-[reference router](../../../architecture/references/README.md), including
+[reference router](../../../architecture/wyrd-design.md), including
 evaluation, drift, OLAP serving, agent harness, testing and spec workflow.
 Related drafts: [pinned Artifact](../verifier-pinned-artifact/spec.md) and
 [long-horizon verification](../long-horizon-verification/spec.md), especially

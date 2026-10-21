@@ -154,6 +154,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await

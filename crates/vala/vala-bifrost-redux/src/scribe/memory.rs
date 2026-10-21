@@ -296,6 +296,39 @@ impl ScribeRejectionCeiling {
     }
 }
 
+/// Accounting owner shared by every physical holder of one generation's Arrow
+/// allocations.
+///
+/// A writable bucket creates it, and its frozen generation, every live capture
+/// of either, and every projected read opened from those captures hold the
+/// same `Arc`. While the generation is in memory its bytes stay in the shard's
+/// [`ScribeOwnership`] ledger and this owner is empty. Retirement moves the
+/// generation's exact root-backed bytes in here with
+/// [`ScribeOwnership::detach_immutable`] instead of returning them, so they stay
+/// charged to the shared Scribe root until the last holder drops and the lease's
+/// own drop returns them exactly once. A generation nothing else holds returns
+/// its bytes when retirement drops the generation, as before.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedArrowCharge {
+    /// Root-backed bytes of the retired generation, set once at retirement.
+    retired: std::sync::OnceLock<crate::resources::ScribeMemoryLease>,
+}
+
+impl RetainedArrowCharge {
+    /// Moves the retiring generation's detached `lease` into this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when this owner already holds a
+    /// retired lease; a generation retires once. The rejected lease is dropped
+    /// and so returns its bytes.
+    pub(crate) fn hold(&self, lease: crate::resources::ScribeMemoryLease) -> Result<(), ScribeError> {
+        self.retired.set(lease).map_err(|_| ScribeError::Internal {
+            detail: "retired Arrow charge was already held".to_owned(),
+        })
+    }
+}
+
 /// Shared active/immutable ownership ledger for shard-owned Arrow buffers.
 #[derive(Debug, Clone)]
 pub struct ScribeOwnership {
@@ -590,6 +623,33 @@ impl ScribeOwnership {
             })?;
         immutable.resize_ingress(target)?;
         Ok(())
+    }
+
+    /// Detaches a retiring generation's exact immutable bytes as a standalone
+    /// root-backed lease.
+    ///
+    /// The split is net-zero at the root: the bytes leave this ledger but stay
+    /// charged as Immutable to the shared Scribe and Bifrost pools, so growth
+    /// past the cap is still refused while any holder of the generation's
+    /// Arrow remains. Retirement hands the lease to the generation's
+    /// [`RetainedArrowCharge`]; dropping it returns the bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable ledger lock is
+    /// poisoned or the ledger cannot cover `bytes`; nothing is detached then.
+    pub(crate) fn detach_immutable(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        immutable
+            .split(bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })
     }
 
     /// Check immutable ledger ownership before explicit retirement mutates it.

@@ -402,11 +402,24 @@ pub struct HotBatch {
 pub struct LiveTailBatches {
     /// Memory batches in capture order, not yet filtered.
     memtable: Vec<HotBatch>,
+    /// Accounting owners of `memtable`'s Arrow buffers, shared with the
+    /// retained capture so retirement cannot uncharge them while this read
+    /// holds them.
+    charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
     /// Staged run paths in merge order.
     runs: Vec<PathBuf>,
     /// Lease keeping `runs` on disk, shared with the retained capture.
     staged: Option<Arc<StagedSourceLease>>,
 }
+
+/// The parts of one [`LiveTailBatches`]: memory batches, their accounting
+/// owners, staged run paths, and the lease keeping those runs on disk.
+pub(crate) type LiveTailParts = (
+    Vec<HotBatch>,
+    Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    Vec<PathBuf>,
+    Option<Arc<StagedSourceLease>>,
+);
 
 impl LiveTailBatches {
     /// Wraps an already captured memtable snapshot with no staged members.
@@ -416,20 +429,22 @@ impl LiveTailBatches {
     pub fn from_snapshot(memtable: Vec<HotBatch>) -> Self {
         Self {
             memtable,
+            charges: Vec::new(),
             runs: Vec::new(),
             staged: None,
         }
     }
 
-    /// Splits the read into its memory batches, its staged run paths in merge
-    /// order, and the lease keeping those runs on disk.
+    /// Splits the read into its memory batches, their accounting owners, its
+    /// staged run paths in merge order, and the lease keeping those runs on
+    /// disk.
     ///
-    /// The caller must hold the lease for as long as it reads any run path.
+    /// The caller must hold the charges for as long as any memory batch or a
+    /// projection of one lives, and the lease for as long as it reads any run
+    /// path.
     #[must_use]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (Vec<HotBatch>, Vec<PathBuf>, Option<Arc<StagedSourceLease>>) {
-        (self.memtable, self.runs, self.staged)
+    pub(crate) fn into_parts(self) -> LiveTailParts {
+        (self.memtable, self.charges, self.runs, self.staged)
     }
 }
 
@@ -472,8 +487,20 @@ pub(crate) struct RetainedCapture {
     binding: TenantTableBinding,
     /// The captured sources.
     capture: crate::scribe::memtable::LiveCapture,
-    /// Expiry timer, aborted when the capture is released first.
-    expiry: tokio::task::AbortHandle,
+    /// The query's monotonic deadline, the end of the capture's authority: no
+    /// read opens it at or after this instant, whether or not its expiry timer
+    /// has run yet.
+    deadline: tokio::time::Instant,
+    /// Expiry timer, armed only after the capture is in the table and aborted
+    /// when the capture is released first; empty while it is being armed.
+    expiry: std::sync::OnceLock<tokio::task::AbortHandle>,
+}
+
+impl RetainedCapture {
+    /// Reports whether the capture's authority has ended at `now`.
+    fn elapsed_at(&self, now: tokio::time::Instant) -> bool {
+        now >= self.deadline
+    }
 }
 
 /// Captures retained by one Scribe, shared by every tail service it builds.
@@ -800,8 +827,18 @@ impl FetchLiveTailService {
 
     /// Retains `capture` for `query_id` until release or `deadline`.
     ///
+    /// Registration and expiry are one ordered lifecycle: the capture is
+    /// installed first, then refused and removed if `deadline` has already
+    /// passed, and only then is its expiry timer armed. The timer therefore
+    /// always finds the entry unless a release removed it first, so no capture
+    /// can outlive its deadline because its only remover ran before it was
+    /// installed. Its identity is returned only for a capture whose authority
+    /// is still live.
+    ///
     /// # Errors
-    /// Returns [`TailReadError::State`] when the capture table is poisoned.
+    /// Returns [`TailReadError::DeadlineElapsed`] when `deadline` has passed,
+    /// retaining nothing, and [`TailReadError::State`] when the capture table
+    /// is poisoned. The capture is dropped on either error.
     fn retain(
         &self,
         query_id: uuid::Uuid,
@@ -810,6 +847,19 @@ impl FetchLiveTailService {
         deadline: tokio::time::Instant,
     ) -> Result<uuid::Uuid, TailReadError> {
         let capture_id = uuid::Uuid::new_v4();
+        let retained = Arc::new(RetainedCapture {
+            query_id,
+            binding,
+            capture,
+            deadline,
+            expiry: std::sync::OnceLock::new(),
+        });
+        self.captures.insert(capture_id, Arc::clone(&retained))?;
+        if retained.elapsed_at(tokio::time::Instant::now()) {
+            let elapsed = self.captures.remove(capture_id, |_| true)?;
+            drop(elapsed);
+            return Err(TailReadError::DeadlineElapsed);
+        }
         let captures = Arc::clone(&self.captures);
         let expiry = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
@@ -818,15 +868,10 @@ impl FetchLiveTailService {
             tracing::debug!(%capture_id, "live capture expired");
         })
         .abort_handle();
-        self.captures.insert(
-            capture_id,
-            Arc::new(RetainedCapture {
-                query_id,
-                binding,
-                capture,
-                expiry,
-            }),
-        )?;
+        // A release that removed the capture before this point finds no
+        // handle to abort; the timer then wakes at the deadline, finds
+        // nothing, and exits.
+        let _ = retained.expiry.set(expiry);
         Ok(capture_id)
     }
 
@@ -848,8 +893,9 @@ impl FetchLiveTailService {
         let binding = binding_from_wire(binding)?;
         if let Some(retained) = self.captures.remove(capture_id, |retained| {
             retained.query_id == query_id && retained.binding == binding
-        })? {
-            retained.expiry.abort();
+        })? && let Some(expiry) = retained.expiry.get()
+        {
+            expiry.abort();
         }
         Ok(())
     }
@@ -863,17 +909,21 @@ impl FetchLiveTailService {
 
     /// Opens one partition range of a retained capture.
     ///
-    /// The capture must exist and belong to the request's stream, query,
-    /// tenant, and table; nothing is read from live state. Filtering and
-    /// staged decoding happen only in the plan the Scribe follower builds
-    /// from the returned read.
+    /// The capture must exist, belong to the request's stream, query, tenant,
+    /// and table, and be within its deadline; nothing is read from live state.
+    /// The deadline is checked here, before any source is projected, because
+    /// the expiry timer that removes the capture may not have run yet.
+    /// Filtering and staged decoding happen only in the plan the Scribe
+    /// follower builds from the returned read, which keeps its batches,
+    /// their charges, and the staged lease after the capture is released or
+    /// expires.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::StreamMismatch`] when the request names another
     /// stream, and [`ScribeError::Internal`] for an inverted range, a capture
-    /// that is not retained for this query and table, or a projection that
-    /// cannot be read.
+    /// that is not retained for this query and table or whose deadline has
+    /// passed, or a projection that cannot be read.
     pub fn open_capture(
         &self,
         request: &FetchLiveTailRequest,
@@ -900,6 +950,11 @@ impl FetchLiveTailService {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "live capture is not retained for this query".to_owned(),
             })?;
+        if retained.elapsed_at(tokio::time::Instant::now()) {
+            return Err(ScribeError::Internal {
+                detail: "live capture has expired".to_owned(),
+            });
+        }
         let read = retained.capture.read(
             &(request.start_partition..=request.end_partition),
             &request.required_columns,
@@ -915,6 +970,7 @@ impl FetchLiveTailService {
                     statistics: readable.statistics,
                 })
                 .collect(),
+            charges: read.charges,
             runs: read.runs,
             staged: read.lease,
         })
@@ -1200,7 +1256,7 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when a staged run cannot be decoded.
     fn served_values(read: super::LiveTailBatches) -> Vec<i64> {
-        let (rows, runs, _lease) = read.into_parts();
+        let (rows, _charges, runs, _lease) = read.into_parts();
         let mut values = rows
             .iter()
             .flat_map(|batch| first_column_values(&batch.rows))
@@ -1605,7 +1661,7 @@ pub(crate) mod tests {
                 },
             )
             .expect("the generation publishes");
-        let (rows, runs, lease) = open.into_parts();
+        let (rows, _charges, runs, lease) = open.into_parts();
         assert!(rows.is_empty(), "a durable staged generation leaves memory");
         assert_eq!(runs.len(), 1, "the leased run is still named");
         assert!(
@@ -1671,6 +1727,86 @@ pub(crate) mod tests {
         ] {
             assert!(service.open_capture(&foreign).is_err());
         }
+    }
+
+    /// A capture whose deadline passed before it was installed is refused
+    /// with no identity, and neither it nor its staged lease is left behind
+    /// for a timer that already ran or never runs.
+    ///
+    /// The deadline has already elapsed when `retain` is called, as when
+    /// selection and sizing outlast the query's remaining time; the table and
+    /// the lease are checked before the runtime polls anything else.
+    ///
+    /// # Panics
+    /// Panics when the elapsed capture is retained, returns an identity, or
+    /// keeps its staged runs leased.
+    #[tokio::test]
+    async fn a_capture_elapsed_before_installation_is_refused_and_retains_nothing() {
+        let StagedGenerationFixture {
+            service,
+            memtable,
+            registry,
+            key,
+            generation,
+            member,
+            request,
+            directory: _directory,
+        } = staged_generation_fixture();
+        memtable
+            .complete_staged(generation.get(), member)
+            .expect("the shard marks the generation durable");
+        let capture = capture_of(&service, &request.binding).await;
+        assert_eq!(registry.leases(&key, generation).expect("leases"), 1);
+        let refused = service.retain(
+            request.query_id,
+            request.binding.clone(),
+            capture,
+            tokio::time::Instant::now(),
+        );
+        assert!(matches!(refused, Err(TailReadError::DeadlineElapsed)));
+        assert_eq!(service.retained_captures_for_test(), 0);
+        assert_eq!(registry.leases(&key, generation).expect("leases"), 0);
+    }
+
+    /// An installed capture refuses a new open once its deadline passes, even
+    /// while its expiry timer has not run, and a read opened before the
+    /// deadline keeps serving.
+    ///
+    /// The test blocks its only runtime thread across the deadline, so the
+    /// timer cannot be polled and the capture is still in the table when the
+    /// late open arrives.
+    ///
+    /// # Panics
+    /// Panics when the late open succeeds or the capture leaves the table
+    /// without its timer running.
+    #[tokio::test]
+    async fn an_elapsed_capture_refuses_a_new_open_before_its_expiry_runs() {
+        let StagedGenerationFixture {
+            service,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        let capture = capture_of(&service, &request.binding).await;
+        let authority = std::time::Duration::from_millis(20);
+        let capture_id = service
+            .retain(
+                request.query_id,
+                request.binding.clone(),
+                capture,
+                tokio::time::Instant::now() + authority,
+            )
+            .expect("the capture is retained");
+        let request = super::FetchLiveTailRequest {
+            capture_id,
+            ..request
+        };
+        let opened = service.open_capture(&request).expect("an open in time");
+        std::thread::sleep(authority * 2);
+        assert_eq!(service.retained_captures_for_test(), 1);
+        assert!(service.open_capture(&request).is_err());
+        let (_rows, _charges, runs, lease) = opened.into_parts();
+        assert!(lease.is_some() && runs.iter().all(|run| run.exists()));
     }
 
     /// An unreleased capture expires at its query deadline and is never

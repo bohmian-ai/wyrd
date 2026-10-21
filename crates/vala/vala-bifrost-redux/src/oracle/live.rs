@@ -96,9 +96,10 @@ pub(crate) struct LiveScribeRoute {
 ///
 /// Shared by every clone of the table's routes, so the captures stay retained
 /// while any plan can still read them and are released once, by the last
-/// drop, on completion, cancellation, failure, or a discarded selection. A
-/// drop outside a Tokio runtime releases nothing; each capture then expires at
-/// its query deadline.
+/// drop, on completion, cancellation, failure, or a discarded selection. The
+/// detached release waits no later than the query deadline. A drop outside a
+/// Tokio runtime releases nothing; each capture then expires at that
+/// deadline on its Scribe.
 pub(crate) struct LiveCaptures {
     /// Discovery that retained the captures and releases them.
     discovery: Arc<dyn super::TailStreamDiscovery>,
@@ -108,21 +109,27 @@ pub(crate) struct LiveCaptures {
     query_id: uuid::Uuid,
     /// Each retaining Scribe with its capture.
     captures: Vec<(super::OracleQueryParticipant, uuid::Uuid)>,
+    /// The query's absolute deadline, which is every capture's expiry and the
+    /// latest instant the release waits for a Scribe.
+    deadline: std::time::Instant,
 }
 
 impl LiveCaptures {
-    /// Takes ownership of the captures `discovery` retained for one table.
+    /// Takes ownership of the captures `discovery` retained for one table
+    /// until the query's `deadline`.
     pub(crate) fn new(
         discovery: Arc<dyn super::TailStreamDiscovery>,
         binding: TenantTableBinding,
         query_id: uuid::Uuid,
         captures: Vec<(super::OracleQueryParticipant, uuid::Uuid)>,
+        deadline: std::time::Instant,
     ) -> Self {
         Self {
             discovery,
             binding,
             query_id,
             captures,
+            deadline,
         }
     }
 }
@@ -135,6 +142,10 @@ struct NoCaptureDiscovery;
 #[async_trait::async_trait]
 impl super::TailStreamDiscovery for NoCaptureDiscovery {
     /// Discovers nothing; fixtures construct their routes directly.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: the fixture always returns an empty discovery.
     async fn discover(
         &self,
         _binding: &TenantTableBinding,
@@ -152,6 +163,7 @@ impl super::TailStreamDiscovery for NoCaptureDiscovery {
         _binding: &TenantTableBinding,
         _query_id: uuid::Uuid,
         _captures: &[(super::OracleQueryParticipant, uuid::Uuid)],
+        _deadline: std::time::Instant,
     ) {
     }
 }
@@ -165,12 +177,15 @@ impl LiveCaptures {
             binding,
             uuid::Uuid::nil(),
             Vec::new(),
+            std::time::Instant::now(),
         ))
     }
 }
 
 impl Drop for LiveCaptures {
-    /// Spawns the release of every capture on the current runtime.
+    /// Spawns the release of every capture on the current runtime, bounded
+    /// by the query deadline so a stalled Scribe cannot keep the detached task
+    /// alive past it; a capture left unreleased expires there.
     fn drop(&mut self) {
         let captures = std::mem::take(&mut self.captures);
         if captures.is_empty() {
@@ -182,14 +197,21 @@ impl Drop for LiveCaptures {
         let discovery = Arc::clone(&self.discovery);
         let binding = self.binding.clone();
         let query_id = self.query_id;
+        let deadline = self.deadline;
         runtime.spawn(async move {
-            discovery.release(&binding, query_id, &captures).await;
+            discovery
+                .release(&binding, query_id, &captures, deadline)
+                .await;
         });
     }
 }
 
 impl std::fmt::Debug for LiveCaptures {
     /// Renders the query and capture count; the discovery holds peer channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error unchanged.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LiveCaptures")

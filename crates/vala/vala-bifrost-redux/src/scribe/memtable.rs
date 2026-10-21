@@ -501,6 +501,7 @@ impl Memtable {
             opened_at: Instant::now(),
             closed_at: Instant::now(),
             arrow_bytes,
+            charge: Default::default(),
         })
     }
 
@@ -1127,12 +1128,21 @@ impl Memtable {
 
     /// Commit a previously planned retirement and remove exactly that entry.
     ///
+    /// `retained` is the generation's exact root-backed bytes, already detached
+    /// from the shard ledger. It moves into the generation's
+    /// [`crate::scribe::memory::RetainedArrowCharge`], so the bytes are returned
+    /// only when the last live capture or opened read of the generation's
+    /// batches drops, or here, outside the lock, when nothing else holds them.
+    ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when the token no longer matches a
-    /// committed immutable generation or its lock is poisoned.
+    /// committed immutable generation, its charge already holds a retired
+    /// lease, or its lock is poisoned. `retained` is dropped, returning its
+    /// bytes, on every error.
     pub(crate) fn commit_retirement(
         &self,
         token: CommittedRetirement,
+        retained: crate::resources::ScribeMemoryLease,
     ) -> Result<WalRange, ScribeError> {
         let mut immutable = self
             .immutable
@@ -1157,9 +1167,11 @@ impl Memtable {
                     ),
                 });
             }
-            entries.remove(index);
+            let retired = entries.remove(index);
+            retired.frozen.charge.hold(retained)?;
             immutable.retain(|_, values| !values.is_empty());
             drop(immutable);
+            drop(retired);
             // The generation's authority is not released here. Dropping this
             // Arrow copy is not a handover: the staged run is already
             // authoritative for these rows and stays so until the published
@@ -1333,6 +1345,9 @@ pub(crate) struct MemtableBucket {
     bytes_accumulated: usize,
     first_insert_at: Instant,
     last_insert_at: Instant,
+    /// Accounting owner shared by every holder of this bucket's batches,
+    /// carried into its frozen generation.
+    charge: Arc<crate::scribe::memory::RetainedArrowCharge>,
 }
 
 impl MemtableBucket {
@@ -1348,6 +1363,7 @@ impl MemtableBucket {
             bytes_accumulated: 0,
             first_insert_at: now,
             last_insert_at: now,
+            charge: Arc::default(),
         }
     }
 
@@ -1416,6 +1432,7 @@ impl MemtableBucket {
             opened_at,
             closed_at,
             arrow_bytes,
+            charge: self.charge,
         }
     }
 
@@ -1428,6 +1445,7 @@ impl MemtableBucket {
             &self.metas,
             self.seal_key.partition,
             None,
+            &self.charge,
         )
     }
 }
@@ -1627,6 +1645,10 @@ pub struct FrozenMemtable {
     pub closed_at: Instant,
     /// Estimated Arrow memory retained by the generation.
     pub arrow_bytes: usize,
+    /// Accounting owner shared by every holder of `batches`; retirement moves
+    /// the generation's charged bytes into it (see
+    /// [`crate::scribe::memory::RetainedArrowCharge`]).
+    pub(crate) charge: Arc<crate::scribe::memory::RetainedArrowCharge>,
 }
 
 impl FrozenMemtable {
@@ -1653,6 +1675,7 @@ impl FrozenMemtable {
             &self.metas,
             self.seal_key.partition,
             Some(generation),
+            &self.charge,
         )
     }
 }
@@ -1796,11 +1819,13 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches projected
-    /// to `required_columns`, its staged run paths in merge order, and the
-    /// lease that keeps those runs on disk.
+    /// to `required_columns`, the accounting owners of those batches, its
+    /// staged run paths in merge order, and the lease that keeps those runs on
+    /// disk.
     ///
-    /// The caller must hold the returned lease for as long as it reads any
-    /// returned run path.
+    /// Projection shares the captured Arrow buffers, so the caller must hold
+    /// the returned charges for as long as any returned batch lives, and the
+    /// returned lease for as long as it reads any returned run path.
     ///
     /// # Errors
     ///
@@ -1812,9 +1837,11 @@ impl LiveCapture {
         required_columns: &[String],
     ) -> Result<CapturedRead, ScribeError> {
         let mut batches = Vec::new();
+        let mut charges = Vec::new();
         for source in &self.memory {
             if partitions.contains(&source.partition_day) {
                 source.project(required_columns, &mut batches)?;
+                charges.push(Arc::clone(&source.charge));
             }
         }
         let runs = self
@@ -1826,6 +1853,7 @@ impl LiveCapture {
             .collect();
         Ok(CapturedRead {
             batches,
+            charges,
             runs,
             lease: self.staged.clone(),
         })
@@ -1852,6 +1880,9 @@ pub(crate) fn on_capture_selected_for_test(hook: Box<dyn FnOnce()>) {
 pub(crate) struct CapturedRead {
     /// Memory batches projected to the read's columns.
     pub(crate) batches: Vec<ReadableBatch>,
+    /// Accounting owners of `batches`, which keep their bytes charged to the
+    /// Scribe root while the read holds them.
+    pub(crate) charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
     /// Staged run paths, in merge order.
     pub(crate) runs: Vec<std::path::PathBuf>,
     /// Lease keeping `runs` on disk while the read holds it.
@@ -1879,10 +1910,14 @@ struct ReadableSource {
     partition_day: crate::catalog::layout::TimePartition,
     /// Serving immutable generation, or `None` for a writable bucket.
     generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
+    /// Accounting owner of `batches`, shared with the bucket or generation
+    /// they were captured from so retirement cannot uncharge them.
+    charge: Arc<crate::scribe::memory::RetainedArrowCharge>,
 }
 
 impl ReadableSource {
-    /// Captures `batches` and their bounds and WAL positions by reference.
+    /// Captures `batches` and their bounds and WAL positions by reference,
+    /// sharing `charge`, the accounting owner of those batches.
     fn capture(
         schema: &SchemaRef,
         batches: &[RecordBatch],
@@ -1890,6 +1925,7 @@ impl ReadableSource {
         metas: &[ScribeAppendMeta],
         partition_day: crate::catalog::layout::TimePartition,
         generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
+        charge: &Arc<crate::scribe::memory::RetainedArrowCharge>,
     ) -> Self {
         Self {
             schema: Arc::clone(schema),
@@ -1898,6 +1934,7 @@ impl ReadableSource {
             wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
             partition_day,
             generation,
+            charge: Arc::clone(charge),
         }
     }
 

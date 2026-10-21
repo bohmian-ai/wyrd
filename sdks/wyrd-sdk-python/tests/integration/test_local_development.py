@@ -9,6 +9,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import http.client
 import json
@@ -35,6 +36,8 @@ import httpx
 import openai
 import pytest
 import tomllib
+from mcp import Client, StdioServerParameters
+from mcp.shared.exceptions import MCPError
 from opentelemetry import trace
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost
@@ -1168,6 +1171,59 @@ def test_installed_cli_guided_setup() -> None:
         assert not any(value.encode() in protected for value in secrets.values())
         restart_on_another_listener(cli_path, home, env, listed)
     unattended_terminal_offers_no_hosts(cli_path)
+
+
+def read_setup_prompt(cli_path: str, home: Path, env: dict[str, str]) -> str:
+    """Read the MCP ``setup`` prompt as a host does: the official client over the installed proxy.
+
+    Only the ``setup`` prompt is listed, it takes no arguments, and other names
+    or any argument are refused.
+    """
+    proxy = StdioServerParameters(command=cli_path, args=["mcp", "proxy"], env=env, cwd=home)
+
+    async def read() -> str:
+        async with Client(proxy) as host:
+            listed = (await host.list_prompts()).prompts
+            assert [prompt.name for prompt in listed] == ["setup"]
+            assert not listed[0].arguments
+            for name, arguments in (("start", None), ("setup", {"language": "rust"})):
+                with pytest.raises(MCPError):
+                    await host.get_prompt(name, arguments)
+            [message] = (await host.get_prompt("setup")).messages
+            assert message.role == "user"
+            return message.content.text
+
+    return asyncio.run(read())
+
+
+@pytest.mark.local_dev
+def test_guided_setup_prompt_surfaces() -> None:
+    """The installed Python CLI and an authenticated MCP host agree on the setup prompt.
+
+    ``wyrd init --print-prompt`` prints the release-labelled prompt with no
+    deployment, configuration, or server, and refuses setup options. Once
+    ``wyrd init`` is ready, a host connected through ``wyrd mcp proxy`` with
+    the saved local credential reads the same bytes from the ``setup`` prompt.
+    """
+    cli_path = os.environ.get("WYRD_TEST_INSTALLED_CLI", str(Path(sys.executable).parent / "wyrd"))
+    with local_deployment() as (home, env):
+        printed = subprocess.run(
+            [cli_path, "init", "--print-prompt"], cwd=home, env=env, capture_output=True, text=True
+        )
+        assert printed.returncode == 0 and printed.stderr == "", printed.stderr
+        release = subprocess.check_output([cli_path, "--version"], text=True).split()[1]
+        assert printed.stdout.startswith(f"# Wyrd {release} setup\n\n")
+        assert not (home / "wyrd/config.toml").exists(), "printing saved nothing"
+        refused = subprocess.run(
+            [cli_path, "init", "--print-prompt", "--format", "json"],
+            cwd=home,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert refused.returncode == os.EX_USAGE and refused.stdout == ""
+        with installed_local_cli(cli_path, home, env, ""):
+            assert read_setup_prompt(cli_path, home, env) == printed.stdout
 
 
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")

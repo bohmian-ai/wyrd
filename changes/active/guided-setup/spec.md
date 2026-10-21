@@ -1,6 +1,6 @@
 ---
 id: SPEC-guided-setup
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -15,8 +15,9 @@ applications must manage evidence writers and telemetry by hand. Missing the
 last step can leave evidence queued when a process exits.
 
 This change keeps those related fixes together. `wyrd init` becomes the local
-bootstrap command and hands the user a setup prompt or equivalent manual
-steps. A deployment key belongs to a Service or Agent across its versions;
+bootstrap command. `wyrd init guided` starts a selected coding agent with the
+shared setup prompt after local readiness; ordinary `wyrd init` prints the
+handoff and manual steps remain available. A deployment key belongs to a Service or Agent across its versions;
 each release supplies its exact Card UID separately. An explicit ASGI middleware connects
 request Runs to the existing SDK lifecycle and drains evidence on graceful
 shutdown. Documentation teaches and verifies these same paths.
@@ -35,6 +36,12 @@ with prerequisites, not a claim that one command installs PostgreSQL, chooses
 an application language, or completes production deployment. The CLI,
 compatible runtime tools, and PostgreSQL must already be available; provider
 credentials are unnecessary for the first verification.
+
+Guided setup requires an installed coding agent and an interactive terminal.
+The agent uses its own account, permissions and approval controls. Wyrd supplies
+the setup instructions and supervises the process it starts; it does not become
+an agent runtime. The local server remains available after the agent finishes
+until the user interrupts Wyrd.
 
 A deployment key deliberately authorizes every active version of the same
 Service or Agent, identified by its kind, space, and name. Per-version principals and grants remain separate.
@@ -60,8 +67,10 @@ supply `telemetry=False`.
   interaction fixed by `SPEC-local-server-bootstrap`. Its server lifecycle,
   input resolution, saved settings, MCP host connection, and gateway behavior
   remain authoritative and move unchanged to `wyrd init`. Approval of revision 5 explicitly supersedes only that packet's command
-  name and guided handoff requirements. Its other approved behavior remains
-  authoritative; no second approval of this rename is required.
+  name and guided handoff requirements. Revision 6 additionally permits the
+  explicitly selected `guided` mode to launch one coding agent; ordinary init
+  retains the printed handoff and existing server lifecycle. The packet's other
+  approved behavior remains authoritative.
 - Documentation follows `docs/AGENTS.md` and builds on
   `SPEC-docsite-incremental-reset`.
 
@@ -127,7 +136,9 @@ caching is keyed by the credential, so UID selection must also separate caches.
   it with the setup prompt in the current directory. Hosts without a supported
   launch command receive instructions for retrieving and pasting the prompt.
   Command arguments preserve the prompt literally, without shell expansion or
-  secrets. It keeps the server in the foreground until interrupted and never starts a coding agent itself.
+  secrets. Ordinary `wyrd init` keeps the server in the foreground until
+  interrupted and never starts a coding agent itself. The explicit `guided`
+  mode follows REQ-037–038 instead of requiring the user to run the handoff.
 - **REQ-003** `wyrd init --print-prompt` prints the setup prompt for the
   installed CLI version on stdout and exits 0. It reads no configuration,
   contacts no server, makes no change, and conflicts with setup options
@@ -138,6 +149,35 @@ caching is keyed by the credential, so UID selection must also separate caches.
 - **REQ-005** The Wyrd MCP server exposes the setup prompt as an MCP prompt
   named `setup`, available to every authenticated principal, with no
   arguments. Reading it grants no write permission and never executes a step.
+
+- **REQ-037** `wyrd init guided` reuses the existing local bootstrap and MCP
+  host configuration, waits for the server and selected host connection to be
+  ready, then starts exactly one selected coding agent in the current directory
+  with the installed CLI release's shared setup prompt. The existing `--host`
+  selector names that agent; more than one explicit host is refused. Without
+  an explicit host the user chooses one usable installed agent interactively;
+  no agent is silently selected. A configuration file alone does not establish
+  that its launch executable is installed. Missing executables, unsupported
+  launch commands and failed host connection are reported before launching;
+  no different agent or silent paste fallback is substituted. This mode
+  requires an interactive terminal and refuses `--format json` and
+  `--print-prompt` before bootstrap side effects. Other bootstrap inputs and
+  persistence retain their existing meaning. The prompt is passed literally
+  as an argument, without shell evaluation or credentials. The agent retains
+  its normal permissions and approval controls; Wyrd never enables unattended
+  approval or bypasses its safeguards.
+- **REQ-038** Guided mode gives the launched agent terminal input and output
+  while continuing to supervise the local server and UI. Agent completion,
+  failure to start, or nonzero exit is reported without claiming setup succeeded
+  and leaves a ready local server serving until the user interrupts Wyrd. Agent
+  exit alone is not proof of stored verification; the setup prompt's evidence
+  confirmation remains required. Interruption stops and reaps the coding-agent
+  process Wyrd started before settling server/UI through the existing bounded
+  shutdown. Unexpected server/UI exit is reported and also stops that child;
+  the terminal remains usable after cleanup. Wyrd does not stop pre-existing
+  editor or agent processes or claim ownership of sessions detached by the
+  selected host. No daemon, second server supervisor, agent execution engine,
+  credential exchange or new durable workflow is introduced.
 
 ### Setup prompt
 
@@ -343,7 +383,7 @@ caching is keyed by the credential, so UID selection must also separate caches.
 
 - **REQ-027** Get started opens with `wyrd init` as the single entry command,
   after installation and PostgreSQL prerequisites, with two tabs:
-  "Agent-assisted" (start the agent with the setup prompt) and
+  "Agent-assisted" (`wyrd init guided` starts the selected agent with the setup prompt) and
   "Manual" (the same steps the prompt gives, journey-tested).
 - **REQ-028** A "Choose your path" page offers exactly three setup paths:
   AI engineer (SDK in an application), platform team (deploy and attribute
@@ -386,7 +426,9 @@ caching is keyed by the credential, so UID selection must also separate caches.
   cloud, or trusted issuer is required.
 - **INV-007** The setup prompt has one source; the CLI, MCP, and docs project
   the same content for the same release.
-- **INV-008** `wyrd init` never starts or drives a coding agent.
+- **INV-008** Only an explicit `wyrd init guided` invocation may launch one
+  user-selected coding agent. Ordinary init and every prompt-read surface
+  remain passive. Wyrd never bypasses the selected agent's approval controls.
 - **INV-009** Every feature works identically on macOS arm64, Linux x86_64,
   and Linux arm64. Kubernetes and OBI are documented deployment examples, not
   platform requirements.
@@ -414,7 +456,7 @@ caching is keyed by the credential, so UID selection must also separate caches.
 
 ## Expensive-to-reverse decisions and required boundaries
 
-- `wyrd init`, `--print-prompt`, and the `declare` output in `wyrd-cli`.
+- `wyrd init`, `wyrd init guided`, `--print-prompt`, and the `declare` output in `wyrd-cli`.
 - The `setup` MCP prompt in the Wyrd MCP server. It is instruction text, not
   an Agent or Prompt Card registration and not a workflow executor.
 - Version-independent Service/Agent API-key targeting and the Workload UID exchange parameter in the
@@ -459,6 +501,7 @@ for Python or Node lifecycle and public SDK projection evidence.
 | AC-017 | With one key and endpoint, concurrent clients selecting different UIDs, disk-cache reuse, transport reuse, and token refresh never borrow another version's subject or permissions. | REQ-033 | Shared-client integration checks and public SDK refresh journeys |
 | AC-018 | Issue, inspect, list, and revoke deployment keys through the approved management surfaces; metadata names kind, space, and name rather than an arbitrary version principal, tenant isolation holds, and revoking one leaves another usable. | REQ-010, REQ-035 | HTTP, MCP, CLI and SDK credential-management journeys |
 | AC-019 | Rehearse rejection and one-time replacement of persisted exact-version credentials; no secret gains authority silently and unsafe release skew is refused before readiness. | REQ-036, INV-003 | Migration/rollout rehearsal and release compatibility evidence |
+| AC-020 | Guided init starts only the chosen installed agent, after server/host readiness, in the project directory with the exact shared prompt and working terminal IO. Missing/unsupported/multiple selections, absent terminal and conflicting output modes refuse explicitly without launching another agent. Agent exit leaves Wyrd serving; failed start/nonzero exit is visible; interrupt and server failure settle the launched child and retain usable terminal state. Ordinary init, JSON readiness and offline prompt behavior are unchanged. | REQ-037–038, INV-008 | Installed CLI journey against real WyrdTestServer/Postgres with controlled host executables for argv, readiness, terminal and process-lifecycle assertions; no paid live-agent session or LLM output is a release gate |
 
 ## Scope and non-goals
 
@@ -478,7 +521,8 @@ Excluded:
   collector identity and its own specification.
 - Coupling `wyrd declare` with `wyrd pull`.
 - GenAI semantic-convention mapping of OBI spans.
-- Launching or controlling a coding agent from `wyrd init`.
+- Launching agents implicitly, bypassing agent approvals, or owning an agent
+  runtime beyond the explicitly selected guided setup process.
 - HTTP span instrumentation of our own, framework integrations other than
   ASGI, and TypeScript web-framework integrations.
 - Changing how Card attribution (`wyrd.card_uid`) or Run correlation works.
@@ -491,6 +535,13 @@ migration, and approved keeping registration separate from deployment loading.
 Revision 5 records those decisions and the credential-management projections.
 Kind, space, name, version and UID remain the domain vocabulary.
 
+On 2026-10-21 the maintainer explicitly approved revising the specification to
+add `wyrd init guided`, with agent launch using the shared setup prompt, while
+retaining offline prompt printing and the local server after agent completion.
+Revision 6 records that direction. It does not turn the original TASK-001
+review's host-command omission into a retroactive agent-launch finding: guided
+mode is a human-directed addition, with its own requirements and proof.
+
 The existing pull and offline bundle-loading workflow supplies the separate
 read-only loading path. It avoids introducing a second state loader or making
 `declare` depend on the credential for its meaning. The one-time cost is
@@ -499,7 +550,7 @@ replacing old Card-bound keys and deploying the matching UID configuration.
 ## Open material decisions
 
 None. Explicit maintainer approval applies to the behavior and decisions
-recorded in revision 5. Task planning and the independent comprehension pass do
+recorded in revisions 5 and 6. Task planning and the independent comprehension pass do
 not constitute implementation readiness or permission to commit.
 
 ## Research basis and authority links
@@ -516,7 +567,7 @@ gaps, not authority over the proposed design.
 | [State owner](../../../crates/shared/wyrd-client/src/state.rs), `from_path`, `declare_with` | Offline loading does not construct a client; online declaration currently owns declare, pull, and load with one client. |
 | [Auth owner](../../../crates/shared/wyrd-client/src/auth.rs), `AuthMiddleware` | API-key caching and renewal already exist; selected UID must participate in their identity. |
 | [Issuance contract](../../../crates/wyrd-spec/src/auth/issue_key.rs) and [principal routes](../../../crates/wyrd/wyrd-server/src/components/principals/routes.rs) | Current responses and management target a single principal; deployment-key lifecycle is a required boundary change. |
-| [Local bootstrap](../../../crates/wyrd/wyrd-cli/src/server/dev.rs) and [approved bootstrap spec](../local-server-bootstrap/spec.md) | Extend the readiness handoff while preserving bootstrap semantics; reconcile approved overlapping requirements. |
+| [Local bootstrap](../../../crates/wyrd/wyrd-cli/src/init.rs) and [approved bootstrap spec](../local-server-bootstrap/spec.md) | Extend the existing readiness/host handoff with explicit guided launch, preserving bootstrap persistence and supervision; host configuration detection is distinct from executable availability. |
 | [Python state](../../../sdks/wyrd-sdk-python/src/state/mod.rs), telemetry and shutdown | Reuse existing lifecycle, provider-conflict errors, and authored Python public contracts. |
 | [Docs rules](../../../docs/AGENTS.md) and [docsite spec](../docsite-incremental-reset/spec.md) | Tested examples, reader tools, and Guide shape apply; integration is a shape within that taxonomy. |
 | [ASGI lifespan protocol](https://asgi.readthedocs.io/en/stable/specs/lifespan.html) | Startup must signal startup-failed explicitly; an exception alone can be treated as unsupported lifespan. Lifespan resources belong to each worker/event loop. |
@@ -540,3 +591,4 @@ branch's workflow; no unrelated architecture or workflow files were imported.
 | 3 | draft | Deployment identity uses Wyrd API keys only: one deployment key per Service across versions, selected to an exact version by `WYRD_WORKLOAD_UID` from the CI declare output. Trusted issuers, workload bindings, and token files leave the flow. Deployed workloads never declare. Key rotation without downtime joins the required scenario. `pull` stays separate and optional. |
 | 4 | draft | Research and structure review: explain approach and costs before contracts; retain the combined scope; preserve offline loading; specify ASGI failure signaling, cleanup and context isolation; separate UID-aware caches and role resolution; restore per-surface evidence; record the maintainer's cross-version deployment-key decision and remove the extra terminology; replace unsupported “no open decisions” with credential lifecycle, deployed loading, and compatibility decisions. |
 | 5 | approved | Maintainer approved the scope and two parallel tasks, then confirmed reusable deployment-key management, no migration of existing Card-bound keys, and explicit separation of registration from deployed loading. Preserve declare semantics; reuse exact-UID pull and offline bundle loading; fix credential-management projections and one-time key replacement. |
+| 6 | approved | Explicit maintainer approval on 2026-10-21 adds `wyrd init guided` to launch one selected coding agent after readiness, retain its normal approvals and literal shared prompt, supervise its child process, and leave Wyrd serving after agent completion. Ordinary init and offline prompt reads remain passive. This scope addition is separate from the revision-5 review findings; deployment identity and ASGI semantics are unchanged. |

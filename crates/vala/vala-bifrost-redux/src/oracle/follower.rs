@@ -155,6 +155,12 @@ where
     T: FollowerSourceResolver + ?Sized,
 {
     /// Delegates to the one injected process resolver allocation.
+    ///
+    /// Adds no state, retry, or cancellation behavior of its own: dropping
+    /// this future drops the inner resolution under that resolver's contract.
+    ///
+    /// # Errors
+    /// Returns the inner resolver's [`FollowerResolutionError`] unchanged.
     async fn resolve(
         &self,
         target_role: ClusterRole,
@@ -419,7 +425,7 @@ impl<T> ScribeTailResolver<T> {
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
         let fault = |detail: &str| FollowerResolutionError::Fault(detail.to_owned());
-        let (rows, runs, lease) = read.into_parts();
+        let (rows, charges, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if !rows.is_empty() || runs.is_empty() {
             let projected = rows
@@ -436,6 +442,7 @@ impl<T> ScribeTailResolver<T> {
             // re-deals whatever the query's predicate keeps.
             let source = super::memtable_source::MemtableSource::try_new(
                 projected,
+                charges.into(),
                 self.partitioning,
                 session.config().target_partitions(),
                 Arc::clone(required_schema),

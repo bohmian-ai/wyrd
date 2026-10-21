@@ -46,6 +46,16 @@ impl ScribeTailService for ScribeTailGrpc {
     /// Captures one tenant table's live sources for the request's query and
     /// lists the captured event-day scopes with the bytes the request's scope
     /// reads in each; returns metadata and the capture id, never rows.
+    ///
+    /// The capture is retained until it is released or `expires_at_unix_ms`
+    /// passes. Cancelling the RPC before the capture is retained retains
+    /// nothing; cancelling after leaves it to its release or that expiry.
+    ///
+    /// # Errors
+    /// Returns invalid-argument for an absent or malformed binding or query
+    /// id or an invalid tail binding, deadline-exceeded when the expiry
+    /// passes before the capture is taken, and internal when Scribe state
+    /// cannot be captured.
     async fn list_active_streams(
         &self,
         request: Request<ListActiveStreamsRequest>,
@@ -80,6 +90,15 @@ impl ScribeTailService for ScribeTailGrpc {
     }
 
     /// Releases one query's retained capture; an unknown capture is a no-op.
+    ///
+    /// A capture owned by another query or table is left unchanged, and the
+    /// release completes without awaiting once decoded, so a cancelled RPC
+    /// either released the capture or leaves it to its expiry.
+    ///
+    /// # Errors
+    /// Returns invalid-argument for an absent or malformed binding, query id,
+    /// or capture id or an invalid tail binding, and internal when the
+    /// capture table is poisoned.
     async fn release_capture(
         &self,
         request: Request<ReleaseTailCaptureRequest>,

@@ -1701,8 +1701,9 @@ and published-plus-live source behavior. The request exposes no visibility,
 freshness, or query-class choice. Oracle selects Interactive or Analytical
 automatically from the one DataFusion physical plan. A successful query returns
 each row its selected published and online live sources hold exactly once,
-including rows published while it runs; an unreachable Scribe yields a degraded
-terminal. `bifrost-design.md` owns the source-selection and failure details.
+including rows published while it runs. A Scribe that cannot be listed yields a
+degraded terminal; losing a Scribe whose capture was accepted fails the query,
+even before its first row. `bifrost-design.md` owns the source-selection and failure details.
 
 ### Coordination clock
 

@@ -363,8 +363,9 @@ bounded Arrow results to Oracle, producing each batch only when Oracle pulls
 it. The scan's memtable references, staged-run leases, and follower admission
 belong to that stream and are released when it completes, is cancelled, or is
 dropped; the query deadline is its only timeout. An unavailable Scribe missing before
-discovery is outside the known live set. A known live source lost before rows
-degrades the result; loss after rows fails the query. Published-source,
+discovery is outside the known live set. A known Scribe that cannot be listed
+degrades the result. Losing a Scribe after its capture was accepted fails the
+query, even before its first row. Published-source,
 security, tenant, schema, resource, cancellation, and deadline failures fail.
 
 All callers, including Verifiers, use this same query service and source

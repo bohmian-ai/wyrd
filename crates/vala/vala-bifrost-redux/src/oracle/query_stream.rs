@@ -888,9 +888,11 @@ fn exhausted_terminal(
 /// * A published loss (`Iceberg` or `HotSealed`) always fails. `validate`
 ///   requires both published entries to be `Complete`, so there is no way to
 ///   report a short answer over persisted data honestly.
-/// * A known live-source loss before rows degrades the result and carries
-///   [`QueryWarning::LiveTailUnavailable`]. Live coverage is best effort, so
-///   a live tier reported `Complete` covers only the selected online sources.
+/// * A known Scribe that could not be listed degrades the result and carries
+///   [`QueryWarning::LiveTailUnavailable`], so a live tier reported
+///   `Complete` covers only the Scribes that were listed. Losing an accepted
+///   capture fails the execution, even before its first row, and never
+///   reaches this terminal.
 ///
 /// [`QueryWarning::LiveTailUnavailable`]: wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable
 fn successful_terminal(

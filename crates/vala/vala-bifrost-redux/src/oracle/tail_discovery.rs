@@ -68,15 +68,19 @@ pub trait TailStreamDiscovery: Send + Sync {
         deadline: Instant,
     ) -> Result<DiscoveredTail, TailReadError>;
 
-    /// Releases captures this discovery retained for `query_id`.
+    /// Releases captures this discovery retained for `query_id`, waiting no
+    /// later than the query's `deadline`.
     ///
-    /// Best effort: a capture that cannot be released expires at its query
-    /// deadline, so a failure is logged and never returned.
+    /// Best effort: a capture that cannot be released, or whose Scribe has not
+    /// answered by `deadline`, expires there on its Scribe, so a failure is
+    /// logged and never returned and a stalled peer cannot keep the caller
+    /// waiting past the query.
     async fn release(
         &self,
         binding: &TenantTableBinding,
         query_id: uuid::Uuid,
         captures: &[(OracleQueryParticipant, uuid::Uuid)],
+        deadline: Instant,
     );
 
     /// Toggles a test-tier discovery outage without changing production behavior.

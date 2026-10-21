@@ -472,6 +472,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes,
+            charge: Arc::default(),
         }
     }
 

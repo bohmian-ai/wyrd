@@ -16,6 +16,7 @@ pub(crate) mod ingress;
 mod invocation;
 mod ledger;
 mod multipart;
+mod owner;
 #[cfg(test)]
 mod pg_administration_tests;
 #[cfg(test)]
@@ -32,11 +33,11 @@ pub use capture::CallCapture;
 #[cfg(test)]
 pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
-pub(crate) use invocation::unconnected_engine;
 pub use invocation::{
     GatewayCallAttribution, GatewayCallRequest, GatewayCallResponse, GatewayCallSubject,
     GatewayInvocation,
 };
+pub use owner::Gateway;
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
 pub(crate) use service::invalid;

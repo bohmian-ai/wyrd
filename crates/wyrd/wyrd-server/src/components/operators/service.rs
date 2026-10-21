@@ -78,7 +78,7 @@ impl<'a> OperatorConnectionControl<'a> {
 
     /// The key owner.
     fn keys(&self) -> &OperatorKeys {
-        &self.state.operator_keys
+        self.state.verification.operator_keys()
     }
 
     /// Create a connection, sealing its secret under the active key version.

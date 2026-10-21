@@ -108,7 +108,7 @@ impl<'a> QueryAuthority<'a> {
     pub(crate) fn authorize(&self) -> Result<(), WyrdError> {
         match self
             .state
-            .authz
+            .auth
             .permission_check
             .check(&self.caller.principal, &self.permission)
         {
@@ -147,7 +147,7 @@ impl<'a> QueryAuthority<'a> {
 
     /// Stages one decision row for this operation on the process audit outbox.
     fn stage(&self, outcome: AuditOutcome) {
-        self.state.scribe_outbox.stage(
+        self.state.bifrost.scribe_outbox().stage(
             self.caller.data_tenant_id,
             audit::audit_event(
                 self.caller,

@@ -55,6 +55,8 @@ pub struct AuthHandles {
 /// through the supplied [`PgIssuerResolver`] and is used only where a workload
 /// assertion is exchanged for a Wyrd one.
 ///
+/// Both verifiers apply `settings`, such as the accepted clock skew.
+///
 /// `http` is the deployment's outbound address screening. The JWKS cache is
 /// built with it rather than a bare client, so a refresh long after the issuer
 /// was configured is screened again at the moment it is made.
@@ -71,6 +73,7 @@ pub fn build_auth_handles(
     signing_key: &SecretString,
     issuer_resolver: Arc<PgIssuerResolver>,
     http: ScreenedHttp,
+    settings: WyrdAuthVerifySettings,
 ) -> Result<AuthHandles, ServerBootError> {
     wyrd_tls::install_crypto_provider()
         .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
@@ -86,7 +89,6 @@ pub fn build_auth_handles(
 
     let mut decoding_keys = HashMap::new();
     decoding_keys.insert(kid, Arc::new(decoding));
-    let settings = WyrdAuthVerifySettings::default();
     let token_verifier = TokenVerifier::new(decoding_keys, WYRD_ISSUER, settings.clone());
     let external_verifier = ExternalVerifier::new(
         Arc::new(JwksCache::new(
@@ -167,6 +169,7 @@ mod tests {
             &SecretString::from(PRIVATE_KEY_PEM),
             issuer_resolver(),
             ScreenedHttp::allowing_internal(),
+            WyrdAuthVerifySettings::default(),
         )
         .expect("auth handles assemble from the signing key");
 
@@ -209,6 +212,7 @@ mod tests {
             &SecretString::from("not a pem"),
             issuer_resolver(),
             ScreenedHttp::allowing_internal(),
+            WyrdAuthVerifySettings::default(),
         );
         assert!(matches!(result, Err(ServerBootError::SigningKey(_))));
     }

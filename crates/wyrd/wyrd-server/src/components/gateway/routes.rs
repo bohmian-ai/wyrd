@@ -1115,7 +1115,7 @@ pub(crate) async fn image_edits(
         OpenAiMediaRoute::ImageEdits,
         &headers,
         request.map(Body::from),
-        state.limits.body_bytes,
+        state.settings.limits.body_bytes,
         FileSink::Memory,
     )
     .await;
@@ -1170,7 +1170,7 @@ pub(crate) async fn image_variations(
         OpenAiMediaRoute::ImageVariations,
         &headers,
         request.map(Body::from),
-        state.limits.body_bytes,
+        state.settings.limits.body_bytes,
         FileSink::Memory,
     )
     .await;
@@ -1355,7 +1355,7 @@ async fn audio_form(
                 route,
                 headers,
                 Ok(body),
-                state.limits.audio_upload_bytes,
+                state.settings.limits.audio_upload_bytes,
                 FileSink::Spool,
             )
             .await

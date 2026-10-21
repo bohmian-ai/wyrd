@@ -65,7 +65,7 @@ use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::sandbox_worker::worker;
 
@@ -89,6 +89,14 @@ impl Registered {
     /// # Panics
     /// Panics when the server, bootstrap, load, or registration fails.
     async fn start() -> Self {
+        Self::start_with(WyrdTestServer::builder()).await
+    }
+
+    /// Register as [`Self::start`] does on a bound server `builder` starts.
+    ///
+    /// # Panics
+    /// Panics when the server, bootstrap, load, or registration fails.
+    async fn start_with(builder: WyrdTestServerBuilder) -> Self {
         let temp = tempfile::tempdir().expect("loader workspace creates");
         std::fs::write(temp.path().join("notes.txt"), NOTES).expect("notes write");
         std::fs::write(temp.path().join("check.py"), CHECK).expect("source writes");
@@ -100,7 +108,7 @@ impl Registered {
         .expect("card writes");
         let input = build_declaration_input(load(&card).expect("loader tree builds"))
             .expect("registration input builds");
-        let server = Box::pin(WyrdTestServer::start_bound())
+        let server = Box::pin(builder.start_bound())
             .await
             .expect("bound test server starts");
         let Bootstrap::User { jwt, .. } = server
@@ -949,22 +957,17 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 #[tokio::test]
 async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let logs = LogCapture::install();
-    let registered = Registered::start().await;
+    let registered = Registered::start_with(
+        WyrdTestServer::builder().with_verification_limits_for_test(saturable()),
+    )
+    .await;
     let tenant = registered.server.data_tenant_id();
     registered
         .server
         .ensure_builtin_tables_for_test(tenant)
         .await
         .expect("tenant receives every built-in table");
-    let state = registered
-        .server
-        .state()
-        .clone()
-        .with_verification_blocks(Arc::new(
-            HostedBlocks::start(worker(), saturable())
-                .await
-                .expect("pool starts"),
-        ));
+    let state = registered.server.state().clone();
     let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
         .await
         .expect("tenant provisions");
@@ -1232,22 +1235,17 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
 /// settles otherwise.
 #[tokio::test]
 async fn nonconforming_queued_evidence_errors_without_a_verdict() {
-    let registered = Registered::start().await;
+    let registered = Registered::start_with(
+        WyrdTestServer::builder().with_verification_limits_for_test(tight_files()),
+    )
+    .await;
     let tenant = registered.server.data_tenant_id();
     registered
         .server
         .ensure_builtin_tables_for_test(tenant)
         .await
         .expect("tenant receives every built-in table");
-    let state = registered
-        .server
-        .state()
-        .clone()
-        .with_verification_blocks(Arc::new(
-            HostedBlocks::start(worker(), tight_files())
-                .await
-                .expect("pool starts"),
-        ));
+    let state = registered.server.state().clone();
     let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
         .await
         .expect("tenant provisions");

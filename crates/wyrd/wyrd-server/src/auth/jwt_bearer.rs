@@ -34,7 +34,7 @@ pub async fn exchange_jwt_bearer(
     let service = wyrd_auth::jwt_bearer::JwtBearer {
         issuer: state
             .auth
-            .tenant_issuer(&state.scribe_outbox)
+            .tenant_issuer(state.bifrost.scribe_outbox())
             .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
@@ -553,7 +553,7 @@ mod pg_tests {
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
             issuer: state
                 .auth
-                .tenant_issuer(&state.scribe_outbox)
+                .tenant_issuer(state.bifrost.scribe_outbox())
                 .expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -645,16 +645,16 @@ mod pg_tests {
             Arc::clone(&issuer_resolver),
             WyrdAuthVerifySettings::default(),
         );
-        test_state(fixture)
-            .await
-            .with_auth(crate::components::auth::ServerAuth {
+        test_state(fixture).await.with_owners_for_test(|owners| {
+            owners.auth = crate::components::auth::ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(Arc::new(verifier)),
                 external_verifier: Some(Arc::new(external_verifier)),
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 ..crate::components::auth::ServerAuth::default()
-            })
+            }
+        })
     }
 
     /// Insert a workload principal with the named roles and return its id, so
@@ -835,7 +835,7 @@ mod pg_tests {
     ) -> Vec<AuditRow> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );

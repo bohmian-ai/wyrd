@@ -113,7 +113,7 @@ async fn authorize<'a>(
     } else {
         AuditOutcome::Denied
     };
-    state.scribe_outbox.stage(
+    state.bifrost.scribe_outbox().stage(
         caller.data_tenant_id,
         audit::audit_event(caller, operation, resource, REQUIRED_PERMISSION, outcome),
     );

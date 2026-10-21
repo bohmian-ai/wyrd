@@ -1668,7 +1668,7 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     script.push(EngineOutcome::Completed(unscored_report()));
     let crash = CapabilityCrash::default();
     let runtime = RunningRuntime::spawn(harness.runtime(&Harness::limits(), &script, &crash));
-    let health = std::sync::Arc::clone(&harness.server.state().verification);
+    let health = std::sync::Arc::clone(&harness.server.state().verification.health);
     wait_until("runtime health", || {
         health.is_composed() && !health.is_degraded()
     })
@@ -1826,6 +1826,7 @@ async fn shutdown_releases_runs_still_in_flight_after_the_grace() {
             .server
             .state()
             .verification
+            .health
             .is_up(RuntimeCapability::Runner)
     );
     assert!(harness.writes().await.is_empty());
@@ -1906,7 +1907,7 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!harness.server.state().verification.is_degraded());
+    assert!(!harness.server.state().verification.health.is_degraded());
     first.stop().await;
     second.stop().await;
 
@@ -1938,7 +1939,7 @@ async fn bound_server_composes_the_runtime_and_reports_it_ready() {
         .start_bound()
         .await
         .expect("plain server starts");
-    assert!(!plain.state().verification.is_composed());
+    assert!(!plain.state().verification.health.is_composed());
     plain.shutdown().await.expect("plain server shuts down");
 
     let server = WyrdTestServer::builder()
@@ -1946,12 +1947,12 @@ async fn bound_server_composes_the_runtime_and_reports_it_ready() {
         .start_bound()
         .await
         .expect("server starts");
-    let health = std::sync::Arc::clone(&server.state().verification);
+    let health = std::sync::Arc::clone(&server.state().verification.health);
     wait_until("runtime up", || {
         health.is_up(RuntimeCapability::Scheduler) && health.is_up(RuntimeCapability::Runner)
     })
     .await;
-    let readiness = std::sync::Arc::clone(&server.state().readiness);
+    let readiness = std::sync::Arc::clone(&server.state().health.readiness);
     wait_until("verification readiness", || {
         readiness
             .load()
@@ -2868,7 +2869,7 @@ async fn verification_targets_are_cached_and_a_deleted_card_errors() {
         .service("gone")
         .await
         .expect("subject registers");
-    let cache = &harness.server.state().verifier_cards;
+    let cache = &harness.server.state().verification.verifier_cards();
     for (subject, deleted, code) in [
         (&gone, &gone, "WYRD_VERIFICATION_400_INVALID_TARGET"),
         (&harness.subject, &harness.verifier, VERIFIER_UNAVAILABLE),
@@ -3869,7 +3870,7 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
     let tenant = cluster.data_tenant_id();
     let oracle = cluster.server(0).expect("an Oracle pod");
     let (verifier, subject, _, jwt) = traced_tenant(oracle, tenant, "outage-caller").await;
-    let outbox = Arc::clone(&oracle.state().scribe_outbox);
+    let outbox = Arc::clone(oracle.state().bifrost.scribe_outbox());
     let assertion = oracle
         .pg_fixture()
         .superuser_pool()

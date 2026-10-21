@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::value::to_raw_value;
 use serde_json::{Value, json};
@@ -23,10 +22,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use wyrd_gateway::{
-    AttemptResult, AttemptUsage, BatchAction, CallExecution, CallInput, CallPlan,
-    CredentialResolver, DeploymentHealth, FailureClass, GatewayEngine, GatewayTenantSnapshot,
-    IngressDialect, MediaRequest, ProviderAttempt, ProviderDispatch, ResponseBody, ResponseCapture,
-    StreamEnd, UnsupportedRequest, outcome_error_code, outcome_name,
+    AttemptUsage, BatchAction, CallExecution, CallInput, CallPlan, FailureClass,
+    GatewayTenantSnapshot, IngressDialect, MediaRequest, ResponseBody, ResponseCapture, StreamEnd,
+    UnsupportedRequest, outcome_error_code, outcome_name,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
@@ -464,7 +462,7 @@ impl<'a> GatewayInvocation<'a> {
             call_span: tracing::Span::current(),
             cancel: call_cancel,
         };
-        self.state.gateway_tasks.spawn(
+        self.state.gateway.tasks().spawn(
             task.run(head)
                 .instrument(tracing::info_span!("gateway.execute")),
         );
@@ -789,7 +787,7 @@ impl<'a> GatewayInvocation<'a> {
             .is_some_and(|deployment| deployment.access == DeploymentAccess::Granted);
         let verdict = self
             .state
-            .authz
+            .auth
             .permission_check
             .check(&caller.principal, &permission)
             .into_result()
@@ -821,7 +819,10 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        self.state.scribe_outbox.stage(caller.data_tenant_id, event);
+        self.state
+            .bifrost
+            .scribe_outbox()
+            .stage(caller.data_tenant_id, event);
         verdict
     }
 
@@ -1020,7 +1021,10 @@ impl<'a> GatewayInvocation<'a> {
         .instrument(tracing::info_span!("gateway.capture"));
         let result = match tokio::time::timeout_at(call.deadline, work).await {
             Ok(Ok(capture)) => {
-                state.scribe_outbox.stage(capture.tenant(), capture);
+                state
+                    .bifrost
+                    .scribe_outbox()
+                    .stage(capture.tenant(), capture);
                 Ok(())
             }
             Ok(Err(drop)) => Err(drop),
@@ -1154,7 +1158,8 @@ impl CallTask {
         .record(self.received.elapsed().as_secs_f64());
         let mut execution = self
             .state
-            .gateway_engine
+            .gateway
+            .engine()
             .execute(CallInput {
                 tenant: self.call.tenant,
                 snapshot: &self.call.snapshot,
@@ -1410,30 +1415,6 @@ impl Drop for ActiveCall {
     fn drop(&mut self) {
         metrics::gauge!("wyrd_gateway_active_calls").decrement(1.0);
     }
-}
-
-/// Provider dispatch used until concrete adapters are connected: every
-/// attempt fails before reaching a provider, so nothing is billable.
-pub(crate) struct NoProviderDispatch;
-
-#[async_trait]
-impl ProviderDispatch for NoProviderDispatch {
-    /// Refuses the attempt before dispatch.
-    async fn dispatch(&self, _attempt: ProviderAttempt<'_>) -> AttemptResult {
-        AttemptResult::Failed {
-            class: FailureClass::BeforeDispatch,
-            usage: AttemptUsage::default(),
-        }
-    }
-}
-
-/// Builds the engine a server uses when none is attached.
-pub(crate) fn unconnected_engine() -> GatewayEngine {
-    GatewayEngine::new(
-        CredentialResolver::default(),
-        DeploymentHealth::default(),
-        Arc::new(NoProviderDispatch),
-    )
 }
 
 /// Stable rejection of an invalid call request.

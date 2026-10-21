@@ -1628,9 +1628,18 @@ pub(crate) mod recording {
         ///
         /// Owners built from `state` before this call keep the replaced
         /// outbox, so record before deriving any.
-        pub(crate) fn record(self: &Arc<Self>, mut state: AppState) -> AppState {
-            state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(self) as _, None);
-            state
+        ///
+        /// # Panics
+        /// Panics when `state` or its Bifrost shell is already shared.
+        pub(crate) fn record(self: &Arc<Self>, state: AppState) -> AppState {
+            let mut owners = state.into_owners_for_test();
+            Arc::get_mut(&mut owners.bifrost)
+                .expect("a recorded shell's Bifrost is not yet shared")
+                .replace_scribe_outbox_for_test(ScribeSink::local_outbox(
+                    Arc::clone(self) as _,
+                    None,
+                ));
+            AppState::from_owners_for_test(owners)
         }
 
         /// Every acknowledged `vala.system.audit_log` row, in arrival order.

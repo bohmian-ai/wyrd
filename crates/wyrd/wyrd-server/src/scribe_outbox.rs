@@ -702,6 +702,7 @@ impl ScribeSink {
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
     /// spawned immediately.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
         Self::bounded_outbox(route, request_bytes, SCRIBE_CAPACITY, None)

@@ -149,7 +149,8 @@ impl GatewayIngress {
                     .cloned()
                     .unwrap_or_else(RequestId::now_v7);
                 state
-                    .gateway_api_keys
+                    .gateway
+                    .api_keys()
                     .authenticate(&state, &api_key, request_id.as_str())
                     .await
             }

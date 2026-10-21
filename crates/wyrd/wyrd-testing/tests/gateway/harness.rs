@@ -415,7 +415,7 @@ impl Journey {
     /// # Panics
     /// Panics when the tasks do not drain within thirty seconds.
     pub(crate) async fn drain_calls(&self) {
-        let tasks = &self.server.state().gateway_tasks;
+        let tasks = self.server.state().gateway.tasks();
         tasks.close();
         tokio::time::timeout(Duration::from_secs(30), tasks.wait())
             .await

@@ -3854,7 +3854,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .expect("tenant connection opens");
     let queue = VerifierExecutionQueue::default();
     let state = server.state();
-    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
+    let authority =
+        BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox()));
     let mut outcomes = Vec::new();
     while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
         let accepted = match due.owner() {

@@ -40,7 +40,12 @@ use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
-use crate::state::AppState;
+use crate::components::operators::keys::OperatorKeys;
+use crate::state::{AppState, EngineWorker};
+
+use self::cache::VerifierCardCache;
+use self::hosted::blocks::HostedBlocks;
+use self::submissions::{SubmissionOutbox, SubmissionSink};
 
 use self::authority::BackgroundAuthority;
 #[cfg(feature = "test-support")]
@@ -53,6 +58,94 @@ use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
 use self::runner::EngineScript;
 use self::runner::VerifierRunner;
 use self::scheduler::VerificationScheduler;
+
+/// The process's verification capabilities shared by request handlers and
+/// the runtime: hosted Verifier blocks, the acknowledged-submission queue
+/// writer with its resolved-target cache, Operator connection keys, and
+/// runtime liveness.
+pub struct Verification {
+    /// Liveness of the composed runtime capabilities, read by readiness.
+    pub health: Arc<VerificationHealth>,
+    /// Hosted Verifier blocks; `None` where this process runs no Verifier.
+    blocks: Option<Arc<HostedBlocks>>,
+    /// Queue writer of submissions whose inputs Scribe acknowledged; its
+    /// sink owns the resolved verification target cache.
+    submissions: Arc<SubmissionOutbox>,
+    /// Operator connection key owner.
+    operator_keys: Arc<OperatorKeys>,
+}
+
+impl Verification {
+    /// Capabilities over `postgres`, hosting `blocks` and sealing Operator
+    /// connections with `operator_keys`.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the submission
+    /// writer task is spawned immediately.
+    #[must_use]
+    pub fn new(
+        postgres: wyrd_sql::WyrdPostgres,
+        blocks: Option<HostedBlocks>,
+        operator_keys: OperatorKeys,
+    ) -> Self {
+        Self {
+            health: Arc::default(),
+            blocks: blocks.map(Arc::new),
+            submissions: SubmissionSink::outbox(postgres),
+            operator_keys: Arc::new(operator_keys),
+        }
+    }
+
+    /// The hosted Verifier blocks, when this process runs Verifiers.
+    #[must_use]
+    pub const fn blocks(&self) -> Option<&Arc<HostedBlocks>> {
+        self.blocks.as_ref()
+    }
+
+    /// The acknowledged-submission queue writer.
+    #[must_use]
+    pub const fn submissions(&self) -> &Arc<SubmissionOutbox> {
+        &self.submissions
+    }
+
+    /// The resolved verification target cache.
+    #[must_use]
+    pub fn verifier_cards(&self) -> Arc<VerifierCardCache> {
+        self.submissions.sink().verifier_cards()
+    }
+
+    /// The Operator connection key owner.
+    #[must_use]
+    pub const fn operator_keys(&self) -> &Arc<OperatorKeys> {
+        &self.operator_keys
+    }
+
+    /// The target invalidation listener over `pool`, which runs until
+    /// `shutdown`; `None` where no Verifier runs, since targets are resolved
+    /// only where blocks are hosted.
+    pub(crate) fn refresh_worker(
+        &self,
+        pool: sqlx::PgPool,
+        shutdown: CancellationToken,
+    ) -> Option<EngineWorker> {
+        self.blocks.as_ref()?;
+        let targets = self.verifier_cards();
+        Some((
+            "verifier_card_cache",
+            Box::pin(async move { targets.watch(&pool, shutdown).await }),
+        ))
+    }
+
+    /// Settle hosted Python sandbox work and reap its workers by `deadline`;
+    /// see [`HostedBlocks::shutdown`]. Returns whether everything settled,
+    /// trivially when no blocks are hosted.
+    pub async fn close_hosted(&self, deadline: tokio::time::Instant) -> bool {
+        match &self.blocks {
+            Some(blocks) => blocks.shutdown(deadline).await,
+            None => true,
+        }
+    }
+}
 
 /// Bounds every runtime loop, lease, and drain obeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +325,8 @@ impl VerificationRuntime {
             engine_script: None,
             #[cfg(feature = "test-support")]
             crash: None,
+            #[cfg(feature = "test-support")]
+            operator_keys: None,
         }
     }
 
@@ -316,6 +411,10 @@ pub struct VerificationRuntimeBuilder<'a> {
     /// Test-only capability crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
+    /// Test-only Operator key owner standing in for the process's own, as a
+    /// replica configured with other keys would hold.
+    #[cfg(feature = "test-support")]
+    operator_keys: Option<Arc<OperatorKeys>>,
 }
 
 impl VerificationRuntimeBuilder<'_> {
@@ -358,6 +457,14 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
+    /// Deliver Operators with `keys` instead of the process's own owner.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn operator_keys(mut self, keys: Arc<OperatorKeys>) -> Self {
+        self.operator_keys = Some(keys);
+        self
+    }
+
     /// Compose the runtime, or `None` when this process cannot run any
     /// capability.
     ///
@@ -385,10 +492,14 @@ impl VerificationRuntimeBuilder<'_> {
             postgres.clone(),
             operator.clone(),
             queue,
-            BackgroundAuthority::new(self.state.auth.tenant_issuer(&self.state.scribe_outbox)),
+            BackgroundAuthority::new(
+                self.state
+                    .auth
+                    .tenant_issuer(self.state.bifrost.scribe_outbox()),
+            ),
             self.limits.poll_interval,
         );
-        let scheduler = match &self.state.verification_blocks {
+        let scheduler = match self.state.verification.blocks() {
             Some(_) => scheduler.with_groups(
                 GroupPoller::new(self.state.clone(), self.limits.execution_timeout),
                 Arc::clone(&capacity),
@@ -411,12 +522,15 @@ impl VerificationRuntimeBuilder<'_> {
             Some(crash) => fitter.with_crash(crash.clone()),
             None => fitter,
         };
+        let keys = Arc::clone(self.state.verification.operator_keys());
+        #[cfg(feature = "test-support")]
+        let keys = self.operator_keys.unwrap_or(keys);
         let worker = OperatorWorker::new(
             postgres.clone(),
             operator.clone(),
-            Arc::clone(&self.state.operator_keys),
+            keys,
             OperatorDelivery::new(
-                self.state.deployment_profile.screened_http(),
+                self.state.settings.deployment_profile.screened_http(),
                 self.endpoints,
             ),
             self.limits,
@@ -431,7 +545,7 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        let outbox = Arc::clone(&self.state.scribe_outbox);
+        let outbox = Arc::clone(self.state.bifrost.scribe_outbox());
         #[cfg(feature = "test-support")]
         let outbox = match (self.publication_fault, self.state.bifrost.scribe()) {
             (Some(fault), Some(scribe)) => {
@@ -439,7 +553,7 @@ impl VerificationRuntimeBuilder<'_> {
             }
             _ => outbox,
         };
-        if let Some(blocks) = &self.state.verification_blocks
+        if let Some(blocks) = self.state.verification.blocks()
             && outbox.sink().reaches_scribe()
         {
             let runner = VerifierRunner::new(
@@ -465,7 +579,7 @@ impl VerificationRuntimeBuilder<'_> {
         } else {
             tracing::warn!("Verifier runner not composed: no hosted blocks or no reachable Scribe");
         }
-        let health = Arc::clone(&self.state.verification);
+        let health = Arc::clone(&self.state.verification.health);
         for capability in &capabilities {
             health.require(capability.slot());
         }

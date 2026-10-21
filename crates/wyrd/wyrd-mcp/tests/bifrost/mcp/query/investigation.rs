@@ -211,7 +211,7 @@ impl EvidenceInvestigation {
             };
             let payload = ResultPayloadBuilder::new(run, uid, now, now).build(&outcome)?;
             result_ids.push(payload.result_id());
-            server.state().scribe_outbox.stage(
+            server.state().bifrost.scribe_outbox().stage(
                 server.data_tenant_id(),
                 ScribeWrite::Result {
                     payload,

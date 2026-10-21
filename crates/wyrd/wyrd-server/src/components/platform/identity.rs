@@ -217,7 +217,8 @@ async fn configure_connection(
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
     let mut decision = authorize(
         &authz,
         &caller,
@@ -327,7 +328,7 @@ async fn read_connection(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
-        &state.scribe_outbox,
+        state.bifrost.scribe_outbox(),
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_CONNECTION_RESOURCE,
@@ -383,7 +384,8 @@ async fn remove_connection(
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
     let mut decision = authorize(
         &authz,
         &caller,
@@ -455,7 +457,8 @@ async fn register_admin(
     // the name an operator would retry with.
     //
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
     // The id is minted before the decision so the record names the principal
     // this request creates. Nothing has adopted an existing row here — unlike
     // tenant provisioning — so the minted id is the one that is written.
@@ -548,7 +551,7 @@ async fn list_platform_admins(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
-        &state.scribe_outbox,
+        state.bifrost.scribe_outbox(),
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_ADMINS_RESOURCE,
@@ -625,7 +628,8 @@ async fn set_admin_status(
 
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
     let mut decision = authorize(
         &authz,
         &caller,

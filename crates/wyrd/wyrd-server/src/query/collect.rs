@@ -274,6 +274,7 @@ impl BoundedQuery {
             #[cfg(feature = "test-support")]
             stall: self
                 .state
+                .test_hooks
                 .query_stream_fault
                 .as_ref()
                 .and_then(|fault| fault.apply(&mut stream)),

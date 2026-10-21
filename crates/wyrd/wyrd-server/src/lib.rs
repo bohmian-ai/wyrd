@@ -34,7 +34,7 @@ pub use app::metrics::{TelemetryRuntimeError, WyrdTelemetryRuntime};
 pub use app::run_forge_worker_process_for_test;
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
 pub use boot::{
-    ServerBootError, StateOverrides, build_state, check_card_recovery_pool, spawn_storage_sweeper,
+    BootedServer, ServerBootError, StartInputs, check_card_recovery_pool, spawn_storage_sweeper,
 };
 #[cfg(feature = "test-support")]
 pub use config::BifrostTarget;

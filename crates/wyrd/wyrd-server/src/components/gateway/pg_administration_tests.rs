@@ -63,7 +63,14 @@ pub(super) async fn test_state(fixture: &PgFixture) -> AppState {
         Arc::new(StorageHandle::new(signer)),
         crate::test_support::test_catalog().await,
     )
-    .with_gateway(gateway_config(fixture.data_tenant_id()))
+    .with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::from_config(
+            gateway_config(fixture.data_tenant_id()),
+            crate::config::DeploymentProfile::Development,
+            owners.auth.sealing_key.clone(),
+        )
+        .expect("the gateway builds");
+    })
 }
 
 /// Assigns a credential source to `tenant` and `provider` without a host.
@@ -133,7 +140,7 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
 pub(super) async fn settle_audit(state: &AppState) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     assert_eq!(
-        state.scribe_outbox.settle(deadline).await,
+        state.bifrost.scribe_outbox().settle(deadline).await,
         0,
         "audit settles"
     );
@@ -424,8 +431,9 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     const SUBMITTED: &str = "sk-live-managed-submission";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let mut state = test_state(&fixture).await;
-    state.auth.sealing_key = Some(sealing_keyring(1));
+    let state = test_state(&fixture).await;
+    let state =
+        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(1)));
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let managed = |name: &str, secret: &str| {
@@ -575,7 +583,14 @@ async fn gateway_credential_sources_stay_within_operator_assignments() {
         .expect("vault backend")
         .paths
         .insert("other".to_owned(), assigned(other, "openai"));
-    let state = test_state(&fixture).await.with_gateway(config);
+    let state = test_state(&fixture).await.with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::from_config(
+            config,
+            crate::config::DeploymentProfile::Development,
+            owners.auth.sealing_key.clone(),
+        )
+        .expect("the gateway builds");
+    });
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let put = |name: &str, provider: &str, source: Value| {
@@ -1474,8 +1489,9 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         .await
         .expect("tenant b");
     let keyless = test_state(&fixture).await;
-    let (mut state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
-    state.auth.sealing_key = Some(sealing_keyring(2));
+    let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
+    let state =
+        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(2)));
     let admin_of = admin;
     let admin = admin_of(tenant);
     let gateway = GatewayAdministration::new(&state);

@@ -851,7 +851,7 @@ mod tests {
     use crate::catalog::TableRef;
     use crate::contracts::{
         CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
-        StampedAttribution, projected_source_schema_fingerprint,
+        projected_source_schema_fingerprint,
     };
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::memory::MemoryCategory;

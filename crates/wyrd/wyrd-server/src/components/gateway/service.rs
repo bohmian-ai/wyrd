@@ -70,7 +70,7 @@ impl<'a> GatewayAdministration<'a> {
         Self {
             state,
             postgres: &state.postgres,
-            config: &state.gateway,
+            config: state.gateway.config(),
             keyring: state.auth.sealing_key.as_deref(),
         }
     }
@@ -633,7 +633,7 @@ impl<'a> GatewayAdministration<'a> {
         &self,
         tenant: DataTenantId,
     ) -> Result<Arc<GatewayTenantSnapshot>, WyrdError> {
-        let snapshots = &self.state.gateway_snapshots;
+        let snapshots = self.state.gateway.snapshots();
         if let Some(snapshot) = snapshots.cached(tenant) {
             return Ok(snapshot);
         }

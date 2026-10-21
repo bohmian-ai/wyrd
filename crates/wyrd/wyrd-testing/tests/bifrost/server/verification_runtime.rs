@@ -225,7 +225,8 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     // it reaches the peer Scribe only once that outbox drains.
     let unwritten = oracle
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -504,7 +505,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     // the results reach the peer Scribe only once that outbox drains.
     let unwritten = oracle
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -2477,7 +2479,7 @@ impl TypedPayloadJourney {
             )
             .build(&outcome)?;
             let result = payload.result_id();
-            self.gateway.server.state().scribe_outbox.stage(
+            self.gateway.server.state().bifrost.scribe_outbox().stage(
                 self.gateway.tenant,
                 ScribeWrite::Result {
                     payload,
@@ -2524,7 +2526,8 @@ impl TypedPayloadJourney {
         self.gateway
             .server
             .state()
-            .scribe_outbox
+            .bifrost
+            .scribe_outbox()
             .stage(self.gateway.tenant, event);
         self.gateway.server.await_audit_retained().await?;
         Ok(StagedDecision {
@@ -2819,7 +2822,8 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
 
     let unwritten = server
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -3058,7 +3062,8 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
 
     let unwritten = server
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {

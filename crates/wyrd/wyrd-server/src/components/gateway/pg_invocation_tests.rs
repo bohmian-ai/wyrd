@@ -66,7 +66,7 @@ use super::pg_administration_tests::{
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::state::{AppState, LimitsConfig};
+use crate::state::AppState;
 
 /// One scripted provider attempt.
 enum Step {
@@ -150,13 +150,16 @@ impl ProviderDispatch for Held {
 
 /// Builds one server replica over `fixture` whose engine uses `dispatch`.
 async fn replica(fixture: &PgFixture, dispatch: Arc<dyn ProviderDispatch>) -> AppState {
-    test_state(fixture)
-        .await
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            dispatch,
-        ))
+    test_state(fixture).await.with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::new(
+            crate::config::GatewayConfig::default(),
+            GatewayEngine::new(
+                CredentialResolver::default(),
+                DeploymentHealth::default(),
+                dispatch,
+            ),
+        );
+    })
 }
 
 /// Deterministic principal id `n`.
@@ -550,13 +553,18 @@ async fn managed_replica(
     keyring: Option<Arc<SealingKeyring>>,
     dispatch: Arc<dyn ProviderDispatch>,
 ) -> AppState {
-    let mut state = test_state(fixture).await;
-    state.auth.sealing_key = keyring.clone();
-    state.with_gateway_engine(GatewayEngine::new(
-        CredentialResolver::new(std::collections::BTreeMap::new(), keyring),
-        DeploymentHealth::default(),
-        dispatch,
-    ))
+    let state = test_state(fixture).await;
+    let state = state.with_owners_for_test(|owners| owners.auth.sealing_key = keyring.clone());
+    state.with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::new(
+            crate::config::GatewayConfig::default(),
+            GatewayEngine::new(
+                CredentialResolver::new(std::collections::BTreeMap::new(), keyring),
+                DeploymentHealth::default(),
+                dispatch,
+            ),
+        );
+    })
 }
 
 /// Reads `tenant`'s stored `managed` envelope through that tenant's own
@@ -1625,35 +1633,38 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         .await;
     let secret = tempfile::NamedTempFile::new().expect("secret file");
     std::fs::write(secret.path(), "sk-deepseek\n").expect("secret writes");
-    let state = test_state(&fixture)
-        .await
-        .with_gateway(crate::config::GatewayConfig {
-            endpoints: wyrd_gateway::BuiltinEndpoints::default(),
-            credential_bindings: std::collections::BTreeMap::from([(
-                wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
-                crate::config::GatewayCredentialBinding {
-                    secret: wyrd_spec::security::SecretRef::File {
-                        path: secret.path().display().to_string(),
+    let state = test_state(&fixture).await.with_owners_for_test(|owners| {
+        owners.settings.limits.audio_upload_bytes = 3 * 1024 * 1024;
+        owners.gateway = crate::components::gateway::Gateway::new(
+            crate::config::GatewayConfig {
+                endpoints: wyrd_gateway::BuiltinEndpoints::default(),
+                credential_bindings: std::collections::BTreeMap::from([(
+                    wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
+                    crate::config::GatewayCredentialBinding {
+                        secret: wyrd_spec::security::SecretRef::File {
+                            path: secret.path().display().to_string(),
+                        },
+                        assignment: wyrd_gateway::CredentialAssignment {
+                            host: Some("127.0.0.1".to_owned()),
+                            ..super::pg_administration_tests::assigned(tenant, "deepseek")
+                        },
                     },
-                    assignment: wyrd_gateway::CredentialAssignment {
-                        host: Some("127.0.0.1".to_owned()),
-                        ..super::pg_administration_tests::assigned(tenant, "deepseek")
-                    },
-                },
-            )]),
-            secret_backends: std::collections::BTreeMap::new(),
-        })
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            Arc::new(
-                wyrd_gateway::HttpProviderDispatch::new(
-                    skald_providers::EndpointPolicy::new(false),
-                    wyrd_gateway::BuiltinEndpoints::default(),
-                )
-                .expect("gateway dispatch builds"),
+                )]),
+                secret_backends: std::collections::BTreeMap::new(),
+            },
+            GatewayEngine::new(
+                CredentialResolver::default(),
+                DeploymentHealth::default(),
+                Arc::new(
+                    wyrd_gateway::HttpProviderDispatch::new(
+                        skald_providers::EndpointPolicy::new(false),
+                        wyrd_gateway::BuiltinEndpoints::default(),
+                    )
+                    .expect("gateway dispatch builds"),
+                ),
             ),
-        ));
+        );
+    });
     let (state, scribe) = RecordingScribe::attach(state);
     capture_metadata(&state, tenant).await;
     let admin = admin(tenant);
@@ -2071,10 +2082,6 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     // a 2 MiB file arrives in chunks and reaches the provider byte for byte,
     // while an upload over the Audio bound or a body that breaks mid-upload
     // is refused before any provider request.
-    let audio = state.clone().with_limits(LimitsConfig {
-        audio_upload_bytes: 3 * 1024 * 1024,
-        ..state.limits
-    });
     let big_form = |size: usize| {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -2095,11 +2102,11 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     };
     let (headers, file, chunks) = big_form(2 * 1024 * 1024);
     assert!(
-        file.len() > audio.limits.body_bytes,
+        file.len() > state.settings.limits.body_bytes,
         "the upload exceeds the general limit"
     );
     let streamed = super::routes::audio_transcriptions(
-        State(audio.clone()),
+        State(state.clone()),
         Ok(caller.clone()),
         None,
         headers,
@@ -2134,7 +2141,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let dispatched = requests.len();
     let (headers, _, chunks) = big_form(4 * 1024 * 1024);
     let oversized = super::routes::audio_transcriptions(
-        State(audio.clone()),
+        State(state.clone()),
         Ok(caller.clone()),
         None,
         headers,
@@ -2146,7 +2153,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     chunks.truncate(4);
     chunks.push(Err(std::io::Error::other("caller went away")));
     let broken = super::routes::audio_translations(
-        State(audio.clone()),
+        State(state.clone()),
         Ok(caller.clone()),
         None,
         headers,
@@ -2392,35 +2399,37 @@ async fn held_upstream(frame: &'static str) -> (u16, JoinHandle<bool>, Arc<Notif
 /// Panics when the fixed binding name is invalid or the HTTP gateway dispatch
 /// cannot be built.
 async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) -> AppState {
-    test_state(fixture)
-        .await
-        .with_gateway(crate::config::GatewayConfig {
-            endpoints: wyrd_gateway::BuiltinEndpoints::default(),
-            credential_bindings: std::collections::BTreeMap::from([(
-                wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
-                crate::config::GatewayCredentialBinding {
-                    secret: wyrd_spec::security::SecretRef::File {
-                        path: secret.display().to_string(),
+    test_state(fixture).await.with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::new(
+            crate::config::GatewayConfig {
+                endpoints: wyrd_gateway::BuiltinEndpoints::default(),
+                credential_bindings: std::collections::BTreeMap::from([(
+                    wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
+                    crate::config::GatewayCredentialBinding {
+                        secret: wyrd_spec::security::SecretRef::File {
+                            path: secret.display().to_string(),
+                        },
+                        assignment: wyrd_gateway::CredentialAssignment {
+                            host: Some("127.0.0.1".to_owned()),
+                            ..super::pg_administration_tests::assigned(tenant, "deepseek")
+                        },
                     },
-                    assignment: wyrd_gateway::CredentialAssignment {
-                        host: Some("127.0.0.1".to_owned()),
-                        ..super::pg_administration_tests::assigned(tenant, "deepseek")
-                    },
-                },
-            )]),
-            secret_backends: std::collections::BTreeMap::new(),
-        })
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            Arc::new(
-                wyrd_gateway::HttpProviderDispatch::new(
-                    skald_providers::EndpointPolicy::new(false),
-                    wyrd_gateway::BuiltinEndpoints::default(),
-                )
-                .expect("gateway dispatch builds"),
+                )]),
+                secret_backends: std::collections::BTreeMap::new(),
+            },
+            GatewayEngine::new(
+                CredentialResolver::default(),
+                DeploymentHealth::default(),
+                Arc::new(
+                    wyrd_gateway::HttpProviderDispatch::new(
+                        skald_providers::EndpointPolicy::new(false),
+                        wyrd_gateway::BuiltinEndpoints::default(),
+                    )
+                    .expect("gateway dispatch builds"),
+                ),
             ),
-        ))
+        );
+    })
 }
 
 /// Proves the Batches lifecycle across two replicas and tenants: an upload
@@ -3280,19 +3289,19 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
 ///
 /// Panics when the tracked work does not settle within ten seconds.
 async fn drain_gateway(state: &AppState) {
-    state.gateway_tasks.close();
-    tokio::time::timeout(Duration::from_secs(10), state.gateway_tasks.wait())
+    state.gateway.tasks().close();
+    tokio::time::timeout(Duration::from_secs(10), state.gateway.tasks().wait())
         .await
         .expect("gateway tasks drain");
-    state.gateway_tasks.reopen();
+    state.gateway.tasks().reopen();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     assert_eq!(
-        state.scribe_outbox.settle(deadline).await,
+        state.bifrost.scribe_outbox().settle(deadline).await,
         0,
         "audit settles"
     );
     assert_eq!(
-        state.scribe_outbox.settle(deadline).await,
+        state.bifrost.scribe_outbox().settle(deadline).await,
         0,
         "capture settles"
     );
@@ -3559,13 +3568,16 @@ async fn replica_with_fixture_catalog(
         .await
         .expect("the catalog builds against the fixture"),
     );
-    crate::test_support::test_app_state(postgres, storage, catalog).with_gateway_engine(
-        GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            dispatch,
-        ),
-    )
+    crate::test_support::test_app_state(postgres, storage, catalog).with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::new(
+            crate::config::GatewayConfig::default(),
+            GatewayEngine::new(
+                CredentialResolver::default(),
+                DeploymentHealth::default(),
+                dispatch,
+            ),
+        );
+    })
 }
 
 /// Exact bytes of the captured binary answer; the marker makes their absence
@@ -4410,37 +4422,38 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         .await;
     let secret = tempfile::NamedTempFile::new().expect("secret file");
     std::fs::write(secret.path(), format!("{CANARY}\n")).expect("secret writes");
-    let (state, scribe) = RecordingScribe::attach(
-        test_state(&fixture)
-            .await
-            .with_gateway(crate::config::GatewayConfig {
-                endpoints: wyrd_gateway::BuiltinEndpoints::default(),
-                credential_bindings: std::collections::BTreeMap::from([(
-                    wyrd_spec::ids::CredentialBindingName::new("canary-file").expect("binding"),
-                    crate::config::GatewayCredentialBinding {
-                        secret: wyrd_spec::security::SecretRef::File {
-                            path: secret.path().display().to_string(),
+    let (state, scribe) =
+        RecordingScribe::attach(test_state(&fixture).await.with_owners_for_test(|owners| {
+            owners.gateway = crate::components::gateway::Gateway::new(
+                crate::config::GatewayConfig {
+                    endpoints: wyrd_gateway::BuiltinEndpoints::default(),
+                    credential_bindings: std::collections::BTreeMap::from([(
+                        wyrd_spec::ids::CredentialBindingName::new("canary-file").expect("binding"),
+                        crate::config::GatewayCredentialBinding {
+                            secret: wyrd_spec::security::SecretRef::File {
+                                path: secret.path().display().to_string(),
+                            },
+                            assignment: wyrd_gateway::CredentialAssignment {
+                                host: Some("127.0.0.1".to_owned()),
+                                ..super::pg_administration_tests::assigned(tenant, "deepseek")
+                            },
                         },
-                        assignment: wyrd_gateway::CredentialAssignment {
-                            host: Some("127.0.0.1".to_owned()),
-                            ..super::pg_administration_tests::assigned(tenant, "deepseek")
-                        },
-                    },
-                )]),
-                secret_backends: std::collections::BTreeMap::new(),
-            })
-            .with_gateway_engine(GatewayEngine::new(
-                CredentialResolver::default(),
-                DeploymentHealth::default(),
-                Arc::new(
-                    wyrd_gateway::HttpProviderDispatch::new(
-                        skald_providers::EndpointPolicy::new(false),
-                        wyrd_gateway::BuiltinEndpoints::default(),
-                    )
-                    .expect("gateway dispatch builds"),
+                    )]),
+                    secret_backends: std::collections::BTreeMap::new(),
+                },
+                GatewayEngine::new(
+                    CredentialResolver::default(),
+                    DeploymentHealth::default(),
+                    Arc::new(
+                        wyrd_gateway::HttpProviderDispatch::new(
+                            skald_providers::EndpointPolicy::new(false),
+                            wyrd_gateway::BuiltinEndpoints::default(),
+                        )
+                        .expect("gateway dispatch builds"),
+                    ),
                 ),
-            )),
-    );
+            );
+        }));
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     gateway

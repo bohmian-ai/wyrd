@@ -320,17 +320,21 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         reason: ProbeReason::Ok,
         elapsed_ms: 1,
     };
-    server.state().readiness.store(Arc::new(ReadinessSnapshot {
-        postgres: ok_probe.clone(),
-        storage: ok_probe.clone(),
-        scribe: ok_probe.clone(),
-        oracle: ok_probe.clone(),
-        peer: ok_probe,
-        forge_coordinator: None,
-        forge_worker: None,
-        verification: None,
-        scribe_fault_is_role_local: false,
-    }));
+    server
+        .state()
+        .health
+        .readiness
+        .store(Arc::new(ReadinessSnapshot {
+            postgres: ok_probe.clone(),
+            storage: ok_probe.clone(),
+            scribe: ok_probe.clone(),
+            oracle: ok_probe.clone(),
+            peer: ok_probe,
+            forge_coordinator: None,
+            forge_worker: None,
+            verification: None,
+            scribe_fault_is_role_local: false,
+        }));
 
     let response = server
         .oneshot(
@@ -519,19 +523,22 @@ async fn production_profile_requires_a_token_verifier_on_a_serving_target() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let state = server
-        .state()
-        .clone()
-        .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production);
-    state
-        .production_validate()
+    let state = server.state();
+    let production = wyrd_server::state::ServerSettings {
+        deployment_profile: wyrd_server::config::DeploymentProfile::Production,
+        ..state.settings
+    };
+    production
+        .validate(&state.bifrost, &state.auth)
         .expect("a composed serving target with a verifier is production-valid");
 
-    let mut without_verifier = state;
-    without_verifier.auth.token_verifier = None;
+    let without_verifier = wyrd_server::components::auth::ServerAuth {
+        token_verifier: None,
+        ..state.auth.clone()
+    };
     assert!(
         matches!(
-            without_verifier.production_validate(),
+            production.validate(&state.bifrost, &without_verifier),
             Err(wyrd_server::state::ProductionValidationError::MissingTokenVerifier)
         ),
         "a production target without a token verifier must be refused"
@@ -595,12 +602,13 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
         .start_in_process()
         .await
         .expect("test server starts");
-    server
-        .state()
-        .clone()
-        .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production)
-        .production_validate()
-        .expect("real verifier, audit, and signing key are production-valid");
+    let state = server.state();
+    wyrd_server::state::ServerSettings {
+        deployment_profile: wyrd_server::config::DeploymentProfile::Production,
+        ..state.settings
+    }
+    .validate(&state.bifrost, &state.auth)
+    .expect("real verifier, audit, and signing key are production-valid");
 
     let subject = server
         .bootstrap_service("production-subject", &["editor"])
@@ -808,7 +816,7 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
     ));
     let snapshot = tokio::time::timeout(SNAPSHOT_PUBLICATION_CEILING, async {
         loop {
-            let snapshot = server.state().readiness.load_full();
+            let snapshot = server.state().health.readiness.load_full();
             if snapshot.postgres.reason != ProbeReason::Warmup {
                 break snapshot;
             }
@@ -821,7 +829,7 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
         loop_handle.abort();
         panic!(
             "readiness publication timed out; postgres={:?}, completed passes={}",
-            server.state().readiness.load().postgres,
+            server.state().health.readiness.load().postgres,
             server.completed_forge_scheduler_passes_for_test()
         );
     });

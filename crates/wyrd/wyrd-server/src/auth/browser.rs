@@ -52,7 +52,7 @@ pub(crate) const SESSION_COOKIE_PREFIX: &str = "wyrd_session_";
 pub(crate) fn browser_sessions(state: &AppState) -> Result<BrowserSessions, WyrdErrorResponse> {
     let issuer = state
         .auth
-        .tenant_issuer(&state.scribe_outbox)
+        .tenant_issuer(state.bifrost.scribe_outbox())
         .ok_or_else(auth_not_configured)?;
     let connections = state
         .auth
@@ -708,22 +708,24 @@ mod pg_tests {
             Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         );
-        let audit = Arc::clone(&state.scribe_outbox);
+        let audit = Arc::clone(state.bifrost.scribe_outbox());
         let issuing_key = IssuingKey::from_ed_pem(
             SecretString::from(PRIVATE_KEY_PEM.to_owned()),
             Kid::new("k1").expect("kid is valid"),
             "wyrd",
         )
         .expect("issuing key parses");
-        state.with_auth(ServerAuth {
-            issuing_key: Some(Arc::new(issuing_key)),
-            human_connections: Some(HumanConnections::new(
-                fixture.wyrd_postgres().clone(),
-                None,
-                ScreenedHttp::allowing_internal(),
-                audit,
-            )),
-            ..ServerAuth::default()
+        state.with_owners_for_test(|owners| {
+            owners.auth = ServerAuth {
+                issuing_key: Some(Arc::new(issuing_key)),
+                human_connections: Some(HumanConnections::new(
+                    fixture.wyrd_postgres().clone(),
+                    None,
+                    ScreenedHttp::allowing_internal(),
+                    audit,
+                )),
+                ..ServerAuth::default()
+            }
         })
     }
 

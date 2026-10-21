@@ -15,10 +15,15 @@
 //! delivered after its commit, so a call racing an administrative write can
 //! still route on the previous snapshot for that delivery latency, as a call
 //! admitted just before the write would.
+//!
+//! At most [`CACHE_TENANTS`] tenants' snapshots are retained, evicting the
+//! least recently used, because every Wyrd-owned buffer is bounded; an
+//! evicted tenant's next call reads Postgres.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use lru::LruCache;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_gateway::GatewayTenantSnapshot;
@@ -27,12 +32,14 @@ use wyrd_spec::DataTenantId;
 /// Postgres channel the snapshot triggers notify on.
 pub(crate) const SNAPSHOT_CHANNEL: &str = "wyrd_gateway_snapshot";
 
+/// Most tenants whose snapshots one process retains.
+const CACHE_TENANTS: NonZeroUsize = NonZeroUsize::new(4_096).expect("4096 is non-zero");
+
 /// Cache state guarded by one lock, so a fill and an invalidation are ordered
 /// by it.
-#[derive(Default)]
 struct Entries {
-    /// Cached snapshots by tenant.
-    snapshots: HashMap<DataTenantId, Arc<GatewayTenantSnapshot>>,
+    /// Cached snapshots by tenant, least recently used evicted first.
+    snapshots: LruCache<DataTenantId, Arc<GatewayTenantSnapshot>>,
     /// Bumped by every invalidation; a fill that began under an older value
     /// is not cached.
     generation: u64,
@@ -40,11 +47,21 @@ struct Entries {
     live: bool,
 }
 
+impl Default for Entries {
+    /// No snapshots, generation zero, and not yet listening.
+    fn default() -> Self {
+        Self {
+            snapshots: LruCache::new(CACHE_TENANTS),
+            generation: 0,
+            live: false,
+        }
+    }
+}
+
 /// Tenant-keyed cache of gateway snapshots; see the module docs for when it
-/// serves.
-// ponytail: one entry per tenant that called the gateway since the last
-// invalidation, unbounded; bound it by bytes like the Verifier target cache
-// if tenant counts make that matter.
+/// serves and how much it retains.
+// ponytail: bounded by tenant count, not bytes; charge each snapshot's size
+// like the Verifier target cache if tenants' configurations grow large.
 #[derive(Default)]
 pub struct GatewaySnapshots {
     /// Entries behind one short synchronous lock; no await happens under it.
@@ -60,11 +77,11 @@ impl GatewaySnapshots {
 
     /// The snapshot cached for `tenant`, served only while listening.
     pub(crate) fn cached(&self, tenant: DataTenantId) -> Option<Arc<GatewayTenantSnapshot>> {
-        let entries = self.entries();
-        entries
-            .live
-            .then(|| entries.snapshots.get(&tenant).map(Arc::clone))
-            .flatten()
+        let mut entries = self.entries();
+        if !entries.live {
+            return None;
+        }
+        entries.snapshots.get(&tenant).map(Arc::clone)
     }
 
     /// The generation a load must start under for its snapshot to be cached,
@@ -86,7 +103,7 @@ impl GatewaySnapshots {
         let snapshot = Arc::new(snapshot);
         let mut entries = self.entries();
         if entries.live && generation == Some(entries.generation) {
-            entries.snapshots.insert(tenant, Arc::clone(&snapshot));
+            entries.snapshots.put(tenant, Arc::clone(&snapshot));
         }
         snapshot
     }
@@ -102,7 +119,7 @@ impl GatewaySnapshots {
             .and_then(|tenant| DataTenantId::new(tenant).ok())
         {
             Some(tenant) => {
-                entries.snapshots.remove(&tenant);
+                entries.snapshots.pop(&tenant);
             }
             None => entries.snapshots.clear(),
         }
@@ -148,7 +165,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::gateway::{GatewayCaptureMode, GatewayCapturePolicy};
 
-    use super::GatewaySnapshots;
+    use super::{CACHE_TENANTS, GatewaySnapshots};
 
     /// An empty snapshot.
     fn snapshot() -> GatewayTenantSnapshot {
@@ -199,5 +216,31 @@ mod tests {
         cache.reset(false);
         cache.reset(true);
         assert!(cache.cached(tenant).is_none(), "a lost listener forgets");
+    }
+
+    /// The cache retains at most [`CACHE_TENANTS`] tenants, evicting the
+    /// least recently served one, while every retained tenant keeps serving.
+    #[test]
+    fn snapshots_retain_a_bounded_number_of_tenants() {
+        let cache = GatewaySnapshots::default();
+        cache.reset(true);
+        let first = DataTenantId::new_v7();
+        let second = DataTenantId::new_v7();
+        cache.insert(first, cache.fill_generation(), snapshot());
+        cache.insert(second, cache.fill_generation(), snapshot());
+        for _ in 2..CACHE_TENANTS.get() {
+            cache.insert(DataTenantId::new_v7(), cache.fill_generation(), snapshot());
+        }
+        assert!(cache.cached(first).is_some(), "serving refreshes recency");
+
+        cache.insert(DataTenantId::new_v7(), cache.fill_generation(), snapshot());
+        assert!(
+            cache.cached(first).is_some(),
+            "the recently served tenant stays"
+        );
+        assert!(
+            cache.cached(second).is_none(),
+            "the least recently served tenant is evicted"
+        );
     }
 }

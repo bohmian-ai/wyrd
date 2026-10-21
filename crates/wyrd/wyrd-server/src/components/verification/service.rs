@@ -488,7 +488,11 @@ impl<'a> VerificationControl<'a> {
         let admitted = telemetry.time(Phase::Admit, || {
             self.authorize_run(caller, &request.verifier_card_uid, None, EXECUTE, &resource)?;
             // The inputs and result rows, reserved before any work is done.
-            self.state.scribe_outbox.reserve(2).map_err(staging_full)
+            self.state
+                .bifrost
+                .scribe_outbox()
+                .reserve(2)
+                .map_err(staging_full)
         });
         let staged = match admitted {
             Ok(staged) => staged,
@@ -652,8 +656,10 @@ impl<'a> VerificationControl<'a> {
         let submissions = self
             .state
             .bifrost
-            .submissions()
-            .filter(|_| self.state.scribe_outbox.sink().reaches_scribe())
+            .scribe_outbox()
+            .sink()
+            .reaches_scribe()
+            .then_some(self.state.verification.submissions())
             .ok_or_else(Self::unavailable)?;
         let resource = format!(
             "verifier:{}/subject:{}",
@@ -704,7 +710,12 @@ impl<'a> VerificationControl<'a> {
         .inputs(&submission.request.inputs, Some(&submission))
         .map_err(|error| payload_error(&error))?;
         let queued = submissions.reserve(1).map_err(staging_full)?;
-        let staged = self.state.scribe_outbox.reserve(1).map_err(staging_full)?;
+        let staged = self
+            .state
+            .bifrost
+            .scribe_outbox()
+            .reserve(1)
+            .map_err(staging_full)?;
         let execution_id = submission.execution_id;
         staged.stage(
             caller.data_tenant_id,
@@ -808,7 +819,8 @@ impl<'a> VerificationControl<'a> {
         };
         let resolved = self
             .state
-            .verifier_cards
+            .verification
+            .verifier_cards()
             .resolve(
                 Db::Pool(self.state.postgres.wyrd()),
                 caller.data_tenant_id,
@@ -851,8 +863,9 @@ impl<'a> VerificationControl<'a> {
     /// none.
     fn blocks(&self) -> Result<&HostedBlocks, WyrdError> {
         self.state
-            .verification_blocks
-            .as_deref()
+            .verification
+            .blocks()
+            .map(Arc::as_ref)
             .ok_or_else(Self::unavailable)
     }
 
@@ -886,7 +899,7 @@ impl<'a> VerificationControl<'a> {
         let required = Permission::verifier_run(verifier.clone());
         let decision = self
             .state
-            .authz
+            .auth
             .permission_check
             .check(&caller.principal, &required)
             .into_result()
@@ -908,7 +921,7 @@ impl<'a> VerificationControl<'a> {
         } else {
             AuditOutcome::Denied
         };
-        self.state.scribe_outbox.stage(
+        self.state.bifrost.scribe_outbox().stage(
             caller.data_tenant_id,
             audit::audit_event(caller, operation, resource, &required.to_string(), outcome),
         );
@@ -937,7 +950,7 @@ impl<'a> VerificationControl<'a> {
         } else {
             AuditOutcome::Denied
         };
-        self.state.scribe_outbox.stage(
+        self.state.bifrost.scribe_outbox().stage(
             caller.data_tenant_id,
             audit::audit_event(
                 caller,

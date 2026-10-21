@@ -193,7 +193,7 @@ impl Support {
             state.postgres.wyrd().clone(),
             self.server.operator_pool(),
             VerifierExecutionQueue::default(),
-            BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox)),
+            BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox())),
             Duration::from_secs(1),
         )
         .with_groups(
@@ -532,7 +532,7 @@ async fn available_rows_form_expiring_group_snapshots() {
     let judged = support.execute("yes").await;
     let staged = payload(&source, &group, &judged);
     let state = support.server.state();
-    state.scribe_outbox.stage(
+    state.bifrost.scribe_outbox().stage(
         support.server.data_tenant_id(),
         result(&source, staged.clone()),
     );
@@ -582,7 +582,8 @@ async fn available_rows_form_expiring_group_snapshots() {
     );
 
     state
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .stage(support.server.data_tenant_id(), result(&source, staged));
     support
         .server
@@ -668,7 +669,8 @@ async fn incomplete_snapshots_retry_then_error() {
     .expect("the result builds");
     let state = support.server.state();
     state
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .stage(support.server.data_tenant_id(), result(&source, payload));
     support
         .server
@@ -825,14 +827,15 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     );
     drop(rival);
     let state = support.server.state();
-    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox))
-        .resolve(
-            &mut claimer,
-            due.owner.expect("the Service has a principal"),
-        )
-        .await
-        .expect("authority resolves")
-        .expect("the owner is accepted");
+    let authority =
+        BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox()))
+            .resolve(
+                &mut claimer,
+                due.owner.expect("the Service has a principal"),
+            )
+            .await
+            .expect("authority resolves")
+            .expect("the owner is accepted");
     let system = system_principal_id(&mut claimer)
         .await
         .expect("SYSTEM reads")

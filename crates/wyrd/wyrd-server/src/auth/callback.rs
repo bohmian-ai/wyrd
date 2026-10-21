@@ -31,7 +31,7 @@ pub async fn exchange_authorization_code(
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
         issuer: state
             .auth
-            .tenant_issuer(&state.scribe_outbox)
+            .tenant_issuer(state.bifrost.scribe_outbox())
             .ok_or_else(auth_not_configured)?,
         connections: state
             .auth
@@ -1286,7 +1286,7 @@ mod pg_tests {
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                &*state.scribe_outbox,
+                &**state.bifrost.scribe_outbox(),
                 trusted.tenant_id,
                 "req",
                 &error.0,
@@ -1303,7 +1303,7 @@ mod pg_tests {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
-                .tenant_issuer(&state.scribe_outbox)
+                .tenant_issuer(state.bifrost.scribe_outbox())
                 .expect("test state has issuing key"),
             connections: state
                 .auth
@@ -1381,18 +1381,20 @@ mod pg_tests {
         );
         let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
         let (state, scribe) = RecordingScribe::attach(test_state(fixture).await);
-        let audit = Arc::clone(&state.scribe_outbox);
-        let state = state.with_auth(crate::components::auth::ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(Arc::new(verifier)),
-            human_connections: Some(HumanConnections::new(
-                fixture.wyrd_postgres().clone(),
-                Some(Arc::clone(&sealing_key)),
-                ScreenedHttp::allowing_internal(),
-                audit,
-            )),
-            sealing_key: Some(sealing_key),
-            ..crate::components::auth::ServerAuth::default()
+        let audit = Arc::clone(state.bifrost.scribe_outbox());
+        let state = state.with_owners_for_test(|owners| {
+            owners.auth = crate::components::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(Arc::new(verifier)),
+                human_connections: Some(HumanConnections::new(
+                    fixture.wyrd_postgres().clone(),
+                    Some(Arc::clone(&sealing_key)),
+                    ScreenedHttp::allowing_internal(),
+                    audit,
+                )),
+                sealing_key: Some(sealing_key),
+                ..crate::components::auth::ServerAuth::default()
+            }
         });
         (state, scribe)
     }
@@ -1423,7 +1425,7 @@ mod pg_tests {
     async fn settle(state: &AppState) {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );

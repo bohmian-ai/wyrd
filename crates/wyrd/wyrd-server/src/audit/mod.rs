@@ -126,7 +126,10 @@ pub fn authorize(
     resource: &str,
 ) -> Result<(), WyrdError> {
     let allowed = authorize_recording_denial(state, caller, required, operation, resource)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, allowed);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, allowed);
     Ok(())
 }
 
@@ -134,7 +137,7 @@ pub fn authorize(
 ///
 /// A denial is staged here because it carries no operation detail. The
 /// returned `Allowed` event is *not* yet staged: the caller enriches it with
-/// its operation-specific detail and MUST stage it on `state.scribe_outbox`
+/// its operation-specific detail and MUST stage it on `state.bifrost.scribe_outbox()`
 /// before performing the operation, so every evaluated allowance is recorded
 /// whether or not the operation later succeeds.
 ///
@@ -148,7 +151,7 @@ pub fn authorize_recording_denial(
     resource: &str,
 ) -> Result<AuditEvent, WyrdError> {
     if let Err(reason) = state
-        .authz
+        .auth
         .permission_check
         .check(&caller.principal, required)
         .into_result()
@@ -160,7 +163,10 @@ pub fn authorize_recording_denial(
             &required.to_string(),
             AuditOutcome::Denied,
         );
-        state.scribe_outbox.stage(caller.data_tenant_id, denied);
+        state
+            .bifrost
+            .scribe_outbox()
+            .stage(caller.data_tenant_id, denied);
         return Err(permission_deny_reason_to_wyrd(reason));
     }
     Ok(audit_event(
@@ -177,7 +183,7 @@ pub fn authorize_recording_denial(
 /// Credential administration shares one permission across issuance, trusted
 /// issuers, workload bindings, and principal revocation. A denial is staged
 /// here; the returned `Allowed` event lets the handler attach its
-/// operation-specific detail and MUST be staged on `state.scribe_outbox` before
+/// operation-specific detail and MUST be staged on `state.bifrost.scribe_outbox()` before
 /// the handler performs the operation.
 ///
 /// The verdict comes from the configured `PermissionCheck` through

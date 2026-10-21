@@ -120,19 +120,20 @@ impl Verification {
         &self.operator_keys
     }
 
-    /// The target invalidation listener over `pool`, which runs until
+    /// The target invalidation listener over `postgres`, which runs until
     /// `shutdown`; `None` where no Verifier runs, since targets are resolved
     /// only where blocks are hosted.
     pub(crate) fn refresh_worker(
         &self,
-        pool: sqlx::PgPool,
+        postgres: &wyrd_sql::WyrdPostgres,
         shutdown: CancellationToken,
     ) -> Option<EngineWorker> {
         self.blocks.as_ref()?;
+        let postgres = postgres.clone();
         let targets = self.verifier_cards();
         Some((
             "verifier_card_cache",
-            Box::pin(async move { targets.watch(&pool, shutdown).await }),
+            Box::pin(async move { targets.watch(&postgres, shutdown).await }),
         ))
     }
 

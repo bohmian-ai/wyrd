@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wyrd_crypt::SealingKeyring;
 use wyrd_gateway::GatewayEngine;
+use wyrd_sql::WyrdPostgres;
 
 use super::{GatewayApiKeys, GatewaySnapshots};
 use crate::boot::ServerBootError;
@@ -111,13 +111,18 @@ impl Gateway {
         &self.tasks
     }
 
-    /// The snapshot invalidation listener over `pool`, which runs until
-    /// `shutdown`; snapshots serve only while it listens.
-    pub(crate) fn refresh_worker(&self, pool: PgPool, shutdown: CancellationToken) -> EngineWorker {
+    /// The snapshot invalidation listener over `postgres`, which runs
+    /// until `shutdown`; snapshots serve only while it listens.
+    pub(crate) fn refresh_worker(
+        &self,
+        postgres: &WyrdPostgres,
+        shutdown: CancellationToken,
+    ) -> EngineWorker {
+        let postgres = postgres.clone();
         let snapshots = Arc::clone(&self.snapshots);
         (
             "gateway_snapshot_cache",
-            Box::pin(async move { snapshots.watch(&pool, shutdown).await }),
+            Box::pin(async move { snapshots.watch(&postgres, shutdown).await }),
         )
     }
 

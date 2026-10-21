@@ -116,7 +116,7 @@ impl ServerPostgres {
 /// Pause before reconnecting after a listener fails to connect or listen.
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Listens on Postgres `channel` from `pool` until `shutdown`, feeding an
+/// Listens on Postgres `channel` from `postgres`'s app pool until `shutdown`, feeding an
 /// in-process cache that serves only while it hears every invalidation.
 ///
 /// Holds one pool connection for the listener. `reset(true)` runs after each
@@ -126,7 +126,7 @@ const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 /// serving. Each notification's payload goes to `notify`. A failed connect or
 /// `LISTEN` leaves serving off and retries after [`RECONNECT_DELAY`].
 pub(crate) async fn watch_channel(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     channel: &str,
     shutdown: tokio_util::sync::CancellationToken,
     reset: impl Fn(bool),
@@ -134,7 +134,8 @@ pub(crate) async fn watch_channel(
 ) {
     while !shutdown.is_cancelled() {
         let listener = async {
-            let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+            let mut listener =
+                sqlx::postgres::PgListener::connect_with(postgres.app_pool()).await?;
             listener.listen(channel).await?;
             Ok::<_, sqlx::Error>(listener)
         };

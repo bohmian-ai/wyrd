@@ -335,13 +335,13 @@ impl VerifierCardCache {
         entries.live = live;
     }
 
-    /// Listens for target invalidations on `pool` until `shutdown`.
+    /// Listens for target invalidations from `postgres` until `shutdown`.
     ///
     /// Targets serve only between a successful `LISTEN` and the next lost
     /// connection; see [`crate::postgres::watch_channel`].
-    pub async fn watch(&self, pool: &sqlx::PgPool, shutdown: CancellationToken) {
+    pub async fn watch(&self, postgres: &wyrd_sql::WyrdPostgres, shutdown: CancellationToken) {
         crate::postgres::watch_channel(
-            pool,
+            postgres,
             TARGET_CHANNEL,
             shutdown,
             |live| self.reset(live),

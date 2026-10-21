@@ -142,11 +142,11 @@ impl GatewaySnapshots {
         self.entries().generation
     }
 
-    /// Listens for snapshot invalidations on `pool` until `shutdown`; see
+    /// Listens for snapshot invalidations from `postgres` until `shutdown`; see
     /// [`crate::postgres::watch_channel`].
-    pub async fn watch(&self, pool: &sqlx::PgPool, shutdown: CancellationToken) {
+    pub async fn watch(&self, postgres: &wyrd_sql::WyrdPostgres, shutdown: CancellationToken) {
         crate::postgres::watch_channel(
-            pool,
+            postgres,
             SNAPSHOT_CHANNEL,
             shutdown,
             |live| self.reset(live),

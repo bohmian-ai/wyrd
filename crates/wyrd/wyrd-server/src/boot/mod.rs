@@ -1357,7 +1357,7 @@ impl AppState {
     /// the verification runtime of an API-serving process with verification
     /// enabled, its drain grace clipped inside the server's shutdown budget.
     fn engine_workers(&self, config: &WyrdServerConfig) -> Vec<EngineWorker> {
-        let pool = self.postgres.wyrd().app_pool().clone();
+        let postgres = self.postgres.wyrd();
         let shutdown = &self.shutdown_token;
         let mut workers: Vec<EngineWorker> = self
             .bifrost
@@ -1367,8 +1367,8 @@ impl AppState {
         if !config.role.serves_api() {
             return workers;
         }
-        workers.push(self.gateway.refresh_worker(pool.clone(), shutdown.clone()));
-        workers.extend(self.verification.refresh_worker(pool, shutdown.clone()));
+        workers.push(self.gateway.refresh_worker(postgres, shutdown.clone()));
+        workers.extend(self.verification.refresh_worker(postgres, shutdown.clone()));
         #[cfg(feature = "test-support")]
         let held = self.test_hooks.hold_verification_runner;
         #[cfg(not(feature = "test-support"))]

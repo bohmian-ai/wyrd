@@ -10,7 +10,7 @@ status: runnable
 
 A Service Card is the root of your declaration. It names the components your service is built from, each pinned to an exact Card version, and the tables it records rows into. You write it in YAML whatever language the service is written in, and `wyrd declare --check` checks it without a server.
 
-This page builds the `support-desk` Service from the [quickstart](/get-started/quickstart/). The finished files are in `examples/support-desk-app/service/`.
+This page builds the `support-desk` Service. The finished files are in `examples/support-desk-app/service/`.
 
 ## 1. Write the components
 

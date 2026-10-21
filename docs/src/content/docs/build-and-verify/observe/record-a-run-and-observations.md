@@ -14,8 +14,8 @@ Pull and load the exact Service version you deployed, wrap each request in a run
 
 ## Prerequisites
 
-- The declared `support-desk` Service from [Verify your first agent](/get-started/quickstart/). Its Cards live in `examples/support-desk-app/service/`: the Service declares a `tickets` table with `question` and `answer` columns, binds `no-refund-promise` (one `answer` input) to itself, and binds `ticket-complete` (one `ticket` input) and `follows-policy` (one `letter` file) to its `agent` component.
-- A credential bound to that Service version, so the server can attribute what it records. Against the local server from [Set up Wyrd](/get-started/setup/), the saved settings work as they are, as in the quickstart. Elsewhere, a tenant administrator issues one:
+- The declared `support-desk` Service. Its Cards live in `examples/support-desk-app/service/`: the Service declares a `tickets` table with `question` and `answer` columns, binds `no-refund-promise` (one `answer` input) to itself, and binds `ticket-complete` (one `ticket` input) and `follows-policy` (one `letter` file) to its `agent` component.
+- A credential bound to that Service version, so the server can attribute what it records. Against the local server from [Set up Wyrd](/get-started/setup/), the saved settings work as they are. Elsewhere, a tenant administrator issues one:
 
   ```bash
   wyrd auth issue-key --kind Service --name support-desk --version 1.0.0 --space default
@@ -33,7 +33,7 @@ wyrd pull --space default --kind Service --name support-desk --version 1.0.0 \
   --output-dir ./.wyrd-bundle
 ```
 
-Pull replaces an existing bundle only once the new one is complete, so a failed pull leaves the previous bundle usable. `wyrd get` with the same selector prints the Service's envelope only and writes nothing. The example apps pull from code instead, right after declaring; see step 4 of the [quickstart](/get-started/quickstart/#4-deploy-the-cards).
+Pull replaces an existing bundle only once the new one is complete, so a failed pull leaves the previous bundle usable. `wyrd get` with the same selector prints the Service's envelope only and writes nothing. The example apps pull from code instead, right after declaring; see [Declare and inspect](/build-and-verify/declare/declare-and-inspect/).
 
 ## 2. Load it and start Bifrost and telemetry
 

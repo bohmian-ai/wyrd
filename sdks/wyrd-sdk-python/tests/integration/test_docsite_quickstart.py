@@ -1,7 +1,7 @@
 """The docsite Quickstart, run as a reader runs them.
 
 ``examples/quickstart`` holds a Verifier, the Service that references it, and
-one script that declares them with ``WyrdState.declare`` and verifies a passing
+``quickstart.py``, one script that declares them with ``WyrdState.declare`` and verifies a passing
 and a failing refund. The journey copies the files to an empty directory and
 runs the script against a real server, twice.
 """
@@ -37,12 +37,15 @@ def run_quickstart(directory: Path) -> tuple[dict, str]:
 @pytest.fixture
 def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """An empty directory holding only the Quickstart's files, as the working directory."""
-    shutil.copytree(EXAMPLE, tmp_path / "quickstart")
-    monkeypatch.chdir(tmp_path / "quickstart")
+    reader = tmp_path / "quickstart"
+    reader.mkdir()
+    for path in [*EXAMPLE.glob("*.yaml"), EXAMPLE / "quickstart.py"]:
+        shutil.copy(path, reader)
+    monkeypatch.chdir(reader)
     # Keep the developer's saved Wyrd config out of the SDK credential chain.
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
     (tmp_path / "tmp").mkdir()
-    return tmp_path / "quickstart"
+    return reader
 
 
 @pytest.fixture

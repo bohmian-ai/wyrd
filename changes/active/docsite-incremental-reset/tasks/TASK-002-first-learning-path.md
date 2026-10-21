@@ -132,3 +132,40 @@ within the approved experience is implementation-owned.
 - [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Introduction teaches verification, assurance, exact identities, and the boundary before any run | `docs/src/content/docs/get-started/introduction.md` | `mise run docs:check` (build, links, a11y) | PASS |
+| Setup installs one pinned version per language and starts one kept-running server | `get-started/setup.md` (0.3.0, LangTabs) | `docs:check`; TASK-001 0.2.0 walkthroughs for the server lifecycle | PASS (source); released walkthrough pending |
+| Quickstart embeds verified files verbatim in Python, Rust, and TypeScript | `examples/quickstart/{refund-limit,support-reply}.yaml`, `quickstart.{py,rs,ts}`; `get-started/quickstart.md` | `page-text.test.ts`; `test_docsite_quickstart.py` (3 passed); `mise run test:examples` (`quickstart_verifies_and_repeats` PASS); `declare-and-pull.test.ts` (14 passed) | PASS |
+| Pass, fail, rerun, spec drift, and refusal behave as documented | Quickstart sections 2–4 | the Python journey covers drift, refusal, and missing file; the Rust and TS journeys cover pass, fail, and an identical rerun with no new files | PASS |
+| Machine index start descriptions and generated outputs match | `docs/scripts/generate_llms_txt.py`; regenerated `llms*.txt` | `docs:check` generated-drift stage | PASS |
+| Onboarding disposition rows | `changes/active/docsite-incremental-reset/dispositions.md` | review | PASS |
+
+Commands: `mise run docs:check`, `mise run docs:svelte:check`, `mise run test:examples`,
+`mise run check:ci-selection`, `mise run ts:format:check`, `mise run ts:lints`,
+`mise run ts:typecheck`, `mise run py:format`, `mise run py:lints`, `mise run fmt`,
+clippy `-D warnings` on `wyrd-rust-examples` and `wyrd-spec`, the exact Python and TypeScript
+journey selectors above, and `git diff --check`.
+
+Diagnosis (default version):
+- **Symptom:** The Rust journey printed `support-reply@0.1.0`, but the docs and TASK-001 evidence said `1.0.0`.
+- **Cause:** A Service with no `metadata.version` defaults to `0.1.0`. The Python journey asserted only the verdicts.
+- **Fix site:** The example's `support-reply.yaml` now declares `version: 1.0.0` explicitly. No SDK default changed.
+
+Supporting changes, each forced by a gate:
+- `VerificationVerdict` derives `strum::Display`, so Rust prints `passed` and `failed` like the other SDKs.
+- `check_commands.py` now forbids only workspace cargo commands, and a self-check pins the rule. Reader-project `cargo new`, `cargo add`, `cargo run`, and `cargo install` are allowed.
+- The `docs:svelte:check` type errors in `highlight.js` and `page-text.js` are fixed.
+- Four retained pages had stale Quickstart anchors and claims, which are corrected. One of those anchors failed prerender.
+- The CI selection now routes `examples/<guide>/` files and the `wyrd-rust-examples` crate to the `test:examples` lane.
+
+Limits and blockers:
+- **Merge blocker:** no released version ships `WyrdState.declare`. The pages are pinned to 0.3.0, and the released 0.3.0 walkthrough on Linux and macOS arm64 must pass before merge.
+- The Rust SDK `wyrd-ai` has never been published to crates.io. The 0.3.0 release must publish it, or the Rust install fails.
+- The macOS memory fix (the CLI no longer supplies `BIFROST_MEMORY_LIMIT`) is at HEAD but unreleased.
+- Biome does not lint `examples/*.ts`; `tsc` through `ts:typecheck` covers it.
+- Keyboard navigation, both themes, and responsive layout are covered by `docs:a11y` and the build only. A manual visual review comes with the release walkthrough.
+- The generated `llms*.txt` and API pages are staged, not committed. The commit waits for the caller.

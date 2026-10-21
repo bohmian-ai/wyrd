@@ -148,6 +148,7 @@ pub enum VerificationExecutionStatus {
     Serialize,
     Deserialize,
     schemars::JsonSchema,
+    strum::Display,
     strum::EnumString,
     strum::IntoStaticStr,
 )]

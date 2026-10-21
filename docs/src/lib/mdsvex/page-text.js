@@ -9,6 +9,7 @@ import { embedCodeFromFile } from './highlight.js';
 // Mirrors `paths.base` in svelte.config.js.
 const BASE = '/wyrd';
 
+/** @type {Record<string, string>} */
 const LANGS = { python: 'Python', rust: 'Rust', typescript: 'TypeScript' };
 
 // Components a page renders as structure or pictures, not text.
@@ -47,9 +48,12 @@ function fence(code, lang, title) {
  */
 function component(tag, name, attrs) {
   if (tag.startsWith('</')) return '';
-  const attr = (key) => attrs.match(new RegExp(`\\b${key}="([^"]*)"`))?.[1];
+  const attr = (/** @type {string} */ key) => attrs.match(new RegExp(`\\b${key}="([^"]*)"`))?.[1];
   if (name === 'Tab') return `**${attr('label')}**`;
-  if (name === 'LangTab') return `**${LANGS[attr('lang')] ?? attr('lang')}**`;
+  if (name === 'LangTab') {
+    const lang = attr('lang') ?? '';
+    return `**${LANGS[lang] ?? lang}**`;
+  }
   if (name === 'Aside') return `**${attr('title') ?? 'Note'}:** `;
   if (name.startsWith('Wyrd')) return `_Diagram \`${attr('name')}\`: see the web page._`;
   return '';

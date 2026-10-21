@@ -17,7 +17,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
 use wyrd_tonic::otlp::metrics::v1::{
@@ -250,14 +250,23 @@ pub struct MetricOutputWidths {
     pub exemplar: usize,
 }
 
+/// Projected point schema, built once: every point batch shares this `Arc`,
+/// so batches of one destination compare by pointer and no row rebuilds or
+/// frees the schema tree.
+static METRIC_SCHEMA: LazyLock<Arc<Schema>> =
+    LazyLock::new(|| projected_signal_schema(METRIC_FIELDS));
+
+/// Point output widths, derived once from the constant point ledger.
+static METRIC_WIDTHS: LazyLock<MetricOutputWidths> = LazyLock::new(|| MetricOutputWidths {
+    row: fixed_row_bytes(METRIC_SCHEMA.fields()),
+    exemplar: fixed_row_bytes(&Fields::from(vec![EXEMPLAR_ELEMENT.to_arrow()])),
+});
+
 impl MetricOutputWidths {
-    /// Derives the widths from the canonical point ledger.
+    /// The widths of the canonical point ledger, derived once per process.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            row: fixed_row_bytes(projected_signal_schema(METRIC_FIELDS).fields()),
-            exemplar: fixed_row_bytes(&Fields::from(vec![EXEMPLAR_ELEMENT.to_arrow()])),
-        }
+        *METRIC_WIDTHS
     }
 }
 
@@ -1189,7 +1198,7 @@ impl PointColumns {
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
         ];
-        RecordBatch::try_new(projected_signal_schema(METRIC_FIELDS), columns)
+        RecordBatch::try_new(Arc::clone(&METRIC_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))
     }
 }

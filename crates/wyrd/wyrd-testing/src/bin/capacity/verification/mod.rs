@@ -4,9 +4,10 @@
 //! release `wyrd-server` through the local-development guide (`migrate`,
 //! serve, `setup`) on the whole host, Linux or macOS; the report title carries
 //! the host fingerprint, so compare only reports from matching hosts. One
-//! tenant registers an assertion Verifier, a Model, and a Service, and the
-//! application loads the pulled Service bundle under a Card-bound key, so
-//! every call is the public Rust client's `observe().verify` or
+//! tenant registers an assertion Verifier, a Model, and one Service per
+//! closed-loop client, and each client is its own application loading its
+//! pulled Service bundle under that Service's own Card-bound key, so every
+//! call is the public Rust client's `observe().verify` or
 //! `observe().submit` exactly as production makes it. All evidence comes from
 //! client timings, `/metrics`, and the OS's readings of the server process.
 //!
@@ -66,10 +67,11 @@ async fn benchmark(cases: &[u8], clients: &[usize]) -> Result<bool> {
     let [setup] = server.tenants() else {
         return Err("setup provisioned one tenant".into());
     };
-    let tenant = Tenant::provision(setup, &output.join("tenants")).await?;
+    let applications = clients.iter().copied().max().unwrap_or(0);
+    let tenant = Tenant::provision(setup, &output.join("tenants"), applications).await?;
     let bench = Bench::new(&server, tenant, output.join("profiles"));
     let label = format!(
-        "{}, {}s windows, 2 KiB contexts",
+        "{}, {}s windows, 2 KiB contexts, one Service key per client",
         server.describe(),
         WINDOW.as_secs()
     );

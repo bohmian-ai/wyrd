@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -614,19 +615,29 @@ impl<'a> GatewayAdministration<'a> {
         .await
     }
 
-    /// Loads one immutable admission snapshot of the tenant configuration.
+    /// The immutable admission snapshot of the tenant configuration.
     ///
-    /// Every table is read by one SQL statement, so the snapshot is consistent
-    /// even while administrators replace resources. It performs no
-    /// authorization: the runtime calls it only after admitting a verified
-    /// invocation. It never carries credential plaintext — environment
-    /// bindings carry only the operator reference and external secrets only
-    /// their opaque backend reference.
+    /// Served from the process [`GatewaySnapshots`](super::snapshots::GatewaySnapshots)
+    /// cache with no IO while it holds the tenant; otherwise every table is
+    /// read by one SQL statement, so the snapshot is consistent even while
+    /// administrators replace resources, and the result is cached. It
+    /// performs no authorization: the runtime calls it only after admitting a
+    /// verified invocation. It never carries credential plaintext —
+    /// environment bindings carry only the operator reference and external
+    /// secrets only their opaque backend reference.
     ///
     /// # Errors
     /// Returns `ServiceUnavailable` when storage fails and `Internal` when a
     /// stored document no longer decodes.
-    pub async fn snapshot(&self, tenant: DataTenantId) -> Result<GatewayTenantSnapshot, WyrdError> {
+    pub async fn snapshot(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Arc<GatewayTenantSnapshot>, WyrdError> {
+        let snapshots = &self.state.gateway_snapshots;
+        if let Some(snapshot) = snapshots.cached(tenant) {
+            return Ok(snapshot);
+        }
+        let generation = snapshots.fill_generation();
         let mut conn = self
             .postgres
             .tenant_conn(tenant)
@@ -637,7 +648,7 @@ impl<'a> GatewayAdministration<'a> {
         let credentials: Vec<StoredCredential> = decode(row.credentials)?;
         let mut governance: GatewayGovernancePolicy = decode_or_default(row.governance)?;
         governance.pricing = decode(row.pricing)?;
-        Ok(GatewayTenantSnapshot {
+        let snapshot = GatewayTenantSnapshot {
             deployments: decode(row.deployments)?,
             credentials: credentials
                 .into_iter()
@@ -646,7 +657,8 @@ impl<'a> GatewayAdministration<'a> {
             fallback: decode_or_default(row.fallback)?,
             governance,
             capture: capture_from(row.capture)?,
-        })
+        };
+        Ok(snapshots.insert(tenant, generation, snapshot))
     }
 
     /// Authorizes one operation, stages its decision, and runs it.

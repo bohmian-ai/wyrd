@@ -43,8 +43,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::{Array as _, AsArray as _, RecordBatch};
+use arrow::array::{Array as _, ArrayRef, AsArray as _, RecordBatch, StringArray};
 use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use chrono::Utc;
@@ -55,7 +56,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
+use vala_bifrost_redux::contracts::{
+    IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
+};
 use vala_bifrost_redux::gate::attribution::native_card_uids;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
@@ -68,10 +71,11 @@ use vala_bifrost_redux::tables::{
 use wyrd_runtime::outbox::{Outbox, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL};
+use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, SERVER_WRITE_PRINCIPAL};
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
+use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
@@ -80,7 +84,7 @@ use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 
-use crate::components::gateway::{CallCapture, CaptureDrop};
+use crate::components::gateway::CallCapture;
 use crate::verification::results::{ResultBatch, ResultPayload};
 use crate::verification::submissions::SubmissionSink;
 
@@ -189,14 +193,12 @@ impl From<CallCapture> for ScribeWrite {
 }
 
 /// One write's rows for one destination, before grouping.
-struct Rows<'a> {
+struct Rows {
     /// Destination table.
     table: ScribeTable,
-    /// Subject and actor Scribe stamps on the rows; the unresolved sentinel
-    /// pair for audit rows, which carry their own attribution as content.
+    /// Subject and actor Scribe stamps on every row; ignored for audit rows,
+    /// which carry their own attribution as content.
     attribution: Attribution,
-    /// Request the rows were admitted under, when the write has one.
-    request: Option<&'a RequestId>,
     /// The rows.
     batch: RecordBatch,
 }
@@ -219,25 +221,16 @@ impl ScribeWrite {
     /// # Errors
     ///
     /// Returns the projection failure's reason when the rows cannot be built.
-    fn rows(&self) -> Result<Vec<Rows<'_>>, &'static str> {
+    fn rows(&self) -> Result<Vec<Rows>, &'static str> {
         match self {
             Self::Audit(batch) => Ok(vec![Rows {
                 table: ScribeTable::AuditLog,
                 attribution: Attribution::unresolved(),
-                request: None,
                 batch: batch.clone().ok_or("projection")?,
             }]),
-            Self::Capture(capture) => Ok(capture
-                .batches()
-                .map_err(CaptureDrop::reason)?
-                .into_iter()
-                .map(|(table, batch)| Rows {
-                    table,
-                    attribution: capture.attribution(),
-                    request: Some(capture.request_id()),
-                    batch,
-                })
-                .collect()),
+            // Captures are projected in bulk by `ScribeSink::frames`, never
+            // one call at a time.
+            Self::Capture(_) => Ok(Vec::new()),
             Self::Result {
                 payload,
                 attribution,
@@ -251,7 +244,6 @@ impl ScribeWrite {
                     Ok(Rows {
                         table,
                         attribution: *attribution,
-                        request: None,
                         batch: batch.batch.clone(),
                     })
                 })
@@ -263,7 +255,6 @@ impl ScribeWrite {
                     .filter(|table| *table == ScribeTable::ExecutionInputs)
                     .ok_or("projection")?,
                 attribution: *attribution,
-                request: None,
                 batch: row.batch.clone(),
             }]),
             Self::ServerSpans {
@@ -271,7 +262,6 @@ impl ScribeWrite {
             } => Ok(vec![Rows {
                 table: ScribeTable::Spans,
                 attribution: *attribution,
-                request: None,
                 batch: project_spans(spans).ok_or("projection")?,
             }]),
         }
@@ -453,31 +443,32 @@ pub(crate) struct ScribeBatch {
     pub(crate) batch_id: Uuid,
     /// Request the frame is admitted under.
     pub(crate) request_id: RequestId,
-    /// The rows as one Arrow IPC stream.
+    /// The rows as one Arrow IPC stream; every row but an audit decision
+    /// carries the subject and actor Scribe stamps on it.
     pub(crate) ipc: Bytes,
-    /// Subject and actor Scribe stamps on the frame's rows.
-    pub(crate) attribution: Attribution,
 }
 
 impl ScribeBatch {
     /// Builds the Scribe frame for this batch.
     ///
-    /// Scribe stamps the batch's [`Attribution`] on every row and authorizes
-    /// each row's `card_uid` against the UID-bearing Cards the rows name,
-    /// which the producing owner authorized before staging. The transport
-    /// principal only carries the frame: the platform audit principal, the
-    /// one principal Scribe admits for the system owner's audit history, for
-    /// an audit frame, and the stamped actor otherwise. It carries no
-    /// permission, since every write here is server-internal and evaluates
-    /// none.
+    /// Scribe stamps each row's own subject and actor, which it carries as
+    /// content, and authorizes each row's `card_uid` against the UID-bearing
+    /// Cards the rows name, which the producing owner authorized before
+    /// staging. Audit decisions carry their pair as content, so an audit
+    /// frame submits the unresolved pair under the platform audit principal,
+    /// the one principal Scribe admits for the system owner's audit history;
+    /// every other frame is row-attributed under the reserved server-write
+    /// principal, the one principal Scribe admits row-carried pairs from. The
+    /// transport principal carries no permission, since every write here is
+    /// server-internal and evaluates none.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let transport = match self.table {
-            ScribeTable::AuditLog => PLATFORM_AUDIT_PRINCIPAL,
-            _ => self.attribution.act_principal_id,
+        let (transport, attribution) = match self.table {
+            ScribeTable::AuditLog => (PLATFORM_AUDIT_PRINCIPAL, Attribution::unresolved().into()),
+            _ => (SERVER_WRITE_PRINCIPAL, StampedAttribution::Rows),
         };
         ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
-            attribution: self.attribution,
+            attribution,
             principal: Principal::new(
                 transport,
                 PrincipalKind::User,
@@ -580,8 +571,6 @@ impl ScribePeers {
                 batch_id: batch.batch_id.to_string(),
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: batch.ipc.clone(),
-                sub_principal_id: batch.attribution.sub_principal_id.to_string(),
-                act_principal_id: batch.attribution.act_principal_id.to_string(),
             })
             .await
             .map(|_| ())
@@ -814,31 +803,52 @@ impl ScribeSink {
     }
 }
 
+/// Slice position of the write that contributed one row, and the subject and
+/// actor Scribe stamps on it.
+pub(crate) type Owner = (usize, Attribution);
+
 /// One frame being assembled from consecutive rows of one destination.
-struct Frame<'a> {
+struct Frame {
     /// Destination table.
     table: ScribeTable,
-    /// Subject and actor Scribe stamps on every row.
-    attribution: Attribution,
-    /// Request every row was admitted under, when they share one.
-    request: Option<&'a RequestId>,
     /// The rows, all of one schema.
     batches: Vec<RecordBatch>,
-    /// Slice position of the write that contributed each row, in row order.
-    owners: Vec<usize>,
+    /// Owner of each row, in row order.
+    owners: Vec<Owner>,
 }
 
-impl Frame<'_> {
-    /// Whether `rows` share this frame's destination, attribution, request,
-    /// and schema, so one Scribe frame can carry both.
-    fn shares(&self, rows: &Rows<'_>) -> bool {
-        self.table == rows.table
-            && self.attribution == rows.attribution
-            && self.request == rows.request
-            && {
-                let (ours, theirs) = (self.batches[0].schema_ref(), rows.batch.schema_ref());
-                Arc::ptr_eq(ours, theirs) || ours == theirs
+impl Frame {
+    /// Adds `batch`, bound for `table` and owned row by row by `owners`, to
+    /// the latest frame of `frames` it shares a destination and schema with,
+    /// or opens a new frame for it.
+    ///
+    /// Attribution never splits a frame: each row carries its own pair, so
+    /// one frame holds the rows of every caller in the slice.
+    fn absorb(frames: &mut Vec<Self>, table: ScribeTable, batch: RecordBatch, owners: Vec<Owner>) {
+        match frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.shares(table, &batch))
+        {
+            Some(frame) => {
+                frame.batches.push(batch);
+                frame.owners.extend(owners);
             }
+            None => frames.push(Self {
+                table,
+                batches: vec![batch],
+                owners,
+            }),
+        }
+    }
+
+    /// Whether `batch`, bound for `table`, shares this frame's destination
+    /// and schema, so one Scribe frame can carry both.
+    fn shares(&self, table: ScribeTable, batch: &RecordBatch) -> bool {
+        self.table == table && {
+            let (ours, theirs) = (self.batches[0].schema_ref(), batch.schema_ref());
+            Arc::ptr_eq(ours, theirs) || ours == theirs
+        }
     }
 
     /// The [`Chunk`] of this frame's `rows` rows starting at row `first`,
@@ -846,8 +856,6 @@ impl Frame<'_> {
     fn chunk(&self, first: usize, rows: usize, batches: Vec<RecordBatch>) -> Chunk {
         Chunk {
             table: self.table,
-            attribution: self.attribution,
-            request: self.request.cloned(),
             batches,
             owners: self.owners[first..first + rows].to_vec(),
         }
@@ -857,51 +865,74 @@ impl Frame<'_> {
 impl ScribeSink {
     /// Groups `items` into frames, in first-seen destination order.
     ///
-    /// Rows join the latest frame they share a destination, attribution,
-    /// request, and schema with, and otherwise open a new one, so the frames
-    /// of an identical slice are identical. Nothing is sized per row: one
+    /// Rows join the latest frame they share a destination and schema with,
+    /// and otherwise open a new one, so the frames of an identical slice are
+    /// identical. Attribution never splits a frame: every row carries its own
+    /// subject and actor, so a slice of many callers' writes still forms one
+    /// frame per destination. Nothing is sized per row: one
     /// row's batch allocates many times the bytes it holds, and measuring each
     /// row on the writer cost more than the write itself. [`Self::chunks`]
-    /// cuts each frame into budget-sized chunks from one measured row. Gateway capture
-    /// carries its admitting request, which Scribe stamps as
-    /// `wyrd_request_id`, so captures group per request. Result summary frames
+    /// cuts each frame into budget-sized chunks from one measured row. No write
+    /// keys its frame by request: a gateway call row carries its admitting
+    /// request as content, like an audit decision, so captures of many calls
+    /// share a frame. Captures are gathered and projected in one pass, after
+    /// the other writes' rows. Result summary frames
     /// are moved after every detail frame, so a visible summary's details
     /// were acknowledged first. Positions of writes that cannot be projected
     /// are added to `lost`.
-    fn frames<'a>(items: &'a [ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame<'a>> {
-        let mut frames: Vec<Frame<'a>> = Vec::new();
+    fn frames(items: &[ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame> {
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut captures: Vec<(usize, &CallCapture)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
+            if let ScribeWrite::Capture(capture) = item {
+                captures.push((index, capture));
+                continue;
+            }
             let rows = match item.rows() {
                 Ok(rows) => rows,
                 Err(reason) => {
-                    tracing::warn!(
-                        outbox = Self::NAME,
-                        reason,
-                        "a Scribe write could not be projected; it is dropped"
-                    );
-                    lost.insert(index);
+                    Self::unprojected(reason, [index], lost);
                     continue;
                 }
             };
             for rows in rows {
-                let owners = std::iter::repeat_n(index, rows.batch.num_rows());
-                match frames.iter_mut().rev().find(|frame| frame.shares(&rows)) {
-                    Some(frame) => {
-                        frame.batches.push(rows.batch);
-                        frame.owners.extend(owners);
-                    }
-                    None => frames.push(Frame {
-                        table: rows.table,
-                        attribution: rows.attribution,
-                        request: rows.request,
-                        batches: vec![rows.batch],
-                        owners: owners.collect(),
-                    }),
-                }
+                let owners = vec![(index, rows.attribution); rows.batch.num_rows()];
+                Frame::absorb(&mut frames, rows.table, rows.batch, owners);
             }
+        }
+        // Captures that cannot project in bulk are projected call by call, so
+        // only the captures that cannot project are lost.
+        let projected = CallCapture::project(&captures).unwrap_or_else(|_| {
+            captures
+                .chunks(1)
+                .filter_map(|single| {
+                    CallCapture::project(single)
+                        .map_err(|drop| Self::unprojected(drop.reason(), [single[0].0], lost))
+                        .ok()
+                })
+                .flatten()
+                .collect()
+        });
+        for (table, batch, owners) in projected {
+            Frame::absorb(&mut frames, table, batch, owners);
         }
         frames.sort_by_key(|frame| frame.table == ScribeTable::Results);
         frames
+    }
+
+    /// Logs the writes at `positions` as unprojectable for `reason` and adds
+    /// them to `lost`.
+    fn unprojected(
+        reason: &'static str,
+        positions: impl IntoIterator<Item = usize>,
+        lost: &mut BTreeSet<usize>,
+    ) {
+        tracing::warn!(
+            outbox = Self::NAME,
+            reason,
+            "a Scribe write could not be projected; it is dropped"
+        );
+        lost.extend(positions);
     }
 
     /// Cuts `frame`'s rows into consecutive [`Chunk`]s of about `budget`
@@ -912,7 +943,7 @@ impl ScribeSink {
     /// only on the rows: an identical slice always cuts identically. A
     /// staged batch is never divided; skewed row sizes are left to
     /// [`Chunk::encode`]'s split by encoded size.
-    fn chunks(frame: &Frame<'_>, budget: usize) -> Vec<Chunk> {
+    fn chunks(frame: &Frame, budget: usize) -> Vec<Chunk> {
         let sample = &frame.batches[0];
         let row_bytes = wyrd_queue::retained_bytes(sample)
             .unwrap_or_else(|| sample.get_array_memory_size())
@@ -944,14 +975,10 @@ impl ScribeSink {
 struct Chunk {
     /// Destination table.
     table: ScribeTable,
-    /// Subject and actor Scribe stamps on every row.
-    attribution: Attribution,
-    /// Request every row was admitted under, when they share one.
-    request: Option<RequestId>,
     /// The staged batches holding the chunk's rows, in row order.
     batches: Vec<RecordBatch>,
-    /// Slice position of the write that contributed each row, in row order.
-    owners: Vec<usize>,
+    /// Owner of each row, in row order.
+    owners: Vec<Owner>,
 }
 
 /// One submitted stream: how Scribe answered, the stream, and the slice
@@ -959,9 +986,11 @@ struct Chunk {
 type Submitted = (Result<(), ScribeRefusal>, ScribeBatch, BTreeSet<usize>);
 
 impl Chunk {
-    /// Concatenates the chunk's rows and encodes them as Arrow IPC streams
-    /// of at most `budget` bytes, each under its content-derived identity
-    /// and with the slice positions of the writes its rows came from.
+    /// Concatenates the chunk's rows, appends each row's subject and actor
+    /// unless they are audit decisions that carry their own, and encodes them
+    /// as Arrow IPC streams of at most `budget` bytes, each under its
+    /// content-derived identity and with the slice positions of the writes
+    /// its rows came from.
     ///
     /// A single row larger than `budget` is still encoded alone; Scribe
     /// decides whether its ceiling admits it.
@@ -979,15 +1008,51 @@ impl Chunk {
             [only] => only.clone(),
             batches => concat_batches(batches[0].schema_ref(), batches)?,
         };
+        let rows = match self.table {
+            ScribeTable::AuditLog => rows,
+            _ => self.attributed(&rows)?,
+        };
         let mut streams = Vec::new();
         Self::split(&rows, 0, budget, &mut streams)?;
         Ok(streams
             .into_iter()
             .map(|(start, count, ipc)| {
-                let owners = self.owners[start..start + count].iter().copied().collect();
+                let owners = self.owners[start..start + count]
+                    .iter()
+                    .map(|(position, _)| *position)
+                    .collect();
                 (self.identify(tenant, ipc), owners)
             })
             .collect())
+    }
+
+    /// `rows` with each row's owner's subject and actor appended as the
+    /// `sub_principal_id` and `act_principal_id` columns Scribe stamps from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the columns cannot be appended.
+    fn attributed(&self, rows: &RecordBatch) -> Result<RecordBatch, arrow::error::ArrowError> {
+        let column = |pick: fn(&Attribution) -> PrincipalId| {
+            Arc::new(StringArray::from_iter_values(
+                self.owners.iter().map(|(_, pair)| pick(pair).to_string()),
+            )) as ArrayRef
+        };
+        let mut fields = rows.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            SUB_PRINCIPAL_ID,
+            DataType::Utf8,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            ACT_PRINCIPAL_ID,
+            DataType::Utf8,
+            false,
+        )));
+        let mut columns = rows.columns().to_vec();
+        columns.push(column(|pair| pair.sub_principal_id));
+        columns.push(column(|pair| pair.act_principal_id));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
     }
 
     /// Appends `rows`, whose first row is row `first` of its frame, to
@@ -1027,12 +1092,11 @@ impl Chunk {
 
     /// Wraps one encoded stream of `frame` under its content-derived identity.
     ///
-    /// The batch id hashes the tenant, destination, attribution, request,
-    /// and encoded rows, so a retry of the identical slice resubmits the same
-    /// identity and Scribe's batch-id dedup absorbs frames it already
-    /// accepted. A frame with no originating request is admitted under a
-    /// request id derived from the batch id, so it too is stable across
-    /// retries. The digest carries `UUIDv7` version and variant bits.
+    /// The batch id hashes the tenant, destination, and encoded rows, each
+    /// row's attribution included, so a retry of the identical slice resubmits the same identity
+    /// and Scribe's batch-id dedup absorbs frames it already accepted. The
+    /// frame is admitted under a request id derived from the batch id, so it
+    /// too is stable across retries. The digest carries `UUIDv7` version and variant bits.
     ///
     /// # Panics
     ///
@@ -1043,11 +1107,6 @@ impl Chunk {
         digest.update(b"wyrd.scribe.outbox.batch-id.v1");
         digest.update(tenant.as_uuid().as_bytes());
         digest.update(self.table.fqn().as_bytes());
-        digest.update(self.attribution.sub_principal_id.as_uuid().as_bytes());
-        digest.update(self.attribution.act_principal_id.as_uuid().as_bytes());
-        if let Some(request) = &self.request {
-            digest.update(request.as_str().as_bytes());
-        }
         digest.update(&ipc);
         let digest: [u8; 32] = digest.finalize().into();
         let mut bytes = [0_u8; 16];
@@ -1055,16 +1114,14 @@ impl Chunk {
         bytes[6] = (bytes[6] & 0x0f) | 0x70;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let batch_id = Uuid::from_bytes(bytes);
-        let request_id = self.request.clone().unwrap_or_else(|| {
-            RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id")
-        });
+        let request_id =
+            RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id");
         ScribeBatch {
             tenant,
             table: self.table,
             batch_id,
             request_id,
             ipc: Bytes::from(ipc),
-            attribution: self.attribution,
         }
     }
 }
@@ -1096,7 +1153,7 @@ impl ScribeSink {
         &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
-        frames: &[Frame<'_>],
+        frames: &[Frame],
         attempt: usize,
         lost: &mut BTreeSet<usize>,
     ) -> Result<(), ScribeRefusal> {
@@ -1141,7 +1198,15 @@ impl ScribeSink {
     ) -> (Vec<Submitted>, Vec<usize>) {
         let encoding = tokio::task::spawn_blocking(move || match chunk.encode(tenant, budget) {
             Ok(streams) => Ok(streams),
-            Err(error) => Err((error, chunk.table, chunk.owners)),
+            Err(error) => Err((
+                error,
+                chunk.table,
+                chunk
+                    .owners
+                    .into_iter()
+                    .map(|(position, _)| position)
+                    .collect(),
+            )),
         });
         let streams = match encoding.await {
             Ok(Ok(streams)) => streams,
@@ -1276,7 +1341,10 @@ mod tests {
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
     use wyrd_runtime::audit::AuditStage;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+    use wyrd_spec::auth::{
+        Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag,
+        SERVER_WRITE_PRINCIPAL,
+    };
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::gateway::GatewayCaptureMode;
@@ -1314,8 +1382,8 @@ mod tests {
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{ResultPayloadBuilder, ResultRun};
 
-    /// One validated `Metadata` capture for `tenant`: a call row and one
-    /// attempt span under its own admitting request.
+    /// One validated `Metadata` capture for `tenant`: a call row naming its
+    /// own admitting request and one attempt span.
     ///
     /// # Panics
     ///
@@ -1446,19 +1514,22 @@ mod tests {
         assert_eq!(outbox.settle(deadline).await, 0, "the outbox settles");
     }
 
-    /// Proves one tenant slice becomes one frame per destination: three
-    /// results of one run attribution share a single summary frame stamped
-    /// with that pair and scoped to the Cards verified, the capture writes its
-    /// row and span frames under the call's pair and admitting request, and
-    /// the summary frame is submitted last although it was staged first. The
-    /// capture's two frames share a phase and arrive in either order.
+    /// Proves one tenant slice becomes one frame per destination whatever
+    /// its callers: three results of one run attribution share a single
+    /// summary frame scoped to the Cards verified, two calls of different
+    /// callers admitted under different requests share one row frame and one
+    /// span frame, every row carrying its own write's subject and actor and
+    /// naming its own admitting request, and the summary frame is submitted
+    /// last although it was staged first. Every frame is row-attributed under
+    /// the server-write principal. The capture frames share a phase and
+    /// arrive in either order.
     ///
     /// # Panics
     ///
-    /// Panics when the frames, the summary's position, rows, or attribution
-    /// differ.
+    /// Panics when the frames, the summary's position, rows, requests, or
+    /// attribution differ.
     #[tokio::test]
-    async fn writes_group_by_destination_under_their_attribution() {
+    async fn writes_group_by_destination_whatever_their_attribution() {
         let scribe = Arc::new(RecordingScribe::default());
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
@@ -1467,10 +1538,16 @@ mod tests {
         for subject in &subjects {
             outbox.stage(tenant, result(subject, attribution));
         }
-        let captured = capture(tenant);
-        let request = captured.request_id().clone();
-        let call = captured.attribution();
-        outbox.stage(tenant, captured);
+        let callers = [background(), background()];
+        for caller in callers {
+            let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
+            facts.tenant = tenant;
+            facts.attribution = caller;
+            outbox.stage(
+                tenant,
+                CallCapture::from_facts(facts).expect("metadata projects"),
+            );
+        }
         settle(&outbox).await;
 
         let received = scribe.received();
@@ -1482,22 +1559,32 @@ mod tests {
         assert_eq!(
             frames,
             [
-                ("vala.gateway.calls", 1),
-                ("vala.traces.spans", 1),
+                ("vala.gateway.calls", 2),
+                ("vala.traces.spans", 2),
                 ("vala.verification.results", 3),
             ]
         );
         for frame in &received[..2] {
-            assert_eq!(frame.attribution, call);
-            assert_eq!(frame.request_id, request);
+            assert_eq!(frame.pairs, callers, "{}", frame.table);
             assert!(frame.card_scope.is_empty());
         }
-        assert_eq!(received[2].attribution, attribution);
+        let requests = scribe
+            .calls()
+            .iter()
+            .map(|row| row["request_id"].as_str().expect("request_id").to_owned())
+            .collect::<HashSet<_>>();
+        assert_eq!(requests.len(), 2, "each row names its own request");
+        assert_eq!(received[2].pairs, [attribution; 3]);
         assert_eq!(
             received[2].card_scope.iter().collect::<HashSet<_>>(),
             subjects.iter().collect::<HashSet<_>>()
         );
         assert!(received.iter().all(|frame| frame.tenant == tenant));
+        assert!(
+            received
+                .iter()
+                .all(|frame| frame.principal == SERVER_WRITE_PRINCIPAL)
+        );
         assert!(
             received
                 .iter()
@@ -1787,7 +1874,7 @@ mod tests {
         let received = scribe.received();
         assert_eq!(received.len(), 1, "{received:?}");
         assert_eq!(received[0].table, "vala.traces.spans");
-        assert_eq!(received[0].attribution, route.attribution);
+        assert_eq!(received[0].pairs, [route.attribution]);
         assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
     }
 

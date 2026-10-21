@@ -28,7 +28,7 @@ pub const PLATFORM_AUDIT_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::f
 /// captured row carries the verified pair the call ran under. Like
 /// [`PLATFORM_AUDIT_PRINCIPAL`], this id never appears in a token; issuers
 /// refuse to mint it and verifiers reject any token naming it.
-pub const GATEWAY_CAPTURE_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::from_bytes([
+pub const SERVER_WRITE_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::from_bytes([
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x02,
 ]));
 

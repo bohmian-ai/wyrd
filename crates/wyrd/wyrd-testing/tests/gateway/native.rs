@@ -30,13 +30,15 @@ use crate::harness::{
 /// `?key=` call, records the caller token.
 ///
 /// # Panics
-/// Panics when any status, body, stream, ledger, or upstream expectation fails.
+/// Panics when any status, body, stream, captured row, or upstream expectation
+/// fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
     let (_telemetry, traces) = init_test_capture(TelemetryConfig::default())
         .expect("production-shaped trace capture installs");
     let journey = Journey::start().await;
+    journey.capture_metadata().await;
     let message = json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 5, "output_tokens": 3}, "container": null});
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -125,9 +127,9 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
         ANTHROPIC_EVENTS
     );
     assert_eq!(
-        journey.settled_usage().await,
+        journey.settled_usage(2).await,
         vec![tokens(5, 3), tokens(5, 3)],
-        "the ledger accounts the mock's message and stream usage"
+        "the captured rows account the mock's message and stream usage"
     );
     let truncated = journey
         .post(
@@ -291,11 +293,13 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
 /// upstream call.
 ///
 /// # Panics
-/// Panics when any status, body, stream, ledger, or upstream expectation fails.
+/// Panics when any status, body, stream, captured row, or upstream expectation
+/// fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     let journey = Journey::start().await;
+    journey.capture_metadata().await;
     let answer = json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP", "index": 0}], "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2, "totalTokenCount": 9}, "modelVersion": "gemini-2.5-flash", "responseId": "resp_1"});
     Mock::given(method("POST"))
         .and(path(
@@ -364,9 +368,9 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     assert_eq!(stream.headers()["content-type"], "text/event-stream");
     assert_eq!(stream.text().await.expect("complete stream"), GEMINI_EVENTS);
     assert_eq!(
-        journey.settled_usage().await,
+        journey.settled_usage(2).await,
         vec![tokens(7, 2), tokens(7, 2)],
-        "the ledger accounts the mock's answer and stream usage"
+        "the captured rows account the mock's answer and stream usage"
     );
     let mut truncated = journey
         .http
@@ -581,7 +585,7 @@ async fn decisions(journey: &Journey, request_id: &str) -> Vec<(String, String)>
 /// `auth.token.exchange`, and then reused: later calls carry only their own
 /// gateway decisions. A warmed key confers nothing on another key, so a
 /// reader's key is still denied before dispatch, and a second tenant's key
-/// sees only its own deployments and ledger. Malformed keys earn the API-key
+/// sees only its own deployments and captures. Malformed keys earn the API-key
 /// error in each native envelope, ambiguous and URL-borne keys stay refused,
 /// and no refusal reaches a provider. A retired key, whose principal stays
 /// active, keeps working only from its cached exchange, never beyond sixty
@@ -589,7 +593,7 @@ async fn decisions(journey: &Journey, request_id: &str) -> Vec<(String, String)>
 /// captured call row, or production-shaped span.
 ///
 /// # Panics
-/// Panics when any status, envelope, audit, ledger, capture, upstream, or
+/// Panics when any status, envelope, audit, capture, upstream, or
 /// span expectation fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -897,7 +901,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
         "no refused key reaches a provider"
     );
 
-    // A second tenant's key sees only its own deployments and ledger.
+    // A second tenant's key sees only its own deployments and captures.
     let other = journey
         .server
         .seed_tenant("gateway-key-other")
@@ -939,6 +943,13 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
             &["chat_completions"],
         )
         .await;
+    journey
+        .put_as(
+            &other_admin,
+            "capture-policy",
+            json!({"mode": "metadata", "payload_fields": []}),
+        )
+        .await;
     let own = journey
         .post("/v1/messages", &anthropic(&other_key), &messages)
         .await;
@@ -948,28 +959,19 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
         "the second tenant's own deployment serves it"
     );
     bodies.push(own.text().await.expect("answer"));
-    let settled = journey.settled_usage().await;
+    let settled = journey.settled_usage(6).await;
     assert_eq!(
         settled.len(),
         6,
-        "the first tenant's ledger holds only its own six calls: {settled:?}"
+        "the first tenant's captures hold only its own six calls: {settled:?}"
     );
-    let mut conn = journey
-        .server
-        .pg_fixture()
-        .tenant_conn_for(other)
-        .await
-        .expect("second-tenant conn");
-    let other_calls: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.gateway_accounting_entries WHERE entry ? 'call_accounted'",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("second-tenant ledger reads");
-    conn.commit().await.expect("ledger read commits");
     assert_eq!(
-        other_calls, 1,
-        "the second tenant's ledger holds only its call"
+        journey
+            .captured_calls(&secrecy::SecretString::from(other_key.clone()), 1)
+            .await
+            .len(),
+        1,
+        "the second tenant's captures hold only its call"
     );
 
     // Repeated hits never extend the retired key's window.

@@ -1,7 +1,7 @@
 //! The Python sandbox against real `wyrd-server subprocess` Monty workers.
 //!
-//! Ignored in the fast lane because they need the release `wyrd-server`
-//! binary; `mise run test:verification:sandbox` builds it and runs them.
+//! Cargo builds this package's `wyrd-server` binary, which serves as its own
+//! worker, in the same profile before it runs these tests.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,21 +14,10 @@ use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
 
-/// Why every test here is ignored in the fast lane.
-const NEEDS_WORKER: &str = "needs the Monty worker; run `mise run test:verification:sandbox`";
-
-/// The worker binary: `WYRD_VERIFICATION_MONTY_WORKER`, else the
-/// `build:server` `wyrd-server`, which serves as its own worker.
-///
-/// # Panics
-/// Panics when the binary is missing.
+/// The worker binary: this package's `wyrd-server`, which serves as its own
+/// worker.
 pub(crate) fn worker() -> PathBuf {
-    let path = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/release/wyrd-server"),
-        PathBuf::from,
-    );
-    assert!(path.is_file(), "{}: {NEEDS_WORKER}", path.display());
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_wyrd-server"))
 }
 
 /// A sandbox under `limits` with no prewarmed workers.
@@ -90,7 +79,6 @@ fn terminal(result: Result<CodeRun, BlockError>) -> String {
 /// # Panics
 /// Panics when values, prints, or state cross wrongly.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_runs_entrypoints_without_shared_state() {
     let limits = HostedLimits {
         tool_result_max_bytes: 64,
@@ -134,7 +122,6 @@ async fn sandbox_runs_entrypoints_without_shared_state() {
 /// # Panics
 /// Panics when output splits a character or the sandbox stops serving.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_cuts_output_on_character_boundaries() {
     let sandbox = start(HostedLimits {
         tool_result_max_bytes: 4,
@@ -160,7 +147,6 @@ async fn sandbox_cuts_output_on_character_boundaries() {
 /// # Panics
 /// Panics when host state is reachable or a mount mode is ignored.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_reaches_only_its_mounts() {
     let sandbox = start(HostedLimits::default()).await;
     for source in [
@@ -240,7 +226,6 @@ async fn write(sandbox: &Sandbox, workspace: &Workspace, source: &str) -> Result
 /// Panics when writes together exceed the limit, earlier files are lost, or
 /// a cancelled writer keeps the lock.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn workspace_writes_share_one_budget() {
     let limits = HostedLimits {
         work_write_max_bytes: 16,
@@ -334,7 +319,6 @@ async fn workspace_writes_share_one_budget() {
 /// Panics when a breach succeeds, poisons the pool, or impossible limits
 /// start.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_contains_runaway_code() {
     let sandbox = start(HostedLimits {
         code_timeout: Duration::from_secs(1),
@@ -402,7 +386,6 @@ async fn sandbox_contains_runaway_code() {
 /// # Panics
 /// Panics when admission or the checkout deadline is not enforced.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_bounds_workers_and_waiters() {
     let sandbox = start(HostedLimits {
         monty_max_workers: 1,

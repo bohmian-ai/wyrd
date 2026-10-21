@@ -642,6 +642,19 @@ impl BoundServer {
                 },
             ));
         }
+        // Gateway snapshots serve only while this listener hears every
+        // gateway configuration change, so it runs wherever the server does.
+        {
+            let snapshots = Arc::clone(&self.state.gateway_snapshots);
+            let pool = self.state.postgres.wyrd().app_pool().clone();
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("gateway_snapshot_cache"),
+                async move {
+                    snapshots.watch(&pool, shutdown).await;
+                },
+            ));
+        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {

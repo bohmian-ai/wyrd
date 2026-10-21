@@ -13,7 +13,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_tonic::otlp::common::v1::EntityRef;
 use wyrd_tonic::otlp::common::v1::any_value::Value;
@@ -106,13 +106,21 @@ pub fn project_resource_logs(
     ))
 }
 
+/// Projected log schema, built once: every log batch shares this `Arc`, so
+/// batches of one destination compare by pointer and no row rebuilds or
+/// frees the schema tree.
+static LOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| projected_signal_schema(LOG_FIELDS));
+
+/// Fixed Arrow bytes of one projected log row, derived once.
+static LOG_ROW_BYTES: LazyLock<usize> = LazyLock::new(|| fixed_row_bytes(LOG_SCHEMA.fields()));
+
 /// Returns the fixed Arrow bytes one projected log row retains.
 ///
 /// The log projector charges this with each accepted row, and the server's
 /// OTLP preflight charges it per wire record.
 #[must_use]
 pub fn log_row_output_bytes() -> usize {
-    fixed_row_bytes(projected_signal_schema(LOG_FIELDS).fields())
+    *LOG_ROW_BYTES
 }
 
 /// Return the canonical user-column schema of `vala.logs.records`.
@@ -341,7 +349,7 @@ impl LogColumns {
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
         ];
-        RecordBatch::try_new(projected_signal_schema(LOG_FIELDS), columns)
+        RecordBatch::try_new(Arc::clone(&LOG_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical log batch: {error}")))
     }
 }

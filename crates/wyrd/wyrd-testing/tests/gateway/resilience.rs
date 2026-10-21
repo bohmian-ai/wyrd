@@ -26,7 +26,7 @@ use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::Metrics;
 
-use crate::harness::{Journey, api_key, openai_code, refusal, tokens};
+use crate::harness::{Journey, api_key, openai_code, refusal};
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
 const PROJECTION: &str = "acme-first/m";
@@ -85,19 +85,20 @@ async fn deploy_compatible(journey: &Journey, name: &str, prefix: &str) {
 /// The requested deployment falls back to a sibling; the first provider exchange of the
 /// call refuses with a retryable `503`, so the call completes on the sibling
 /// deployment and the caller never sees the refusal. Both attempts are
-/// accounted, and because the refused attempt reached its provider with no
-/// reported usage the call total stays unknown rather than understating what
-/// the refused exchange may have consumed. A tenant limit of one request per
+/// captured on the call row, and because the refused attempt reached its
+/// provider with no reported usage the call total stays unknown rather than
+/// understating what the refused exchange may have consumed. A tenant limit of one request per
 /// minute then refuses the next call with the stable limit code and dispatches
 /// nothing.
 ///
 /// # Panics
-/// Panics when a status, body, ledger entry, or dispatch-count expectation
+/// Panics when a status, body, captured row, or dispatch-count expectation
 /// fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
     let journey = Journey::start().await;
+    journey.capture_metadata().await;
     // Exactly one provider exchange refuses retryably: the requested
     // deployment's, since it is always attempted first.
     Mock::given(method("POST"))
@@ -163,19 +164,11 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
         "the refused attempt and the completing one both dispatched"
     );
     assert_eq!(
-        journey.settled_usage().await,
-        vec![Value::Null],
-        "the call is accounted once; a dispatched attempt whose usage the \
-         provider never reported leaves the call total unknown rather than \
-         understated"
-    );
-    assert_eq!(
-        journey.accounted_attempts().await,
-        vec![
-            (json!("failed"), Value::Null),
-            (json!("succeeded"), tokens(11, 4)),
-        ],
-        "both attempts are accounted, the completing one with its usage"
+        journey.settled_calls(1).await,
+        vec![(2, Value::Null)],
+        "the call is captured once with both attempts; a dispatched attempt \
+         whose usage the provider never reported leaves the call total \
+         unknown rather than understated"
     );
 
     let dispatched = journey.upstream_calls().await.len();
@@ -199,16 +192,18 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
 ///
 /// The provider holds the exchange open; once the upstream has recorded the
 /// dispatch the caller's request is dropped, which cancels the call. The
-/// gateway still settles it on its tracked task, so the tenant ledger carries
-/// the call with no usage rather than losing it, and the server keeps serving.
+/// gateway still settles it on its tracked task, so the tenant's captured
+/// row carries the call with no usage rather than losing it, and the server
+/// keeps serving.
 ///
 /// # Panics
-/// Panics when the dispatch is not recorded within the bound, or a ledger or
-/// status expectation fails.
+/// Panics when the dispatch is not recorded within the bound, or a captured
+/// row or status expectation fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
     let journey = Journey::start().await;
+    journey.capture_metadata().await;
     Mock::given(method("POST"))
         .and(path("/held/v1/chat/completions"))
         .respond_with(
@@ -252,10 +247,10 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
     .expect("the held call dispatched");
     abandoned.abort();
 
-    // The gateway settles a cancelled call on the task tracker, so the ledger
-    // carries it once the tracker drains.
+    // The gateway settles a cancelled call on the task tracker, so its
+    // capture is staged once the tracker drains.
     assert_eq!(
-        journey.settled_usage().await,
+        journey.settled_usage(1).await,
         vec![Value::Null],
         "the cancelled call is accounted with no usage"
     );
@@ -340,7 +335,7 @@ async fn gateway_capacity_metrics_cover_buffered_and_streamed_calls() {
             .expect("complete stream")
             .ends_with("data: [DONE]\n\n")
     );
-    journey.settled_usage().await;
+    journey.drain_calls().await;
     let after = Metrics::parse(&telemetry.render());
     let delta = |family: &str, labels: &[&str]| {
         Histogram::read(&before, family, labels).since(&Histogram::read(&after, family, labels))
@@ -451,7 +446,7 @@ fn delta(before: &Metrics, after: &Metrics, family: &str, labels: &[&str]) -> f6
 /// # Panics
 /// Panics when the tracker or outbox does not settle.
 async fn drained(journey: &Journey) -> Metrics {
-    journey.settled_usage().await;
+    journey.drain_calls().await;
     journey
         .server
         .await_audit_retained()
@@ -791,7 +786,7 @@ async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
         recovered.json::<Value>().await.expect("recovered answer");
     }
 
-    journey.settled_usage().await;
+    journey.drain_calls().await;
     assert_eq!(
         journey.captured_calls(&inspector, 2).await.len(),
         2,

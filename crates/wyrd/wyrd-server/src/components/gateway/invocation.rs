@@ -50,7 +50,7 @@ use super::capture::{
     CallCapture, CallFacts, CaptureDrop, PayloadObjects, error_code, operation_name, record,
     request_content, selects,
 };
-use super::ledger::{Admission, GatewayLedger, LedgerCall};
+use super::ledger::{Accounted, Admission, GatewayLedger, LedgerCall};
 use super::service::{GatewayAdministration, unavailable};
 use super::telemetry::{CallTelemetry, IngressClock, Phase};
 use crate::app::metrics::{
@@ -219,8 +219,8 @@ struct AdmittedCall {
     attribution: Attribution,
     /// Request that admitted the call, carried into its capture.
     request_id: RequestId,
-    /// Immutable admitted configuration.
-    snapshot: GatewayTenantSnapshot,
+    /// Immutable admitted configuration, shared with the tenant snapshot cache.
+    snapshot: Arc<GatewayTenantSnapshot>,
     /// Operation request body.
     body: Value,
     /// Route and uploaded files of an Images or Audio call.
@@ -287,17 +287,18 @@ impl<'a> GatewayInvocation<'a> {
     /// Runs one governed call for `caller`.
     ///
     /// Authorization of the requested model precedes every other step; each
-    /// candidate decision is audited standalone. Admission commits before any
-    /// credential or provider work. Execution and accounting run in a task on
+    /// candidate decision is audited standalone. Admission charges before any
+    /// credential or provider work. Execution and settlement run in a task on
     /// the server's gateway tracker, so dropping this future cancels the
-    /// in-flight attempt yet still records its accounting, and shutdown drain
-    /// waits for that accounting.
+    /// in-flight attempt yet still settles its charges, and shutdown drain
+    /// waits for that settlement.
     ///
-    /// A buffered answer returns once its accounting commits. A streamed
-    /// answer returns as soon as the stream opens; once the relay reports the
-    /// stream's end, the task settles the call and its completing attempt to
-    /// that terminal outcome, time, and usage before accounting, metrics, and
-    /// capture, and logs an accounting failure it can no longer return.
+    /// A buffered answer returns once the call is priced, in memory. A
+    /// streamed answer returns as soon as the stream opens; once the relay
+    /// reports the stream's end, the task settles the call and its completing
+    /// attempt to that terminal outcome, time, and usage before accounting,
+    /// metrics, and capture. Settlement always follows the answer and logs a
+    /// failure it can no longer return.
     ///
     /// A call whose last attempt the provider refused returns that refusal's
     /// status and body rather than an error, so native callers keep provider
@@ -422,9 +423,8 @@ impl<'a> GatewayInvocation<'a> {
     /// capture still finish if the caller goes away.
     ///
     /// Latency: the caller waits for admission (see [`Self::admit_call`]),
-    /// the provider attempts, and, for a buffered answer, the accounting
-    /// commit. A stream answers when it opens. Capture never delays the
-    /// answer. Dropping this future before the answer cancels the call.
+    /// and the provider attempts. A stream answers when it opens. Settlement
+    /// and capture never delay the answer. Dropping this future before the answer cancels the call.
     ///
     /// The call's `answer` point is recorded once the answer, or a refusal
     /// before execution, is in hand here, ready for the response body.
@@ -499,9 +499,9 @@ impl<'a> GatewayInvocation<'a> {
     /// Checks, authorizes, routes, and reserves one call before any provider
     /// sees it.
     ///
-    /// Latency: on the request path, with sequential Postgres round trips:
-    /// the tenant snapshot load and the reservation commit in
-    /// [`Self::admit`]. Every invoke-decision audit, here and per fallback
+    /// Latency: on the request path. The tenant snapshot is served from the
+    /// process cache, and [`Self::admit`] costs one Postgres statement only
+    /// when a limit or budget covers the call. Every invoke-decision audit, here and per fallback
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
     ///
@@ -880,63 +880,38 @@ impl<'a> GatewayInvocation<'a> {
         }
     }
 
-    /// Admits `call` in its own committed tenant transaction.
+    /// Admits `call` against its limits and budgets.
+    ///
+    /// A call nothing covers is admitted with no IO; a covered call costs one
+    /// admission statement.
     ///
     /// # Errors
     /// Returns the admission rejections of [`GatewayLedger::admit`] and
-    /// `ServiceUnavailable` when storage fails; a rejection commits nothing.
+    /// `ServiceUnavailable` when storage fails; a rejection charges nothing.
     #[tracing::instrument(name = "gateway.admit", skip_all)]
     async fn admit(
         &self,
         call: &AdmittedCall,
         plan: &mut CallPlan,
     ) -> Result<Admission, WyrdError> {
-        let mut conn = self
-            .state
-            .postgres
-            .tenant_conn(call.tenant)
-            .await
-            .map_err(unavailable)?;
-        let admission = GatewayLedger::new(&mut conn)
+        GatewayLedger::new(self.state.postgres.wyrd())
             .admit(&call.ledger(), plan)
-            .await?;
-        conn.commit().await.map_err(unavailable)?;
-        Ok(admission)
+            .await
     }
 
-    /// Accounts `execution` in its own committed tenant transaction.
+    /// Settles what admission charged `call`, in one statement, after the
+    /// caller has its answer.
     ///
-    /// On failure nothing commits: leases lapse and reconciliation settles the
-    /// reservations at their reserved cost once they expire. On success the
-    /// appended attempt and call entries are returned for capture and metrics.
-    ///
-    /// # Errors
-    /// Returns `ServiceUnavailable` when storage fails and `Internal` when an
-    /// entry violates the ledger contract.
+    /// A failure is logged and never changes the call: leases lapse at their
+    /// expiry and each reservation keeps counting at its reserved cost.
     #[tracing::instrument(name = "gateway.account", skip_all)]
-    async fn account(
-        state: &AppState,
-        call: &AdmittedCall,
-        admission: &Admission,
-        execution: &CallExecution,
-    ) -> Result<Vec<GatewayAccountingEntryV1>, WyrdError> {
-        let result = async {
-            let mut conn = state
-                .postgres
-                .tenant_conn(call.tenant)
-                .await
-                .map_err(unavailable)?;
-            let entries = GatewayLedger::new(&mut conn)
-                .account(&call.ledger(), admission, execution)
-                .await?;
-            conn.commit().await.map_err(unavailable)?;
-            Ok(entries)
+    async fn settle(state: &AppState, call: &AdmittedCall, accounted: &Accounted) {
+        if let Err(error) = GatewayLedger::new(state.postgres.wyrd())
+            .settle(call.tenant, accounted)
+            .await
+        {
+            tracing::error!(call_id = %call.call_id.as_uuid(), error = %error, "gateway call settlement failed");
         }
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(call_id = %call.call_id.as_uuid(), error = %error, "gateway call accounting failed");
-        }
-        result
     }
 
     /// Terminal facts of `execution` when the admitted policy captures `call`.
@@ -1216,13 +1191,18 @@ impl CallTask {
         }
     }
 
-    /// Accounts a buffered call, then answers the caller, then captures it.
+    /// Prices and settles a buffered call, answers the caller, then captures
+    /// it.
     ///
-    /// Latency: the caller waits for the accounting commit, a tenant Postgres
-    /// transaction, because an accounting failure must fail the call. The
-    /// call then settles as `Failed` with the accounting error code, while
-    /// attempt and routing evidence keep the provider's outcome. Capture runs
-    /// after the answer is sent and never delays it.
+    /// Latency: pricing is in memory. A call that charged a limit or budget
+    /// settles in one statement before the answer is sent, so a caller that
+    /// calls again on its answer never meets its own lease, hold, or
+    /// reservation; a call that charged nothing waits for no Postgres work.
+    /// A failed settlement is only logged, leaving its leases to lapse and
+    /// its reservations counting at their reserved cost. Entries that violate
+    /// the ledger contract fail the call as `Failed` with that error code,
+    /// while attempt and routing evidence keep the provider's outcome.
+    /// Capture runs after the answer is sent and never delays it.
     async fn settle_buffered(
         self,
         mut execution: CallExecution,
@@ -1231,11 +1211,14 @@ impl CallTask {
     ) {
         let operation = self.plan.operation;
         let upstream = execution.timing.upstream;
-        let started = std::time::Instant::now();
-        let accounted =
-            GatewayInvocation::account(&self.state, &self.call, &self.admission, &execution).await;
-        self.telemetry.since(Phase::Account, started);
-        let entries = accounted.as_deref().ok();
+        let accounted = Accounted::new(&self.call.ledger(), &self.admission, &execution);
+        if let Err(error) = &accounted {
+            tracing::error!(call_id = %self.call.call_id.as_uuid(), error = %error, "gateway call accounting failed");
+        }
+        let entries = accounted
+            .as_ref()
+            .ok()
+            .map(|accounted| accounted.entries.as_slice());
         let mut facts = GatewayInvocation::facts(
             &self.call,
             operation,
@@ -1256,7 +1239,15 @@ impl CallTask {
         };
         GatewayInvocation::observe(operation, self.received, outcome, &execution, entries);
         record_first_byte(operation, self.received);
-        let answer = accounted.and_then(|_| GatewayInvocation::respond(&self.call, execution));
+        let answer = match accounted {
+            Ok(accounted) => {
+                let started = std::time::Instant::now();
+                GatewayInvocation::settle(&self.state, &self.call, &accounted).await;
+                self.telemetry.since(Phase::Account, started);
+                GatewayInvocation::respond(&self.call, execution)
+            }
+            Err(error) => Err(error),
+        };
         record_call(&self.call_span, outcome, answer.is_ok());
         // A dropped caller no longer awaits the answer.
         head.send(Answer {
@@ -1342,11 +1333,18 @@ impl CallTask {
             attempt_span,
             timing,
         };
-        let started = std::time::Instant::now();
-        let entries =
-            GatewayInvocation::account(&self.state, &self.call, &self.admission, &accounted).await;
-        self.telemetry.since(Phase::Account, started);
-        let entries = entries.as_deref().ok();
+        let priced = Accounted::new(&self.call.ledger(), &self.admission, &accounted);
+        match &priced {
+            Ok(priced) => {
+                let started = std::time::Instant::now();
+                GatewayInvocation::settle(&self.state, &self.call, priced).await;
+                self.telemetry.since(Phase::Account, started);
+            }
+            Err(error) => {
+                tracing::error!(call_id = %self.call.call_id.as_uuid(), error = %error, "gateway call accounting failed");
+            }
+        }
+        let entries = priced.as_ref().ok().map(|priced| priced.entries.as_slice());
         let facts = GatewayInvocation::facts(
             &self.call,
             operation,

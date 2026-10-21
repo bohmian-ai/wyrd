@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-use wyrd_spec::auth::Attribution;
 use wyrd_spec::request_id::RequestId;
 
 use crate::catalog::TableRef;
@@ -83,8 +82,9 @@ pub(crate) enum AdmittedRows {
 pub(crate) struct NativeAdmittedRows {
     /// Transport-owned Arrow IPC stream, decoded zero-copy where aligned.
     pub(crate) bytes: Bytes,
-    /// Trusted subject/actor pair stamped as managed correlation columns.
-    pub(crate) attribution: Attribution,
+    /// Source of the trusted subject/actor pair stamped as managed
+    /// correlation columns.
+    pub(crate) attribution: crate::contracts::StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
@@ -1063,7 +1063,7 @@ mod tests {
             conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
-            attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
+            attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())).into(),
             expected_schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),

@@ -112,3 +112,61 @@ impl ServerPostgres {
         self.vala_pool().close().await;
     }
 }
+
+/// Pause before reconnecting after a listener fails to connect or listen.
+const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Listens on Postgres `channel` from `pool` until `shutdown`, feeding an
+/// in-process cache that serves only while it hears every invalidation.
+///
+/// Holds one pool connection for the listener. `reset(true)` runs after each
+/// successful `LISTEN` and after sqlx reconnects and re-listens following a
+/// lost connection, so the cache forgets what it held and serves from fresh
+/// reads; `reset(false)` runs when listening stops, so the cache stops
+/// serving. Each notification's payload goes to `notify`. A failed connect or
+/// `LISTEN` leaves serving off and retries after [`RECONNECT_DELAY`].
+pub(crate) async fn watch_channel(
+    pool: &PgPool,
+    channel: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+    reset: impl Fn(bool),
+    notify: impl Fn(&str),
+) {
+    while !shutdown.is_cancelled() {
+        let listener = async {
+            let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+            listener.listen(channel).await?;
+            Ok::<_, sqlx::Error>(listener)
+        };
+        let mut listener = match listener.await {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::warn!(%error, channel, "cache listener could not start; reads go to Postgres");
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(RECONNECT_DELAY) => continue,
+                }
+            }
+        };
+        reset(true);
+        loop {
+            let received = tokio::select! {
+                () = shutdown.cancelled() => break,
+                received = listener.try_recv() => received,
+            };
+            match received {
+                Ok(Some(notification)) => notify(notification.payload()),
+                Ok(None) => {
+                    tracing::warn!(channel, "cache listener reconnected; cache forgotten");
+                    reset(true);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, channel, "cache listener failed; reads go to Postgres");
+                    break;
+                }
+            }
+        }
+        reset(false);
+    }
+    reset(false);
+}

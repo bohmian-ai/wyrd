@@ -5,7 +5,8 @@
 //! transactions, lifecycle rules, and redacted views.
 //! HTTP handlers and MCP tools are thin projections of its methods.
 //! [`GatewayAdministration::snapshot`] hands the gateway runtime one immutable,
-//! statement-consistent view of the tenant configuration per admission.
+//! statement-consistent view of the tenant configuration per admission,
+//! cached per tenant by [`GatewaySnapshots`] until an administrator changes it.
 
 mod api_keys;
 mod batches;
@@ -21,13 +22,13 @@ mod pg_administration_tests;
 mod pg_invocation_tests;
 pub(crate) mod routes;
 mod service;
+mod snapshots;
 mod telemetry;
 
 pub(crate) use api_keys::GatewayApiKeys;
 pub use batches::{BatchAnswer, GatewayBatches};
 pub(crate) use caller::ServerWyrdGatewayCaller;
 pub use capture::CallCapture;
-pub(crate) use capture::CaptureDrop;
 #[cfg(test)]
 pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
@@ -39,4 +40,5 @@ pub use invocation::{
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
 pub(crate) use service::invalid;
+pub use snapshots::GatewaySnapshots;
 pub use wyrd_gateway::{GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot};

@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -6112,17 +6112,16 @@ mod tests {
 }
 
 /// Hosted Verifier blocks for a test server: the default Deployment limits
-/// with no prewarmed worker. Only a Verifier that runs
-/// Python spawns the Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else
-/// the `build:server` `wyrd-server`, which serves as its own worker.
+/// with no prewarmed worker. The host process (a test binary, Python, or
+/// Node) is not `wyrd-server`, so only a Verifier that runs Python spawns the
+/// `wyrd-server` binary cargo built into this harness's own profile directory
+/// (`mise run build:server`), which serves as its own worker.
 ///
 /// # Errors
 /// Returns [`WyrdTestServerError::Start`] when the sandbox pool cannot start.
 async fn test_verification_blocks() -> Result<HostedBlocks, WyrdTestServerError> {
-    let worker = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/release/wyrd-server"),
-        PathBuf::from,
-    );
+    let worker = Path::new(env!("WYRD_TESTING_PROFILE_DIR"))
+        .join(format!("wyrd-server{}", std::env::consts::EXE_SUFFIX));
     let limits = HostedLimits {
         monty_min_workers: 0,
         ..HostedLimits::default()

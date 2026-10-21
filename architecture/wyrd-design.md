@@ -184,7 +184,7 @@ not a passive integration or inventory product.
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
     carry the verified pair the call ran under. The reserved
-    `GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never
+    `SERVER_WRITE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never
     appears in a token: every issuer refuses it, every verifier rejects a
     token naming it, and it never replaces the invocation caller in audit.
     `PLATFORM_AUDIT_PRINCIPAL` is the single no-verified-caller marker. It

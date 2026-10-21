@@ -312,57 +312,6 @@ impl Journey {
             .expect("request recording is on")
     }
 
-    /// Normalized usage of every `call_accounted` ledger entry, oldest first.
-    ///
-    /// # Panics
-    /// Panics when the tenant ledger cannot be read.
-    pub(crate) async fn accounted_usage(&self) -> Vec<Value> {
-        let mut conn = self
-            .server
-            .pg_fixture()
-            .tenant_conn_for(self.server.data_tenant_id())
-            .await
-            .expect("tenant conn");
-        let rows: Vec<Value> = sqlx::query_scalar(
-            "SELECT entry->'call_accounted'->'normalized_usage' \
-               FROM wyrd.gateway_accounting_entries \
-              WHERE entry ? 'call_accounted' ORDER BY recorded_at, entry_id",
-        )
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("ledger reads");
-        conn.commit().await.expect("ledger read commits");
-        rows
-    }
-
-    /// Outcome and normalized usage of every `attempt_accounted` ledger entry,
-    /// oldest first.
-    ///
-    /// Call it after [`Self::settled_usage`] has drained the call tasks, so the
-    /// attempt entries of the settled call are all present.
-    ///
-    /// # Panics
-    /// Panics when the tenant ledger cannot be read.
-    pub(crate) async fn accounted_attempts(&self) -> Vec<(Value, Value)> {
-        let mut conn = self
-            .server
-            .pg_fixture()
-            .tenant_conn_for(self.server.data_tenant_id())
-            .await
-            .expect("tenant conn");
-        let rows: Vec<(Value, Value)> = sqlx::query_as(
-            "SELECT entry->'attempt_accounted'->'outcome', \
-                    entry->'attempt_accounted'->'normalized_usage' \
-               FROM wyrd.gateway_accounting_entries \
-              WHERE entry ? 'attempt_accounted' ORDER BY recorded_at, entry_id",
-        )
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("ledger reads");
-        conn.commit().await.expect("ledger read commits");
-        rows
-    }
-
     /// Every cell of every `vala.gateway.calls` row the tenant of `inspector`
     /// retains, rendered as text, once at least `expected` rows have landed.
     ///
@@ -375,6 +324,46 @@ impl Journey {
     ) -> Vec<String> {
         use arrow::util::display::{ArrayFormatter, FormatOptions};
 
+        let mut rows = Vec::new();
+        for batch in self
+            .captured(inspector, "SELECT * FROM vala.gateway.calls", expected)
+            .await
+        {
+            let formatters: Vec<_> = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default())
+                        .expect("column formats")
+                })
+                .collect();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    formatters
+                        .iter()
+                        .map(|formatter| formatter.value(row).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}"),
+                );
+            }
+        }
+        rows
+    }
+
+    /// The batches `sql` reads from `vala.gateway.calls` as the tenant of
+    /// `inspector`, once they hold at least `expected` rows.
+    ///
+    /// Settles the Scribe outbox and flushes Bifrost before every read, so a
+    /// staged capture becomes visible without sleeping on a guess.
+    ///
+    /// # Panics
+    /// Panics when the rows do not land within thirty seconds or the query fails.
+    async fn captured(
+        &self,
+        inspector: &SecretString,
+        sql: &str,
+        expected: usize,
+    ) -> Vec<arrow::array::RecordBatch> {
         let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
             grpc: wyrd_client::transport::GrpcConfig {
                 endpoint: self.server.grpc_url().expect("gRPC url"),
@@ -399,59 +388,100 @@ impl Journey {
                 .await
                 .expect("the Scribe outbox settles");
             self.server.flush_bifrost().await.expect("Bifrost flushes");
-            let result = bifrost
-                .sql("SELECT * FROM vala.gateway.calls", &[])
-                .await
-                .expect("captured calls query");
-            let mut rows = Vec::new();
-            for batch in result.batches() {
-                let formatters: Vec<_> = batch
-                    .columns()
-                    .iter()
-                    .map(|column| {
-                        ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default())
-                            .expect("column formats")
-                    })
-                    .collect();
-                for row in 0..batch.num_rows() {
-                    rows.push(
-                        formatters
-                            .iter()
-                            .map(|formatter| formatter.value(row).to_string())
-                            .collect::<Vec<_>>()
-                            .join("\u{1f}"),
-                    );
-                }
-            }
-            if rows.len() >= expected {
-                return rows;
+            let result = bifrost.sql(sql, &[]).await.expect("captured calls query");
+            let batches = result.batches().to_vec();
+            let rows: usize = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            if rows >= expected {
+                return batches;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "{expected} captured calls never landed: {}",
-                rows.len()
+                "{expected} captured calls never landed: {rows}"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
-    /// Waits for every gateway call task, then reads the settled usage.
+    /// Waits for every gateway call task to finish.
     ///
-    /// A call settles on its tracked task after its last byte reaches the
-    /// caller, so the ledger is complete once the tracker drains. The bound
-    /// covers a capture outage, where settlement waits out the embedded
-    /// client's own bounded publication retry.
+    /// A call is accounted and captured on its tracked task after its last
+    /// byte reaches the caller, so its capture is staged once the tracker
+    /// drains. The bound covers a capture outage, where the task waits out the
+    /// embedded client's own bounded publication retry.
     ///
     /// # Panics
     /// Panics when the tasks do not drain within thirty seconds.
-    pub(crate) async fn settled_usage(&self) -> Vec<Value> {
+    pub(crate) async fn drain_calls(&self) {
         let tasks = &self.server.state().gateway_tasks;
         tasks.close();
         tokio::time::timeout(Duration::from_secs(30), tasks.wait())
             .await
             .expect("gateway tasks drain");
         tasks.reopen();
-        self.accounted_usage().await
+    }
+
+    /// Drains the call tasks, then reads the `attempt_count` and settled
+    /// `usage` of the tenant's first `expected` captured calls, oldest first,
+    /// `usage` null when unknown.
+    ///
+    /// A call's usage is recorded only on its captured row, so the journey
+    /// stores a `metadata` capture policy before its calls.
+    ///
+    /// # Panics
+    /// Panics when the tasks do not drain, the rows do not land, or a row
+    /// cannot be read as JSON.
+    pub(crate) async fn settled_calls(&self, expected: usize) -> Vec<(u64, Value)> {
+        self.drain_calls().await;
+        let mut writer = arrow::json::ArrayWriter::new(Vec::new());
+        for batch in self
+            .captured(
+                &self.api_keys[0],
+                "SELECT attempt_count, usage FROM vala.gateway.calls ORDER BY started_at",
+                expected,
+            )
+            .await
+        {
+            writer.write(&batch).expect("captured rows write as JSON");
+        }
+        writer.finish().expect("captured rows finish");
+        let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).expect("rows are JSON");
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row["attempt_count"].as_u64().expect("attempt count"),
+                    row.get("usage").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect()
+    }
+
+    /// The settled `usage` of the tenant's first `expected` captured calls,
+    /// oldest first; see [`Self::settled_calls`].
+    ///
+    /// # Panics
+    /// Panics as [`Self::settled_calls`] does.
+    pub(crate) async fn settled_usage(&self, expected: usize) -> Vec<Value> {
+        self.settled_calls(expected)
+            .await
+            .into_iter()
+            .map(|(_, usage)| usage)
+            .collect()
+    }
+
+    /// Stores the `metadata` capture policy, which records every later call's
+    /// usage on its captured row.
+    ///
+    /// # Panics
+    /// Panics when the policy is refused.
+    pub(crate) async fn capture_metadata(&self) {
+        self.put(
+            "capture-policy",
+            json!({"mode": "metadata", "payload_fields": []}),
+        )
+        .await;
     }
 }
 

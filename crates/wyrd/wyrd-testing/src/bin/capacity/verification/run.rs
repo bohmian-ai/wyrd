@@ -264,14 +264,21 @@ impl<'a> Bench<'a> {
         Ok(measured)
     }
 
-    /// Runs `clients` closed-loop clients making `op` calls for `duration`.
+    /// Runs `clients` closed-loop clients making `op` calls for `duration`,
+    /// each through its own application, so client `i` presents application
+    /// `i`'s key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `clients` exceeds the provisioned applications, which
+    /// `main` provisions for the largest selected client count.
     async fn drive(&self, op: Op, clients: usize, duration: Duration) -> Measured {
         let started = Instant::now();
         let deadline = started + duration;
         let sequence = Arc::new(AtomicU64::new(0));
         let mut tasks = JoinSet::new();
-        for _ in 0..clients {
-            let (state, sequence) = (self.tenant.state.clone(), Arc::clone(&sequence));
+        for state in &self.tenant.states[..clients] {
+            let (state, sequence) = (state.clone(), Arc::clone(&sequence));
             tasks.spawn(async move {
                 let mut measured = Measured::default();
                 while Instant::now() < deadline {

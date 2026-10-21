@@ -42,14 +42,14 @@ fn chat(stream: bool, marker: &str) -> Value {
 /// sentinel; a provider stream that stops mid-answer ends in a terminal
 /// in-band error carrying the stable upstream code before the sentinel, so a
 /// caller cannot mistake truncation for completion. A Scribe WAL outage that
-/// refuses every capture append
-/// leaves the answer, its usage accounting, and the operator credential
-/// boundary unchanged, and rows published after the outage clears carry the
-/// later call.
+/// refuses every capture append leaves the answer and the operator
+/// credential boundary unchanged, and once the outage clears the outbox's
+/// retry publishes the outage call's row, with its usage, before the later
+/// call's.
 ///
 /// # Panics
 ///
-/// Panics when a status, relayed body, stream terminator, ledger entry, or
+/// Panics when a status, relayed body, stream terminator, captured row, or
 /// upstream credential expectation fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
@@ -153,9 +153,9 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
     assert_eq!(after_outage.status().as_u16(), 200);
 
     assert_eq!(
-        journey.settled_usage().await,
+        journey.settled_usage(4).await,
         vec![tokens(11, 4), Value::Null, tokens(11, 4), tokens(11, 4)],
-        "every call is accounted in order, the truncated stream with no usage \
+        "every call is captured in order, the truncated stream with no usage \
          and the outage call with the mock's"
     );
     let dispatched = journey.upstream_calls().await;

@@ -1,18 +1,28 @@
-//! Tenant accounting ledger handle for gateway admission and settlement.
+//! Gateway admission and accounting ledger.
 //!
-//! [`GatewayLedger`] borrows the caller's tenant transaction and never
-//! commits it. Admission first takes the tenant's admission advisory lock, so
-//! concurrent admissions on every replica see each other's committed limit
-//! charges and budget reservations before charging their own.
+//! [`GatewayLedger::admit`] decides a call's limits and budgets from the
+//! cached tenant snapshot. A call no limit or budget covers touches Postgres
+//! not at all. A covered call is checked and charged by one
+//! `wyrd.gateway_admit` statement, which takes the tenant's admission
+//! advisory lock, so concurrent admissions on every replica see each other's
+//! committed limit charges and budget reservations before charging their own.
 //!
 //! Limits use fixed one-minute request and token windows plus concurrency
 //! leases. Admission charges one request and holds the call's bounded token
-//! exposure in its admission window; accounting settles each window to the
+//! exposure in its admission window; settlement replaces each hold by the
 //! actual tokens of the attempts its limit target covers, and an abandoned
-//! hold lapses with the window. Budgets
-//! reserve the bounded cost of every attempt the call may bill and are settled
-//! with the call's actual cost, zero when nothing was billed, or the whole
-//! reservation when billed cost is unknown.
+//! hold lapses with the window. Budgets reserve the bounded cost of every
+//! attempt the call may bill and are settled with the call's actual cost,
+//! zero when nothing was billed, or the whole reservation when billed cost is
+//! unknown. An unsettled reservation counts against its budget at its
+//! reserved cost, so a call that never settles is charged in full.
+//!
+//! [`Accounted::new`] prices the call's attempts in memory; its attempt and
+//! call entries travel only with the call's capture.
+//! [`GatewayLedger::settle`] persists what admission charged, in one
+//! `wyrd.gateway_settle` statement, and only for a call that a limit or budget
+//! covered: before a buffered answer is sent, so the caller's next call
+//! never meets this call's charges, and once a stream ends.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -30,18 +40,13 @@ use wyrd_spec::gateway::{
     GatewayLimit, GatewayLimitSubject, GatewayPolicySubject, GatewayPolicyTarget,
     GatewayUsageAmount, ModelRef, UnknownCostPolicy,
 };
-use wyrd_sql::TenantConn;
-use wyrd_sql::queries::gateway::{
-    GatewayAccountingEntryWrite, append_gateway_accounting_entry, charge_gateway_limit_window,
-    expired_gateway_reservations, gateway_budget_spend, gateway_limit_usage,
-    insert_gateway_call_lease, lock_gateway_admission, prune_gateway_admission,
-    release_gateway_call_leases,
+use wyrd_sql::WyrdPostgres;
+use wyrd_sql::queries::gateway_admission::{
+    GatewayAdmissionOutcome, GatewayAdmissionWrite, GatewayAdmissions, GatewayBudgetCharge,
+    GatewayHoldDelta, GatewayLimitCharge, GatewaySettlementEntry, GatewaySettlementWrite,
 };
 
-use super::service::{decode, encode, internal, unavailable};
-
-/// Expired reservations one admission settles; the rest wait for the next.
-const RECONCILE_BATCH: i64 = 32;
+use super::service::{encode, internal, unavailable};
 
 /// Identity, policy, and bounds of one call as the ledger sees it.
 #[derive(Debug, Clone, Copy)]
@@ -60,17 +65,19 @@ pub(crate) struct LedgerCall<'s> {
     pub usage_bound: Option<&'s [GatewayUsageAmount]>,
     /// Admission time fixing pricing, limit windows, and budget periods.
     pub admitted_at: DateTime<Utc>,
-    /// Time after which leases lapse and reconciliation may settle.
+    /// Time after which the call's leases lapse.
     pub expires_at: DateTime<Utc>,
 }
 
-/// Charges admission made for one call, released when it is accounted.
+/// Charges admission made for one call, settled when it is accounted.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Admission {
     /// Token holds charged to limit admission windows.
     holds: Vec<Hold>,
     /// Budget reservations created.
     reservations: Vec<Reservation>,
+    /// Whether the call took a concurrency lease.
+    leased: bool,
 }
 
 /// Tokens one admitted call holds in one limit's admission window.
@@ -95,192 +102,56 @@ struct Reservation {
     currency: CurrencyCode,
 }
 
-/// Borrowed tenant transaction carrying every ledger and admission write.
-pub(crate) struct GatewayLedger<'c, 'a> {
-    /// Caller-owned tenant transaction.
-    conn: &'c mut TenantConn<'a>,
+/// One call's priced accounting, computed in memory from its execution.
+#[derive(Debug)]
+pub(crate) struct Accounted {
+    /// Attempt entries then the call entry, which capture projects instead
+    /// of pricing the call a second time.
+    pub entries: Vec<GatewayAccountingEntryV1>,
+    /// The statement settling what admission charged, or `None` when the
+    /// call charged nothing.
+    settlement: Option<Settlement>,
 }
 
-impl<'c, 'a> GatewayLedger<'c, 'a> {
-    /// Borrows `conn` for ledger work; the caller commits it.
-    pub(crate) fn new(conn: &'c mut TenantConn<'a>) -> Self {
-        Self { conn }
-    }
+/// The settlement statement's arguments for one call.
+#[derive(Debug)]
+struct Settlement {
+    /// Logical call.
+    call_id: GatewayCallId,
+    /// The call's admission window.
+    window_start: DateTime<Utc>,
+    /// Settlement time.
+    now: DateTime<Utc>,
+    /// Hold corrections.
+    holds: Vec<GatewayHoldDelta>,
+    /// Reservation settlements.
+    settlements: Vec<GatewaySettlementEntry>,
+    /// Whether the call's leases are released.
+    release: bool,
+}
 
-    /// Admits `call`, narrowing `plan` to candidates its limits and budgets
-    /// allow, and charges the result.
-    ///
-    /// Under the tenant admission lock it prunes stale windows and leases,
-    /// settles a bounded batch of expired reservations, then:
-    ///
-    /// 1. drops candidates covered by an exhausted request or concurrency
-    ///    limit, or by a token limit whose held tokens plus the call's token
-    ///    exposure (the usage bound's tokens per covered attempt) exceed it or
-    ///    whose exposure is unbounded;
-    /// 2. when a budget applies or unknown cost is rejected, drops candidates
-    ///    whose cost cannot be bounded from active pricing and the usage
-    ///    bound;
-    /// 3. checks every applicable budget's spend plus the summed bound of
-    ///    every remaining `(candidate, deployment)` attempt and reserves that
-    ///    sum against each; and
-    /// 4. charges one request, the covered token exposure as a hold, and,
-    ///    where configured, a concurrency lease to every limit covering a
-    ///    remaining candidate.
-    ///
-    /// Nothing is durable until the caller commits, so a rejection charges
-    /// nothing.
-    ///
-    /// # Errors
-    /// Returns `GatewayLimitExceeded` with `retry_after_seconds`,
-    /// `GatewayCostUnbounded` (also for unbounded token exposure), or
-    /// `GatewayBudgetExceeded` when no candidate survives, `ServiceUnavailable` when storage fails, and `Internal` for an
-    /// undecodable ledger entry.
-    pub(crate) async fn admit(
-        &mut self,
-        call: &LedgerCall<'_>,
-        plan: &mut CallPlan,
-    ) -> Result<Admission, WyrdError> {
-        let now = call.admitted_at;
-        let window = minute_start(now);
-        lock_gateway_admission(self.conn)
-            .await
-            .map_err(unavailable)?;
-        prune_gateway_admission(self.conn, window - chrono::TimeDelta::minutes(1), now)
-            .await
-            .map_err(unavailable)?;
-        self.reconcile(call.tenant, now).await?;
-
-        let mut limits = Vec::new();
-        for limit in &call.governance.limits {
-            if limit_applies(limit, call.principal) {
-                limits.push((limit, encode(&(&limit.subject, &limit.target))?.to_string()));
-            }
-        }
-        let attempt_tokens = call.usage_bound.map(|bound| {
-            whole_units(
-                &bound
-                    .iter()
-                    .filter(|amount| amount.unit == "tokens")
-                    .map(|amount| GatewayCost::from_decimal(&amount.quantity))
-                    .sum(),
-            )
-        });
-        let exposure = |plan: &CallPlan, target| {
-            attempt_tokens.map(|tokens| tokens.saturating_mul(covered_attempts(plan, target)))
-        };
-        let mut exhausted = Vec::new();
-        let mut unbounded = false;
-        for (limit, key) in &limits {
-            let (requests, tokens, leases) = gateway_limit_usage(self.conn, key, window, now)
-                .await
-                .map_err(unavailable)?;
-            let over_tokens = limit.tokens_per_minute.is_some_and(|cap| {
-                if let Some(held) = exposure(plan, &limit.target) {
-                    u64::try_from(tokens.saturating_add(held)).is_ok_and(|total| total > cap.get())
-                } else {
-                    unbounded |= covered_attempts(plan, &limit.target) > 0;
-                    true
-                }
-            });
-            if reached(limit.requests_per_minute, requests)
-                || over_tokens
-                || reached(limit.concurrent_calls, leases)
-            {
-                exhausted.push(&limit.target);
-            }
-        }
-        plan.retain(|model| !exhausted.iter().any(|target| covers(target, model)));
-        if plan.candidates.is_empty() {
-            return Err(if unbounded {
-                cost_unbounded()
-            } else {
-                limit_exceeded(now)
-            });
-        }
-
-        let budgets: Vec<&GatewayBudget> = call
-            .governance
-            .budgets
-            .iter()
-            .filter(|budget| budget_applies(budget, call.principal))
-            .collect();
-        let bound = |model: &ModelRef| {
-            PricedModel::select(call.governance, model, now)?.cost(call.usage_bound?)
-        };
-        if !budgets.is_empty() || call.governance.unknown_cost == UnknownCostPolicy::Reject {
-            plan.retain(|model| bound(model).is_some());
-            if plan.candidates.is_empty() {
-                return Err(cost_unbounded());
-            }
-        }
-        let mut admission = Admission::default();
-        if !budgets.is_empty() {
-            let reserve = plan
-                .candidates
-                .iter()
-                .map(|candidate| &candidate.model)
-                .filter_map(bound)
-                .sum();
-            for budget in budgets {
-                admission
-                    .reservations
-                    .extend(self.reserve(call, budget, &reserve).await?);
-            }
-        }
-
-        for (limit, key) in limits {
-            if !plan
-                .candidates
-                .iter()
-                .any(|candidate| covers(&limit.target, &candidate.model))
-            {
-                continue;
-            }
-            let hold = exposure(plan, &limit.target).unwrap_or(0);
-            charge_gateway_limit_window(self.conn, &key, window, 1, hold)
-                .await
-                .map_err(unavailable)?;
-            if limit.concurrent_calls.is_some() {
-                insert_gateway_call_lease(self.conn, &key, call.call_id.as_uuid(), call.expires_at)
-                    .await
-                    .map_err(unavailable)?;
-            }
-            admission.holds.push(Hold {
-                key,
-                target: limit.target.clone(),
-                tokens: hold,
-            });
-        }
-        Ok(admission)
-    }
-
-    /// Records every attempt and the logical call, settles the call's
-    /// reservations, settles its token holds, and releases its leases.
-    ///
-    /// Reservations settle at the call's cost, zero when no attempt was
-    /// billed, or in full when billed cost is unknown. Each token hold is
-    /// replaced in its admission window by the tokens of the billed attempts
-    /// its limit target covers, released when none was billed, and kept when
-    /// a covered billed attempt's usage is unknown.
+impl Accounted {
+    /// Prices every attempt and the logical call, and prepares the settlement
+    /// of `admission`.
     ///
     /// Billable attempts are priced with the pricing version selected at
     /// admission; a non-billable attempt carries unknown usage and cost. The
     /// call's usage is the per-dimension sum and its cost the sum of attempt
     /// costs, each known only when every billable attempt's value is known.
-    /// Every entry is fenced, so replaying accounting writes nothing twice.
     ///
-    /// Returns the attempt and call entries in append order, which capture
-    /// projects instead of pricing the call a second time.
+    /// Reservations settle at the call's cost, zero when no attempt was
+    /// billed, or in full when billed cost is unknown. Each token hold is
+    /// replaced by the tokens of the billed attempts its limit target covers,
+    /// released when none was billed, and kept when a covered billed
+    /// attempt's usage is unknown. Pure: no IO.
     ///
     /// # Errors
-    /// Returns `ServiceUnavailable` when storage fails and `Internal` when an
-    /// entry violates the ledger contract.
-    pub(crate) async fn account(
-        &mut self,
+    /// Returns `Internal` when an entry violates the ledger contract.
+    pub(crate) fn new(
         call: &LedgerCall<'_>,
         admission: &Admission,
         execution: &CallExecution,
-    ) -> Result<Vec<GatewayAccountingEntryV1>, WyrdError> {
+    ) -> Result<Self, WyrdError> {
         let now = Utc::now();
         let mut entries = Vec::with_capacity(execution.attempts.len() + 1);
         let mut usage: Option<BTreeMap<(String, String), GatewayCost>> = Some(BTreeMap::new());
@@ -334,7 +205,7 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
                 pricing_version: attempt_cost.as_ref().map(|(p, _)| p.version().to_owned()),
                 accounted_at: now,
             };
-            self.append(&entry).await?;
+            entry.validate().map_err(internal)?;
             entries.push(entry);
         }
 
@@ -366,203 +237,343 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
             },
             accounted_at: now,
         };
-        self.append(&entry).await?;
+        entry.validate().map_err(internal)?;
         entries.push(entry);
 
-        for reservation in &admission.reservations {
-            let actual = match &cost {
-                Some((total, _)) => total.clone(),
-                None if billed => reservation.reserved.clone(),
-                None => GatewayCost::zero(),
-            };
-            self.settle(call.call_id, call.tenant, reservation, &actual, now)
-                .await?;
-        }
-        for hold in &admission.holds {
-            let delta = covered_tokens(&hold.target, &execution.attempts)
-                .map_or(0, |tokens| tokens - hold.tokens);
-            charge_gateway_limit_window(
-                self.conn,
-                &hold.key,
-                minute_start(call.admitted_at),
-                0,
-                delta,
-            )
-            .await
-            .map_err(unavailable)?;
-        }
-        release_gateway_call_leases(self.conn, call.call_id.as_uuid())
-            .await
-            .map_err(unavailable)?;
-        Ok(entries)
+        let charged = !admission.holds.is_empty() || !admission.reservations.is_empty();
+        let settlement = (charged || admission.leased)
+            .then(|| -> Result<Settlement, WyrdError> {
+                let mut settlements = Vec::with_capacity(admission.reservations.len());
+                for reservation in &admission.reservations {
+                    let actual = match &cost {
+                        Some((total, _)) => total.clone(),
+                        None if billed => reservation.reserved.clone(),
+                        None => GatewayCost::zero(),
+                    };
+                    settlements.push(settlement(call, reservation, &actual, now)?);
+                }
+                let holds = admission
+                    .holds
+                    .iter()
+                    .map(|hold| GatewayHoldDelta {
+                        key: hold.key.clone(),
+                        delta: covered_tokens(&hold.target, &execution.attempts)
+                            .map_or(0, |tokens| tokens - hold.tokens),
+                    })
+                    .collect();
+                Ok(Settlement {
+                    call_id: call.call_id,
+                    window_start: minute_start(call.admitted_at),
+                    now,
+                    holds,
+                    settlements,
+                    release: admission.leased,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            entries,
+            settlement,
+        })
+    }
+}
+
+/// Admits and settles gateway calls against the tenant pool.
+pub(crate) struct GatewayLedger<'p> {
+    /// Tenant pool the admission and settlement statements run on.
+    postgres: &'p WyrdPostgres,
+}
+
+impl<'p> GatewayLedger<'p> {
+    /// Borrows the tenant pool.
+    pub(crate) fn new(postgres: &'p WyrdPostgres) -> Self {
+        Self { postgres }
     }
 
-    /// Settles up to [`RECONCILE_BATCH`] reservations that expired unsettled.
+    /// Admits `call`, narrowing `plan` to candidates its limits and budgets
+    /// allow, and charges the result.
     ///
-    /// Their call never reached accounting, so its cost is unknown: the whole
-    /// reservation is charged rather than released as zero.
+    /// In memory, from the admitted snapshot, it:
     ///
-    /// # Errors
-    /// Returns `ServiceUnavailable` when storage fails and `Internal` for an
-    /// undecodable reservation entry.
-    pub(crate) async fn reconcile(
-        &mut self,
-        tenant: DataTenantId,
-        now: DateTime<Utc>,
-    ) -> Result<(), WyrdError> {
-        let expired = expired_gateway_reservations(self.conn, now, RECONCILE_BATCH)
-            .await
-            .map_err(unavailable)?;
-        for document in expired {
-            let GatewayAccountingEntryV1::BudgetReservationCreated {
-                reservation_id,
-                call_id,
-                reserved_cost,
-                currency,
-                ..
-            } = decode(document)?
-            else {
-                return Err(internal(
-                    "expired reservation query returned another entry kind",
-                ));
-            };
-            let reservation = Reservation {
-                id: reservation_id,
-                reserved: GatewayCost::from_decimal(&reserved_cost),
-                currency,
-            };
-            let actual = reservation.reserved.clone();
-            self.settle(call_id, tenant, &reservation, &actual, now)
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Checks `budget` can absorb `reserve` this period and reserves it.
+    /// 1. drops candidates covered by a token limit whose exposure (the usage
+    ///    bound's tokens per covered attempt) is unbounded;
+    /// 2. when a budget applies or unknown cost is rejected, drops candidates
+    ///    whose cost cannot be bounded from active pricing and the usage
+    ///    bound; and
+    /// 3. sums the bounded cost of every remaining candidate as the reserve
+    ///    of each applicable budget.
     ///
-    /// Returns no reservation for a zero bound, which consumes nothing.
+    /// When no limit covers a remaining candidate and no budget applies, the
+    /// call is admitted with no IO. Otherwise one `wyrd.gateway_admit`
+    /// statement checks every covering limit's request, token, and
+    /// concurrency use and every budget's period spend under the tenant
+    /// admission lock, and charges all of them only when all have room. A
+    /// limit it reports exhausted removes the candidates it covers, and the
+    /// statement runs again for what remains, so each repetition removes at
+    /// least one candidate. Nothing is charged by a rejection.
     ///
     /// # Errors
-    /// Returns `GatewayBudgetExceeded` when period spend plus `reserve`
-    /// exceeds the budget, and storage or contract errors.
-    async fn reserve(
-        &mut self,
+    /// Returns `GatewayLimitExceeded` with `retry_after_seconds`,
+    /// `GatewayCostUnbounded` (also for unbounded token exposure), or
+    /// `GatewayBudgetExceeded` when no candidate survives,
+    /// `ServiceUnavailable` when storage fails, and `Internal` for an entry
+    /// that violates the ledger contract.
+    pub(crate) async fn admit(
+        &self,
         call: &LedgerCall<'_>,
-        budget: &GatewayBudget,
-        reserve: &GatewayCost,
-    ) -> Result<Option<Reservation>, WyrdError> {
-        let (period_start, period_end) = period_bounds(budget.period, call.admitted_at)
-            .ok_or_else(|| internal("budget period is out of range"))?;
-        let (start_text, end_text) = (encode(&period_start)?, encode(&period_end)?);
-        let spend = gateway_budget_spend(
-            self.conn,
-            &encode(&budget.subject)?,
-            start_text.as_str().unwrap_or_default(),
-            end_text.as_str().unwrap_or_default(),
-        )
-        .await
-        .map_err(unavailable)?;
-        let spend = GatewayCost::parse(&spend).map_err(internal)?;
-        if spend + reserve.clone() > GatewayCost::from_decimal(&budget.amount) {
-            return Err(budget_exceeded());
+        plan: &mut CallPlan,
+    ) -> Result<Admission, WyrdError> {
+        let now = call.admitted_at;
+        let mut limits = Vec::new();
+        for limit in &call.governance.limits {
+            if limit_applies(limit, call.principal) {
+                limits.push((limit, encode(&(&limit.subject, &limit.target))?.to_string()));
+            }
         }
-        if reserve.is_zero() {
-            return Ok(None);
-        }
-        let reservation = Reservation {
-            id: GatewayBudgetReservationId::new_v7(),
-            reserved: reserve.clone(),
-            currency: budget.currency.clone(),
+        let budgets: Vec<&GatewayBudget> = call
+            .governance
+            .budgets
+            .iter()
+            .filter(|budget| budget_applies(budget, call.principal))
+            .collect();
+        let attempt_tokens = call.usage_bound.map(|bound| {
+            whole_units(
+                &bound
+                    .iter()
+                    .filter(|amount| amount.unit == "tokens")
+                    .map(|amount| GatewayCost::from_decimal(&amount.quantity))
+                    .sum(),
+            )
+        });
+        let exposure = |plan: &CallPlan, target| {
+            attempt_tokens.map(|tokens| tokens.saturating_mul(covered_attempts(plan, target)))
         };
-        self.append(&GatewayAccountingEntryV1::BudgetReservationCreated {
-            entry_id: GatewayAccountingEntryId::new_v7(),
-            reservation_id: reservation.id,
-            call_id: call.call_id,
-            data_tenant_id: call.tenant,
-            subject: budget.subject.clone(),
-            reserved_cost: reserve.to_decimal(),
-            currency: budget.currency.clone(),
-            created_at: call.admitted_at,
-            period_start,
-            period_end,
-            expires_at: call.expires_at,
-        })
-        .await?;
-        Ok(Some(reservation))
+        let bound = |model: &ModelRef| {
+            PricedModel::select(call.governance, model, now)?.cost(call.usage_bound?)
+        };
+
+        let mut unbounded = false;
+        let unbounded_targets: Vec<&GatewayPolicyTarget> = limits
+            .iter()
+            .filter(|(limit, _)| {
+                limit.tokens_per_minute.is_some() && exposure(plan, &limit.target).is_none()
+            })
+            .map(|(limit, _)| &limit.target)
+            .collect();
+        for target in &unbounded_targets {
+            unbounded |= covered_attempts(plan, target) > 0;
+        }
+        plan.retain(|model| !unbounded_targets.iter().any(|target| covers(target, model)));
+        if plan.candidates.is_empty() {
+            return Err(cost_unbounded());
+        }
+        if !budgets.is_empty() || call.governance.unknown_cost == UnknownCostPolicy::Reject {
+            plan.retain(|model| bound(model).is_some());
+            if plan.candidates.is_empty() {
+                return Err(cost_unbounded());
+            }
+        }
+
+        loop {
+            let covering: Vec<&(&GatewayLimit, String)> = limits
+                .iter()
+                .filter(|(limit, _)| {
+                    plan.candidates
+                        .iter()
+                        .any(|candidate| covers(&limit.target, &candidate.model))
+                })
+                .collect();
+            let charges: Vec<GatewayLimitCharge> = covering
+                .iter()
+                .map(|(limit, key)| GatewayLimitCharge {
+                    key: key.clone(),
+                    requests: limit.requests_per_minute.map(NonZeroU64::get),
+                    tokens: limit.tokens_per_minute.map(NonZeroU64::get),
+                    concurrent: limit.concurrent_calls.map(NonZeroU64::get),
+                    hold: exposure(plan, &limit.target).unwrap_or(0),
+                    lease: limit.concurrent_calls.is_some(),
+                })
+                .collect();
+            let reserve: GatewayCost = if budgets.is_empty() {
+                GatewayCost::zero()
+            } else {
+                plan.candidates
+                    .iter()
+                    .map(|candidate| &candidate.model)
+                    .filter_map(bound)
+                    .sum()
+            };
+            let mut reservations = Vec::new();
+            let mut budget_charges = Vec::with_capacity(budgets.len());
+            for budget in &budgets {
+                let (charge, reservation) = reservation(call, budget, &reserve)?;
+                budget_charges.push(charge);
+                reservations.extend(reservation);
+            }
+            if charges.is_empty() && budget_charges.is_empty() {
+                return Ok(Admission::default());
+            }
+
+            let mut conn = self.postgres.conn().await.map_err(unavailable)?;
+            let outcome = GatewayAdmissions::new(&mut conn, call.tenant)
+                .admit(&GatewayAdmissionWrite {
+                    call_id: call.call_id.as_uuid(),
+                    window_start: minute_start(now),
+                    now,
+                    expires_at: call.expires_at,
+                    limits: &charges,
+                    budgets: &budget_charges,
+                })
+                .await
+                .map_err(unavailable)?;
+            match outcome {
+                GatewayAdmissionOutcome::Admitted => {
+                    return Ok(Admission {
+                        leased: charges.iter().any(|charge| charge.lease),
+                        holds: covering
+                            .iter()
+                            .zip(charges)
+                            .map(|((limit, _), charge)| Hold {
+                                key: charge.key,
+                                target: limit.target.clone(),
+                                tokens: charge.hold,
+                            })
+                            .collect(),
+                        reservations,
+                    });
+                }
+                GatewayAdmissionOutcome::BudgetExceeded => return Err(budget_exceeded()),
+                GatewayAdmissionOutcome::Exhausted(keys) => {
+                    let exhausted: Vec<&GatewayPolicyTarget> = covering
+                        .iter()
+                        .filter(|(_, key)| keys.contains(key))
+                        .map(|(limit, _)| &limit.target)
+                        .collect();
+                    plan.retain(|model| !exhausted.iter().any(|target| covers(target, model)));
+                    if plan.candidates.is_empty() {
+                        return Err(if unbounded {
+                            cost_unbounded()
+                        } else {
+                            limit_exceeded(now)
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    /// Appends the settlement of `reservation` at `actual` cost.
+    /// Persists what admission charged `accounted`'s call in one
+    /// `wyrd.gateway_settle` statement, and does nothing for a call that
+    /// charged nothing.
+    ///
+    /// The statement replaces each hold by its actual tokens, appends each
+    /// reservation settlement (a replay appends nothing), releases the
+    /// call's leases, and prunes windows and leases no admission reads.
     ///
     /// # Errors
-    /// Returns storage or contract errors.
-    async fn settle(
-        &mut self,
-        call_id: GatewayCallId,
+    /// Returns `ServiceUnavailable` when storage fails. Nothing commits then:
+    /// leases lapse at their expiry and each reservation keeps counting at
+    /// its reserved cost.
+    pub(crate) async fn settle(
+        &self,
         tenant: DataTenantId,
-        reservation: &Reservation,
-        actual: &GatewayCost,
-        now: DateTime<Utc>,
+        accounted: &Accounted,
     ) -> Result<(), WyrdError> {
-        self.append(&GatewayAccountingEntryV1::BudgetReservationSettled {
-            entry_id: GatewayAccountingEntryId::new_v7(),
-            reservation_id: reservation.id,
-            call_id,
-            data_tenant_id: tenant,
-            actual_cost: actual.to_decimal(),
-            released_cost: reservation.reserved.saturating_sub(actual).to_decimal(),
-            currency: reservation.currency.clone(),
-            settled_at: now,
-        })
-        .await
-        .map(|_| ())
-    }
-
-    /// Validates and appends one entry; a fenced replay is a no-op.
-    ///
-    /// # Errors
-    /// Returns `Internal` when the entry violates its contract and
-    /// `ServiceUnavailable` when storage fails.
-    async fn append(&mut self, entry: &GatewayAccountingEntryV1) -> Result<bool, WyrdError> {
-        entry.validate().map_err(internal)?;
-        let (entry_id, call_id, kind, priced) = match entry {
-            GatewayAccountingEntryV1::BudgetReservationCreated {
-                entry_id, call_id, ..
-            } => (entry_id, call_id, "budget_reservation_created", None),
-            GatewayAccountingEntryV1::BudgetReservationSettled {
-                entry_id, call_id, ..
-            } => (entry_id, call_id, "budget_reservation_settled", None),
-            GatewayAccountingEntryV1::AttemptAccounted {
-                entry_id,
-                call_id,
-                model,
-                pricing_version,
-                ..
-            } => (
-                entry_id,
-                call_id,
-                "attempt_accounted",
-                pricing_version.as_deref().map(|version| (model, version)),
-            ),
-            GatewayAccountingEntryV1::CallAccounted {
-                entry_id, call_id, ..
-            } => (entry_id, call_id, "call_accounted", None),
+        let Some(settlement) = &accounted.settlement else {
+            return Ok(());
         };
-        let document = encode(entry)?;
-        append_gateway_accounting_entry(
-            self.conn,
-            GatewayAccountingEntryWrite {
-                entry_id: entry_id.as_uuid(),
-                call_id: call_id.as_uuid(),
-                kind,
-                deployment: priced.map(|(model, _)| model.deployment.as_str()),
-                model: priced.map(|(model, _)| model.model.as_str()),
-                pricing_version: priced.map(|(_, version)| version),
-                entry: &document,
-            },
-        )
-        .await
-        .map_err(unavailable)
+        let mut conn = self.postgres.conn().await.map_err(unavailable)?;
+        GatewayAdmissions::new(&mut conn, tenant)
+            .settle(&GatewaySettlementWrite {
+                call_id: settlement.call_id.as_uuid(),
+                window_start: settlement.window_start,
+                window_floor: minute_start(settlement.now) - chrono::TimeDelta::minutes(1),
+                now: settlement.now,
+                holds: &settlement.holds,
+                settlements: &settlement.settlements,
+                release: settlement.release,
+            })
+            .await
+            .map_err(unavailable)
     }
+}
+
+/// The admission statement's check of `budget` against `reserve`, and the
+/// reservation it creates, which is `None` for a zero reserve.
+///
+/// # Errors
+/// Returns `Internal` when the budget period is out of range or the
+/// reservation entry violates the ledger contract.
+fn reservation(
+    call: &LedgerCall<'_>,
+    budget: &GatewayBudget,
+    reserve: &GatewayCost,
+) -> Result<(GatewayBudgetCharge, Option<Reservation>), WyrdError> {
+    let (period_start, period_end) = period_bounds(budget.period, call.admitted_at)
+        .ok_or_else(|| internal("budget period is out of range"))?;
+    let mut charge = GatewayBudgetCharge {
+        subject: encode(&budget.subject)?,
+        period_start: encode(&period_start)?,
+        period_end: encode(&period_end)?,
+        amount: budget.amount.as_str().to_owned(),
+        reserve: reserve.to_decimal().as_str().to_owned(),
+        entry_id: None,
+        entry: None,
+    };
+    if reserve.is_zero() {
+        return Ok((charge, None));
+    }
+    let reservation = Reservation {
+        id: GatewayBudgetReservationId::new_v7(),
+        reserved: reserve.clone(),
+        currency: budget.currency.clone(),
+    };
+    let entry_id = GatewayAccountingEntryId::new_v7();
+    let entry = GatewayAccountingEntryV1::BudgetReservationCreated {
+        entry_id,
+        reservation_id: reservation.id,
+        call_id: call.call_id,
+        data_tenant_id: call.tenant,
+        subject: budget.subject.clone(),
+        reserved_cost: reserve.to_decimal(),
+        currency: budget.currency.clone(),
+        created_at: call.admitted_at,
+        period_start,
+        period_end,
+        expires_at: call.expires_at,
+    };
+    entry.validate().map_err(internal)?;
+    charge.entry_id = Some(entry_id.as_uuid());
+    charge.entry = Some(encode(&entry)?);
+    Ok((charge, Some(reservation)))
+}
+
+/// The settlement entry of `reservation` at `actual` cost.
+///
+/// # Errors
+/// Returns `Internal` when the entry violates the ledger contract.
+fn settlement(
+    call: &LedgerCall<'_>,
+    reservation: &Reservation,
+    actual: &GatewayCost,
+    now: DateTime<Utc>,
+) -> Result<GatewaySettlementEntry, WyrdError> {
+    let entry_id = GatewayAccountingEntryId::new_v7();
+    let entry = GatewayAccountingEntryV1::BudgetReservationSettled {
+        entry_id,
+        reservation_id: reservation.id,
+        call_id: call.call_id,
+        data_tenant_id: call.tenant,
+        actual_cost: actual.to_decimal(),
+        released_cost: reservation.reserved.saturating_sub(actual).to_decimal(),
+        currency: reservation.currency.clone(),
+        settled_at: now,
+    };
+    entry.validate().map_err(internal)?;
+    Ok(GatewaySettlementEntry {
+        entry_id: entry_id.as_uuid(),
+        entry: encode(&entry)?,
+    })
 }
 
 /// True when a limit applies to `principal`.
@@ -592,11 +603,6 @@ fn covers(target: &GatewayPolicyTarget, model: &ModelRef) -> bool {
         GatewayPolicyTarget::Deployment { deployment } => *deployment == model.deployment,
         GatewayPolicyTarget::Model { model: covered } => covered == model,
     }
-}
-
-/// True when a configured cap is already consumed by `used`.
-fn reached(cap: Option<NonZeroU64>, used: i64) -> bool {
-    cap.is_some_and(|cap| u64::try_from(used).unwrap_or(0) >= cap.get())
 }
 
 /// Number of `plan` attempts, one per candidate, whose model `target` covers.
@@ -715,6 +721,5 @@ mod tests {
             whole_units(&GatewayCost::parse("1500.75").expect("cost")),
             1500
         );
-        assert!(reached(NonZeroU64::new(2), 2) && !reached(NonZeroU64::new(2), 1));
     }
 }

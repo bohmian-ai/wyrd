@@ -956,7 +956,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
-                attribution: auth.attribution(),
+                attribution: auth.attribution().into(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
                 table,
@@ -1033,7 +1033,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
-            attribution: auth.attribution(),
+            attribution: auth.attribution().into(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
             table,
@@ -1271,7 +1271,7 @@ mod tests {
     use wyrd_runtime::{
         Action, Permission, PermissionScope, PermissionSet, Principal, PrincipalKind, Resource,
     };
-    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+    use wyrd_spec::auth::{PrincipalId, SERVER_WRITE_PRINCIPAL};
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::QueryStreamFrame;
@@ -2018,7 +2018,7 @@ mod tests {
 
         for principal in [
             PrincipalId::new(uuid::Uuid::now_v7()),
-            GATEWAY_CAPTURE_PRINCIPAL,
+            SERVER_WRITE_PRINCIPAL,
         ] {
             let context = context_with(principal, PrincipalKind::User, wildcard.clone());
             let error = gate

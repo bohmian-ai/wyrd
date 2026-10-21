@@ -1,6 +1,6 @@
 ---
 id: SPEC-gateway-capacity
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -472,6 +472,10 @@ percentiles in no-profile and profiled modes.
 
 ## Approval and history
 
+**Revision 4:** the user explicitly approved the [revision-4 amendment](spec-revision-4.md)
+on 2026-10-21. Its scope correction and REQ-012–015/AC-010–014 are part of this
+specification; every unchanged revision-3 obligation remains in force.
+
 **Approved scope:** on 2026-10-20 the user agreed to the proposed overhead and
 sustained-capacity split sharing one harness and requested spec/task updates.
 The follow-ups explicitly require verification-style client-server roundtrip
@@ -490,6 +494,9 @@ Performance optimization and reservation/refusal policy remain outside scope.
 - 2026-10-20 — User explicitly approved the complete revision 2 specification
   and companion task after reviewing the updated packet. TASK-001 is ready;
   implementation has not started.
+- 2026-10-21 — User explicitly approved the revision-4 amendment (complete
+  startup, engine ownership, portable Monty worker, verified row attribution
+  without a transport identity) for TASK-002.
 
 ## Authorities
 
@@ -498,4 +505,4 @@ Performance optimization and reservation/refusal policy remain outside scope.
 [Wyrd design](../../../architecture/wyrd-design.md),
 [doctrine](../../../architecture/wyrd-doctrine.mdx),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md).
-No Bifrost ingest/storage contract change is authorized.
+No Bifrost ingest/storage contract change is authorized beyond the revision-4 amendment.

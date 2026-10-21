@@ -4,8 +4,8 @@
 //!
 //! The Artifact is registered through the SDK registration saga, so its Card
 //! blob, inventory, and stored bytes are exactly what production reads.
-//! Ignored in the fast lane because the code case needs the worker binary;
-//! `mise run test:verification:sandbox` builds it and runs them.
+//! The worker is this package's `wyrd-server`, which cargo builds in the same
+//! profile before it runs these tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -213,7 +213,6 @@ fn notes() -> SlotName {
 /// # Panics
 /// Panics when a consumer refuses the valid Artifact or sees other bytes.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn artifact_evidence_and_code_reach_every_consumer() {
     let registered = Registered::start().await;
     let declaration = registered.file("notes.txt");
@@ -315,7 +314,6 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
 /// # Panics
 /// Panics when a refused read succeeds or is retryable.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn artifact_reads_refuse_before_use() {
     let registered = Registered::start().await;
     let tenant = registered.server.data_tenant_id();
@@ -515,7 +513,6 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 /// Panics when a scope widens, a call goes unrecorded, an invalid citation
 /// survives, or an undeclared tool is accepted.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn recovered_authority_bounds_every_agent_tool() {
     /// A query of the one granted table.
     const LOGS: &str = "SELECT severity_text FROM vala.logs.records";
@@ -722,7 +719,6 @@ async fn recovered_authority_bounds_every_agent_tool() {
 /// # Panics
 /// Panics when a lookup reads a Card its caller may not read.
 #[tokio::test]
-#[ignore = "needs a bound server; run `mise run test:verification:sandbox`"]
 async fn card_resolution_is_the_callers_read() {
     let registered = Registered::start().await;
     let state = registered.server.state().clone();
@@ -803,7 +799,6 @@ fn notes_workspace(registered: &Registered) -> BTreeMap<String, CallInput> {
 /// Panics when a refusal is not busy, a refused call waits, or capacity
 /// does not return.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
     let registered = Registered::start().await;
     let limits = saturable();
@@ -952,7 +947,6 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// Panics when the server, seeding, or runtime fails, the second execution
 /// is never deferred, or it settles other than `completed` on one attempt.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let logs = LogCapture::install();
     let registered = Registered::start().await;
@@ -1109,7 +1103,6 @@ fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
 /// Panics when the server, pool, or engine fails to start, a refusal is
 /// not the expected input error, or the within-budget control fails.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit() {
     let registered = Registered::start().await;
     let blocks = HostedBlocks::start(worker(), tight_files())
@@ -1238,7 +1231,6 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
 /// Panics when the server, seeding, or runtime fails, or an execution
 /// settles otherwise.
 #[tokio::test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     let registered = Registered::start().await;
     let tenant = registered.server.data_tenant_id();

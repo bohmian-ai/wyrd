@@ -49,7 +49,8 @@ pub(crate) enum Phase {
     Credential,
     /// Adapter work outside provider exchanges, summed across attempts.
     Translate,
-    /// The accounting transaction.
+    /// The settlement statement of a call a limit or budget covered; zero
+    /// for a call that charged nothing.
     Account,
     /// Relay decoding, translation, and framing of a stream's chunks.
     Relay,

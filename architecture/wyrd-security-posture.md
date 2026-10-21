@@ -70,7 +70,7 @@ identity is not a registered AI-system component.
 Gateway capture is a server-internal write that holds no token, evaluates no
 permission, and writes no audit decision. Its rows carry the verified
 subject/actor pair the call ran under. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never appears in
+`SERVER_WRITE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never appears in
 a token: every issuer refuses it, every verifier rejects a token naming it, it
 never appears in a delegation chain, and it never replaces the invocation
 caller in audit. Gate refuses every public write to `vala.gateway.calls`. A pod

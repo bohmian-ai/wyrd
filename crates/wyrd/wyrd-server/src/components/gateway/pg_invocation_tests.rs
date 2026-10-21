@@ -53,16 +53,13 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
-use wyrd_sql::queries::gateway::{
-    GatewayAccountingEntryWrite, append_gateway_accounting_entry, claim_gateway_batch,
-    gateway_call_accounting_entries, lock_gateway_admission, record_gateway_batch,
-};
+use wyrd_sql::queries::gateway::{claim_gateway_batch, record_gateway_batch};
 use wyrd_sql::row_types::gateway::GatewayBatchRow;
 use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
-use super::ledger::{GatewayLedger, LedgerCall};
+use super::ledger::{Accounted, GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
     admin, audit_decisions, await_lock_waiters, sealing_keyring, test_state,
 };
@@ -353,16 +350,23 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json body")
 }
 
-/// Reads and decodes every ledger entry of `call_id`.
+/// Reads and decodes every budget reservation entry of `call_id`, the only
+/// ledger entries Postgres keeps; a call's attempt and call entries travel
+/// with its capture instead, which [`captured`] reads.
 async fn entries(
     fixture: &PgFixture,
     tenant: DataTenantId,
     call_id: GatewayCallId,
 ) -> Vec<GatewayAccountingEntryV1> {
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let rows = gateway_call_accounting_entries(&mut conn, call_id.as_uuid())
-        .await
-        .expect("ledger reads");
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT entry FROM wyrd.gateway_accounting_entries WHERE call_id = $1 \
+         ORDER BY recorded_at, entry_id",
+    )
+    .bind(call_id.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("ledger reads");
     conn.commit().await.expect("ledger read commits");
     rows.into_iter()
         .map(|row| serde_json::from_value(row).expect("ledger entry decodes"))
@@ -381,22 +385,67 @@ async fn append_raw(
     entry: &Value,
 ) -> bool {
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let inserted = append_gateway_accounting_entry(
-        &mut conn,
-        GatewayAccountingEntryWrite {
-            entry_id: Uuid::now_v7(),
-            call_id,
-            kind,
-            deployment: None,
-            model: None,
-            pricing_version: None,
-            entry,
-        },
+    let inserted = sqlx::query(
+        "INSERT INTO wyrd.gateway_accounting_entries (data_tenant_id, entry_id, call_id, kind, entry) \
+         VALUES (wyrd.current_tenant(), $1, $2, $3, $4) ON CONFLICT DO NOTHING",
     )
+    .bind(Uuid::now_v7())
+    .bind(call_id)
+    .bind(kind)
+    .bind(entry)
+    .execute(&mut **conn.transaction())
     .await
-    .expect("ledger append");
+    .expect("ledger append")
+    .rows_affected()
+        == 1;
     conn.commit().await.expect("ledger append commits");
     inserted
+}
+
+/// Stores the `Metadata` capture policy, so every later call's usage, cost,
+/// and pricing reach the Scribe its state records into.
+///
+/// # Panics
+/// Panics when the policy cannot be stored.
+async fn capture_metadata(state: &AppState, tenant: DataTenantId) {
+    GatewayAdministration::new(state)
+        .put_capture(
+            &admin(tenant),
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("metadata policy stores");
+}
+
+/// The captured `vala.gateway.calls` row of `call_id` as a JSON object of
+/// its scalar columns, null columns absent; the row is where a call's
+/// usage, cost, and pricing are recorded.
+///
+/// # Panics
+/// Panics when `scribe` acknowledged no row for the call.
+fn captured(scribe: &RecordingScribe, call_id: GatewayCallId) -> Value {
+    let id = call_id.as_uuid().to_string();
+    scribe
+        .calls()
+        .into_iter()
+        .find(|row| row.get("call_id").and_then(Value::as_str) == Some(id.as_str()))
+        .map_or_else(|| panic!("no captured row for call {id}"), Value::Object)
+}
+
+/// The cost a captured call `row` records.
+///
+/// # Panics
+/// Panics when the row records no cost or a malformed one.
+fn row_cost(row: &Value) -> GatewayDecimal {
+    let cost = match &row["cost"] {
+        Value::String(cost) => cost.clone(),
+        Value::Number(cost) => cost.to_string(),
+        other => panic!("the row records no cost: {other} in {row}"),
+    };
+    GatewayDecimal::new(&cost).expect("captured cost is a decimal")
 }
 
 /// Attempt that fails before reaching the provider, so nothing is billed.
@@ -762,7 +811,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
 /// Public handler and internal seam share one pipeline: the requested model
 /// is authorized and audited before dispatch, an unauthorized fallback is
 /// skipped and audited, fallback preserves requested and resolved identity,
-/// and billed failed and successful attempts are priced in the ledger.
+/// and billed failed and successful attempts are priced on the captured row.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -774,6 +823,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let scribe = Arc::new(RecordingScribe::default());
     let state = scribe.record(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    capture_metadata(&state, tenant).await;
     let invocation = GatewayInvocation::new(&state);
     let decision = |outcome: &str| ("gateway.invoke".to_owned(), outcome.to_owned());
 
@@ -840,43 +890,18 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         (model("dep-a/a"), model("dep-b/b"))
     );
     assert_eq!(dispatch.seen(), ["dep-a", "dep-a", "dep-b"]);
-    let ledger = entries(&fixture, tenant, response.call_id).await;
-    let attempts: Vec<(GatewayCallOutcome, &str)> = ledger
-        .iter()
-        .filter_map(|entry| match entry {
-            GatewayAccountingEntryV1::AttemptAccounted {
-                outcome,
-                cost: Some(cost),
-                ..
-            } => Some((*outcome, cost.as_str())),
-            _ => None,
-        })
-        .collect();
+    drain_gateway(&fresh).await;
+    let row = captured(&scribe, response.call_id);
     assert_eq!(
-        attempts.len(),
-        2,
-        "both billed attempts are priced: {ledger:?}"
+        (&row["outcome"], &row["attempt_count"]),
+        (&json!("succeeded"), &json!(2)),
+        "{row}"
     );
+    assert_cost(&row_cost(&row), "0.0026");
     assert_eq!(
-        (attempts[0].0, attempts[1].0),
-        (GatewayCallOutcome::Failed, GatewayCallOutcome::Succeeded)
-    );
-    let call = ledger.iter().find_map(|entry| match entry {
-        GatewayAccountingEntryV1::CallAccounted {
-            outcome,
-            cost: Some(cost),
-            pricing_versions,
-            normalized_usage: Some(_),
-            ..
-        } => Some((outcome, cost, pricing_versions)),
-        _ => None,
-    });
-    let (outcome, cost, versions) = call.expect("priced call entry");
-    assert_eq!(*outcome, GatewayCallOutcome::Succeeded);
-    assert_cost(cost, "0.0026");
-    assert_eq!(
-        *versions,
-        BTreeSet::from(["a-v1".to_owned(), "b-v1".to_owned()])
+        row["pricing_versions"],
+        json!(["a-v1", "b-v1"]),
+        "both billed attempts are priced: {row}"
     );
 
     dispatch.push(Step::Return(completed(10, 5)));
@@ -892,17 +917,12 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     .await;
     assert_eq!(public.status(), StatusCode::OK);
     assert_eq!(body_json(public).await, json!({"id": "chatcmpl-test"}));
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let calls: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.gateway_accounting_entries WHERE kind = 'call_accounted'",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("call entries counted");
-    conn.commit().await.expect("count commits");
-    assert_eq!(calls, 3, "internal and public calls share one ledger");
-    drain_gateway(&fresh).await;
     drain_gateway(&state).await;
+    assert_eq!(
+        scribe.calls().len(),
+        3,
+        "internal and public calls share one accounting"
+    );
 }
 
 /// Two replicas share limits and budgets: a parked call's concurrency lease
@@ -984,6 +1004,7 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
         .await
         .expect("parked task joins")
         .expect("parked call completes");
+    drain_gateway(&a).await;
     let ledger = entries(&fixture, tenant, settled.call_id).await;
     let (actual, released) = settlement(&ledger);
     assert_cost(actual, "0.0006");
@@ -994,6 +1015,7 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
     on_b.invoke(&other, bounded())
         .await
         .expect("settlement frees the budget");
+    drain_gateway(&b).await;
     on_b.invoke(&held, bounded())
         .await
         .expect("accounting releases the lease");
@@ -1002,9 +1024,10 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
     drain_gateway(&b).await;
 }
 
-/// The ledger fences replays, admission reconciles an abandoned expired
-/// reservation at its full reserved cost, and a deadline-exceeded call records
-/// a billable attempt with unknown usage and settles at the reservation.
+/// The ledger fences replayed reservations, an abandoned expired reservation
+/// is never settled and so keeps counting at its full reserved cost, and a
+/// deadline-exceeded call captures unknown usage and cost and settles at the
+/// reservation.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -1013,8 +1036,9 @@ async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), daily_budget("0.01"), "reject").await;
+    capture_metadata(&state, tenant).await;
 
     let now = Utc::now();
     let period_start = now
@@ -1058,55 +1082,23 @@ async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
     let call_id: GatewayCallId =
         serde_json::from_value(details["call_id"].clone()).expect("call id detail");
 
-    let reconciled = entries(&fixture, tenant, abandoned_call).await;
-    let (actual, released) = settlement(&reconciled);
-    assert_cost(actual, "0.005");
-    assert_cost(released, "0");
-
-    let ledger = entries(&fixture, tenant, call_id).await;
-    assert!(
-        ledger.iter().any(|entry| matches!(
-            entry,
-            GatewayAccountingEntryV1::AttemptAccounted {
-                outcome: GatewayCallOutcome::TimedOut,
-                normalized_usage: None,
-                cost: None,
-                ..
-            }
-        )),
-        "{ledger:?}"
+    assert_eq!(
+        entries(&fixture, tenant, abandoned_call).await.len(),
+        1,
+        "an abandoned reservation stays unsettled"
     );
-    let call = ledger
-        .iter()
-        .find(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. }))
-        .expect("call entry");
-    assert!(matches!(
-        call,
-        GatewayAccountingEntryV1::CallAccounted {
-            outcome: GatewayCallOutcome::TimedOut,
-            cost: None,
-            ..
-        }
-    ));
+
+    drain_gateway(&state).await;
+    let row = captured(&scribe, call_id);
+    assert_eq!(row["outcome"], "timed_out", "{row}");
+    assert!(
+        row.get("usage").is_none() && row.get("cost").is_none(),
+        "{row}"
+    );
+    let ledger = entries(&fixture, tenant, call_id).await;
     let (actual, released) = settlement(&ledger);
     assert_cost(actual, "0.002");
     assert_cost(released, "0");
-
-    let mut replay = serde_json::to_value(call).expect("call entry encodes");
-    replay["call_accounted"]["entry_id"] = json!(Uuid::now_v7());
-    assert!(
-        !append_raw(
-            &fixture,
-            tenant,
-            "call_accounted",
-            call_id.as_uuid(),
-            &replay
-        )
-        .await,
-        "a replayed call entry is fenced"
-    );
-    assert_eq!(entries(&fixture, tenant, call_id).await.len(), ledger.len());
-    drain_gateway(&state).await;
 }
 
 /// A reservation covers every billable `(candidate, deployment)` attempt, a
@@ -1154,6 +1146,7 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
         .invoke(&caller, bounded())
         .await
         .expect("the day budget ignores the longer period's spend");
+    drain_gateway(&state).await;
     let ledger = entries(&fixture, tenant, billed.call_id).await;
     let reserved = ledger
         .iter()
@@ -1182,6 +1175,7 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
     };
     let call_id: GatewayCallId =
         serde_json::from_value(details["call_id"].clone()).expect("call id detail");
+    drain_gateway(&fresh).await;
     let ledger = entries(&fixture, tenant, call_id).await;
     let (actual, released) = settlement(&ledger);
     assert_cost(actual, "0");
@@ -1193,6 +1187,8 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
 /// A token limit holds the call's bounded token exposure at admission so a
 /// concurrent call cannot oversubscribe it, rejects unbounded exposure, and
 /// settles actual tokens into the admission window even after that minute.
+/// Settlement prunes only windows older than the previous minute, so the
+/// late call is admitted one minute back.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -1248,20 +1244,22 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         .await
         .expect("parked task joins")
         .expect("parked call completes");
+    drain_gateway(&state).await;
     assert_eq!(window_tokens(&fixture, tenant).await, 150);
     dispatch.push(Step::Return(completed(100, 50)));
     invocation
         .invoke(&caller, bounded())
         .await
         .expect("settlement frees the unused hold");
+    drain_gateway(&state).await;
 
-    // Settle a call admitted five minutes ago: its hold and actual tokens stay
-    // in its own window, never the accounting minute.
+    // Settle a call admitted a minute ago: its hold and actual tokens stay in
+    // its own window, never the accounting minute.
     let snapshot = GatewayAdministration::new(&state)
         .snapshot(tenant)
         .await
         .expect("snapshot");
-    let admitted_at = Utc::now() - TimeDelta::minutes(5);
+    let admitted_at = Utc::now() - TimeDelta::minutes(1);
     let usage_bound = [amount("input_tokens", 1000), amount("output_tokens", 500)];
     let call = LedgerCall {
         call_id: GatewayCallId::new_v7(),
@@ -1280,12 +1278,11 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         model("dep-a/a"),
         None,
     );
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let admission = GatewayLedger::new(&mut conn)
+    let ledger = GatewayLedger::new(state.postgres.wyrd());
+    let admission = ledger
         .admit(&call, &mut plan)
         .await
         .expect("past admission");
-    conn.commit().await.expect("admission commits");
     let execution = CallExecution {
         outcome: GatewayCallOutcome::Succeeded,
         response: None,
@@ -1306,12 +1303,11 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         attempt_span: tracing::Span::none(),
         timing: ExecutionTiming::default(),
     };
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    GatewayLedger::new(&mut conn)
-        .account(&call, &admission, &execution)
+    let accounted = Accounted::new(&call, &admission, &execution).expect("late accounting prices");
+    ledger
+        .settle(tenant, &accounted)
         .await
-        .expect("late accounting");
-    conn.commit().await.expect("accounting commits");
+        .expect("late settlement");
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     let admitted_window: i64 = sqlx::query_scalar(
         "SELECT tokens FROM wyrd.gateway_limit_windows WHERE window_start = date_trunc('minute', $1::timestamptz)",
@@ -1430,29 +1426,24 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             model("dep-a/a"),
             None,
         );
-        let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-        let admission = GatewayLedger::new(&mut conn)
-            .admit(&call, &mut plan)
-            .await
-            .expect("admission");
-        GatewayLedger::new(&mut conn)
-            .account(
-                &call,
-                &admission,
-                &CallExecution {
-                    outcome: GatewayCallOutcome::Succeeded,
-                    response: None,
-                    resolved: Some(model("dep-b/b")),
-                    attempts,
-                    refusal: None,
-                    capture: None,
-                    attempt_span: tracing::Span::none(),
-                    timing: ExecutionTiming::default(),
-                },
-            )
-            .await
-            .expect("accounting");
-        conn.commit().await.expect("call commits");
+        let ledger = GatewayLedger::new(state.postgres.wyrd());
+        let admission = ledger.admit(&call, &mut plan).await.expect("admission");
+        let accounted = Accounted::new(
+            &call,
+            &admission,
+            &CallExecution {
+                outcome: GatewayCallOutcome::Succeeded,
+                response: None,
+                resolved: Some(model("dep-b/b")),
+                attempts,
+                refusal: None,
+                capture: None,
+                attempt_span: tracing::Span::none(),
+                timing: ExecutionTiming::default(),
+            },
+        )
+        .expect("accounting prices");
+        ledger.settle(tenant, &accounted).await.expect("settlement");
         assert_eq!((window("dep-a/a").await, window("dep-b/b").await), expected);
     }
     drain_gateway(&state).await;
@@ -1461,14 +1452,14 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
 /// Races [`RACE_CALLS`] bounded, priced calls across two replicas under
 /// `limits` and `budgets`, returning how many dispatched and every rejection.
 ///
-/// A superuser `SHARE` lock on the accounting ledger blocks only ledger
-/// appends, which every call makes when it reserves budget after reading its
-/// limit usage and budget spend, and releases once every call waits. Without
-/// the tenant advisory lock each call therefore reads the same capacity before
-/// any charge commits and all of them dispatch; with it, one call waits on the
-/// append while holding the advisory lock and the rest wait on that lock, so
-/// admissions serialize after release. The barrier locks no row admission
-/// reads, prunes, or charges.
+/// A superuser `SHARE` lock on the accounting ledger and the limit windows
+/// blocks only their writes, which every call makes when it charges a limit
+/// window or reserves budget after reading its limit usage and budget spend,
+/// and releases once every call waits. Without the tenant advisory lock each
+/// call therefore reads the same capacity before any charge commits and all
+/// of them dispatch; with it, one call waits on the charge while holding the
+/// advisory lock and the rest wait on that lock, so admissions serialize
+/// after release. The barrier locks no row admission reads.
 ///
 /// # Panics
 ///
@@ -1490,10 +1481,12 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
 
     let superuser = fixture.superuser_pool().expect("superuser pool");
     let mut barrier = superuser.begin().await.expect("barrier begins");
-    sqlx::query("LOCK TABLE wyrd.gateway_accounting_entries IN SHARE MODE")
-        .execute(&mut *barrier)
-        .await
-        .expect("ledger appends held");
+    sqlx::query(
+        "LOCK TABLE wyrd.gateway_accounting_entries, wyrd.gateway_limit_windows IN SHARE MODE",
+    )
+    .execute(&mut *barrier)
+    .await
+    .expect("admission charges held");
     let mut calls = JoinSet::new();
     for n in 0..RACE_CALLS {
         let state = replicas[n % 2].clone();
@@ -1661,6 +1654,8 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
                 .expect("gateway dispatch builds"),
             ),
         ));
+    let (state, scribe) = RecordingScribe::attach(state);
+    capture_metadata(&state, tenant).await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     gateway
@@ -1747,17 +1742,11 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             .all(|name| !name.as_str().starts_with("wyrd-")),
         "only provider authentication reaches the provider"
     );
-    let ledger = entries(&fixture, tenant, response.call_id).await;
+    drain_gateway(&state).await;
+    let row = captured(&scribe, response.call_id);
     assert!(
-        ledger.iter().any(|entry| matches!(
-            entry,
-            GatewayAccountingEntryV1::CallAccounted {
-                outcome: GatewayCallOutcome::Succeeded,
-                normalized_usage: Some(_),
-                ..
-            }
-        )),
-        "{ledger:?}"
+        row["outcome"] == "succeeded" && row["usage"].is_array(),
+        "{row}"
     );
 
     let streaming = super::routes::chat_completions(
@@ -1796,28 +1785,15 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         panic!("event stream expected: {:?}", response.body);
     };
     while stream.recv().await.is_some() {}
-    // Accounting commits after the relay reports usage; poll the ledger.
-    let accounted = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let ledger = entries(&fixture, tenant, response.call_id).await;
-            if let Some(usage) = ledger.into_iter().find_map(|entry| match entry {
-                GatewayAccountingEntryV1::CallAccounted {
-                    outcome: GatewayCallOutcome::Succeeded,
-                    normalized_usage,
-                    ..
-                } => Some(normalized_usage),
-                _ => None,
-            }) {
-                break usage;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("streamed call is accounted");
+    // The streamed call is accounted and captured after the relay reports
+    // usage, on tracked gateway work.
+    drain_gateway(&state).await;
+    let row = captured(&scribe, response.call_id);
+    assert_eq!(row["outcome"], "succeeded", "{row}");
     assert_eq!(
-        accounted,
-        Some(vec![amount("input_tokens", 4), amount("output_tokens", 1)])
+        row["usage"],
+        json!([amount("input_tokens", 4), amount("output_tokens", 1)]),
+        "{row}"
     );
 
     // Responses and embeddings share the public handler: native answers return
@@ -2303,52 +2279,22 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         hanging.await.expect("upstream task"),
         "dropping the public body closes the upstream connection"
     );
-    // Accounting commits after the relay ends, on the gateway task tracker
-    // that shutdown drain waits for: once it drains, the evidence is present.
+    // Accounting and capture run after the relay ends, on the gateway task
+    // tracker that shutdown drain waits for: once it drains, the row is present.
     drain_gateway(&state).await;
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let documents: Vec<Value> = sqlx::query_scalar(
-        "SELECT entry FROM wyrd.gateway_accounting_entries WHERE kind = 'attempt_accounted'",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("attempts read");
-    conn.commit().await.expect("attempts read commits");
-    let attempt = documents
-        .into_iter()
-        .map(|document| serde_json::from_value::<GatewayAccountingEntryV1>(document).expect("entry"))
-        .find(|entry| {
-            matches!(entry, GatewayAccountingEntryV1::AttemptAccounted { model: served, .. } if *served == model("deepseek-hang/deepseek-hang"))
-        })
-        .expect("drained accounting recorded the dropped stream's attempt");
-    let GatewayAccountingEntryV1::AttemptAccounted { call_id, .. } = &attempt else {
-        unreachable!("the attempt filter matched only attempt entries");
-    };
-    let call = entries(&fixture, tenant, *call_id)
-        .await
-        .into_iter()
-        .find(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. }))
-        .expect("drained accounting recorded the dropped stream's call");
+    let rows = scribe.calls();
+    let row = rows
+        .iter()
+        .cloned()
+        .map(Value::Object)
+        .find(|row| row["requested_model"]["deployment"] == "deepseek-hang")
+        .unwrap_or_else(|| {
+            panic!("drained accounting captured the dropped stream's call: {rows:?}")
+        });
+    assert_eq!(row["attempt_count"], 1, "{row}");
     assert!(
-        matches!(
-            attempt,
-            GatewayAccountingEntryV1::AttemptAccounted {
-                provider_usage_json: None,
-                normalized_usage: None,
-                ..
-            }
-        ),
-        "{attempt:?}"
-    );
-    assert!(
-        matches!(
-            call,
-            GatewayAccountingEntryV1::CallAccounted {
-                normalized_usage: None,
-                ..
-            }
-        ),
-        "{call:?}"
+        row.get("usage").is_none(),
+        "a dropped stream's usage is unknown: {row}"
     );
 
     // Drain: an open public stream ends with the terminal error frame and
@@ -3062,12 +3008,34 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
 
     // A caller that leaves after the claim commits and before dispatch, here
     // while admission on healthy replica D waits on the tenant's admission
-    // lock, has its claim
-    // released by tracked server work; the identical replay then creates once.
-    let mut lock = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    lock_gateway_admission(&mut lock)
+    // lock, has its claim released by tracked server work; the identical
+    // replay then creates once. Only a call a limit covers takes that lock.
+    let limit = serde_json::to_value(GatewayLimit {
+        subject: GatewayLimitSubject::Tenant,
+        target: GatewayPolicyTarget::All,
+        requests_per_minute: NonZeroU64::new(1000),
+        tokens_per_minute: None,
+        concurrent_calls: None,
+    })
+    .expect("limit encodes");
+    GatewayAdministration::new(&d)
+        .put_governance(
+            &admin(tenant),
+            serde_json::from_value(json!({
+                "limits": [limit], "budgets": [], "pricing": [], "unknown_cost": "allow_unpriced",
+            }))
+            .expect("governance decodes"),
+        )
         .await
-        .expect("admission lock");
+        .expect("governance stores");
+    let mut lock = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+         hashtextextended('wyrd.gateway_admission:' || wyrd.current_tenant()::text, 0))",
+    )
+    .execute(&mut **lock.transaction())
+    .await
+    .expect("admission lock");
     let abandoned = tokio::spawn(create(&d, "abandoned"));
     tokio::time::timeout(Duration::from_secs(10), async {
         while pending().await != 2 {
@@ -3332,8 +3300,8 @@ async fn drain_gateway(state: &AppState) {
 
 /// Proves capture follows the admitted policy without changing the call:
 /// `Disabled` submits nothing, `Metadata` writes one row plus one span per
-/// attempt under the admitting request, and a pod reaching no Scribe drops
-/// capture while the call still answers and accounts.
+/// attempt, the row naming the admitting request, and a pod reaching no Scribe drops
+/// capture while the call still answers.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -3390,20 +3358,16 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         ["vala.gateway.calls", "vala.traces.spans"],
         "the call row delivers before its spans"
     );
-    for frame in &received {
-        assert_eq!(
-            frame.request_id, caller.request_id,
-            "{} delivers under the admitting request",
-            frame.table
-        );
-        assert_eq!(frame.tenant, tenant);
-    }
+    assert!(received.iter().all(|frame| frame.tenant == tenant));
+    let row = self::captured(&scribe, response.call_id);
+    assert_eq!(
+        row["request_id"],
+        caller.request_id.as_str(),
+        "the row names the admitting request"
+    );
     assert!(
-        entries(&fixture, tenant, response.call_id)
-            .await
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
-        "capture never replaces accounting"
+        row["usage"].is_array(),
+        "the captured row carries the call's accounting"
     );
 
     let unavailable = replica(&fixture, dispatch.clone()).await;
@@ -3412,13 +3376,8 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .invoke(&caller, call())
         .await
         .expect("a pod reaching no Scribe never fails the call");
+    assert_eq!(answered.status, 200);
     drain_gateway(&unavailable).await;
-    assert!(
-        entries(&fixture, tenant, answered.call_id)
-            .await
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. }))
-    );
 }
 
 /// Proves a call's Run and Card UID attribution is authorized before
@@ -3904,13 +3863,6 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         unpublished.attempts() == 0,
         "the whole capture is dropped before any row is submitted"
     );
-    assert!(
-        entries(&fixture, tenant, unaffected.call_id)
-            .await
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
-        "accounting is unaffected"
-    );
 }
 
 /// Proves selected generated speech reaches the governed object store: the
@@ -4071,7 +4023,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
 
 /// Proves post-response capture work is bounded by the admitted call's
 /// absolute deadline. With the captured object's storage read parked on a
-/// FIFO, the call still answers and accounts, its capture is dropped once as
+/// FIFO, the call still answers, its capture is dropped once as
 /// unavailable when the deadline passes, nothing is staged, and the capture
 /// task ends so tracked gateway work drains while the dependency is still
 /// parked.
@@ -4138,13 +4090,6 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     assert!(
         recorder.series.lock().expect("series").contains(dropped),
         "the expired capture is dropped as unavailable"
-    );
-    assert!(
-        entries(&fixture, tenant, answered.call_id)
-            .await
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
-        "accounting is unaffected"
     );
     // Release the blocking reader still parked on the FIFO.
     drop(
@@ -4706,18 +4651,6 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         gateway.capture(&admin).await.expect("capture policy reads"),
     ))
     .expect("configuration serializes");
-    let mut ledger = String::new();
-    for call_id in [
-        disabled.call_id,
-        answered.call_id,
-        echoed.call_id,
-        nested.call_id,
-    ]
-    .into_iter()
-    .chain(streams.iter().copied())
-    {
-        let _ = write!(ledger, "{:?}", entries(&fixture, tenant, call_id).await);
-    }
     let series = recorder
         .series
         .lock()
@@ -4736,7 +4669,6 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         ("logs and traces", logs.clone()),
         ("metrics", series.clone()),
         ("audit", audit.join("\n")),
-        ("ledger", ledger),
         ("bifrost", published),
         ("configuration", configuration),
     ] {
@@ -4865,17 +4797,8 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                 .contains(&field("error.code", code))),
             "{call:?}"
         );
-        let ledger = entries(&fixture, tenant, call_id).await;
-        assert!(
-            ledger.iter().any(|entry| matches!(entry,
-                GatewayAccountingEntryV1::CallAccounted { outcome: accounted, .. } if *accounted == outcome)),
-            "{ledger:?}"
-        );
-        assert!(
-            ledger.iter().any(|entry| matches!(entry,
-                GatewayAccountingEntryV1::AttemptAccounted { outcome: accounted, .. } if *accounted == outcome)),
-            "{ledger:?}"
-        );
+        let row = captured(&scribe, call_id);
+        assert_eq!(row["outcome"], json!(outcome), "{row}");
         assert!(
             series.contains(&format!(
                 "wyrd_gateway_requests_total{{operation=chat_completions,outcome={name}}}"
@@ -5080,13 +5003,13 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
 /// time out or are cancelled in flight close both the call and the attempt
 /// with that outcome and the stable code. A native stream whose provider
 /// holds the connection open after `[DONE]` settles promptly as a success,
-/// delivers no later byte, and records a matching ledger, request metric,
+/// delivers no later byte, and records a matching captured row, request metric,
 /// selected capture, and call and attempt spans.
 ///
 /// # Panics
 ///
 /// Panics when a fixture fails, a call returns the wrong result, or a close
-/// line, ledger entry, metric, or capture differs from the terminal result.
+/// line, captured row, metric, or capture differs from the terminal result.
 #[tokio::test]
 async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let recorder = SeriesRecorder::default();
@@ -5374,22 +5297,8 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         }
     }
 
-    let ledger = entries(&fixture, tenant, done_call).await;
-    assert!(
-        ledger
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
-        "{ledger:?}"
-    );
-    for accounted in &ledger {
-        match accounted {
-            GatewayAccountingEntryV1::CallAccounted { outcome, .. }
-            | GatewayAccountingEntryV1::AttemptAccounted { outcome, .. } => {
-                assert_eq!(*outcome, GatewayCallOutcome::Succeeded, "{ledger:?}");
-            }
-            _ => {}
-        }
-    }
+    let row = captured(&scribe, done_call);
+    assert_eq!(row["outcome"], "succeeded", "{row}");
     let series = recorder
         .series
         .lock()
@@ -5411,22 +5320,23 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     drain_gateway(&state).await;
 }
 
-/// A buffered call whose provider attempt completed but whose accounting then
-/// fails returns the stable error, and its closed call span, request metrics,
-/// and published Metadata call row say `failed` with that code and unknown
-/// usage and cost, while its provider attempt span, attempt metrics, routing
-/// metric, and published attempt span still say `succeeded`.
+/// A buffered call whose settlement fails after its provider attempt
+/// completed still answers: a failed settlement is only logged, so its
+/// request metric and published Metadata call row say `succeeded` with the
+/// call's usage, and the unsettled reservation keeps counting at its reserved
+/// cost.
 ///
-/// Accounting is faulted by a `NOT VALID` check constraint on the fixture's
-/// own database refusing attempt entries, added while the attempt is parked
-/// after admission committed, so only the post-provider append fails.
+/// Settlement is faulted by a `NOT VALID` check constraint on the fixture's
+/// own database refusing reservation settlements, added while the attempt is
+/// parked after admission reserved, so only the settlement statement fails.
 ///
 /// # Panics
 ///
-/// Panics when a fixture or the fault fails, the call answers, or a closed
-/// span, metric series, or published row differs from those outcomes.
+/// Panics when a fixture or the fault fails, the call fails, or a metric
+/// series, published row, log line, or ledger entry differs from those
+/// outcomes.
 #[tokio::test]
-async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_span() {
+async fn gateway_settlement_failure_never_changes_the_answered_call() {
     let recorder = SeriesRecorder::default();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let traces = TraceBuffer::default();
@@ -5434,25 +5344,15 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         tracing_subscriber::fmt()
             .with_writer(traces.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .with_span_events(FmtSpan::CLOSE)
+            .with_max_level(tracing::Level::WARN)
             .finish(),
     );
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
     let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
-    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
-    GatewayAdministration::new(&state)
-        .put_capture(
-            &admin(tenant),
-            GatewayCapturePolicyWrite {
-                mode: GatewayCaptureMode::Metadata,
-                payload_fields: BTreeSet::new(),
-            },
-        )
-        .await
-        .expect("metadata policy stores");
+    configure(&state, tenant, json!([]), daily_budget("1"), "reject").await;
+    capture_metadata(&state, tenant).await;
     let caller = invoker(tenant, 1, [open_access()]);
 
     dispatch.push(Step::Park(completed(10, 5)));
@@ -5460,24 +5360,28 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         let (state, caller) = (state.clone(), caller.clone());
         async move {
             GatewayInvocation::new(&state)
-                .invoke(&caller, request("dep-a/a", None, Duration::from_secs(30)))
+                .invoke(
+                    &caller,
+                    request("dep-a/a", Some((1000, 500)), Duration::from_secs(30)),
+                )
                 .await
         }
     });
     dispatch.entered.notified().await;
     let superuser = fixture.superuser_pool().expect("superuser pool");
     sqlx::query(
-        "ALTER TABLE wyrd.gateway_accounting_entries ADD CONSTRAINT attempt_accounting_fault \
-         CHECK (kind <> 'attempt_accounted') NOT VALID",
+        "ALTER TABLE wyrd.gateway_accounting_entries ADD CONSTRAINT settlement_fault \
+         CHECK (kind <> 'budget_reservation_settled') NOT VALID",
     )
     .execute(&superuser)
     .await
-    .expect("accounting fault installs");
+    .expect("settlement fault installs");
     dispatch.release.notify_one();
-    let error = call
+    let response = call
         .await
         .expect("call task joins")
-        .expect_err("failed accounting prevents the answer");
+        .expect("a failed settlement never fails the answered call");
+    assert_eq!(response.status, 200);
     drain_gateway(&state).await;
 
     let series = recorder
@@ -5488,72 +5392,30 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
-    for expected in [
-        "wyrd_gateway_requests_total{operation=chat_completions,outcome=failed}",
-        "wyrd_gateway_request_duration_seconds{operation=chat_completions,outcome=failed}",
-        "wyrd_gateway_attempts_total{operation=chat_completions,outcome=succeeded}",
-        "wyrd_gateway_routing_total{result=primary}",
-    ] {
-        assert!(series.contains(expected), "{expected} in {series}");
-    }
     assert!(
-        !series
+        series
             .contains("wyrd_gateway_requests_total{operation=chat_completions,outcome=succeeded}")
-            && !series.contains("wyrd_gateway_tokens_total")
-            && !series.contains("wyrd_gateway_call_cost"),
-        "no success or accounted usage and cost is reported: {series}"
+            && !series
+                .contains("wyrd_gateway_requests_total{operation=chat_completions,outcome=failed}"),
+        "{series}"
     );
-    let published = |table: &str| {
-        let frames = scribe
-            .received()
-            .into_iter()
-            .filter(|frame| frame.table.contains(table))
-            .collect::<Vec<_>>();
-        assert_eq!(frames.len(), 1, "one {table} batch");
-        String::from_utf8_lossy(&frames[0].ipc).into_owned()
-    };
-    let row = published("calls");
-    let upstream = wyrd_gateway::outcome_error_code(GatewayCallOutcome::Failed)
-        .expect("a failed outcome has a code");
-    assert_ne!(error.code(), upstream, "the accounting error is distinct");
+    let row = captured(&scribe, response.call_id);
     assert!(
-        row.contains("failed") && !row.contains("succeeded"),
-        "the call row says failed: {row}"
+        row["outcome"] == "succeeded" && row["usage"].is_array(),
+        "{row}"
     );
     assert!(
-        row.contains(error.code()) && !row.contains(upstream),
-        "the call row carries the caller's stable error: {row}"
+        traces.text().contains("gateway call settlement failed"),
+        "the failed settlement is logged"
     );
+    let ledger = entries(&fixture, tenant, response.call_id).await;
     assert!(
-        !row.contains("input_tokens") && !row.contains("output_tokens"),
-        "the call row leaves usage unknown: {row}"
+        matches!(
+            ledger.as_slice(),
+            [GatewayAccountingEntryV1::BudgetReservationCreated { .. }]
+        ),
+        "the reservation stays unsettled: {ledger:?}"
     );
-    assert!(
-        published("spans").contains("succeeded"),
-        "the published attempt span keeps the provider outcome"
-    );
-
-    let logs = traces.text();
-    let closed = |name: &str| {
-        logs.lines()
-            .filter(|line| line.contains(": close"))
-            .filter(|line| {
-                line.split_once("}: ")
-                    .and_then(|(path, _)| path.rsplit("}:").next()?.split_once('{'))
-                    .is_some_and(|(span, _)| span.rsplit([':', ' ']).next() == Some(name))
-            })
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    let (call, attempt) = (closed("gateway.call"), closed("gateway.attempt"));
-    assert_eq!((call.len(), attempt.len()), (1, 1), "{logs}");
-    assert!(call[0].contains("outcome=\"failed\""), "{call:?}");
-    assert!(
-        call[0].contains(&format!("error.code={:?}", error.code())),
-        "{call:?}"
-    );
-    assert!(attempt[0].contains("outcome=\"succeeded\""), "{attempt:?}");
-    drain_gateway(&state).await;
 }
 
 /// One public inference ingress that reads the `wyrd-gateway-fallback`

@@ -32,9 +32,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::SecretRef;
-use wyrd_sql::queries::gateway::{
-    GatewayAccountingEntryWrite, append_gateway_accounting_entry, revoke_gateway_credential,
-};
+use wyrd_sql::queries::gateway::revoke_gateway_credential;
 use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::recording::RecordingScribe;
@@ -914,7 +912,7 @@ async fn gateway_fallback_policy_replaces_and_resets() {
 }
 
 /// Proves governance validation, pricing immutability, and retention of
-/// pricing referenced by accounting history across replace and delete.
+/// omitted pricing versions, inactive, across replace and delete.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -981,23 +979,6 @@ async fn gateway_governance_retains_referenced_pricing() {
         .expect_err("pricing version is immutable");
     assert_invalid(&changed, "pricing[0]");
 
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    append_gateway_accounting_entry(
-        &mut conn,
-        GatewayAccountingEntryWrite {
-            entry_id: Uuid::now_v7(),
-            call_id: Uuid::now_v7(),
-            kind: "attempt_accounted",
-            deployment: Some("openai"),
-            model: Some("gpt-4o"),
-            pricing_version: Some("v1"),
-            entry: &json!({}),
-        },
-    )
-    .await
-    .expect("ledger entry");
-    conn.commit().await.expect("ledger commits");
-
     let replaced = gateway
         .put_governance(
             &admin,
@@ -1015,23 +996,6 @@ async fn gateway_governance_retains_referenced_pricing() {
         vec![("v1", false), ("v2", false), ("v3", true)],
         "omitted versions are retained inactive"
     );
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    append_gateway_accounting_entry(
-        &mut conn,
-        GatewayAccountingEntryWrite {
-            entry_id: Uuid::now_v7(),
-            call_id: Uuid::now_v7(),
-            kind: "attempt_accounted",
-            deployment: Some("openai"),
-            model: Some("gpt-4o"),
-            pricing_version: Some("v2"),
-            entry: &json!({}),
-        },
-    )
-    .await
-    .expect("a call admitted under unreferenced v2 still accounts after replacement");
-    conn.commit().await.expect("late ledger commits");
-
     gateway.delete_governance(&admin).await.expect("delete");
     gateway.delete_governance(&admin).await.expect("idempotent");
     let reset = gateway.governance(&admin).await.expect("reset");

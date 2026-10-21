@@ -206,7 +206,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
-            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             principal,
             table,
             expected_schema_fingerprint: Some(ReduxSchemaFingerprint::from_arrow_schema(

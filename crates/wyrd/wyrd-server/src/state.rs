@@ -2290,6 +2290,9 @@ pub struct AppStateInner {
     /// writer's own cache when this process has one. Targets serve only
     /// while the server's listener hears every change that could alter them.
     pub verifier_cards: Arc<VerifierCardCache>,
+    /// Per-tenant gateway admission snapshots, served only while the
+    /// server's listener hears every gateway configuration change.
+    pub gateway_snapshots: Arc<crate::components::gateway::GatewaySnapshots>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2354,6 +2357,7 @@ impl AppState {
             operator_keys: Arc::new(OperatorKeys::default()),
             verification_blocks: None,
             verifier_cards,
+            gateway_snapshots: Arc::default(),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
         }))

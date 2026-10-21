@@ -65,12 +65,14 @@ VALA_TENANT_CONN_OWNER_ALLOWLIST = {
 # function it calls, so it runs as a single autocommit round trip on a plain
 # request-role connection with no transaction around it. A bound transaction
 # would add `BEGIN`/`SET LOCAL`/`COMMIT` round trips to the hottest per-request
-# reads: the Oracle cut and a direct verification's target. Each entry names
+# reads and writes: the Oracle cut, a direct verification's target, and a
+# limited gateway call's admission and settlement. Each entry names
 # the file and the exact struct; the struct must own a `PgConnection` and a
 # `DataTenantId`, and only its own methods are exempt.
 STATEMENT_TENANT_OWNERS = {
     "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs": "OracleTableCuts",
     "crates/wyrd/wyrd-sql/src/queries/verification_target.rs": "VerificationTargets",
+    "crates/wyrd/wyrd-sql/src/queries/gateway_admission.rs": "GatewayAdmissions",
 }
 
 

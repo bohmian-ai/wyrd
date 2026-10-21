@@ -1130,11 +1130,12 @@ pub fn production_guards(config: &WyrdServerConfig) {
 /// verification runtime enabled, and attach them to `state`.
 ///
 /// Other processes keep `state` unchanged, so their verification routes
-/// answer unavailable.
+/// answer unavailable. The Monty pool spawns this `wyrd-server` executable
+/// itself as each worker (`wyrd-server subprocess`).
 ///
 /// # Errors
-/// Returns [`ServerBootError::VerificationBlocks`] when no Monty worker path
-/// was resolved or the sandbox pool cannot start.
+/// Returns [`ServerBootError::VerificationBlocks`] when this executable's path
+/// is unavailable or the sandbox pool cannot start.
 async fn attach_verification_blocks(
     state: AppState,
     config: &WyrdServerConfig,
@@ -1142,10 +1143,8 @@ async fn attach_verification_blocks(
     if !(config.verification.enabled && config.role.serves_api()) {
         return Ok(state);
     }
-    let worker = config.verification.monty_worker.clone().ok_or_else(|| {
-        ServerBootError::VerificationBlocks(
-            "no Monty worker path; set WYRD_VERIFICATION_MONTY_WORKER".to_owned(),
-        )
+    let worker = std::env::current_exe().map_err(|error| {
+        ServerBootError::VerificationBlocks(format!("cannot locate this executable: {error}"))
     })?;
     let blocks = HostedBlocks::start(worker, config.verification.limits)
         .await

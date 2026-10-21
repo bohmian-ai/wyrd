@@ -20,7 +20,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalKindTag};
+use wyrd_spec::auth::{PrincipalKindTag, SERVER_WRITE_PRINCIPAL};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRefScope;
 
@@ -177,7 +177,7 @@ impl IssuingKey {
     /// Mint a tenant access token for one resolved grant.
     ///
     /// The public tenant access-token path. It refuses the reserved
-    /// [`GATEWAY_CAPTURE_PRINCIPAL`], which gateway capture stamps on its
+    /// [`SERVER_WRITE_PRINCIPAL`], which gateway capture stamps on its
     /// server-internal writes and which never appears in a token, then signs
     /// through [`Self::sign_access_token`].
     ///
@@ -189,7 +189,7 @@ impl IssuingKey {
         grant: AccessGrant,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if grant.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
+        if grant.principal.id == SERVER_WRITE_PRINCIPAL {
             return Err(IssueError::InvalidPrincipalKind);
         }
         self.sign_access_token(grant, ttl)
@@ -210,7 +210,7 @@ impl IssuingKey {
         grant: AccessGrant,
         ttl: Duration,
     ) -> Result<AccessTokenClaims, IssueError> {
-        if grant.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
+        if grant.principal.id == SERVER_WRITE_PRINCIPAL {
             return Err(IssueError::InvalidPrincipalKind);
         }
         self.build_access_claims(grant, ttl)
@@ -333,7 +333,7 @@ impl IssuingKey {
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for the SYSTEM kind or
-    /// [`GATEWAY_CAPTURE_PRINCIPAL`], and an error when TTL is invalid or signing fails.
+    /// [`SERVER_WRITE_PRINCIPAL`], and an error when TTL is invalid or signing fails.
     #[tracing::instrument(
         level = "debug",
         skip(self),
@@ -354,7 +354,7 @@ impl IssuingKey {
         issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if principal_kind == PrincipalKindTag::System || principal_id == GATEWAY_CAPTURE_PRINCIPAL {
+        if principal_kind == PrincipalKindTag::System || principal_id == SERVER_WRITE_PRINCIPAL {
             return Err(IssueError::InvalidPrincipalKind);
         }
         let (iat, exp) = timestamps(issued_at, ttl)?;
@@ -389,7 +389,7 @@ impl IssuingKey {
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved
-    /// [`GATEWAY_CAPTURE_PRINCIPAL`], [`IssueError::Signing`] when the token
+    /// [`SERVER_WRITE_PRINCIPAL`], [`IssueError::Signing`] when the token
     /// cannot be signed, and a timestamp error when the issued-at or expiry
     /// cannot be computed.
     pub fn issue_platform_access_token(
@@ -398,7 +398,7 @@ impl IssuingKey {
         credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if principal_id == GATEWAY_CAPTURE_PRINCIPAL {
+        if principal_id == SERVER_WRITE_PRINCIPAL {
             return Err(IssueError::InvalidPrincipalKind);
         }
         let (iat, exp) = timestamps(Utc::now(), ttl)?;
@@ -518,7 +518,7 @@ mod tests {
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalKindTag};
+    use wyrd_spec::auth::{PrincipalKindTag, SERVER_WRITE_PRINCIPAL};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -585,7 +585,7 @@ mod tests {
             (PrincipalKindTag::Service, Some(Box::new(caller))),
         ] {
             let reserved = TokenPrincipalRef {
-                id: GATEWAY_CAPTURE_PRINCIPAL,
+                id: SERVER_WRITE_PRINCIPAL,
                 kind,
                 ..user_principal()
             };
@@ -601,7 +601,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            key.issue_platform_access_token(GATEWAY_CAPTURE_PRINCIPAL, None, Duration::minutes(5)),
+            key.issue_platform_access_token(SERVER_WRITE_PRINCIPAL, None, Duration::minutes(5)),
             Err(IssueError::InvalidPrincipalKind)
         ));
     }
@@ -1052,7 +1052,7 @@ mod tests {
         for kind in [PrincipalKindTag::Service, PrincipalKindTag::User] {
             let result = issuing_key().issue_refresh_token(
                 kind,
-                GATEWAY_CAPTURE_PRINCIPAL,
+                SERVER_WRITE_PRINCIPAL,
                 tenant_id(),
                 Utc::now(),
                 Duration::days(30),

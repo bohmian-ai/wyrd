@@ -49,7 +49,7 @@ pub use platform_identity::{
     PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
     RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
 };
-pub use principal_id::{GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
+pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, SERVER_WRITE_PRINCIPAL};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;

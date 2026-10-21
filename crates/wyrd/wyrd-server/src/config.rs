@@ -1707,11 +1707,6 @@ pub struct VerificationConfig {
     /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
     #[serde(skip)]
     pub limits: HostedLimits,
-    /// The executable the Monty pool spawns as `<path> subprocess`:
-    /// `WYRD_VERIFICATION_MONTY_WORKER`, else the running `wyrd-server`
-    /// itself.
-    #[serde(skip)]
-    pub monty_worker: Option<PathBuf>,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1726,7 +1721,6 @@ impl Default for VerificationConfig {
             enabled: default_verification_enabled(),
             operator_keys: OperatorKeysConfig::default(),
             limits: HostedLimits::default(),
-            monty_worker: None,
         }
     }
 }
@@ -1876,9 +1870,6 @@ impl VerificationConfig {
                 message: message.to_owned(),
             });
         }
-        self.monty_worker = env_opt("WYRD_VERIFICATION_MONTY_WORKER")?
-            .map(PathBuf::from)
-            .or_else(|| env::current_exe().ok());
         Ok(())
     }
 }
@@ -4253,20 +4244,13 @@ maintenance_interval_secs = 45
     fn verification_limits_env_applies_and_refuses() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let mut config = VerificationConfig::default();
-        temp_env::with_vars_unset(["WYRD_VERIFICATION_MONTY_WORKER"], || {
-            config.apply_limits_env().expect("defaults apply");
-        });
+        config.apply_limits_env().expect("defaults apply");
         assert_eq!(config.limits, HostedLimits::default());
-        assert!(
-            config.monty_worker.is_some(),
-            "the worker defaults to the running server"
-        );
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
-                ("WYRD_VERIFICATION_MONTY_WORKER", Some("/opt/worker")),
             ],
             || {
                 let mut config = VerificationConfig::default();
@@ -4274,7 +4258,6 @@ maintenance_interval_secs = 45
                 assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
-                assert_eq!(config.monty_worker, Some(PathBuf::from("/opt/worker")));
             },
         );
         for (key, value) in [

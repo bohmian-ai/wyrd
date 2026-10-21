@@ -117,11 +117,11 @@ async fn submit_partial_resolved_model(
     tenant: DataTenantId,
 ) -> Result<(uuid::Uuid, WyrdError), Box<dyn std::error::Error>> {
     let call_id = uuid::Uuid::now_v7();
-    let principal = uuid::Uuid::now_v7().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let row = json!({
         "schema_version": 1,
         "call_id": call_id.to_string(),
+        "request_id": RequestId::now_v7().as_str(),
         "operation": "chat_completions",
         "ingress_dialect": "openai",
         "requested_model": {"deployment": "openai", "model": "gpt-4o"},
@@ -163,8 +163,6 @@ async fn submit_partial_resolved_model(
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: writer.into_inner()?.into(),
-            sub_principal_id: principal.clone(),
-            act_principal_id: principal,
         })
         .await
         .err()
@@ -315,12 +313,21 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         GatewayCapture::completion()
     );
 
+    // The call row names its admitting request; its attempt span's trace is
+    // the call id, since the caller sent no trace context.
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut call_id = None;
     for table in ["vala.gateway.calls", "vala.traces.spans"] {
-        let sql = format!(
-            "SELECT sub_principal_id, act_principal_id FROM {table} \
-             WHERE wyrd_request_id = '{request_id}'"
-        );
+        let sql = match &call_id {
+            None => format!(
+                "SELECT call_id, sub_principal_id, act_principal_id FROM {table} \
+                 WHERE request_id = '{request_id}'"
+            ),
+            Some(call_id) => format!(
+                "SELECT sub_principal_id, act_principal_id FROM {table} \
+                 WHERE encode(trace_id, 'hex') = '{call_id}'"
+            ),
+        };
         let principals = loop {
             scribe
                 .flush_bifrost()
@@ -331,6 +338,15 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
                     let actors = strings(gateway, &admin_key, &sql, "act_principal_id")
                         .await
                         .expect("the landed capture's actor reads");
+                    if call_id.is_none() {
+                        let ids = strings(gateway, &admin_key, &sql, "call_id")
+                            .await
+                            .expect("the landed call's id reads");
+                        call_id = ids
+                            .first()
+                            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+                            .map(|id| id.simple().to_string());
+                    }
                     break (subjects, actors);
                 }
                 outcome => assert!(

@@ -12,6 +12,7 @@ pub mod auth;
 pub mod cards;
 pub mod drift_baselines;
 pub mod gateway;
+pub mod gateway_admission;
 pub mod operator_connections;
 pub mod operator_dispatches;
 pub mod platform;

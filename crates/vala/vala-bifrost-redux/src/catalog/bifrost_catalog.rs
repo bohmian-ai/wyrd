@@ -25,7 +25,6 @@ use wyrd_spec::vala::api::{
     RegisterOutcome, RegisterTableResponse,
 };
 
-use crate::catalog::cut_cache::CutCache;
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
@@ -152,6 +151,12 @@ pub struct PinnedSealedTable {
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
     pub estimated_bytes: u64,
+    /// The table's publication revision, read in the same statement snapshot
+    /// as `hot_files`.
+    ///
+    /// Oracle rereads it after capturing the live Scribe sources and keeps
+    /// the selection only if it is unchanged.
+    pub publication_revision: i64,
 }
 
 /// Immutable file metadata retained from one pinned Iceberg manifest entry.
@@ -274,9 +279,6 @@ pub struct BifrostCatalog {
     /// is never dropped, so a loaded schema stays authoritative for the life
     /// of the node. Grows with registered tables, never with writes.
     registered_schemas: Arc<RwLock<RegisteredSchemas>>,
-    /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
-    /// is listening for invalidations.
-    cut_cache: Arc<CutCache>,
 }
 
 /// Registered Iceberg schemas a node has loaded, keyed by tenant and table
@@ -399,23 +401,22 @@ impl BifrostCatalog {
         Ok(cut)
     }
 
-    /// Returns one query's cut from the node's cut cache, or reads it with
-    /// [`Self::read_cut`] and caches it.
+    /// Reads every table's current publication revision in one read-only
+    /// tenant statement, in `tables` order.
     ///
-    /// Only cuts read at or after `not_before` are served (any when `None`);
-    /// Oracle passes its deadline minus the maximum query deadline, so every
-    /// served pointer outlives the query (see the `cut_cache` module). The cache serves
-    /// nothing until [`Self::watch_cuts`] is listening, so without it every
-    /// call reads Postgres.
+    /// Oracle calls it after capturing a query's live sources and compares
+    /// the result with the revisions [`Self::read_cut`] returned; any
+    /// difference means a file was published in between.
     ///
     /// # Errors
-    /// Returns the errors of [`Self::read_cut`]; a cache hit cannot fail.
-    pub async fn read_cut_cached(
+    /// Returns [`BifrostCatalogError::InvalidBinding`] when a table cannot be
+    /// bound to `tenant`, and a SQL error when the connection or statement
+    /// fails or the result does not match the request.
+    pub async fn read_publication_revisions(
         &self,
         tenant: DataTenantId,
         tables: &[TableRef],
-        not_before: Option<std::time::Instant>,
-    ) -> Result<Vec<TableCut>, BifrostCatalogError> {
+    ) -> Result<Vec<i64>, BifrostCatalogError> {
         let bindings = tables
             .iter()
             .map(|table| {
@@ -430,23 +431,10 @@ impl BifrostCatalog {
                 table_name: &binding.table_name,
             })
             .collect::<Vec<_>>();
-        if let Some(cut) = self.cut_cache.get(tenant, &refs, not_before) {
-            return Ok(cut);
-        }
-        let generation = self.cut_cache.fill_generation();
-        let cut = self.read_cut(tenant, tables).await?;
-        if let Some(generation) = generation {
-            self.cut_cache
-                .insert(generation, std::time::Instant::now(), &cut);
-        }
-        Ok(cut)
-    }
-
-    /// Keeps the node's cut cache coherent until `shutdown`: listens on one
-    /// Vala pool connection for the `vala.file_list` trigger's notifications
-    /// and drops each cut they name. See [`CutCache::watch`].
-    pub async fn watch_cuts(&self, shutdown: tokio_util::sync::CancellationToken) {
-        self.cut_cache.watch(self.postgres.pool(), shutdown).await;
+        let mut conn = self.postgres.conn().await?;
+        Ok(OracleTableCuts::new(&mut conn, tenant)
+            .read_revisions(&refs)
+            .await?)
     }
 
     /// Materializes one table of a read cut.
@@ -485,6 +473,7 @@ impl BifrostCatalog {
             ));
         }
         let table_uid = TableUid::from_bytes(acquired.identity.table_uid);
+        let publication_revision = acquired.publication_revision;
         let identifier = binding.table_ident();
         // A fault reads a document that does not exist, through the same
         // `FileIO`, so the reacquisition sees the production error shape.
@@ -556,6 +545,7 @@ impl BifrostCatalog {
             hot_files,
             hot_manifest_digest,
             estimated_bytes,
+            publication_revision,
         })
     }
 
@@ -772,7 +762,6 @@ impl BifrostCatalog {
             metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
             registrations: Arc::default(),
             registered_schemas: Arc::default(),
-            cut_cache: Arc::default(),
         })
     }
 

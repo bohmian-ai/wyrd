@@ -10,7 +10,6 @@
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
 mod bifrost_catalog;
-mod cut_cache;
 mod error;
 pub mod event_time;
 mod iceberg_sql;

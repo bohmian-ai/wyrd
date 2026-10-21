@@ -1841,6 +1841,12 @@ pub struct ScribeProviderCut {
     pub start_partition: TimePartitionWire,
     /// Inclusive final partition in the provider projection.
     pub end_partition: TimePartitionWire,
+    /// Retained Scribe live capture the follower reads, minted by that
+    /// Scribe's listing for this query.
+    ///
+    /// The follower opens only this capture and never takes a fresh one, so
+    /// the rows it reads are the rows Oracle validated against the cut.
+    pub capture_id: Uuid,
 }
 
 impl ScribeProviderCut {

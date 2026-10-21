@@ -19,7 +19,7 @@
 //! [`TARGET_CHANNEL`] notification from inside the committing transaction, so
 //! it is delivered only if the write commits. A Card or baseline notification
 //! forgets every target naming that Card; a principal notification forgets
-//! every target of the tenant. Like Oracle's cut cache, the listener's absence
+//! every target of the tenant. The listener's absence
 //! or any lost connection forgets everything, so every resolution then reads
 //! Postgres. A notification is delivered after its commit, so a resolution
 //! racing a Card deletion or deprecation can still serve the old target for

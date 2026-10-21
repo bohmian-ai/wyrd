@@ -2139,7 +2139,10 @@ impl WyrdTestCluster {
     ) -> Result<(), ClusterError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match self.observe_live_tail_once(tenant, table, &time_partition) {
+            match self
+                .observe_live_tail_once(tenant, table, &time_partition)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(error) if tokio::time::Instant::now() < deadline => {
                     tokio::task::yield_now().await;
@@ -2151,7 +2154,15 @@ impl WyrdTestCluster {
     }
 
     /// Checks the current Scribe-owned stream snapshot without mutating routes.
-    fn observe_live_tail_once(
+    ///
+    /// Each Scribe is captured under a throwaway query id and the capture is
+    /// released at once, so the observation retains nothing.
+    ///
+    /// # Errors
+    /// Returns [`ClusterError::Resource`] when the table is not qualified, a
+    /// Scribe has no tail service or cannot capture, or no Scribe retains the
+    /// partition.
+    async fn observe_live_tail_once(
         &self,
         tenant: wyrd_spec::DataTenantId,
         table: &str,
@@ -2176,10 +2187,23 @@ impl WyrdTestCluster {
                 .bifrost_ingest()
                 .map(|runtime| runtime.tail_service())
                 .ok_or_else(|| ClusterError::Resource("Scribe tail service missing".to_owned()))?;
-            let streams = source
-                .list_active_streams(&binding, &ScanScope::default())
+            let query_id = uuid::Uuid::new_v4();
+            let capture = source
+                .capture_active_streams(
+                    &binding,
+                    &ScanScope::default(),
+                    query_id,
+                    std::time::SystemTime::now() + Duration::from_secs(5),
+                )
+                .await
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            if streams
+            if let Some(capture_id) = capture.capture_id {
+                source
+                    .release_capture(&binding, query_id, capture_id)
+                    .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            }
+            if capture
+                .streams
                 .iter()
                 .any(|stream| stream.time_partition == *time_partition)
             {

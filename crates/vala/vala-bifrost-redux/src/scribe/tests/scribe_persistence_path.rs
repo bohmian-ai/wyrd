@@ -389,9 +389,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
                 .map(|name| (*name).to_owned())
                 .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
                 .collect(),
+            query_id: Uuid::new_v4(),
+            capture_id: Uuid::nil(),
         },
         "hot snapshot",
-    );
+    )
+    .await;
 
     assert_payload_modes_agree(
         &stored,
@@ -479,8 +482,10 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         start_partition,
         end_partition,
         required_columns: vec!["value".to_owned()],
+        query_id: Uuid::new_v4(),
+        capture_id: Uuid::nil(),
     };
-    let hot = live_rows(&scribe, &request, "hot snapshot");
+    let hot = live_rows(&scribe, &request, "hot snapshot").await;
     assert_eq!(hot.len(), 1);
     assert_eq!(hot[0].schema().fields().len(), 1);
     assert_eq!(hot[0].schema().field(0).name(), "value");
@@ -531,11 +536,12 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_partition_isolation(
         current,
         &source_value,
         stream,
-    );
+    )
+    .await;
     let read = |hours| hot_values(&scribe, tenant, &isolation_table, hours, stream);
-    assert_eq!(read(current), vec![101]);
-    assert_eq!(read(shifted), vec![202]);
-    assert_other_tenant_isolated(&scribe, &pointer_table, current, stream);
+    assert_eq!(read(current).await, vec![101]);
+    assert_eq!(read(shifted).await, vec![202]);
+    assert_other_tenant_isolated(&scribe, &pointer_table, current, stream).await;
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
@@ -595,6 +601,8 @@ fn value_read(
         start_partition,
         end_partition,
         required_columns: vec!["value".to_owned()],
+        query_id: Uuid::new_v4(),
+        capture_id: Uuid::nil(),
     }
 }
 
@@ -602,7 +610,7 @@ fn value_read(
 ///
 /// # Panics
 /// Panics when the read does not return exactly the source allocation.
-fn assert_pointer_identity(
+async fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -617,7 +625,8 @@ fn assert_pointer_identity(
         scribe,
         &value_read(tenant, table, hours, stream),
         "pointer hot snapshot",
-    );
+    )
+    .await;
     assert_eq!(hot.len(), 1);
     assert!(Arc::ptr_eq(source_value, hot[0].column(0)));
 }
@@ -626,7 +635,7 @@ fn assert_pointer_identity(
 ///
 /// # Panics
 /// Panics when the read cannot open or a value column is not `Int64`.
-fn hot_values(
+async fn hot_values(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -641,6 +650,7 @@ fn hot_values(
         &value_read(tenant, table, hours, stream),
         "isolation snapshot",
     )
+    .await
     .iter()
     .flat_map(|rows| {
         rows.column(0)
@@ -653,24 +663,21 @@ fn hot_values(
     .collect()
 }
 
-/// Opens one live read on `scribe` and returns its memtable rows.
+/// Captures and opens one live read on `scribe` and returns its memtable rows.
 ///
 /// These fixtures never stage a generation, so the memtable cut is the whole
 /// read.
 ///
 /// # Panics
 /// Panics with `context` when the read cannot open or names a staged run.
-fn live_rows(
+async fn live_rows(
     scribe: &ScribeImpl,
     request: &FetchLiveTailRequest,
     context: &str,
 ) -> Vec<RecordBatch> {
-    let (rows, runs, _lease) = scribe
-        .tail_service()
-        .expect("tail service")
-        .open_live_batches(request)
-        .expect(context)
-        .into_parts();
+    let service = scribe.tail_service().expect("tail service");
+    let request = crate::scribe::tail_rpc::tests::captured(&service, request).await;
+    let (rows, runs, _lease) = service.open_capture(&request).expect(context).into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
     rows.into_iter().map(|batch| batch.rows).collect()
 }
@@ -679,7 +686,7 @@ fn live_rows(
 ///
 /// # Panics
 /// Panics when another tenant's read returns any row.
-fn assert_other_tenant_isolated(
+async fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
     hours: (
@@ -692,7 +699,8 @@ fn assert_other_tenant_isolated(
         scribe,
         &value_read(DataTenantId::new_v7(), table, hours, stream),
         "other tenant snapshot",
-    );
+    )
+    .await;
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 

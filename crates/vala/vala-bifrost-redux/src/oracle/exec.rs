@@ -970,7 +970,7 @@ pub(crate) enum HotObjects {
     /// Scribe staged runs on this node's disk. They are rewritable, so their
     /// footers are never cached; the lease, when present, keeps them on disk
     /// for as long as the plan holds its files.
-    Staged(Option<StagedSourceLease>),
+    Staged(Option<Arc<StagedSourceLease>>),
 }
 
 /// Builds one hot leaf: a plain `DataFusion` Parquet scan of `files`.
@@ -1037,7 +1037,7 @@ pub(super) fn hot_parquet_scan(
                 tenant,
             }),
             None,
-            lease.map(Arc::new),
+            lease,
         ),
     };
     let source = ParquetSource::new(Arc::clone(schema))
@@ -3645,12 +3645,14 @@ pub(super) mod tests {
     ///
     /// Panics if the fixed hour boundary is rejected, which is a fixture bug.
     pub(in crate::oracle) fn one_live_route(tenant: DataTenantId) -> LiveTableRoutes {
+        let binding = wyrd_spec::vala::api::TenantTableBinding {
+            tenant_id: tenant,
+            namespace: "traces".to_owned(),
+            table: "spans".to_owned(),
+        };
         LiveTableRoutes {
-            binding: wyrd_spec::vala::api::TenantTableBinding {
-                tenant_id: tenant,
-                namespace: "traces".to_owned(),
-                table: "spans".to_owned(),
-            },
+            captures: crate::oracle::live::LiveCaptures::none_for_test(binding.clone()),
+            binding,
             routes: vec![crate::oracle::live::LiveScribeRoute {
                 node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
                 writer_epoch: 1,
@@ -3662,6 +3664,7 @@ pub(super) mod tests {
                 )
                 .expect("hour boundary"),
                 bytes: 0,
+                capture_id: uuid::Uuid::nil(),
             }],
         }
     }

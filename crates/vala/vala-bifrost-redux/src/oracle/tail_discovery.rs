@@ -1,8 +1,9 @@
 //! Authenticated query-scoped discovery of active Scribe live streams.
 //!
 //! Oracle lists each pinned table's reported streams on its frozen Scribe
-//! roster before planning; the routes name exact Scribe incarnations and
-//! writer epochs and retain no rows.
+//! roster before planning; the routes name exact Scribe incarnations, writer
+//! epochs, and the capture each Scribe retains for the query until released
+//! or expired.
 
 use wyrd_spec::vala::api::{TailStreamIdentity, TenantTableBinding, TimePartitionWire};
 
@@ -16,6 +17,9 @@ pub struct DiscoveredTailRoute {
     pub stream: TailStreamIdentity,
     /// Live bytes the listing's scope reads in this partition.
     pub bytes: u64,
+    /// Capture the reporting Scribe retains for this query; fragments read
+    /// only this capture.
+    pub capture_id: uuid::Uuid,
 }
 
 /// Query-scoped resolver for live Scribe streams.
@@ -25,7 +29,10 @@ pub trait TailStreamDiscovery: Send + Sync {
     /// each with the bytes `scope` reads there.
     ///
     /// `scribes` is the query attempt's frozen roster; discovery never rereads
-    /// membership, so every route names a participant of that one cut.
+    /// membership, so every route names a participant of that one cut. Each
+    /// listing retains a capture bound to `query_id` that expires at
+    /// `deadline`. When any listing fails, the captures the others retained
+    /// are released before the error returns.
     ///
     /// # Errors
     /// Returns the listing's [`TailReadError`] class:
@@ -41,8 +48,20 @@ pub trait TailStreamDiscovery: Send + Sync {
         binding: &TenantTableBinding,
         scope: &crate::scan_sizing::ScanScope,
         scribes: &[OracleQueryParticipant],
+        query_id: uuid::Uuid,
         deadline: Instant,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;
+
+    /// Releases captures this discovery retained for `query_id`.
+    ///
+    /// Best effort: a capture that cannot be released expires at its query
+    /// deadline, so a failure is logged and never returned.
+    async fn release(
+        &self,
+        binding: &TenantTableBinding,
+        query_id: uuid::Uuid,
+        captures: &[(OracleQueryParticipant, uuid::Uuid)],
+    );
 
     /// Toggles a test-tier discovery outage without changing production behavior.
     #[cfg(feature = "test-support")]

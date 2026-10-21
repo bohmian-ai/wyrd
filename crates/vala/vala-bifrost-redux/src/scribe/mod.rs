@@ -282,6 +282,10 @@ pub struct ScribeImpl {
     /// published objects, and the live-tail service that resolves which staged
     /// members still serve rows.
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Live captures retained for in-flight queries, shared by every tail
+    /// service this Scribe constructs so a capture listed over one is opened
+    /// and released over another.
+    tail_captures: tail_rpc::RetainedCaptures,
     /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
     ///
     /// Shared by the admission path and the periodic age scanner so the
@@ -1209,6 +1213,7 @@ impl ScribeImpl {
             #[cfg(any(test, feature = "test-support"))]
             geometry,
             hot_sources,
+            tail_captures: tail_rpc::RetainedCaptures::default(),
             persistence_cpu,
             wal_io,
             ingress_cpu,
@@ -2575,6 +2580,11 @@ impl ScribeImpl {
     }
 
     /// Construct the pod-local typed tail reader.
+    ///
+    /// Every reader shares this Scribe's retained captures.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when the node id is not a UUID.
     pub fn tail_service(&self) -> Result<FetchLiveTailService, ScribeError> {
         let node_id =
             uuid::Uuid::parse_str(&self.node_id).map_err(|error| ScribeError::Internal {
@@ -2588,6 +2598,7 @@ impl ScribeImpl {
             stream,
             Arc::clone(&self.shards),
             Arc::clone(&self.hot_sources),
+            Arc::clone(&self.tail_captures),
         ))
     }
 }

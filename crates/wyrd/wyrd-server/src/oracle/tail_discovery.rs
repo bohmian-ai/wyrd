@@ -1,6 +1,7 @@
 //! Query-scoped live Scribe discovery over the attempt's frozen Scribe roster.
 //!
-//! Listing returns partition metadata, never rows. It trusts the mutually
+//! Listing returns partition metadata and retains a query-bound capture on
+//! each Scribe, never rows. It trusts the mutually
 //! authenticated `wyrd-peer` channel alone; row-serving fragments additionally
 //! carry the receiver-validated typed peer context. A process-local node has
 //! no peer channel: its roster names only its own Scribe, listed in-process.
@@ -9,7 +10,7 @@ use std::collections::HashMap;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
@@ -17,7 +18,7 @@ use vala_bifrost_redux::oracle::{
 };
 use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::tail_rpc::{
-    ActiveTailStream, FetchLiveTailService, TailReadError, TonicTailReadTransport,
+    ActiveTailStream, FetchLiveTailService, TailCapture, TailReadError, TonicTailReadTransport,
 };
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_tonic::tonic::transport::Channel;
@@ -103,13 +104,31 @@ impl RegistryTailStreamDiscovery {
         &self,
         scribes: &[OracleQueryParticipant],
     ) -> Result<Vec<Channel>, TailReadError> {
+        self.channels
+            .lock()
+            .map_err(|_| TailReadError::State {
+                detail: "tail channel map lock is poisoned".to_owned(),
+            })?
+            .retain(|node_id, _| scribes.iter().any(|scribe| scribe.node_id == *node_id));
+        self.cached_channels(scribes)
+    }
+
+    /// Returns the reusable channel for each named Scribe without evicting
+    /// any other node, so releasing a subset keeps the roster's channels.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the peer identity is missing, an
+    /// endpoint is invalid, or the channel map lock is poisoned.
+    fn cached_channels(
+        &self,
+        scribes: &[OracleQueryParticipant],
+    ) -> Result<Vec<Channel>, TailReadError> {
         let tls = self.tls.as_ref().ok_or_else(|| TailReadError::State {
             detail: "tail transport requires the Bifrost peer identity".to_owned(),
         })?;
         let mut channels = self.channels.lock().map_err(|_| TailReadError::State {
             detail: "tail channel map lock is poisoned".to_owned(),
         })?;
-        channels.retain(|node_id, _| scribes.iter().any(|scribe| scribe.node_id == *node_id));
         scribes
             .iter()
             .map(|scribe| {
@@ -130,22 +149,21 @@ impl RegistryTailStreamDiscovery {
             .collect()
     }
 
-    /// Lists one frozen Scribe under `scope` and checks every stream against
-    /// its fence.
+    /// Captures one frozen Scribe under `scope` for `query_id` until
+    /// `expires_at`.
     ///
     /// # Errors
-    /// Returns the listing's [`TailReadError`] class, or
-    /// [`TailReadError::StaleIdentity`] when a stream names another node or
-    /// writer epoch than the frozen participant.
+    /// Returns the listing's [`TailReadError`] class.
     async fn list_one(
         scribe: &OracleQueryParticipant,
         channel: Channel,
         binding: &TenantTableBinding,
         scope: &ScanScope,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
-        let transport = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel));
-        let streams = transport
-            .list_active_streams(binding.clone(), scope)
+        query_id: uuid::Uuid,
+        expires_at: SystemTime,
+    ) -> Result<TailCapture, TailReadError> {
+        TonicTailReadTransport::new(ScribeTailServiceClient::new(channel))
+            .list_active_streams(binding.clone(), scope, query_id, expires_at)
             .await
             .inspect_err(|error| {
                 tracing::warn!(
@@ -153,38 +171,38 @@ impl RegistryTailStreamDiscovery {
                     node_id = %scribe.node_id.as_uuid(),
                     "private Scribe tail listing failed"
                 );
-            })?;
-        streams
-            .into_iter()
-            .map(|stream| Self::route(scribe, stream))
-            .collect()
+            })
     }
 
-    /// Lists the frozen roster in-process under `scope` on a node with no
-    /// peer channel.
+    /// Captures the frozen roster in-process under `scope` on a node with no
+    /// peer channel, returning each participant's capture in roster order.
     ///
     /// # Errors
     /// Returns [`TailReadError::State`] when the roster names a Scribe other
-    /// than this process's own, and the local listing or
-    /// [`TailReadError::StaleIdentity`] class otherwise.
-    fn list_local(
+    /// than this process's own, and the local capture's class otherwise.
+    async fn list_local(
         local: &FetchLiveTailService,
         scribes: &[OracleQueryParticipant],
         binding: &TenantTableBinding,
         scope: &ScanScope,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
-        let mut routes = Vec::new();
+        query_id: uuid::Uuid,
+        expires_at: SystemTime,
+    ) -> Vec<Result<TailCapture, TailReadError>> {
+        let mut captures = Vec::with_capacity(scribes.len());
         for scribe in scribes {
             if scribe.node_id.as_uuid() != local.stream().node_id.as_uuid() {
-                return Err(TailReadError::State {
+                captures.push(Err(TailReadError::State {
                     detail: "tail transport requires the Bifrost peer identity".to_owned(),
-                });
+                }));
+                continue;
             }
-            for stream in local.list_active_streams(binding, scope)? {
-                routes.push(Self::route(scribe, stream)?);
-            }
+            captures.push(
+                local
+                    .capture_active_streams(binding, scope, query_id, expires_at)
+                    .await,
+            );
         }
-        Ok(routes)
+        captures
     }
 
     /// Admits one listed stream only when it names the frozen incarnation.
@@ -195,6 +213,7 @@ impl RegistryTailStreamDiscovery {
     fn route(
         scribe: &OracleQueryParticipant,
         listed: ActiveTailStream,
+        capture_id: uuid::Uuid,
     ) -> Result<DiscoveredTailRoute, TailReadError> {
         let ActiveTailStream {
             time_partition,
@@ -208,16 +227,68 @@ impl RegistryTailStreamDiscovery {
             time_partition,
             stream,
             bytes,
+            capture_id,
         })
+    }
+
+    /// Admits every roster participant's capture, or releases all of them.
+    ///
+    /// The first failure in roster order decides the result, exactly as a
+    /// sequential walk would; every capture another listing retained is
+    /// released before it returns.
+    ///
+    /// # Errors
+    /// Returns the first listing failure or [`TailReadError::StaleIdentity`]
+    /// for a stream that names another incarnation than its participant.
+    async fn admit(
+        &self,
+        binding: &TenantTableBinding,
+        scribes: &[OracleQueryParticipant],
+        query_id: uuid::Uuid,
+        listed: Vec<Result<TailCapture, TailReadError>>,
+    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
+        let mut routes = Vec::new();
+        let mut retained = Vec::new();
+        let mut failure = None;
+        for (scribe, listing) in scribes.iter().zip(listed) {
+            let capture = match listing {
+                Ok(capture) => capture,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            let Some(capture_id) = capture.capture_id else {
+                continue;
+            };
+            retained.push((scribe.clone(), capture_id));
+            for stream in capture.streams {
+                match Self::route(scribe, stream, capture_id) {
+                    Ok(route) => routes.push(route),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        let Some(error) = failure else {
+            return Ok(routes);
+        };
+        self.release(binding, query_id, &retained).await;
+        Err(error)
     }
 }
 
 #[async_trait::async_trait]
 impl TailStreamDiscovery for RegistryTailStreamDiscovery {
-    /// Lists every frozen Scribe concurrently and returns ephemeral routes.
+    /// Captures every frozen Scribe concurrently and returns the routes of
+    /// those captures.
     ///
-    /// All listings share one deadline; the first failure in roster order
-    /// decides the result, exactly as a sequential walk would.
+    /// All listings share one deadline, which is also every capture's expiry;
+    /// the first failure in roster order decides the result, exactly as a
+    /// sequential walk would. Captures that the other Scribes retained are
+    /// released before a failure returns; a listing still in flight at the
+    /// deadline leaves its capture to expire.
     ///
     /// # Errors
     /// Returns the listing's own [`TailReadError`] class unchanged:
@@ -232,6 +303,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         binding: &TenantTableBinding,
         scope: &ScanScope,
         scribes: &[OracleQueryParticipant],
+        query_id: uuid::Uuid,
         deadline: Instant,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
         #[cfg(feature = "test-support")]
@@ -252,21 +324,23 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         if scribes.is_empty() {
             return Ok(Vec::new());
         }
-        if self.tls.is_none()
-            && let Some(local) = &self.local
-        {
-            return Self::list_local(local, scribes, binding, scope);
-        }
-        let channels = self.channels_for(scribes)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(TailReadError::DeadlineElapsed)?;
-        let listings = futures_util::future::join_all(
-            scribes
-                .iter()
-                .zip(channels)
-                .map(|(scribe, channel)| Self::list_one(scribe, channel, binding, scope)),
-        );
+        let expires_at = SystemTime::now() + remaining;
+        if self.tls.is_none()
+            && let Some(local) = &self.local
+        {
+            let listed =
+                Self::list_local(local, scribes, binding, scope, query_id, expires_at).await;
+            return self.admit(binding, scribes, query_id, listed).await;
+        }
+        let channels = self.channels_for(scribes)?;
+        let listings = futures_util::future::join_all(scribes.iter().zip(channels).map(
+            |(scribe, channel)| {
+                Self::list_one(scribe, channel, binding, scope, query_id, expires_at)
+            },
+        ));
         #[cfg(feature = "test-support")]
         let listings = async {
             if STALL_NEXT_LISTING.swap(false, Ordering::AcqRel) {
@@ -282,11 +356,58 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
             scribe_count = scribes.len(),
             "listed frozen Scribe roster"
         );
-        let mut routes = Vec::new();
-        for listing in listed {
-            routes.extend(listing?);
+        self.admit(binding, scribes, query_id, listed).await
+    }
+
+    /// Releases each capture on its Scribe concurrently, in-process for the
+    /// local Scribe on a node with no peer channel.
+    ///
+    /// A failed release is logged; the capture then expires at its deadline.
+    async fn release(
+        &self,
+        binding: &TenantTableBinding,
+        query_id: uuid::Uuid,
+        captures: &[(OracleQueryParticipant, uuid::Uuid)],
+    ) {
+        if captures.is_empty() {
+            return;
         }
-        Ok(routes)
+        if self.tls.is_none()
+            && let Some(local) = &self.local
+        {
+            for (_, capture_id) in captures {
+                if let Err(error) = local.release_capture(binding, query_id, *capture_id) {
+                    tracing::warn!(?error, "local Scribe capture release failed");
+                }
+            }
+            return;
+        }
+        let scribes = captures
+            .iter()
+            .map(|(scribe, _)| scribe.clone())
+            .collect::<Vec<_>>();
+        let channels = match self.cached_channels(&scribes) {
+            Ok(channels) => channels,
+            Err(error) => {
+                tracing::warn!(?error, "Scribe capture release found no channel");
+                return;
+            }
+        };
+        futures_util::future::join_all(captures.iter().zip(channels).map(
+            |((scribe, capture_id), channel)| async move {
+                let released = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel))
+                    .release_capture(binding.clone(), query_id, *capture_id)
+                    .await;
+                if let Err(error) = released {
+                    tracing::warn!(
+                        ?error,
+                        node_id = %scribe.node_id.as_uuid(),
+                        "private Scribe capture release failed"
+                    );
+                }
+            },
+        ))
+        .await;
     }
 
     /// Injects or clears the private discovery outage used by test journeys.

@@ -2021,7 +2021,10 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns the stable catalog, planning, or roster error. Every one of them
-    /// is terminal; nothing here repins or rebuilds.
+    /// is terminal. A selection whose publication revisions moved during
+    /// acquisition is not an error: its captures are released, the cut is
+    /// repinned, and the root rebuilt under the same deadline, all before
+    /// admission, so no row of a discarded selection is ever produced.
     async fn classify_one_build(
         &self,
         input: ClassifyInput<'_>,
@@ -2031,12 +2034,26 @@ impl Oracle {
             request,
             deadline,
             mut roster,
-            prepared: planned,
+            prepared: mut planned,
             query_telemetry,
         } = input;
-        let retained = self
-            .build_physical_root(context, request, &planned, &mut roster, deadline)
-            .await?;
+        let retained = loop {
+            if let Some(retained) = self
+                .build_physical_root(context, request, &planned, &mut roster, deadline)
+                .await?
+            {
+                break retained;
+            }
+            let tables = planned
+                .cuts
+                .iter()
+                .map(|cut| cut.binding.table_ref.clone())
+                .collect::<Vec<_>>();
+            planned = self
+                .planner
+                .pin_cut(context, &tables, deadline, &self.catalog)
+                .await?;
+        };
         let query_class = exec::query_class_for_root(retained.root.as_ref());
         tracing::Span::current().record("query_class", query_class_label(query_class));
         let participant_cut = roster
@@ -2783,9 +2800,11 @@ impl Oracle {
     /// Returns [`BifrostError::QueryAdmissionRejected`] when this pod's CPU
     /// shape cannot be read, [`BifrostError::QueryTimeout`] when the deadline
     /// passes during planning, the stable listing errors of
-    /// [`Self::discover_live_routes`], or the mapped planning failure, which
-    /// is terminal for this query: there is no second build and no fallback
-    /// path.
+    /// [`Self::discover_live_routes`], the public catalog error when the
+    /// publication revisions cannot be reread, or the mapped planning failure,
+    /// which is terminal for this query. `Ok(None)` reports a selection whose
+    /// publication revisions moved after the cut was read: its captures are
+    /// released and the caller repins.
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
@@ -2793,7 +2812,7 @@ impl Oracle {
         planned: &PlannedSqlCut,
         roster: &mut OracleQueryAttemptRoster,
         deadline: Instant,
-    ) -> Result<RetainedPhysicalPlan, BifrostError> {
+    ) -> Result<Option<RetainedPhysicalPlan>, BifrostError> {
         let cuts = planned.cuts.as_slice();
         let cap = self.admission.session_partitions(planned.local_ratio)?;
         let shape = crate::resources::OracleSessionShape::new(cap);
@@ -2825,6 +2844,9 @@ impl Oracle {
             .discover_live_routes(roster, cuts, &scans, deadline)
             .await?;
         listing.done();
+        if !self.selection_holds(context, cuts, deadline).await? {
+            return Ok(None);
+        }
         for provider in &registered {
             if let Some(routes) = live.tables.get(provider.table()) {
                 provider.set_live(routes.clone());
@@ -2875,11 +2897,57 @@ impl Oracle {
             .await?
             .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
-        Ok(RetainedPhysicalPlan {
+        Ok(Some(RetainedPhysicalPlan {
             config: planning.copied_config(),
             root,
             live_listing_lost: live.listing_lost,
-        })
+        }))
+    }
+
+    /// Reports whether no file was published for any pinned table since its
+    /// cut was read, so the cut and the live captures taken after it neither
+    /// lose nor repeat a row.
+    ///
+    /// Rereads every table's publication revision in one statement after all
+    /// captures, an empty capture included, and compares it with the revision
+    /// the cut read. A node that plans no live source captures nothing and
+    /// has nothing to validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
+    /// and the public catalog error when the revisions cannot be read.
+    async fn selection_holds(
+        &self,
+        context: &AuthorizedQueryContext,
+        cuts: &[PinnedSealedTable],
+        deadline: Instant,
+    ) -> Result<bool, BifrostError> {
+        if self.tail_discovery.is_none() || self.fragment_dispatcher.is_none() {
+            return Ok(true);
+        }
+        let tables = cuts
+            .iter()
+            .map(|cut| cut.binding.table_ref.clone())
+            .collect::<Vec<_>>();
+        let revisions = Self::before_deadline(
+            deadline,
+            self.catalog
+                .read_publication_revisions(context.data_tenant_id, &tables),
+        )
+        .await?
+        .map_err(BifrostCatalogError::into_public)?;
+        let holds = revisions
+            .iter()
+            .zip(cuts)
+            .all(|(revision, cut)| *revision == cut.publication_revision);
+        if !holds {
+            tracing::debug!(
+                tables = cuts.len(),
+                "Oracle discards a selection whose publication revision moved"
+            );
+        }
+        Ok(holds)
     }
 
     /// Runs one planning step under the query deadline.
@@ -2934,7 +3002,7 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<LiveDiscovery, BifrostError> {
         let (Some(discovery), Some(_)) = (
-            self.tail_discovery.as_deref(),
+            self.tail_discovery.as_ref(),
             self.fragment_dispatcher.as_ref(),
         ) else {
             return Ok(LiveDiscovery::default());
@@ -2965,7 +3033,7 @@ impl Oracle {
     /// roster refreeze failure.
     async fn list_live_routes(
         &self,
-        discovery: &dyn TailStreamDiscovery,
+        discovery: &Arc<dyn TailStreamDiscovery>,
         roster: &OracleQueryAttemptRoster,
         (cuts, scans): (&[PinnedSealedTable], &sizing::OracleScans),
         deadline: Instant,
@@ -2976,7 +3044,13 @@ impl Oracle {
             let binding = tail_discovery::wire_binding(cut)?;
             let scope = scans.listing_scope(&cut.binding.table_ref.fqn());
             let routes = match discovery
-                .discover(&binding, &scope, roster.scribes(), deadline)
+                .discover(
+                    &binding,
+                    &scope,
+                    roster.scribes(),
+                    roster.attempt_id().as_uuid(),
+                    deadline,
+                )
                 .await
             {
                 Ok(routes) => routes,
@@ -3011,6 +3085,24 @@ impl Oracle {
             if routes.is_empty() {
                 continue;
             }
+            let mut captures = Vec::<(OracleQueryParticipant, uuid::Uuid)>::new();
+            for route in &routes {
+                if !captures.iter().any(|(_, id)| *id == route.capture_id)
+                    && let Some(scribe) = roster
+                        .scribes()
+                        .iter()
+                        .find(|scribe| scribe.node_id == route.stream.node_id)
+                {
+                    captures.push((scribe.clone(), route.capture_id));
+                }
+            }
+            // Owned before any fallible step, so an error below releases them.
+            let captures = Arc::new(live::LiveCaptures::new(
+                Arc::clone(discovery),
+                binding.clone(),
+                roster.attempt_id().as_uuid(),
+                captures,
+            ));
             let routes = routes
                 .into_iter()
                 .map(|route| {
@@ -3026,12 +3118,17 @@ impl Oracle {
                         endpoint,
                         time_partition: route.time_partition,
                         bytes: route.bytes,
+                        capture_id: route.capture_id,
                     })
                 })
                 .collect::<Result<Vec<_>, BifrostError>>()?;
             discovered.tables.insert(
                 cut.binding.table_ref.fqn(),
-                live::LiveTableRoutes { binding, routes },
+                live::LiveTableRoutes {
+                    binding,
+                    routes,
+                    captures,
+                },
             );
         }
         Ok(Some(discovered))

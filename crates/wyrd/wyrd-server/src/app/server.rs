@@ -615,19 +615,6 @@ impl BoundServer {
                 },
             ));
         }
-        // Oracle's cut cache serves only while this listener hears every
-        // `vala.file_list` change, so it runs wherever Oracle plans queries.
-        if self.state.bifrost.oracle_peer_service().is_some()
-            && let Some(catalog) = self.state.bifrost.catalog().map(Arc::clone)
-        {
-            let shutdown = shutdown.clone();
-            set.spawn(worker_task(
-                TaskId::Worker("oracle_cut_cache"),
-                async move {
-                    catalog.watch_cuts(shutdown).await;
-                },
-            ));
-        }
         // Resolved verification targets serve only while this listener hears
         // every Card, drift baseline, and SYSTEM principal change that could
         // alter them, so it runs wherever Verifiers execute.

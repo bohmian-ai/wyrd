@@ -668,6 +668,10 @@ impl ScribeStagingRuntime {
 
     /// Installs the durable authority of every member recovery kept.
     ///
+    /// A member recovered mid-publication is also marked as possibly
+    /// committed (see
+    /// [`crate::scribe::hot_source::ScribeHotSourceRegistry::begin_publication`]).
+    ///
     /// A member still served from its staged runs is offered with the runs'
     /// footers, read by [`crate::scribe::member_stager::preflight_run`]
     /// exactly as staging reads them, so its scans are sized like any other
@@ -733,19 +737,31 @@ impl ScribeStagingRuntime {
                     }
                 }
             };
-            hot_sources
-                .restore_durable(
-                    &seal_key,
-                    crate::scribe::hot_source::GenerationOrdinal::new(id.shard(), id.generation()),
-                    authority,
-                )
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!(
-                        "restore the authority of staged member {}-{}: {error}",
-                        id.shard(),
-                        id.generation()
-                    ),
-                })?;
+            let generation =
+                crate::scribe::hot_source::GenerationOrdinal::new(id.shard(), id.generation());
+            let restored = hot_sources
+                .restore_durable(&seal_key, generation, authority)
+                .and_then(|()| {
+                    // An earlier process may have committed this member's
+                    // publication without recording it, so the catalog may
+                    // already serve its rows. Captures refuse the table until
+                    // the resumed publication settles the outcome.
+                    if matches!(
+                        member.record().state(),
+                        StagedMemberState::Publishing { .. }
+                    ) {
+                        hot_sources.begin_publication(&seal_key, &[generation])
+                    } else {
+                        Ok(())
+                    }
+                });
+            restored.map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "restore the authority of staged member {}-{}: {error}",
+                    id.shard(),
+                    id.generation()
+                ),
+            })?;
         }
         Ok(())
     }

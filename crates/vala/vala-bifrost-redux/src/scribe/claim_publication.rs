@@ -165,6 +165,54 @@ impl ClaimPublisher {
             })
     }
 
+    /// Marks, or with `begin` false clears, the claim's generations as
+    /// possibly committed in the catalog.
+    ///
+    /// Marked immediately before the fenced commit is attempted, so no live
+    /// capture can lease the members' staged runs while the catalog may
+    /// already serve the same rows. The advance to `Published` clears the
+    /// mark; a commit known not to have landed clears it here; an outcome
+    /// that stays unknown leaves it set until recovery settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the mark,
+    /// which means a member's generation is unknown to it.
+    fn mark_publication(
+        &self,
+        request: &PublishClaimRequest<'_>,
+        begin: bool,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let key = request.claim.key();
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        let generations: Vec<_> = request
+            .claim
+            .members()
+            .iter()
+            .map(|member| {
+                crate::scribe::hot_source::GenerationOrdinal::new(
+                    member.id().shard(),
+                    member.id().generation(),
+                )
+            })
+            .collect();
+        if begin {
+            hot_sources.begin_publication(&seal_key, &generations)
+        } else {
+            hot_sources.abandon_publication(&seal_key, &generations)
+        }
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("mark the claim's publication in the authority registry: {error}"),
+        })
+    }
+
     /// Releases one published member's authority from the pod registry.
     ///
     /// This is the last step of the handover the registry exists to describe:
@@ -329,9 +377,13 @@ impl ClaimPublisher {
                 &claims,
             )
             .await?;
+        self.mark_publication(&request, true)?;
         let (outcome, ambiguity) = match self.reconciler.publish(&rows).await {
             ScribePublicationOutcome::Committed(outcome) => (outcome, None),
-            ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+            ScribePublicationOutcome::KnownNotCommitted(error) => {
+                self.mark_publication(&request, false)?;
+                return Err(error);
+            }
             ScribePublicationOutcome::UnknownCommitOutcome(error) => {
                 // The transaction may already hold these rows. Leaving that
                 // undecided is the one outcome this pod cannot carry: a
@@ -346,6 +398,8 @@ impl ClaimPublisher {
                     ScribePublicationOutcome::Committed(outcome) => {
                         (outcome, Some(error.to_string()))
                     }
+                    // The retry is replay-exact, so its refusal settles
+                    // nothing about the first attempt: the mark stays.
                     ScribePublicationOutcome::UnknownCommitOutcome(_)
                     | ScribePublicationOutcome::KnownNotCommitted(_) => return Err(error),
                 }

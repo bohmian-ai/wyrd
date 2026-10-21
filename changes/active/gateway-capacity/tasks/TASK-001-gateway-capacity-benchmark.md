@@ -574,7 +574,7 @@ captures staged = arrivals, dropped 0, lost 0.
    each across about 11 large slices per step, and WAL fsync accounts for
    about 1.9 ms per call. About 2 of the overhead run's minutes are drains. A
    faster outbox drain shortens every benchmark.
-3. **Capacity run time is set by the spec.** Each rate has a 10 s warmup and
+3. **Capacity run time was set by the spec; revision 3 shortens it.** Each rate has a 10 s warmup and
    a 60 s window, across 5 rates and 3 cases, plus 30 s of overload and 90 s
    of recovery per case. One run is about 25–30 min. Proposed revision: 2 s
    warmup, 15 s window, 10 s overload, and 20 s of recovery judged on its

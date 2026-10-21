@@ -38,22 +38,22 @@ pub const RATES: [f64; 5] = [50.0, 100.0, 250.0, 500.0, 1000.0];
 
 /// Untimed arrivals at each rate before its window, settled before the
 /// baseline.
-pub const WARMUP: Duration = Duration::from_secs(10);
+pub const WARMUP: Duration = Duration::from_secs(2);
 
 /// Measured arrival window of each rate.
-pub const WINDOW: Duration = Duration::from_secs(60);
+pub const WINDOW: Duration = Duration::from_secs(15);
 
 /// The high-rate interval of an overload sequence.
-pub const OVERLOAD: Duration = Duration::from_secs(30);
+pub const OVERLOAD: Duration = Duration::from_secs(10);
 
 /// The lower-rate interval after it.
-pub const RECOVERY: Duration = Duration::from_secs(90);
+pub const RECOVERY: Duration = Duration::from_secs(20);
 
 /// The final part of [`RECOVERY`] whose calls judge recovery.
-pub const RECOVERED: Duration = Duration::from_secs(60);
+pub const RECOVERED: Duration = Duration::from_secs(15);
 
 /// The leading and trailing interval of a window whose backlog is compared.
-pub const EDGE: Duration = Duration::from_secs(10);
+pub const EDGE: Duration = Duration::from_secs(3);
 
 /// Calls the driver holds open at once; an arrival beyond it is capped.
 pub const MAX_IN_FLIGHT: usize = 16_384;
@@ -66,7 +66,7 @@ pub const MISS_AFTER: Duration = Duration::from_millis(20);
 pub const LATENESS_LIMIT_US: u64 = 5_000;
 
 /// Completed calls each tenant/mode distribution needs to judge an SLO.
-pub const MIN_CALLS: usize = 100;
+pub const MIN_CALLS: usize = 30;
 
 /// Warmed keys each tenant's arrivals rotate through.
 pub const KEYS_PER_TENANT: usize = 8;

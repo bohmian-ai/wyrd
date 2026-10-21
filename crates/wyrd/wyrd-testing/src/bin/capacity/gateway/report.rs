@@ -579,7 +579,9 @@ mod tests {
     use wyrd_testing::capacity::{Histogram, Telemetry, Usage};
 
     use super::{Shutdown, Verdict, drain_misses, overhead_misses, shutdown_misses};
-    use crate::gateway::capacity::{Arrived, Backlog, Driven, Load, Measured, Ownership, Slo};
+    use crate::gateway::capacity::{
+        Arrived, Backlog, Driven, Load, MIN_CALLS, Measured, Ownership, Slo,
+    };
     use crate::gateway::envelope::{
         capture_misses, classify, envelope, overload_misses, recovery_misses,
     };
@@ -823,9 +825,9 @@ mod tests {
             verdict(&window(50.0, calls(200, 0, false, 201))),
             Verdict::OutsideSlo
         );
-        // Fewer than 100 completions per tenant/mode is not evidence.
+        // Fewer than the minimum completions per tenant/mode is not evidence.
         assert_eq!(
-            verdict(&window(50.0, calls(99, 0, false, 150))),
+            verdict(&window(50.0, calls(MIN_CALLS - 1, 0, false, 150))),
             Verdict::Invalid
         );
         // Streams judge first token, chunk lag, and the whole stream.
@@ -959,7 +961,7 @@ mod tests {
         // Recovery needs every SLO, enough calls, no refusal, and no loss.
         let recovered = |measured: &Measured| recovery_misses(buffered, measured, &SLO, LIMIT);
         assert!(recovered(&window(50.0, calls(200, 0, false, 150))).is_empty());
-        assert!(!recovered(&window(50.0, calls(99, 0, false, 150))).is_empty());
+        assert!(!recovered(&window(50.0, calls(MIN_CALLS - 1, 0, false, 150))).is_empty());
         assert!(!recovered(&refused).is_empty());
         let mut lossy = window(50.0, calls(200, 0, false, 150));
         lossy.integrity.lost = 1.0;

@@ -1,13 +1,16 @@
 ---
 id: SPEC-gateway-capacity
-revision: 2
+revision: 3
 status: approved
 ---
 
 # AI gateway overhead and sustained-capacity benchmarks
 
 The user approved the two-mode design on 2026-10-20 and requested this revision
-and its companion task. One shared harness serves two opt-in commands with
+and its companion task. Revision 3 (user-approved 2026-10-20) shortens the
+capacity windows for quick turnaround: 2 s warmup, 15 s windows, 3 s backlog
+edges, 10 s overload, 20 s recovery judged on its last 15 s, and a 30-call
+per-tenant/mode minimum. One shared harness serves two opt-in commands with
 separate measurements and verdicts. The user additionally required overhead to
 follow verification's client → server → client roundtrip measurement pattern.
 Implementation and benchmark execution are not part of this planning revision.
@@ -269,7 +272,7 @@ are not receipt; parse complete SSE events across arbitrary network chunks.
 
 Run fixed offered rates independently of response completion. Default aggregate
 rates are 50/100/250/500/1000 requests/s, in ascending order for each selected
-case. Each rate has a 10 s warmup, settled before the baseline, then a 60 s
+case. Each rate has a 2 s warmup, settled before the baseline, then a 15 s
 arrival window. Retain per-tenant/mode evidence; do not hide the quieter tenants
 in aggregate percentiles or promise a new production fairness policy.
 
@@ -306,7 +309,7 @@ A sustainable rate requires:
   nonnegative data-event lag relative to each matched upstream send, and complete
   stream receipt within the declared applicable bounds (equality passes).
   Completion/first-token clocks start at scheduled arrival. Each applicable
-  tenant/mode distribution requires at least 100 completed calls; chunk lag
+  tenant/mode distribution requires at least 30 completed calls; chunk lag
   additionally reports all matched data-event samples. Insufficient evidence
   cannot become sustainable. Apply these checks per tenant/mode as well as
   aggregate, so low-volume tenant failures remain visible.
@@ -318,7 +321,7 @@ A sustainable rate requires:
   ownership through tenant-authorized reads. A staged count alone is not proof
   of durable capture completion.
 - Bounded outstanding accepted work and capture/Scribe backlog: compare the
-  first and last 10 s of the measured window. A positive growth above one second
+  first and last 3 s of the measured window. A positive growth above one second
   of the offered workload (or its measured capture bytes for a byte queue)
   fails sustainability. Report samples and slopes rather than using drain to
   hide sustained accumulation. Missing queue/completion evidence is invalid.
@@ -332,8 +335,8 @@ command; invalid evidence or integrity failure always does, as does finding no
 sustainable rate for a selected profile.
 
 For each selected case with a passing rate, add a bounded overload/recovery
-sequence without changing production admission semantics: 30 s at twice its
-highest passing rate, then 90 s back at that passing rate. Explicit configured
+sequence without changing production admission semantics: 10 s at twice its
+highest passing rate, then 20 s back at that passing rate. Explicit configured
 admission refusals may pass overload safety; timeouts, unexpected errors,
 malformed/truncated successful responses, loss, dropped captures, exceeded memory
 headroom or invalid driver evidence fail. Honor existing request deadlines.
@@ -342,7 +345,7 @@ say overload safety was not demonstrated; do not manufacture a failure by
 changing the production policy or claim the capacity ceiling was found.
 
 After the high-rate interval, keep lower-rate arrivals running. Recovery requires
-the final 60 s to satisfy the declared per-tenant/mode SLOs with zero refusals,
+the final 15 s to satisfy the declared per-tenant/mode SLOs with zero refusals,
 restored bounded backlog, and subsequent common drain/shutdown integrity. Final
 recovery distributions need 100 calls each; insufficient samples fail that proof.
 Keep overload, recovery, drain and shutdown as separate verdict rows. End the run

@@ -237,3 +237,56 @@ A cross-task integration failure remains work to close after integration.
 - [Deployment/release](../../../../architecture/operations/deployment-and-release.md)
 - [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md)
 - [Docs rules](../../../../docs/AGENTS.md)
+
+## Implementation Evidence
+
+Commits `4188c05f3`..`0cf57f3a5` on `task/guided-setup/TASK-001`. Runtime
+proof ran on Linux x86_64 only; macOS arm64 and Linux arm64 were not exercised.
+C8 ran two Gunicorn `UvicornWorker` processes. Postgres journeys ran through
+`scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`, with
+`uv run --no-sync` against the already-built development wheel.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001–004, INV-008, AC-001 | `crates/wyrd/wyrd-cli/src/init.rs` (`wyrd init`, `--print-prompt`, conflicts), `src/cli.rs`; `server dev` removed with no alias | C1 `guided_init_print_prompt_is_offline`, C2 `pg_tests::guided_init_lifecycle_and_prompt`; RED was the missing command and mode before `4188c05f3` | PASS |
+| REQ-005–006, INV-007, AC-002 | One prompt `crates/wyrd-spec/src/setup-prompt.md` via `wyrd_spec::mcp::setup_prompt`; readiness `setup_prompt`; server MCP prompt `setup` (`wyrd-server/src/mcp/guide.rs`); proxy forwarding (`wyrd-cli/src/mcp/mod.rs`); host launch commands (`mcp/hosts.rs`); docs embed the same file | C2; C3 `test_guided_setup_prompt_surfaces` (installed CLI, JSON readiness, MCP proxy, unknown prompt and arguments refused) | PASS |
+| REQ-007–008, AC-003 | Prompt step 6 and Setup's manual tab drive `examples/quickstart` | C4 `test_guided_manual_setup[python,rust,typescript]`: verdicts `passed`/`failed` printed and read back from `vala.verification.results` with the prompt's own SQL over `bifrost.query`. RED: strict MCP client rejected `cards.get` output (`Spec` schema `oneOf` matched several variants) | PASS |
+| REQ-021–023, AC-014 | `sdks/wyrd-sdk-python/python/wyrd/integrations/asgi/_middleware.py::WyrdMiddleware._lifespan/_start/_drain` | C5 `test_asgi_lifespan`: success with app-shutdown evidence kept; writer failure, provider conflict (owned provider unchanged, state closed), app startup failure, drain failure (`WYRD_VALA_403_BIFROST_CARD_SCOPE` logged and `shutdown.failed`). RED: module absent | PASS |
+| REQ-024–025, AC-012 | `WyrdMiddleware.__call__` enters `state.run(alias)`; `wyrd/otel.py` mirrors the Run scope in `_SCOPE_VAR` | C6 `test_asgi_run_isolation` (5 overlapping requests, streaming, raised route, cancellation, invalid alias before the app, WebSocket, passthrough, stored rows per Run); C7 `test_asgi_telemetry_ownership` (one `GET /work` server span, every span tagged, `telemetry=False` keeps the app's provider). RED for C7: inner spans lacked `wyrd.run_id` | PASS |
+| REQ-026, INV-009, AC-013 | Per-worker lifespan; `tests/integration/asgi_app.py` | C8 `test_asgi_worker_lifecycle`: both pids served, SIGTERM exit 0, two `Application shutdown complete`, drift rows stored for every request | PASS |
+| REQ-027–028/030–031, AC-015 (learning and integration portion) | `get-started/setup.md` (agent-assisted and manual tabs), `get-started/choose-your-path.md`, `connect/integrate-fastapi.md` embedding `examples/integrate-fastapi/app.py`, `docs/AGENTS.md` Integration shape | `test_fastapi_example` runs the embedded app; `docs:check:commands`, `docs:linkcheck`, `docs:test`, `docs:svelte:check`, `docs:build` | PASS; platform path content pending TASK-002 integration |
+| REQ-032, AC-016 | Pages, `check_commands.py`, regenerated `llms*.txt`, CHANGELOG | `git grep "server dev"` outside `changes/` and CHANGELOG finds only the removed-spelling test comment. The persisted `logs/server-dev.log` path is kept to preserve bootstrap persistence | PASS |
+| INV-005 | Example loads `.wyrd-bundle` with `WyrdState.from_path`; the middleware never declares | `test_fastapi_example`, C8 | PASS |
+
+Checks: `mise run fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`,
+`codegen:check`, `git diff --check`, `docs:generate` all pass.
+`tests/unit/state/test_observe_surface.py` passes (68). New journeys run in
+`test:local-dev:journey` (C3, C4) and the Python observation journey lane (ASGI).
+
+### Diagnoses
+
+- **Spec schema (C4).** Symptom: the MCP client failed to validate the
+  `cards.get` output. Evidence: the schemars `Spec` schema used `oneOf`, and
+  `Service` specs match more than one variant. Cause: `oneOf` requires exactly
+  one match. Fix site: `crates/wyrd-spec/src/envelope.rs` `JsonSchema for
+  Spec` now emits `anyOf`; the OpenAPI projection keeps `oneOf` (utoipa's
+  `AnyOfBuilder` has no title).
+- **Span correlation (C7).** Symptom: OTel ASGI spans inside a Run had no
+  `wyrd.run_id`. Evidence: the instrumentation attaches `extract()`'s fresh
+  `Context()`, which drops `_SCOPE_KEY`. Cause: the Run scope lived only in the
+  OTel context. Fix site, confirmed by a read-only diagnostician:
+  `wyrd/otel.py` `_enter_run`/`_exit_run` also push and pop a `ContextVar`,
+  and `_RunCorrelationProcessor.on_start` falls back to it. Callers checked:
+  every Run enter/exit routes through these two functions.
+- **Docs prerender (outside the planned write set).** Symptom: `docs:build`
+  returned 500 for `/wyrd/` (ENOENT under `docs/.svelte-kit/examples`).
+  Cause: the landing loader (baseline `d61408b88`) resolved `REPO_ROOT` from the
+  bundled chunk's `import.meta.url`. Fix: `src/routes/+page.server.ts` inlines
+  the Quickstart sources with `import.meta.glob(..., { query: '?raw' })`; the
+  publication fixture links `examples` beside its `Cargo.toml`.
+
+Non-goals stayed excluded: no framework auto-discovery, other adapters,
+collector identity, credential migration, registration changes, or TASK-002
+auth, key, and deployment-guide work. Pending at change review: full
+`docs:check`, installed bootstrap regressions, all SDK journeys, and the
+cross-task ASGI identity refusals.

@@ -75,6 +75,7 @@ impl ScribeTailService for ScribeTailGrpc {
                     bytes: stream.bytes,
                 })
                 .collect(),
+            publication_revision: capture.publication_revision,
         }))
     }
 

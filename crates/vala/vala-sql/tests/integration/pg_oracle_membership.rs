@@ -566,26 +566,6 @@ mod pg_tests {
             OracleTableCuts::new(&mut conn, tenant).read(&refs).await
         }
 
-        /// Reads `tables`' publication revisions for `tenant`, in request order.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the connection or the statement fails.
-        async fn revisions(&self, tenant: DataTenantId, tables: &[&str]) -> Vec<i64> {
-            let refs: Vec<CutTableRef<'_>> = tables
-                .iter()
-                .map(|table| CutTableRef {
-                    namespace_name: NAMESPACE,
-                    table_name: table,
-                })
-                .collect();
-            let mut conn = self.fixture.app_pool().acquire().await.expect("connection");
-            OracleTableCuts::new(&mut conn, tenant)
-                .read_revisions(&refs)
-                .await
-                .expect("revisions read")
-        }
-
         /// Records `replaced` for one table under its exclusive authority, as
         /// snapshot expiry does, and returns the retained snapshots.
         ///
@@ -892,19 +872,66 @@ mod pg_tests {
         );
     }
 
-    /// Proves each committed `vala.file_list` publication advances its table's
-    /// publication revision once, and that the cut and the revision reread
-    /// agree.
+    /// Proves every committed `vala.file_list` change notifies the Oracle cut
+    /// channel with its table, and a rolled-back change notifies nothing.
     ///
-    /// A rolled-back insert and an identical replay advance nothing, a table
-    /// with no publication reads revision 0, and another tenant's revision is
-    /// independent.
+    /// # Panics
+    ///
+    /// Panics when the listener cannot start, a committed write is not
+    /// heard, or a rolled-back write is.
+    #[tokio::test]
+    async fn file_list_changes_notify_the_cut_channel_on_commit() {
+        let reads = CutReads::start().await;
+        let tenant = reads.tenant().await;
+        reads
+            .register(tenant, "events", Some("s3://a/events/v1.metadata.json"))
+            .await;
+        let mut listener = sqlx::postgres::PgListener::connect_with(reads.fixture.app_pool())
+            .await
+            .expect("listener connects");
+        listener.listen("bifrost_cut").await.expect("listens");
+
+        reads
+            .hot_row(tenant, "events", "a/hot-1.parquet", false, None)
+            .await;
+
+        let heard = tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv())
+            .await
+            .expect("a committed insert is heard")
+            .expect("notification");
+        assert_eq!(
+            heard.payload(),
+            format!("{}|{NAMESPACE}|events", tenant.as_uuid()),
+            "the payload names exactly the changed table"
+        );
+        let mut rolled_back = reads.superuser.begin().await.expect("begin");
+        let deleted = sqlx::query("DELETE FROM vala.file_list WHERE data_tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *rolled_back)
+            .await
+            .expect("delete runs");
+        assert_eq!(deleted.rows_affected(), 1, "the trigger fired once");
+        rolled_back.rollback().await.expect("rollback");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.recv())
+                .await
+                .is_err(),
+            "a rolled-back change is never heard"
+        );
+    }
+
+    /// Proves each committed `vala.file_list` publication advances its
+    /// node's table revision once, and the cut returns every node's revision.
+    ///
+    /// A second publication by the same node advances that node only; an
+    /// identical replay and a rolled-back publication advance nothing; a table
+    /// with no publication and another tenant read no revision.
     ///
     /// # Panics
     ///
     /// Panics when a read fails or a revision differs from the expected count.
     #[tokio::test]
-    async fn file_list_publications_advance_the_table_revision() {
+    async fn file_list_publications_advance_their_node_revision() {
         let reads = CutReads::start().await;
         let tenant = reads.tenant().await;
         let other = reads.tenant().await;
@@ -916,21 +943,35 @@ mod pg_tests {
         reads
             .register(tenant, "quiet", Some("s3://a/quiet/v1.metadata.json"))
             .await;
-        let revisions = |owner| reads.revisions(owner, &["events", "quiet"]);
-        assert_eq!(revisions(tenant).await, [0, 0], "nothing is published yet");
-
         reads
             .hot_row(tenant, "events", "a/hot-1.parquet", false, None)
             .await;
         reads
             .hot_row(tenant, "events", "a/hot-2.parquet", false, None)
             .await;
-        assert_eq!(
-            revisions(tenant).await,
-            [2, 0],
-            "each publication advances once"
+        let node = |path: &str| {
+            sqlx::query_scalar::<_, Uuid>("SELECT node_id FROM vala.file_list WHERE file_path = $1")
+                .bind(path.to_owned())
+                .fetch_one(&reads.superuser)
+        };
+        let (first, second) = (
+            node("a/hot-1.parquet").await.expect("first node"),
+            node("a/hot-2.parquet").await.expect("second node"),
         );
-
+        let republish = "INSERT INTO vala.file_list ( \
+                id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, \
+                min_event_time, max_event_time, partition_granularity, partition_start, \
+                node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record, compacted) \
+             SELECT gen_random_uuid(), data_tenant_id, namespace, table_name, \
+                    file_path || $1, file_size, row_count, min_event_time, \
+                    max_event_time, partition_granularity, partition_start, node_id, \
+                    writer_epoch, wal_lsn_max + 1, wal_lsn_max + 1, promotion_record, compacted \
+               FROM vala.file_list WHERE file_path = 'a/hot-1.parquet'";
+        sqlx::query(republish)
+            .bind(".next")
+            .execute(&reads.superuser)
+            .await
+            .expect("the same node publishes again");
         let replayed = sqlx::query(
             "INSERT INTO vala.file_list SELECT * FROM vala.file_list \
               WHERE data_tenant_id = $1 ON CONFLICT DO NOTHING",
@@ -941,43 +982,30 @@ mod pg_tests {
         .expect("the replay runs");
         assert_eq!(replayed.rows_affected(), 0, "a replay inserts nothing");
         let mut rolled_back = reads.superuser.begin().await.expect("begin");
-        sqlx::query(
-            "INSERT INTO vala.file_list ( \
-                id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, \
-                min_event_time, max_event_time, partition_granularity, partition_start, \
-                node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record, compacted) \
-             SELECT gen_random_uuid(), data_tenant_id, namespace, table_name, \
-                    file_path || '.uncommitted', file_size, row_count, min_event_time, \
-                    max_event_time, partition_granularity, partition_start, gen_random_uuid(), \
-                    writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record, compacted \
-               FROM vala.file_list WHERE data_tenant_id = $1 LIMIT 1",
-        )
-        .bind(tenant.as_uuid())
-        .execute(&mut *rolled_back)
-        .await
-        .expect("the uncommitted publication inserts");
+        sqlx::query(republish)
+            .bind(".uncommitted")
+            .execute(&mut *rolled_back)
+            .await
+            .expect("the uncommitted publication inserts");
         rolled_back.rollback().await.expect("rollback");
-        assert_eq!(
-            revisions(tenant).await,
-            [2, 0],
-            "neither a replay nor a rolled-back publication advances"
-        );
-        assert_eq!(
-            revisions(other).await,
-            [0, 0],
-            "another tenant is independent"
-        );
 
         let cuts = reads
             .read(tenant, &["events", "quiet"])
             .await
             .expect("the cut reads");
         assert_eq!(
-            cuts.iter()
-                .map(|cut| cut.publication_revision)
-                .collect::<Vec<_>>(),
-            [2, 0],
-            "the cut reads the same revisions"
+            cuts[0].publication_revisions,
+            std::collections::HashMap::from([(first, 2), (second, 1)]),
+            "each node's publications advance only that node, once each"
+        );
+        assert!(
+            cuts[1].publication_revisions.is_empty(),
+            "an unpublished table has no revision"
+        );
+        let foreign = reads.read(other, &["events"]).await.expect("other cut");
+        assert!(
+            foreign[0].publication_revisions.is_empty(),
+            "another tenant is independent"
         );
     }
 }

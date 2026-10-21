@@ -1821,6 +1821,22 @@ impl ScribePublicationReconciler {
         }
     }
 
+    /// Reads every table publication revision this node has committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the read fails.
+    pub(crate) async fn node_publication_revisions(
+        &self,
+    ) -> Result<Vec<((wyrd_spec::DataTenantId, crate::catalog::TableRef), i64)>, ScribeError> {
+        file_list_writer::node_publication_revisions(
+            &self.operator_pool,
+            self.actor_stream.node_id.as_uuid(),
+        )
+        .await
+        .map_err(ScribeError::from)
+    }
+
     /// Reports whether the test fault injector refuses the next claim
     /// retirement after its commit landed.
     ///

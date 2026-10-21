@@ -110,7 +110,8 @@ impl ClaimPublisher {
         self.hot_sources = Some(hot_sources);
     }
 
-    /// Moves every published member's authority to the committed hot objects.
+    /// Moves every published member's authority to the committed hot objects
+    /// and raises the table's reported revision to `publication_revision`.
     ///
     /// This runs between the fenced commit and retirement, and the order is
     /// what makes retirement safe: once a member is `Published` no further
@@ -127,6 +128,7 @@ impl ClaimPublisher {
         &self,
         request: &PublishClaimRequest<'_>,
         object_identities: &[String],
+        publication_revision: i64,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -159,9 +161,34 @@ impl ClaimPublisher {
             })
             .collect::<Vec<_>>();
         hot_sources
-            .advance_all_atomic(&seal_key, &transitions)
+            .advance_all_atomic(&seal_key, &transitions, publication_revision)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("move complete claim authority to its hot objects: {error}"),
+            })
+    }
+
+    /// Raises the registry's reported publication revisions to every one
+    /// this node has committed.
+    ///
+    /// Runs where a commit's revision was never advanced in memory: at boot,
+    /// before captures are served, and when a committed claim is finished
+    /// from its durable records. Without it a capture would stop serving the
+    /// committed generations while still reporting a revision a cut lacking
+    /// their rows satisfies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the read fails or the registry lock is
+    /// poisoned.
+    pub(crate) async fn restore_publication_revisions(&self) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let revisions = self.reconciler.node_publication_revisions().await?;
+        hot_sources
+            .restore_publication_revisions(revisions)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("restore this node's publication revisions: {error}"),
             })
     }
 
@@ -406,7 +433,7 @@ impl ClaimPublisher {
             }
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
-        self.advance_published(&request, &object_identities)?;
+        self.advance_published(&request, &object_identities, outcome.publication_revision)?;
         self.retire_members(&request, &outcome.commit_key, &object_identities, &records)
             .await?;
         self.mover.cleanup_published(&claims).await?;
@@ -652,6 +679,7 @@ impl ClaimPublisher {
                 ),
             });
         }
+        self.restore_publication_revisions().await?;
         let surviving = surviving.iter().collect::<Vec<_>>();
         self.recover_terminal_members(key, &surviving).await?;
         self.stage

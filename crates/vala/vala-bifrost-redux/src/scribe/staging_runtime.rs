@@ -604,15 +604,20 @@ impl ScribeStagingRuntime {
     /// fails closed rather than merging durable rows under a recipe they were
     /// not written with.
     ///
+    /// Before any member, it raises the registry's reported publication
+    /// revisions to every one this node committed in an earlier process.
+    ///
     /// Returns the number of members restored.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the staged namespace cannot be
+    /// Returns [`ScribeError`] when this node's publication revisions cannot
+    /// be read, and [`ScribeError::Internal`] when the staged namespace cannot be
     /// recovered or validated, a member's binding, schema, or recipe cannot be
     /// reconstructed, the recovered layout contradicts the key, the ready index
     /// refuses a duplicate member.
     pub async fn restore(&self, pool: &OperatorPool) -> Result<usize, ScribeError> {
+        self.publisher.restore_publication_revisions().await?;
         let recovered = self
             .stage
             .recover()

@@ -359,7 +359,15 @@ pub struct StagedCapture {
     /// Memory-served generations whose authority is already a published
     /// object; the capture must drop their memory copy.
     pub superseded: std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
+    /// The table revision this node's last locally completed publication
+    /// committed at, read in the same critical section: every generation
+    /// the capture omits as published is covered by a cut at least this new.
+    pub publication_revision: i64,
 }
+
+/// Highest committed publication revision this node has advanced per tenant
+/// table.
+type PublicationRevisions = HashMap<(wyrd_spec::ids::DataTenantId, crate::catalog::TableRef), i64>;
 
 /// Pod-wide registry of where every live generation's rows are readable.
 #[derive(Debug, Default)]
@@ -371,6 +379,14 @@ pub struct ScribeHotSourceRegistry {
     /// Signalled whenever a publication mark is cleared, so a capture
     /// refused by one can retry.
     settled: tokio::sync::Notify,
+    /// Each table's revision as of this node's last locally completed
+    /// publication, never decreasing.
+    ///
+    /// Locked only while `state` is held, so a capture reads the revision
+    /// in the same critical section that decides which generations it
+    /// still serves, and an advance to `Published` raises it in the same
+    /// critical section that stops serving them.
+    revisions: Mutex<PublicationRevisions>,
 }
 
 impl ScribeHotSourceRegistry {
@@ -453,12 +469,15 @@ impl ScribeHotSourceRegistry {
         Ok(())
     }
 
-    /// Atomically advances every named generation under one seal key.
+    /// Atomically advances every named generation under one seal key, the
+    /// moves of one committed publication at `publication_revision`.
     ///
     /// The registry prevalidates the complete set while holding its one state
-    /// lock, then applies every move. An exact replay is idempotent; a missing
-    /// generation, backwards move, or same-stage identity contradiction leaves
-    /// the complete set unchanged.
+    /// lock, then applies every move and raises the table's revision to
+    /// `publication_revision` in the same critical section. An exact replay is
+    /// idempotent; a missing generation, backwards move, or same-stage
+    /// identity contradiction leaves the complete set and the revision
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -468,8 +487,10 @@ impl ScribeHotSourceRegistry {
         &self,
         key: &SealKey,
         transitions: &[(GenerationOrdinal, HotAuthority)],
+        publication_revision: i64,
     ) -> Result<(), HotSourceError> {
         let mut state = self.lock()?;
+        let mut revisions = self.lock_revisions()?;
         let authorities = state.get_mut(key).ok_or_else(|| {
             transitions.first().map_or(
                 HotSourceError::Unregistered { generation: 0 },
@@ -510,6 +531,11 @@ impl ScribeHotSourceRegistry {
                 *current = next.clone();
             }
         }
+        let revision = revisions
+            .entry((key.tenant, key.table.clone()))
+            .or_default();
+        *revision = (*revision).max(publication_revision);
+        drop(revisions);
         let published = transitions
             .iter()
             .filter(|(_, next)| matches!(next, HotAuthority::Published { .. }))
@@ -708,6 +734,34 @@ impl ScribeHotSourceRegistry {
         Ok(())
     }
 
+    /// Raises each table's revision to one an earlier process of this node
+    /// committed, before this process serves any capture.
+    ///
+    /// A restarted Scribe no longer holds the generations it published
+    /// before, so without this it would report a lower revision than a cut
+    /// that lacks those rows needs to be caught by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn restore_publication_revisions(
+        &self,
+        restored: impl IntoIterator<
+            Item = (
+                (wyrd_spec::ids::DataTenantId, crate::catalog::TableRef),
+                i64,
+            ),
+        >,
+    ) -> Result<(), HotSourceError> {
+        let _state = self.lock()?;
+        let mut revisions = self.lock_revisions()?;
+        for (table, publication_revision) in restored {
+            let revision = revisions.entry(table).or_default();
+            *revision = (*revision).max(publication_revision);
+        }
+        Ok(())
+    }
+
     /// Returns one generation's current authority, if it is still registered.
     ///
     /// # Errors
@@ -839,6 +893,11 @@ impl ScribeHotSourceRegistry {
         served: &std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
     ) -> Result<Option<StagedCapture>, HotSourceError> {
         let mut state = self.lock()?;
+        let publication_revision = self
+            .lock_revisions()?
+            .get(&(tenant, table.clone()))
+            .copied()
+            .unwrap_or(0);
         let selected = |key: &SealKey| key.tenant == tenant && key.table == *table;
         if state
             .iter()
@@ -903,6 +962,7 @@ impl ScribeHotSourceRegistry {
                 sources,
             },
             superseded,
+            publication_revision,
         }))
     }
 
@@ -997,6 +1057,21 @@ impl ScribeHotSourceRegistry {
                 .values()
                 .all(HotAuthority::is_durable)
         }))
+    }
+
+    /// Locks the publication revisions; callers already hold `state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] when a previous holder panicked.
+    fn lock_revisions(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, PublicationRevisions>, HotSourceError> {
+        self.revisions
+            .lock()
+            .map_err(|error| HotSourceError::Poisoned {
+                detail: error.to_string(),
+            })
     }
 
     /// Locks the registry, converting a poisoned lock into a typed error.
@@ -1133,7 +1208,7 @@ mod tests {
         let transitions = vec![(first, published.clone()), (second, published.clone())];
 
         assert!(matches!(
-            registry.advance_all_atomic(&key, &transitions),
+            registry.advance_all_atomic(&key, &transitions, 1),
             Err(HotSourceError::Unregistered { generation: 2 })
         ));
         assert_eq!(
@@ -1148,10 +1223,10 @@ mod tests {
             .restore_durable(&key, second, staged())
             .expect("missing staged member restores under the same identity");
         registry
-            .advance_all_atomic(&key, &transitions)
+            .advance_all_atomic(&key, &transitions, 1)
             .expect("the complete retry publishes atomically");
         registry
-            .advance_all_atomic(&key, &transitions)
+            .advance_all_atomic(&key, &transitions, 1)
             .expect("exact replay is idempotent success");
         for generation in [first, second] {
             assert_eq!(

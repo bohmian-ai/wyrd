@@ -167,6 +167,32 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         Ok(())
     }
 
+    /// Tells every Oracle node that `table`'s cut changed.
+    ///
+    /// Sends the `bifrost_cut` notification the `vala.file_list` trigger sends,
+    /// for a Forge commit that moves the catalog pointer without touching
+    /// `vala.file_list`, such as a rewrite. Without it a warm node keeps
+    /// planning against the replaced files. `NOTIFY` is transactional, so the
+    /// notification is delivered only if this owner's transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the statement fails.
+    pub async fn announce_cut_change(&mut self, table: CutTableRef<'_>) -> Result<(), SqlError> {
+        let payload = format!(
+            "{}|{}|{}",
+            self.conn.data_tenant_id().as_uuid(),
+            table.namespace_name,
+            table.table_name
+        );
+        sqlx::query("SELECT pg_catalog.pg_notify('bifrost_cut', $1)")
+            .bind(payload)
+            .execute(&mut **self.conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        Ok(())
+    }
+
     /// Takes the table's exclusive maintenance authority and turns this owner
     /// into the capability destructive Forge work requires.
     ///
@@ -343,13 +369,16 @@ pub struct TableCut {
     pub identity: TableAuthorityIdentity,
     /// Current Iceberg metadata document location for the table.
     pub metadata_location: String,
-    /// Count of `vala.file_list` publications into the table, read in the same
-    /// statement snapshot as `metadata_location` and `hot_files`.
+    /// Publication revision per Scribe node, read in the same statement
+    /// snapshot as `metadata_location` and `hot_files`; a node absent here has
+    /// revision 0.
     ///
-    /// Oracle compares it with [`OracleTableCuts::read_revisions`] after it
-    /// captures the live sources; equality proves no file was published in
-    /// between.
-    pub publication_revision: i64,
+    /// One node's publications into a table commit in revision order, so the
+    /// cut holds every publication of a node up to its revision. Oracle
+    /// compares this with the revision each Scribe reports with its live
+    /// capture: a higher reported revision means the cut predates rows that
+    /// Scribe no longer serves live.
+    pub publication_revisions: std::collections::HashMap<Uuid, i64>,
     /// Unresolved `file_list` rows in durable file-list order. These are
     /// candidates; reconciliation against the selected snapshot happens after
     /// the metadata document is read.
@@ -399,7 +428,17 @@ impl<'conn> OracleTableCuts<'conn> {
         if tables.is_empty() {
             return Err(invariant("an Oracle cut needs at least one table"));
         }
-        let request = cut_request(tables);
+        let request = serde_json::Value::Array(
+            tables
+                .iter()
+                .map(|table| {
+                    serde_json::json!({
+                        "namespace": table.namespace_name,
+                        "table": table.table_name,
+                    })
+                })
+                .collect(),
+        );
         let rows: Vec<CutDbRow> =
             sqlx::query_as("SELECT * FROM vala.oracle_read_table_cut($1::uuid, $2::jsonb)")
                 .bind(self.data_tenant_id.as_uuid())
@@ -409,79 +448,6 @@ impl<'conn> OracleTableCuts<'conn> {
                 .map_err(cut_error)?;
         group_table_cut(self.data_tenant_id, tables, rows)
     }
-
-    /// Reads every table's current publication revision in one statement.
-    ///
-    /// The result has one revision per distinct table in input order, the
-    /// same order [`Self::read`] returns cuts in, so a caller compares the two
-    /// position by position. A table with no publication reads revision 0.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] for an empty request or a
-    /// result whose length or order differs from the distinct request, and
-    /// [`SqlError`] when the statement fails.
-    pub async fn read_revisions(
-        &mut self,
-        tables: &[CutTableRef<'_>],
-    ) -> Result<Vec<i64>, SqlError> {
-        let expected = distinct_ordinals(tables)?;
-        let rows: Vec<(i32, i64)> = sqlx::query_as(
-            "SELECT ordinal, publication_revision FROM vala.oracle_read_publication_revisions($1::uuid, $2::jsonb)",
-        )
-        .bind(self.data_tenant_id.as_uuid())
-        .bind(cut_request(tables))
-        .fetch_all(&mut *self.conn)
-        .await
-        .map_err(SqlError::from)?;
-        if rows.len() != expected.len()
-            || rows
-                .iter()
-                .zip(&expected)
-                .any(|((ordinal, _), (expected, _))| ordinal != expected)
-        {
-            return Err(invariant("publication revisions do not match the request"));
-        }
-        Ok(rows.into_iter().map(|(_, revision)| revision).collect())
-    }
-}
-
-/// Encodes the ordered table request both cut functions take.
-fn cut_request(tables: &[CutTableRef<'_>]) -> serde_json::Value {
-    serde_json::Value::Array(
-        tables
-            .iter()
-            .map(|table| {
-                serde_json::json!({
-                    "namespace": table.namespace_name,
-                    "table": table.table_name,
-                })
-            })
-            .collect(),
-    )
-}
-
-/// Returns each distinct requested table with the 1-based position of its
-/// first occurrence, the ordinal both cut functions report.
-///
-/// # Errors
-///
-/// Returns [`SqlError::InvariantViolation`] for an empty or oversized request.
-fn distinct_ordinals<'a>(
-    tables: &[CutTableRef<'a>],
-) -> Result<Vec<(i32, CutTableRef<'a>)>, SqlError> {
-    if tables.is_empty() {
-        return Err(invariant("an Oracle cut needs at least one table"));
-    }
-    let mut expected: Vec<(i32, CutTableRef<'a>)> = Vec::with_capacity(tables.len());
-    for (position, table) in tables.iter().enumerate() {
-        if !expected.iter().any(|(_, seen)| seen == table) {
-            let ordinal = i32::try_from(position + 1)
-                .map_err(|_| invariant("Oracle cut request is too large"))?;
-            expected.push((ordinal, *table));
-        }
-    }
-    Ok(expected)
 }
 
 /// Maps the cut function's not-found signal onto the typed absence.
@@ -512,8 +478,9 @@ struct CutDbRow {
     table_name: String,
     /// Catalog pointer of the table's current metadata.
     metadata_location: String,
-    /// The table's publication revision, repeated on every row of the table.
-    publication_revision: i64,
+    /// The table's per-node publication revisions as a JSON object from node
+    /// id to revision, repeated on every row of the table.
+    publication_revisions: sqlx::types::Json<std::collections::HashMap<Uuid, i64>>,
     /// Hot row identity; `None` exactly when the hot side is empty.
     id: Option<Uuid>,
     /// Hot row tenant.
@@ -635,7 +602,14 @@ fn group_table_cut(
     tables: &[CutTableRef<'_>],
     rows: Vec<CutDbRow>,
 ) -> Result<Vec<TableCut>, SqlError> {
-    let expected = distinct_ordinals(tables)?;
+    let mut expected: Vec<(i32, CutTableRef<'_>)> = Vec::with_capacity(tables.len());
+    for (position, table) in tables.iter().enumerate() {
+        if !expected.iter().any(|(_, seen)| seen == table) {
+            let ordinal = i32::try_from(position + 1)
+                .map_err(|_| invariant("Oracle cut request is too large"))?;
+            expected.push((ordinal, *table));
+        }
+    }
     let mut cuts: Vec<(i32, TableCut)> = Vec::with_capacity(expected.len());
     for mut row in rows {
         let hot = row.hot_file()?;
@@ -646,7 +620,7 @@ fn group_table_cut(
                 || cut.identity.namespace_name != row.namespace_name
                 || cut.identity.table_name != row.table_name
                 || cut.metadata_location != row.metadata_location
-                || cut.publication_revision != row.publication_revision
+                || cut.publication_revisions != row.publication_revisions.0
             {
                 return Err(invariant("table cut returned conflicting table identity"));
             }
@@ -678,7 +652,7 @@ fn group_table_cut(
             TableCut {
                 identity,
                 metadata_location: row.metadata_location,
-                publication_revision: row.publication_revision,
+                publication_revisions: std::mem::take(&mut row.publication_revisions.0),
                 hot_files: hot.into_iter().collect(),
             },
         ));

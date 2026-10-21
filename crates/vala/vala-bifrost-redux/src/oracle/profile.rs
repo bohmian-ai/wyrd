@@ -55,8 +55,9 @@ pub(crate) struct QueryProfile {
     pub(crate) admission: Time,
     /// Staging the read decision and binding sources to the retained root.
     pub(crate) audit_bind: Time,
-    /// Selections discarded because a publication revision moved during
-    /// live capture, each followed by a fresh pin under the same profile.
+    /// Selections discarded because a captured Scribe reported a publication
+    /// revision above the cut's, each followed by a fresh pin under the same
+    /// profile.
     pub(crate) selection_retries: Count,
     /// Operator metrics folded from the executed root when its owner released
     /// it.

@@ -1680,6 +1680,9 @@ pub(crate) struct LiveCapture {
     memory: Vec<ReadableSource>,
     /// Lease over the staged members the memory half did not serve.
     staged: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+    /// Revision of this node's last locally completed publication of the
+    /// table, read with the staged boundary; 0 without a registry.
+    publication_revision: i64,
 }
 
 impl LiveCapture {
@@ -1714,6 +1717,7 @@ impl LiveCapture {
         if let Some(hook) = CAPTURE_SELECTED.with(|hook| hook.borrow_mut().take()) {
             hook();
         }
+        let mut publication_revision = 0;
         let staged = if let Some(registry) = registry {
             let served = memory
                 .iter()
@@ -1735,12 +1739,26 @@ impl LiveCapture {
                         .contains(&(source.partition_day, generation))
                 })
             });
+            publication_revision = capture.publication_revision;
             Some(Arc::new(capture.lease))
         } else {
             None
         };
         drop(guards);
-        Ok(Some(Self { memory, staged }))
+        Ok(Some(Self {
+            memory,
+            staged,
+            publication_revision,
+        }))
+    }
+
+    /// Returns the revision of this node's last locally completed
+    /// publication of the table as of the capture.
+    ///
+    /// The Oracle compares it against its cut: a higher revision means the
+    /// cut predates a publication whose rows the capture no longer serves.
+    pub(crate) fn publication_revision(&self) -> i64 {
+        self.publication_revision
     }
 
     /// Reports whether the capture holds no memory source and no staged run.

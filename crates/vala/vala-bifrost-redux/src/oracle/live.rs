@@ -142,8 +142,8 @@ impl super::TailStreamDiscovery for NoCaptureDiscovery {
         _scribes: &[super::OracleQueryParticipant],
         _query_id: uuid::Uuid,
         _deadline: std::time::Instant,
-    ) -> Result<Vec<super::DiscoveredTailRoute>, crate::scribe::tail_rpc::TailReadError> {
-        Ok(Vec::new())
+    ) -> Result<super::DiscoveredTail, crate::scribe::tail_rpc::TailReadError> {
+        Ok(super::DiscoveredTail::default())
     }
 
     /// Holds no capture, so there is nothing to release.

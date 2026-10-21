@@ -128,6 +128,7 @@ impl TonicTailReadTransport {
         Ok(TailCapture {
             capture_id,
             streams,
+            publication_revision: response.publication_revision,
         })
     }
 
@@ -487,6 +488,12 @@ pub struct TailCapture {
     pub capture_id: Option<uuid::Uuid>,
     /// Listed partitions, sorted, each once.
     pub streams: Vec<ActiveTailStream>,
+    /// The table revision this Scribe node's last locally completed
+    /// publication committed at, read in the capture's critical section.
+    ///
+    /// Reported for an empty capture too: Oracle keeps a cut only when its
+    /// revision for this node is at least this one.
+    pub publication_revision: i64,
 }
 
 /// Pod-local live-tail service over the Scribe memtable.
@@ -607,10 +614,12 @@ impl FetchLiveTailService {
             active_partition_count = partitions.len(),
             "captured active Scribe tail partitions"
         );
+        let publication_revision = capture.publication_revision();
         if capture.is_empty() {
             return Ok(TailCapture {
                 capture_id: None,
                 streams: Vec::new(),
+                publication_revision,
             });
         }
         let stream = self.stream;
@@ -633,6 +642,7 @@ impl FetchLiveTailService {
         Ok(TailCapture {
             capture_id: Some(capture_id),
             streams,
+            publication_revision,
         })
     }
 

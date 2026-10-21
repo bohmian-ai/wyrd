@@ -87,9 +87,9 @@ impl OraclePlanner {
     /// The resolved tables are authorized next, still before any object IO,
     /// and then every table's metadata and manifests are read concurrently.
     /// Only an object-store `NotFound` on a selected document — a catalog move
-    /// that already deleted it — rereads, and only once. Every read is a fresh
-    /// Postgres read: its publication revisions are what Oracle validates the
-    /// query's live capture against.
+    /// that already deleted it — rereads, and only once. The first read may
+    /// come from the node's cut cache, bounded by `not_before`; the reread
+    /// always reads Postgres.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryForbidden`] when the caller's grants do not
@@ -101,15 +101,18 @@ impl OraclePlanner {
         context: &AuthorizedQueryContext,
         catalog: &BifrostCatalog,
         profile: &super::profile::QueryProfile,
+        not_before: Option<Instant>,
     ) -> Result<Vec<PinnedSealedTable>, BifrostError> {
         let tenant = context.data_tenant_id;
         let mut reread = false;
         loop {
             let read = profile.cut_read.timer();
-            let cut = catalog
-                .read_cut(tenant, tables)
-                .await
-                .map_err(BifrostCatalogError::into_public)?;
+            let cut = if reread {
+                catalog.read_cut(tenant, tables).await
+            } else {
+                catalog.read_cut_cached(tenant, tables, not_before).await
+            };
+            let cut = cut.map_err(BifrostCatalogError::into_public)?;
             read.done();
             let identities = cut
                 .iter()
@@ -174,7 +177,13 @@ impl OraclePlanner {
     ) -> Result<PlannedSqlCut, BifrostError> {
         let cuts = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            Self::read_and_materialize(tables, context, catalog, &profile),
+            Self::read_and_materialize(
+                tables,
+                context,
+                catalog,
+                &profile,
+                deadline.checked_sub(self.config.max_deadline),
+            ),
         )
         .await
         .map_err(|_| BifrostError::QueryTimeout)??;

@@ -124,7 +124,12 @@ message ListActiveStreamsRequest {
 message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; uint64 bytes = 3; }
 // capture_id names the retained capture every listed stream is read from. It
 // is empty, and nothing is retained, when no stream is listed.
-message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; bytes capture_id = 2; }
+// publication_revision is the table revision this Scribe node's last locally
+// completed publication committed at, read with the capture; an empty
+// capture reports it too.
+message ListActiveStreamsResponse {
+  repeated ActiveTailStream streams = 1; bytes capture_id = 2; int64 publication_revision = 3;
+}
 message ReleaseTailCaptureRequest {
   TenantTableBinding binding = 1; bytes query_id = 2; bytes capture_id = 3;
 }

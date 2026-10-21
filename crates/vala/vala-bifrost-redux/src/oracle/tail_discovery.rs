@@ -22,11 +22,27 @@ pub struct DiscoveredTailRoute {
     pub capture_id: uuid::Uuid,
 }
 
+/// One table's query-scoped discovery: every reported route plus the
+/// publication revision each answering Scribe reported in the same capture.
+#[derive(Default)]
+pub struct DiscoveredTail {
+    /// Routes of every retained capture.
+    pub routes: Vec<DiscoveredTailRoute>,
+    /// Each answering Scribe's node and the table revision its last locally
+    /// completed publication committed at, an empty capture included.
+    ///
+    /// Oracle compares each with the cut's revision for that node: a higher
+    /// reported revision means the cut lacks rows that Scribe no longer
+    /// serves live.
+    pub revisions: Vec<(uuid::Uuid, i64)>,
+}
+
 /// Query-scoped resolver for live Scribe streams.
 #[async_trait::async_trait]
 pub trait TailStreamDiscovery: Send + Sync {
     /// Lists active streams for one binding on exactly the frozen Scribes,
-    /// each with the bytes `scope` reads there.
+    /// each with the bytes `scope` reads there, and every answering Scribe's
+    /// publication revision.
     ///
     /// `scribes` is the query attempt's frozen roster; discovery never rereads
     /// membership, so every route names a participant of that one cut. Each
@@ -50,7 +66,7 @@ pub trait TailStreamDiscovery: Send + Sync {
         scribes: &[OracleQueryParticipant],
         query_id: uuid::Uuid,
         deadline: Instant,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;
+    ) -> Result<DiscoveredTail, TailReadError>;
 
     /// Releases captures this discovery retained for `query_id`.
     ///

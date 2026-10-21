@@ -132,7 +132,7 @@ pub use query_stream::{
 use query_stream::{QueryStreamInput, RunningQueryTerminalOwner};
 pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
-pub use tail_discovery::{DiscoveredTailRoute, TailStreamDiscovery};
+pub use tail_discovery::{DiscoveredTail, DiscoveredTailRoute, TailStreamDiscovery};
 
 /// Default maximum SQL request size accepted by the synchronous query floor.
 pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
@@ -993,6 +993,9 @@ struct LiveDiscovery {
     tables: std::collections::HashMap<String, live::LiveTableRoutes>,
     /// Whether listing failed for any pinned table.
     listing_lost: bool,
+    /// Pinned tables whose cut a captured Scribe proved stale: it reported a
+    /// publication revision above the cut's for its node.
+    stale: Vec<TableRef>,
 }
 
 /// Everything the one retained root needs to execute exactly once.
@@ -2027,9 +2030,9 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns the stable catalog, planning, or roster error. Every one of them
-    /// is terminal. A selection whose publication revisions moved during
-    /// acquisition is not an error: its captures are released, the cut is
-    /// repinned, and the root rebuilt under the same deadline, all before
+    /// is terminal. A selection whose cut a captured Scribe proved stale is
+    /// not an error: its captures are released, the cut is repinned from
+    /// Postgres, and the root rebuilt under the same deadline, all before
     /// admission, so no row of a discarded selection is ever produced. Each
     /// retry is counted on the query's one profile as `selection_retries`.
     async fn classify_one_build(
@@ -2814,11 +2817,11 @@ impl Oracle {
     /// Returns [`BifrostError::QueryAdmissionRejected`] when this pod's CPU
     /// shape cannot be read, [`BifrostError::QueryTimeout`] when the deadline
     /// passes during planning, the stable listing errors of
-    /// [`Self::discover_live_routes`], the public catalog error when the
-    /// publication revisions cannot be reread, or the mapped planning failure,
-    /// which is terminal for this query. `Ok(None)` reports a selection whose
-    /// publication revisions moved after the cut was read: its captures are
-    /// released and the caller repins.
+    /// [`Self::discover_live_routes`], or the mapped planning failure, which
+    /// is terminal for this query. `Ok(None)` reports a selection whose cut a
+    /// captured Scribe proved stale by reporting a higher publication revision
+    /// for its node: the stale cuts are evicted from the node's cut cache, the
+    /// captures are released, and the caller repins from Postgres.
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
@@ -2858,7 +2861,14 @@ impl Oracle {
             .discover_live_routes(roster, cuts, &scans, deadline)
             .await?;
         listing.done();
-        if !self.selection_holds(context, cuts, deadline).await? {
+        if !live.stale.is_empty() {
+            for table in &live.stale {
+                self.catalog.evict_cut(context.data_tenant_id, table);
+            }
+            tracing::debug!(
+                tables = live.stale.len(),
+                "Oracle discards a selection whose cut predates a Scribe's publication"
+            );
             return Ok(None);
         }
         for provider in &registered {
@@ -2916,52 +2926,6 @@ impl Oracle {
             root,
             live_listing_lost: live.listing_lost,
         }))
-    }
-
-    /// Reports whether no file was published for any pinned table since its
-    /// cut was read, so the cut and the live captures taken after it neither
-    /// lose nor repeat a row.
-    ///
-    /// Rereads every table's publication revision in one statement after all
-    /// captures, an empty capture included, and compares it with the revision
-    /// the cut read. A node that plans no live source captures nothing and
-    /// has nothing to validate.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
-    /// and the public catalog error when the revisions cannot be read.
-    async fn selection_holds(
-        &self,
-        context: &AuthorizedQueryContext,
-        cuts: &[PinnedSealedTable],
-        deadline: Instant,
-    ) -> Result<bool, BifrostError> {
-        if self.tail_discovery.is_none() || self.fragment_dispatcher.is_none() {
-            return Ok(true);
-        }
-        let tables = cuts
-            .iter()
-            .map(|cut| cut.binding.table_ref.clone())
-            .collect::<Vec<_>>();
-        let revisions = Self::before_deadline(
-            deadline,
-            self.catalog
-                .read_publication_revisions(context.data_tenant_id, &tables),
-        )
-        .await?
-        .map_err(BifrostCatalogError::into_public)?;
-        let holds = revisions
-            .iter()
-            .zip(cuts)
-            .all(|(revision, cut)| *revision == cut.publication_revision);
-        if !holds {
-            tracing::debug!(
-                tables = cuts.len(),
-                "Oracle discards a selection whose publication revision moved"
-            );
-        }
-        Ok(holds)
     }
 
     /// Runs one planning step under the query deadline.
@@ -3057,7 +3021,7 @@ impl Oracle {
         for cut in cuts {
             let binding = tail_discovery::wire_binding(cut)?;
             let scope = scans.listing_scope(&cut.binding.table_ref.fqn());
-            let routes = match discovery
+            let discovered_tail = match discovery
                 .discover(
                     &binding,
                     &scope,
@@ -3067,7 +3031,7 @@ impl Oracle {
                 )
                 .await
             {
-                Ok(routes) => routes,
+                Ok(discovered_tail) => discovered_tail,
                 Err(_) if Instant::now() >= deadline => {
                     return Err(BifrostError::QueryTimeout);
                 }
@@ -3096,6 +3060,12 @@ impl Oracle {
                     });
                 }
             };
+            if discovered_tail.revisions.iter().any(|(node_id, revision)| {
+                *revision > cut.publication_revisions.get(node_id).copied().unwrap_or(0)
+            }) {
+                discovered.stale.push(cut.binding.table_ref.clone());
+            }
+            let routes = discovered_tail.routes;
             if routes.is_empty() {
                 continue;
             }

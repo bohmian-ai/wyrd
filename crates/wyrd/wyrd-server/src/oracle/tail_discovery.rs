@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime};
 
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
-    DiscoveredTailRoute, OracleQueryParticipant, TailStreamDiscovery,
+    DiscoveredTail, DiscoveredTailRoute, OracleQueryParticipant, TailStreamDiscovery,
 };
 use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::tail_rpc::{
@@ -233,9 +233,10 @@ impl RegistryTailStreamDiscovery {
 
     /// Admits every roster participant's capture, or releases all of them.
     ///
-    /// The first failure in roster order decides the result, exactly as a
-    /// sequential walk would; every capture another listing retained is
-    /// released before it returns.
+    /// Every answering participant's publication revision is kept, an empty
+    /// capture included. The first failure in roster order decides the
+    /// result, exactly as a sequential walk would; every capture another
+    /// listing retained is released before it returns.
     ///
     /// # Errors
     /// Returns the first listing failure or [`TailReadError::StaleIdentity`]
@@ -246,8 +247,9 @@ impl RegistryTailStreamDiscovery {
         scribes: &[OracleQueryParticipant],
         query_id: uuid::Uuid,
         listed: Vec<Result<TailCapture, TailReadError>>,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
+    ) -> Result<DiscoveredTail, TailReadError> {
         let mut routes = Vec::new();
+        let mut revisions = Vec::with_capacity(scribes.len());
         let mut retained = Vec::new();
         let mut failure = None;
         for (scribe, listing) in scribes.iter().zip(listed) {
@@ -258,6 +260,7 @@ impl RegistryTailStreamDiscovery {
                     continue;
                 }
             };
+            revisions.push((scribe.node_id.as_uuid(), capture.publication_revision));
             let Some(capture_id) = capture.capture_id else {
                 continue;
             };
@@ -272,7 +275,7 @@ impl RegistryTailStreamDiscovery {
             }
         }
         let Some(error) = failure else {
-            return Ok(routes);
+            return Ok(DiscoveredTail { routes, revisions });
         };
         self.release(binding, query_id, &retained).await;
         Err(error)
@@ -305,7 +308,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         scribes: &[OracleQueryParticipant],
         query_id: uuid::Uuid,
         deadline: Instant,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
+    ) -> Result<DiscoveredTail, TailReadError> {
         #[cfg(feature = "test-support")]
         if self.unavailable.load(Ordering::Acquire) {
             return Err(TailReadError::Unavailable {
@@ -322,7 +325,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
             return Err(TailReadError::StaleIdentity);
         }
         if scribes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(DiscoveredTail::default());
         }
         let remaining = deadline
             .checked_duration_since(Instant::now())

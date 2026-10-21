@@ -1,17 +1,18 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: in_progress
 spec: SPEC-bifrost-source-consistency
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006]
 depends_on: []
 ---
 
 # Reliable Bifrost reads
 
-[Specification revision 1](../spec.md) is draft; this task remains proposed
-until it is approved. There is one implementation task and no task dependency.
+[Specification revision 2](../spec.md) is approved and governs this task; its
+validated cut cache replaces the per-query fresh cut read this task first
+described. Review remediation TASK-001-R1 is in progress. There is one implementation task and no task dependency.
 PR #189 is merged. Execute this same fix in a new worktree based on current
 `origin/main` containing that merge. Delivered long-horizon work is the base,
 not work to repeat or reapprove. Follow the spec's [worktree handoff](../spec.md#execution-base-and-worktree-handoff),
@@ -389,8 +390,6 @@ a prior successful build qualifies a changed implementation.
   change the target or silently accept the old limits.
 - A new public error/API, dependency, Cargo feature, destructive migration,
   compatibility protocol or material ownership/security change proves necessary.
-- Specification revision 1 has not been explicitly approved. Preparation of
-  this task is not that approval.
 
 Missing local repository-managed Postgres, migrations or profiler setup are
 execution mechanics to provision, not reasons to stop before attempting them.
@@ -400,7 +399,7 @@ fresh correctness/capacity evidence; it does not reopen or close PR #189.
 
 ## Authority Links
 
-- [Specification revision 1](../spec.md).
+- [Specification revision 2](../spec.md).
 - [Original long-horizon specification revision 21](../../long-horizon-verification/spec.md), with this change's approved supersession limited to the named publication/performance obligations.
 - [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md).
 - [Bifrost design](../../../../architecture/bifrost-design.md), [Wyrd design](../../../../architecture/wyrd-design.md).

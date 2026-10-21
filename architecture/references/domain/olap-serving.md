@@ -89,9 +89,8 @@ runtime, memory pool, spill allocation, deadline, and cancellation tree, all
 drawn from one aggregate query memory pool shared by operators and exchanges.
 Head cancellation joins all descendants. A selected analytical query owns one
 execution attempt; peer or transport loss after selection fails the stream
-terminally with no successor attempt and no interactive rerun. Transport and
-stage execution must not duplicate rows; the accepted publication overlap can
-still duplicate a row across published and live sources.
+terminally with no successor attempt and no interactive rerun. Transport,
+stage execution, and publication must not drop or duplicate a selected row.
 
 Interactive and analytical work use separate queues and counters. Analytical
 work cannot borrow the protected interactive slot floor. Both remain beneath

@@ -137,6 +137,22 @@ function injectMdsvexComponents() {
   };
 }
 
+// Svelte preprocessor that runs BEFORE mdsvex. Drafts are reviewed on the dev
+// server only; everywhere else (production build, tests, type checks) a draft
+// compiles to its frontmatter alone, so neither its prose nor any source it
+// embeds reaches the build output or must exist to build the site.
+function stripDrafts() {
+  return {
+    name: 'strip-drafts',
+    /** @param {{ content: string, filename?: string }} input */
+    markup({ content, filename }) {
+      if (process.env.NODE_ENV === 'development' || !filename || !/\.(svx|md)$/.test(filename)) return;
+      const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0];
+      if (frontmatter && /^draft:\s*true\s*$/m.test(frontmatter)) return { code: frontmatter };
+    }
+  };
+}
+
 /** @type {import('mdsvex').MdsvexOptions} */
 const mdsvexOptions = {
   extensions: ['.svx', '.md'],
@@ -160,7 +176,7 @@ const mdsvexOptions = {
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
   extensions: ['.svelte', '.svx', '.md'],
-  preprocess: [mdsvex(mdsvexOptions), injectMdsvexComponents()],
+  preprocess: [stripDrafts(), mdsvex(mdsvexOptions), injectMdsvexComponents()],
   kit: {
     // Static SSG with a client-side fallback shell for any non-prerendered URL.
     adapter: adapter({ fallback: '404.html' }),

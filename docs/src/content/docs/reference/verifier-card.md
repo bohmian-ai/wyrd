@@ -1,40 +1,13 @@
 ---
 title: Verifier Card
-description: Every field of a Verifier spec, its input slots, steps, checks, operators, references, citations, and outcomes.
+description: Fields, input slots, steps, checks, operators, references, citations, and refusals of a Verifier spec.
 pillar: wyrd
 section: Reference
 order: 1
 status: runnable
 ---
 
-A Verifier takes evidence from your app and decides whether it meets your requirements. Every object on this page rejects keys it does not define, so a typo fails at `wyrd declare --check` instead of being ignored. For a walkthrough, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
-
-## How a Verifier works
-
-A Verifier is built from five parts:
-
-| Part | What it is | Example |
-| --- | --- | --- |
-| Input | A named piece of evidence your app sends | `letter`, a Markdown file |
-| Step | Optional work that prepares evidence before anything is judged | Read the text out of the letter |
-| Action | What one step does: `extract`, `agent`, or `code` | `extract` the letter |
-| Requirement | One claim that must be true, in words a reviewer reads | "The letter follows the refund policy" |
-| Check | How one requirement is decided: `assert`, `trace`, `agent`, `code`, or `drift` | Ask a judge Agent |
-
-When you call `verify` or `submit`, the server:
-
-1. Checks each input against its slot, such as a file's format and size.
-2. Runs the steps. A step starts once the steps it reads from are done, and steps that don't depend on each other may run at the same time. A step's own requirements are checked right after it, before anything that depends on it starts.
-3. Checks the top-level requirements, once every step has finished.
-4. Combines every requirement's outcome into one verdict with `decide`.
-
-Steps read and compute; they are not the place for side effects. To act when a Verifier fails, such as paging someone, attach an [Operator](/build-and-verify/verify/respond-to-a-failed-verification/) to the binding.
-
-A Verifier with no steps is common: one input and one `assert` requirement covers many checks.
-
-## Spec fields
-
-A Verifier spec has six fields.
+A Verifier spec declares the evidence a caller sends, the steps that prepare it, and the requirements that judge it. Every object refuses keys it does not define.
 
 ```yaml
 apiVersion: wyrd/v1
@@ -48,20 +21,22 @@ spec:
   decide: all
 ```
 
+## Spec fields
+
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `description` | string | none | One sentence shown with results |
 | `inputs` | map of slot name to [input slot](#input-slots) | `{}` | The named evidence a caller sends |
 | `steps` | list of [steps](#steps) | `[]` | Work that prepares evidence before requirements run |
 | `requirements` | list of [requirements](#requirements) | `[]` | What must be true; each has one check |
-| `decide` | `all` or `{pass_rate: {threshold}}` | `all` | How requirement outcomes become the verdict |
+| `decide` | [`all` or `{pass_rate: {threshold}}`](#decide) | `all` | How requirement outcomes become the verdict |
 | `context_capture` | object | none | What run context to keep with the result |
 
-Step and requirement `id`s share one namespace across the whole Verifier.
+Step and requirement `id`s share one namespace.
 
 ## Input slots
 
-An input slot names one piece of evidence and the shape it must have. Your app fills it by name, as in `verify("follows-policy", letter=...)`, and steps and checks read it as `inputs.<slot>`. Each slot has a `type` and `required`, which defaults to `true`.
+A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. `json`, `media`, and `trace` slots also take `required`, default `true`.
 
 | `type` | Extra fields | Accepts |
 | --- | --- | --- |
@@ -72,242 +47,35 @@ An input slot names one piece of evidence and the shape it must have. Your app f
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
 
-An `extract` step can read `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`. See [extract](#extract) for what each extractor returns.
-
 ## Steps
 
-A step prepares evidence a requirement needs but the caller did not send in usable form: text pulled out of a PDF, a value computed in Python, or an Agent's summary. Its result is `steps.<id>.output`. Skip steps when your requirements can read the inputs directly.
+A step's result is `steps.<id>.output`.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `id` | string | required | Name used in references such as `steps.<id>.output` |
+| `id` | string | required | Name used in references |
 | `action` | [action](#actions) | required | What the step does |
 | `depends_on` | list of step ids | `[]` | Steps that must finish first |
-| `when` | `{path, operator, expected}` | none | Run the step only if this condition holds |
-| `requirements` | list of [requirements](#requirements) | `[]` | Requirements checked against this step's output |
+| `when` | `{path, operator, expected}` | none | Run only if this holds; otherwise the step is skipped and its requirements are `not_applicable` |
+| `requirements` | list of [requirements](#requirements) | `[]` | Checked against this step's output, right after it |
 | `timeout_seconds` | integer above 0 | none | Time limit for one attempt |
 | `retries` | 0 to 5 | `0` | Attempts after the first |
 
 ### Actions
 
-The action is what a step does. Each step has exactly one.
-
-| `kind` | Use it to | Output |
+| `kind` | Fields | Output |
 | --- | --- | --- |
-| [`extract`](#extract) | Turn an uploaded file into JSON that checks and Agents can read | The file's text and structure |
-| [`agent`](#agent) | Ask an Agent to read evidence and return structured data | The Agent's response |
-| [`code`](#code) | Compute a value in Python | The function's return value |
+| `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/reference/extraction-output/) gives for its format |
+| `agent` | `agent`, `inputs`, `workspace` | The Agent's response, shaped by its Prompt `response_format` |
+| `code` | `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
-#### extract
-
-`extract` runs one of Wyrd's built-in extractors on a `media` input and returns the file's text and structure as JSON. Checks and Agent placeholders read JSON and text, not raw files, so any PDF, Office document, or data file you want to judge goes through `extract` first.
-
-It takes one field, `from`, naming a `media` slot. The extractor is picked by the file's format; you don't choose one.
-
-```yaml
-spec:
-  inputs:
-    policy: {type: media, formats: [pdf]}
-  steps:
-    - id: policy-text
-      action: {kind: extract, from: inputs.policy}
-  requirements:
-    - id: has-text
-      statement: Every page of the policy has text
-      check: {kind: assert, each: "steps.policy-text.output.pages[*].text", operator: not_equals, expected: ""}
-    - id: names-window
-      statement: The first page states the refund window
-      check: {kind: assert, path: "steps.policy-text.output.pages[0].text", operator: contains, expected: "30 days"}
-```
-
-```python
-from wyrd import verify
-
-run.observe.verify("policy-check", policy=verify.File("policy.pdf"))
-```
-
-##### Built-in extractors
-
-Every output has a `format` field naming the extractor that produced it, and every other field is always present: an empty list is `[]`, empty text is `""`, and `null` appears only where the type allows it. There is no `page_count` or `slide_count`; use the list's length.
-
-| Format | Reads | Output |
-| --- | --- | --- |
-| `pdf` | The text layer of each page | `pages` |
-| `docx` | Paragraphs with their style, and tables, in document order | `blocks` |
-| `pptx` | Each slide's title, body paragraphs, tables, and speaker notes | `slides` |
-| `xlsx` | Every non-empty cell of every sheet: value, formula, and error | `sheets` |
-| `csv` | Every row, including the header, as strings | `rows` |
-| `json` | The parsed document | `value` |
-| `text`, `markdown`, `html` | The source text, unchanged | `text` |
-
-###### PDF
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"pdf"` | Always `pdf` |
-| `pages` | list | One entry per page, in document order |
-| `pages[].number` | integer | Page number, starting at 1 |
-| `pages[].text` | string | All text on the page. `""` when the page has no text layer, such as a scan |
-
-```json
-{"format": "pdf", "pages": [{"number": 1, "text": "Refund policy\nRefunds are issued within 30 days."}, {"number": 2, "text": ""}]}
-```
-
-An encrypted PDF fails the step.
-
-###### DOCX
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"docx"` | Always `docx` |
-| `blocks` | list | The document body, one entry per paragraph or table, in document order |
-| `blocks[].kind` | `"paragraph"` or `"table"` | Which of the two shapes below this block has |
-| `blocks[].text` | string | Paragraph only: the paragraph's text |
-| `blocks[].style` | string or `null` | Paragraph only: Word's style ID, such as `Heading1` or `ListParagraph`. `null` for an unstyled paragraph |
-| `blocks[].rows` | list of lists of strings | Table only: each row's cell text, left to right |
-
-```json
-{"format": "docx", "blocks": [{"kind": "paragraph", "text": "Refund policy", "style": "Heading1"}, {"kind": "table", "rows": [["Window", "Days"], ["Standard", "30"]]}]}
-```
-
-Only the document body is read: text inside content controls is included; headers, footers, footnotes, and comments are not.
-
-###### PPTX
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"pptx"` | Always `pptx` |
-| `slides` | list | One entry per slide, in presentation order |
-| `slides[].number` | integer | Slide number, starting at 1 |
-| `slides[].title` | string or `null` | Text of the slide's title placeholder, with its lines joined by `\n`. `null` when the slide has none |
-| `slides[].paragraphs` | list of strings | Every non-empty paragraph in the slide's other text boxes and placeholders, in slide order. Table text is not repeated here |
-| `slides[].tables` | list | Tables on the slide |
-| `slides[].tables[].rows` | list of lists of strings | Each row's cell text, left to right |
-| `slides[].notes` | string | Speaker notes, with paragraphs joined by `\n`. `""` when there are none |
-
-```json
-{"format": "pptx", "slides": [{"number": 1, "title": "Q3 refunds", "paragraphs": ["Refund rate fell to 2%"], "tables": [{"rows": [["Region", "Rate"], ["US", "2%"]]}], "notes": ""}]}
-```
-
-###### XLSX
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"xlsx"` | Always `xlsx` |
-| `sheets` | list | One entry per worksheet, in workbook order |
-| `sheets[].name` | string | The sheet's tab name |
-| `sheets[].cells` | list | Every non-empty cell, row by row, left to right. Empty cells are left out |
-| `sheets[].cells[].address` | string | The cell's address, such as `B2` |
-| `sheets[].cells[].value` | string, number, boolean, or `null` | The cell's value. For a formula, the result Excel last saved; Wyrd never recalculates. Dates are Excel serial numbers. `null` for an error cell |
-| `sheets[].cells[].formula` | string or `null` | The formula, such as `=SUM(B2:B9)`. `null` for a typed value |
-| `sheets[].cells[].error` | string or `null` | The error the cell shows, such as `#DIV/0!`. `null` when there is none |
-
-```json
-{"format": "xlsx", "sheets": [{"name": "Refunds", "cells": [{"address": "A1", "value": "Days", "formula": null, "error": null}, {"address": "B2", "value": 30, "formula": "=15*2", "error": null}]}]}
-```
-
-Because empty cells are left out, `cells[1]` above is `B2`, not `A2`. Look a cell up by `address`.
-
-###### CSV
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"csv"` | Always `csv` |
-| `rows` | list of lists of strings | Every row in file order, including the header row. Every cell is a string, so `0.02` is `"0.02"`. Rows may have different lengths |
-
-```json
-{"format": "csv", "rows": [["region", "rate"], ["US", "0.02"]]}
-```
-
-###### JSON
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"json"` | Always `json` |
-| `value` | any JSON | The parsed document, unchanged |
-
-```json
-{"format": "json", "value": {"refund_days": 30, "regions": ["US", "EU"]}}
-```
-
-###### Text, Markdown, HTML
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `format` | `"text"`, `"markdown"`, or `"html"` | The slot format the file was sent as |
-| `text` | string | The whole file, unchanged. Markdown and HTML are not parsed, so headings and tags are still in the text |
-
-```json
-{"format": "markdown", "text": "# Refund policy\n\nRefunds are issued within 30 days.\n"}
-```
-
-The file must be UTF-8.
-
-###### Tables and merged cells
-
-In DOCX and PPTX tables, a merged cell's text is in its top-left position and every position it covers is `""`, so every row of one table has the same length.
-
-##### Use the output
-
-Read fields with a path, as in the example: `steps.<id>.output.pages[0].text`. Indexes are zero-based, even though PDF `number` and PPTX `number` start at 1. `[*]` works only in an `assert` check's `each`.
-
-To give the whole file to an Agent, pass the output to a placeholder: `inputs: {policy: steps.policy-text.output}`. A citation still points at the original file by slot, using `page` for PDF, `slide` for PPTX, `lines` for text, Markdown, HTML, and CSV, and `json_pointer` into this output for DOCX, XLSX, and JSON. [Extraction output](/reference/extraction-output/) has a citation example for each.
-
-##### What extract does not do
-
-- Read images. There is no OCR and no rendering. `png`, `jpeg`, `gif`, and `webp` can't be extracted; give them to an Agent as a `media` input instead.
-- Read legacy Office files. `doc`, `xls`, and `ppt` are separate formats; convert them to `docx`, `xlsx`, or `pptx`.
-- Open archives. `zip` and `tar_gz` go to a step Agent's `workspace` instead.
-
-A slot that accepts a format `extract` can't read fails `wyrd declare --check` with rule `extract_format`. At run time the step fails, and the requirements that need it are `inconclusive`, when the file doesn't parse as its format, a PDF is encrypted, a text file isn't UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/reference/verification-runtime-limits/)). Each result records the extractor version, `wyrd-extract/1`, so a verdict shows which extractor read the file.
-
-#### agent
-
-`agent` runs an Agent Card and returns its response, shaped by the Agent's Prompt `response_format`. Use it when a later requirement needs a model to pull something out of the evidence, such as the refund limit a policy states:
-
-```yaml
-steps:
-  - id: refund-rules
-    action:
-      kind: agent
-      agent: ./refund-reader.yaml
-      inputs: {policy: steps.policy-text.output, answer: inputs.answer.text}
-requirements:
-  - id: limit-found
-    statement: The reader found a positive refund limit
-    check: {kind: assert, path: steps.refund-rules.output.max_refund, operator: greater_than, expected: 0}
-```
-
-`agent` is a path such as `./refund-reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference. A placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps file paths under `/inputs/`, such as `/inputs/policy.pdf`, to references, for Agents that read files with the `fs` tools.
-
-A step Agent can use these tools: `cards.list`, `cards.get`, `bifrost.list_tables`, `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`, and `code.run`.
-
-#### code
-
-`code` calls a Python function and returns what it returns, as JSON. Use it for logic one operator cannot express:
-
-```yaml
-steps:
-  - id: answer-facts
-    action:
-      kind: code
-      entrypoint: facts
-      inputs: {answer: inputs.answer, rules: steps.refund-rules.output}
-      source:
-        inline: |
-          def facts(answer, rules):
-              return {"within_limit": answer["refund"] <= rules["max_refund"]}
-requirements:
-  - id: refund-within-limit
-    statement: The refund offered is within the policy limit
-    check: {kind: assert, path: steps.answer-facts.output.within_limit, operator: equals, expected: true}
-```
-
-`entrypoint` names the function; it receives `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card. A step returns data for later checks. To return a verdict directly, use a [`code` check](#checks) instead.
+- `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
+- `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to references. Tools are in [Agent tools and authorization](/reference/agent-tools-and-authorization/).
+- `code` calls the function `entrypoint` with `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card.
 
 ## Requirements
 
-A requirement is one claim the evidence must support, plus the check that decides it. Each requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`, and those outcomes become the verdict. Put a requirement on a step when it judges that step's output, so later steps can branch on it; otherwise list it at the top level.
+A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -317,21 +85,17 @@ A requirement is one claim the evidence must support, plus the check that decide
 
 ### Checks
 
-A check is the method that decides one requirement. Use the cheapest one that can decide it: `assert` and `trace` compare values with no model, `code` runs your Python, and `agent` asks a model.
-
 | `kind` | Fields | Decides by |
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs` | A tool-less Agent whose `response_format` is a closed [verdict](#verdicts-and-citations) |
+| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose `response_format` is a closed [verdict](#verdicts-and-citations) |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs` | A Python function that returns a verdict |
-| `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline; see [Monitor drift](/build-and-verify/verify/monitor-drift/) |
-
-`assert` and `trace` return in milliseconds. A step whose `when` condition is false is skipped, and its requirements are `not_applicable`.
+| `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
 ## Comparison operators
 
-`assert`, `trace`, and `when` compare a value with an operator. Write an operator as its name, such as `operator: not_contains`, or, when it takes parameters, as `{kind: <name>, ...}`.
+`assert`, `trace`, and `when` take an operator: its name, such as `operator: not_contains`, or `{kind: <name>, ...}` when it takes parameters.
 
 | Group | Operators |
 | --- | --- |
@@ -365,7 +129,7 @@ check: {kind: assert, path: inputs.refund.amount, operator: {kind: in_range, min
 
 ## References
 
-Every `path`, `from`, `on`, and `inputs` value is a reference.
+Every `path`, `each`, `from`, `on`, and `inputs` value is a reference.
 
 | Reference | Reads |
 | --- | --- |
@@ -380,7 +144,7 @@ Inputs and step outputs take child selectors: `.field`, `[0]`, and `[*]`. `[*]` 
 
 ## Verdicts and citations
 
-An `agent` or `code` check returns:
+An `agent` or `code` check returns a verdict:
 
 ```json
 {
@@ -390,7 +154,7 @@ An `agent` or `code` check returns:
 }
 ```
 
-`outcome` is `passed`, `failed`, `inconclusive`, or `not_applicable`. Each citation names an input `slot` and one `locator`:
+`outcome` is `passed`, `failed`, or `inconclusive`. Each citation names an input `slot` and one `locator`:
 
 | Locator | For |
 | --- | --- |
@@ -400,20 +164,24 @@ An `agent` or `code` check returns:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-The server checks every citation against the evidence. A `passed` verdict without a valid citation is recorded as `inconclusive`.
+A citation names the original slot, never an extract step. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
 
 ## Decide
 
-With `decide: all`, the Verifier passes when every requirement that applies passes. With `decide: {pass_rate: {threshold: 0.8}}`, it passes when at least that share of applicable requirements pass. `threshold` is above 0 and at most 1.
+| Value | Passes when |
+| --- | --- |
+| `all` | Every applicable requirement passes |
+| `{pass_rate: {threshold}}` | At least `threshold` of applicable requirements pass; `threshold` is above 0 and at most 1 |
 
 ## Rejections
 
 | Code | Raised when |
 | --- | --- |
-| `WYRD_REGISTRY_400_INVALID_CARD_SPEC` | A field is unknown, missing, or has the wrong type |
-| `WYRD_SPEC_400_VALIDATION` | A rule fails; `details` holds `rule` and `path` |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | `wyrd declare` refused the Card tree; each problem is one entry in `details.diagnostics` with its own code |
+| `WYRD_REGISTRY_400_INVALID_CARD_SPEC` | The server refused a registered spec whose field is unknown, missing, or has the wrong type |
+| `WYRD_SPEC_400_VALIDATION` | A rule fails; its `rule` and `path` are in `details`, or in a `wyrd declare` diagnostic's `context` |
 
-Common `rule` values:
+Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 
 | `rule` | Cause |
 | --- | --- |

@@ -1,9 +1,8 @@
 import { highlight } from '$lib/mdsvex/highlight.js';
-import verifier from '../../../examples/support-desk-app/service/ticket-complete.yaml?raw';
 
 // The landing page's Declare → Observe → Verify example: one Service, one
-// Verifier, carried through all three steps. The Verifier is the example app's
-// own file; the rest is written for this page and highlighted at build time.
+// Verifier, carried through all three steps. Written for this page, so the
+// site depends on no application source, and highlighted at build time.
 
 const SERVICE = `apiVersion: wyrd/v1
 kind: Service
@@ -15,6 +14,35 @@ spec:
   service_type: agent
   verified_by:
     - verifier: ./ticket-complete.yaml`;
+
+const VERIFIER_CARD = `# A code check: sandboxed Python reads the ticket and names every field the
+# help desk needs that is missing. No model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ticket-complete
+  version: 1.0.0
+  space: support
+spec:
+  description: A support ticket carries the fields the help desk needs.
+  inputs:
+    ticket: {type: json}
+  requirements:
+    - id: ticket-complete
+      statement: The ticket has an answer and an order id
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {ticket: inputs.ticket}
+        source:
+          inline: |
+            def check(ticket):
+                missing = [field for field in ("answer", "order_id") if not ticket.get(field)]
+                return {
+                    "outcome": "failed" if missing else "passed",
+                    "reason": "missing " + ", ".join(missing) if missing else "all fields present",
+                    "citations": [{"slot": "ticket", "locator": {"json_pointer": ""}}],
+                }`;
 
 const OBSERVE = {
   python: {
@@ -65,11 +93,11 @@ const submitted = await run.observe.submit("ticket-complete", { ticket });`
 // The wire shapes are `VerificationResult` and `VerificationExecutionState`
 // in crates/wyrd-spec/src/verification/execution.rs. The ticket is the one
 // above without an order ID; the outcome, reason, and citation are what
-// ticket-complete.yaml's check returns for it. IDs are illustrative.
+// VERIFIER_CARD's check returns for it. IDs are illustrative.
 const VERIFIER = `{"kind": "Verifier", "name": "ticket-complete", "version": "1.0.0", "space": "support", "uid": "019a3c2e-6f12-7c4d-8e31-5a9b0c7d2e64"}`;
 const SUBJECT = `{"kind": "Service", "name": "support-desk", "version": "1.0.0", "space": "default", "uid": "019a3c2e-6f0a-7b22-9d4e-1c8f3a5b6d70"}`;
-const CHECK_SOURCE = verifier.match(/inline: \|\n((?: {12}.*\n?)+)/)?.[1].replace(/^ {12}/gm, '') ?? '';
-if (!CHECK_SOURCE) throw new Error('landing: no inline check source in ticket-complete.yaml');
+const CHECK_SOURCE = VERIFIER_CARD.match(/inline: \|\n((?: {12}.*\n?)+)/)?.[1].replace(/^ {12}/gm, '') ?? '';
+if (!CHECK_SOURCE) throw new Error('landing: no inline check source in the Verifier');
 
 /** The `VerificationResult` JSON for one execution of ticket-complete, at `indent`. */
 function result(executionId: string, indent: string): string {
@@ -122,7 +150,7 @@ export function load() {
   return {
     declare: {
       service: { title: 'support-desk.yaml', html: highlight(SERVICE, 'yaml') },
-      verifier: { title: 'ticket-complete.yaml', html: highlight(verifier.trimEnd(), 'yaml') }
+      verifier: { title: 'ticket-complete.yaml', html: highlight(VERIFIER_CARD, 'yaml') }
     },
     observe: langs.map((lang) => ({ lang, title: OBSERVE[lang].title, html: highlight(OBSERVE[lang].code, lang) })),
     verify: {

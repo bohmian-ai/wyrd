@@ -35,7 +35,8 @@ ORIGIN = "https://docs.bohmian.ai"
 BASE = "/wyrd"
 SITE = f"{ORIGIN}{BASE}"
 
-# The onboarding route, in reading order: the canonical start for agents.
+# The onboarding route, in reading order: the canonical start for agents. Only
+# the steps the sidebar publishes are listed, so a withdrawn step drops out.
 START = [
     ("get-started/setup", "install Wyrd and start a local server you keep running"),
     ("get-started/quickstart", "declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript"),
@@ -138,21 +139,24 @@ def url_for(slug: str) -> str:
 
 
 def render_start() -> list[str]:
-    """The canonical start route, for an agent that reads only the top."""
+    """The canonical start route, for an agent that reads only the top.
+
+    Empty when the sidebar publishes none of its steps.
+    """
     titles = {slug: title for _section, slug, title, _description, _path in sidebar_pages()}
-    lines = [
+    steps = [f"- [{titles[slug]}]({url_for(slug)}): {purpose}." for slug, purpose in START if slug in titles]
+    if not steps:
+        return []
+    return [
         "## Start here",
         "",
         "Set up a local server, then run one verification, in this order. "
         "A connected Wyrd MCP server teaches the same route through "
         '`wyrd.guide {"topic":"start"}`.',
         "",
+        *steps,
+        "",
     ]
-    for slug, purpose in START:
-        lines.append(f"- [{titles[slug]}]({url_for(slug)}): {purpose}.")
-    lines.append(f"- [Error catalog]({url_for('api/errors')}): every stable error code and its remediation.")
-    lines.append("")
-    return lines
 
 
 def render_pages_index() -> list[str]:

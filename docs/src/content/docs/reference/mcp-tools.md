@@ -1,65 +1,61 @@
 ---
 title: MCP tools
-description: Exact Wyrd tool names, permissions, argument and result shapes, refusals, and query limits.
+description: Wyrd MCP tool names, permissions, shapes, and query limits.
 pillar: wyrd
 section: Reference
 order: 3
 status: runnable
 ---
 
-The Wyrd server exposes its MCP tools over HTTP at `/mcp`. `wyrd mcp proxy` relays the same tools to an agent over stdio and adds none of its own. [Connect an agent through MCP](/connect/connect-an-agent-through-mcp/) covers installation and credentials.
+The server serves MCP protocol revision 2026-07-28 over HTTP at `/mcp`; `wyrd mcp proxy` relays the same tools over stdio.
 
-## Discovery and authentication
+## Discovery
 
-Every request is authenticated in the caller's tenant. Use `tools/list` for the current input and output JSON Schemas and effect annotations. Unknown fields in closed argument objects are refused. IDs and versions below are exact discovered values, not names inferred from a prompt.
-
-Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, Operator connection writes, and gateway writes, revocation, resets, and deletions are advertised only to callers with their required write or delete permission. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
-
-The tables below summarize wire shapes. Named shapes such as `ExecuteVerificationRequest` or `OperatorConnectionView` are the JSON Schemas `tools/list` returns for that tool; use them for every nested field, enum, and bound. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
+- `tools/list` returns each tool's current input and output JSON Schemas; named shapes below, such as `VerificationRequest`, are those schemas. Unknown argument fields are refused.
+- Read tools and `wyrd.guide` are always listed. Write, revoke, reset, and delete tools are listed only to callers holding their permission. Listing grants nothing.
+- Credentials and secrets are never returned.
 
 ## Agent frameworks
 
-Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain dots and do not change. Model providers commonly accept only `^[a-zA-Z0-9_-]{1,64}$` as a function-tool name, so each framework below forwards a model-facing alias instead; its own MCP client still calls the dotted Wyrd tool and surfaces Wyrd's refusals as tool errors. These are the configurations Wyrd's framework journeys test.
+Tool names contain dots, which many model providers refuse, so each framework forwards an alias.
 
 | Framework | Tested configuration |
 | --- | --- |
-| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}` forwards aliases such as `mcp_wyrd__wyrd_guide`. |
-| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per discovered tool. |
-| Google ADK | Set `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` (experimental in ADK) to negotiate 2026-07-28, and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to skip ADK's Google Cloud mTLS probe. ADK has no renaming option and declares the dotted names as they are, so override `McpToolset.get_tools` to return shallow copies whose `name` is the alias; ADK still calls each copy's original MCP tool. |
+| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}`; aliases such as `mcp_wyrd__wyrd_guide` |
+| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per tool |
+| Google ADK | `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false`; override `McpToolset.get_tools` to return copies whose `name` is the alias |
 
 ## Investigation guide
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `wyrd.guide` | Read; authenticated | `{topic}` → `{topic, steps, examples}` | Static guidance; reads no tenant data and grants no permission |
+| `wyrd.guide` | Any caller | `{topic}` → `{topic, steps, examples}` | Static workflow guidance |
 
-`topic` is one of `start`, `overview`, `cards`, `verification`, `bifrost_sql`. `start` teaches an unfamiliar coding agent the Declare → Observe → Verify workflow on its own application: the CLI commands and SDK operations it runs from a shell, the docs to read, and the server evidence that shows it is done. The server's initialization `instructions` point new agents to it. Each example contains `tool`, `purpose`, and an `arguments` object. Replace angle-bracket placeholders with discovered identities and adjust example time windows. The guide is a workflow aid; `tools/list` remains the current schema authority.
+`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; replace angle-bracket placeholders with discovered values.
 
 ## Cards and verification
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `cards.list` | Read; `cards:read` | List filters and optional cursor → `{items, next_cursor}` | Discover metadata summaries by kind, name, space, version range, lifecycle status, or metadata filter |
-| `cards.get` | Read; `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card by exact kind, name, version, and space, or by kind and UID; pass exactly one form |
-| `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and latest admitted `last_execution_id` |
-| `verification.get_execution` | Read; `cards:read` | `{execution_id}` → execution status | Inspect state, result, error, and Operator dispatches of one execution |
-| `verification.evidence` | Execute; `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan presigned uploads for evidence files the tenant does not already hold |
-| `verification.execute` | Execute; `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Return the result in the same call and store it; creates no queued execution or Operator dispatch |
-| `verification.enqueue` | Execute; `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Accept the execution without waiting; poll `verification.get_execution`. A just-enqueued execution may read as not found until the queue accepts it |
+| `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
+| `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
+| `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
+| `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
+| `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan uploads for files the tenant lacks |
+| `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
+| `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 
-`cards.list.filter` is a metadata query string, not a JSON object: for example `labels.env = "prod"`, `labels.tier in ["gold","silver"]`, or `labels.deprecated not exists`, combined with `and`, `or`, and `not`. Fields are `labels.<key>`, `annotations.<key>`, and `attributes.<key>`; a query may hold up to 64 predicates. A syntax error returns `WYRD_QUERY_400_INVALID_SYNTAX`. Preserve `next_cursor` unchanged alongside the same filters. A missing version or malformed cursor is invalid; no implicit newest-version or fuzzy selection occurs. Missing and foreign-tenant Cards are indistinguishable. Relationship edges in `outbound_refs` and `inbound_refs` carry exact identities under `ref`.
-
-`verification.execute` refuses a Verifier that judges a scheduled window; drift is judged only by its schedule. Follow the [verification procedure](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) to read persisted results.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. Pass `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `bifrost.list_tables` | Read; `bifrost_table:read` | `{}` → `{tables}` | List tenant-authorized namespace, name, status entries |
-| `bifrost.describe_table` | Read; `bifrost_table:read` | `{namespace, name}` → table description | Read user fields, managed fields, partitioning, sorting, and Bloom columns |
-| `bifrost.query` | Read; scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one complete bounded SELECT over authorized tables |
+| `bifrost.list_tables` | `bifrost_table:read` | `{}` → `{tables}` | List readable tables |
+| `bifrost.describe_table` | `bifrost_table:read` | `{namespace, name}` → table description | Read one table's schema and layout |
+| `bifrost.query` | scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one bounded `SELECT` |
 
-Schema/table object grants restrict the query to the allowed objects. Gateway request/response payload columns also require `gateway_payload:read`. Catalog listing and schema description require `bifrost_table:read`; query grants separately decide which objects can be read. Sensitive metadata on verification or trace columns is descriptive; table query permission governs those columns.
+Gateway request and response payload columns also need `gateway_payload:read`.
 
 ### Query limits
 
@@ -70,60 +66,59 @@ Schema/table object grants restrict the query to the allowed objects. Gateway re
 | `max_bytes` | 4 MiB | 16 MiB |
 | `deadline_ms` | Server policy | 4,294,967,295 ms; minimum 1 |
 
-Use DataFusion SQL: one SELECT, explicit projections, fully qualified discovered names, appropriate time bounds, and LIMIT. Caller identity, tenant, execution path, query class, topology, and plan are server-owned and cannot be supplied as arguments.
-
-`columns` describes the ordered projection; each row is a positional array in that order. Require `terminal.outcome: "success"` before reporting a complete result. Empty rows are absence of matches. Exceeding a row/byte ceiling refuses the result rather than truncating it; errors contain no partial successful rows. See the [Bifrost procedure](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/) for runnable writes and queries.
+Use one DataFusion SQL `SELECT` with fully qualified names and a `LIMIT`. Rows are positional arrays in `columns` order. Trust a result only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
 
 ## Principal credentials
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `principals.list_credentials` | Read; `service_accounts:write` | `{principal_id}` → CredentialListResponse | Read nonsecret metadata including expired/revoked credentials |
-| `principals.revoke_credential` | Write; `service_accounts:write` | `{principal_id, credential_id}` → CredentialRevoked | Prevent further token issuance from that credential |
+| `principals.list_credentials` | `service_accounts:write` | `{principal_id}` → CredentialListResponse | List credentials, including expired and revoked |
+| `principals.revoke_credential` | `service_accounts:write` | `{principal_id, credential_id}` → CredentialRevoked | Stop token issuance from a credential |
 
-A token already minted from a revoked credential lapses within five minutes. The principal, its roles, and other credentials remain. Unknown or foreign-tenant identities are refused; secret material is never disclosed.
+A token already minted from a revoked credential lapses within five minutes.
 
 ## Operator connections
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `operator_connections.list` | Read; `operators:read` | `{}` → `{connections}` | List redacted connection metadata |
-| `operator_connections.get` | Read; `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
-| `operator_connections.create` | Write; `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create provider-tagged Slack, PagerDuty, or HTTP configuration |
-| `operator_connections.update` | Write; `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch configuration, secret, or status; provider/name remain fixed |
-| `operator_connections.disable` | Write; `operators:write` | `{connection_id}` → OperatorConnectionView | Retain the connection in disabled state |
-
-Provider-specific invalid configuration, missing connection IDs, and permission denials are refused. Updates preserve omitted fields. Secrets are encrypted at rest and redacted from every response.
+| `operator_connections.list` | `operators:read` | `{}` → `{connections}` | List connections |
+| `operator_connections.get` | `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
+| `operator_connections.create` | `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create a Slack, PagerDuty, or HTTP connection |
+| `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
+| `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
 
 ## Gateway administration
 
-Gateway tools address resources in the authenticated tenant by exact `name`. They do not invoke a model. Reads require `gateway:read`, replacements/revocation/policy resets require `gateway:write`, and credential/deployment deletion requires `gateway:delete`.
+Gateway tools address resources by exact `name` and never call a model.
 
-| Tool | Effect / permission | Input → output | Purpose |
+| Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `gateway.list_provider_credentials` | Read; `gateway:read` | `{}` → `{items}` of credential views | List redacted sources, states, timestamps |
-| `gateway.list_provider_deployments` | Read; `gateway:read` | `{}` → `{items}` of deployments | List model adapters, credential names, capabilities, weights |
-| `gateway.get_provider_credential` | Read; `gateway:read` | `{name}` → credential view | Read one redacted credential |
-| `gateway.get_provider_deployment` | Read; `gateway:read` | `{name}` → deployment | Read one deployment |
-| `gateway.get_fallback_policy` | Read; `gateway:read` | `{}` → fallback policy | Read effective routing fallback |
-| `gateway.get_governance_policy` | Read; `gateway:read` | `{}` → governance policy | Read limits, budgets, pricing, unknown-cost policy |
-| `gateway.get_capture_policy` | Read; `gateway:read` | `{}` → versioned capture policy | Read payload capture configuration |
-| `gateway.put_provider_credential` | Write; `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate an operator/external binding or write-only managed secret |
-| `gateway.put_provider_deployment` | Write; `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
-| `gateway.apply_provider_deployments` | Write; `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Create or rotate credentials and create or replace deployments in one transaction; secrets are write-only |
-| `gateway.put_fallback_policy` | Write; `gateway:write` | FallbackPolicy → fallback policy | Replace routing fallback |
-| `gateway.put_governance_policy` | Write; `gateway:write` | GovernancePolicy → governance policy | Replace limits, budgets, pricing |
-| `gateway.put_capture_policy` | Write; `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace payload capture configuration |
-| `gateway.revoke_provider_credential` | Write; `gateway:write` | `{name}` → credential view | Terminally revoke; repeated calls retain that state |
-| `gateway.delete_provider_credential` | Delete; `gateway:delete` | `{name}` → `{}` | Delete an unreferenced credential; absence succeeds |
-| `gateway.delete_provider_deployment` | Delete; `gateway:delete` | `{name}` → `{}` | Delete a deployment; absence succeeds |
-| `gateway.delete_fallback_policy` | Reset; `gateway:write` | `{}` → `{}` | Restore default fallback policy |
-| `gateway.delete_governance_policy` | Reset; `gateway:write` | `{}` → `{}` | Restore default governance policy |
+| `gateway.list_provider_credentials` | `gateway:read` | `{}` → `{items}` of credential views | List credentials |
+| `gateway.list_provider_deployments` | `gateway:read` | `{}` → `{items}` of deployments | List deployments |
+| `gateway.get_provider_credential` | `gateway:read` | `{name}` → credential view | Read one credential |
+| `gateway.get_provider_deployment` | `gateway:read` | `{name}` → deployment | Read one deployment |
+| `gateway.get_fallback_policy` | `gateway:read` | `{}` → fallback policy | Read the fallback policy |
+| `gateway.get_governance_policy` | `gateway:read` | `{}` → governance policy | Read limits, budgets, and pricing |
+| `gateway.get_capture_policy` | `gateway:read` | `{}` → versioned capture policy | Read the capture policy |
+| `gateway.put_provider_credential` | `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate a credential |
+| `gateway.put_provider_deployment` | `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
+| `gateway.apply_provider_deployments` | `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Write credentials and deployments in one transaction |
+| `gateway.put_fallback_policy` | `gateway:write` | FallbackPolicy → fallback policy | Replace the fallback policy |
+| `gateway.put_governance_policy` | `gateway:write` | GovernancePolicy → governance policy | Replace the governance policy |
+| `gateway.put_capture_policy` | `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace the capture policy |
+| `gateway.revoke_provider_credential` | `gateway:write` | `{name}` → credential view | Revoke permanently |
+| `gateway.delete_provider_credential` | `gateway:delete` | `{name}` → `{}` | Delete an unreferenced credential; absent succeeds |
+| `gateway.delete_provider_deployment` | `gateway:delete` | `{name}` → `{}` | Delete a deployment; absent succeeds |
+| `gateway.delete_fallback_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
+| `gateway.delete_governance_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
 
-Gateway schemas bound managed secret input and validate provider capabilities and policy values. Never paste a provider secret into an investigation prompt. A managed secret is accepted only for writing and never readable again. Credentials still referenced by deployments cannot be deleted. Wrong names, invalid configurations, and missing scopes return structured Wyrd errors.
+A managed secret is write-only. A credential still referenced by a deployment cannot be deleted.
 
-## Errors and evidence
+## If it fails
 
-A tool can return a JSON-RPC error carrying a Wyrd problem, or an `isError` result with a structured problem body. Read its stable `code`, `status`, and remediation rather than treating transport success as operation success. Bifrost runtime refusals use the structured result form; malformed arguments may fail at the protocol boundary.
+A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem; read its `code` and remediation.
 
-Common query refusals include permission denial, non-SELECT admission, unknown columns/tables, deadline failure, and `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE`. Retry only when the problem's remediation warrants it. A failed or incomplete query supplied no complete evidence. State uncertainty and absence of retained results explicitly.
+| Code | Cause |
+| --- | --- |
+| `WYRD_QUERY_400_INVALID_SYNTAX` | Malformed `cards.list` filter |
+| `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` | The query result is too large to return |

@@ -1,6 +1,6 @@
 ---
 id: SPEC-gateway-capacity
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -472,6 +472,12 @@ percentiles in no-profile and profiled modes.
 
 ## Approval and history
 
+**Revision 5:** the user explicitly approved the [revision-5 amendment](spec-revision-5.md)
+on 2026-10-21. Capture stays best-effort with reason-labelled loss, byte-bounded
+outboxes and `CAPTURE-SATURATED` overhead rows; REQ-016–019/AC-015–019 are part
+of this specification and supersede REQ-005.3's zero-loss rule only for
+shed-at-limit loss on closed-loop overhead rows.
+
 **Revision 4:** the user explicitly approved the [revision-4 amendment](spec-revision-4.md)
 on 2026-10-21. Its scope correction and REQ-012–015/AC-010–014 are part of this
 specification; every unchanged revision-3 obligation remains in force.
@@ -497,6 +503,9 @@ Performance optimization and reservation/refusal policy remain outside scope.
 - 2026-10-21 — User explicitly approved the revision-4 amendment (complete
   startup, engine ownership, portable Monty worker, verified row attribution
   without a transport identity) for TASK-002.
+- 2026-10-21 — User explicitly approved the revision-5 amendment (capture loss
+  under saturation: reasons, byte bounds, saturation verdict, multi-lane
+  capture with a 64-client zero-shed target on the reference host).
 
 ## Authorities
 

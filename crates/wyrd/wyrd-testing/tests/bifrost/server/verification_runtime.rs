@@ -3857,6 +3857,382 @@ async fn silent_listener_stall_falls_back_and_recovers() -> Result<(), ServerJou
     Ok(())
 }
 
+/// What a shared cache listener told its cache, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Heard {
+    /// `reset(live)`: the cache was cleared and now serves only when `live`.
+    Reset(bool),
+    /// `notify(payload)`.
+    Notified(String),
+}
+
+/// One shared cache listener running under test, recording each callback
+/// in place of a cache.
+struct Watched {
+    /// Every callback so far.
+    heard: Arc<std::sync::Mutex<Vec<Heard>>>,
+    /// Cancels the listener.
+    shutdown: CancellationToken,
+    /// The listener's worker.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Watched {
+    /// Spawn `listener`'s watch, recording its callbacks.
+    fn start(listener: wyrd_sql::NotificationListener) -> Self {
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let (resets, notes, token) = (Arc::clone(&heard), Arc::clone(&heard), shutdown.clone());
+        let task = tokio::spawn(async move {
+            listener
+                .watch(
+                    token,
+                    |live| Self::push(&resets, Heard::Reset(live)),
+                    |payload| Self::push(&notes, Heard::Notified(payload.to_owned())),
+                )
+                .await;
+        });
+        Self {
+            heard,
+            shutdown,
+            task,
+        }
+    }
+
+    /// Append one callback to `heard`.
+    fn push(heard: &std::sync::Mutex<Vec<Heard>>, event: Heard) {
+        heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    /// Every callback so far.
+    fn heard(&self) -> Vec<Heard> {
+        self.heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the last reset switched the cache on.
+    fn live(&self) -> bool {
+        self.heard()
+            .iter()
+            .rev()
+            .find_map(|heard| match heard {
+                Heard::Reset(live) => Some(*live),
+                Heard::Notified(_) => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// The resets heard since the first `skip` callbacks, in order.
+    fn resets_since(&self, skip: usize) -> Vec<bool> {
+        self.heard()
+            .into_iter()
+            .skip(skip)
+            .filter_map(|heard| match heard {
+                Heard::Reset(live) => Some(live),
+                Heard::Notified(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether `payload` was delivered.
+    fn notified(&self, payload: &str) -> bool {
+        self.heard().contains(&Heard::Notified(payload.to_owned()))
+    }
+
+    /// Cancel the listener and return how long it took to finish, failing
+    /// unless it ends within the production shutdown drain with its cache
+    /// switched off.
+    ///
+    /// # Errors
+    /// Returns a join error, or a description of a late or live finish.
+    async fn stop(self) -> Result<Duration, ServerJourneyError> {
+        let started = tokio::time::Instant::now();
+        self.shutdown.cancel();
+        tokio::time::timeout(SHUTDOWN_DRAIN, self.task)
+            .await
+            .map_err(|_| "the cancelled listener outlived the shutdown drain")??;
+        let elapsed = started.elapsed();
+        if self
+            .heard
+            .lock()
+            .map(|heard| heard.last().cloned())
+            .ok()
+            .flatten()
+            != Some(Heard::Reset(false))
+        {
+            return Err("the cancelled listener left its cache serving".into());
+        }
+        Ok(elapsed)
+    }
+}
+
+/// The production shutdown drain every engine worker must finish within.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(35);
+
+/// Wait until `ready` holds, polling, or fail naming `what` after [`WAIT`].
+///
+/// # Errors
+/// Returns a description naming `what` when it never holds.
+async fn until(what: &str, ready: impl Fn() -> bool) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !ready() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Send `payload` on `channel` over a connection that bypasses the proxy.
+///
+/// # Errors
+/// Returns the statement error.
+async fn notify_channel(
+    pool: &sqlx::PgPool,
+    channel: &str,
+    payload: &str,
+) -> Result<(), ServerJourneyError> {
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(channel)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A fixture database, a stall proxy in front of it, and a Wyrd handle
+/// whose pools dial the proxy, with the process telemetry installed so
+/// `WYRD_LOG` traces the listener.
+///
+/// # Errors
+/// Returns a telemetry, fixture, proxy, or connection error.
+async fn proxied_postgres() -> Result<
+    (
+        wyrd_dev_fixtures::pg::PgFixture,
+        ListenerStallProxy,
+        wyrd_sql::WyrdPostgres,
+    ),
+    ServerJourneyError,
+> {
+    wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
+    let fixture = wyrd_dev_fixtures::pg::PgFixture::start().await?;
+    let dsns = fixture.runtime_dsns()?;
+    let proxy = ListenerStallProxy::start(&dsns).await?;
+    let postgres = wyrd_sql::WyrdPostgres::connect_from_dsns(&proxy.route(&dsns)?).await?;
+    Ok((fixture, proxy, postgres))
+}
+
+/// A detected listener loss switches the cache off before any replacement
+/// subscribes, and a failed start keeps it off (REQ-013, AC-011).
+///
+/// The shared listener's pool dials Postgres through a stall proxy. Started
+/// while its channel is stalled, it never reports a live cache and retries
+/// at most once per reconnect delay, releasing each stalled attempt. Once
+/// the channel is restored it subscribes and delivers a notification. Its
+/// backend is then terminated while every new subscription is held
+/// pending: the cache is switched off before the replacement can subscribe
+/// and stays off while it waits. After the path is restored the replacement
+/// switches the cache on, from empty, and delivers the next notification.
+///
+/// # Errors
+/// Returns fixture, proxy, or statement errors, or a description of the
+/// first live cache during recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn listener_loss_disables_cache_before_reconnect() -> Result<(), ServerJourneyError> {
+    const CHANNEL: &str = "wyrd_listener_loss";
+    let (fixture, proxy, postgres) = proxied_postgres().await?;
+
+    proxy.stall(CHANNEL);
+    let started = tokio::time::Instant::now();
+    let watched = Watched::start(postgres.listener(CHANNEL));
+    until("two stalled subscription attempts", || {
+        proxy.subscriptions(CHANNEL) >= 2
+    })
+    .await?;
+    let attempts = proxy.subscriptions(CHANNEL);
+    let allowed = started.elapsed().as_secs() / wyrd_sql::listener::RECONNECT_DELAY.as_secs() + 1;
+    if u64::try_from(attempts)? > allowed {
+        return Err(format!("{attempts} subscription attempts spun past {allowed}").into());
+    }
+    if watched.resets_since(0).contains(&true) {
+        return Err("a stalled start switched the cache on".into());
+    }
+    if proxy.stalled_open(CHANNEL) > 1 {
+        return Err("stalled subscription attempts were retained".into());
+    }
+
+    proxy.restore(CHANNEL);
+    until("a live subscription", || {
+        watched.live() && proxy.listening(CHANNEL) == 1
+    })
+    .await?;
+    notify_channel(fixture.app_pool(), CHANNEL, "one").await?;
+    until("the first notification", || watched.notified("one")).await?;
+
+    let before = watched.heard().len();
+    let subscribed = proxy.subscriptions(CHANNEL);
+    expect_eq("stalled live subscriptions", &proxy.stall(CHANNEL), &1)?;
+    let superuser = fixture.superuser_pool()?;
+    // Selected first: the planner may evaluate a termination in the same
+    // WHERE clause before its filters, ending unrelated sessions.
+    let listeners: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND query = $1",
+    )
+    .bind(format!("LISTEN \"{CHANNEL}\""))
+    .fetch_all(&superuser)
+    .await?;
+    expect_eq("listener backends", &listeners.len(), &1)?;
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM unnest($1::int[]) AS pid")
+        .bind(&listeners)
+        .execute(&superuser)
+        .await?;
+    until("a pending replacement subscription", || {
+        proxy.subscriptions(CHANNEL) > subscribed && proxy.stalled_open(CHANNEL) >= 1
+    })
+    .await?;
+    let pending = watched.resets_since(before);
+    if pending.first() != Some(&false) || pending.contains(&true) {
+        return Err(format!("the cache while its replacement is pending: {pending:?}").into());
+    }
+
+    proxy.restore(CHANNEL);
+    until("a recovered subscription", || watched.live()).await?;
+    let recovered = watched.resets_since(before);
+    if recovered.first() != Some(&false) || recovered.iter().filter(|live| **live).count() != 1 {
+        return Err(format!("recovery after loss: {recovered:?}").into());
+    }
+    notify_channel(fixture.app_pool(), CHANNEL, "two").await?;
+    until("the recovered notification", || watched.notified("two")).await?;
+    let stopped = watched.stop().await?;
+    tracing::info!(?stopped, "loss-ordering listener stopped");
+    Ok(())
+}
+
+/// Stalled listeners release their connections while still stalled, every
+/// pending stage ends within the shutdown drain, and one stalled listener
+/// never stops another (REQ-013, AC-011).
+///
+/// Two shared listeners on different channels share one proxied pool, with
+/// the heartbeat shortened. Three times the first channel stalls: its
+/// listener switches its cache off, closes its stalled connection while the
+/// stall persists, and resubscribes once restored, while the second keeps
+/// delivering notifications and the pool grows no retained connections.
+/// Listeners are then cancelled while receiving on a stalled path, while a
+/// liveness probe is unanswered, while a subscription is unanswered, and
+/// while waiting to retry; each finishes within the production drain with
+/// its cache off and no stalled connection left open.
+///
+/// # Errors
+/// Returns fixture, proxy, or statement errors, or a description of the
+/// first retained connection, late cancellation, or coupled failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn listener_shutdown_releases_stalled_connections() -> Result<(), ServerJourneyError> {
+    const STALLED: &str = "wyrd_listener_stalled";
+    const HEALTHY: &str = "wyrd_listener_healthy";
+    let (fixture, proxy, postgres) = proxied_postgres().await?;
+    let quick = |channel: &str, timeout: Duration| {
+        postgres
+            .listener(channel)
+            .with_heartbeat_for_test(Duration::from_secs(1), timeout)
+    };
+    let mut stalled = Watched::start(quick(STALLED, Duration::from_secs(1)));
+    let healthy = Watched::start(quick(HEALTHY, Duration::from_secs(1)));
+    until("both listeners live", || stalled.live() && healthy.live()).await?;
+    let baseline = postgres.app_pool().size();
+
+    for round in 0..3 {
+        if proxy.stall(STALLED) == 0 {
+            return Err("no live subscription was stalled".into());
+        }
+        until("stall detection", || !stalled.live()).await?;
+        until("the stalled connection's release", || {
+            proxy.stalled_open(STALLED) == 0
+        })
+        .await?;
+        let payload = format!("round-{round}");
+        notify_channel(fixture.app_pool(), HEALTHY, &payload).await?;
+        until("the healthy listener's notification", || {
+            healthy.notified(&payload)
+        })
+        .await?;
+        proxy.restore(STALLED);
+        until("resubscription", || {
+            stalled.live() && proxy.listening(STALLED) == 1
+        })
+        .await?;
+    }
+    let size = postgres.app_pool().size();
+    if size > baseline {
+        return Err(format!("the pool grew from {baseline} to {size} connections").into());
+    }
+
+    proxy.stall(STALLED);
+    let receive = stalled.stop().await?;
+    until("release after receive", || proxy.stalled_open(STALLED) == 0).await?;
+
+    proxy.restore(STALLED);
+    stalled = Watched::start(quick(STALLED, wyrd_sql::listener::PROBE_TIMEOUT));
+    until("a live listener", || {
+        stalled.live() && proxy.listening(STALLED) == 1
+    })
+    .await?;
+    let discarded = proxy.discarded(STALLED);
+    proxy.stall(STALLED);
+    until("an unanswered probe", || {
+        proxy.discarded(STALLED) > discarded
+    })
+    .await?;
+    let probe = stalled.stop().await?;
+    until("release after a probe", || proxy.stalled_open(STALLED) == 0).await?;
+
+    let attempts = proxy.subscriptions(STALLED);
+    stalled = Watched::start(quick(STALLED, wyrd_sql::listener::PROBE_TIMEOUT));
+    until("an unanswered subscription", || {
+        proxy.subscriptions(STALLED) > attempts && proxy.stalled_open(STALLED) == 1
+    })
+    .await?;
+    let subscription = stalled.stop().await?;
+    until("release after a subscription", || {
+        proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+
+    let attempts = proxy.subscriptions(STALLED);
+    stalled = Watched::start(quick(STALLED, Duration::from_millis(200)));
+    until("a released attempt awaiting retry", || {
+        proxy.subscriptions(STALLED) > attempts && proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+    let retry = stalled.stop().await?;
+    tracing::info!(
+        ?receive,
+        ?probe,
+        ?subscription,
+        ?retry,
+        "stalled listeners cancelled"
+    );
+
+    notify_channel(fixture.app_pool(), HEALTHY, "after").await?;
+    until("the healthy listener after every stall", || {
+        healthy.notified("after")
+    })
+    .await?;
+    healthy.stop().await?;
+    until("no stalled connection left open", || {
+        proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+    Ok(())
+}
+
 /// Shared shutdown settles accepted producer work, reaps its workers, and
 /// commits acknowledgements that arrive while it drains (AC-003/011/012).
 ///

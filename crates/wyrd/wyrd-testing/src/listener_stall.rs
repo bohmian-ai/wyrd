@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -55,6 +55,8 @@ struct Link {
     stalled: AtomicBool,
     /// Cleared when the client closes its side of the connection.
     client_open: AtomicBool,
+    /// Client bytes discarded while stalled, such as an unanswered probe.
+    discarded: AtomicUsize,
 }
 
 impl Link {
@@ -216,6 +218,19 @@ impl ListenerStallProxy {
         self.count(channel, true)
     }
 
+    /// Client bytes discarded so far by stalled connections subscribed to
+    /// `channel`; growth means the client sent a statement, such as a
+    /// liveness probe, that will never be answered.
+    #[must_use]
+    pub fn discarded(&self, channel: &str) -> usize {
+        self.shared
+            .links()
+            .iter()
+            .filter(|link| link.channels().contains(channel))
+            .map(|link| link.discarded.load(Ordering::SeqCst))
+            .sum()
+    }
+
     /// Every connection that ever subscribed to `channel`, open or closed.
     #[must_use]
     pub fn subscriptions(&self, channel: &str) -> usize {
@@ -285,9 +300,9 @@ impl ListenerStallProxy {
             scan.extend_from_slice(&chunk[..read]);
             shared.observe(link, &scan);
             scan.drain(..scan.len().saturating_sub(SCAN_TAIL));
-            if !link.stalled.load(Ordering::SeqCst)
-                && server.write_all(&chunk[..read]).await.is_err()
-            {
+            if link.stalled.load(Ordering::SeqCst) {
+                link.discarded.fetch_add(read, Ordering::SeqCst);
+            } else if server.write_all(&chunk[..read]).await.is_err() {
                 break;
             }
         }

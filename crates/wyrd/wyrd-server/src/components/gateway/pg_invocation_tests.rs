@@ -4753,7 +4753,10 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         "direction",
         "operation",
         "outcome",
+        "phase",
+        "point",
         "result",
+        "stream",
     ];
     let tenant_text = tenant.to_string();
     let call_text = answered.call_id.as_uuid().to_string();

@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: ready
 spec: SPEC-gateway-capacity
-spec_revision: 2
+spec_revision: 5
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, INV-001, INV-002, INV-003, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
 depends_on: []
 ---

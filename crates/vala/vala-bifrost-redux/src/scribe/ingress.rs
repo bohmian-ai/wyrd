@@ -582,8 +582,24 @@ impl ScribeImpl {
         };
         let preprocess = profile.preprocess.timer();
         let mut prepared = self.preprocess(admitted).await?;
-        self.charge_prepared(&mut prepared)?;
+        let duplicate_rows = self.shards.committed_duplicate_rows(&prepared);
+        if duplicate_rows.is_none() {
+            self.charge_prepared(&mut prepared)?;
+        }
         preprocess.done();
+        if let Some(rows) = duplicate_rows {
+            // An honest retry of a fenced, visible batch: answer it now. The
+            // append and its reservations drop here, and nothing is rewritten.
+            drop(prepared);
+            metrics::histogram!("bifrost_scribe_ack_seconds")
+                .record(append_started.elapsed().as_secs_f64());
+            return Ok(FrameAdmission {
+                batch_id: frame.batch_id,
+                rows_accepted: rows,
+                receipt_micros,
+                first_commit: false,
+            });
+        }
         self.shards
             .try_send(prepared)
             .inspect_err(|_| super::record_scribe_rejection("queue"))?;

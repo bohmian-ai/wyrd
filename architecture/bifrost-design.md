@@ -493,6 +493,16 @@ durable with one sync over every segment the cycle touched before it records
 the batch fences. No request is acknowledged before that sync and its fence
 commit.
 
+An honest retry of a batch that is already fenced and visible is the one
+exception: its data was synced by the earlier attempt, so re-queueing it would
+only make it wait behind fresh writes' syncs before the fence suppressed it.
+After preprocessing, Scribe compares the request with a bounded pod-local index
+of batches its shards fenced and made visible. When the tenant, batch id,
+logical table, logical slice-set digest, and slice count all match, the request
+is acknowledged at once with no first commit and nothing is rewritten. A miss,
+an evicted entry, or any mismatch takes the shard path, where the durable fence
+remains the only authority for first commits and identity contradictions.
+
 Each write request carries one profile in the Oracle query-profile pattern,
 emitted once when the request settles as
 `scribe_write_profile_nanoseconds_total{event}` and

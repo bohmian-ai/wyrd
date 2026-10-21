@@ -2548,7 +2548,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{AppState, LimitsConfig};
+    use super::AppState;
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_storage::{LocalSigner, StorageHandle};
@@ -2704,27 +2704,6 @@ mod tests {
             state.production_validate().is_ok(),
             "a process that serves no public surface is not refused for a missing verifier"
         );
-    }
-
-    /// `with_limits` replaces every request limit on the state it returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the test state cannot be built or a supplied limit is not
-    /// reflected on the returned state.
-    #[tokio::test]
-    async fn with_limits_updates_all_fields() {
-        let state = test_state().await;
-        let limits = LimitsConfig {
-            body_bytes: 2048,
-            audio_upload_bytes: 4096,
-            timeout: std::time::Duration::from_secs(1),
-            concurrency: 10,
-        };
-        let state = state.with_owners_for_test(|owners| owners.settings.limits = limits);
-        assert_eq!(state.settings.limits.body_bytes, 2048);
-        assert_eq!(state.settings.limits.audio_upload_bytes, 4096);
-        assert_eq!(state.settings.limits.concurrency, 10);
     }
 
     async fn test_state() -> AppState {

@@ -410,3 +410,48 @@ async fn sandbox_bounds_workers_and_waiters() {
         }
     }
 }
+
+/// Shutdown reaps every worker by its deadline and closes admission, and
+/// never reports a checkout still running as settled.
+///
+/// A spinning operation holds the only worker when the first shutdown's
+/// short deadline passes, so that shutdown reports `false`; the spin still
+/// ends as a terminal failure rather than hanging. Repeating shutdown is safe
+/// and settles. A sandbox whose operations all finished settles at once, and
+/// either sandbox then refuses new work as busy.
+///
+/// # Panics
+/// Panics when a busy checkout is reported settled, shutdown does not
+/// settle once idle, or a closed sandbox admits work.
+#[tokio::test]
+async fn sandbox_shutdown_settles_checkouts_and_reaps_workers() {
+    let busy = start(HostedLimits {
+        monty_max_workers: 1,
+        code_timeout: Duration::from_secs(2),
+        ..HostedLimits::default()
+    })
+    .await;
+    let spin = "def f():\n    while True:\n        pass";
+    // `join!` polls the spin first, and its admission is taken before its
+    // first await, so shutdown always finds the checkout live.
+    let (spun, settled) = tokio::join!(
+        run(&busy, spin, "f", json!({})),
+        busy.shutdown(Instant::now() + Duration::from_millis(200)),
+    );
+    assert!(!settled, "a live checkout is never reported settled");
+    terminal(spun);
+    assert!(busy.shutdown(far()).await, "a repeated shutdown settles");
+
+    let idle = start(HostedLimits::default()).await;
+    let answered = run(&idle, "def f():\n    return 1", "f", json!({}))
+        .await
+        .expect("the operation answers");
+    assert_eq!(answered.value, json!(1));
+    assert!(idle.shutdown(far()).await, "an idle sandbox settles");
+    for closed in [&busy, &idle] {
+        match run(closed, "def f():\n    return 1", "f", json!({})).await {
+            Err(BlockError::Busy { .. }) => {}
+            other => panic!("a closed sandbox refuses work as busy, got {other:?}"),
+        }
+    }
+}

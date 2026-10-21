@@ -15,7 +15,7 @@
 //! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
 //! columns to built-ins and proves each is refused before any ACK.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,16 +46,18 @@ use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
+use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
+use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::card::verifier::Check;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, VerificationResultId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -68,7 +70,7 @@ use wyrd_spec::vala::managed_columns::{
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    InputDeclaration, RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
@@ -3310,5 +3312,586 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
         return Err(format!("expected A/SYSTEM with chain [{b_id}], read {row:?}").into());
     }
     server.shutdown().await?;
+    Ok(())
+}
+
+/// Request body ceiling the shared-startup journey injects, well under the
+/// production default so an ordinary body proves the injected value governs.
+const STARTUP_BODY_BYTES: usize = 16 * 1024;
+
+/// Poll `execution` until the runtime settles it as completed or errored.
+///
+/// # Errors
+/// Returns a fixture error, or a description when the execution is not
+/// settled within [`WAIT`].
+async fn settled_execution(
+    seed: &VerificationFixture,
+    execution: ExecutionId,
+) -> Result<ExecutionRow, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let row = seed.execution(execution).await?;
+        if matches!(row.status.as_str(), "completed" | "errored") {
+            return Ok(row);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the execution was never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Production and harness servers start the same complete graph from the
+/// same configuration and injected inputs (AC-010/011, INV-001/003).
+///
+/// A server whose hosted blocks must prewarm a worker that does not exist
+/// fails startup after its Bifrost roles were acquired; the next server
+/// opens the same durable data root, so the failed start released it. That server is composed with
+/// an injected body ceiling and the queued runtime: its state carries the
+/// injected limit and development profile, a body over the ceiling is
+/// refused at a buffered public route, and an execution submitted to the queue is
+/// completed by the runtime startup returned. A last server over the missing
+/// worker with no prewarm starts lazily, and without the queued runtime its
+/// runner never comes up.
+///
+/// # Errors
+/// Returns server, seeding, or request errors, or a description of the
+/// first startup, limit, or runtime expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn shared_startup_uses_complete_injected_engines() -> Result<(), ServerJourneyError> {
+    let scratch = tempfile::tempdir()?;
+    let volume = scratch.path().join("volume");
+    std::fs::create_dir_all(&volume)?;
+    let missing = scratch.path().join("no-such-worker");
+    let builder = || WyrdTestServer::builder().with_durable_bifrost_data_root(volume.clone());
+
+    let refused = Box::pin(
+        builder()
+            .with_verification_worker_for_test(missing.clone())
+            .with_verification_limits_for_test(HostedLimits {
+                monty_min_workers: 1,
+                ..HostedLimits::default()
+            })
+            .start_bound(),
+    )
+    .await;
+    match refused {
+        Ok(server) => {
+            server.shutdown().await?;
+            return Err("a prewarmed missing worker must fail startup".into());
+        }
+        Err(error)
+            if error
+                .to_string()
+                .contains("hosted Verifier blocks could not start") => {}
+        Err(error) => return Err(format!("startup failed for another reason: {error}").into()),
+    }
+
+    let server = Box::pin(
+        builder()
+            .with_limits_for_test(LimitsConfig {
+                body_bytes: STARTUP_BODY_BYTES,
+                ..LimitsConfig::default()
+            })
+            .with_verification_runtime_for_test()
+            .start_bound(),
+    )
+    .await?;
+    let state = server.state();
+    if state.settings.limits.body_bytes != STARTUP_BODY_BYTES
+        || state.settings.deployment_profile.is_production()
+    {
+        return Err(format!("the injected settings were not kept: {:?}", state.settings).into());
+    }
+    let caller = server.bootstrap_service("startup-caller", &[]).await?;
+    let token = server
+        .exchange_api_key(caller.api_key().ok_or("the caller carries an API key")?)
+        .await?;
+    let oversized = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/cards/upload/init",
+            server.base_url().ok_or("the server is bound")?
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(vec![b' '; 2 * STARTUP_BODY_BYTES])
+        .send()
+        .await?;
+    if oversized.status() != reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        return Err(format!("an oversized body answered {}", oversized.status()).into());
+    }
+
+    let seed =
+        VerificationFixture::provision(state.postgres.wyrd(), server.data_tenant_id()).await?;
+    let (subject, _) = seed.service("startup-subject").await?;
+    let verifier = assert_verifier(&seed, "startup-assert").await?;
+    let execution = seed
+        .submit(
+            &verifier,
+            &subject,
+            BTreeMap::from([(
+                SlotName::new("x")?,
+                InputDeclaration::Json { value: json!(true) },
+            )]),
+        )
+        .await?;
+    let row = settled_execution(&seed, execution).await?;
+    if row.status != "completed" || !state.verification.health.is_up(RuntimeCapability::Runner) {
+        return Err(format!("the started runtime did not complete the run: {row:?}").into());
+    }
+    server.shutdown().await?;
+
+    // A fresh fixture database cannot replay the previous server's WAL, so
+    // the lazy server mounts no shared data root.
+    let lazy = Box::pin(
+        WyrdTestServer::builder()
+            .with_verification_worker_for_test(missing)
+            .start_bound(),
+    )
+    .await?;
+    let runner_up = lazy
+        .state()
+        .verification
+        .health
+        .is_up(RuntimeCapability::Runner);
+    lazy.shutdown().await?;
+    if runner_up {
+        return Err("a server without the queued runtime reports its runner up".into());
+    }
+    Ok(())
+}
+
+/// One bound server whose gateway reaches a recording mock upstream, and
+/// the administration and invocation requests the refresh journey sends.
+struct RefreshJourney {
+    /// The bound server under test.
+    server: WyrdTestServer,
+    /// Mock upstream answering every request with one completion.
+    upstream: wiremock::MockServer,
+    /// Plain HTTP client standing in for the SDK transport.
+    http: reqwest::Client,
+    /// The server's base URL.
+    base: String,
+}
+
+impl RefreshJourney {
+    /// Start a bound server whose built-in adapters target a fresh mock
+    /// upstream answering every request with one completion.
+    ///
+    /// # Errors
+    /// Returns a mock, URL, or server startup error.
+    async fn start() -> Result<Self, ServerJourneyError> {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()),
+            )
+            .mount(&upstream)
+            .await;
+        let root = url::Url::parse(&upstream.uri())?;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_gateway_provider_root_for_test(root)
+                .start_bound(),
+        )
+        .await?;
+        let base = server.base_url().ok_or("the server is bound")?.to_owned();
+        Ok(Self {
+            server,
+            upstream,
+            http: reqwest::Client::new(),
+            base,
+        })
+    }
+
+    /// Access token of a new administrator named `name` in `tenant`, or in
+    /// the fixture tenant when `tenant` is `None`.
+    ///
+    /// # Errors
+    /// Returns a bootstrap or exchange error.
+    async fn admin(
+        &self,
+        tenant: Option<DataTenantId>,
+        name: &str,
+    ) -> Result<String, ServerJourneyError> {
+        let admin = match tenant {
+            Some(tenant) => {
+                self.server
+                    .bootstrap_service_in_tenant(tenant, name, &["admin"])
+                    .await?
+            }
+            None => self.server.bootstrap_service(name, &["admin"]).await?,
+        };
+        Ok(self
+            .server
+            .exchange_api_key(admin.api_key().ok_or("the admin carries an API key")?)
+            .await?)
+    }
+
+    /// Store `admin`'s tenant deployment `acme`, serving any model from the
+    /// mock upstream under `prefix`, through the public administration route.
+    ///
+    /// # Errors
+    /// Returns a request error or a description of a refused write.
+    async fn deploy(&self, admin: &str, prefix: &str) -> Result<(), ServerJourneyError> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/v1/admin/gateway/provider-deployments/acme",
+                self.base
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {admin}"))
+            .json(&json!({
+                "name": "acme",
+                "adapter": {"openai_compatible": {
+                    "base_url": format!("{}/{prefix}/v1", self.upstream.uri())
+                }},
+                "auth": "none",
+                "capabilities": ["chat_completions"],
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "deploying {prefix}: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Call `acme/m` as `caller` and return the upstream path the call
+    /// reached, or `None` when the gateway refused it before dispatch.
+    ///
+    /// # Errors
+    /// Returns a request or recording error.
+    async fn call(&self, caller: &str) -> Result<Option<String>, ServerJourneyError> {
+        let before = self.upstream_paths().await?.len();
+        let response = self
+            .http
+            .post(format!("{}/v1/chat/completions", self.base))
+            .bearer_auth(caller)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await?;
+        let answered = response.status().is_success();
+        response.bytes().await?;
+        let mut paths = self.upstream_paths().await?;
+        if !answered {
+            return if paths.len() == before {
+                Ok(None)
+            } else {
+                Err("a refused call reached the upstream".into())
+            };
+        }
+        Ok(paths.pop().filter(|_| paths.len() == before))
+    }
+
+    /// Every path the mock upstream received, oldest first.
+    ///
+    /// # Errors
+    /// Returns a description when request recording is off.
+    async fn upstream_paths(&self) -> Result<Vec<String>, ServerJourneyError> {
+        Ok(self
+            .upstream
+            .received_requests()
+            .await
+            .ok_or("request recording is on")?
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect())
+    }
+
+    /// Number of this server's Postgres sessions waiting on `LISTEN`; when
+    /// `terminate` is set, each is terminated as a lost listener connection.
+    ///
+    /// # Errors
+    /// Returns a pool or statement error.
+    async fn listeners(&self, terminate: bool) -> Result<i64, ServerJourneyError> {
+        let superuser = self.server.pg_fixture().superuser_pool()?;
+        let sql = if terminate {
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid() \
+             AND pg_terminate_backend(pid)"
+        } else {
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid()"
+        };
+        Ok(sqlx::query_scalar(sql).fetch_one(&superuser).await?)
+    }
+}
+
+/// Engine-owned refresh keeps every tenant's gateway changes current
+/// through listener loss, without one tenant seeing another's snapshot
+/// (REQ-005/013, INV-001/003, AC-010/011).
+///
+/// Tenant A's administrator stores deployment `acme` and calls it, then
+/// moves it twice: once while the server's change listeners are connected,
+/// and once right after every listener session is terminated. Each call
+/// reaches the newest upstream, so a lost listener leaves no stale snapshot.
+/// Once the listeners reconnect a further move is still seen. Tenant B
+/// cannot call A's deployment, and B's own `acme` reaches only B's upstream
+/// while A keeps its own.
+///
+/// # Errors
+/// Returns server, request, or Postgres errors, or a description of the
+/// first stale, leaked, or missing route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn engine_owned_refresh_preserves_tenant_changes() -> Result<(), ServerJourneyError> {
+    let journey = RefreshJourney::start().await?;
+    let a = journey.admin(None, "refresh-a").await?;
+    let other = journey.server.seed_tenant("refresh-other").await?;
+    let b = journey.admin(Some(other), "refresh-b").await?;
+    let reaches = |prefix: &str| Some(format!("/{prefix}/v1/chat/completions"));
+
+    journey.deploy(&a, "one").await?;
+    expect_eq("A's first route", &journey.call(&a).await?, &reaches("one"))?;
+    expect_eq(
+        "B before its own route",
+        &journey.call(&b).await?,
+        &None::<String>,
+    )?;
+    journey.deploy(&a, "two").await?;
+    expect_eq("A's moved route", &journey.call(&a).await?, &reaches("two"))?;
+
+    if journey.listeners(true).await? == 0 {
+        return Err("startup composed no engine-owned change listener".into());
+    }
+    journey.deploy(&a, "three").await?;
+    expect_eq(
+        "A's route after listener loss",
+        &journey.call(&a).await?,
+        &reaches("three"),
+    )?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.listeners(false).await? == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the change listeners never reconnected".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    journey.deploy(&a, "four").await?;
+    expect_eq(
+        "A's route after reconnect",
+        &journey.call(&a).await?,
+        &reaches("four"),
+    )?;
+
+    journey.deploy(&b, "bee").await?;
+    expect_eq("B's own route", &journey.call(&b).await?, &reaches("bee"))?;
+    expect_eq(
+        "A beside B's route",
+        &journey.call(&a).await?,
+        &reaches("four"),
+    )?;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// Shared shutdown settles accepted producer work, reaps its workers, and
+/// commits acknowledgements that arrive while it drains (AC-003/011/012).
+///
+/// A bound server with the queued runtime holds one gateway call at its slow
+/// upstream and accepts one public enqueue whose Scribe acknowledgement is
+/// still outstanding, then shuts down through the production supervisor.
+/// Drain cancels the held call, which answers its caller as unavailable and
+/// is still settled: a server restarted over the same Postgres, storage, and
+/// Bifrost data root reads exactly one cancelled capture and the accepted
+/// execution. A second
+/// server whose drain budget is already spent, shut down with a call still
+/// held, reports the expired drain instead of a clean one.
+///
+/// # Errors
+/// Returns server, seeding, request, or query errors, or a description of
+/// the first lost, duplicated, or falsely settled item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
+-> Result<(), ServerJourneyError> {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&upstream)
+        .await;
+    let root = url::Url::parse(&upstream.uri())?;
+    let scratch = tempfile::tempdir()?;
+    let builder = || {
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root.clone())
+            .with_durable_bifrost_data_root(scratch.path().to_path_buf())
+    };
+    let server = Box::pin(builder().with_verification_runtime_for_test().start_bound()).await?;
+    let journey = RefreshJourney {
+        base: server.base_url().ok_or("the server is bound")?.to_owned(),
+        server,
+        upstream,
+        http: reqwest::Client::new(),
+    };
+    let admin = journey
+        .server
+        .bootstrap_service("drain-admin", &["admin"])
+        .await?;
+    let admin_key = admin.api_key().ok_or("the admin carries an API key")?;
+    let token = journey.server.exchange_api_key(admin_key).await?;
+    journey.deploy(&token, "held").await?;
+    let metadata = json!({"mode": "metadata", "payload_fields": []});
+    let policy = journey
+        .http
+        .put(format!("{}/v1/admin/gateway/capture-policy", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .json(&metadata)
+        .send()
+        .await?;
+    if !policy.status().is_success() {
+        return Err(format!("the capture policy was refused: {}", policy.status()).into());
+    }
+    journey
+        .server
+        .seed_role(
+            "drain_runner",
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    // A service is bound to its own Card scope; a user is decided by RBAC.
+    let Bootstrap::User { jwt: enqueuer, .. } = journey
+        .server
+        .bootstrap_user("drain-enqueuer", &["drain_runner"])
+        .await?
+    else {
+        return Err("the enqueuer bootstraps a user".into());
+    };
+    let seed = VerificationFixture::provision(
+        journey.server.state().postgres.wyrd(),
+        journey.server.data_tenant_id(),
+    )
+    .await?;
+    let (subject, _) = seed.service("drain-subject").await?;
+    let verifier = assert_verifier(&seed, "drain-assert").await?;
+
+    let (http, base, caller) = (journey.http.clone(), journey.base.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(caller)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.upstream_paths().await?.is_empty() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the held call never dispatched".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let accepted: Value = journey
+        .http
+        .post(format!("{}/v1/verification/enqueue", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {enqueuer}"))
+        .json(&enqueue_body(
+            &verifier,
+            &subject,
+            json!({ "x": { "kind": "json", "value": true } }),
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let execution = accepted["execution_id"]
+        .as_str()
+        .ok_or("the enqueue answers an execution ID")?
+        .parse::<uuid::Uuid>()?;
+
+    let RefreshJourney {
+        mut server,
+        upstream,
+        ..
+    } = journey;
+    server.cancel_and_join_for_test().await?;
+    let answered = held.await??;
+    if answered.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(format!("the drained call answered {}", answered.status()).into());
+    }
+
+    let server = Box::pin(server.restart_bound(builder())).await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_executions WHERE execution_id = $1")
+            .bind(execution)
+            .fetch_one(&superuser)
+            .await?;
+    server.flush_bifrost().await?;
+    let captured = query_rows(
+        &server,
+        server.data_tenant_id(),
+        "SELECT call_id FROM vala.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
+    )
+    .await?;
+    server.shutdown().await?;
+    if (queued, captured) != (1, 1) {
+        return Err(format!(
+            "expected the accepted execution and one cancelled capture, read {queued} and {captured}"
+        )
+        .into());
+    }
+
+    let mut expired = Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root)
+            .with_shutdown_drain_for_test(Duration::ZERO)
+            .start_bound(),
+    )
+    .await?;
+    let journey = RefreshJourney {
+        base: expired.base_url().ok_or("the server is bound")?.to_owned(),
+        server: expired,
+        upstream,
+        http: reqwest::Client::new(),
+    };
+    let token = journey.admin(None, "expired-admin").await?;
+    journey.deploy(&token, "held").await?;
+    let dispatched = journey.upstream_paths().await?.len();
+    let (http, base) = (journey.http.clone(), journey.base.clone());
+    let held = tokio::spawn(async move {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(token)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.upstream_paths().await?.len() == dispatched {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the expired server's held call never dispatched".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    expired = journey.server;
+    let drained = expired.cancel_and_join_for_test().await;
+    let _ = held.await;
+    expired.shutdown().await?;
+    if drained.is_ok() {
+        return Err("an expired drain with a held call reported a clean shutdown".into());
+    }
     Ok(())
 }

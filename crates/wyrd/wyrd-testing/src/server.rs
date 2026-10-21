@@ -565,6 +565,9 @@ pub struct WyrdTestServerBuilder {
     /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
     /// prewarmed worker.
     verification_limits: Option<HostedLimits>,
+    /// Hosted Verifier worker executable replacing the shipped same-profile
+    /// `wyrd-server`, so a journey can prove a bad worker fails startup.
+    verification_worker: Option<std::path::PathBuf>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -687,6 +690,7 @@ impl Default for WyrdTestServerBuilder {
             mcp_context_probe: false,
             operator_keys: None,
             verification_limits: None,
+            verification_worker: None,
         }
     }
 }
@@ -4165,9 +4169,9 @@ impl WyrdTestServerBuilder {
     ///
     /// Edge behaviour that only manifests at a boundary — a body-size refusal,
     /// a request timeout, a concurrency cap — is unreachable at the production
-    /// defaults inside a test. This knob feeds the profile through the same
-    /// `AppState::with_limits` the server uses, so the router under test is the
-    /// composed production router with one configuration value changed.
+    /// defaults inside a test. This knob sets `WyrdServerConfig.limits`, which
+    /// [`AppState::start`] reads exactly as production does, so the router
+    /// under test is the composed production router with one value changed.
     #[must_use]
     pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
         self.limits = Some(limits);
@@ -4275,6 +4279,15 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub const fn with_verification_limits_for_test(mut self, limits: HostedLimits) -> Self {
         self.verification_limits = Some(limits);
+        self
+    }
+
+    /// Start the hosted Verifier blocks over `worker` instead of the shipped
+    /// same-profile `wyrd-server`, through the same startup input production
+    /// fills with its own executable.
+    #[must_use]
+    pub fn with_verification_worker_for_test(mut self, worker: std::path::PathBuf) -> Self {
+        self.verification_worker = Some(worker);
         self
     }
 
@@ -5019,8 +5032,10 @@ impl WyrdTestServerBuilder {
                 ),
                 permission_check: Arc::new(RbacCheck),
                 peer_tls,
-                worker: Path::new(env!("WYRD_TESTING_PROFILE_DIR"))
-                    .join(format!("wyrd-server{}", std::env::consts::EXE_SUFFIX)),
+                worker: self.verification_worker.take().unwrap_or_else(|| {
+                    Path::new(env!("WYRD_TESTING_PROFILE_DIR"))
+                        .join(format!("wyrd-server{}", std::env::consts::EXE_SUFFIX))
+                }),
                 bifrost_test_controls: Some(test_controls),
                 test_hooks: TestHooks {
                     mcp_context_probe: self.mcp_context_probe,

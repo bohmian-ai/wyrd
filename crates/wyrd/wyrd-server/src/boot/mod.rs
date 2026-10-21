@@ -1076,7 +1076,7 @@ pub fn spawn_forge_worker(
 
 /// One booted server state paired with the coordination-runtime owner it needs.
 ///
-/// [`build_state`] produces two values with different ownership rules: the
+/// [`AppState::start`] produces two values with different ownership rules: the
 /// cloneable [`AppState`] handed to every route, and the single non-`Clone`
 /// [`ScribeCoordinationRuntime`]. Returning them as one named value keeps the
 /// caller from publishing the state while silently dropping the executor that

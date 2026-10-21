@@ -1189,9 +1189,9 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Gateway capture: the resolved call carries both model Structs whole,
     // and the refused call's absent resolved model reads both children null.
     let models_sql = format!(
-        "SELECT wyrd_request_id, requested_model['deployment'], requested_model['model'], \
+        "SELECT request_id, requested_model['deployment'], requested_model['model'], \
          resolved_model['deployment'], resolved_model['model'] FROM vala.gateway.calls \
-         WHERE wyrd_request_id IN ('{}', '{}') ORDER BY wyrd_request_id",
+         WHERE request_id IN ('{}', '{}') ORDER BY request_id",
         call.request_id, call.unresolved_request_id
     );
     let mut expected_models = vec![
@@ -1237,7 +1237,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let payloads = journey
         .rows(format!(
             "SELECT request_payload, response_payload FROM vala.gateway.calls \
-             WHERE wyrd_request_id = '{}'",
+             WHERE request_id = '{}'",
             call.request_id
         ))
         .await?;
@@ -3648,19 +3648,28 @@ impl RefreshJourney {
     /// Number of this server's Postgres sessions waiting on `LISTEN`; when
     /// `terminate` is set, each is terminated as a lost listener connection.
     ///
+    /// The sessions are selected before any is terminated: in one statement
+    /// the planner may evaluate the termination before the database filter,
+    /// ending concurrent tests' listeners in other databases on the same
+    /// instance.
+    ///
     /// # Errors
     /// Returns a pool or statement error.
     async fn listeners(&self, terminate: bool) -> Result<i64, ServerJourneyError> {
         let superuser = self.server.pg_fixture().superuser_pool()?;
-        let sql = if terminate {
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
-             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid() \
-             AND pg_terminate_backend(pid)"
-        } else {
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
-             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid()"
-        };
-        Ok(sqlx::query_scalar(sql).fetch_one(&superuser).await?)
+        let pids: Vec<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
+             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid()",
+        )
+        .fetch_all(&superuser)
+        .await?;
+        if terminate {
+            sqlx::query("SELECT pg_terminate_backend(pid) FROM unnest($1::int[]) AS pid")
+                .bind(&pids)
+                .execute(&superuser)
+                .await?;
+        }
+        Ok(i64::try_from(pids.len())?)
     }
 }
 

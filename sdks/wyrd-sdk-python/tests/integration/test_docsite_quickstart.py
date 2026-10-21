@@ -31,8 +31,6 @@ def run_quickstart(directory: Path) -> tuple[dict, str]:
     printed = io.StringIO()
     with contextlib.redirect_stdout(printed):
         script = runpy.run_path(str(directory / "quickstart.py"), run_name="__main__")
-    # Shown by `mise run quickstart`, which runs pytest with `-s`.
-    print(printed.getvalue())
     return script, printed.getvalue()
 
 

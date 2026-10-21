@@ -379,3 +379,20 @@ support and equivalent focused selectors remain implementation decisions.
 - **Other files:** none outside the task's write set were changed.
 - **Not run (deliberate):** the broad journey suites and `gate` were not run,
   per the task scope.
+
+### Full-gate failure diagnoses
+
+The user asked for the full gate to pass. Each failure was rerun with
+`WYRD_LOG` and diagnosed before it was fixed. Timing and connection causes
+went to a fresh read-only diagnostician, which was given only the command,
+trace, and diff.
+
+| Failure | Cause | Fix site | Proof |
+|---|---|---|---|
+| Seven TypeScript integration journeys reported `WYRD_TOOL_500_CALL: failed to spawn monty worker: target/x86_64-unknown-linux-gnu/debug/wyrd-server` | napi always builds with `--target <host>`. The harness build script resolved the profile under the triple directory, but `build:server` places the worker in `target/debug`. | `wyrd-testing/build.rs` resolves the host-native profile when `TARGET == HOST`. | Both TS files pass 46/46 (`1e310dd82`). |
+| Listener shutdown journey, gate only | `RefreshJourney::listeners` terminated pids in the same statement that filtered `pg_stat_activity`, so the planner evaluated the terminate before the database filter and killed concurrent tests' listeners. | The test helper now selects pids, then terminates them. | All four listener and refresh tests pass (`1e310dd82`). |
+| `typed_builtin_payloads_are_queryable` | Revision 4 made the envelope `wyrd_request_id` the Scribe batch id, but the test still filtered on it. | The test filters on the payload `request_id`. | Passes (`1e310dd82`). |
+| `client_declaration_saga_returns_active_receipt`: `IdempotentNoop` instead of `Declared` | A pending heavy Card was due for reconciliation at insert (`declare.rs:295`). Under load, the 1 s reconciler verified the landed upload and activated the Card before the client's own completion. The diagnostician agreed. | `insert_card_row` binds `reconcile_delay`. `persist_node` passes the presign TTL for Cards with artifacts and zero otherwise. | Card route tests pass 32/32 and SQL card tests 51/51. A new assertion shows a heavy Card is deferred (`1ab039a84`). |
+| `owner_status_serves_stable_binding_ids_and_exchange_activates`: pool timed out at startup | Concurrent tests overcommitted Postgres `max_connections=400`. Each server holds two pool sets, and the Vala pool was uncapped (16). Ungrouped `wyrd-sql`/`vala-sql` fixtures ran outside the budget. SQLx reports 53300 as `PoolTimedOut`. The diagnostician agreed. | The wrapper caps `WYRD_DB_MAX_CONNECTIONS_VALA=8`. Nextest's `pg-servers` group now includes the `wyrd-sql`/`vala-sql` `pg_*` modules, and its budget comment is corrected. The release server removes the cap. | `e05251c5e`; proved by the full gate. |
+| Scribe `ambiguous_retry`: retry never acknowledged within 10 s | An already-durable resend re-entered the serial shard and was rewritten and synced behind every fresh write's 750 ms injected sync before the fence suppressed it. | User decision: answer honest retries of fenced, visible batches at ingress from a bounded pod-local index. A miss or mismatch takes the shard path and the fence. `bifrost-design.md` records the exception. | `ambiguous_retry` passes. Scribe lib tests pass 363/363 and Scribe journeys 30/30 (`dfeb1f163`). |
+| Identity journey, gate only: Keycloak `IncompleteMessage` | Not reproduced alone: `mise run test:identity:journey` passed. | None. | Judged by the full-gate rerun. |

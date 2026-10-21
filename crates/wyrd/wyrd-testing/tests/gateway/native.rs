@@ -5,7 +5,6 @@
 //! shared local upstream through the built-in adapters.
 
 use std::time::Duration;
-use wyrd_client::bifrost::BifrostOptions;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -574,83 +573,6 @@ async fn decisions(journey: &Journey, request_id: &str) -> Vec<(String, String)>
         .collect()
 }
 
-/// Every cell of every `vala.gateway.calls` row the tenant of `inspector`
-/// retains, rendered as text, once at least `expected` rows have landed.
-///
-/// # Panics
-/// Panics when the rows do not land within thirty seconds or the query fails.
-async fn captured_calls(
-    journey: &Journey,
-    inspector: &secrecy::SecretString,
-    expected: usize,
-) -> Vec<String> {
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-
-    let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
-        grpc: wyrd_client::transport::GrpcConfig {
-            endpoint: journey.server.grpc_url().expect("gRPC url"),
-            connect_retries: 0,
-            ..wyrd_client::transport::GrpcConfig::default()
-        },
-        http: wyrd_client::transport::HttpConfig {
-            base_url: journey.base.clone(),
-            ..wyrd_client::transport::HttpConfig::default()
-        },
-        credential: Some(inspector.clone()),
-        ..wyrd_client::config::ClientConfig::default()
-    })
-    .expect("inspection client builds");
-    let bifrost = wyrd_client::Bifrost::connect_with(&client, BifrostOptions::default())
-        .await
-        .expect("inspection Bifrost connects");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        journey
-            .server
-            .await_audit_retained()
-            .await
-            .expect("the Scribe outbox settles");
-        journey
-            .server
-            .flush_bifrost()
-            .await
-            .expect("Bifrost flushes");
-        let result = bifrost
-            .sql("SELECT * FROM vala.gateway.calls", &[])
-            .await
-            .expect("captured calls query");
-        let mut rows = Vec::new();
-        for batch in result.batches() {
-            let formatters: Vec<_> = batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default())
-                        .expect("column formats")
-                })
-                .collect();
-            for row in 0..batch.num_rows() {
-                rows.push(
-                    formatters
-                        .iter()
-                        .map(|formatter| formatter.value(row).to_string())
-                        .collect::<Vec<_>>()
-                        .join("\u{1f}"),
-                );
-            }
-        }
-        if rows.len() >= expected {
-            return rows;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{expected} captured calls never landed: {}",
-            rows.len()
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 /// Proves a Wyrd API key presented directly to every gateway ingress dialect.
 ///
 /// A static key in each accepted carrier (`Authorization` and
@@ -1108,7 +1030,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
             assert_provider_credentials(&routed, header, &expected, key);
         }
     }
-    let rows = captured_calls(&journey, &inspector, 7).await;
+    let rows = journey.captured_calls(&inspector, 7).await;
     let spans = traces.finished_since(0);
     for key in keys.iter().chain([&other_key]) {
         for body in &bodies {

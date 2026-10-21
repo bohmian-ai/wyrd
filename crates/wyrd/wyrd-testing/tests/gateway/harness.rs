@@ -23,6 +23,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::{MockServer, Request};
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_testing::Bootstrap;
@@ -360,6 +361,78 @@ impl Journey {
         .expect("ledger reads");
         conn.commit().await.expect("ledger read commits");
         rows
+    }
+
+    /// Every cell of every `vala.gateway.calls` row the tenant of `inspector`
+    /// retains, rendered as text, once at least `expected` rows have landed.
+    ///
+    /// # Panics
+    /// Panics when the rows do not land within thirty seconds or the query fails.
+    pub(crate) async fn captured_calls(
+        &self,
+        inspector: &SecretString,
+        expected: usize,
+    ) -> Vec<String> {
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+        let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: self.server.grpc_url().expect("gRPC url"),
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: self.base.clone(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            credential: Some(inspector.clone()),
+            ..wyrd_client::config::ClientConfig::default()
+        })
+        .expect("inspection client builds");
+        let bifrost = wyrd_client::Bifrost::connect_with(&client, BifrostOptions::default())
+            .await
+            .expect("inspection Bifrost connects");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            self.server
+                .await_audit_retained()
+                .await
+                .expect("the Scribe outbox settles");
+            self.server.flush_bifrost().await.expect("Bifrost flushes");
+            let result = bifrost
+                .sql("SELECT * FROM vala.gateway.calls", &[])
+                .await
+                .expect("captured calls query");
+            let mut rows = Vec::new();
+            for batch in result.batches() {
+                let formatters: Vec<_> = batch
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default())
+                            .expect("column formats")
+                    })
+                    .collect();
+                for row in 0..batch.num_rows() {
+                    rows.push(
+                        formatters
+                            .iter()
+                            .map(|formatter| formatter.value(row).to_string())
+                            .collect::<Vec<_>>()
+                            .join("\u{1f}"),
+                    );
+                }
+            }
+            if rows.len() >= expected {
+                return rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{expected} captured calls never landed: {}",
+                rows.len()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Waits for every gateway call task, then reads the settled usage.

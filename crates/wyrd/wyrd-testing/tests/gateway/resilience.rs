@@ -24,7 +24,7 @@ use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::Metrics;
 
-use crate::harness::{Journey, openai_code, refusal, tokens};
+use crate::harness::{Journey, api_key, openai_code, refusal, tokens};
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
 const PROJECTION: &str = "acme-first/m";
@@ -436,4 +436,126 @@ async fn gateway_capacity_metrics_cover_buffered_and_streamed_calls() {
             "{family} renders the fine buckets"
         );
     }
+}
+
+/// Delta of `family` restricted to `labels` from `before` to `after`.
+fn delta(before: &Metrics, after: &Metrics, family: &str, labels: &[&str]) -> f64 {
+    after.sum(family, labels) - before.sum(family, labels)
+}
+
+/// Waits out the call tracker and then the Scribe outbox, the post-response
+/// work a capture rides on, and scrapes the process telemetry.
+///
+/// # Panics
+/// Panics when the tracker or outbox does not settle.
+async fn drained(journey: &Journey) -> Metrics {
+    journey.settled_usage().await;
+    journey
+        .server
+        .await_audit_retained()
+        .await
+        .expect("the Scribe outbox settles");
+    let (_, telemetry) = shared_process_telemetry_for_test().expect("process telemetry");
+    Metrics::parse(&telemetry.render())
+}
+
+/// Proves the capture accounting the capacity benchmark reads settles only
+/// after each call's post-response work.
+///
+/// A warmup call is settled and scraped first, so its capture never leaks
+/// into the measured interval. A delayed buffered call and a stream are then
+/// answered; once the call tracker and the Scribe outbox drain, exactly their
+/// two captures are staged, none is lost, nothing is pending, and the tenant
+/// reads all three rows. Loss behind an HTTP 200 is judged by the benchmark's
+/// verdict unit cases: server-internal Scribe writes bypass the fingerprint
+/// fence, so no existing seam forces a terminal capture refusal end to end.
+///
+/// # Panics
+/// Panics when a call, metric, or capture-row expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn capacity_capture_accounting_waits_for_post_response_work() {
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(
+                    GatewayCapture::chat_events("chatcmpl-1", 2),
+                    "text/event-stream",
+                )
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(2)
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/timed").await;
+    journey
+        .put(
+            "capture-policy",
+            json!({"mode": "metadata", "payload_fields": []}),
+        )
+        .await;
+    let inspector = api_key(&journey.server, "capacity_inspector", &["admin"]).await;
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    let staged = ["outcome=\"staged\""];
+    let scribe = ["outbox=\"scribe\""];
+
+    let warmup = journey
+        .post("/v1/chat/completions", &bearer, &chat("acme-first/m"))
+        .await;
+    assert_eq!(warmup.status().as_u16(), 200);
+    warmup.json::<Value>().await.expect("warmup answer");
+    let baseline = drained(&journey).await;
+
+    let buffered = journey
+        .post("/v1/chat/completions", &bearer, &chat("acme-first/m"))
+        .await;
+    assert_eq!(buffered.status().as_u16(), 200);
+    buffered.json::<Value>().await.expect("buffered answer");
+    let mut streamed = chat("acme-first/m");
+    streamed["stream"] = json!(true);
+    let streamed = journey
+        .post("/v1/chat/completions", &bearer, &streamed)
+        .await;
+    assert_eq!(streamed.status().as_u16(), 200);
+    assert!(
+        streamed
+            .text()
+            .await
+            .expect("complete stream")
+            .ends_with("data: [DONE]\n\n")
+    );
+    let measured = drained(&journey).await;
+    assert_eq!(
+        delta(&baseline, &measured, "wyrd_gateway_capture_total", &staged),
+        2.0,
+        "the measured interval stages its own two captures, not the warmup's"
+    );
+    assert_eq!(
+        delta(&baseline, &measured, "outbox_events_lost_total", &[]),
+        0.0,
+        "nothing is lost"
+    );
+    assert_eq!(
+        measured.sum("outbox_pending", &scribe),
+        0.0,
+        "the drain leaves nothing pending"
+    );
+    assert_eq!(
+        journey.captured_calls(&inspector, 3).await.len(),
+        3,
+        "the tenant reads every captured call"
+    );
 }

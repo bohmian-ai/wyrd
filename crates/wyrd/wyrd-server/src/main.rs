@@ -15,19 +15,18 @@ use wyrd_server::boot::init::{
     InitError, initialize_platform_root, issue_platform_root_credential,
 };
 use wyrd_server::config::ServeMode;
+use wyrd_server::verification::hosted::worker;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::{MIGRATION_LEASE_WAIT, PoolConfig, SqlError, WyrdPostgres};
 
-mod monty_worker;
-
 /// Process-wide allocator for the server binary and its Monty workers.
 ///
 /// mimalloc serves every allocation; a worker process also counts its heap
-/// against its session's memory budget (see [`monty_worker`]). Library crates
+/// against its session's memory budget (see [`worker`]). Library crates
 /// never install an allocator, so embedders keep theirs.
 #[global_allocator]
-static GLOBAL: monty_worker::CountingMiMalloc = monty_worker::CountingMiMalloc;
+static GLOBAL: worker::CountingMiMalloc = worker::CountingMiMalloc;
 
 const EX_CONFIG: i32 = 78;
 const EX_SOFTWARE: i32 = 70;
@@ -88,16 +87,13 @@ struct SetupArgs {
 }
 
 /// Run the binary as a Monty pool worker when the pool spawned it with
-/// [`monty_worker::SUBPROCESS_ARG`], and as the Wyrd server otherwise.
+/// [`worker::SUBPROCESS_ARG`], and as the Wyrd server otherwise.
 ///
 /// The worker check runs before any runtime, CLI, or telemetry exists, so a
 /// worker process holds only the interpreter thread and its own heap count.
 fn main() -> std::process::ExitCode {
-    if std::env::args_os()
-        .skip(1)
-        .eq([std::ffi::OsString::from(monty_worker::SUBPROCESS_ARG)])
-    {
-        return monty_worker::run();
+    if let Some(code) = worker::dispatch() {
+        return code;
     }
     server_main();
     std::process::ExitCode::SUCCESS

@@ -1,7 +1,7 @@
 //! The `wyrd-server subprocess` Monty worker and the allocator that bounds it.
 //!
-//! The server's Monty pool spawns its own executable as `wyrd-server
-//! subprocess` with an empty environment and speaks Monty's framed protocol
+//! The server's Monty pool spawns the `wyrd-server` executable it was given
+//! as `wyrd-server subprocess` with an empty environment and speaks Monty's framed protocol
 //! over stdio, so one binary ships both the server and its Python workers.
 //! Isolation is Monty's own and identical on every platform: sandboxed Python
 //! has no host files, network, subprocesses, environment, or host callbacks;
@@ -9,7 +9,9 @@
 //! or refuses. A worker that crashes, aborts, or exceeds its budget ends only
 //! its own process; the pool replaces it.
 //!
-//! [`CountingMiMalloc`] is the binary's global allocator. In the server it is
+//! [`CountingMiMalloc`] is the binary's global allocator; the library only
+//! defines it, so embedders keep theirs, and the `wyrd-server` binary installs
+//! it and calls [`dispatch`] first in `main`. In the server it is
 //! mimalloc behind one relaxed flag load. In a worker it also feeds
 //! [`LIVE_MEMORY`], which Monty's soft memory limit reads, and ends the
 //! process with [`OOM_EXIT_CODE`] past the session's memory budget plus
@@ -175,12 +177,24 @@ fn out_of_memory(reason: fmt::Arguments<'_>) -> ! {
     process::exit(OOM_EXIT_CODE);
 }
 
+/// Run this process as a Monty pool worker when the pool spawned it.
+///
+/// Returns `Some` exit code after serving the worker protocol when the only
+/// argument is [`SUBPROCESS_ARG`], and `None` for every other invocation so
+/// the caller continues as the server. The binary calls this first in
+/// `main`, before any runtime, CLI, or telemetry exists, so a worker process
+/// holds only the interpreter thread and its own heap count.
+#[must_use]
+pub fn dispatch() -> Option<ExitCode> {
+    std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from(SUBPROCESS_ARG)])
+        .then(run)
+}
+
 /// Run this process as a Monty pool worker: start counting the heap, then
 /// serve the protocol on a dedicated interpreter thread until it ends.
-///
-/// Called by `main` when the pool spawned the binary with [`SUBPROCESS_ARG`],
-/// before anything else allocates on the worker's behalf.
-pub fn run() -> ExitCode {
+fn run() -> ExitCode {
     COUNTING.store(true, Ordering::Relaxed);
     thread::Builder::new()
         .name("monty-worker".to_owned())

@@ -1,7 +1,7 @@
 //! The shared Python sandbox behind `code` blocks and the `code.run` tool.
 //!
 //! [`Sandbox`] owns one process-wide Monty pool of `wyrd-server
-//! subprocess` worker processes (see the binary's `monty_worker` module for
+//! subprocess` worker processes (see [`super::worker`] for
 //! the in-worker isolation). Each [`Sandbox::run`] admits at most `max_workers +
 //! max_waiters` operations, checks out a fresh worker within the operation's
 //! deadline, feeds the source plus one

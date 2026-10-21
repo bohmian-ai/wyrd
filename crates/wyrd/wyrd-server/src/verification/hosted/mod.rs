@@ -17,6 +17,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod tools;
 pub mod traces;
+pub mod worker;
 pub mod workspace;
 
 /// `caller` under a fresh request ID, for one Oracle statement.

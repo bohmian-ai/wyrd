@@ -80,6 +80,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:wyrd:inner"]
 hide = true
 description = "Run wyrd family tests with the lifecycle already provisioned; packages are the crates under the family directory"
+depends = ["build:server"]
 run = "bash scripts/run-family-tests.sh wyrd"
 
 [tasks."test:cards:unit"]
@@ -319,6 +320,7 @@ hide = true
 description = """The gate's share of Bifrost: only the ignored Rust tests. Every non-ignored Rust test belongs to a family lane, and py:test:integration,
 ts:test:integration, and ts:test:unit own the SDK Bifrost files. One `nextest` invocation schedules
 every selected binary together. Run `test:bifrost` for the complete, standalone lane."""
+depends = ["build:server"]
 run = """
 scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -e
@@ -481,11 +483,11 @@ run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
-depends = ["build:server"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
 [tasks."test:bifrost:journey:drift:inner"]
 hide = true
-description = "wyrd-ai verify_in_real_time, verifier_building_blocks, and scheduled_drift_alerts_operator stories"
+description = "wyrd-ai verify_in_real_time, verifier_building_blocks, and scheduled_drift_alerts_operator stories; grouped support launches the public Python and Node SDKs"
+depends = ["build:server", "py:setup", "ts:build", "ts:build:testing"]
 run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|verifier_building_blocks|scheduled_drift_alerts_operator)::/)'"
 
 [tasks."test:bifrost:journey:forge"]
@@ -629,6 +631,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:server:inner"]
 hide = true
 description = "wyrd-testing `server` binary, whole"
+depends = ["build:server"]
 run = "cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all"
 
 [tasks."test:bifrost:journey:mcp"]

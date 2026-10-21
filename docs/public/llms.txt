@@ -43,7 +43,7 @@ Declare -> Observe -> Verify an application you own, in this order. A connected 
 
 - [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/): Prepare PostgreSQL with a platform login and a tenant login, migrate it, start the server, and create the first tenant.
 - [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
-- [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/): Install the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
+- [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/): Understand the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 - [Troubleshoot a deployment](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
 
 ## Understand

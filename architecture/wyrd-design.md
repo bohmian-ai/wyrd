@@ -1760,7 +1760,9 @@ its slot before its inputs are staged, so the hand-off is never refused; a
 `submit` that finds no room is refused with
 `WYRD_VERIFICATION_429_STAGING_FULL` before anything is staged. The outbox
 never drops a request because PostgreSQL is slow or down: a failed write
-keeps its batch and retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
+keeps its batch and retries with backoff. Verification owns this outbox; graceful shutdown keeps it
+open through Bifrost's final Scribe flush, so a late acknowledgement still creates its row, and then
+flushes it before its dependencies close. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 

@@ -47,7 +47,7 @@ These limits protect a server that runs Verifiers for many tenants. They are env
   - `MONTY_PROCESS_MEMORY_MIB` too small for `MONTY_MEMORY_MIB` plus Monty's 4 MiB allocator headroom;
   - `FILE_MAX_MIB` above `FILES_MAX_MIB`;
   - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`.
-- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the worker binary is missing or the first `MONTY_MIN_WORKERS` workers cannot start.
+- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the first `MONTY_MIN_WORKERS` workers, started from its own binary, cannot start. With `MONTY_MIN_WORKERS=0` workers start on first use, and a worker that cannot start fails that operation instead.
 - No setting disables a limit or an isolation protection.
 
 A Verifier can lower a limit for one slot, such as `max_bytes` on a `media` slot, never raise it. Step, Agent, and request deadlines apply too; the earliest one wins.

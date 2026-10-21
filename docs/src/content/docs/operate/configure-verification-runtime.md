@@ -1,6 +1,6 @@
 ---
 title: Configure the verification runtime
-description: Install the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
+description: Understand the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 pillar: wyrd
 section: Operate
 order: 4
@@ -11,9 +11,9 @@ The verification runtime runs Verifier steps and checks inside `wyrd-server`: fi
 
 ## Python workers
 
-`wyrd-server` runs Python in worker processes it starts from its own binary as `wyrd-server subprocess`. Release bundles and the official images ship only `wyrd-server`, and the default needs no setting. A worker that crashes or exceeds its memory budget ends only its own process; the server keeps serving and starts a replacement.
+`wyrd-server` runs Python in worker processes it always starts from its own shipped binary as `wyrd-server subprocess`. There is nothing to install and no setting to choose another worker; release bundles and the official images ship only `wyrd-server`. A worker that crashes or exceeds its memory budget ends only its own process; the server keeps serving and starts a replacement.
 
-A server that runs Verifiers refuses to start when its worker cannot start:
+A server that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready, and refuses to start when they cannot start:
 
 ```text
 hosted Verifier blocks could not start: ...

@@ -597,7 +597,7 @@ atomically.
 
 Audit follows evaluated permission decisions. Stage exactly one allowed or
 denied event for every verdict a receiving boundary reaches on the process
-Scribe outbox (`AppState::scribe_outbox`; lower crates stage through
+Scribe outbox (owned by Bifrost, `state.bifrost.scribe_outbox()`; lower crates stage through
 `wyrd_runtime::audit::AuditStage`), never inside the operation's transaction.
 Authorization still completes before protected work, but the operation never
 waits for, or is reversed by, the audit write; the outbox resubmits the

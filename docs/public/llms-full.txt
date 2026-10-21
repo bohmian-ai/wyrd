@@ -4096,15 +4096,15 @@ Run it with any SDK's `Bifrost.sql`, or the `bifrost.query` MCP tool. A refused 
 
 Page: /wyrd/operate/configure-verification-runtime/
 
-> Install the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
+> Understand the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 
 The verification runtime runs Verifier steps and checks inside `wyrd-server`: file extraction, scratch workspaces, Agent tools, and Python code in a pool of worker processes. Every setting, default, and startup rule is in [Verification runtime limits](/wyrd/reference/verification-runtime-limits/); this page covers the decisions an operator makes. For database and server setup, see [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/).
 
 ## Python workers
 
-`wyrd-server` runs Python in worker processes it starts from its own binary as `wyrd-server subprocess`. Release bundles and the official images ship only `wyrd-server`, and the default needs no setting. A worker that crashes or exceeds its memory budget ends only its own process; the server keeps serving and starts a replacement.
+`wyrd-server` runs Python in worker processes it always starts from its own shipped binary as `wyrd-server subprocess`. There is nothing to install and no setting to choose another worker; release bundles and the official images ship only `wyrd-server`. A worker that crashes or exceeds its memory budget ends only its own process; the server keeps serving and starts a replacement.
 
-A server that runs Verifiers refuses to start when its worker cannot start:
+A server that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready, and refuses to start when they cannot start:
 
 ```text
 hosted Verifier blocks could not start: ...
@@ -6062,7 +6062,7 @@ These limits protect a server that runs Verifiers for many tenants. They are env
   - `MONTY_PROCESS_MEMORY_MIB` too small for `MONTY_MEMORY_MIB` plus Monty's 4 MiB allocator headroom;
   - `FILE_MAX_MIB` above `FILES_MAX_MIB`;
   - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`.
-- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the worker binary is missing or the first `MONTY_MIN_WORKERS` workers cannot start.
+- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the first `MONTY_MIN_WORKERS` workers, started from its own binary, cannot start. With `MONTY_MIN_WORKERS=0` workers start on first use, and a worker that cannot start fails that operation instead.
 - No setting disables a limit or an isolation protection.
 
 A Verifier can lower a limit for one slot, such as `max_bytes` on a `media` slot, never raise it. Step, Agent, and request deadlines apply too; the earliest one wins.

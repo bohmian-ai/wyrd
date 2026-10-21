@@ -16,8 +16,16 @@ history lives in git; this document states one architecture.
 
 `wyrd-server` is the only network-serving surface. It owns listeners, TLS,
 authentication, authorization, request limits, boot readiness, and server
-lifecycle for Bifrost HTTP, gRPC, and MCP operations. Vala owns the Bifrost
-engine and its three cohesive subsystems:
+lifecycle for Bifrost HTTP, gRPC, and MCP operations. Production and the test
+harness start the same complete graph through one `AppState::start`; the
+resulting state is immutable. Each engine owns its caches and refresh tasks
+and returns them as startup workers that the one server supervisor runs: Bifrost
+owns the only Scribe outbox, and Verification owns its hosted blocks, queued
+submission outbox, and Operator keys. Shutdown stops transports and new claims,
+then drains the gateway, MCP, and verification (runner, then the Monty pool is
+closed and its workers reaped), the Scribe outbox, Bifrost, the verifier
+submission outbox, and telemetry, in that order, under one deadline. Vala owns
+the Bifrost engine and its three cohesive subsystems:
 
 - **Scribe** owns pod-local ingestion, WAL durability, active and immutable
   rows, durable local staging, hot-object publication, and bounded live-tail
@@ -85,8 +93,9 @@ authenticated principal.
 
 Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
 Required, non-null `sub_principal_id` and `act_principal_id` record who the
-row's work was for and who performed it, stamped from verified attribution and
-never from row values: a direct publisher is both, a delegated one records the
+row's work was for and who performed it. Public writes are stamped from the
+verified token and refuse supplied values; server-owned outbox writes carry
+each row's own verified pair, which Scribe validates. A direct publisher is both, a delegated one records the
 party it acts for as subject and itself as actor. None participates in row
 identity.
 

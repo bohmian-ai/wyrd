@@ -12,7 +12,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::schema_check::verify_tenant_pool;
-use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn};
+use wyrd_sql::{NotificationListener, OperatorPool, PoolConfig, SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Vala runtime-pool acquisition.
 struct PoolAcquireLifecycle<'a> {
@@ -124,6 +124,13 @@ impl ValaPostgres {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// A cache listener on `channel` that holds one Vala pool connection
+    /// while subscribed; see [`NotificationListener::watch`].
+    #[must_use]
+    pub fn listener(&self, channel: &str) -> NotificationListener {
+        NotificationListener::new(self.pool.clone(), channel)
     }
 
     /// Acquire one plain connection from the Vala application pool.

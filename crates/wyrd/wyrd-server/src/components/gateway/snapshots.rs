@@ -142,17 +142,21 @@ impl GatewaySnapshots {
         self.entries().generation
     }
 
-    /// Listens for snapshot invalidations from `postgres` until `shutdown`; see
-    /// [`crate::postgres::watch_channel`].
+    /// Listens for snapshot invalidations from `postgres` until `shutdown`.
+    ///
+    /// Snapshots serve only while the listener is subscribed and its
+    /// heartbeat answers, so a lost or silently stalled listener stops
+    /// serving within the heartbeat bound; see
+    /// [`wyrd_sql::NotificationListener::watch`].
     pub async fn watch(&self, postgres: &wyrd_sql::WyrdPostgres, shutdown: CancellationToken) {
-        crate::postgres::watch_channel(
-            postgres,
-            SNAPSHOT_CHANNEL,
-            shutdown,
-            |live| self.reset(live),
-            |payload| self.invalidate(payload),
-        )
-        .await;
+        postgres
+            .listener(SNAPSHOT_CHANNEL)
+            .watch(
+                shutdown,
+                |live| self.reset(live),
+                |payload| self.invalidate(payload),
+            )
+            .await;
     }
 }
 

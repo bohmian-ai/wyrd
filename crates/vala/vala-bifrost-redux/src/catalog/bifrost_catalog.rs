@@ -25,7 +25,7 @@ use wyrd_spec::vala::api::{
     RegisterOutcome, RegisterTableResponse,
 };
 
-use crate::catalog::cut_cache::CutCache;
+use crate::catalog::cut_cache::{CUT_CHANNEL, CutCache};
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
@@ -452,7 +452,9 @@ impl BifrostCatalog {
     /// Vala pool connection for the `vala.file_list` trigger's notifications
     /// and drops each cut they name. See [`CutCache::watch`].
     pub async fn watch_cuts(&self, shutdown: tokio_util::sync::CancellationToken) {
-        self.cut_cache.watch(self.postgres.pool(), shutdown).await;
+        self.cut_cache
+            .watch(&self.postgres.listener(CUT_CHANNEL), shutdown)
+            .await;
     }
 
     /// Drops `table`'s cached cut so the next read reaches Postgres.

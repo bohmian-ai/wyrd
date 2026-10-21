@@ -11,7 +11,7 @@ use crate::dsn::ResolvedDsns;
 use crate::operator_pool::OperatorPool;
 use crate::pool::{PoolConfig, build_pool};
 use crate::schema_check::verify_tenant_pool;
-use crate::{SqlError, TenantConn};
+use crate::{NotificationListener, SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Wyrd application-pool acquisition.
 struct PoolAcquireLifecycle<'a> {
@@ -152,6 +152,13 @@ impl WyrdPostgres {
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {
         &self.app
+    }
+
+    /// A cache listener on `channel` that holds one app-pool connection
+    /// while subscribed; see [`NotificationListener::watch`].
+    #[must_use]
+    pub fn listener(&self, channel: &str) -> NotificationListener {
+        NotificationListener::new(self.app.clone(), channel)
     }
 
     /// Build an `OperatorPool` from the optional platform-admin pool.

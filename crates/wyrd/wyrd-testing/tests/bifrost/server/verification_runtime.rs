@@ -75,8 +75,9 @@ use wyrd_spec::verification::execution::{
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::gateway_capture::GatewayCapture;
+use wyrd_testing::listener_stall::ListenerStallProxy;
 use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 use wyrd_types::variant::{variant_field, variant_storage_type};
 
 use super::query::{ServerJourneyError, audit_rows, scheduled_context};
@@ -3482,6 +3483,15 @@ impl RefreshJourney {
     /// # Errors
     /// Returns a mock, URL, or server startup error.
     async fn start() -> Result<Self, ServerJourneyError> {
+        Self::start_with(WyrdTestServer::builder()).await
+    }
+
+    /// Start `builder` bound, with its built-in adapters targeting a fresh
+    /// mock upstream answering every request with one completion.
+    ///
+    /// # Errors
+    /// Returns a mock, URL, or server startup error.
+    async fn start_with(builder: WyrdTestServerBuilder) -> Result<Self, ServerJourneyError> {
         let upstream = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(
@@ -3491,7 +3501,7 @@ impl RefreshJourney {
             .await;
         let root = url::Url::parse(&upstream.uri())?;
         let server = Box::pin(
-            WyrdTestServer::builder()
+            builder
                 .with_gateway_provider_root_for_test(root)
                 .start_bound(),
         )
@@ -3731,6 +3741,118 @@ async fn engine_owned_refresh_preserves_tenant_changes() -> Result<(), ServerJou
         &journey.call(&a).await?,
         &reaches("four"),
     )?;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// The gateway snapshot cache's notification channel.
+const SNAPSHOT_CHANNEL: &str = "wyrd_gateway_snapshot";
+
+/// Production bound on noticing a silently stalled listener: one 30 s
+/// heartbeat interval plus its 5 s probe timeout.
+const STALL_DETECTION: Duration = Duration::from_secs(35);
+
+/// Scheduling allowance this journey grants beyond [`STALL_DETECTION`].
+const STALL_TOLERANCE: Duration = Duration::from_secs(10);
+
+/// Wait until `proxy` relays at least one live subscription to `channel`.
+///
+/// # Errors
+/// Returns a description when no subscription arrives within [`WAIT`].
+async fn subscribed(proxy: &ListenerStallProxy, channel: &str) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while proxy.listening(channel) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("no listener subscribed to {channel}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// A silently stalled snapshot listener stops serving cached routes within
+/// the heartbeat bound and recovers once its path returns (REQ-013,
+/// AC-011).
+///
+/// The server's runtime pools dial Postgres through a proxy. Once tenant A's
+/// route is cached, the proxy stops relaying the snapshot listener's
+/// connection without closing either socket, so no notification and no loss
+/// report reach the server; request connections keep flowing. A's next
+/// move commits normally, and calls reach the new route within
+/// [`STALL_DETECTION`] plus [`STALL_TOLERANCE`] while every subscription
+/// is still stalled, so they read Postgres. Tenant B keeps its own route
+/// throughout. After the path is restored and a listener subscribes again, a
+/// further move is still seen.
+///
+/// # Errors
+/// Returns server, proxy, request, or Postgres errors, or a description of
+/// the first stale, leaked, or late route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn silent_listener_stall_falls_back_and_recovers() -> Result<(), ServerJourneyError> {
+    expect_eq(
+        "production stall detection bound",
+        &(wyrd_sql::listener::HEARTBEAT + wyrd_sql::listener::PROBE_TIMEOUT),
+        &STALL_DETECTION,
+    )?;
+    let dsns = wyrd_sql::dsn::ResolvedDsns::from_env()?;
+    let proxy = Arc::new(ListenerStallProxy::start(&dsns).await?);
+    let journey = RefreshJourney::start_with(
+        WyrdTestServer::builder().with_postgres_proxy_for_test(Arc::clone(&proxy)),
+    )
+    .await?;
+    let a = journey.admin(None, "stall-a").await?;
+    let other = journey.server.seed_tenant("stall-other").await?;
+    let b = journey.admin(Some(other), "stall-b").await?;
+    let reaches = |prefix: &str| Some(format!("/{prefix}/v1/chat/completions"));
+
+    subscribed(&proxy, SNAPSHOT_CHANNEL).await?;
+    journey.deploy(&a, "one").await?;
+    journey.deploy(&b, "bee").await?;
+    let (one, bee) = (reaches("one"), reaches("bee"));
+    expect_eq(
+        "A's cached route",
+        &journey.route_after_write(&a, one.as_deref()).await?,
+        &one,
+    )?;
+    expect_eq(
+        "B's cached route",
+        &journey.route_after_write(&b, bee.as_deref()).await?,
+        &bee,
+    )?;
+
+    if proxy.stall(SNAPSHOT_CHANNEL) == 0 {
+        return Err("no subscribed snapshot listener was stalled".into());
+    }
+    let stalled_at = tokio::time::Instant::now();
+    journey.deploy(&a, "two").await?;
+    let two = reaches("two");
+    expect_eq(
+        "A's route during a silent stall",
+        &journey.route_after_write(&a, two.as_deref()).await?,
+        &two,
+    )?;
+    let detected = stalled_at.elapsed();
+    tracing::info!(?detected, "stalled snapshot listener detected");
+    if detected > STALL_DETECTION + STALL_TOLERANCE {
+        return Err(format!("the stalled listener served a stale route for {detected:?}").into());
+    }
+    if proxy.listening(SNAPSHOT_CHANNEL) != 0 {
+        return Err("a snapshot listener subscribed through a stalled path".into());
+    }
+    expect_eq("B during A's stall", &journey.call(&b).await?, &bee)?;
+
+    proxy.restore(SNAPSHOT_CHANNEL);
+    subscribed(&proxy, SNAPSHOT_CHANNEL).await?;
+    expect_eq("A after recovery", &journey.call(&a).await?, &two)?;
+    journey.deploy(&a, "three").await?;
+    let three = reaches("three");
+    expect_eq(
+        "A's route after recovery",
+        &journey.route_after_write(&a, three.as_deref()).await?,
+        &three,
+    )?;
+    expect_eq("B after recovery", &journey.call(&b).await?, &bee)?;
     journey.server.shutdown().await?;
     Ok(())
 }

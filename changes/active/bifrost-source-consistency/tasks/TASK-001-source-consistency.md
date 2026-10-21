@@ -430,6 +430,14 @@ Lanes: `fmt`, `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`,
 `test:bifrost:integration:{redux,sql,server}`, `docs:check`, `git diff --check` — all exit 0.
 Span-permit regression `scribe_outbox::tests::sustained_scribe_outage_caps_tenant_spans` passed.
 
+Final task verification at `051be28a3`: every command in Verification and
+Evidence above except the capacity sequence (run at `05186c1e4`, code
+unchanged since) — the span-permit test, the five named journeys, the
+rollover and staging tests, the three report tests, `test:bifrost:unit:rust:inner`,
+`test:bifrost:integration:{redux,sql,server}`, `codegen:check`, `check:deps`,
+`check:tenant-isolation`, `docs:check`, `fmt`, `lints` and `git diff --check`
+— all exit 0.
+
 ### Diagnoses
 - **Symptom (rev 2):** six `staging_runtime` recovery tests failed "failed to lookup address information". **Cause:** the revision load ran inside `ScribeStagingRuntime::restore` and on every `finish_committed`, and those tests recover with an unconnected lazy pool. **Fix site:** boot load moved to `replay_wal_async` beside the other operator-backed recovery; `finish_committed` reads only when a member never advanced to `Published`.
 - **Symptom (rev 2):** `file_list_publications_advance_their_node_revision` hit `file_list_stream_range_ordinal_uniq`. **Cause:** both test republishes used the same WAL range. **Fix site:** the test binds distinct offsets.

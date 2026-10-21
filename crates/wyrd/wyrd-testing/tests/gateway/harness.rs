@@ -215,7 +215,7 @@ impl Journey {
     ///
     /// # Panics
     /// Panics when the request fails or is refused.
-    async fn put_as(&self, admin: &str, route: &str, body: Value) {
+    pub(crate) async fn put_as(&self, admin: &str, route: &str, body: Value) {
         let response = self.try_put_as(admin, route, body).await;
         let status = response.status();
         assert!(

@@ -16,12 +16,14 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
+use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
 use wyrd_testing::capacity::Histogram;
-use wyrd_testing::gateway_capture::GatewayCapture;
+use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::Metrics;
 
 use crate::harness::{Journey, api_key, openai_code, refusal, tokens};
@@ -557,5 +559,247 @@ async fn capacity_capture_accounting_waits_for_post_response_work() {
         journey.captured_calls(&inspector, 3).await.len(),
         3,
         "the tenant reads every captured call"
+    );
+}
+
+/// Stream events [`gateway_capacity_paces_streams_isolates_tenants_and_recovers`]'s
+/// paced upstream writes, one per write.
+const PACED_CHUNKS: usize = 4;
+
+/// The paced upstream's answer shape: short, but long enough that each
+/// stream event is a separate, measurable write.
+const PACED: Pacing = Pacing {
+    buffered_delay: Duration::from_millis(50),
+    buffered_bytes: 64,
+    stream_delay: Duration::from_millis(100),
+    chunks: PACED_CHUNKS,
+    chunk_interval: Duration::from_millis(30),
+};
+
+/// Stores `admin`'s tenant deployment `name`, serving any model from
+/// `base_url`, authenticated with `none`.
+async fn deploy_at(journey: &Journey, admin: &str, name: &str, base_url: &str) {
+    journey
+        .put_as(
+            admin,
+            &format!("provider-deployments/{name}"),
+            json!({
+                "name": name,
+                "adapter": {"openai_compatible": {"base_url": base_url}},
+                "auth": "none",
+                "capabilities": ["chat_completions"],
+            }),
+        )
+        .await;
+}
+
+/// One Chat Completions request for `model` whose first message is the
+/// paced upstream's call `marker`.
+fn marked(model: &str, marker: &str, stream: bool) -> Value {
+    let mut body = chat(model);
+    body["messages"][0]["content"] = json!(marker);
+    if stream {
+        body["stream"] = json!(true);
+    }
+    body
+}
+
+/// Proves the capacity workload's real-server path: paced streams, tenant
+/// capture isolation, and configured admission refusals that recover.
+///
+/// A paced upstream delays a stream's headers and writes each event
+/// separately. The caller sees headers no earlier than the delay, reassembles
+/// every event across however many transport reads carried them, and
+/// receives the provider's stream unchanged, while the upstream's recorded
+/// sends are at least the chunk interval apart. A second tenant limited to one
+/// concurrent call holds one slow call, so every concurrent extra call is
+/// refused with the configured limit code before dispatch; once it answers,
+/// lower-rate calls succeed. Each tenant's administrator reads exactly its
+/// own answered calls' captures, and no refused call is captured.
+///
+/// # Panics
+/// Panics when a status, timing, stream, refusal, or capture expectation
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_capacity_paces_streams_isolates_tenants_and_recovers() {
+    let journey = Journey::start().await;
+    let paced = PacedUpstream::start(PACED, 16)
+        .await
+        .expect("paced upstream binds");
+    Mock::given(method("POST"))
+        .and(path("/held/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&journey.upstream)
+        .await;
+    let paced_url = format!("{}/paced/v1", paced.uri());
+    let metadata = json!({"mode": "metadata", "payload_fields": []});
+    deploy_at(&journey, &journey.admin, "acme-first", &paced_url).await;
+    journey.put("capture-policy", metadata.clone()).await;
+    let inspector = api_key(&journey.server, "capacity_inspector", &["admin"]).await;
+
+    let other = journey
+        .server
+        .seed_tenant("gateway-capacity-other")
+        .await
+        .expect("second tenant seeds");
+    let Bootstrap::Machine {
+        api_key: other_key, ..
+    } = journey
+        .server
+        .bootstrap_service_in_tenant(other, "capacity_other", &["admin"])
+        .await
+        .expect("second-tenant service bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
+    let other_admin = journey
+        .server
+        .exchange_api_key(&other_key)
+        .await
+        .expect("second-tenant key exchanges");
+    deploy_at(&journey, &other_admin, "acme-first", &paced_url).await;
+    deploy_at(
+        &journey,
+        &other_admin,
+        "acme-held",
+        &format!("{}/held/v1", journey.upstream.uri()),
+    )
+    .await;
+    journey
+        .put_as(&other_admin, "capture-policy", metadata)
+        .await;
+    journey
+        .put_as(
+            &other_admin,
+            "governance-policy",
+            json!({
+                "limits": [{"subject": "tenant", "target": "all", "requests_per_minute": null,
+                            "tokens_per_minute": null, "concurrent_calls": 1}],
+                "budgets": [],
+                "pricing": [],
+                "unknown_cost": "allow_unpriced",
+            }),
+        )
+        .await;
+    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
+    let other_bearer = vec![("authorization", format!("Bearer {other_admin}"))];
+
+    let sent = std::time::Instant::now();
+    let stream = journey
+        .post(
+            "/v1/chat/completions",
+            &bearer,
+            &marked("acme-first/m", "paced-stream", true),
+        )
+        .await;
+    assert_eq!(stream.status().as_u16(), 200);
+    assert!(
+        sent.elapsed() >= PACED.stream_delay,
+        "the stream's headers wait on the provider's delayed headers"
+    );
+    let mut body = stream.bytes_stream();
+    let (mut text, mut events, mut reads) = (String::new(), 0, 0);
+    while let Some(read) = body.next().await {
+        reads += 1;
+        text.push_str(std::str::from_utf8(&read.expect("stream read")).expect("utf-8 stream"));
+        while let Some(end) = text[events..].find("\n\n").map(|at| events + at + 2) {
+            assert!(text[events..end].starts_with("data: "), "{text}");
+            events = end;
+        }
+    }
+    assert_eq!(
+        text,
+        GatewayCapture::chat_events("paced-stream", PACED_CHUNKS),
+        "the paced stream relays unchanged"
+    );
+    assert!(
+        reads > 1,
+        "separately written events reach the caller apart"
+    );
+    let sends = paced.take("paced-stream");
+    assert_eq!(sends.len(), PACED_CHUNKS, "one recorded send per event");
+    assert!(
+        sends
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] >= PACED.chunk_interval),
+        "the upstream paces its writes"
+    );
+    let buffered = journey
+        .post(
+            "/v1/chat/completions",
+            &bearer,
+            &marked("acme-first/m", "paced-buffered", false),
+        )
+        .await;
+    assert_eq!(buffered.status().as_u16(), 200);
+    buffered.json::<Value>().await.expect("buffered answer");
+
+    let (http, base, token) = (
+        journey.http.clone(),
+        journey.base.clone(),
+        other_admin.clone(),
+    );
+    let held = tokio::spawn(async move {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(token)
+            .json(&chat("acme-held/m"))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while journey.upstream_calls().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the held call dispatched");
+    let bodies: Vec<Value> = (0..3)
+        .map(|index| marked("acme-first/m", &format!("over-{index}"), false))
+        .collect();
+    let over = futures_util::future::join_all(
+        bodies
+            .iter()
+            .map(|body| journey.post("/v1/chat/completions", &other_bearer, body)),
+    )
+    .await;
+    for refused in over {
+        refusal(refused, 429, "WYRD_GATEWAY_429_LIMIT_EXCEEDED", openai_code).await;
+    }
+    let held = held
+        .await
+        .expect("held call joins")
+        .expect("held call answers");
+    assert_eq!(held.status().as_u16(), 200, "the admitted call completes");
+    for index in 0..2 {
+        let recovered = journey
+            .post(
+                "/v1/chat/completions",
+                &other_bearer,
+                &marked("acme-first/m", &format!("recovered-{index}"), false),
+            )
+            .await;
+        assert_eq!(
+            recovered.status().as_u16(),
+            200,
+            "lower-rate calls succeed once the limit frees"
+        );
+        recovered.json::<Value>().await.expect("recovered answer");
+    }
+
+    journey.settled_usage().await;
+    assert_eq!(
+        journey.captured_calls(&inspector, 2).await.len(),
+        2,
+        "the first tenant reads only its own two calls"
+    );
+    assert_eq!(
+        journey.captured_calls(&other_key, 3).await.len(),
+        3,
+        "the second tenant reads its three answered calls and no refusal"
     );
 }

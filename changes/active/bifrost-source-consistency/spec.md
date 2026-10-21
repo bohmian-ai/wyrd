@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-source-consistency
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -15,8 +15,10 @@ publication alone does not schedule another group read. PR #189 has merged;
 this correctness problem remains and will be fixed in a new worktree and PR.
 
 Make Oracle, Bifrost's query engine, choose and retain both sources before it
-executes a query. Oracle checks whether publication changed during that choice.
-If it did, Oracle starts the selection again before returning any rows. Scribe
+executes a query. Each Scribe reports how far its own publication has advanced
+while it captures its live rows, and Oracle checks that its cached published
+cut already covers that point. If it does not, Oracle refreshes the cut once and
+starts the selection again before returning any rows. Scribe
 also prevents local source changes from interrupting its selection of live rows.
 Every reader, including a group Verifier, uses this same corrected service.
 
@@ -64,47 +66,77 @@ leases prevent their deletion until the query releases them. A writer epoch
 identifies a writer incarnation, so a restarted writer cannot inherit an old
 capture's authority.
 
-1. Oracle reads a fresh published cut and its publication revision from the
-   database together. The revision is a per-table counter changed by publication.
+1. Oracle takes each table's published cut from its node-local cut cache, or
+   reads and caches it on a miss. With the cut comes one **publication
+   revision per Scribe node**: a per-table, per-node counter that the
+   publishing transaction advances, so a cut covers every publication of that
+   node up to its revision. Postgres notifications evict cut cache entries
+   for freshness, and a cut is served only while its node listens, exactly as
+   before; notifications never validate a read.
 2. Oracle discovers live data and asks every selected online Scribe to retain
    its matching rows. A Scribe with no matching live rows explicitly says so;
    disappearance of its final live partition cannot silently skip this step.
 3. Each Scribe selects its memory batches and staged files while briefly
-   excluding local ownership changes. In particular, publication cannot be
-   halfway between catalog commit and local advancement, and writable memory
-   cannot freeze into staging halfway through this selection.
-4. After all captures complete, Oracle checks the table revisions and writer
-   identities again using authoritative evidence. It executes only if the
-   acquisition remains valid. Otherwise it releases the entire selection and
-   retries within the original query deadline.
+   excluding local ownership changes, and in the same exclusion reports the
+   table's publication revision for its node: the revision its last
+   locally completed publication committed at. Publication cannot be halfway
+   between catalog commit and local advancement, and writable memory cannot
+   freeze into staging halfway through this selection.
+4. After all captures complete, Oracle compares every reported revision with
+   the cut's revision for that node, in memory. A reported revision above the
+   cut's means the cut predates a publication whose rows that Scribe no longer
+   serves live; Oracle evicts the table's cached cut, releases the entire
+   selection and retries within the original query deadline. The retry reads
+   Postgres because the cut is no longer cached. Writer identities are checked
+   as before.
 5. Execution reads the retained sources. Later publication or cleanup cannot
    invalidate them. Completion, cancellation, failure or expiry releases them.
 
-The ordering closes both races. Publication before the first catalog read is
-already represented by the file selection, and Scribe finishes its local change
-before capture. Publication during acquisition changes the revision, so that
-attempt is discarded. Publication after validation cannot remove retained data.
-The local exclusion also prevents a memory batch from being selected again after
-it freezes into staging, even when no publication occurs.
+The ordering closes both races without a per-query catalog read. A
+publication committed before the cut is in the cut, and Scribe finishes its
+local change before capture. A publication whose local advancement completed
+before capture raises the Scribe's revision above a cut that lacks it, so that
+attempt is discarded. A publication still in flight at capture time makes
+Scribe wait for its local outcome, as in revision 1. A publication after the
+capture leaves its rows in the retained live sources and outside the older
+cut. The local exclusion also prevents a memory batch from being selected
+again after it freezes into staging, even when no publication occurs.
+
+The revision is exact because publications by one node into one table commit
+in revision order: the counter row is locked by the publishing transaction
+until it commits, so a cut that sees revision *r* also sees every earlier
+publication of that node. An identical replay inserts nothing and invents no
+revision. A restarted Scribe loads its node's revisions once at startup, before
+it serves captures, so it never under-reports publications an earlier
+process completed.
 
 ## Why this approach, and its costs
 
-This extends Oracle's existing query ownership and Scribe's existing memory
-references and file leases. It avoids physical-filename comparisons, which
+This extends Oracle's existing query ownership, the existing notification
+cut cache, and Scribe's existing memory references and file leases. It
+follows the handoff pattern of RisingWave Hummock, Apache Fluss union reads
+and Kafka tiered storage: the published version carries a per-writer
+watermark, the writer reports its own watermark with its live data, and only a
+mismatch costs a metadata read. It avoids physical-filename comparisons, which
 become unreliable when compaction replaces files. Re-reading groups would leave
 other readers exposed. A cluster-wide write pause would coordinate more work
 than the source handoff requires.
 
-The cost is query startup coordination: a fresh initial catalog read, a final
-validation read, and live capture before the first result row. Required Scribe
-captures run with bounded parallelism. Publication conflicts repeat acquisition;
-sustained conflicts can exhaust the query deadline. Selective queries and
-`LIMIT` may pay more startup cost because they previously opened live sources
-only when consumed. These costs must fit the measured latency targets below.
+In steady state a query performs **no Postgres round trip**: the cut comes from
+the cache and validation is an in-memory comparison. Only a cut cache miss, a
+notification eviction or a detected stale cut costs one cut read. The remaining
+cost is live capture before the first result row, with bounded parallelism.
+Sustained publication conflicts can exhaust the query deadline. Selective
+queries and `LIMIT` may pay more startup cost because they previously opened
+live sources only when consumed. These costs must fit the measured latency
+targets below. Rows published by a writer that is unavailable at selection are
+as fresh as the cut cache's notification delivery; that matches their existing
+contract.
 
 Appends continue. A local rotation or publication may briefly wait for capture,
 but the guard does not cover upload, query execution, lease drainage or cleanup.
-No catalog round trip is added to each append acknowledgement.
+No catalog round trip is added to each append acknowledgement; publication adds
+one revision read inside its existing catalog transaction.
 
 ## What is promised, and what is outside this change
 
@@ -151,16 +183,19 @@ capture cannot be silently treated as a complete successful acquisition.
 | **INV-001 — One server-owned read service** | Oracle owns reads, Scribe owns source authority and Vala SQL owns catalog state. Clients and group scheduling gain no alternate read path or workaround. |
 | **INV-002 — Captures belong to one authority** | Tenant, table, query, deadline and writer epoch bind each capture and signed peer assignment. A foreign, substituted or expired reference cannot authorize a read. |
 | **INV-003 — Ingestion continues** | No cluster-wide append pause or remotely held publication barrier. Append acknowledgement retains its existing durable boundary and gains no per-append catalog request. |
-| **INV-004 — Revisions reflect committed publication** | New publication advances its revision in the same catalog transaction. Identical replay does not invent another publication. Notification-cache age cannot validate a read. |
+| **INV-004 — Revisions reflect committed publication** | New publication advances its node's table revision in the same catalog transaction, in commit order. Identical replay does not invent another publication. A cut is validated only against Scribe-reported revisions, never by notification-cache age. |
+| **INV-008 — No catalog read on the steady-state query path** | A query whose tables' cuts are cached and current performs no Postgres statement. Only a cache miss, a notification eviction or a detected stale cut reads the catalog, once per table per attempt. |
 | **INV-005 — Invalid acquisition is not success** | An unresolved selection emits no rows. Owner loss or deadline exhaustion cannot produce complete success; loss during execution fails rather than reopening live data. |
 | **INV-006 — Retention has a bounded lifetime** | Captures use existing query admission, memory, lease, cancellation and deadline budgets. They release on completion, cancelled/failed acquisition or expiry; cleanup cannot delete sources still in use. |
 | **INV-007 — Measurements include the real cost** | Refusals, wrong answers and missing required samples fail qualification. Query latency includes acquisition; no samples or coordination time are removed to meet a target. |
 
 ## Technical boundaries being approved
 
-Add tenant-scoped durable publication revision state, initialized for existing
-catalog rows through repository migration conventions. Both catalog acquisition
-and final validation use fresh database evidence. Preserve the existing coherent
+Add tenant-scoped durable publication revision state per table and Scribe
+node. Nothing has shipped, so the change's unreleased migration is edited in
+place rather than followed by another. Keep the notification cut cache and its
+Forge rewrite announcement. Catalog acquisition may be cached; validation uses
+the revisions Scribes report from their own completed publications. Preserve the existing coherent
 hot/Iceberg reconciliation and pinned-file protection across Forge promotion
 and compaction. Do not delete retained analytical data.
 
@@ -207,6 +242,7 @@ affected correctness checks and final capacity sequence again.
 | **AC-001 — Exact row coverage** | A real-client/server query across publication returns the expected row identities once, including when the last live partition disappears. Retained sources survive later publication. A Scribe proof checks the same promise across memory rollover. |
 | **AC-002 — Invalid selections stay contained** | Publication/epoch conflicts retry before output; invalid capture authority is refused. Publication uncertainty never supplies contradictory rows. Cancellation, failure and expiry release retained resources. |
 | **AC-003 — Group evidence reaches its verdict** | The existing late-evidence group journey passes on this build. Regressions for the merged workflows and first-class client/agent surfaces are accounted for at integrated review. |
+| **AC-007 — Steady-state reads skip the catalog** | A real-client/server proof shows a warm query issues no cut read, and a publication completed before capture costs exactly one cut read and a retry before output. |
 | **AC-004 — One current implementation remains** | Diff and documentation checks show the superseded read path and publication-race allowance are gone. Independent integrity checks and historical review evidence remain. |
 | **AC-005 — Benchmark verdicts are accurate** | Report tests accept the exact inclusive limits and reject the next representable value/bucket above them while preserving throughput, sample, refusal and background-reporting rules. |
 | **AC-006 — Final capacity meets the targets** | The final capacity commands pass on the identified candidate with comparable retained artifacts. Bifrost query capacity runs last. Independent task/change review owns approval of this follow-up change. |
@@ -236,9 +272,10 @@ remain caller-owned actions; PR #189 is already merged.
 
 ## Status, history and authority
 
-Revision 1 was explicitly approved by the maintainer on 2026-10-21. Approval
-covers the proposed protocol, limits, performance targets and verification
-obligations. No technical decision is intentionally deferred.
+Revision 2 was directed by the maintainer on 2026-10-21, replacing revision
+1's mandatory per-query catalog reads. Its limits, performance targets and
+verification obligations are unchanged. No technical decision is intentionally
+deferred.
 
 The [long-horizon specification, revision 21](../long-horizon-verification/spec.md)
 continues to govern existing grouping functionality. Approval of this change
@@ -248,7 +285,8 @@ and product prose accordingly, preserving historical evidence and that packet.
 
 | Revision | Status | Change |
 | --- | --- | --- |
-| 1 | approved | Reliable source acquisition and scoped deletion; clarified for maintainer review and execution from merged main in a new worktree. PR #189's merge changes delivery context only, not behavior, scope, targets or proof. Explicitly approved by the maintainer on 2026-10-21. |
+| 2 | approved | Replace the per-query fresh cut read and validation read with the notification cut cache validated by Scribe-reported per-node publication revisions (INV-008). Directed by the maintainer on 2026-10-21 after capacity runs showed the revision 1 read path regressing hot selective latency and throughput. |
+| 1 | superseded | Reliable source acquisition and scoped deletion; clarified for maintainer review and execution from merged main in a new worktree. PR #189's merge changes delivery context only, not behavior, scope, targets or proof. Explicitly approved by the maintainer on 2026-10-21. |
 
 - [Repository standards](../../../AGENTS.md), [agent rules](../../../architecture/agent-rules.md).
 - [Wyrd design](../../../architecture/wyrd-design.md), [Bifrost design](../../../architecture/bifrost-design.md).

@@ -205,8 +205,12 @@ pub fn outcome_key(outcome: &Outcome) -> String {
 /// Integrity counters between a step's baseline and its final scrape.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Integrity {
-    /// Events every outbox counted lost.
+    /// Events every outbox counted lost, for every reason.
     pub lost: f64,
+    /// The part of `lost` shed at an outbox's unreserved staging limit.
+    pub shed: f64,
+    /// Items the Scribe outbox wrote.
+    pub written_items: f64,
     /// Captures staged.
     pub staged: f64,
     /// Captures dropped before staging, any reason.
@@ -225,19 +229,66 @@ impl Integrity {
         let captures = |metrics: &Metrics| metrics.sum("wyrd_gateway_capture_total", &[]);
         let staged = delta("wyrd_gateway_capture_total", &["outcome=\"staged\""]);
         let lost = delta("outbox_events_lost_total", &[]);
+        let shed = delta("outbox_events_lost_total", &["reason=\"shed\""]);
         let total = captures(after) - captures(before);
         let written = delta("outbox_write_seconds_count", &["outbox=\"scribe\""]);
+        let written_items = delta("outbox_items_written_total", &["outbox=\"scribe\""]);
+        let counters = [lost, shed, staged, total, written, written_items];
         Self {
             lost,
+            shed,
+            written_items,
             staged,
             dropped: total - staged,
             written,
-            reset: [lost, staged, total, written]
-                .iter()
-                .any(|value| *value < 0.0)
-                || ![lost, staged, total, written]
-                    .iter()
-                    .all(|value| value.is_finite()),
+            reset: counters.iter().any(|value| *value < 0.0)
+                || !counters.iter().all(|value| value.is_finite()),
+        }
+    }
+
+    /// These counters with shed items forgiven: `lost` keeps only loss for
+    /// another reason, for a window where shedding at the outbox limit is
+    /// reported rather than judged.
+    pub fn without_shed(&self) -> Self {
+        Self {
+            lost: self.lost - self.shed,
+            shed: 0.0,
+            ..*self
+        }
+    }
+
+    /// The fraction of items handed to the outbox that were shed: shed
+    /// items over written and lost ones, or zero when nothing was handed
+    /// over.
+    pub fn shed_fraction(&self) -> f64 {
+        let handed = self.written_items + self.lost;
+        if handed > 0.0 {
+            self.shed / handed
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Items and accounted bytes the Scribe outbox wrote during a traffic
+/// window, the durable capture throughput a saturated row reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Durable {
+    /// Items written.
+    pub items: f64,
+    /// Accounted bytes written.
+    pub bytes: f64,
+}
+
+impl Durable {
+    /// What the Scribe outbox wrote between `before` and `after`.
+    pub fn between(before: &Metrics, after: &Metrics) -> Self {
+        let delta = |family: &str| {
+            after.sum(family, &["outbox=\"scribe\""]) - before.sum(family, &["outbox=\"scribe\""])
+        };
+        Self {
+            items: delta("outbox_items_written_total"),
+            bytes: delta("outbox_bytes_written_total"),
         }
     }
 }
@@ -264,6 +315,8 @@ pub struct Step {
     pub telemetry: Telemetry,
     /// Integrity counters from the baseline to the final scrape.
     pub integrity: Integrity,
+    /// What the Scribe outbox wrote during the traffic window alone.
+    pub durable: Durable,
     /// `None` without profiling; otherwise every missing evidence class.
     pub profile_gaps: Option<Vec<String>>,
 }
@@ -351,7 +404,7 @@ impl<'a> Bench<'a> {
         let capture = self.profiler.start(name)?;
         let (traffic, baseline) = Window::open(self.server, SELECTION).await?;
         let samples = self.drive(shape, clients, WINDOW).await?;
-        let (traffic, _) = traffic.close(self.server).await?;
+        let (traffic, ended) = traffic.close(self.server).await?;
         let (draining, _) = Window::open(self.server, Selection::RESOURCES).await?;
         let drain = settle(self.server).await?;
         let (drained, last) = draining.close(self.server).await?;
@@ -365,6 +418,7 @@ impl<'a> Bench<'a> {
             drained,
             telemetry: Readings::read(&baseline, SELECTION).since(&last),
             integrity: Integrity::between(&baseline, &last),
+            durable: Durable::between(&baseline, &ended),
             profile_gaps: None,
         };
         let metadata = serde_json::json!({"step": name, "clients": clients});

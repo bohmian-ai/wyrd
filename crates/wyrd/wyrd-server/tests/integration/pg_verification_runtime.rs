@@ -3751,18 +3751,22 @@ const OUTAGE_TRACE: &str = "7bf92f3577b34da6a3ce929d0e0e4736";
 /// The caller trace of the one request after Scribe returns.
 const RECOVERED_TRACE: &str = "8bf92f3577b34da6a3ce929d0e0e4736";
 
-/// The process's count of Scribe-outbox writes lost, read from the rendered
-/// production recorder; zero before the first loss.
+/// The process's count of Scribe-outbox writes lost for every reason, read
+/// from the rendered production recorder; zero before the first loss.
 ///
 /// # Panics
-/// Panics when the rendered counter value is not an integer.
+/// Panics when a rendered counter value is not an integer.
 fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster) -> u64 {
     cluster
         .telemetry()
         .render()
         .lines()
-        .find_map(|line| line.strip_prefix(r#"outbox_events_lost_total{outbox="scribe"} "#))
-        .map_or(0, |value| value.trim().parse().expect("an integer counter"))
+        .filter(|line| {
+            line.starts_with("outbox_events_lost_total{") && line.contains(r#"outbox="scribe""#)
+        })
+        .filter_map(|line| line.rsplit_once(' '))
+        .map(|(_, value)| value.trim().parse::<u64>().expect("an integer counter"))
+        .sum()
 }
 
 /// Durable rows `tenant` holds in `table`, from the published file list.

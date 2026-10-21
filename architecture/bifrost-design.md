@@ -969,7 +969,7 @@ Scribe as a `vala.system.audit_log` row in a per-tenant batch, like every other
 audit event. Rows are not held for that write; a retryable failure is logged,
 counted through `outbox_write_failures_total{outbox="scribe"}`, and retried with
 the identical batch, and a terminal rejection is logged, counted through
-`outbox_events_lost_total{outbox="scribe"}`, and consumed. The
+`outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and consumed. The
 `outbox_pending{outbox="scribe"}` gauge reports writes the process still owns
 before Scribe acknowledges them or their loss is counted, and shutdown drains
 the outbox to its deadline. One logical query produces one read-audit event; distributed stages

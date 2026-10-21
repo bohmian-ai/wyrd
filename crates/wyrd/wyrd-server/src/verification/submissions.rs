@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use wyrd_runtime::outbox::{Outbox, OutboxSink};
+use wyrd_runtime::outbox::{Outbox, OutboxLimits, OutboxSink};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
     Submission, SubmissionOutcome, VerifierExecutionQueue,
@@ -79,7 +79,12 @@ impl SubmissionSink {
                 accepted: Arc::new(Notify::new()),
             },
             SUBMISSION_WRITER_CONNECTIONS,
-            SUBMISSION_CAPACITY,
+            OutboxLimits {
+                items: SUBMISSION_CAPACITY,
+                // Each submission is bounded by the verification input
+                // limits, so the item limit bounds this outbox's memory.
+                bytes: usize::MAX,
+            },
         )
     }
 

@@ -879,7 +879,10 @@ pub async fn compose_bifrost(
             peer_tls.as_ref(),
         ),
         scribe_config.ingest_request_bytes,
-        scribe_config.outbox_capacity,
+        wyrd_runtime::outbox::OutboxLimits {
+            items: scribe_config.outbox_capacity,
+            bytes: scribe_config.outbox_bytes,
+        },
         Some(postgres.wyrd().clone()),
     );
     let scribe = if let Some(parts) = scribe {

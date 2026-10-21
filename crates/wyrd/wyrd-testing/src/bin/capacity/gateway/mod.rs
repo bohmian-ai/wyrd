@@ -425,7 +425,8 @@ fn fresh(output: &Path) -> Result<()> {
 }
 
 /// Whether `server` settled with nothing active or pending and no outbox
-/// item ever lost, before it is stopped.
+/// item ever lost other than shed at an outbox limit, which saturated rows
+/// already report, before it is stopped.
 ///
 /// # Errors
 ///
@@ -434,7 +435,9 @@ async fn quiescent(server: &LocalServer) -> Result<bool> {
     if settle(server).await?.is_none() {
         return Ok(false);
     }
-    Ok(server.metrics().await?.sum("outbox_events_lost_total", &[]) == 0.0)
+    let metrics = server.metrics().await?;
+    let lost = metrics.sum("outbox_events_lost_total", &[]);
+    Ok(lost - metrics.sum("outbox_events_lost_total", &["reason=\"shed\""]) == 0.0)
 }
 
 /// The instant overhead upstream: one route per [`Case::prefix`], answering

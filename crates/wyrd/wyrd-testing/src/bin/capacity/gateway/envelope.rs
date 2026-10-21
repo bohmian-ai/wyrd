@@ -316,21 +316,32 @@ fn growth_misses(measured: &Measured) -> Vec<String> {
 /// outside a tenant's own answered-to-admissible calls, rows not summing to
 /// the staged captures, or peak memory within [`MEMORY_HEADROOM_BYTES`] of
 /// `memory_limit`.
-pub fn capture_misses(measured: &Measured, memory_limit: u64) -> Vec<String> {
+///
+/// With `allow_shed`, as during an overload interval, items shed at the
+/// outbox limit are reported but not judged: they are forgiven as loss, and
+/// as many durable rows may be missing from a tenant's answered calls and
+/// from the staged captures.
+pub fn capture_misses(measured: &Measured, memory_limit: u64, allow_shed: bool) -> Vec<String> {
     let mut misses = Vec::new();
     if !measured.admitted.is_finite() || measured.admitted < 0.0 {
         misses.push("admitted calls are not evidence".to_owned());
     }
+    let (integrity, shed) = if allow_shed {
+        (measured.integrity.without_shed(), measured.integrity.shed)
+    } else {
+        (measured.integrity, 0.0)
+    };
     misses.extend(integrity_misses(
-        &measured.integrity,
+        &integrity,
         measured.admitted.to_u64().unwrap_or(0),
     ));
+    let slack = shed.to_i64().unwrap_or(0);
     let mut rows = 0;
     for (tenant, owned) in measured.ownership.iter().enumerate() {
         rows += owned.rows;
         let answered = i64::try_from(owned.answered).unwrap_or(i64::MAX);
         let admissible = i64::try_from(owned.admissible).unwrap_or(i64::MAX);
-        if owned.rows < answered || owned.rows > admissible {
+        if owned.rows.saturating_add(slack) < answered || owned.rows > admissible {
             misses.push(format!(
                 "{} reads {} capture rows for {answered}..={admissible} of its calls",
                 TENANTS[tenant], owned.rows
@@ -339,7 +350,9 @@ pub fn capture_misses(measured: &Measured, memory_limit: u64) -> Vec<String> {
     }
     if measured.ownership.is_empty() {
         misses.push("no tenant capture reads".to_owned());
-    } else if (rows as f64 - measured.integrity.staged).abs() > 0.5 {
+    } else if rows as f64 > measured.integrity.staged + 0.5
+        || (rows as f64) < measured.integrity.staged - shed - 0.5
+    {
         misses.push(format!(
             "tenants read {rows} rows for {} staged captures",
             measured.integrity.staged
@@ -402,7 +415,7 @@ pub fn overload_misses(measured: &Measured, memory_limit: u64) -> (Vec<String>, 
             misses.push(format!("{count}x {outcome}"));
         }
     }
-    misses.extend(capture_misses(measured, memory_limit));
+    misses.extend(capture_misses(measured, memory_limit, true));
     let saturated = refused > 0 || !growth_misses(measured).is_empty();
     (misses, saturated)
 }
@@ -418,7 +431,7 @@ pub fn recovery_misses(
 ) -> Vec<String> {
     let mut misses = evidence_misses(load, measured);
     misses.extend(slo_misses(load, measured, slo));
-    misses.extend(capture_misses(measured, memory_limit));
+    misses.extend(capture_misses(measured, memory_limit, false));
     misses
 }
 
@@ -525,8 +538,13 @@ fn evidence(load: Load, measured: &Measured) -> String {
     }
     let integrity = &measured.integrity;
     parts.push(format!(
-        "captures staged {}/{} admitted, dropped {}, lost {}, scribe writes {}",
-        integrity.staged, measured.admitted, integrity.dropped, integrity.lost, integrity.written
+        "captures staged {}/{} admitted, dropped {}, lost {} (shed {}), scribe writes {}",
+        integrity.staged,
+        measured.admitted,
+        integrity.dropped,
+        integrity.lost,
+        integrity.shed,
+        integrity.written
     ));
     parts.extend(
         measured
@@ -639,13 +657,14 @@ impl Report {
         self.push(Row::judged(
             format!("{} integrity", measured.name),
             blank.clone(),
-            &capture_misses(measured, self.memory_limit_bytes()),
+            &capture_misses(measured, self.memory_limit_bytes(), false),
             format!(
-                "captures staged {}/{} admitted, dropped {}, lost {}",
+                "captures staged {}/{} admitted, dropped {}, lost {} (shed {})",
                 measured.integrity.staged,
                 measured.admitted,
                 measured.integrity.dropped,
-                measured.integrity.lost
+                measured.integrity.lost,
+                measured.integrity.shed
             ),
         ));
         let drain = measured.drain.map_or_else(

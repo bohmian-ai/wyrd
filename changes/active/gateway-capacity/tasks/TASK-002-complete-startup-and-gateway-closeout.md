@@ -683,3 +683,17 @@ corrections and private implementation decisions remain implementation work.
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Status
+
+Criteria 1–4 and 7 are implemented on this branch. Their proof is the shared
+startup, engine-owned refresh, ordered shutdown and two-tenant attribution
+journeys committed with them. Criteria 5–6 are release benchmark evidence:
+- the revision-2 evidence is recorded;
+- the revision-4 matrix found capture shedding under closed-loop saturation,
+  which led to [revision 5](../spec-revision-5.md) and
+  [TASK-004](TASK-004-capture-loss-under-saturation.md);
+- the release matrix rerun on the revision-5 code is deferred at the
+  maintainer's request (2026-10-21).
+
+The task stays `in-progress` until that rerun closes criteria 5–6.

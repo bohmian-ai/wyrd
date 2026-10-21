@@ -380,7 +380,8 @@ impl HttpTransport {
             .open_timed(provider, method, url, headers, payload)
             .await?;
         let answer_type = answer_type(&response).to_owned();
-        let bytes = read_bounded_bytes(provider, response, self.config().max_response_bytes).await?;
+        let bytes =
+            read_bounded_bytes(provider, response, self.config().max_response_bytes).await?;
         drop(exchange);
         Ok((answer_type, bytes))
     }

@@ -481,9 +481,7 @@ impl ExecutionTiming {
     pub fn until_last_byte(&self, last_byte: Option<std::time::Instant>) -> Duration {
         self.upstream
             + self.open.map_or(Duration::ZERO, |(sent, headers)| {
-                last_byte
-                    .unwrap_or(headers)
-                    .saturating_duration_since(sent)
+                last_byte.unwrap_or(headers).saturating_duration_since(sent)
             })
     }
 }
@@ -1314,7 +1312,10 @@ mod tests {
                 ended: Some(at(3)),
             }],
         );
-        assert_eq!((failed.upstream, failed.translate), (Duration::from_millis(2), Duration::from_millis(1)));
+        assert_eq!(
+            (failed.upstream, failed.translate),
+            (Duration::from_millis(2), Duration::from_millis(1))
+        );
         assert_eq!(failed.open, None);
     }
 }

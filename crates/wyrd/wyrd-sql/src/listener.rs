@@ -136,8 +136,8 @@ impl NotificationListener {
             }
         }
         if let Some(failed) = unreleased {
-            // Releasing failed twice; the stalled connection is retained
-            // only until its socket fails.
+            // One last bounded release attempt; if it fails too, the
+            // stalled connection is retained only until its socket fails.
             drop(self.discard(failed).await);
         }
         reset(false);

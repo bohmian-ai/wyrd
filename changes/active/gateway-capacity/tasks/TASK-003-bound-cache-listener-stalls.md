@@ -252,3 +252,130 @@ support and equivalent focused selectors remain implementation decisions.
 - [AGENTS.md](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), and [Bifrost design](../../../../architecture/bifrost-design.md)
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), and [testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+### Reuse and owner
+
+- **Existing owners:** `wyrd-server/src/postgres.rs::watch_channel` (gateway
+  snapshots, Verifier targets) and `vala-bifrost-redux/.../cut_cache.rs::CutCache::watch`
+  (Oracle cuts) duplicated connect/`LISTEN`/receive/retry with SQLx eager
+  reconnect and no liveness probe.
+- **Gap:** neither could detect a silent stall, and both reset the cache only
+  after SQLx had already reconnected.
+- **Extension:** one `wyrd_sql::NotificationListener`
+  (`crates/wyrd/wyrd-sql/src/listener.rs`), built by
+  `WyrdPostgres::listener` / `ValaPostgres::listener` and reexported by
+  `vala-sql`, so no domain caller holds a raw pool. Both old watchers are
+  deleted. Each cache keeps its own `reset`/`invalidate`, generation fence,
+  eviction bounds and worker.
+- **Dependencies:** `wyrd-sql` now declares the workspace `tokio` and
+  `tokio-util` it uses at runtime. Tokio's `time` feature already comes from
+  SQLx's `runtime-tokio`, so no new package, version or feature was added.
+- **Test configuration:** `wyrd-testing` enables the existing
+  `wyrd-sql/test-support` feature, which shortens the heartbeat. `check:deps`
+  confirms the shipped server enables no test seam.
+
+### Pinned SQLx behaviour and bounded cleanup
+
+- **Disconnects:** with `eager_reconnect(false)`, `PgListener::try_recv`
+  returns `Ok(None)` after closing a dead connection, without reconnecting.
+- **Probe buffering:** `SELECT 1` runs on `&mut PgListener`, and its stream
+  buffers any `NotificationResponse` that arrives during the probe for the
+  next `try_recv`.
+- **Cancellation:** `recv_unchecked` is cancel-safe, so racing receive
+  against the heartbeat tick and shutdown loses nothing.
+- **The dropped listener's cleanup task:** `PgListener::drop` spawns an
+  `UNLISTEN *` that waits forever on a stalled path.
+  `NotificationListener::discard` avoids it using only the public API. It
+  detaches a fresh pool connection and `mem::replace`s it into the listener
+  through `Acquire for &mut PgListener`, then `close_hard`s the stalled
+  connection, bounded by the probe timeout. Dropping the listener then sends
+  `UNLISTEN` on the healthy connection and returns it to the pool.
+- **When no replacement connection arrives:** the failed listener is kept,
+  never more than one per watcher, and released before any new subscription.
+  If it still can't be released at shutdown, it is dropped and its stalled
+  connection lives until its socket fails. This happens only when Postgres
+  itself is unreachable.
+- **Defaults:** heartbeat 30 s, probe/stage timeout 5 s, reconnect delay
+  1 s. These are internal constants, not settings.
+
+### Portable fault support
+
+- `crates/wyrd/wyrd-testing/src/listener_stall.rs::ListenerStallProxy` is an
+  in-process loopback TCP proxy. It routes DSNs with `sslmode=disable` and
+  tags each connection by the `LISTEN "<channel>"` it sends.
+- Stalling a channel drops data in both directions on the tagged connections
+  while their sockets stay open. A server close is still forwarded, and the
+  proxy reports client-side release.
+- Wiring: `WyrdTestServerBuilder::with_postgres_proxy_for_test` and
+  `PgFixture::runtime_dsns`. No production switch.
+
+### RED / GREEN
+
+- **Scenario 1 RED** (before `e04a6d8cd`): `silent_listener_stall_falls_back_and_recovers`
+  failed after 61.5 s: `A's route during a silent stall ... stored "/one/..."
+  expected "/two/..."`. The cached route never expired, and request
+  connections were unaffected.
+- **Scenario 1 GREEN:** a stall was detected in 34.4 s and 34.8 s on two runs,
+  logged as `cache listener heartbeat timed out ... channel=wyrd_gateway_snapshot`.
+  During the stall, calls read Postgres and `listening == 0`. Tenant B kept
+  its route. After restore and resubscription, the next move was seen.
+- **Scenarios 2–3:** these exercise `NotificationListener` directly, which
+  doesn't exist before the extraction, so they have no runnable pre-change
+  RED. The old eager-reconnect path is gone. They are recorded as regression
+  proof.
+  - Loss ordering: stalled starts stayed off and retried at the 1 s delay
+    after each 5 s subscription timeout, without spinning. After
+    `pg_terminate_backend`, the cache went off while the replacement
+    subscription was held pending. Recovery switched it on exactly once.
+  - Lifecycle: across three stall/restore rounds, each stalled connection was
+    released while the stall was still in place, the other channel's listener
+    kept delivering, and the pool grew by no connections. Cancellation took
+    25 ms in receive, 1.7 ms during a pending probe, 0.3 ms during a pending
+    subscription and 0.07 ms in retry, all well within the 35 s drain. No
+    stalled connection was left open.
+
+#### Diagnosis: loss-ordering test terminated its own session
+
+- **Symptom:** `listener_loss_disables_cache_before_reconnect` failed with
+  `57P01 terminating connection due to administrator command` from its own
+  superuser statement.
+- **Evidence:** the trace showed the listener loss being handled normally;
+  the error came back on the terminating query itself.
+- **Cause:** `SELECT ... WHERE query = $1 AND pg_terminate_backend(pid)`
+  leaves the qual order to the planner, which may evaluate the termination
+  before the filter.
+- **Fix site:** the new test only. It now selects the pids first and
+  terminates them in a second statement. The existing
+  `RefreshJourney::listeners` was left unchanged; it is outside this task and
+  passes.
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-013, AC-011: silent stall stops cache service within 30 s + 5 s; uncached calls see changes; notifications work after recovery | `listener.rs::receive`/`probe`; three cache `watch` callers | `silent_listener_stall_falls_back_and_recovers` (34.4 s / 34.8 s detection, 10 s tolerance; production defaults asserted) | PASS |
+| REQ-013, AC-011: cache-off before blocked recovery; failed starts stay off; empty restart; old-generation fills rejected | `subscription` resets off before `discard`/retry; owner generation fences unchanged | `listener_loss_disables_cache_before_reconnect`; existing owner unit tests in `test:wyrd`/`test:vala` (e.g. `cut_cache_serves_only_fresh_listened_cuts`) | PASS |
+| REQ-013, AC-011: bounded cancellation, released stalled connections, independent listeners | `discard`, shutdown branches at every stage | `listener_shutdown_releases_stalled_connections` | PASS |
+| INV-001, INV-003: tenant/payload/generation isolation, Oracle revision checks, one SQL-owned implementation | Owners keep `invalidate`/`reset`/`evict`; `rg` finds no `PgListener` outside `wyrd-sql` and tests | `engine_owned_refresh_preserves_tenant_changes`, `test:wyrd`, `test:vala`, `check:tenant-isolation` | PASS |
+
+### Verification
+
+| Command | Result |
+|---|---|
+| `mise run build:server` | PASS |
+| silent-stall, loss-ordering, listener-lifecycle, and refresh exact selectors (task commands) | PASS (4/4) |
+| `WYRD_TEST_PACKAGES='wyrd-sql wyrd-server' mise run test:wyrd` | PASS (1018) |
+| `WYRD_TEST_PACKAGES='vala-sql vala-bifrost-redux' mise run test:vala` | PASS (970) |
+| `mise run fmt`, `mise run lints` | PASS |
+| `mise run check:deps`, `mise run check:tenant-isolation` | PASS |
+| `git diff --check` | PASS |
+
+- **Non-goals:** none were pursued. There is no cache TTL, setting,
+  environment variable, PID tracking, custom connector, shared connection
+  service, migration, public API/SDK change, audit/authorization/capture
+  change, or OS-specific mechanism.
+- **Other files:** none outside the task's write set were changed.
+- **Not run (deliberate):** the broad journey suites and `gate` were not run,
+  per the task scope.

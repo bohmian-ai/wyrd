@@ -20,8 +20,6 @@ status: runnable
 
 - PostgreSQL 16 with an ordinary login that owns the `wyrd` database. The server refuses superuser and `BYPASSRLS` logins.
 
-<Aside type="caution" title="Version">These pages describe Wyrd 0.2.0, built from this repository. The newest published packages (`wyrd-ai` on PyPI and npm), server release, and `bohmian/wyrd` images are 0.1.1, which predates `wyrd declare`, `wyrd get`, `wyrd pull`, and JSON output for setup commands. A 0.2.0 CLI refuses a 0.1.1 server with `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE`.</Aside>
-
 With Docker, this gives you a suitable database. The image's `postgres` user is a superuser, so the commands create a separate `wyrd` login:
 
 ```bash

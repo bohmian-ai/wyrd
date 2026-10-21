@@ -578,7 +578,7 @@ impl ImmutableGeneration {
             opened_at: self.opened_at,
             closed_at: self.closed_at,
             arrow_bytes: self.arrow_bytes,
-            charge: Default::default(),
+            charge: Arc::default(),
         }
     }
 }

@@ -501,7 +501,7 @@ impl Memtable {
             opened_at: Instant::now(),
             closed_at: Instant::now(),
             arrow_bytes,
-            charge: Default::default(),
+            charge: Arc::default(),
         })
     }
 

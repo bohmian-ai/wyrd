@@ -322,7 +322,10 @@ impl RetainedArrowCharge {
     /// Returns [`ScribeError::Internal`] when this owner already holds a
     /// retired lease; a generation retires once. The rejected lease is dropped
     /// and so returns its bytes.
-    pub(crate) fn hold(&self, lease: crate::resources::ScribeMemoryLease) -> Result<(), ScribeError> {
+    pub(crate) fn hold(
+        &self,
+        lease: crate::resources::ScribeMemoryLease,
+    ) -> Result<(), ScribeError> {
         self.retired.set(lease).map_err(|_| ScribeError::Internal {
             detail: "retired Arrow charge was already held".to_owned(),
         })

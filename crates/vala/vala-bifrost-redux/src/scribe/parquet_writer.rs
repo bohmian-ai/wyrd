@@ -1137,7 +1137,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         }
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1276,7 +1276,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         }
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1887,7 +1887,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -2328,7 +2328,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
             arrow_bytes: 0,
-            charge: Default::default(),
+            charge: Arc::default(),
         };
         let (scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
         let paths = encoded

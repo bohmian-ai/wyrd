@@ -439,8 +439,8 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
@@ -480,7 +480,9 @@ mod tests {
             &self,
             _request: Request<ListActiveStreamsRequest>,
         ) -> Result<Response<ListActiveStreamsResponse>, Status> {
-            Err(Status::unimplemented("listing is not served by this fixture"))
+            Err(Status::unimplemented(
+                "listing is not served by this fixture",
+            ))
         }
 
         /// Counts the release and never returns.

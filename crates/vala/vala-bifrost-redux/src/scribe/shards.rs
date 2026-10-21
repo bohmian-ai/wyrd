@@ -8043,9 +8043,10 @@ mod tests {
         memtable
             .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
-        let active = crate::scribe::memtable::LiveCapture::take([&memtable], key.tenant, &key.table, None)
-            .expect("active capture")
-            .expect("unregistered capture");
+        let active =
+            crate::scribe::memtable::LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("active capture")
+                .expect("unregistered capture");
         // Freeze hands persistence a clone of the generation, which holds the
         // charge too; this test keeps only its identity and size.
         let frozen = memtable.freeze(&key).expect("owner freeze");
@@ -8066,9 +8067,14 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
-        let pending = crate::scribe::memtable::LiveCapture::take([owner.memtable.as_ref()], key.tenant, &key.table, None)
-            .expect("pending capture")
-            .expect("unregistered capture");
+        let pending = crate::scribe::memtable::LiveCapture::take(
+            [owner.memtable.as_ref()],
+            key.tenant,
+            &key.table,
+            None,
+        )
+        .expect("pending capture")
+        .expect("unregistered capture");
         let read = active
             .read(&(key.partition..=key.partition), &["value".to_owned()])
             .expect("projected read");
@@ -8084,7 +8090,7 @@ mod tests {
         owner.retained_generations.insert(
             seal_id,
             RetainedGeneration {
-                arrow_bytes: arrow_bytes,
+                arrow_bytes,
                 memory_released: false,
                 wal_segments: Vec::new(),
                 wal: wal_handle,
@@ -8094,12 +8100,14 @@ mod tests {
         let charged = budget.memory_snapshot();
         owner.retire_committed().await.expect("retirement");
         assert!(!owner.retained_generations.contains_key(&seal_id));
-        assert_eq!(owner.memtable.immutable_generation_count().expect("count"), 0);
+        assert_eq!(
+            owner.memtable.immutable_generation_count().expect("count"),
+            0
+        );
         assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
         let retained = budget.memory_snapshot();
         assert_eq!(retained.scribe_total_bytes, charged.scribe_total_bytes);
-        let refreed = retained.scribe_limit_bytes - retained.scribe_total_bytes
-            + arrow_bytes;
+        let refreed = retained.scribe_limit_bytes - retained.scribe_total_bytes + arrow_bytes;
         assert!(
             budget
                 .try_reserve_maintenance(MemoryCategory::Active, refreed)

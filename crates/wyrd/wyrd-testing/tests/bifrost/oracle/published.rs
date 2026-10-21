@@ -1717,18 +1717,14 @@ async fn prove_time_range_reads(
 const SOURCE_TRANSITION_BOUND: Duration = Duration::from_mins(1);
 
 /// Returns how many live captures the cluster's Scribes currently retain.
-///
-/// # Errors
-///
-/// Returns an error when a Scribe pod composes no tail service.
-fn retained_captures(cluster: &WyrdTestCluster) -> Result<usize, JourneyError> {
+fn retained_captures(cluster: &WyrdTestCluster) -> usize {
     let mut retained = 0;
     for server in cluster.servers() {
         if let Some(scribe) = server.state().bifrost_ingest() {
             retained += scribe.tail_service().retained_captures_for_test();
         }
     }
-    Ok(retained)
+    retained
 }
 
 /// Waits until every Scribe has released every capture.
@@ -1743,7 +1739,7 @@ fn retained_captures(cluster: &WyrdTestCluster) -> Result<usize, JourneyError> {
 async fn captures_released(cluster: &WyrdTestCluster, case: &str) -> Result<(), JourneyError> {
     let deadline = tokio::time::Instant::now() + SOURCE_TRANSITION_BOUND;
     loop {
-        let retained = retained_captures(cluster)?;
+        let retained = retained_captures(cluster);
         if retained == 0 {
             return Ok(());
         }
@@ -1817,7 +1813,7 @@ fn expect_exact(case: &str, mut ids: Vec<i64>, expected: &[i64]) -> Result<(), J
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn source_transitions_preserve_exact_rows() {
-    prove_source_transitions()
+    Box::pin(prove_source_transitions())
         .await
         .expect("every source transition preserves exact rows");
 }
@@ -1945,7 +1941,7 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn unvalidated_captures_fail_before_rows_and_release_resources() {
-    prove_unvalidated_captures()
+    Box::pin(prove_unvalidated_captures())
         .await
         .expect("unvalidated captures fail and release");
 }
@@ -2029,7 +2025,7 @@ async fn prove_unvalidated_captures() -> Result<(), JourneyError> {
     // producer pauses before its second batch, so a second live row exists.
     crate::distributed::append_live_row(&writer, &fqn, 7, None).await?;
     let stream = crate::distributed::open_paused_live_query(&query, &sql, "cancelled read").await?;
-    if retained_captures(&cluster)? == 0 {
+    if retained_captures(&cluster) == 0 {
         return Err("cancelled read: the open query retains no capture".into());
     }
     drop(stream);

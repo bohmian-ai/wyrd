@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 from ...errors import WyrdError
+from ...otel import _EXPORTER_EXTRA
 from ...state import WyrdState
 
 Scope = MutableMapping[str, Any]
@@ -23,10 +24,17 @@ _LOG = logging.getLogger("wyrd.integrations.asgi")
 
 
 def _diagnostic(error: Exception) -> str:
-    """One line naming ``error``: its Wyrd code and message, else its type and message."""
+    """One line naming ``error`` without its arbitrary text.
+
+    A ``WyrdError`` gives its code and message, and the missing ``otel`` extra
+    its install remedy; any other error gives only its type, because its text
+    may hold secrets.
+    """
     if isinstance(error, WyrdError):
         return f"{error.code}: {error.message}"
-    return f"{type(error).__name__}: {error}"
+    if isinstance(error, ImportError) and str(error) == _EXPORTER_EXTRA:
+        return _EXPORTER_EXTRA
+    return f"unexpected {type(error).__name__}; its message is withheld"
 
 
 class WyrdMiddleware:
@@ -125,7 +133,14 @@ class WyrdMiddleware:
             await send({"type": "lifespan.startup.failed", "message": _diagnostic(error)})
             return
         pending: list[Message] = [startup]
-        replied = False
+        replied = drained = False
+
+        async def drain() -> str | None:
+            nonlocal drained
+            if drained:
+                return None
+            drained = True
+            return await self._drain()
 
         async def app_receive() -> Message:
             return pending.pop() if pending else await receive()
@@ -135,26 +150,29 @@ class WyrdMiddleware:
             replied = True
             kind = message["type"]
             if kind == "lifespan.startup.failed" or kind.startswith("lifespan.shutdown."):
-                failure = await self._drain()
+                failure = await drain()
                 if failure and kind == "lifespan.shutdown.complete":
                     message = {"type": "lifespan.shutdown.failed", "message": failure}
             await send(message)
 
         try:
             await self.app(scope, app_receive, app_send)
-        except Exception as error:
-            if replied:
+        except BaseException as error:
+            if replied or not isinstance(error, Exception):
+                # The application's error or cancellation stays primary; its
+                # queued evidence is still drained once.
+                await drain()
                 raise
             if not pending:
                 # The application read startup, then failed without replying.
-                await self._drain()
+                await drain()
                 await send({"type": "lifespan.startup.failed", "message": _diagnostic(error)})
                 return
             # An application without lifespan support raises before reading
             # startup; Wyrd still owns startup and drain.
             await send({"type": "lifespan.startup.complete"})
             await receive()
-            failure = await self._drain()
+            failure = await drain()
             await send(
                 {"type": "lifespan.shutdown.failed", "message": failure}
                 if failure

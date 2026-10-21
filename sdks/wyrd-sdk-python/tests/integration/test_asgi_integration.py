@@ -37,7 +37,7 @@ from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.client import WyrdClient
 from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
-from wyrd.otel import install_run_correlation, span_exporter
+from wyrd.otel import _EXPORTER_EXTRA, install_run_correlation, span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
@@ -89,7 +89,8 @@ async def lifespan(app: Any) -> AsyncIterator[list[dict[str, Any]]]:
     """Drive ``app``'s lifespan as a server does, collecting its replies.
 
     Startup runs on entry; shutdown runs on exit only when startup completed.
-    The list holds the startup reply and, after exit, the shutdown reply.
+    The list holds the startup reply and, after exit, the shutdown reply, then
+    ``{"type": "raised", "error": ...}`` when the application raised.
     """
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -106,10 +107,20 @@ async def lifespan(app: Any) -> AsyncIterator[list[dict[str, Any]]]:
     finally:
         if replies[0]["type"] == "lifespan.startup.complete":
             await inbox.put({"type": "lifespan.shutdown"})
-            replies.append(await outbox.get())
+            # An application may raise during shutdown instead of replying.
+            reply = asyncio.create_task(outbox.get())
+            await asyncio.wait([task, reply], return_when=asyncio.FIRST_COMPLETED)
+            reply.cancel()
+            await asyncio.wait([reply])
+            if not reply.cancelled():
+                replies.append(reply.result())
+            elif not outbox.empty():
+                replies.append(outbox.get_nowait())
         await asyncio.wait([task])
-        # A server ignores an app's error raised after it replied startup.failed.
-        task.exception()
+        if task.cancelled():
+            replies.append({"type": "raised", "error": asyncio.CancelledError()})
+        elif task.exception() is not None:
+            replies.append({"type": "raised", "error": task.exception()})
 
 
 def cycle(app: Any) -> list[dict[str, Any]]:
@@ -121,6 +132,46 @@ def cycle(app: Any) -> list[dict[str, Any]]:
         return replies
 
     return asyncio.run(run())
+
+
+SECRET = "postgres://wyrd:hunter2@db/wyrd token=sk-live-1\nforged log line"
+"""An exception body Wyrd must never copy into a message or log it creates."""
+
+
+class Faulty:
+    """``state``, except that each of ``names`` runs and then raises ``error``."""
+
+    def __init__(self, state: WyrdState, error: BaseException, *names: str) -> None:
+        self.state, self.error, self.names = state, error, names
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self.state, name)
+        if name not in self.names:
+            return method
+
+        def faulty(*args: Any) -> Any:
+            method(*args)
+            raise self.error
+
+        return faulty
+
+
+def raw(state: Any, events: list[str], error: BaseException | None = None) -> WyrdMiddleware:
+    """A plain ASGI lifespan that starts, records evidence during shutdown, then raises ``error``.
+
+    Without ``error`` it reads startup and raises before replying.
+    """
+
+    async def application(scope: Any, receive: Any, send: Any) -> None:
+        await receive()
+        if error is None:
+            raise RuntimeError(SECRET)
+        await send({"type": "lifespan.startup.complete"})
+        await receive()
+        events.append(submit(state.run("model"), 8.0))
+        raise error
+
+    return WyrdMiddleware(application, state=state, telemetry=False)
 
 
 def closed(state: WyrdState) -> bool:
@@ -144,7 +195,7 @@ def test_asgi_lifespan(
     def fresh() -> WyrdState:
         return hydrated(observed_bundle, WyrdClient(credential=observed_key))
 
-    def app(state: WyrdState, events: list[str], refuse: bool = False, **options: Any) -> FastAPI:
+    def app(state: Any, events: list[str], refuse: bool = False, **options: Any) -> FastAPI:
         @asynccontextmanager
         async def application_lifespan(_: FastAPI) -> AsyncIterator[None]:
             events.append("startup")
@@ -194,9 +245,10 @@ def test_asgi_lifespan(
 
     # The application's own startup failure stays its failure, and Wyrd drains.
     state, events = fresh(), []
-    [failed] = cycle(app(state, events, telemetry=False, refuse=True))
+    [failed, raised] = cycle(app(state, events, telemetry=False, refuse=True))
     assert failed["type"] == "lifespan.startup.failed"
     assert "the application refused to start" in failed["message"]
+    assert str(raised["error"]) == "the application refused to start"
     assert events == ["startup"] and closed(state)
 
     # A failed drain is logged with its code and reported as shutdown failure.
@@ -209,6 +261,48 @@ def test_asgi_lifespan(
     assert replies[1]["type"] == "lifespan.shutdown.failed"
     assert replies[1]["message"].startswith("WYRD_VALA_403_BIFROST_CARD_SCOPE: ")
     assert "WYRD_VALA_403_BIFROST_CARD_SCOPE" in caplog.text
+
+    # An application that raises during shutdown keeps its error, and its
+    # final evidence is still drained; so does a cancelled one.
+    for error in (RuntimeError(SECRET), asyncio.CancelledError()):
+        state, events = fresh(), []
+        replies = cycle(raw(state, events, error))
+        assert [reply["type"] for reply in replies] == ["lifespan.startup.complete", "raised"]
+        assert type(replies[1]["error"]) is type(error)
+        assert drift(wyrd_server, bifrost, events) == {events[0]: {(8.0, model)}}
+        assert closed(state)
+
+    # A failed drain then is logged, and the application's error stays primary.
+    caplog.clear()
+    agent, events = hydrated(observed_bundle, WyrdClient(credential=agent_key.key)), []
+    with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):
+        replies = cycle(raw(agent, events, RuntimeError("primary")))
+    assert str(replies[1]["error"]) == "primary"
+    assert "WYRD_VALA_403_BIFROST_CARD_SCOPE" in caplog.text
+
+    # Wyrd's own messages and logs name an unexpected error's type, never its body.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="wyrd.integrations.asgi"):
+        state = fresh()
+        [failed] = cycle(raw(state, []))
+        assert failed["type"] == "lifespan.startup.failed" and closed(state)
+        faulty = Faulty(fresh(), RuntimeError(SECRET), "shutdown")
+        replies = cycle(app(faulty, [], telemetry=False))
+        assert replies[1]["type"] == "lifespan.shutdown.failed"
+        reset_tracer_provider(monkeypatch)
+        trace.set_tracer_provider(TracerProvider())
+        [cleanup] = cycle(app(Faulty(fresh(), RuntimeError(SECRET), "shutdown"), []))
+    messages = [failed["message"], replies[1]["message"], cleanup["message"], caplog.text]
+    assert all("RuntimeError" in text and "hunter2" not in text for text in messages[:2])
+    assert not any(
+        secret in text for text in messages for secret in ("hunter2", "sk-live", "forged")
+    )
+    assert cleanup["message"].startswith("WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS: ")
+
+    # The missing otel extra keeps its install remedy.
+    reset_tracer_provider(monkeypatch)
+    [failed] = cycle(app(Faulty(fresh(), ImportError(_EXPORTER_EXTRA), "start_telemetry"), []))
+    assert failed["message"] == _EXPORTER_EXTRA
 
 
 def test_asgi_run_isolation(

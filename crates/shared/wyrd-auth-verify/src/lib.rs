@@ -4,15 +4,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+use lru::LruCache;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use wyrd_auth_oidc::{
     IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
 };
@@ -195,18 +198,32 @@ pub struct VerifiedExternalIdentity {
     pub raw_claims: JsonValue,
 }
 
+/// Most verified tenant tokens one verifier remembers; the least recently
+/// used is evicted beyond it.
+const VERIFIED_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("capacity is non-zero");
+
 /// Wyrd-minted access-token verifier.
 ///
 /// Owns only local cryptographic validation state: the deployment's decoding
-/// keys, its issuer, the fixed Wyrd audience, and the clock-skew policy.
-/// Verification is synchronous and reads no store — a tenant token carries
-/// its own authority snapshot, and a platform session's current state is
-/// revalidated by the platform plane after this signature check.
+/// keys, its issuer, the fixed Wyrd audience, the clock-skew policy, and the
+/// tenant tokens it has already verified. Verification is synchronous and
+/// reads no store — a tenant token carries its own authority snapshot until
+/// it expires, and a platform session's current state is revalidated by the
+/// platform plane after this signature check. Clones share the remembered
+/// tokens.
 #[derive(Clone)]
 pub struct TokenVerifier {
+    /// Public keys by key id; fixed for the verifier's life, so removing a
+    /// key builds a new verifier and forgets every token it verified.
     decoding_keys: Arc<HashMap<Kid, Arc<DecodingKey>>>,
+    /// The issuer every accepted token names.
     issuer: Arc<String>,
+    /// Clock-skew policy.
     settings: WyrdAuthVerifySettings,
+    /// Tenant tokens [`Self::verify_on`] accepted, by the SHA-256 of their
+    /// surface, tenant, and complete token, each until its own expiry; a
+    /// read never extends an entry, and a refusal is never kept.
+    verified: Arc<Mutex<LruCache<[u8; 32], VerifiedToken>>>,
 }
 
 impl TokenVerifier {
@@ -228,6 +245,7 @@ impl TokenVerifier {
             decoding_keys: Arc::new(decoding_keys),
             issuer: Arc::new(issuer.into()),
             settings,
+            verified: Arc::new(Mutex::new(LruCache::new(VERIFIED_CAPACITY))),
         }
     }
 
@@ -313,8 +331,13 @@ impl TokenVerifier {
     /// configured skew), then requires the token's tenant to be the request's
     /// tenant and builds the runtime principal from the claims. The accepted
     /// audiences are `wyrd` — which every tenant surface honors — and
-    /// `surface` itself. Nothing is read from a store and nothing is cached:
-    /// the token's `permissions` claim is its authority until it expires.
+    /// `surface` itself. Nothing is read from a store: the token's
+    /// `permissions` claim is its authority until it expires, so a token this
+    /// verifier already accepted for the same tenant and surface is accepted
+    /// again from memory until its `exp`, without re-checking its signature.
+    /// That is the same decision the full check would make, since no key of
+    /// this verifier can be removed and no tenant token is revoked before it
+    /// expires; the configured skew past `exp` is left to the full check.
     ///
     /// # Errors
     /// Returns [`AuthError::BadTokenFormat`] for an oversized bearer,
@@ -346,6 +369,11 @@ impl TokenVerifier {
         if token.len() > MAX_BEARER_TOKEN_BYTES {
             return Err(AuthError::BadTokenFormat);
         }
+        let digest = Self::digest(token, expected_tenant, surface);
+        if let Some(verified) = self.remembered(&digest, Utc::now()) {
+            tracing::Span::current().record("principal_id", verified.principal.id.to_string());
+            return Ok(verified);
+        }
         let key = self.signing_key(token)?;
         let claims = verify_access_token(token, &key, self.validation(surface))?;
         tracing::Span::current().record("principal_id", claims.principal.id.to_string());
@@ -353,7 +381,42 @@ impl TokenVerifier {
         if &claims.principal.tenant_id != expected_tenant {
             return Err(AuthError::InvalidToken);
         }
-        claims.into_verified()
+        let verified = claims.into_verified()?;
+        self.remember(digest, &verified);
+        Ok(verified)
+    }
+
+    /// The SHA-256 of `surface`, `tenant`, and the complete `token`, the only
+    /// form a verified token is remembered under.
+    fn digest(token: &str, tenant: &DataTenantId, surface: TokenAudience) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(surface.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(tenant.as_uuid().as_bytes());
+        digest.update(token.as_bytes());
+        digest.finalize().into()
+    }
+
+    /// The token remembered under `digest` when it has not expired at `now`;
+    /// an expired entry is removed.
+    fn remembered(&self, digest: &[u8; 32], now: DateTime<Utc>) -> Option<VerifiedToken> {
+        let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+        match verified.get(digest) {
+            Some(token) if now < token.exp => Some(token.clone()),
+            Some(_) => {
+                verified.pop(digest);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remembers `token` under `digest` until its expiry.
+    fn remember(&self, digest: [u8; 32], token: &VerifiedToken) {
+        self.verified
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .put(digest, token.clone());
     }
 
     /// Access-token validation accepting `wyrd` and the `surface` audience.
@@ -993,8 +1056,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use chrono::Utc;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, encode};
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::{
@@ -1584,6 +1648,72 @@ mod tests {
         let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &wrong_tenant);
 
         assert!(matches!(result, Err(AuthError::InvalidToken)));
+    }
+
+    /// An accepted token is remembered for its tenant and surface until its
+    /// `exp`; at `exp` the entry is no longer used and is removed.
+    #[test]
+    fn an_accepted_token_is_remembered_until_it_expires() {
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now(),
+        )));
+        let verifier = verifier(WyrdAuthVerifySettings::default());
+        let digest =
+            TokenVerifier::digest(token.expose_secret(), &tenant_id(), TokenAudience::Wyrd);
+
+        let verified = verifier
+            .verify(&token, &tenant_id())
+            .expect("valid token verifies");
+
+        let remembered = verifier
+            .remembered(&digest, Utc::now())
+            .expect("an accepted token is remembered");
+        assert_eq!(remembered.principal.id, verified.principal.id);
+        assert_eq!(
+            verifier
+                .verify(&token, &tenant_id())
+                .expect("a remembered token verifies")
+                .exp,
+            verified.exp
+        );
+        assert!(verifier.remembered(&digest, verified.exp).is_none());
+        assert!(verifier.verified.lock().expect("unpoisoned").is_empty());
+    }
+
+    /// A token remembered for one tenant or surface does not answer for
+    /// another, and a refusal is never remembered.
+    #[test]
+    fn a_remembered_token_answers_only_its_tenant_and_surface() {
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now(),
+        )));
+        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
+            .parse()
+            .expect("static tenant id is valid");
+        let verifier = verifier(WyrdAuthVerifySettings::default());
+        verifier
+            .verify(&token, &tenant_id())
+            .expect("valid token verifies");
+
+        assert!(matches!(
+            verifier.verify(&token, &wrong_tenant),
+            Err(AuthError::InvalidToken)
+        ));
+        assert!(
+            verifier
+                .remembered(
+                    &TokenVerifier::digest(
+                        token.expose_secret(),
+                        &tenant_id(),
+                        TokenAudience::Bifrost
+                    ),
+                    Utc::now()
+                )
+                .is_none()
+        );
+        assert_eq!(verifier.verified.lock().expect("unpoisoned").len(), 1);
     }
 
     /// An oversized bearer is refused before any decoding.

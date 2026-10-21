@@ -1,10 +1,10 @@
 //! Pure projection of one staged audit decision into the canonical audit
 //! content schema.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -15,6 +15,11 @@ use wyrd_spec::vala::audit_detail_canonical_json;
 
 use super::{AuditLogTable, DETAIL};
 use crate::tables::DomainTable;
+
+/// The `audit_log` content schema, built once and shared by every projected
+/// row, so rows compare as one schema by pointer instead of field by field.
+static AUDIT_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(AuditLogTable::arrow_fields())));
 
 /// Why one audit decision could not be projected into an `audit_log` row.
 #[derive(Debug, Error)]
@@ -75,8 +80,7 @@ pub fn project_audit_event(
                 .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
         ),
     ];
-    let schema = Schema::new(AuditLogTable::arrow_fields());
-    Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+    Ok(RecordBatch::try_new(Arc::clone(&AUDIT_SCHEMA), columns)?)
 }
 
 #[cfg(test)]

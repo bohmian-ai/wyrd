@@ -158,21 +158,6 @@ pub fn serve_linked_work(
     }
 }
 
-/// Make `parent` the parent of `child`, which timed work before `parent`
-/// could start.
-///
-/// `child` keeps the start time it was created with and joins `parent`'s
-/// trace, so a phase that must run before its parent's trace is fixed (a
-/// queued attempt's claim statement) still reads back inside it. `child`
-/// must not have been entered, which would have fixed its own trace; on an
-/// entered or disabled span, or without an OpenTelemetry layer, this does
-/// nothing. Reading `parent`'s context starts it, so its links and parent
-/// must already be installed.
-pub fn adopt_span(child: &tracing::Span, parent: &tracing::Span) {
-    // An entered child keeps its trace; adoption is best-effort observability.
-    let _ = child.set_parent(parent.context());
-}
-
 /// Mark `span` as continuing a caller whose own decision was `sampled`.
 ///
 /// The marker lives in the `tracing` registry, so it is skipped without a

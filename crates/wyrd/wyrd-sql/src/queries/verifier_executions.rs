@@ -16,7 +16,7 @@
 //! reclaimed affects zero rows and observes [`Settlement::StaleLease`].
 // raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 
 use chrono::{DateTime, Duration, Utc};
@@ -63,21 +63,6 @@ const RESOLVE_BINDING_SQL: &str = r"
      WHERE b.binding_id = $1
 ";
 
-/// Resolve a direct target: no owner, binding, Trigger, or Operators.
-const RESOLVE_DIRECT_SQL: &str = r"
-    SELECT p.verifier_card_uid, v.version AS verifier_version,
-           wyrd.verifier_readiness(p.verifier_card_uid) AS readiness,
-           $2::uuid AS card_uid,
-           EXISTS (SELECT 1 FROM wyrd.cards s
-                    WHERE s.card_uid = $2
-                      AND s.status IN ('active', 'deprecated')) AS subject_available,
-           NULL::uuid AS owner_card_uid, NULL::uuid AS binding_id,
-           NULL::uuid AS trigger_uid, NULL::text AS trigger_digest,
-           '[]'::jsonb AS operators
-      FROM (SELECT $1::uuid AS verifier_card_uid) p
-      LEFT JOIN wyrd.cards v ON v.card_uid = p.verifier_card_uid
-";
-
 /// Insert one scheduled execution, due at PostgreSQL's statement time; a
 /// duplicate occurrence conflicts on its partial unique index and inserts
 /// nothing.
@@ -108,14 +93,15 @@ const EXISTING_OCCURRENCE_SQL: &str = r"
        AND window_end = $2
 ";
 
-/// Insert one submitted execution, either `pending` and due at PostgreSQL's
-/// statement time or, when `$15` carries an error, already settled `errored`.
+/// Insert a batch of submitted executions, column by column: each row is
+/// either `pending` and due at PostgreSQL's statement time or, when its
+/// `error` carries one, already settled `errored`.
 ///
 /// The exact Verifier version and subject come from their Card rows, and a
-/// Card the tenant does not hold selects no row, so the statement inserts
-/// nothing rather than failing the batch on a foreign key. An existing
+/// Card the tenant does not hold joins no row, so the statement skips that
+/// submission rather than failing the batch on a foreign key. An existing
 /// execution ID inserts nothing, which absorbs a retried batch.
-const INSERT_SUBMISSION_SQL: &str = r"
+const INSERT_SUBMISSIONS_SQL: &str = r"
     INSERT INTO wyrd.verifier_executions (
         execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, run_id, inputs, route_overrides,
@@ -123,40 +109,69 @@ const INSERT_SUBMISSION_SQL: &str = r"
         idempotency_key, request_sha256, status, error, max_attempts,
         next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id
     )
-    SELECT $1, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
-           'manual', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-           CASE WHEN $15::jsonb IS NULL THEN 'pending' ELSE 'errored' END, $15, $14,
-           CASE WHEN $15::jsonb IS NULL THEN statement_timestamp() END,
-           CASE WHEN $15::jsonb IS NOT NULL THEN statement_timestamp() END,
-           statement_timestamp(), statement_timestamp(), $16, $17
-      FROM wyrd.cards v, wyrd.cards s
-     WHERE v.card_uid = $2 AND s.card_uid = $3
+    SELECT r.execution_id, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
+           'manual', r.run_id, r.inputs, r.route_overrides,
+           r.sub_principal_id, r.act_principal_id, r.authority, r.cause_trace_id,
+           r.cause_span_id, r.idempotency_key, r.request_sha256,
+           CASE WHEN r.error IS NULL THEN 'pending' ELSE 'errored' END, r.error, $17,
+           CASE WHEN r.error IS NULL THEN statement_timestamp() END,
+           CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END,
+           statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id
+      FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::jsonb[],
+                  $6::jsonb[], $7::uuid[], $8::uuid[], $9::jsonb[], $10::bytea[],
+                  $11::bytea[], $12::text[], $13::bytea[], $14::jsonb[], $15::bool[],
+                  $16::text[])
+           AS r(execution_id, verifier_card_uid, card_uid, run_id, inputs,
+                route_overrides, sub_principal_id, act_principal_id, authority,
+                cause_trace_id, cause_span_id, idempotency_key, request_sha256,
+                error, cause_sampled, group_id)
+      JOIN wyrd.cards v ON v.card_uid = r.verifier_card_uid
+      JOIN wyrd.cards s ON s.card_uid = r.card_uid
     ON CONFLICT DO NOTHING
 ";
 
-/// Whether an execution with this ID already exists in the caller's tenant.
-const EXECUTION_EXISTS_SQL: &str = r"
-    SELECT EXISTS (SELECT 1 FROM wyrd.verifier_executions WHERE execution_id = $1)
+/// The batch's execution IDs that already exist in the caller's tenant.
+const EXISTING_EXECUTIONS_SQL: &str = r"
+    SELECT execution_id FROM wyrd.verifier_executions WHERE execution_id = ANY($1)
 ";
 
-/// Serialize concurrent submissions that share one subject, actor, and key.
+/// Serialize concurrent submissions that share one subject, actor, and key,
+/// locking every (subject, actor, key) of a batch in one statement.
 ///
-/// Transaction-scoped, so it releases on commit or rollback; the class keeps
-/// these locks apart from every other advisory lock in the database.
-const LOCK_REQUEST_KEY_SQL: &str = r"
-    SELECT pg_advisory_xact_lock($1, hashtext($2::text || '/' || $3::text || '/' || $4))
+/// Each lock is taken in ascending hash order, the one order every batch
+/// uses, so two batches sharing keys never deadlock. Transaction-scoped, so
+/// the locks release on commit or rollback; the class keeps them apart from
+/// every other advisory lock in the database.
+const LOCK_REQUEST_KEYS_SQL: &str = r"
+    SELECT pg_advisory_xact_lock($1, hash)
+      FROM (SELECT DISTINCT hashtext(k.subject::text || '/' || k.actor::text || '/' || k.key) AS hash
+              FROM unnest($2::uuid[], $3::uuid[], $4::text[]) AS k(subject, actor, key)
+             ORDER BY hash) AS keys
 ";
 
-/// Advisory lock class of [`LOCK_REQUEST_KEY_SQL`].
+/// Advisory lock class of [`LOCK_REQUEST_KEYS_SQL`].
 const REQUEST_KEY_LOCK_CLASS: i32 = 0x0C_A2_D0_31;
 
-/// Find the execution one subject and actor already had accepted under one key.
-const KEYED_EXECUTION_SQL: &str = r"
-    SELECT execution_id, request_sha256
-      FROM wyrd.verifier_executions
-     WHERE sub_principal_id = $1
-       AND act_principal_id = $2
-       AND idempotency_key = $3
+/// Find the executions a batch's (subject, actor, key) triples already hold,
+/// each returned with the 1-based position of its triple in the arrays.
+///
+/// Each triple probes `verifier_runs_manual_idempotency` once through the
+/// lateral subquery, which names the index's leading tenant column, so the
+/// cost follows the batch's keys and never the tenant's execution count. A
+/// plain join left the plan to row estimates; with stale statistics it read
+/// and sorted every execution of the tenant on each batch.
+const KEYED_EXECUTIONS_SQL: &str = r"
+    SELECT k.position, e.execution_id, e.request_sha256
+      FROM unnest($1::uuid[], $2::uuid[], $3::text[]) WITH ORDINALITY AS k(subject, actor, key, position)
+     CROSS JOIN LATERAL (
+           SELECT execution_id, request_sha256
+             FROM wyrd.verifier_executions
+            WHERE data_tenant_id = wyrd.current_tenant()
+              AND sub_principal_id = k.subject
+              AND act_principal_id = k.actor
+              AND idempotency_key = k.key
+            LIMIT 1
+           ) AS e
 ";
 
 /// How long after a scheduled window ends its occurrence becomes claimable.
@@ -326,47 +341,71 @@ const ADVANCE_CURSOR_SQL: &str = r"
      WHERE binding_id = $1
 ";
 
-/// Settle every expired lease that has no attempt left as `errored`.
+/// Claim up to `$3` of the oldest due, retry-due, or lease-expired executions,
+/// each under its own fresh lease, in one statement.
 ///
-/// Expiry is decided and stamped by PostgreSQL, so a lease written by one pod
-/// is never judged against another pod's clock.
-const EXHAUST_EXPIRED_SQL: &str = r"
-    UPDATE wyrd.verifier_executions e
-       SET status = 'errored', error = $1, lease_expires_at = NULL,
-           next_attempt_at = NULL, settled_at = statement_timestamp(),
-           updated_at = statement_timestamp()
-     WHERE e.status = 'running'
-       AND e.lease_expires_at <= statement_timestamp()
-       AND e.attempts >= e.max_attempts
-";
-
-/// Claim the oldest due, retry-due, or lease-expired execution under a fresh lease.
+/// The `exhausted` CTE first settles, as `errored` with error `$1`, every
+/// expired lease that has no attempt left; data-modifying CTEs always run,
+/// and the candidate scan excludes exactly those rows, so one statement both
+/// exhausts and claims without the two touching the same row. Every claimed
+/// row draws its own random lease token, returned as `lease_token`, so each
+/// claim renews and settles independently.
+///
+/// Due and lease-expired rows are each read in the order of their own
+/// partial index (`verifier_runs_due`, `verifier_runs_leased`) and merged, so
+/// a claim reads at most twice `$3` rows however deep the queue is; one
+/// predicate over both would read and sort every due row. Rows locked by
+/// either scan but not claimed stay locked only until the claim commits,
+/// and concurrent claims skip them.
 ///
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
-/// lease the database believes already expired. The claim also returns the
-/// tenant's active SYSTEM principal, the exact Verifier Card's status (`NULL`
-/// when the Card is absent), the binding's scheduled input selectors, and the
-/// Verifier's ready fitted Drift baselines keyed by requirement, so no later
-/// phase opens a connection to read them.
+/// lease the database believes already expired. Each claim also returns the
+/// Verifier's ready fitted Drift baselines keyed by requirement, so the drift
+/// engine opens no connection to read them; the Verifier, subject, and SYSTEM
+/// principal are resolved by the caller through `wyrd.verification_target`.
 const CLAIM_SQL: &str = r"
-    WITH candidate AS (
-        SELECT execution_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
+    WITH exhausted AS (
+        UPDATE wyrd.verifier_executions x
+           SET status = 'errored', error = $1, lease_expires_at = NULL,
+               next_attempt_at = NULL, settled_at = statement_timestamp(),
+               updated_at = statement_timestamp()
+         WHERE x.status = 'running'
+           AND x.lease_expires_at <= statement_timestamp()
+           AND x.attempts >= x.max_attempts
+    ),
+    due AS (
+        SELECT execution_id, next_attempt_at AS due_at
           FROM wyrd.verifier_executions
-         WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp())
-            OR (status = 'running' AND lease_expires_at <= statement_timestamp())
-         ORDER BY COALESCE(next_attempt_at, lease_expires_at), execution_id
-         LIMIT 1
+         WHERE status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp()
+         ORDER BY next_attempt_at, execution_id
+         LIMIT $3
            FOR UPDATE SKIP LOCKED
+    ),
+    expired AS (
+        SELECT execution_id, lease_expires_at AS due_at
+          FROM wyrd.verifier_executions
+         WHERE status = 'running' AND lease_expires_at <= statement_timestamp()
+           AND attempts < max_attempts
+         ORDER BY lease_expires_at, execution_id
+         LIMIT $3
+           FOR UPDATE SKIP LOCKED
+    ),
+    candidate AS (
+        SELECT execution_id, due_at FROM due
+        UNION ALL
+        SELECT execution_id, due_at FROM expired
+        ORDER BY due_at, execution_id
+        LIMIT $3
     )
     UPDATE wyrd.verifier_executions e
-       SET status = 'running', attempts = e.attempts + 1, lease_token = $1,
+       SET status = 'running', attempts = e.attempts + 1, lease_token = gen_random_uuid(),
            lease_expires_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
            next_attempt_at = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE e.execution_id = candidate.execution_id
-    RETURNING e.execution_id, e.verifier_card_uid, e.verifier_version, e.card_uid,
+    RETURNING e.execution_id, e.lease_token, e.verifier_card_uid, e.verifier_version, e.card_uid,
               e.origin, e.owner_card_uid, e.binding_id, e.trigger_uid,
               e.trigger_digest, e.window_start, e.window_end,
               e.run_id, e.inputs, e.route_overrides,
@@ -377,10 +416,6 @@ const CLAIM_SQL: &str = r"
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
                            * 1000)::bigint) AS age_ms,
-              (SELECT a.id FROM wyrd.auth_service_accounts a
-                WHERE a.principal_kind = 'system' AND a.status = 'active') AS system_principal_id,
-              (SELECT c.status FROM wyrd.cards c
-                WHERE c.card_uid = e.verifier_card_uid) AS verifier_status,
               (SELECT jsonb_object_agg(f.requirement_id, f.fitted)
                  FROM wyrd.drift_baselines f
                 WHERE f.verifier_uid = e.verifier_card_uid
@@ -388,24 +423,18 @@ const CLAIM_SQL: &str = r"
                   AND f.requirement_id IS NOT NULL) AS fitted_baselines
 ";
 
-/// Renew every listed lease still held, on the database clock.
+/// Renew every listed lease still held, on the database clock, through
+/// `wyrd.renew_verifier_leases`.
 ///
 /// `$2` is the lease length and `$3` the remaining time under which a lease is
 /// renewed, both in milliseconds, so a lease is extended only once a third of
 /// it has passed. Every unexpired lease still held is returned, renewed or
 /// not; a token absent from the result has expired, been reclaimed, or been
-/// settled.
+/// settled. The function locks rows in `execution_id` order, the order
+/// [`COMPLETE_MANY_SQL`] also locks in, so a renewal and a batched completion
+/// sharing executions never deadlock.
 const RENEW_LEASES_SQL: &str = r"
-    UPDATE wyrd.verifier_executions
-       SET lease_expires_at = CASE
-               WHEN lease_expires_at <= statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond')
-               THEN statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond')
-               ELSE lease_expires_at
-           END,
-           updated_at = statement_timestamp()
-     WHERE status = 'running' AND lease_token = ANY($1)
-       AND lease_expires_at > statement_timestamp()
-    RETURNING lease_token
+    SELECT * FROM wyrd.renew_verifier_leases($1, $2, $3)
 ";
 
 /// Complete a leased execution, or re-apply the same completion idempotently.
@@ -427,6 +456,22 @@ const COMPLETE_SQL: &str = r"
        AND e.lease_token = $2
        AND (e.status = 'running' OR (e.status = 'completed' AND e.result_id = $3))
     RETURNING e.binding_id, e.operators, e.origin = 'group' AS grouped, prior.replayed
+";
+
+/// Complete many leased non-group executions in one round trip through
+/// `wyrd.complete_verifier_executions`, or re-apply the same completions
+/// idempotently, exactly as [`COMPLETE_SQL`] does one: `$1` executions, `$2`
+/// their lease tokens, and `$3` their results, aligned by position. Returns
+/// each applied execution with its binding and frozen Operators; a group
+/// execution, a lost lease, or a different result returns nothing.
+///
+/// The function updates one row at a time by primary key in `execution_id`
+/// order, the order [`RENEW_LEASES_SQL`] also locks in, so its plan never
+/// depends on row estimates and concurrent batches and renewals sharing
+/// executions never deadlock.
+const COMPLETE_MANY_SQL: &str = r"
+    SELECT execution_id, binding_id, operators
+      FROM wyrd.complete_verifier_executions($1, $2, $3)
 ";
 
 /// Insert one Operator dispatch; the (tenant, execution, Operator) key absorbs retries.
@@ -545,13 +590,56 @@ const BINDING_TARGETS_SQL: &str = r"
 ";
 
 /// List every tenant with claimable executions, longest-waiting tenant first.
+///
+/// The recursive terms walk `verifier_runs_due` and `verifier_runs_leased`
+/// backward one distinct tenant at a time, so each step lands on a tenant's
+/// newest entry. Claimed and settled rows leave dead entries at the oldest
+/// end of each tenant's range until vacuum removes them, and a forward walk
+/// would read through them on every claim round. Each tenant's oldest
+/// claimable row is then probed once per index, in a materialized step so the
+/// probe is not repeated for the filter and the order. A scan therefore costs
+/// the tenants with queued or running work and never the rows they hold;
+/// grouping the claimable rows instead read the whole backlog every round.
 const RUNNABLE_TENANTS_SQL: &str = r"
-    SELECT data_tenant_id
-      FROM wyrd.verifier_executions
-     WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp())
-        OR (status = 'running' AND lease_expires_at <= statement_timestamp())
-     GROUP BY data_tenant_id
-     ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
+    WITH RECURSIVE queued(tenant) AS (
+        (SELECT data_tenant_id FROM wyrd.verifier_executions
+          WHERE status IN ('pending', 'retrying')
+          ORDER BY data_tenant_id DESC, next_attempt_at DESC LIMIT 1)
+        UNION ALL
+        SELECT (SELECT e.data_tenant_id FROM wyrd.verifier_executions e
+                 WHERE e.status IN ('pending', 'retrying') AND e.data_tenant_id < q.tenant
+                 ORDER BY e.data_tenant_id DESC, e.next_attempt_at DESC LIMIT 1)
+          FROM queued q
+         WHERE q.tenant IS NOT NULL
+    ), leased(tenant) AS (
+        (SELECT data_tenant_id FROM wyrd.verifier_executions
+          WHERE status = 'running'
+          ORDER BY data_tenant_id DESC, lease_expires_at DESC LIMIT 1)
+        UNION ALL
+        SELECT (SELECT e.data_tenant_id FROM wyrd.verifier_executions e
+                 WHERE e.status = 'running' AND e.data_tenant_id < l.tenant
+                 ORDER BY e.data_tenant_id DESC, e.lease_expires_at DESC LIMIT 1)
+          FROM leased l
+         WHERE l.tenant IS NOT NULL
+    ), waiting AS MATERIALIZED (
+        SELECT t.tenant,
+               LEAST(
+                   (SELECT min(e.next_attempt_at) FROM wyrd.verifier_executions e
+                     WHERE e.data_tenant_id = t.tenant
+                       AND e.status IN ('pending', 'retrying')
+                       AND e.next_attempt_at <= statement_timestamp()),
+                   (SELECT min(e.lease_expires_at) FROM wyrd.verifier_executions e
+                     WHERE e.data_tenant_id = t.tenant
+                       AND e.status = 'running'
+                       AND e.lease_expires_at <= statement_timestamp())) AS since
+          FROM (SELECT tenant FROM queued WHERE tenant IS NOT NULL
+                UNION
+                SELECT tenant FROM leased WHERE tenant IS NOT NULL) AS t
+    )
+    SELECT tenant
+      FROM waiting
+     WHERE since IS NOT NULL
+     ORDER BY since, tenant
 ";
 
 /// List tenants with due scheduled bindings, most overdue tenant first.
@@ -588,6 +676,76 @@ const QUEUE_DEPTH_SQL: &str = r"
         (SELECT count(*) FROM wyrd.operator_dispatches WHERE status = 'retrying') AS dispatches_retrying,
         (SELECT count(*) FROM wyrd.operator_dispatches WHERE status = 'running') AS dispatches_running
 ";
+
+/// Histogram of every verification queue and group-scheduling store
+/// operation, seconds, labelled `op` (the operation, such as `claim` or
+/// `group_enqueue`) and `outcome` (`ok` or `error`). It times the operation's
+/// statements from first send to last row, inside the caller's transaction,
+/// so pool acquisition and commit are not included.
+pub const VERIFICATION_STORE_DURATION_SECONDS: &str = "wyrd_verification_store_duration_seconds";
+
+/// Await `work` as one `op` store operation timed into
+/// [`VERIFICATION_STORE_DURATION_SECONDS`]; a future dropped before
+/// completion records nothing.
+///
+/// # Errors
+/// Returns `work`'s own error unchanged.
+async fn timed<T>(
+    op: &'static str,
+    work: impl std::future::Future<Output = Result<T, SqlxError>>,
+) -> Result<T, SqlxError> {
+    let started = std::time::Instant::now();
+    let result = work.await;
+    metrics::histogram!(
+        VERIFICATION_STORE_DURATION_SECONDS,
+        "op" => op,
+        "outcome" => if result.is_ok() { "ok" } else { "error" }
+    )
+    .record(started.elapsed().as_secs_f64());
+    result
+}
+
+/// Insert one `pending` dispatch per frozen Operator of the just-settled
+/// `execution`, each freezing its failure context from the settled row,
+/// `summary` clipped to [`MAX_SUMMARY_CHARS`], `drift`, `verdict`, and, for a
+/// group verdict change, the `previous` group result and verdict.
+///
+/// The (tenant, execution, Operator) key makes a retried or replayed
+/// settlement insert nothing new.
+///
+/// # Errors
+/// Returns the database error when an insert fails.
+async fn insert_dispatches(
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+    operators: &[FrozenTarget],
+    summary: &str,
+    drift: Option<DriftCounts>,
+    verdict: &str,
+    previous: Option<(Uuid, String)>,
+) -> Result<(), SqlxError> {
+    let (previous_result, previous_verdict) = previous.unzip();
+    let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
+    for operator in operators {
+        let (uid, digest) = match operator {
+            FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
+            FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
+        };
+        sqlx::query(INSERT_DISPATCH_SQL)
+            .bind(OperatorDispatchId::new_v7().as_uuid())
+            .bind(execution.as_uuid())
+            .bind(uid)
+            .bind(digest)
+            .bind(&summary)
+            .bind(drift.map(Json))
+            .bind(verdict)
+            .bind(previous_result)
+            .bind(previous_verdict.as_deref())
+            .execute(&mut **conn.transaction())
+            .await?;
+    }
+    Ok(())
+}
 
 /// Why an execution was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,6 +1296,22 @@ pub struct ExecutionLease {
     pub token: LeaseToken,
 }
 
+/// One claimed execution's completion, settled with others of its tenant by
+/// [`VerifierExecutionQueue::complete_many`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    /// Settlement identity.
+    pub lease: ExecutionLease,
+    /// The staged result the execution points at.
+    pub result_id: VerificationResultId,
+    /// The settled verdict, which decides whether Operators are dispatched.
+    pub verdict: VerificationVerdict,
+    /// The runner's failure summary, frozen into each dispatch.
+    pub summary: String,
+    /// The counts of the Verifier's one drift check, when it has exactly one.
+    pub drift: Option<DriftCounts>,
+}
+
 /// An execution claimed for running, with every frozen identity the runner needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimedExecution {
@@ -1183,12 +1357,6 @@ pub struct ClaimedExecution {
     /// How long before this claim the execution was admitted: the claim
     /// statement's PostgreSQL instant less `created_at`. Telemetry only.
     pub age: std::time::Duration,
-    /// The tenant's active SYSTEM principal, read in the claim transaction;
-    /// `None` when the tenant has none.
-    pub system_principal: Option<PrincipalId>,
-    /// Whether the exact Verifier Card exists and is not deleted, read in the
-    /// claim transaction; a cached Verifier is used only while this holds.
-    pub verifier_present: bool,
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
     pub fitted_baselines: BTreeMap<TaskId, Value>,
@@ -1343,156 +1511,285 @@ impl VerifierExecutionQueue {
     /// Accept one tenant batch of acknowledged submissions, in order.
     ///
     /// This is the batched queue writer's one durable step and the only
-    /// place replay and conflict are decided. For each submission, in the
-    /// caller's transaction: an existing row with its execution ID is
-    /// [`SubmissionOutcome::Replayed`], which makes a retried batch a no-op.
-    /// A keyed submission then takes a transaction-scoped advisory lock on
-    /// (subject, actor, key), so concurrent writers serialize in acceptance
-    /// order, and finds the execution that subject and actor already had
-    /// accepted under the key: the same digest replays it, and a different
-    /// digest settles this submission `errored` with the idempotency-conflict
-    /// code under its own ID and no key, since the key stays the original's.
-    /// Otherwise the direct target is resolved; a refusal settles the
-    /// submission `errored` with [`EnqueueRefusal::error`] and keeps its key,
-    /// so a retry replays the refusal and a different request under the key
-    /// conflicts with it. An accepted submission stores its key, digest,
-    /// optional Run, inputs, route overrides, cause, and accepted authority on
-    /// a `pending` row due at PostgreSQL's statement time. Conflicting and
-    /// refused rows never execute or dispatch. The caller commits.
+    /// place replay and conflict are decided. The caller resolves every
+    /// distinct direct target first and passes the refused ones in
+    /// `refusals`, keyed by (Verifier, subject) UID. The batch reads which of
+    /// its execution IDs already exist, decides every submission in order,
+    /// then writes every new row in one insert, so its round trips do not
+    /// grow with its size. A submission whose execution ID already exists, in the table or
+    /// earlier in the batch, is [`SubmissionOutcome::Replayed`], which makes
+    /// a retried batch a no-op. A keyed submission takes a
+    /// transaction-scoped advisory lock on (subject, actor, key) the first
+    /// time the batch meets that key, so concurrent writers serialize in
+    /// acceptance order, and finds the execution that subject and actor
+    /// already had accepted under the key, earlier in the batch or before
+    /// it: the same digest replays it, and a different digest settles this
+    /// submission `errored` with the idempotency-conflict code under its own
+    /// ID and no key, since the key stays the original's. Otherwise a
+    /// refused target settles the submission `errored` with
+    /// [`EnqueueRefusal::error`] and keeps its key, so a retry replays the
+    /// refusal and a different request under the key conflicts with it. An
+    /// accepted submission stores its key, digest, optional Run, inputs,
+    /// route overrides, cause, and accepted authority on a `pending` row due
+    /// at PostgreSQL's statement time. Conflicting and refused rows never
+    /// execute or dispatch. The caller commits.
     ///
     /// # Errors
     /// Returns the database error when a lock, read, or insert fails, or an
     /// encode or decode error when an authority, input, or stored identity is
     /// malformed; nothing of the batch survives the caller's rollback.
-    #[tracing::instrument(skip(self, conn, submissions), fields(operation = "verification.executions.accept", submissions = submissions.len()))]
+    #[tracing::instrument(skip(self, conn, submissions, refusals), fields(operation = "verification.executions.accept", submissions = submissions.len()))]
     pub async fn accept_submissions(
         &self,
         conn: &mut TenantConn<'_>,
         submissions: &[Submission],
+        refusals: &HashMap<(Uuid, Uuid), EnqueueRefusal>,
     ) -> Result<Vec<SubmissionOutcome>, SqlxError> {
-        let mut outcomes = Vec::with_capacity(submissions.len());
-        for submission in submissions {
-            outcomes.push(self.accept(conn, submission).await?);
-        }
-        Ok(outcomes)
+        timed("accept", async {
+            let ids: Vec<Uuid> = submissions
+                .iter()
+                .map(|submission| submission.execution_id.as_uuid())
+                .collect();
+            let mut decided: HashSet<Uuid> = sqlx::query_scalar(EXISTING_EXECUTIONS_SQL)
+                .bind(&ids)
+                .fetch_all(&mut **conn.transaction())
+                .await?
+                .into_iter()
+                .collect();
+            let keys: Vec<_> = submissions
+                .iter()
+                .filter(|submission| !decided.contains(&submission.execution_id.as_uuid()))
+                .filter_map(holder_key)
+                .collect();
+            let mut holders = Self::key_holders(conn, &keys).await?;
+            let mut rows = Vec::with_capacity(submissions.len());
+            let mut outcomes = Vec::with_capacity(submissions.len());
+            for submission in submissions {
+                if !decided.insert(submission.execution_id.as_uuid()) {
+                    outcomes.push(SubmissionOutcome::Replayed(submission.execution_id));
+                    continue;
+                }
+                outcomes.push(Self::decide(submission, refusals, &mut holders, &mut rows));
+            }
+            self.insert_submissions(conn, &rows).await?;
+            Ok(outcomes)
+        })
+        .await
     }
 
-    /// Decide and write one submission; see [`Self::accept_submissions`].
+    /// Decide one new submission and queue its row, if it writes one; see
+    /// [`Self::accept_submissions`].
     ///
-    /// # Errors
-    /// Returns the database error when a statement fails, or an encode or
-    /// decode error when a value is malformed.
-    async fn accept(
-        &self,
-        conn: &mut TenantConn<'_>,
-        submission: &Submission,
-    ) -> Result<SubmissionOutcome, SqlxError> {
-        let exists: bool = sqlx::query_scalar(EXECUTION_EXISTS_SQL)
-            .bind(submission.execution_id.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        if exists {
-            return Ok(SubmissionOutcome::Replayed(submission.execution_id));
-        }
-        let attribution = submission.authority.attribution();
-        if let Some(key) = &submission.key {
-            sqlx::query(LOCK_REQUEST_KEY_SQL)
-                .bind(REQUEST_KEY_LOCK_CLASS)
-                .bind(attribution.sub_principal_id.as_uuid())
-                .bind(attribution.act_principal_id.as_uuid())
-                .bind(key.key.as_str())
-                .execute(&mut **conn.transaction())
-                .await?;
-            let existing: Option<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(KEYED_EXECUTION_SQL)
-                .bind(attribution.sub_principal_id.as_uuid())
-                .bind(attribution.act_principal_id.as_uuid())
-                .bind(key.key.as_str())
-                .fetch_optional(&mut **conn.transaction())
-                .await?;
-            if let Some((original, digest)) = existing {
-                let original = stored(ExecutionId::new(original))?;
-                if digest.as_deref() == Some(key.request_sha256.as_slice()) {
-                    return Ok(SubmissionOutcome::Replayed(original));
+    /// `holders` maps each (subject, actor, key) of the batch, already locked
+    /// by [`Self::key_holders`], to the execution that holds it, including
+    /// ones decided earlier in this batch and not yet written. Deciding reads
+    /// nothing from the database.
+    fn decide<'s>(
+        submission: &'s Submission,
+        refusals: &HashMap<(Uuid, Uuid), EnqueueRefusal>,
+        holders: &mut HashMap<(Uuid, Uuid, &'s str), KeyHolder>,
+        rows: &mut Vec<NewSubmission<'s>>,
+    ) -> SubmissionOutcome {
+        if let (Some(key), Some(holder_key)) = (&submission.key, holder_key(submission)) {
+            if let Some(holder) = holders.get(&holder_key) {
+                if holder.request_sha256.as_deref() == Some(key.request_sha256.as_slice()) {
+                    return SubmissionOutcome::Replayed(holder.execution_id);
                 }
+                let original = holder.execution_id;
                 let conflict = WyrdError::RegistryIdempotencyConflict {
                     message: String::new(),
                     details: Value::Null,
                 };
-                let error = VerificationError {
-                    code: conflict.code().to_owned(),
-                    message: format!(
-                        "Idempotency-Key {:?} was already used for a different request (execution {original})",
-                        key.key
-                    ),
-                };
-                self.insert_submission(conn, submission, None, Some(&error))
-                    .await?;
-                return Ok(SubmissionOutcome::Conflict { original });
+                rows.push(NewSubmission {
+                    submission,
+                    key: None,
+                    error: Some(VerificationError {
+                        code: conflict.code().to_owned(),
+                        message: format!(
+                            "Idempotency-Key {:?} was already used for a different request (execution {original})",
+                            key.key
+                        ),
+                    }),
+                });
+                return SubmissionOutcome::Conflict { original };
             }
+            holders.insert(
+                holder_key,
+                KeyHolder {
+                    execution_id: submission.execution_id,
+                    request_sha256: Some(key.request_sha256.to_vec()),
+                },
+            );
         }
-        let resolved: ResolvedTarget = sqlx::query_as(RESOLVE_DIRECT_SQL)
-            .bind(submission.request.verifier_card_uid.as_uuid())
-            .bind(submission.request.card_uid.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        if let Some(refusal) = resolved.refusal()? {
-            self.insert_submission(
-                conn,
-                submission,
-                submission.key.as_ref(),
-                Some(&refusal.error()),
-            )
-            .await?;
-            return Ok(SubmissionOutcome::Refused(refusal));
-        }
-        self.insert_submission(conn, submission, submission.key.as_ref(), None)
-            .await?;
-        Ok(SubmissionOutcome::Accepted)
+        let target = (
+            submission.request.verifier_card_uid.as_uuid(),
+            submission.request.card_uid.as_uuid(),
+        );
+        let refusal = refusals.get(&target).copied();
+        rows.push(NewSubmission {
+            submission,
+            key: submission.key.as_ref(),
+            error: refusal.map(EnqueueRefusal::error),
+        });
+        refusal.map_or(SubmissionOutcome::Accepted, SubmissionOutcome::Refused)
     }
 
-    /// Insert one submission's row under `key`: `pending` when `error` is
-    /// `None`, otherwise settled `errored` with `error`.
+    /// Lock every (subject, actor, key) in `keys` and read the executions
+    /// that already hold them, in two statements whatever the batch size.
+    ///
+    /// The locks serialize concurrent batches sharing a key until the
+    /// caller's transaction ends, so the holders read here stay current for
+    /// the whole batch. A key held by no execution is absent from the map.
+    ///
+    /// # Errors
+    /// Returns the database error when the lock or lookup fails, or a decode
+    /// error when a stored execution ID is malformed or a returned position
+    /// names no key.
+    async fn key_holders<'s>(
+        conn: &mut TenantConn<'_>,
+        keys: &[(Uuid, Uuid, &'s str)],
+    ) -> Result<HashMap<(Uuid, Uuid, &'s str), KeyHolder>, SqlxError> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let subjects: Vec<Uuid> = keys.iter().map(|key| key.0).collect();
+        let actors: Vec<Uuid> = keys.iter().map(|key| key.1).collect();
+        let names: Vec<&str> = keys.iter().map(|key| key.2).collect();
+        sqlx::query(LOCK_REQUEST_KEYS_SQL)
+            .bind(REQUEST_KEY_LOCK_CLASS)
+            .bind(&subjects)
+            .bind(&actors)
+            .bind(&names)
+            .execute(&mut **conn.transaction())
+            .await?;
+        let existing: Vec<(i64, Uuid, Option<Vec<u8>>)> = sqlx::query_as(KEYED_EXECUTIONS_SQL)
+            .bind(&subjects)
+            .bind(&actors)
+            .bind(&names)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        existing
+            .into_iter()
+            .map(|(position, execution_id, request_sha256)| {
+                let key = usize::try_from(position - 1)
+                    .ok()
+                    .and_then(|index| keys.get(index))
+                    .ok_or_else(|| {
+                        SqlxError::Decode(format!("key position {position} names no key").into())
+                    })?;
+                let holder = KeyHolder {
+                    execution_id: stored(ExecutionId::new(execution_id))?,
+                    request_sha256,
+                };
+                Ok((*key, holder))
+            })
+            .collect()
+    }
+
+    /// Insert a batch's new rows in one statement; each is `pending` when
+    /// its `error` is `None`, otherwise settled `errored` with it.
     ///
     /// # Errors
     /// Returns the database error when the insert fails, or an encode error
-    /// when the authority, inputs, or route overrides cannot be serialized.
-    async fn insert_submission(
+    /// when an authority, inputs, or route overrides cannot be serialized.
+    async fn insert_submissions(
         &self,
         conn: &mut TenantConn<'_>,
-        submission: &Submission,
-        key: Option<&RequestKey>,
-        error: Option<&VerificationError>,
+        rows: &[NewSubmission<'_>],
     ) -> Result<(), SqlxError> {
-        let attribution = submission.authority.attribution();
-        let request = &submission.request;
-        sqlx::query(INSERT_SUBMISSION_SQL)
-            .bind(submission.execution_id.as_uuid())
-            .bind(request.verifier_card_uid.as_uuid())
-            .bind(request.card_uid.as_uuid())
-            .bind(request.run_id.as_ref().map(RunId::as_str))
-            .bind(Json(&request.inputs))
-            .bind(Json(&request.execution_route_overrides))
-            .bind(attribution.sub_principal_id.as_uuid())
-            .bind(attribution.act_principal_id.as_uuid())
-            .bind(Json(&submission.authority))
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let attributions: Vec<Attribution> = rows
+            .iter()
+            .map(|row| row.submission.authority.attribution())
+            .collect();
+        let causes = || rows.iter().map(|row| row.submission.cause.as_ref());
+        let requests = || rows.iter().map(|row| &row.submission.request);
+        sqlx::query(INSERT_SUBMISSIONS_SQL)
             .bind(
-                submission
-                    .cause
-                    .as_ref()
-                    .map(|cause| cause.trace_id.as_bytes().as_slice()),
+                rows.iter()
+                    .map(|row| row.submission.execution_id.as_uuid())
+                    .collect::<Vec<_>>(),
             )
             .bind(
-                submission
-                    .cause
-                    .as_ref()
-                    .map(|cause| cause.span_id.as_bytes().as_slice()),
+                requests()
+                    .map(|request| request.verifier_card_uid.as_uuid())
+                    .collect::<Vec<_>>(),
             )
-            .bind(key.map(|key| key.key.as_str()))
-            .bind(key.map(|key| key.request_sha256.as_slice()))
+            .bind(
+                requests()
+                    .map(|request| request.card_uid.as_uuid())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                requests()
+                    .map(|request| request.run_id.as_ref().map(RunId::as_str))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                requests()
+                    .map(|request| Json(&request.inputs))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                requests()
+                    .map(|request| Json(&request.execution_route_overrides))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                attributions
+                    .iter()
+                    .map(|attribution| attribution.sub_principal_id.as_uuid())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                attributions
+                    .iter()
+                    .map(|attribution| attribution.act_principal_id.as_uuid())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                rows.iter()
+                    .map(|row| Json(&row.submission.authority))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                causes()
+                    .map(|cause| cause.map(|cause| cause.trace_id.as_bytes().as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                causes()
+                    .map(|cause| cause.map(|cause| cause.span_id.as_bytes().as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                rows.iter()
+                    .map(|row| row.key.map(|key| key.key.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                rows.iter()
+                    .map(|row| row.key.map(|key| key.request_sha256.as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                rows.iter()
+                    .map(|row| row.error.as_ref().map(Json))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                causes()
+                    .map(|cause| cause.map(|cause| cause.sampled))
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                requests()
+                    .map(|request| request.group_id.as_ref().map(GroupId::as_str))
+                    .collect::<Vec<_>>(),
+            )
             .bind(self.retry.max_attempts)
-            .bind(error.map(Json))
-            .bind(submission.cause.as_ref().map(|cause| cause.sampled))
-            .bind(request.group_id.as_ref().map(GroupId::as_str))
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -1524,46 +1821,49 @@ impl VerifierExecutionQueue {
         window: DriftWindow,
         authority: &ExecutionAuthority,
     ) -> Result<EnqueueOutcome, SqlxError> {
-        let resolved = match resolve_binding(conn, binding_id).await? {
-            Ok(resolved) => resolved,
-            Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
-        };
-        let attribution = authority.attribution();
-        let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_SCHEDULED_SQL)
-            .bind(ExecutionId::new_v7().as_uuid())
-            .bind(resolved.verifier_card_uid)
-            .bind(
-                resolved
-                    .verifier_version
-                    .expect("invariant: a ready Verifier has a Card version"),
-            )
-            .bind(resolved.card_uid)
-            .bind(resolved.owner_card_uid)
-            .bind(resolved.binding_id)
-            .bind(resolved.trigger_uid)
-            .bind(resolved.trigger_digest)
-            .bind(resolved.operators)
-            .bind(window.start)
-            .bind(window.end)
-            .bind(attribution.sub_principal_id.as_uuid())
-            .bind(attribution.act_principal_id.as_uuid())
-            .bind(Json(authority.authority()))
-            .bind(self.retry.max_attempts)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        if let Some(execution_id) = inserted {
-            return Ok(EnqueueOutcome::Enqueued(stored(ExecutionId::new(
-                execution_id,
-            ))?));
-        }
-        let existing: Uuid = sqlx::query_scalar(EXISTING_OCCURRENCE_SQL)
-            .bind(binding_id.as_uuid())
-            .bind(window.end)
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        Ok(EnqueueOutcome::AlreadyEnqueued(stored(ExecutionId::new(
-            existing,
-        ))?))
+        timed("enqueue_scheduled", async {
+            let resolved = match resolve_binding(conn, binding_id).await? {
+                Ok(resolved) => resolved,
+                Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
+            };
+            let attribution = authority.attribution();
+            let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_SCHEDULED_SQL)
+                .bind(ExecutionId::new_v7().as_uuid())
+                .bind(resolved.verifier_card_uid)
+                .bind(
+                    resolved
+                        .verifier_version
+                        .expect("invariant: a ready Verifier has a Card version"),
+                )
+                .bind(resolved.card_uid)
+                .bind(resolved.owner_card_uid)
+                .bind(resolved.binding_id)
+                .bind(resolved.trigger_uid)
+                .bind(resolved.trigger_digest)
+                .bind(resolved.operators)
+                .bind(window.start)
+                .bind(window.end)
+                .bind(attribution.sub_principal_id.as_uuid())
+                .bind(attribution.act_principal_id.as_uuid())
+                .bind(Json(authority.authority()))
+                .bind(self.retry.max_attempts)
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            if let Some(execution_id) = inserted {
+                return Ok(EnqueueOutcome::Enqueued(stored(ExecutionId::new(
+                    execution_id,
+                ))?));
+            }
+            let existing: Uuid = sqlx::query_scalar(EXISTING_OCCURRENCE_SQL)
+                .bind(binding_id.as_uuid())
+                .bind(window.end)
+                .fetch_one(&mut **conn.transaction())
+                .await?;
+            Ok(EnqueueOutcome::AlreadyEnqueued(stored(ExecutionId::new(
+                existing,
+            ))?))
+        })
+        .await
     }
 
     /// Lock and decide the earliest due scheduled binding of the caller's
@@ -1587,53 +1887,56 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueBinding>, SqlxError> {
-        let due: Option<DueBindingRow> = sqlx::query_as(DUE_BINDING_SQL)
-            .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some(due) = due else {
-            return Ok(None);
-        };
-        let due_at = due.next_run_at;
-        let binding_id = stored(BindingId::new(due.binding_id))?;
-        let occurrence = match BindingSchedule::parse(
-            &due.schedule_cron,
-            due.schedule_tz.as_deref(),
-        )
-        .and_then(|schedule| schedule.occurrence(due_at, due.schedule_clock))
-        {
-            Ok(occurrence) => occurrence,
-            Err(error) => {
-                tracing::error!(%binding_id, %error, "stored binding schedule cannot advance; disarming");
-                return Ok(Some(DueBinding {
-                    binding_id,
-                    due_at,
-                    decision: DueDecision::InvalidSchedule,
-                }));
-            }
-        };
-        let next_run_at = occurrence.next_run_at;
-        let skip = |skip| DueDecision::Skip { skip, next_run_at };
-        let decision = match occurrence.window {
-            None => skip(ScheduleSkip::Missed),
-            Some(window) => match binding_activity(conn, binding_id, self.inactivity)
-                .await?
-                .filter(|activity| activity.active)
-                .and_then(|activity| activity.principal_id)
+        timed("schedule_claim", async {
+            let due: Option<DueBindingRow> = sqlx::query_as(DUE_BINDING_SQL)
+                .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            let Some(due) = due else {
+                return Ok(None);
+            };
+            let due_at = due.next_run_at;
+            let binding_id = stored(BindingId::new(due.binding_id))?;
+            let occurrence = match BindingSchedule::parse(
+                &due.schedule_cron,
+                due.schedule_tz.as_deref(),
+            )
+            .and_then(|schedule| schedule.occurrence(due_at, due.schedule_clock))
             {
-                None => skip(ScheduleSkip::Inactive),
-                Some(owner) => DueDecision::Run {
-                    window,
-                    owner,
-                    next_run_at,
+                Ok(occurrence) => occurrence,
+                Err(error) => {
+                    tracing::error!(%binding_id, %error, "stored binding schedule cannot advance; disarming");
+                    return Ok(Some(DueBinding {
+                        binding_id,
+                        due_at,
+                        decision: DueDecision::InvalidSchedule,
+                    }));
+                }
+            };
+            let next_run_at = occurrence.next_run_at;
+            let skip = |skip| DueDecision::Skip { skip, next_run_at };
+            let decision = match occurrence.window {
+                None => skip(ScheduleSkip::Missed),
+                Some(window) => match binding_activity(conn, binding_id, self.inactivity)
+                    .await?
+                    .filter(|activity| activity.active)
+                    .and_then(|activity| activity.principal_id)
+                {
+                    None => skip(ScheduleSkip::Inactive),
+                    Some(owner) => DueDecision::Run {
+                        window,
+                        owner,
+                        next_run_at,
+                    },
                 },
-            },
-        };
-        Ok(Some(DueBinding {
-            binding_id,
-            due_at,
-            decision,
-        }))
+            };
+            Ok(Some(DueBinding {
+                binding_id,
+                due_at,
+                decision,
+            }))
+        })
+        .await
     }
 
     /// Settle one tick claimed by [`Self::claim_due`].
@@ -1658,43 +1961,48 @@ impl VerifierExecutionQueue {
         due: DueBinding,
         authority: Option<ExecutionAuthority>,
     ) -> Result<ScheduleTick, SqlxError> {
-        let (outcome, next_run_at) = match due.decision {
-            DueDecision::InvalidSchedule => (
-                ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule),
-                None,
-            ),
-            DueDecision::Skip { skip, next_run_at } => {
-                (ScheduleOutcome::Skipped(skip), Some(next_run_at))
-            }
-            DueDecision::Run {
-                window,
+        timed("schedule_due", async {
+            let (outcome, next_run_at) = match due.decision {
+                DueDecision::InvalidSchedule => (
+                    ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule),
+                    None,
+                ),
+                DueDecision::Skip { skip, next_run_at } => {
+                    (ScheduleOutcome::Skipped(skip), Some(next_run_at))
+                }
+                DueDecision::Run {
+                    window,
+                    next_run_at,
+                    ..
+                } => {
+                    let outcome = match authority {
+                        None => ScheduleOutcome::Skipped(ScheduleSkip::AuthorityUnavailable),
+                        Some(authority) => match self
+                            .enqueue_scheduled(conn, due.binding_id, window, &authority)
+                            .await?
+                        {
+                            EnqueueOutcome::Enqueued(id) => ScheduleOutcome::Enqueued(id),
+                            EnqueueOutcome::AlreadyEnqueued(id) => {
+                                ScheduleOutcome::AlreadyEnqueued(id)
+                            }
+                            EnqueueOutcome::Refused(refusal) => {
+                                ScheduleOutcome::Skipped(ScheduleSkip::Refused(refusal))
+                            }
+                        },
+                    };
+                    (outcome, Some(next_run_at))
+                }
+            };
+            self.advance_cursor(conn, due.binding_id, next_run_at)
+                .await?;
+            Ok(ScheduleTick {
+                binding_id: due.binding_id,
+                due_at: due.due_at,
+                outcome,
                 next_run_at,
-                ..
-            } => {
-                let outcome = match authority {
-                    None => ScheduleOutcome::Skipped(ScheduleSkip::AuthorityUnavailable),
-                    Some(authority) => match self
-                        .enqueue_scheduled(conn, due.binding_id, window, &authority)
-                        .await?
-                    {
-                        EnqueueOutcome::Enqueued(id) => ScheduleOutcome::Enqueued(id),
-                        EnqueueOutcome::AlreadyEnqueued(id) => ScheduleOutcome::AlreadyEnqueued(id),
-                        EnqueueOutcome::Refused(refusal) => {
-                            ScheduleOutcome::Skipped(ScheduleSkip::Refused(refusal))
-                        }
-                    },
-                };
-                (outcome, Some(next_run_at))
-            }
-        };
-        self.advance_cursor(conn, due.binding_id, next_run_at)
-            .await?;
-        Ok(ScheduleTick {
-            binding_id: due.binding_id,
-            due_at: due.due_at,
-            outcome,
-            next_run_at,
+            })
         })
+        .await
     }
 
     /// Store a claimed binding's next cursor.
@@ -1733,24 +2041,27 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         items: &[GroupActivity],
     ) -> Result<(), SqlxError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        let column =
-            |field: fn(&GroupActivity) -> Uuid| items.iter().map(field).collect::<Vec<_>>();
-        sqlx::query(RECORD_GROUP_ACTIVITY_SQL)
-            .bind(column(|item| item.owner_card_uid.as_uuid()))
-            .bind(column(|item| item.card_uid.as_uuid()))
-            .bind(column(|item| item.verifier_card_uid.as_uuid()))
-            .bind(
-                items
-                    .iter()
-                    .map(|item| item.group_id.as_str())
-                    .collect::<Vec<_>>(),
-            )
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(())
+        timed("group_activity", async {
+            if items.is_empty() {
+                return Ok(());
+            }
+            let column =
+                |field: fn(&GroupActivity) -> Uuid| items.iter().map(field).collect::<Vec<_>>();
+            sqlx::query(RECORD_GROUP_ACTIVITY_SQL)
+                .bind(column(|item| item.owner_card_uid.as_uuid()))
+                .bind(column(|item| item.card_uid.as_uuid()))
+                .bind(column(|item| item.verifier_card_uid.as_uuid()))
+                .bind(
+                    items
+                        .iter()
+                        .map(|item| item.group_id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Lock the earliest expired pending group of the caller's tenant.
@@ -1772,28 +2083,31 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueGroup>, SqlxError> {
-        let due: Option<(Uuid, String, bool)> = sqlx::query_as(DUE_GROUP_SQL)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some((binding_id, group_id, overdue)) = due else {
-            return Ok(None);
-        };
-        let (owner, Json(settings)): (Uuid, Json<GroupEndSettings>) =
-            sqlx::query_as(GROUP_BINDING_SQL)
-                .bind(binding_id)
-                .fetch_one(&mut **conn.transaction())
+        timed("group_claim", async {
+            let due: Option<(Uuid, String, bool)> = sqlx::query_as(DUE_GROUP_SQL)
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
-        let binding_id = stored(BindingId::new(binding_id))?;
-        let activity = binding_activity(conn, binding_id, self.inactivity).await?;
-        Ok(Some(DueGroup {
-            binding_id,
-            group_id: stored(GroupId::new(group_id))?,
-            owner_card_uid: stored(CardUid::from_uuid(owner))?,
-            settings,
-            owner: activity.as_ref().and_then(|activity| activity.principal_id),
-            active: activity.is_some_and(|activity| activity.active),
-            overdue,
-        }))
+            let Some((binding_id, group_id, overdue)) = due else {
+                return Ok(None);
+            };
+            let (owner, Json(settings)): (Uuid, Json<GroupEndSettings>) =
+                sqlx::query_as(GROUP_BINDING_SQL)
+                    .bind(binding_id)
+                    .fetch_one(&mut **conn.transaction())
+                    .await?;
+            let binding_id = stored(BindingId::new(binding_id))?;
+            let activity = binding_activity(conn, binding_id, self.inactivity).await?;
+            Ok(Some(DueGroup {
+                binding_id,
+                group_id: stored(GroupId::new(group_id))?,
+                owner_card_uid: stored(CardUid::from_uuid(owner))?,
+                settings,
+                owner: activity.as_ref().and_then(|activity| activity.principal_id),
+                active: activity.is_some_and(|activity| activity.active),
+                overdue,
+            }))
+        })
+        .await
     }
 
     /// Delete a pending group claimed by [`Self::claim_due_group`] in the
@@ -1801,17 +2115,21 @@ impl VerifierExecutionQueue {
     ///
     /// # Errors
     /// Returns the database error when the delete fails.
+    #[tracing::instrument(skip(self, conn, due), fields(operation = "verification.group.consume", binding_id = %due.binding_id, group_id = %due.group_id))]
     pub async fn consume_group(
         &self,
         conn: &mut TenantConn<'_>,
         due: &DueGroup,
     ) -> Result<(), SqlxError> {
-        sqlx::query(CONSUME_GROUP_SQL)
-            .bind(due.binding_id.as_uuid())
-            .bind(due.group_id.as_str())
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(())
+        timed("group_consume", async {
+            sqlx::query(CONSUME_GROUP_SQL)
+                .bind(due.binding_id.as_uuid())
+                .bind(due.group_id.as_str())
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Record the claimed pending group `due` as refused before admission:
@@ -1839,17 +2157,20 @@ impl VerifierExecutionQueue {
         system: PrincipalId,
         error: &VerificationError,
     ) -> Result<ExecutionId, SqlxError> {
-        let execution_id: Uuid = sqlx::query_scalar(INSERT_GROUP_ERROR_SQL)
-            .bind(ExecutionId::new_v7().as_uuid())
-            .bind(due.binding_id.as_uuid())
-            .bind(due.group_id.as_str())
-            .bind(owner.as_uuid())
-            .bind(system.as_uuid())
-            .bind(Json(error))
-            .bind(self.retry.max_attempts)
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        stored(ExecutionId::new(execution_id))
+        timed("group_refuse", async {
+            let execution_id: Uuid = sqlx::query_scalar(INSERT_GROUP_ERROR_SQL)
+                .bind(ExecutionId::new_v7().as_uuid())
+                .bind(due.binding_id.as_uuid())
+                .bind(due.group_id.as_str())
+                .bind(owner.as_uuid())
+                .bind(system.as_uuid())
+                .bind(Json(error))
+                .bind(self.retry.max_attempts)
+                .fetch_one(&mut **conn.transaction())
+                .await?;
+            stored(ExecutionId::new(execution_id))
+        })
+        .await
     }
 
     /// Enqueue one group execution of `binding_id` judging `pinned`.
@@ -1879,88 +2200,92 @@ impl VerifierExecutionQueue {
         pinned: &PinnedGroup,
         authority: &ExecutionAuthority,
     ) -> Result<EnqueueOutcome, SqlxError> {
-        let resolved = match resolve_binding(conn, binding_id).await? {
-            Ok(resolved) => resolved,
-            Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
-        };
-        let attribution = authority.attribution();
-        let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_GROUP_SQL)
-            .bind(ExecutionId::new_v7().as_uuid())
-            .bind(resolved.verifier_card_uid)
-            .bind(
-                resolved
-                    .verifier_version
-                    .expect("invariant: a ready Verifier has a Card version"),
-            )
-            .bind(resolved.card_uid)
-            .bind(resolved.owner_card_uid)
-            .bind(resolved.binding_id)
-            .bind(resolved.trigger_uid)
-            .bind(resolved.trigger_digest)
-            .bind(resolved.operators)
-            .bind(Json(&pinned.inputs))
-            .bind(pinned.group_id.as_str())
-            .bind(pinned.digest.as_slice())
-            .bind(Json(&pinned.snapshot.sources))
-            .bind(attribution.sub_principal_id.as_uuid())
-            .bind(attribution.act_principal_id.as_uuid())
-            .bind(Json(authority.authority()))
-            .bind(self.retry.max_attempts)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        if let Some(execution_id) = inserted {
-            return Ok(EnqueueOutcome::Enqueued(stored(ExecutionId::new(
-                execution_id,
-            ))?));
-        }
-        let existing: Uuid = sqlx::query_scalar(EXISTING_SNAPSHOT_SQL)
-            .bind(binding_id.as_uuid())
-            .bind(pinned.group_id.as_str())
-            .bind(pinned.digest.as_slice())
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        Ok(EnqueueOutcome::AlreadyEnqueued(stored(ExecutionId::new(
-            existing,
-        ))?))
+        timed("group_enqueue", async {
+            let resolved = match resolve_binding(conn, binding_id).await? {
+                Ok(resolved) => resolved,
+                Err(refusal) => return Ok(EnqueueOutcome::Refused(refusal)),
+            };
+            let attribution = authority.attribution();
+            let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_GROUP_SQL)
+                .bind(ExecutionId::new_v7().as_uuid())
+                .bind(resolved.verifier_card_uid)
+                .bind(
+                    resolved
+                        .verifier_version
+                        .expect("invariant: a ready Verifier has a Card version"),
+                )
+                .bind(resolved.card_uid)
+                .bind(resolved.owner_card_uid)
+                .bind(resolved.binding_id)
+                .bind(resolved.trigger_uid)
+                .bind(resolved.trigger_digest)
+                .bind(resolved.operators)
+                .bind(Json(&pinned.inputs))
+                .bind(pinned.group_id.as_str())
+                .bind(pinned.digest.as_slice())
+                .bind(Json(&pinned.snapshot.sources))
+                .bind(attribution.sub_principal_id.as_uuid())
+                .bind(attribution.act_principal_id.as_uuid())
+                .bind(Json(authority.authority()))
+                .bind(self.retry.max_attempts)
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            if let Some(execution_id) = inserted {
+                return Ok(EnqueueOutcome::Enqueued(stored(ExecutionId::new(
+                    execution_id,
+                ))?));
+            }
+            let existing: Uuid = sqlx::query_scalar(EXISTING_SNAPSHOT_SQL)
+                .bind(binding_id.as_uuid())
+                .bind(pinned.group_id.as_str())
+                .bind(pinned.digest.as_slice())
+                .fetch_one(&mut **conn.transaction())
+                .await?;
+            Ok(EnqueueOutcome::AlreadyEnqueued(stored(ExecutionId::new(
+                existing,
+            ))?))
+        })
+        .await
     }
 
-    /// Claim one runnable execution of the caller's tenant under a fresh lease.
+    /// Claim up to `limit` runnable executions of the caller's tenant, each
+    /// under its own fresh lease, in one statement.
     ///
-    /// First settles, as `errored`, every expired lease whose attempts are
-    /// exhausted, so a crash loop cannot exceed the budget. Then locks the
-    /// oldest `pending` or `retrying` execution due at PostgreSQL's statement
-    /// time, or `running` execution whose lease the database considers
-    /// expired, with `SKIP LOCKED`; marks it `running` with a new lease token
-    /// expiring `lease_for` after that same database instant; and counts the
-    /// attempt. Returns `None` when nothing is runnable. The caller commits
-    /// before executing. The statement opens no span of its own: the runner
-    /// times it on a `claim` span it can parent to the attempt only once the
+    /// The statement first settles, as `errored`, every expired lease whose
+    /// attempts are exhausted, so a crash loop cannot exceed the budget. It
+    /// then locks the oldest `pending` or `retrying` executions due at
+    /// PostgreSQL's statement time, or `running` executions whose lease the
+    /// database considers expired, with `SKIP LOCKED`; marks each `running`
+    /// with its own lease token expiring `lease_for` after that same database
+    /// instant; and counts the attempt. Returns nothing when nothing is
+    /// runnable, and never more than `limit`; the order is unspecified. The
+    /// caller commits before executing. The statement opens no span of its
+    /// own: the runner records it on each attempt's `claim` span once the
     /// claimed row names the attempt's cause.
     ///
     /// # Errors
-    /// Returns the database error when a statement fails, or a decode error
-    /// when the claimed row's identities or frozen input are malformed.
+    /// Returns the database error when the statement fails, or a decode error
+    /// when a claimed row's identities or frozen input are malformed.
     pub async fn claim(
         &self,
         conn: &mut TenantConn<'_>,
         lease_for: Duration,
-    ) -> Result<Option<ClaimedExecution>, SqlxError> {
-        let exhausted = VerificationError {
-            code: "lease_expired".to_owned(),
-            message: "the execution's lease expired after its final attempt".to_owned(),
-        };
-        sqlx::query(EXHAUST_EXPIRED_SQL)
-            .bind(Json(&exhausted))
-            .execute(&mut **conn.transaction())
-            .await?;
-        let token = Uuid::now_v7();
-        let row: Option<ClaimedRow> = sqlx::query_as(CLAIM_SQL)
-            .bind(token)
-            .bind(lease_for.num_milliseconds())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        row.map(|row| row.into_claimed(LeaseToken(token)))
-            .transpose()
+        limit: u32,
+    ) -> Result<Vec<ClaimedExecution>, SqlxError> {
+        timed("claim", async {
+            let exhausted = VerificationError {
+                code: "lease_expired".to_owned(),
+                message: "the execution's lease expired after its final attempt".to_owned(),
+            };
+            let rows: Vec<ClaimedRow> = sqlx::query_as(CLAIM_SQL)
+                .bind(Json(&exhausted))
+                .bind(lease_for.num_milliseconds())
+                .bind(i64::from(limit))
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            rows.into_iter().map(ClaimedRow::into_claimed).collect()
+        })
+        .await
     }
 
     /// Renew, on the database clock, every lease in `tokens` still held.
@@ -1982,15 +2307,18 @@ impl VerifierExecutionQueue {
         tokens: &[LeaseToken],
         lease_for: Duration,
     ) -> Result<Vec<LeaseToken>, SqlxError> {
-        let tokens: Vec<Uuid> = tokens.iter().map(|token| token.0).collect();
-        let lease = lease_for.num_milliseconds();
-        let held: Vec<Uuid> = sqlx::query_scalar(RENEW_LEASES_SQL)
-            .bind(tokens)
-            .bind(lease)
-            .bind(lease - lease / 3)
-            .fetch_all(&mut **conn.transaction())
-            .await?;
-        Ok(held.into_iter().map(LeaseToken).collect())
+        timed("renew", async {
+            let tokens: Vec<Uuid> = tokens.iter().map(|token| token.0).collect();
+            let lease = lease_for.num_milliseconds();
+            let held: Vec<Uuid> = sqlx::query_scalar(RENEW_LEASES_SQL)
+                .bind(tokens)
+                .bind(lease)
+                .bind(lease - lease / 3)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            Ok(held.into_iter().map(LeaseToken).collect())
+        })
+        .await
     }
 
     /// Settle a claimed execution `completed`, pointing at its staged result.
@@ -2031,59 +2359,126 @@ impl VerifierExecutionQueue {
         summary: &str,
         drift: Option<DriftCounts>,
     ) -> Result<Settlement, SqlxError> {
-        let verdict_text: &'static str = verdict.into();
-        sqlx::query(LOCK_GROUP_BINDING_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let settled: Option<SettledRow> = sqlx::query_as(COMPLETE_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(result_id.as_uuid())
-            .bind(verdict_text)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some((binding_id, Json(operators), grouped, replayed)) = settled else {
-            return Ok(Settlement::StaleLease);
-        };
-        let previous = if grouped {
-            if replayed {
-                return Ok(Settlement::Applied);
-            }
-            let previous: Option<(Uuid, String)> = sqlx::query_as(PREVIOUS_GROUP_SQL)
+        timed("complete", async {
+            let verdict_text: &'static str = verdict.into();
+            sqlx::query(LOCK_GROUP_BINDING_SQL)
                 .bind(lease.execution_id.as_uuid())
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
-            match previous {
-                Some(previous) if previous.1 != verdict_text => Some(previous),
-                _ => return Ok(Settlement::Applied),
-            }
-        } else if verdict == VerificationVerdict::Failed && binding_id.is_some() {
-            None
-        } else {
-            return Ok(Settlement::Applied);
-        };
-        let (previous_result, previous_verdict) = previous.unzip();
-        let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
-        for operator in &operators {
-            let (uid, digest) = match operator {
-                FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
-                FrozenTarget::Digest(digest) => (None, Some(digest.as_str())),
-            };
-            sqlx::query(INSERT_DISPATCH_SQL)
-                .bind(OperatorDispatchId::new_v7().as_uuid())
+            let settled: Option<SettledRow> = sqlx::query_as(COMPLETE_SQL)
                 .bind(lease.execution_id.as_uuid())
-                .bind(uid)
-                .bind(digest)
-                .bind(&summary)
-                .bind(drift.map(Json))
+                .bind(lease.token.0)
+                .bind(result_id.as_uuid())
                 .bind(verdict_text)
-                .bind(previous_result)
-                .bind(previous_verdict.as_deref())
-                .execute(&mut **conn.transaction())
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
+            let Some((binding_id, Json(operators), grouped, replayed)) = settled else {
+                return Ok(Settlement::StaleLease);
+            };
+            let previous = if grouped {
+                if replayed {
+                    return Ok(Settlement::Applied);
+                }
+                let previous: Option<(Uuid, String)> = sqlx::query_as(PREVIOUS_GROUP_SQL)
+                    .bind(lease.execution_id.as_uuid())
+                    .fetch_optional(&mut **conn.transaction())
+                    .await?;
+                match previous {
+                    Some(previous) if previous.1 != verdict_text => Some(previous),
+                    _ => return Ok(Settlement::Applied),
+                }
+            } else if verdict == VerificationVerdict::Failed && binding_id.is_some() {
+                None
+            } else {
+                return Ok(Settlement::Applied);
+            };
+            insert_dispatches(
+                conn,
+                lease.execution_id,
+                &operators,
+                summary,
+                drift,
+                verdict_text,
+                previous,
+            )
+            .await?;
+            Ok(Settlement::Applied)
+        })
+        .await
+    }
+
+    /// Settle many claimed executions of the caller's tenant `completed` in
+    /// one statement, with the same effects as calling
+    /// [`complete`](Self::complete) for each in turn.
+    ///
+    /// Non-group completions apply through [`COMPLETE_MANY_SQL`], and a
+    /// `failed` binding-created one inserts its dispatches exactly as
+    /// `complete` does. A completion the statement did not apply — a group
+    /// execution, which needs its binding lock and verdict comparison, or a
+    /// lost lease or different result — is settled by `complete` itself in
+    /// the same transaction, which reports [`Settlement::StaleLease`] for a
+    /// lost lease. The returned settlements align with `completions`.
+    ///
+    /// # Errors
+    /// Returns the database error when a statement fails, or a decode error
+    /// when the frozen Operators are malformed; the caller's transaction is
+    /// then unusable and nothing in it should commit.
+    #[tracing::instrument(skip_all, fields(operation = "verification.executions.complete_many", completions = completions.len()))]
+    pub async fn complete_many(
+        &self,
+        conn: &mut TenantConn<'_>,
+        completions: &[Completion],
+    ) -> Result<Vec<Settlement>, SqlxError> {
+        let applied: Vec<(Uuid, Option<Uuid>, Json<Vec<FrozenTarget>>)> =
+            timed("complete_many", async {
+                let (executions, (tokens, results)): (Vec<Uuid>, (Vec<Uuid>, Vec<Uuid>)) =
+                    completions
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.lease.execution_id.as_uuid(),
+                                (c.lease.token.0, c.result_id.as_uuid()),
+                            )
+                        })
+                        .unzip();
+                sqlx::query_as(COMPLETE_MANY_SQL)
+                    .bind(executions)
+                    .bind(tokens)
+                    .bind(results)
+                    .fetch_all(&mut **conn.transaction())
+                    .await
+            })
+            .await?;
+        let mut applied: HashMap<Uuid, (Option<Uuid>, Vec<FrozenTarget>)> = applied
+            .into_iter()
+            .map(|(execution, binding, Json(operators))| (execution, (binding, operators)))
+            .collect();
+        let mut settlements = Vec::with_capacity(completions.len());
+        for c in completions {
+            let settlement = match applied.remove(&c.lease.execution_id.as_uuid()) {
+                Some((binding, operators)) => {
+                    if c.verdict == VerificationVerdict::Failed && binding.is_some() {
+                        insert_dispatches(
+                            conn,
+                            c.lease.execution_id,
+                            &operators,
+                            &c.summary,
+                            c.drift,
+                            c.verdict.into(),
+                            None,
+                        )
+                        .await?;
+                    }
+                    Settlement::Applied
+                }
+                None => {
+                    self.complete(conn, c.lease, c.result_id, c.verdict, &c.summary, c.drift)
+                        .await?
+                }
+            };
+            settlements.push(settlement);
         }
-        Ok(Settlement::Applied)
+        Ok(settlements)
     }
 
     /// Report a retryable engine failure for a claimed execution.
@@ -2103,27 +2498,30 @@ impl VerifierExecutionQueue {
         lease: ExecutionLease,
         error: &VerificationError,
     ) -> Result<RetryOutcome, SqlxError> {
-        let budget: Option<(i32, i32)> = sqlx::query_as(LEASED_ATTEMPTS_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some((attempts, max_attempts)) = budget else {
-            return Ok(RetryOutcome::StaleLease);
-        };
-        if attempts >= max_attempts {
-            self.terminate(conn, lease, TerminalStatus::Errored, error)
+        timed("retry", async {
+            let budget: Option<(i32, i32)> = sqlx::query_as(LEASED_ATTEMPTS_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
-            return Ok(RetryOutcome::Exhausted);
-        }
-        let next_attempt_at: Option<DateTime<Utc>> = sqlx::query_scalar(RETRY_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(Json(error))
-            .bind(self.retry.delay_after(attempts).num_milliseconds())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        Ok(next_attempt_at.map_or(RetryOutcome::StaleLease, RetryOutcome::Scheduled))
+            let Some((attempts, max_attempts)) = budget else {
+                return Ok(RetryOutcome::StaleLease);
+            };
+            if attempts >= max_attempts {
+                self.terminate(conn, lease, TerminalStatus::Errored, error)
+                    .await?;
+                return Ok(RetryOutcome::Exhausted);
+            }
+            let next_attempt_at: Option<DateTime<Utc>> = sqlx::query_scalar(RETRY_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(Json(error))
+                .bind(self.retry.delay_after(attempts).num_milliseconds())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            Ok(next_attempt_at.map_or(RetryOutcome::StaleLease, RetryOutcome::Scheduled))
+        })
+        .await
     }
 
     /// Settle a claimed execution in a terminal status with no verdict.
@@ -2141,14 +2539,17 @@ impl VerifierExecutionQueue {
         status: TerminalStatus,
         error: &VerificationError,
     ) -> Result<Settlement, SqlxError> {
-        let result = sqlx::query(TERMINATE_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(status.as_str())
-            .bind(Json(error))
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(settlement(result.rows_affected()))
+        timed("terminate", async {
+            let result = sqlx::query(TERMINATE_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(status.as_str())
+                .bind(Json(error))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(settlement(result.rows_affected()))
+        })
+        .await
     }
 
     /// Return a claimed execution to the queue with its attempt refunded.
@@ -2168,13 +2569,16 @@ impl VerifierExecutionQueue {
         lease: ExecutionLease,
         delay: Duration,
     ) -> Result<Settlement, SqlxError> {
-        let result = sqlx::query(RELEASE_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(delay.num_milliseconds())
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(settlement(result.rows_affected()))
+        timed("release", async {
+            let result = sqlx::query(RELEASE_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(delay.num_milliseconds())
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(settlement(result.rows_affected()))
+        })
+        .await
     }
 
     /// Read one execution's status projection.
@@ -2192,50 +2596,53 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         execution_id: ExecutionId,
     ) -> Result<Option<ExecutionStatus>, SqlxError> {
-        let row: Option<StatusRow> = sqlx::query_as(STATUS_SQL)
-            .bind(execution_id.as_uuid())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let dispatches: Vec<DispatchRow> = sqlx::query_as(DISPATCHES_SQL)
-            .bind(execution_id.as_uuid())
-            .fetch_all(&mut **conn.transaction())
-            .await?;
-        Ok(Some(ExecutionStatus {
-            state: VerificationExecutionState {
-                execution_id: stored(ExecutionId::new(row.execution_id))?,
-                status: stored(row.status.parse())?,
-                error: row.error.map(|Json(error)| error),
-                result: None,
-                dispatches: dispatches
-                    .into_iter()
-                    .map(DispatchRow::into_state)
-                    .collect::<Result<_, _>>()?,
-                group_id: row
-                    .group_id
-                    .map(|id| stored(GroupId::new(id)))
+        timed("execution_status", async {
+            let row: Option<StatusRow> = sqlx::query_as(STATUS_SQL)
+                .bind(execution_id.as_uuid())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let dispatches: Vec<DispatchRow> = sqlx::query_as(DISPATCHES_SQL)
+                .bind(execution_id.as_uuid())
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            Ok(Some(ExecutionStatus {
+                state: VerificationExecutionState {
+                    execution_id: stored(ExecutionId::new(row.execution_id))?,
+                    status: stored(row.status.parse())?,
+                    error: row.error.map(|Json(error)| error),
+                    result: None,
+                    dispatches: dispatches
+                        .into_iter()
+                        .map(DispatchRow::into_state)
+                        .collect::<Result<_, _>>()?,
+                    group_id: row
+                        .group_id
+                        .map(|id| stored(GroupId::new(id)))
+                        .transpose()?,
+                    owner_card_uid: row
+                        .owner_card_uid
+                        .map(|uid| stored(CardUid::from_uuid(uid)))
+                        .transpose()?,
+                    group: row
+                        .group_sources
+                        .map(|Json(sources)| GroupSnapshot { sources }),
+                },
+                attribution: Attribution::new(
+                    PrincipalId::new(row.sub_principal_id),
+                    PrincipalId::new(row.act_principal_id),
+                ),
+                verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
+                card_uid: stored(CardUid::from_uuid(row.card_uid))?,
+                result_id: row
+                    .result_id
+                    .map(|id| stored(VerificationResultId::new(id)))
                     .transpose()?,
-                owner_card_uid: row
-                    .owner_card_uid
-                    .map(|uid| stored(CardUid::from_uuid(uid)))
-                    .transpose()?,
-                group: row
-                    .group_sources
-                    .map(|Json(sources)| GroupSnapshot { sources }),
-            },
-            attribution: Attribution::new(
-                PrincipalId::new(row.sub_principal_id),
-                PrincipalId::new(row.act_principal_id),
-            ),
-            verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
-            card_uid: stored(CardUid::from_uuid(row.card_uid))?,
-            result_id: row
-                .result_id
-                .map(|id| stored(VerificationResultId::new(id)))
-                .transpose()?,
-        }))
+            }))
+        })
+        .await
     }
 
     /// Read one binding's Binding GET projection at database time.
@@ -2253,33 +2660,36 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         binding_id: BindingId,
     ) -> Result<Option<VerificationBindingStatus>, SqlxError> {
-        let Some(activity) = binding_activity(conn, binding_id, self.inactivity).await? else {
-            return Ok(None);
-        };
-        let (subject, verifier, readiness, last_execution, group_end): (
-            Uuid,
-            Uuid,
-            String,
-            Option<Uuid>,
-            Option<Json<GroupEndSettings>>,
-        ) = sqlx::query_as(BINDING_TARGETS_SQL)
-            .bind(binding_id.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-        Ok(Some(VerificationBindingStatus {
-            binding_id,
-            owner_card_uid: activity.owner_card_uid,
-            card_uid: stored(CardUid::from_uuid(subject))?,
-            verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
-            active: activity.active,
-            readiness: stored(readiness.parse())?,
-            next_run_at: activity.next_run_at,
-            last_activated_at: activity.last_authenticated_at,
-            last_execution_id: last_execution
-                .map(|id| stored(ExecutionId::new(id)))
-                .transpose()?,
-            group_end: group_end.map(|Json(settings)| settings),
-        }))
+        timed("binding_status", async {
+            let Some(activity) = binding_activity(conn, binding_id, self.inactivity).await? else {
+                return Ok(None);
+            };
+            let (subject, verifier, readiness, last_execution, group_end): (
+                Uuid,
+                Uuid,
+                String,
+                Option<Uuid>,
+                Option<Json<GroupEndSettings>>,
+            ) = sqlx::query_as(BINDING_TARGETS_SQL)
+                .bind(binding_id.as_uuid())
+                .fetch_one(&mut **conn.transaction())
+                .await?;
+            Ok(Some(VerificationBindingStatus {
+                binding_id,
+                owner_card_uid: activity.owner_card_uid,
+                card_uid: stored(CardUid::from_uuid(subject))?,
+                verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
+                active: activity.active,
+                readiness: stored(readiness.parse())?,
+                next_run_at: activity.next_run_at,
+                last_activated_at: activity.last_authenticated_at,
+                last_execution_id: last_execution
+                    .map(|id| stored(ExecutionId::new(id)))
+                    .transpose()?,
+                group_end: group_end.map(|Json(settings)| settings),
+            }))
+        })
+        .await
     }
 
     /// List every tenant that has a claimable execution at database time.
@@ -2297,12 +2707,15 @@ impl VerifierExecutionQueue {
         &self,
         operator: &OperatorPool,
     ) -> Result<Vec<DataTenantId>, SqlxError> {
-        let rows: Vec<Uuid> = sqlx::query_scalar(RUNNABLE_TENANTS_SQL)
-            .fetch_all(operator.pool())
-            .await?;
-        rows.into_iter()
-            .map(|tenant| stored(DataTenantId::new(tenant)))
-            .collect()
+        timed("runnable_scan", async {
+            let rows: Vec<Uuid> = sqlx::query_scalar(RUNNABLE_TENANTS_SQL)
+                .fetch_all(operator.pool())
+                .await?;
+            rows.into_iter()
+                .map(|tenant| stored(DataTenantId::new(tenant)))
+                .collect()
+        })
+        .await
     }
 
     /// List up to `limit` tenants that have a due scheduled binding at
@@ -2320,14 +2733,17 @@ impl VerifierExecutionQueue {
         operator: &OperatorPool,
         limit: i64,
     ) -> Result<Vec<DataTenantId>, SqlxError> {
-        let rows: Vec<Uuid> = sqlx::query_scalar(DUE_TENANTS_SQL)
-            .bind(limit)
-            .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
-            .fetch_all(operator.pool())
-            .await?;
-        rows.into_iter()
-            .map(|tenant| stored(DataTenantId::new(tenant)))
-            .collect()
+        timed("due_scan", async {
+            let rows: Vec<Uuid> = sqlx::query_scalar(DUE_TENANTS_SQL)
+                .bind(limit)
+                .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
+                .fetch_all(operator.pool())
+                .await?;
+            rows.into_iter()
+                .map(|tenant| stored(DataTenantId::new(tenant)))
+                .collect()
+        })
+        .await
     }
 
     /// List up to `limit` tenants that have an expired pending group at
@@ -2339,19 +2755,26 @@ impl VerifierExecutionQueue {
     /// # Errors
     /// Returns the database error when the read fails, or a decode error when
     /// a stored tenant key is malformed.
+    #[tracing::instrument(
+        skip(self, operator),
+        fields(operation = "verification.group.due_tenants")
+    )]
     // tenant-isolation: cross-tenant OperatorPool
     pub async fn tenants_with_due_groups(
         &self,
         operator: &OperatorPool,
         limit: i64,
     ) -> Result<Vec<DataTenantId>, SqlxError> {
-        let rows: Vec<Uuid> = sqlx::query_scalar(DUE_GROUP_TENANTS_SQL)
-            .bind(limit)
-            .fetch_all(operator.pool())
-            .await?;
-        rows.into_iter()
-            .map(|tenant| stored(DataTenantId::new(tenant)))
-            .collect()
+        timed("due_group_scan", async {
+            let rows: Vec<Uuid> = sqlx::query_scalar(DUE_GROUP_TENANTS_SQL)
+                .bind(limit)
+                .fetch_all(operator.pool())
+                .await?;
+            rows.into_iter()
+                .map(|tenant| stored(DataTenantId::new(tenant)))
+                .collect()
+        })
+        .await
     }
 
     /// Count non-terminal executions and dispatches by status across every tenant.
@@ -2363,32 +2786,67 @@ impl VerifierExecutionQueue {
     /// Returns the database error when the read fails.
     // tenant-isolation: cross-tenant OperatorPool
     pub async fn queue_depth(&self, operator: &OperatorPool) -> Result<QueueDepth, SqlxError> {
-        let (
-            executions_pending,
-            executions_retrying,
-            executions_running,
-            pending,
-            retrying,
-            running,
-        ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(QUEUE_DEPTH_SQL)
-            .fetch_one(operator.pool())
-            .await?;
-        Ok(QueueDepth {
-            executions: QueueCounts {
-                pending: executions_pending,
-                retrying: executions_retrying,
-                running: executions_running,
-            },
-            dispatches: QueueCounts {
+        timed("queue_depth", async {
+            let (
+                executions_pending,
+                executions_retrying,
+                executions_running,
                 pending,
                 retrying,
                 running,
-            },
+            ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(QUEUE_DEPTH_SQL)
+                .fetch_one(operator.pool())
+                .await?;
+            Ok(QueueDepth {
+                executions: QueueCounts {
+                    pending: executions_pending,
+                    retrying: executions_retrying,
+                    running: executions_running,
+                },
+                dispatches: QueueCounts {
+                    pending,
+                    retrying,
+                    running,
+                },
+            })
         })
+        .await
     }
 }
 
-/// A resolved target row from [`RESOLVE_BINDING_SQL`] or [`RESOLVE_DIRECT_SQL`].
+/// The (subject, actor, key) a keyed submission is decided under, or `None`
+/// for a submission without an `Idempotency-Key`.
+fn holder_key(submission: &Submission) -> Option<(Uuid, Uuid, &str)> {
+    let key = submission.key.as_ref()?;
+    let attribution = submission.authority.attribution();
+    Some((
+        attribution.sub_principal_id.as_uuid(),
+        attribution.act_principal_id.as_uuid(),
+        key.key.as_str(),
+    ))
+}
+
+/// One row a submission batch writes; see
+/// [`VerifierExecutionQueue::accept_submissions`].
+struct NewSubmission<'s> {
+    /// The submission the row records.
+    submission: &'s Submission,
+    /// The key the row stores; a conflicting row stores none.
+    key: Option<&'s RequestKey>,
+    /// The error the row settles with; `None` leaves it `pending`.
+    error: Option<VerificationError>,
+}
+
+/// The execution holding one (subject, actor, key) within a submission batch.
+#[derive(Clone)]
+struct KeyHolder {
+    /// The execution the key belongs to.
+    execution_id: ExecutionId,
+    /// The request digest stored with the key.
+    request_sha256: Option<Vec<u8>>,
+}
+
+/// A resolved target row from [`RESOLVE_BINDING_SQL`].
 #[derive(sqlx::FromRow)]
 struct ResolvedTarget {
     /// Exact Verifier Card UID.
@@ -2459,6 +2917,8 @@ async fn resolve_binding(
 struct ClaimedRow {
     /// Execution identity.
     execution_id: Uuid,
+    /// The lease token this claim drew.
+    lease_token: Uuid,
     /// Verifier Card UID.
     verifier_card_uid: Uuid,
     /// Verifier Card version.
@@ -2511,22 +2971,18 @@ struct ClaimedRow {
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
     age_ms: i64,
-    /// The tenant's active SYSTEM principal.
-    system_principal_id: Option<Uuid>,
-    /// The exact Verifier Card's status; `None` when the Card is absent.
-    verifier_status: Option<String>,
     /// The Verifier's ready fitted baselines by requirement; `None` when none.
     fitted_baselines: Option<Json<BTreeMap<TaskId, Value>>>,
 }
 
 impl ClaimedRow {
-    /// Convert raw columns into a typed claim holding `token`.
+    /// Convert raw columns into a typed claim holding the row's lease token.
     ///
     /// # Errors
     /// Returns [`SqlxError::Decode`] when an identity is not `UUIDv7`, the
     /// origin or input columns violate their closed shapes, or a duration is
     /// negative.
-    fn into_claimed(self, token: LeaseToken) -> Result<ClaimedExecution, SqlxError> {
+    fn into_claimed(self) -> Result<ClaimedExecution, SqlxError> {
         let origin = ExecutionOrigin::parse(&self.origin)?;
         let snapshot = self
             .group_sources
@@ -2569,7 +3025,7 @@ impl ClaimedRow {
         Ok(ClaimedExecution {
             lease: ExecutionLease {
                 execution_id: stored(ExecutionId::new(self.execution_id))?,
-                token,
+                token: LeaseToken(self.lease_token),
             },
             lease_expires_at: self.lease_expires_at,
             attempt: self.attempts,
@@ -2609,10 +3065,6 @@ impl ClaimedRow {
                 self.queue_wait_ms,
             ))?),
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
-            system_principal: self.system_principal_id.map(PrincipalId::new),
-            verifier_present: self
-                .verifier_status
-                .is_some_and(|status| status != "deleted"),
             fitted_baselines: self
                 .fitted_baselines
                 .map(|Json(fitted)| fitted)
@@ -2747,6 +3199,34 @@ mod tests {
 
     use super::*;
 
+    /// Every store operation is timed under its `op` with an `ok` or `error`
+    /// outcome, and its result passes through unchanged.
+    ///
+    /// # Panics
+    /// Panics when a result changes or a labelled sample is missing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_operations_are_timed_by_op_and_outcome() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(timed("claim", async { Ok(7) }).await.ok(), Some(7));
+        assert!(
+            timed::<()>("claim", async { Err(SqlxError::RowNotFound) })
+                .await
+                .is_err()
+        );
+        let rendered = handle.render();
+        for outcome in ["ok", "error"] {
+            let sample = format!(
+                "{VERIFICATION_STORE_DURATION_SECONDS}_count{{op=\"claim\",outcome=\"{outcome}\"}} 1"
+            );
+            assert!(
+                rendered.contains(&sample),
+                "{sample} missing from {rendered}"
+            );
+        }
+    }
+
     /// The default policy allows three attempts with bounded doubling delays.
     ///
     /// # Panics
@@ -2839,6 +3319,156 @@ mod tests {
             ),
         ] {
             assert_eq!(refusal.error().code, code);
+        }
+    }
+}
+
+/// Postgres-backed plan checks of the accept statements, skipped by the fast
+/// lanes.
+#[cfg(test)]
+mod pg_tests {
+    use serde_json::Value;
+    use sqlx::AssertSqlSafe;
+    use sqlx::types::Json;
+    use uuid::Uuid;
+    use wyrd_dev_fixtures::pg::PgFixture;
+
+    use super::{KEYED_EXECUTIONS_SQL, RUNNABLE_TENANTS_SQL};
+
+    /// Executions seeded before a plan is read; enough that reading the whole
+    /// tenant is the plan a row-estimate join picks.
+    const SEEDED: i32 = 100_000;
+
+    /// Analyze `verifier_executions` while empty, then insert [`SEEDED`] rows
+    /// for the fixture's tenant through `insert`, which binds the tenant as
+    /// `$1`, `principal` as `$2`, and the row count as `$3`. Statistics are
+    /// left stale, as on a table that filled after its last analyze.
+    ///
+    /// # Panics
+    /// Panics when analyzing, seeding, or committing fails.
+    async fn seed_stale(fixture: &PgFixture, principal: Uuid, insert: &'static str) {
+        let superuser = fixture.superuser_pool().expect("superuser pool");
+        sqlx::query("ANALYZE wyrd.verifier_executions")
+            .execute(&superuser)
+            .await
+            .expect("empty table analyzes");
+        let mut seed = superuser.begin().await.expect("seed transaction");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *seed)
+            .await
+            .expect("seeding skips foreign keys");
+        sqlx::query(insert)
+            .bind(fixture.data_tenant_id().as_uuid())
+            .bind(principal)
+            .bind(SEEDED)
+            .execute(&mut *seed)
+            .await
+            .expect("executions seed");
+        seed.commit().await.expect("seed commits");
+    }
+
+    /// Every node of `plan` that reads `verifier_executions`, as its node
+    /// type and index name.
+    fn execution_reads(plan: &Value) -> Vec<(Value, Value)> {
+        let mut reads = Vec::new();
+        let mut nodes = vec![&plan[0]["Plan"]];
+        while let Some(node) = nodes.pop() {
+            if node["Relation Name"] == "verifier_executions" {
+                reads.push((node["Node Type"].clone(), node["Index Name"].clone()));
+            }
+            nodes.extend(node["Plans"].as_array().into_iter().flatten());
+        }
+        assert!(!reads.is_empty(), "the plan reads no executions: {plan}");
+        reads
+    }
+
+    /// The idempotency lookup probes `verifier_runs_manual_idempotency` once
+    /// per key and reads `verifier_executions` through nothing else, even
+    /// when the table was analyzed empty and then filled, so a batch's cost
+    /// never follows the tenant's execution count.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, seeding or `EXPLAIN` fails, or
+    /// the plan reads `verifier_executions` other than through that index.
+    #[tokio::test]
+    async fn keyed_lookup_probes_the_idempotency_index_however_large_the_tenant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let principal = Uuid::now_v7();
+        seed_stale(
+            &fixture,
+            principal,
+            "INSERT INTO wyrd.verifier_executions (
+                 execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
+                 origin, sub_principal_id, act_principal_id, authority, status, error,
+                 max_attempts, created_at, updated_at, settled_at, idempotency_key,
+                 request_sha256, inputs, route_overrides)
+             SELECT gen_random_uuid(), $1, gen_random_uuid(), '1.0.0', gen_random_uuid(),
+                    'manual', $2, $2, '{}', 'errored', '{}', 3, now(), now(), now(),
+                    'key-' || g, '\\x00', '{}', '{}'
+               FROM generate_series(1, $3) AS g",
+        )
+        .await;
+
+        let keys: Vec<String> = (1..=1_000).map(|key| format!("key-{}", key * 50)).collect();
+        let principals = vec![principal; keys.len()];
+        let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+        let (Json(plan),): (Json<Value>,) = sqlx::query_as(AssertSqlSafe(format!(
+            "EXPLAIN (FORMAT JSON) {KEYED_EXECUTIONS_SQL}"
+        )))
+        .bind(&principals)
+        .bind(&principals)
+        .bind(&keys)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("lookup explains");
+
+        for (node, index) in execution_reads(&plan) {
+            assert!(
+                node == "Index Scan" && index == "verifier_runs_manual_idempotency",
+                "{node} via {index} in {plan}"
+            );
+        }
+    }
+
+    /// The runnable-tenant scan reads `verifier_executions` only through its
+    /// claim indexes, never the table or a bitmap of the backlog, so each
+    /// claim round costs the tenants with work and not the rows queued.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, seeding or `EXPLAIN` fails, or
+    /// the plan reads `verifier_executions` other than through
+    /// `verifier_runs_due` or `verifier_runs_leased`.
+    #[tokio::test]
+    async fn runnable_scan_walks_the_claim_indexes_however_large_the_backlog() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        seed_stale(
+            &fixture,
+            Uuid::now_v7(),
+            "INSERT INTO wyrd.verifier_executions (
+                 execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
+                 origin, sub_principal_id, act_principal_id, authority, status,
+                 max_attempts, next_attempt_at, created_at, updated_at, inputs, route_overrides)
+             SELECT gen_random_uuid(), $1, gen_random_uuid(), '1.0.0', gen_random_uuid(),
+                    'manual', $2, $2, '{}', 'pending', 3, now() - g * INTERVAL '1 ms',
+                    now(), now(), '{}', '{}'
+               FROM generate_series(1, $3) AS g",
+        )
+        .await;
+
+        let operator = fixture.superuser_pool().expect("superuser pool");
+        let (Json(plan),): (Json<Value>,) = sqlx::query_as(AssertSqlSafe(format!(
+            "EXPLAIN (FORMAT JSON) {RUNNABLE_TENANTS_SQL}"
+        )))
+        .fetch_one(&operator)
+        .await
+        .expect("scan explains");
+
+        for (node, index) in execution_reads(&plan) {
+            assert!(
+                (node == "Index Only Scan" || node == "Index Scan")
+                    && (index == "verifier_runs_due" || index == "verifier_runs_leased"),
+                "{node} via {index} in {plan}"
+            );
         }
     }
 }

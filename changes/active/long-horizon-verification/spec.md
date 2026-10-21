@@ -1,6 +1,6 @@
 ---
 id: SPEC-long-horizon-verification
-revision: 20
+revision: 21
 status: approved
 ---
 
@@ -56,6 +56,13 @@ snapshot in which a selected source execution has a visible result but no
 visible input caught a publication mid-read. It is not pinned and stays pending
 for the next pass. A group still incomplete five minutes after its due time
 records one terminal errored group execution and consumes pending.
+
+Revision 21 records the owner's explicit approval to narrow REQ-015/AC-009 to
+the verification runtime itself. The benchmark measures plain
+`observe().verify` and `observe().submit`; grouping is TASK-001–003
+functionality and is not benchmarked. The server measures its own overhead
+apart from the Verifier's execution, and the Verifier runner claims work on
+demand instead of one item per tenant per poll.
 
 Current implementation base: `ba92ac9b9` on
 `change/long-horizon-verification-task-001`. Extend the existing
@@ -498,8 +505,8 @@ long evaluations hold no lifetime Postgres connection or in-memory group timer.
 At 300 4-KiB turns/s, source content is about 99 GiB/day before overhead.
 At 300 five-minute executions/s, unbounded occupancy would be 90,000: enforce
 finite process work limits and existing admission instead of accepting unlimited
-compute. The later AC-009 benchmark tests a 1,000/s burst with bounded refusal;
-TASK-003a proves the functional pressure/drain behavior at normal test concurrency.
+compute. TASK-003a proves the functional pressure/drain behavior at normal test
+concurrency; AC-009 does not benchmark overload.
 Bound pending scheduling claims per tenant pass and subsequent snapshot reads; query count
 depends on due groups and bounded batches, not an exact statements-per-tick
 contract. Bound query work/output and defer further groups on pressure; never judge a
@@ -695,48 +702,43 @@ payload authorization remain; direct verify has no automatic dispatch.
 Ambiguity validation is REQ-013's group-reference check only. Unrelated duplicate
 tuples across occurrences are not globally banned by this change.
 
-### REQ-015 — Capacity qualification and synchronous overhead
+### REQ-015 — Verification runtime overhead
 
-Extend the existing `crates/wyrd/wyrd-testing/src/bin/capacity/` binary via
-`mise run bench:capacity`. Do not create another benchmark or put it in a gate
-or verify lane. Retain its existing production mix, normal-load SLOs, one/two
-replica qualification, bounded command lifetime and target/capacity Markdown/
-JSON evidence. New cases belong to this same opt-in benchmark/report; profiling
-remains diagnostic, not authoritative performance evidence.
+Benchmark the verification runtime through the `verification-capacity`
+workload of `crates/wyrd/wyrd-testing/src/bin/capacity/`, run by
+`mise run bench:verification:capacity`. It is opt-in and in no gate or verify
+lane. It measures plain direct `observe().verify` and background
+`observe().submit` of an assertion-only Verifier, without `group_id`. Grouping,
+bursts, and multi-tenant progress are not benchmarked here.
 
-The owner target is synchronous assertion-only direct verification overhead
-**p99 < 0.001 seconds**, using the existing
-`wyrd_verification_engine_overhead_seconds` with mode=direct (engine elapsed
-minus measured external waits). It is not client latency, total request time,
-a sum of phase percentiles or a replacement metric. Preserve the existing
-capacity **p95 < 0.010 seconds** SLO and its original scope. Judge and report
-both: the new p99 target is stricter for the specified assertion-only cases;
-passing the older p95 check cannot excuse missing it.
+The server measures each execution as one profile, the way Bifrost's query
+profile does, and emits it once. No timing is threaded through callers.
 
-Use matched warmed release runs at a common normal offered load, with the same
-assertion-only Card, JSON evidence, authenticated owner, host/topology and
-background mix. Separate no-group and grouped measurement windows; no unrelated
-direct workload may contaminate their metric samples. Collect at least 1,000
-overhead samples per measured direct case. Sum histogram bucket deltas across
-replicas before calculating p95/p99; never average replica percentiles. Retain
-counts, buckets/resolution and units. An upper bound at 1 ms does not prove
-strictly below 1 ms: insufficient resolution/samples cannot pass. Extend the
-same metric/report resolution if needed, not its meaning or threshold.
+- `wyrd_verification_verifier_seconds{mode,outcome}` is the Verifier's own
+  execution: the union of the engine's action and check block intervals.
+- `wyrd_verification_overhead_seconds{mode,outcome}` is the whole execution
+  less that Verifier time. For a direct request the execution runs from the
+  request's arrival at the server's HTTP stack until its result is staged.
+  For a queued run it runs from the claim until settlement. Admission, Card
+  load, engine bookkeeping, input reads, and staging are overhead and are
+  visible as `wyrd_verification_phase_duration_seconds` phases.
+- `wyrd_verification_submit_seconds{outcome}` is a `submit` request's arrival
+  until it is staged or refused.
 
-Use repeat baseline/grouped comparisons and disclose a noise envelope derived
-from repeated baseline measurements on that same setup, with the method fixed
-before judging the grouped delta. Report that envelope and the delta in time
-units; a repeatable positive delta beyond noise fails. A baseline already
-missing 1 ms is pre-existing work **in scope of this change**, not a waiver:
-report it and leave overhead qualification failed until addressed. The engine
-metric excludes work outside its intervals; report existing request/phase and
-client timing alongside it, and retain REQ-014's no-new-IO check rather than
-claiming this metric alone proves all request-path costs absent.
+These replace `wyrd_verification_engine_overhead_seconds` and its wait
+accounting. Client latency less the server's time is the client-added time.
 
-AC-009 defines five mandatory cases. Preserve existing normal-load error/SLO
-judgments. Only the explicitly overloaded case expects retryable pressure;
-label it separately so expected refusals do not become normal-load successes.
-Missing evidence, unfinished drains or skipped cases cannot establish PASS.
+The owner target is direct overhead **p99 strictly below 0.001 seconds**,
+judged from at least 1,000 observations in one window by the histogram bucket
+bound. A p99 in the `le="0.001"` bucket does not prove it. p50 and p95 are
+reported, not judged. Background overhead is reported only, because it
+includes queueing.
+
+The Verifier runner's claim loop is pull-based, like Forge workers. Each round
+claims up to its free execution capacity, round-robin across due tenants. It
+claims again at once while it found work. An in-process wake from the
+submission outbox's commit ends an idle wait. The one-second poll remains the
+cross-replica fallback.
 
 ## Acceptance criteria and concrete user journeys
 
@@ -960,40 +962,28 @@ Direct verify has no automatic reaction. Replayed queued work preserves recorded
 owner metadata through existing processing. Background eligibility/authorization
 must remain tenant-isolated and pinned to the declared exact versions.
 
-### AC-009 — Existing capacity benchmark covers overhead and grouping load
+### AC-009 — Verification runtime overhead benchmark
 
-**Maps:** REQ-015, REQ-001–006, REQ-008, REQ-010, REQ-013–014; INV-001–005.
+**Maps:** REQ-015.
 
-Run the extended bench:capacity through the existing real public Rust-client
-capacity driver/server deployment; SDK functional parity stays in J-001–005,
-not three new performance harnesses. Store case verdicts plus raw measurement
-inputs in its existing Markdown/JSON report artifacts. Record revision/build,
-hardware, replica/tenant counts, workload/payload sizes, warmup/window/sample
-counts, process bounds, group/source counts, Trigger/poll settings, achieved
-traffic, errors, memory/CPU and drain times so runs can be compared. Group
-fixtures use short declared after durations to finish within the
-existing command lifetime; no extra long-running harness or host stress tool.
+Run `mise run bench:verification:capacity`. It starts one release server
+through the local-development journey on the whole host and provisions one
+tenant. The application loads a hydrated Service bundle under a Card-bound key
+and calls the public Rust client. Each case runs 1, 4, 16, and 64 closed-loop
+clients for a 10-second window after a 2-second warmup.
+
+The report records the host fingerprint, throughput, client p50/p95/p99,
+refusals, server and driver CPU, and peak memory. It also prints each window's
+runtime component Pareto, its CPU Pareto by crate, and its off-CPU stacks.
 
 | Case | Report | Pass/fail |
 |---|---|---|
-| 1. Baseline direct verify, assertion-only, no group_id | Overhead p95/p99, sample/bucket evidence and existing request/client timings at the matched load. | Correct judgments, normal-load SLOs and p99 < 1 ms. A current-baseline miss is explicitly marked pre-existing work in scope, not excluded from the verdict. |
-| 2. Same direct verify with group_id and authenticated owner metadata | The same metrics, grouped-minus-baseline overhead delta, repeated-baseline noise envelope, and evidence of recorded metadata. | Both overhead SLOs hold and the positive delta does not exceed the disclosed noise envelope. No additional producer Postgres IO; insufficient measurement resolution cannot pass as zero delta. |
-| 3. Grouped submit at rising load | Offered/accepted/completed executions/s, normal capacity knee, queue depth/age, throughput plateau, refusals by code, client latency and all backlog drain times. | Identify the throughput ceiling; below it retain normal-load SLOs. Saturation is reported as the limit, not hidden as acceptable loss. After stopping load, existing backlogs drain within 60 s; normal-load unexpected refusal/loss/wrong judgment fails. |
-| 4. Many groups × N source executions and group_end | Explicit group/N sweep at representative N values; expiration-to-result p50/p95/p99; pending scheduling SQL and Bifrost snapshot query count, latency and rows/bytes read, plus group queue/drain evidence. | Every eligible fixture gets its correct whole-group result, without truncated inputs or bypassing ordinary query bounds. Resource refusal defers group verification rather than creating a synthetic verdict. Ordinary due-group results complete within the existing 60-second drain allowance after their configured due point; report latency separately, without inventing a sub-ms group-latency SLO. |
-| 5. Burst above the measured capacity | Per-process staged bytes/items against bounds, memory time series/peak, accepted/refused counts and typed retryability/retry timing, drain time and per-tenant completion timeline. | Staging stays within finite process bounds; warmed memory plateaus while overload continues, stays inside the declared process envelope and returns toward baseline after drain. Excess requests receive typed retryable refusal before staging; no unexpected loss/errors. An admitted tenant B completes work during A's continuing burst using existing claim rounds. Existing backlogs drain within 60 s after stopping the burst. No strict distributed fairness/quota claim. |
+| 1. Direct `verify`, assertion-only | Server overhead p50/p95/p99 and mean, Verifier time, server total, the phases, and client-added time. | Overhead p99 strictly below 1 ms from at least 1,000 samples at every client point, with zero refusals and correct verdicts. |
+| 2. Background `submit`, assertion-only | Server submit time, client-added time, queue wait, queued overhead and Verifier time, trigger to terminal, throughput, and drain time. | Reported only. It fails only on a refusal or a backlog that does not drain within 60 s. |
 
-Use the original J-005 workload's 300/s qualification and 1,000/s ten-second burst as offered points
-alongside the measured knee; bounded refusal is valid above provisioned capacity.
-For the memory case, repeated equal bursts must not increase retained staging
-or post-drain memory in proportion to offered requests; disclose baseline
-variation and envelope, rather than claiming byte-identical RSS. CPU/memory
-remain reported-only for the old normal steps; the new overload case expressly
-judges their boundedness. Declared incomplete-evidence results are
-correct judgments, not failed execution errors. Expected overload refusals are
-counted and judged only in the overload case; existing normal-load zero-error
-rules and client queue drain <=1 s remain unchanged. Produce an overall extension
-PASS only with all five case criteria satisfied, alongside the unchanged legacy
-capacity verdict. No benchmark result is claimed merely from specification edits.
+Either case also fails when peak server memory comes within 1 GiB of the
+host's memory. Missing evidence cannot pass. No benchmark result is claimed
+merely from specification edits.
 
 ## Required boundaries, accepted tradeoffs and completion boundary
 
@@ -1071,6 +1061,7 @@ pending-row, batching and capacity seams remain.
 | 18 | approved | Owner approved retaining pending only for blocked enqueue/retryable Wyrd problems; inactive/retired owner or auth rejection records one terminal errored execution and consumes pending atomically, without evaluation/verdict/Operator or fabricated accepted authority/snapshot. Error-write failure retains pending; existing latest-binding/execution status supplies visibility. Owner explicitly capped group_end.after at one year (365 fixed days), rejected at write time; accepted durations remain exact and the hidden SQL clamp is deleted. Other accepted limits unchanged. |
 | 19 | approved | Owner directed that core verification never rely on owner credentials an outside party can remove. The group snapshot read of verification inputs/results runs as the tenant's credentialless, role-free internal read principal: table-scoped `bifrost_query:read`, owner/source filter in the statement. The owner activity/authority check before kickoff and revision 18's terminal errored execution are unchanged. Execution work, including Agent actions/tool reads and gateway spend, keeps the owner's accepted authority and sub/act. The snapshot-read 403 path is removed. Owner explicitly approved this revision. |
 | 20 | approved | Owner approved one post-read completeness rule. A snapshot read in which a selected source execution has a visible result but no visible input caught a publication mid-read; it pins nothing and stays pending, with a traced warning. Still incomplete more than five minutes past `due_at` (PostgreSQL time, fixed bound) records one terminal errored group execution with `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` naming the executions and consumes pending, using revision 18's pre-admission shape. An input without a result remains a normal null. This replaces revision 18's blanket no-expiry and the no-post-read-completeness-check wording for this one case. Owner explicitly approved this revision. |
+| 21 | approved | Owner narrowed REQ-015/AC-009 to the verification runtime. They cover direct and background assertion-only `verify`/`submit` without groups, bursts, or a neighbor tenant, in the new opt-in `bench:verification:capacity`. Direct server overhead p99 < 1 ms is the only judged target, and the redundant p95 < 10 ms is dropped. Background latency is reported only. The per-execution profile measures overhead from HTTP arrival (direct) or claim (queued) less the union of Verifier block intervals. `wyrd_verification_{overhead,verifier,submit}_seconds` replace `wyrd_verification_engine_overhead_seconds` and its wait accounting. The Verifier claim loop becomes pull-based: it claims up to free capacity round-robin across tenants, wakes on submission commit, and keeps the poll as fallback. Owner explicitly approved this revision in chat. |
 
 Authorities: [AGENTS.md](../../../AGENTS.md),
 [agent rules](../../../architecture/agent-rules.md),

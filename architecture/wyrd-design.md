@@ -1747,9 +1747,10 @@ executions, never one mixed-subject execution.
 
 Queued-execution creation follows Scribe's acknowledgement and never delays
 it. After the ack, the server puts one request per submission into an
-in-process outbox. One writer drains it, one multi-row insert per tenant,
-deciding idempotent replay and conflict in that transaction, so a repeated
-request inserts nothing. The outbox is bounded, but each submission reserves
+in-process outbox. One writer drains it in multi-row inserts, several per
+tenant at once, each deciding idempotent replay and conflict in its
+transaction. Requests sharing an idempotency key are written in arrival
+order, so a repeated request inserts nothing. The outbox is bounded, but each submission reserves
 its slot before its inputs are staged, so the hand-off is never refused; a
 `submit` that finds no room is refused with
 `WYRD_VERIFICATION_429_STAGING_FULL` before anything is staged. The outbox

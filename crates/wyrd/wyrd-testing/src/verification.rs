@@ -7,7 +7,7 @@
 //! state back.
 //! It never executes, publishes, or settles work; that is the runtime's job.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 use sqlx::Error as SqlxError;
@@ -514,7 +514,11 @@ impl VerificationFixture {
         .map_err(|error| VerificationFixtureError::NotEnqueued(error.to_string()))?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let outcomes = VerifierExecutionQueue::default()
-            .accept_submissions(&mut conn, std::slice::from_ref(&submission))
+            .accept_submissions(
+                &mut conn,
+                std::slice::from_ref(&submission),
+                &HashMap::new(),
+            )
             .await?;
         conn.commit().await?;
         match outcomes.as_slice() {

@@ -628,6 +628,20 @@ impl BoundServer {
                 },
             ));
         }
+        // Resolved verification targets serve only while this listener hears
+        // every Card, drift baseline, and SYSTEM principal change that could
+        // alter them, so it runs wherever Verifiers execute.
+        if self.state.verification_blocks.is_some() {
+            let targets = Arc::clone(&self.state.verifier_cards);
+            let pool = self.state.postgres.wyrd().app_pool().clone();
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("verifier_card_cache"),
+                async move {
+                    targets.watch(&pool, shutdown).await;
+                },
+            ));
+        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {

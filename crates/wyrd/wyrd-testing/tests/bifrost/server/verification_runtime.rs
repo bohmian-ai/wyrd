@@ -3217,11 +3217,12 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
 
     let mut conn = server.tenant_conn_for(tenant).await?;
     let claimed = wyrd_sql::queries::verifier_executions::VerifierExecutionQueue::default()
-        .claim(&mut conn, chrono::Duration::minutes(1))
+        .claim(&mut conn, chrono::Duration::minutes(1), 1)
         .await?
+        .pop()
         .ok_or("the queued execution is claimable")?;
     conn.commit().await?;
-    let system = claimed.system_principal.ok_or("the tenant has SYSTEM")?;
+    let system = PrincipalId::new(seed.system_principal());
     let call = |subject: Option<CardUid>| wyrd_server::components::gateway::GatewayCallRequest {
         operation: wyrd_spec::gateway::GatewayOperation::ChatCompletions,
         ingress: wyrd_gateway::IngressDialect::OpenAi,

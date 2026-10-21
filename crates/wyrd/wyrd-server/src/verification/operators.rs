@@ -187,6 +187,7 @@ impl OperatorWorker {
                     limits.operator_tenant_permits,
                 )),
                 Arc::new(Semaphore::new(limits.operator_global_permits.max(1))),
+                None,
                 &limits,
             ),
             postgres,
@@ -454,10 +455,19 @@ impl LeasedWork for OperatorWorker {
 
     /// Claim the tenant's next due dispatch under a fresh lease.
     ///
+    /// Claims at most one dispatch whatever `limit` allows; the loop then
+    /// keeps the tenant for its next pass.
+    ///
     /// # Errors
     /// Returns [`SqlError`] when the claim fails.
-    async fn claim(&self, conn: &mut TenantConn<'_>) -> Result<Option<ClaimedDispatch>, SqlError> {
-        Ok(self.queue.claim(conn).await?)
+    // ponytail: one dispatch per statement, since per-tenant delivery permits
+    // bound Operator throughput; batch the dispatch claim if that changes.
+    async fn claim(
+        &self,
+        conn: &mut TenantConn<'_>,
+        _limit: u32,
+    ) -> Result<Vec<ClaimedDispatch>, SqlError> {
+        Ok(self.queue.claim(conn).await?.into_iter().collect())
     }
 
     /// Attempt one claimed dispatch and apply its single settlement.

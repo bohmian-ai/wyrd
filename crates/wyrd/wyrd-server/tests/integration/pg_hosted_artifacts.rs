@@ -23,8 +23,9 @@ use skald_spec::{ProviderName, ProviderResponse};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use vala_verify::blocks::{
-    ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockError, CallInput, CallValue,
-    CheckExecutor, DriftChecks, EngineError, EvidenceReader, Position, PromptCardResolver,
+    ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockClock, BlockError, CallInput,
+    CallValue, CheckExecutor, DriftChecks, EngineError, EvidenceReader, Position,
+    PromptCardResolver,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -1148,6 +1149,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         },
                         accepted_at: chrono::Utc::now(),
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        clock: BlockClock::default(),
                     },
                 )
                 .expect("engine builds")

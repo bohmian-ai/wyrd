@@ -2,16 +2,19 @@
 //!
 //! A server surface that must record derived work without delaying the request
 //! that produced it hands each item to [`Outbox::stage`], which only enqueues
-//! it. One background writer per outbox groups queued items by tenant and
-//! writes each tenant's whole backlog through its [`OutboxSink`] in one
-//! all-or-nothing call. At most `concurrency` tenants are written at once and
-//! each tenant has at most one write in flight, so a slow tenant delays only
-//! its own items.
+//! it. One background writer per outbox groups queued items by tenant and by
+//! the sink's [`OutboxSink::lane`], and writes each lane's whole backlog
+//! through its [`OutboxSink`] in one all-or-nothing call. Each lane has at
+//! most one write in flight, so items of one lane are written in arrival
+//! order; a tenant's lanes write concurrently. At most `concurrency` writes
+//! run at once, and the tenant with the fewest writes in flight is
+//! dispatched first, so a busy tenant cannot hold every slot while another
+//! waits, and a slow tenant delays only its own items.
 //!
 //! A failed write is never dropped. A write that returns an error or panics
-//! keeps its exact items as that tenant's next write, apart from anything that
-//! arrived meanwhile, and the tenant is retried after a backoff that starts at
-//! [`INITIAL_BACKOFF`] and doubles up to [`MAX_BACKOFF`]; other tenants keep
+//! keeps its exact items as that lane's next write, apart from anything that
+//! arrived meanwhile, and the lane is retried after a backoff that starts at
+//! [`INITIAL_BACKOFF`] and doubles up to [`MAX_BACKOFF`]; other lanes keep
 //! writing. Later arrivals wait for the write after the retry succeeds, so a
 //! sink deriving identity from its slice presents the same identity on every
 //! attempt. Because a write may be retried after an unknown commit outcome,
@@ -55,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wyrd_spec::DataTenantId;
 
-/// Delay before the first retry of a tenant whose write failed.
+/// Delay before the first retry of a lane whose write failed.
 pub const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Longest delay between retries of a tenant whose writes keep failing.
@@ -84,9 +87,10 @@ pub struct OutboxFull {
 
 /// One destination an outbox writes to.
 ///
-/// Implementations write everything a tenant has queued in one call: in one
-/// transaction, or as idempotent writes whose repeat is absorbed. The outbox
-/// owns queueing, grouping, concurrency, retry, and shutdown.
+/// Implementations write everything one lane of a tenant has queued in one
+/// call: in one transaction, or as idempotent writes whose repeat is
+/// absorbed. The outbox owns queueing, grouping, concurrency, retry, and
+/// shutdown.
 pub trait OutboxSink: Send + Sync + 'static {
     /// The item callers stage.
     type Item: Send + 'static;
@@ -94,8 +98,23 @@ pub trait OutboxSink: Send + Sync + 'static {
     type Error: Display + Send + 'static;
     /// Label for this outbox's metrics and logs.
     const NAME: &'static str;
+    /// Lanes each tenant's items are spread over. Lanes of one tenant write
+    /// concurrently; the default single lane writes a tenant one slice at a
+    /// time.
+    const LANES: usize = 1;
 
-    /// Writes one tenant's items, in order, in one transaction.
+    /// The lane `item` is written in, taken modulo [`Self::LANES`].
+    ///
+    /// Items of one tenant and lane are written in arrival order, one write
+    /// at a time, so items whose writes must observe each other in arrival
+    /// order, such as requests sharing an idempotency key, must share a lane.
+    #[must_use]
+    fn lane(item: &Self::Item) -> u64 {
+        let _ = item;
+        0
+    }
+
+    /// Writes one lane's items of one tenant, in order, in one transaction.
     ///
     /// A write may be retried after its commit outcome is unknown, so writing
     /// the same items twice must leave the same durable state as writing them
@@ -163,8 +182,8 @@ impl<S: OutboxSink> std::fmt::Debug for Outbox<S> {
 impl<S: OutboxSink> Outbox<S> {
     /// Creates the outbox around `sink` and starts its writer.
     ///
-    /// `concurrency` is the most tenants written at once, which bounds the
-    /// connections the sink may hold; `capacity` is the most items admitted
+    /// `concurrency` is the most writes run at once across every tenant and
+    /// lane, which bounds the connections the sink may hold; `capacity` is the most items admitted
     /// at once, which bounds the memory queued, waiting, retrying, and
     /// in-flight work may hold.
     ///
@@ -462,40 +481,42 @@ fn admit(share: &AtomicUsize, count: usize, limit: usize) -> Result<(), usize> {
         .map(|_| ())
 }
 
-/// One tenant's items in arrival order and how many of them are reserved.
+/// One lane's items in arrival order and how many of them are reserved.
 type Backlog<I> = (Vec<I>, usize);
 
-/// Outcome of one spawned tenant write: the tenant, its items, and the result,
-/// whose error is the sink's error or the message of a contained panic.
-type Written<S> = (
-    DataTenantId,
-    Vec<<S as OutboxSink>::Item>,
-    Result<(), String>,
-);
+/// A tenant and one of its [`OutboxSink::LANES`]: the unit written in arrival
+/// order, one write at a time.
+type Lane = (DataTenantId, usize);
+
+/// Outcome of one spawned lane write: the lane, its items, and the result,
+/// whose error is the sink's error or the message of a contained panic. The
+/// items come back only from a failed write, for its retry; a written slice's
+/// items are freed off the writer loop and come back empty.
+type Written<S> = (Lane, Vec<<S as OutboxSink>::Item>, Result<(), String>);
 
 /// The writer task behind one [`Outbox`].
 ///
 /// Moved into its task by [`Outbox::new`]; it owns the receiving half of the
-/// queue, the per-tenant backlogs, the in-flight writes, and the retry state.
+/// queue, the per-lane backlogs, the in-flight writes, and the retry state.
 struct OutboxWriter<S: OutboxSink> {
     /// Destination every write goes to.
     sink: Arc<S>,
     /// Receiving half of the queue.
     requests: mpsc::UnboundedReceiver<Queued<S>>,
-    /// Received items per tenant, in arrival order, not being written.
-    waiting: HashMap<DataTenantId, Backlog<S::Item>>,
-    /// The exact slice of each tenant whose last write failed; it is that
-    /// tenant's next write, unmerged with `waiting`.
-    failed: HashMap<DataTenantId, Backlog<S::Item>>,
-    /// In-flight tenant writes.
+    /// Received items per lane, in arrival order, not being written.
+    waiting: HashMap<Lane, Backlog<S::Item>>,
+    /// The exact slice of each lane whose last write failed; it is that
+    /// lane's next write, unmerged with `waiting`.
+    failed: HashMap<Lane, Backlog<S::Item>>,
+    /// In-flight lane writes.
     writing: JoinSet<Written<S>>,
-    /// Tenant, item count, and reserved item count of each in-flight write,
-    /// keyed by its task.
-    in_flight: HashMap<Id, (DataTenantId, usize, usize)>,
-    /// Earliest retry time and current backoff of each tenant whose last
+    /// Lane, item count, reserved item count, and dispatch time of each
+    /// in-flight write, keyed by its task.
+    in_flight: HashMap<Id, (Lane, usize, usize, Instant)>,
+    /// Earliest retry time and current backoff of each lane whose last
     /// write failed.
-    retry_at: HashMap<DataTenantId, (Instant, Duration)>,
-    /// Most tenants written at once.
+    retry_at: HashMap<Lane, (Instant, Duration)>,
+    /// Most writes run at once.
     concurrency: usize,
     /// Count shared with the handle; decremented once items are written.
     pending: Arc<AtomicUsize>,
@@ -508,7 +529,7 @@ struct OutboxWriter<S: OutboxSink> {
 }
 
 impl<S: OutboxSink> OutboxWriter<S> {
-    /// The writer loop: receives items, dispatches tenant writes, settles
+    /// The writer loop: receives items, dispatches lane writes, settles
     /// finished ones, and wakes for retries, until shutdown has dropped the
     /// sender and nothing is left, or shutdown abandons it at the deadline.
     ///
@@ -532,8 +553,12 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 }
                 count = self.requests.recv_many(&mut received, usize::MAX), if open => {
                     open = count != 0;
+                    let lanes = S::LANES.max(1) as u64;
                     for (tenant, item, reserved) in received.drain(..) {
-                        let (items, reserved_count) = self.waiting.entry(tenant).or_default();
+                        // The remainder is below `LANES`, a `usize`.
+                        let lane = usize::try_from(S::lane(&item) % lanes).unwrap_or_default();
+                        let (items, reserved_count) =
+                            self.waiting.entry((tenant, lane)).or_default();
                         items.push(item);
                         *reserved_count += usize::from(reserved);
                     }
@@ -548,38 +573,54 @@ impl<S: OutboxSink> OutboxWriter<S> {
         }
     }
 
-    /// Starts one write for each tenant that has items waiting, has no write
+    /// Starts one write for each lane that has items waiting, has no write
     /// in flight, and is not backing off, while fewer than `concurrency` writes
-    /// run. A tenant with a failed slice writes exactly that slice again;
-    /// otherwise a write takes the tenant's whole backlog.
+    /// run. Ready lanes are taken in order of their tenant's writes in flight
+    /// plus the lane's rank among that tenant's ready lanes, so every tenant's
+    /// first lane goes before any tenant's second. A lane with a failed slice
+    /// writes exactly that slice again; otherwise a write takes the lane's
+    /// whole backlog.
     ///
     /// The write task keeps its items through a panicking sink, including a
     /// panic while rendering the sink's error, and returns them with the panic
     /// as the error, so they are retried like any failed write.
     fn dispatch(&mut self) {
+        if self.writing.len() >= self.concurrency {
+            return;
+        }
         let now = Instant::now();
-        let ready: Vec<DataTenantId> = self
+        let mut busy: HashMap<DataTenantId, usize> = HashMap::new();
+        for ((tenant, _), ..) in self.in_flight.values() {
+            *busy.entry(*tenant).or_default() += 1;
+        }
+        let mut ready: Vec<(usize, Lane)> = self
             .waiting
             .keys()
             .chain(
                 self.failed
                     .keys()
-                    .filter(|tenant| !self.waiting.contains_key(*tenant)),
+                    .filter(|lane| !self.waiting.contains_key(*lane)),
             )
-            .filter(|tenant| self.is_ready(**tenant, now))
-            .copied()
+            .filter(|lane| self.is_ready(**lane, now))
+            .map(|lane| {
+                let order = busy.entry(lane.0).or_default();
+                *order += 1;
+                (*order, *lane)
+            })
             .collect();
-        for tenant in ready {
+        ready.sort_unstable_by_key(|(order, _)| *order);
+        for (_, lane) in ready {
             if self.writing.len() >= self.concurrency {
                 return;
             }
             let Some((items, reserved)) = self
                 .failed
-                .remove(&tenant)
-                .or_else(|| self.waiting.remove(&tenant))
+                .remove(&lane)
+                .or_else(|| self.waiting.remove(&lane))
             else {
                 continue;
             };
+            let (tenant, _) = lane;
             let count = items.len();
             let sink = Arc::clone(&self.sink);
             let task = self.writing.spawn(async move {
@@ -604,19 +645,27 @@ impl<S: OutboxSink> OutboxWriter<S> {
                         panic_message(&*panic)
                     ))
                 });
-                (tenant, items, result)
+                if result.is_ok() {
+                    // A large slice's items can take as long to free as to
+                    // write; freeing them on the blocking pool keeps the
+                    // writer loop free to receive and dispatch the next write.
+                    drop(tokio::task::spawn_blocking(move || drop(items)));
+                    return (lane, Vec::new(), result);
+                }
+                (lane, items, result)
             });
-            self.in_flight.insert(task.id(), (tenant, count, reserved));
+            self.in_flight
+                .insert(task.id(), (lane, count, reserved, Instant::now()));
         }
     }
 
-    /// Whether `tenant` has no write in flight and its backoff has elapsed.
-    fn is_ready(&self, tenant: DataTenantId, now: Instant) -> bool {
-        !self.in_flight.values().any(|(busy, ..)| *busy == tenant)
-            && self.retry_at.get(&tenant).is_none_or(|(at, _)| *at <= now)
+    /// Whether `lane` has no write in flight and its backoff has elapsed.
+    fn is_ready(&self, lane: Lane, now: Instant) -> bool {
+        !self.in_flight.values().any(|(busy, ..)| *busy == lane)
+            && self.retry_at.get(&lane).is_none_or(|(at, _)| *at <= now)
     }
 
-    /// The earliest future retry time of a waiting tenant, or `None` when no
+    /// The earliest future retry time of a failed lane, or `None` when no
     /// timer is needed because every write slot is busy or nobody backs off.
     fn next_retry(&self) -> Option<Instant> {
         if self.writing.len() >= self.concurrency {
@@ -625,32 +674,41 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let now = Instant::now();
         self.retry_at
             .iter()
-            .filter(|(tenant, (at, _))| *at > now && self.failed.contains_key(*tenant))
+            .filter(|(lane, (at, _))| *at > now && self.failed.contains_key(*lane))
             .map(|(_, (at, _))| *at)
             .min()
     }
 
     /// Settles one finished write.
     ///
-    /// Success clears the tenant's backoff and releases its items. Failure,
-    /// including a contained sink panic, keeps the items as the tenant's next
+    /// Every joined write, succeeded or failed, records its dispatch-to-settle
+    /// time in `outbox_write_seconds`. Success clears the lane's backoff and
+    /// releases the slots of the items it wrote, which the write task already
+    /// handed to the blocking pool to free. Failure,
+    /// including a contained sink panic, keeps the items as the lane's next
     /// write, unmerged with later arrivals, doubles its backoff, and counts
     /// and logs the attempt. A task that failed to join lost its items, which are counted
     /// lost; with sink panics contained that needs a panic that escapes
     /// containment, such as one raised while dropping a panic payload.
     fn finish(&mut self, done: Result<(Id, Written<S>), JoinError>) {
-        let ((tenant, items, result), reserved) = match done {
+        let ((lane, items, result), count, reserved) = match done {
             Ok((id, written)) => {
-                let reserved = self
-                    .in_flight
-                    .remove(&id)
-                    .map_or(0, |(.., reserved)| reserved);
-                (written, reserved)
+                let (count, reserved) =
+                    self.in_flight
+                        .remove(&id)
+                        .map_or((0, 0), |(_, count, reserved, started)| {
+                            metrics::histogram!("outbox_write_seconds", "outbox" => S::NAME)
+                                .record(started.elapsed().as_secs_f64());
+                            (count, reserved)
+                        });
+                (written, count, reserved)
             }
             Err(error) => {
-                if let Some((tenant, count, reserved)) = self.in_flight.remove(&error.id()) {
+                if let Some(((tenant, lane), count, reserved, _)) =
+                    self.in_flight.remove(&error.id())
+                {
                     count_lost::<S>(count);
-                    tracing::error!(outbox = S::NAME, %tenant, %error, lost = count, "outbox write task failed");
+                    tracing::error!(outbox = S::NAME, %tenant, lane, %error, lost = count, "outbox write task failed");
                     self.release(count, reserved);
                 }
                 return;
@@ -658,28 +716,29 @@ impl<S: OutboxSink> OutboxWriter<S> {
         };
         let error = match result {
             Ok(()) => {
-                self.retry_at.remove(&tenant);
-                self.release(items.len(), reserved);
+                self.retry_at.remove(&lane);
+                self.release(count, reserved);
                 return;
             }
             Err(error) => error,
         };
         let backoff = self
             .retry_at
-            .get(&tenant)
+            .get(&lane)
             .map_or(INITIAL_BACKOFF, |(_, last)| (*last * 2).min(MAX_BACKOFF));
         self.retry_at
-            .insert(tenant, (Instant::now() + backoff, backoff));
+            .insert(lane, (Instant::now() + backoff, backoff));
         metrics::counter!("outbox_write_failures_total", "outbox" => S::NAME).increment(1);
         tracing::error!(
             outbox = S::NAME,
-            %tenant,
+            tenant = %lane.0,
+            lane = lane.1,
             %error,
             items = items.len(),
             retry_in_ms = backoff.as_millis(),
             "outbox write failed; retrying"
         );
-        self.failed.insert(tenant, (items, reserved));
+        self.failed.insert(lane, (items, reserved));
     }
 
     /// Releases `count` written or lost items, `reserved` of them reserved,
@@ -881,6 +940,136 @@ mod tests {
                 .lock()
                 .expect("memory sink state is never poisoned")
         }
+    }
+
+    /// An item whose drop blocks until its gate opens or ten seconds pass,
+    /// standing in for a slice that is slow to free.
+    struct SlowDrop(Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl Drop for SlowDrop {
+        /// Blocks until the gate opens, its sender is dropped, or ten
+        /// seconds pass.
+        fn drop(&mut self) {
+            if let Ok(gate) = self.0.lock() {
+                let _ = gate.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+
+    /// A sink that accepts every write of [`SlowDrop`] items.
+    struct SlowDropSink;
+
+    impl OutboxSink for SlowDropSink {
+        type Item = SlowDrop;
+        type Error = MemoryError;
+        const NAME: &'static str = "slow_drop";
+
+        /// Accepts `items` without inspecting them.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn write(
+            &self,
+            _tenant: DataTenantId,
+            _items: &[SlowDrop],
+        ) -> impl Future<Output = Result<(), MemoryError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Proves freeing a written slice does not hold up the writer: while the
+    /// first slice's item is still blocked in its drop, a slice staged after
+    /// it is written and settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the second slice waits for the first slice's drop. Two
+    /// workers keep a blocked writer loop from also blocking the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn freeing_a_written_slice_does_not_hold_up_the_next_write() {
+        let outbox = Outbox::new(SlowDropSink, 1, ROOMY);
+        let tenant = DataTenantId::new_v7();
+        let (gate, held) = std::sync::mpsc::channel();
+        outbox.stage(tenant, SlowDrop(Mutex::new(held)));
+        let first = outbox.settle(Instant::now() + Duration::from_secs(2)).await;
+        let (_, open) = std::sync::mpsc::channel();
+        outbox.stage(tenant, SlowDrop(Mutex::new(open)));
+        let second = outbox.settle(Instant::now() + Duration::from_secs(2)).await;
+        drop(gate);
+        assert_eq!((first, second), (0, 0), "the next write waited for a drop");
+    }
+
+    /// A two-lane sink, odd items in lane 1 and even in lane 0, that records
+    /// each written slice and holds the slice `[0]` until `gate` is notified.
+    #[derive(Default)]
+    struct LaneSink {
+        /// Releases the held `[0]` write.
+        gate: Notify,
+        /// Every written slice, in completion order.
+        written: Mutex<Vec<Vec<u32>>>,
+    }
+
+    impl OutboxSink for LaneSink {
+        type Item = u32;
+        type Error = MemoryError;
+        const NAME: &'static str = "lanes";
+        const LANES: usize = 2;
+
+        /// An item's parity is its lane.
+        fn lane(item: &u32) -> u64 {
+            u64::from(item % 2)
+        }
+
+        /// Records `items` once written, first waiting for `gate` when the
+        /// slice is exactly `[0]`.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the record's lock is poisoned.
+        async fn write(&self, _tenant: DataTenantId, items: &[u32]) -> Result<(), MemoryError> {
+            if items == [0] {
+                self.gate.notified().await;
+            }
+            self.written
+                .lock()
+                .expect("unpoisoned")
+                .push(items.to_vec());
+            Ok(())
+        }
+    }
+
+    /// One tenant's lanes write concurrently while each lane keeps arrival
+    /// order: lane 1 commits while lane 0's first write hangs, and lane 0's
+    /// later items wait for that write instead of passing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when lane 1 waits for lane 0, or lane 0 writes out of order.
+    #[tokio::test]
+    async fn a_tenants_lanes_write_concurrently_and_each_keeps_order() {
+        let outbox = Outbox::new(LaneSink::default(), 2, ROOMY);
+        let tenant = DataTenantId::new_v7();
+        outbox.stage(tenant, 0_u32);
+        outbox.stage(tenant, 1_u32);
+        let deadline = within(10);
+        while outbox.sink().written.lock().expect("unpoisoned").is_empty() {
+            assert!(Instant::now() < deadline, "lane 1 waited for lane 0");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        outbox.stage(tenant, 2_u32);
+        outbox.stage(tenant, 4_u32);
+        outbox.sink().gate.notify_one();
+
+        assert_eq!(outbox.settle(within(10)).await, 0);
+        assert_eq!(
+            *outbox.sink().written.lock().expect("unpoisoned"),
+            vec![vec![1], vec![0], vec![2, 4]]
+        );
     }
 
     /// Capacity of test outboxes that do not exercise the bound.

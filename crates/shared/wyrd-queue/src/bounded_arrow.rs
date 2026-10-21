@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use arrow::array::{Array as _, RecordBatch};
+
 /// Publicly observable facts needed to bound one Arrow normalization and IPC operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArrowIpcMaterialFacts {
@@ -262,6 +264,27 @@ fn checked_align(bytes: usize, alignment: usize) -> Result<usize, ArrowIpcMateri
         .checked_add(mask)
         .map(|value| value & !mask)
         .ok_or(ArrowIpcMaterialError::Overflow)
+}
+
+/// Sums the Arrow value, offset, and validity bytes `batch`'s logical rows retain.
+///
+/// Slices of one shared backing allocation contribute only their own logical
+/// range, so native IPC backing aliased by several columns is counted once,
+/// and allocated but unused capacity is not counted at all. Scribe bounds
+/// every decoded ingest batch by this measure before WAL, and the server's
+/// Scribe outbox sizes its frames by it, so both agree on a frame's size.
+///
+/// Returns `None` when Arrow cannot size a column's logical range or the sum
+/// overflows.
+#[must_use]
+pub fn retained_bytes(batch: &RecordBatch) -> Option<usize> {
+    batch.columns().iter().try_fold(0_usize, |total, column| {
+        column
+            .to_data()
+            .get_slice_memory_size()
+            .ok()
+            .and_then(|bytes| total.checked_add(bytes))
+    })
 }
 
 #[cfg(test)]

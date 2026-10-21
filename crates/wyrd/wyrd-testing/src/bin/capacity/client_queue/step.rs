@@ -18,9 +18,9 @@ use wyrd_testing::capacity::driver_cpu_seconds;
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::client_queue::Result;
+use crate::client_queue::fixture::DRIFT_VERIFIER;
 use crate::client_queue::fixture::Tenant;
 use crate::client_queue::proxy::DelayProxy;
-use crate::fixture::DRIFT_VERIFIER;
 
 /// Numeric features, and so durable rows, of one observation (AC-041).
 pub const FEATURES: usize = 100;

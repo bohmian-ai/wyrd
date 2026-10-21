@@ -5,9 +5,11 @@
 //! return at once. The outbox writer hands each tenant's pending slice to
 //! [`ScribeSink`], which projects every write into its fixed destination rows,
 //! groups those rows by destination, encodes each group as Arrow IPC frames
-//! under content-derived batch ids, splitting any frame larger than a quarter
-//! of the configured Scribe request ceiling by rows, and submits the frames
-//! in-process to this pod's Scribe or over the peer plane to a live one. A
+//! under content-derived batch ids, splitting any group larger than a quarter
+//! of the configured Scribe request ceiling by rows, encoding on the blocking
+//! pool, and submits up to [`FRAMES_IN_FLIGHT`] chunks of frames at once
+//! in-process to this pod's Scribe or over
+//! the peer plane to a live one. A
 //! peer call that has not answered within [`PEER_SUBMIT_TIMEOUT`] fails as
 //! unavailable, so the retry rotates to the next ready Scribe. Scribe ingress alone
 //! admits, accounts, persists, and acknowledges them; nothing here reserves
@@ -45,7 +47,9 @@ use arrow::array::{Array as _, AsArray as _, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -98,10 +102,20 @@ pub(crate) const SCRIBE_CAPACITY: usize = 65_536;
 /// `DeadlineExceeded`, which classifies as [`ScribeRefusal::Unavailable`].
 const PEER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Most frames of one tenant slice awaiting Scribe's acknowledgement at once.
+///
+/// Each frame waits for its own durable acknowledgement, so submitting them
+/// one at a time made a slice's write time the sum of its acknowledgements.
+/// Concurrent frames share Scribe's WAL commits instead. The bound keeps one
+/// slice's encoded frames, at most this many times the frame budget, within
+/// the memory a large backlog may take, and leaves Scribe admission room for
+/// the other writers' slices.
+const FRAMES_IN_FLIGHT: usize = 8;
+
 /// Frame budget for a Scribe request ceiling of `request_bytes`.
 ///
-/// A tenant slice can hold a long outage's backlog, so each frame's rows, in
-/// memory and as encoded Arrow IPC, stay within a quarter of the ceiling. The
+/// A tenant slice can hold a long outage's backlog, so each frame's rows, as
+/// retained Arrow bytes and as encoded Arrow IPC, stay within a quarter of the ceiling. The
 /// quarter leaves room for IPC framing and keeps Scribe's decoded and expanded
 /// request bounds, which scale from the same ceiling, out of reach.
 const fn frame_budget(request_bytes: usize) -> usize {
@@ -114,14 +128,12 @@ const fn frame_budget(request_bytes: usize) -> usize {
 /// the Arrow encoding, grouping, identity, and delivery of those rows.
 #[derive(Debug)]
 pub enum ScribeWrite {
-    /// One authorization decision bound for retained audit history.
-    Audit {
-        /// The decision, boxed so the enum stays as small as its pointer
-        /// variants.
-        event: Box<AuditEvent>,
-        /// When the boundary decided, captured as the decision is staged.
-        decided_at: DateTime<Utc>,
-    },
+    /// One authorization decision bound for retained audit history,
+    /// projected into its `vala.system.audit_log` row when it is staged, so
+    /// the staging caller, not the one writer every tenant write waits on,
+    /// pays for the projection; `None` when the decision could not be
+    /// projected, which the sink counts lost.
+    Audit(Option<RecordBatch>),
     /// One gateway call's validated analytical record, its objects already
     /// persisted.
     Capture(Box<CallCapture>),
@@ -162,13 +174,10 @@ pub enum ScribeWrite {
 }
 
 impl From<AuditEvent> for ScribeWrite {
-    /// Stages one decision, stamped with the instant it is staged, which is
-    /// the instant the boundary decided.
+    /// Stages one decision projected into its row, stamped with the instant
+    /// it is staged, which is the instant the boundary decided.
     fn from(event: AuditEvent) -> Self {
-        Self::Audit {
-            event: Box::new(event),
-            decided_at: Utc::now(),
-        }
+        Self::Audit(project_audit_event(&event, Utc::now()).ok())
     }
 }
 
@@ -212,11 +221,11 @@ impl ScribeWrite {
     /// Returns the projection failure's reason when the rows cannot be built.
     fn rows(&self) -> Result<Vec<Rows<'_>>, &'static str> {
         match self {
-            Self::Audit { event, decided_at } => Ok(vec![Rows {
+            Self::Audit(batch) => Ok(vec![Rows {
                 table: ScribeTable::AuditLog,
                 attribution: Attribution::unresolved(),
                 request: None,
-                batch: project_audit_event(event, *decided_at).map_err(|_| "projection")?,
+                batch: batch.clone().ok_or("projection")?,
             }]),
             Self::Capture(capture) => Ok(capture
                 .batches()
@@ -280,17 +289,18 @@ impl ScribeWrite {
                 .iter()
                 .find(|batch| ScribeTable::from_fqn(&batch.table) == Some(ScribeTable::Results))
                 .map(|batch| &batch.batch)?,
-            Self::Audit { .. } | Self::Capture(_) | Self::ServerSpans { .. } => return None,
+            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } => return None,
         };
         let cell = |name: &str| {
             let column = batch.column_by_name(name)?.as_string_opt::<i32>()?;
             (batch.num_rows() > 0 && column.is_valid(0)).then(|| column.value(0))
         };
+        let group_id = GroupId::new(cell("group_id")?).ok()?;
         Some(GroupActivity {
             owner_card_uid: CardUid::new(cell("owner_card_uid")?).ok()?,
             card_uid: CardUid::new(cell("card_uid")?).ok()?,
             verifier_card_uid: CardUid::new(cell("verifier_card_uid")?).ok()?,
-            group_id: GroupId::new(cell("group_id")?).ok()?,
+            group_id,
         })
     }
 }
@@ -814,10 +824,8 @@ struct Frame<'a> {
     request: Option<&'a RequestId>,
     /// The rows, all of one schema.
     batches: Vec<RecordBatch>,
-    /// In-memory size of `batches`.
-    bytes: usize,
-    /// Slice positions of the writes contributing rows.
-    items: BTreeSet<usize>,
+    /// Slice position of the write that contributed each row, in row order.
+    owners: Vec<usize>,
 }
 
 impl Frame<'_> {
@@ -827,7 +835,22 @@ impl Frame<'_> {
         self.table == rows.table
             && self.attribution == rows.attribution
             && self.request == rows.request
-            && self.batches[0].schema() == rows.batch.schema()
+            && {
+                let (ours, theirs) = (self.batches[0].schema_ref(), rows.batch.schema_ref());
+                Arc::ptr_eq(ours, theirs) || ours == theirs
+            }
+    }
+
+    /// The [`Chunk`] of this frame's `rows` rows starting at row `first`,
+    /// held by `batches`.
+    fn chunk(&self, first: usize, rows: usize, batches: Vec<RecordBatch>) -> Chunk {
+        Chunk {
+            table: self.table,
+            attribution: self.attribution,
+            request: self.request.cloned(),
+            batches,
+            owners: self.owners[first..first + rows].to_vec(),
+        }
     }
 }
 
@@ -835,17 +858,17 @@ impl ScribeSink {
     /// Groups `items` into frames, in first-seen destination order.
     ///
     /// Rows join the latest frame they share a destination, attribution,
-    /// request, and schema with while it stays within `budget` bytes in
-    /// memory, and otherwise open a new one, so the frames of an identical slice are
-    /// identical. Gateway capture carries its admitting request, which Scribe
-    /// stamps as `wyrd_request_id`, so captures group per request. Result summary frames are moved after every detail frame,
-    /// so a visible summary's details were submitted first. Positions of
-    /// writes that cannot be projected are added to `lost`.
-    fn frames<'a>(
-        items: &'a [ScribeWrite],
-        budget: usize,
-        lost: &mut BTreeSet<usize>,
-    ) -> Vec<Frame<'a>> {
+    /// request, and schema with, and otherwise open a new one, so the frames
+    /// of an identical slice are identical. Nothing is sized per row: one
+    /// row's batch allocates many times the bytes it holds, and measuring each
+    /// row on the writer cost more than the write itself. [`Self::chunks`]
+    /// cuts each frame into budget-sized chunks from one measured row. Gateway capture
+    /// carries its admitting request, which Scribe stamps as
+    /// `wyrd_request_id`, so captures group per request. Result summary frames
+    /// are moved after every detail frame, so a visible summary's details
+    /// were acknowledged first. Positions of writes that cannot be projected
+    /// are added to `lost`.
+    fn frames<'a>(items: &'a [ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame<'a>> {
         let mut frames: Vec<Frame<'a>> = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let rows = match item.rows() {
@@ -861,25 +884,18 @@ impl ScribeSink {
                 }
             };
             for rows in rows {
-                let size = rows.batch.get_array_memory_size();
-                match frames
-                    .iter_mut()
-                    .rev()
-                    .find(|frame| frame.shares(&rows))
-                    .filter(|frame| frame.bytes + size <= budget)
-                {
+                let owners = std::iter::repeat_n(index, rows.batch.num_rows());
+                match frames.iter_mut().rev().find(|frame| frame.shares(&rows)) {
                     Some(frame) => {
                         frame.batches.push(rows.batch);
-                        frame.bytes += size;
-                        frame.items.insert(index);
+                        frame.owners.extend(owners);
                     }
                     None => frames.push(Frame {
                         table: rows.table,
                         attribution: rows.attribution,
                         request: rows.request,
                         batches: vec![rows.batch],
-                        bytes: size,
-                        items: BTreeSet::from([index]),
+                        owners: owners.collect(),
                     }),
                 }
             }
@@ -888,32 +904,96 @@ impl ScribeSink {
         frames
     }
 
-    /// Encodes `frame` as Arrow IPC streams of at most `budget` bytes, each
-    /// under its content-derived identity, in row order.
+    /// Cuts `frame`'s rows into consecutive [`Chunk`]s of about `budget`
+    /// retained Arrow bytes each, without concatenating them.
+    ///
+    /// The frame's first batch is measured once and every row is taken to
+    /// be its size, so cutting costs one measurement per frame and depends
+    /// only on the rows: an identical slice always cuts identically. A
+    /// staged batch is never divided; skewed row sizes are left to
+    /// [`Chunk::encode`]'s split by encoded size.
+    fn chunks(frame: &Frame<'_>, budget: usize) -> Vec<Chunk> {
+        let sample = &frame.batches[0];
+        let row_bytes = wyrd_queue::retained_bytes(sample)
+            .unwrap_or_else(|| sample.get_array_memory_size())
+            .div_ceil(sample.num_rows().max(1))
+            .max(1);
+        let rows_per_chunk = (budget / row_bytes).max(1);
+        let mut chunks = Vec::new();
+        let (mut first, mut rows, mut batches) = (0, 0, Vec::new());
+        for batch in &frame.batches {
+            if rows > 0 && rows + batch.num_rows() > rows_per_chunk {
+                chunks.push(frame.chunk(first, rows, std::mem::take(&mut batches)));
+                first += rows;
+                rows = 0;
+            }
+            rows += batch.num_rows();
+            batches.push(batch.clone());
+        }
+        if rows > 0 {
+            chunks.push(frame.chunk(first, rows, batches));
+        }
+        chunks
+    }
+}
+
+/// One run of a frame's consecutive rows, encoded and submitted together.
+///
+/// It owns everything its encoding reads, so the encoding runs on the
+/// blocking pool while the slice's other chunks encode or await Scribe.
+struct Chunk {
+    /// Destination table.
+    table: ScribeTable,
+    /// Subject and actor Scribe stamps on every row.
+    attribution: Attribution,
+    /// Request every row was admitted under, when they share one.
+    request: Option<RequestId>,
+    /// The staged batches holding the chunk's rows, in row order.
+    batches: Vec<RecordBatch>,
+    /// Slice position of the write that contributed each row, in row order.
+    owners: Vec<usize>,
+}
+
+/// One submitted stream: how Scribe answered, the stream, and the slice
+/// positions of the writes its rows came from.
+type Submitted = (Result<(), ScribeRefusal>, ScribeBatch, BTreeSet<usize>);
+
+impl Chunk {
+    /// Concatenates the chunk's rows and encodes them as Arrow IPC streams
+    /// of at most `budget` bytes, each under its content-derived identity
+    /// and with the slice positions of the writes its rows came from.
     ///
     /// A single row larger than `budget` is still encoded alone; Scribe
     /// decides whether its ceiling admits it.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be concatenated or encoded.
+    /// Returns the Arrow error when the rows cannot be concatenated or
+    /// encoded.
     fn encode(
+        &self,
         tenant: DataTenantId,
-        frame: &Frame<'_>,
         budget: usize,
-    ) -> Result<Vec<ScribeBatch>, arrow::error::ArrowError> {
-        let rows = concat_batches(&frame.batches[0].schema(), &frame.batches)?;
+    ) -> Result<Vec<(ScribeBatch, BTreeSet<usize>)>, arrow::error::ArrowError> {
+        let rows = match self.batches.as_slice() {
+            [only] => only.clone(),
+            batches => concat_batches(batches[0].schema_ref(), batches)?,
+        };
         let mut streams = Vec::new();
-        Self::split(&rows, budget, &mut streams)?;
+        Self::split(&rows, 0, budget, &mut streams)?;
         Ok(streams
             .into_iter()
-            .map(|ipc| Self::identify(tenant, frame, ipc))
+            .map(|(start, count, ipc)| {
+                let owners = self.owners[start..start + count].iter().copied().collect();
+                (self.identify(tenant, ipc), owners)
+            })
             .collect())
     }
 
-    /// Appends `rows` to `streams` as one Arrow IPC stream, or, when that
-    /// stream exceeds `budget` bytes and holds more than one row, as the
-    /// streams of each half in turn.
+    /// Appends `rows`, whose first row is row `first` of its frame, to
+    /// `streams` as one Arrow IPC stream with its first row and row count, or,
+    /// when that stream exceeds `budget` bytes and holds more than one row, as
+    /// the streams of each half in turn.
     ///
     /// Halving depends only on the rows, so an identical slice always splits
     /// into identical streams, whatever its row sizes.
@@ -923,19 +1003,26 @@ impl ScribeSink {
     /// Returns the Arrow error when the rows cannot be encoded.
     fn split(
         rows: &RecordBatch,
+        first: usize,
         budget: usize,
-        streams: &mut Vec<Vec<u8>>,
+        streams: &mut Vec<(usize, usize, Vec<u8>)>,
     ) -> Result<(), arrow::error::ArrowError> {
         let mut writer = StreamWriter::try_new(Vec::new(), &rows.schema())?;
         writer.write(rows)?;
         let ipc = writer.into_inner()?;
         let count = rows.num_rows();
         if ipc.len() <= budget || count < 2 {
-            streams.push(ipc);
+            streams.push((first, count, ipc));
             return Ok(());
         }
-        Self::split(&rows.slice(0, count / 2), budget, streams)?;
-        Self::split(&rows.slice(count / 2, count - count / 2), budget, streams)
+        let half = count / 2;
+        Self::split(&rows.slice(0, half), first, budget, streams)?;
+        Self::split(
+            &rows.slice(half, count - half),
+            first + half,
+            budget,
+            streams,
+        )
     }
 
     /// Wraps one encoded stream of `frame` under its content-derived identity.
@@ -951,14 +1038,14 @@ impl ScribeSink {
     ///
     /// Panics only if a `UUIDv7` batch id failed to parse as a request id,
     /// which its construction rules out.
-    fn identify(tenant: DataTenantId, frame: &Frame<'_>, ipc: Vec<u8>) -> ScribeBatch {
+    fn identify(&self, tenant: DataTenantId, ipc: Vec<u8>) -> ScribeBatch {
         let mut digest = Sha256::new();
         digest.update(b"wyrd.scribe.outbox.batch-id.v1");
         digest.update(tenant.as_uuid().as_bytes());
-        digest.update(frame.table.fqn().as_bytes());
-        digest.update(frame.attribution.sub_principal_id.as_uuid().as_bytes());
-        digest.update(frame.attribution.act_principal_id.as_uuid().as_bytes());
-        if let Some(request) = frame.request {
+        digest.update(self.table.fqn().as_bytes());
+        digest.update(self.attribution.sub_principal_id.as_uuid().as_bytes());
+        digest.update(self.attribution.act_principal_id.as_uuid().as_bytes());
+        if let Some(request) = &self.request {
             digest.update(request.as_str().as_bytes());
         }
         digest.update(&ipc);
@@ -968,16 +1055,137 @@ impl ScribeSink {
         bytes[6] = (bytes[6] & 0x0f) | 0x70;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let batch_id = Uuid::from_bytes(bytes);
-        let request_id = frame.request.cloned().unwrap_or_else(|| {
+        let request_id = self.request.clone().unwrap_or_else(|| {
             RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id")
         });
         ScribeBatch {
             tenant,
-            table: frame.table,
+            table: self.table,
             batch_id,
             request_id,
             ipc: Bytes::from(ipc),
-            attribution: frame.attribution,
+            attribution: self.attribution,
+        }
+    }
+}
+
+impl ScribeSink {
+    /// Submits every frame of `frames` along `route` for write `attempt`,
+    /// keeping up to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting
+    /// acknowledgement.
+    ///
+    /// Each frame is cut into [`Chunk`]s, and each chunk is concatenated and
+    /// encoded on the blocking pool by [`Self::deliver`] only as a slot
+    /// frees, so the slice's encoding runs in parallel and at most
+    /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
+    /// rows cannot be encoded, or whose stream Scribe rejects terminally,
+    /// are added to `lost`. After a retryable refusal no further chunk is
+    /// started; those in flight still finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first retryable refusal once every chunk in flight has
+    /// finished.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future drops the chunks in flight; Scribe may already
+    /// hold some of their streams, and the retried slice resubmits them
+    /// under the same batch ids.
+    async fn submit(
+        &self,
+        route: &ScribeRoute,
+        tenant: DataTenantId,
+        frames: &[Frame<'_>],
+        attempt: usize,
+        lost: &mut BTreeSet<usize>,
+    ) -> Result<(), ScribeRefusal> {
+        let budget = self.frame_budget;
+        let mut in_flight = FuturesUnordered::new();
+        let mut refused = None;
+        for chunk in frames.iter().flat_map(|frame| Self::chunks(frame, budget)) {
+            if in_flight.len() == FRAMES_IN_FLIGHT
+                && let Some(done) = in_flight.next().await
+            {
+                Self::tally(tenant, done, lost, &mut refused);
+            }
+            if refused.is_some() {
+                break;
+            }
+            in_flight.push(Self::deliver(route, tenant, chunk, budget, attempt));
+        }
+        while let Some(done) = in_flight.next().await {
+            Self::tally(tenant, done, lost, &mut refused);
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
+    /// Encodes `chunk` on the blocking pool, then submits its streams along
+    /// `route` in turn, stopping after a retryable refusal.
+    ///
+    /// Returns each submitted stream with its answer, and the slice positions
+    /// of the chunk's writes when its rows could not be encoded, which is
+    /// logged here.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic of the encoding. The encoding is not cancelled
+    /// while this future awaits it, since a runtime shutting down drops this
+    /// future first.
+    async fn deliver(
+        route: &ScribeRoute,
+        tenant: DataTenantId,
+        chunk: Chunk,
+        budget: usize,
+        attempt: usize,
+    ) -> (Vec<Submitted>, Vec<usize>) {
+        let encoding = tokio::task::spawn_blocking(move || match chunk.encode(tenant, budget) {
+            Ok(streams) => Ok(streams),
+            Err(error) => Err((error, chunk.table, chunk.owners)),
+        });
+        let streams = match encoding.await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err((error, table, owners))) => {
+                tracing::warn!(outbox = Self::NAME, %tenant, table = table.fqn(), %error, "a Scribe frame could not be encoded; its writes are dropped");
+                return (Vec::new(), owners);
+            }
+            Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
+        };
+        let mut submitted = Vec::with_capacity(streams.len());
+        for (batch, owners) in streams {
+            let result = route.submit(&batch, attempt).await;
+            let retryable = matches!(result, Err(refusal) if refusal != ScribeRefusal::Rejected);
+            submitted.push((result, batch, owners));
+            if retryable {
+                break;
+            }
+        }
+        (submitted, Vec::new())
+    }
+
+    /// Records one delivered chunk: writes that could not be encoded or
+    /// whose stream was rejected terminally are added to `lost`, and the
+    /// first retryable refusal is kept in `refused` unless an earlier one
+    /// already is.
+    fn tally(
+        tenant: DataTenantId,
+        (submitted, unencodable): (Vec<Submitted>, Vec<usize>),
+        lost: &mut BTreeSet<usize>,
+        refused: &mut Option<ScribeRefusal>,
+    ) {
+        lost.extend(unencodable);
+        for (result, batch, owners) in submitted {
+            match result {
+                Ok(()) => {}
+                Err(ScribeRefusal::Rejected) => {
+                    tracing::error!(outbox = Self::NAME, %tenant, table = batch.table.fqn(), batch_id = %batch.batch_id, writes = owners.len(), "Scribe rejected a frame terminally; its writes are dropped");
+                    lost.extend(owners);
+                }
+                Err(refusal) => {
+                    tracing::warn!(outbox = Self::NAME, %tenant, table = batch.table.fqn(), reason = refusal.reason(), "Scribe refused a frame; the slice will be retried");
+                    refused.get_or_insert(refusal);
+                }
+            }
         }
     }
 }
@@ -987,14 +1195,18 @@ impl OutboxSink for ScribeSink {
     type Error = ScribeRefusal;
     const NAME: &'static str = "scribe";
 
-    /// Writes one tenant's slice as destination frames, in order.
+    /// Writes one tenant's slice as destination frames: every detail frame,
+    /// then, once all are acknowledged, every result summary frame.
     ///
-    /// Every frame of this attempt is submitted to the same Scribe, so a
-    /// retry after a peer refusal or timeout moves the whole slice to the
-    /// next ready one. A frame over the budget is submitted as its row-split
-    /// streams. Every
-    /// frame is submitted even after a terminal refusal; a retryable refusal
-    /// stops the write so the outbox retries the identical slice.
+    /// Within each phase up to [`FRAMES_IN_FLIGHT`] frames await Scribe at
+    /// once, so their acknowledgement order is not their row order. Every
+    /// frame of this attempt is submitted to the same Scribe, so a retry
+    /// after a peer refusal or timeout moves the whole slice to the next
+    /// ready one. A frame over the budget is submitted as its row-split
+    /// streams. Every frame is submitted even after a terminal refusal; a
+    /// retryable refusal submits no further frame, lets those in flight
+    /// finish, and fails the write so the outbox retries the identical slice,
+    /// whose already acknowledged frames Scribe's batch-id fence absorbs.
     /// Writes that were projected away or whose frame was refused terminally
     /// are counted lost once the slice completes, never on a retried
     /// attempt. A process that reaches no Scribe drops the whole slice.
@@ -1024,28 +1236,12 @@ impl OutboxSink for ScribeSink {
         };
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut lost = BTreeSet::new();
-        for frame in Self::frames(items, self.frame_budget, &mut lost) {
-            let batches = match Self::encode(tenant, &frame, self.frame_budget) {
-                Ok(batches) => batches,
-                Err(error) => {
-                    tracing::warn!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), %error, "a Scribe frame could not be encoded; its writes are dropped");
-                    lost.extend(&frame.items);
-                    continue;
-                }
-            };
-            for batch in batches {
-                match route.submit(&batch, attempt).await {
-                    Ok(()) => {}
-                    Err(ScribeRefusal::Rejected) => {
-                        tracing::error!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), batch_id = %batch.batch_id, writes = frame.items.len(), "Scribe rejected a frame terminally; its writes are dropped");
-                        lost.extend(&frame.items);
-                    }
-                    Err(refusal) => {
-                        tracing::warn!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), reason = refusal.reason(), "Scribe refused a frame; the slice will be retried");
-                        return Err(refusal);
-                    }
-                }
-            }
+        let frames = Self::frames(items, &mut lost);
+        let (details, summaries) =
+            frames.split_at(frames.partition_point(|frame| frame.table != ScribeTable::Results));
+        for phase in [details, summaries] {
+            self.submit(route, tenant, phase, attempt, &mut lost)
+                .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;
         count_lost::<Self>(lost.len());
@@ -1108,8 +1304,9 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        Outbox, SCRIBE_CAPACITY, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal,
-        ScribeRoute, ScribeSink, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
+        FRAMES_IN_FLIGHT, Outbox, SCRIBE_CAPACITY, SCRIBE_WRITERS, ScribeOutbox, ScribePeers,
+        ScribeRefusal, ScribeRoute, ScribeSink, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS,
+        frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -1253,11 +1450,13 @@ mod tests {
     /// results of one run attribution share a single summary frame stamped
     /// with that pair and scoped to the Cards verified, the capture writes its
     /// row and span frames under the call's pair and admitting request, and
-    /// the summary frame is submitted last although it was staged first.
+    /// the summary frame is submitted last although it was staged first. The
+    /// capture's two frames share a phase and arrive in either order.
     ///
     /// # Panics
     ///
-    /// Panics when the frames, their order, rows, or attribution differ.
+    /// Panics when the frames, the summary's position, rows, or attribution
+    /// differ.
     #[tokio::test]
     async fn writes_group_by_destination_under_their_attribution() {
         let scribe = Arc::new(RecordingScribe::default());
@@ -1275,10 +1474,11 @@ mod tests {
         settle(&outbox).await;
 
         let received = scribe.received();
-        let frames = received
+        let mut frames = received
             .iter()
             .map(|frame| (frame.table.as_str(), frame.rows))
             .collect::<Vec<_>>();
+        frames[..2].sort_unstable();
         assert_eq!(
             frames,
             [
@@ -1357,9 +1557,38 @@ mod tests {
         assert_eq!(frames, expected);
     }
 
-    /// Proves a retryable refusal replays the identical slice: the refused
-    /// frame is resubmitted under the same batch id, and only then does the
-    /// next frame follow.
+    /// Proves frames are sized by the bytes their rows hold, not by each
+    /// one-row batch's allocated capacity: a slice of many small decisions
+    /// travels as one frame, so it waits for one durable acknowledgement
+    /// rather than one per few hundred rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the slice is split into more than one frame.
+    #[tokio::test]
+    async fn a_slice_of_small_writes_travels_as_one_frame() {
+        const DECISIONS: usize = 2_000;
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let audit: &dyn AuditStage = &*outbox;
+        let tenant = DataTenantId::new_v7();
+        for _ in 0..DECISIONS {
+            audit.stage(tenant, decision("bifrost.record.write"));
+        }
+        settle(&outbox).await;
+
+        let frames: Vec<_> = scribe
+            .audit_frames()
+            .into_iter()
+            .map(|frame| frame.rows)
+            .collect();
+        assert_eq!(frames, vec![DECISIONS]);
+    }
+
+    /// Proves a retryable refusal replays the identical slice: the call and
+    /// span frames are in flight together, so when the call frame is refused
+    /// both are resubmitted under their original batch ids, and Scribe ends
+    /// up holding each frame once.
     ///
     /// # Panics
     ///
@@ -1376,14 +1605,18 @@ mod tests {
         settle(&outbox).await;
 
         let submitted = scribe.submitted();
-        let acknowledged = scribe
-            .received()
+        assert_eq!(submitted.len(), 4, "the whole slice is submitted twice");
+        // The two frames are in flight together, so each attempt submits
+        // them in whichever order their encodings finish.
+        let (mut first, mut retry) = (submitted[..2].to_vec(), submitted[2..].to_vec());
+        first.sort_unstable();
+        retry.sort_unstable();
+        assert_eq!(first, retry, "the retry keeps every identity");
+        let held = retained(scribe.received())
             .iter()
             .map(|frame| frame.batch_id)
-            .collect::<Vec<_>>();
-        assert_eq!(submitted.len(), 3, "the refused frame is submitted twice");
-        assert_eq!(submitted[0], submitted[1], "the retry keeps its identity");
-        assert_eq!(acknowledged, submitted[1..]);
+            .collect::<HashSet<_>>();
+        assert_eq!(held, submitted[..2].iter().copied().collect::<HashSet<_>>());
     }
 
     /// Proves a terminal refusal is consumed: the rejected frame is dropped,
@@ -1404,19 +1637,16 @@ mod tests {
         outbox.stage(tenant, capture(tenant));
         settle(&outbox).await;
 
-        let tables = scribe
+        // Either capture frame may arrive first and take the refusal, so the
+        // first slice leaves one frame and the second writes both.
+        let mut tables = scribe
             .received()
             .iter()
             .map(|frame| frame.table.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            tables,
-            [
-                "vala.traces.spans",
-                "vala.gateway.calls",
-                "vala.traces.spans"
-            ]
-        );
+        assert_eq!(tables.len(), 3, "{tables:?}");
+        tables[1..].sort_unstable();
+        assert_eq!(tables[1..], ["vala.gateway.calls", "vala.traces.spans"]);
         assert_eq!(scribe.attempts(), 4, "the rejected frame is never retried");
     }
 
@@ -1622,14 +1852,15 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `frames` carry every one of `tasks` item rows exactly once and
-    /// in order, in more than one item frame within the small ceiling's
-    /// budget, and end with the one summary.
+    /// Asserts `frames` carry every one of `features` item rows exactly once,
+    /// in more than one item frame within the small ceiling's budget, and end
+    /// with the one summary. Item frames are in flight together, so rows are
+    /// compared without order.
     ///
     /// # Panics
     ///
-    /// Panics when a row is missing, repeated, misordered, or a frame is over
-    /// budget or out of order.
+    /// Panics when a row is missing or repeated, a frame is over budget, or
+    /// the summary is not last.
     fn assert_bounded_detail(frames: &[Received], features: usize) {
         let tables = frames
             .iter()
@@ -1656,11 +1887,9 @@ mod tests {
         let expected = (0..features)
             .map(|feature| format!("f{feature:04}"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            detail_features(frames),
-            expected,
-            "every row once, in order"
-        );
+        let mut features = detail_features(frames);
+        features.sort_unstable();
+        assert_eq!(features, expected, "every row once");
     }
 
     /// A Scribe that acknowledges through `inner` but reports the
@@ -1715,7 +1944,7 @@ mod tests {
 
     /// Proves a multi-row verification detail larger than one frame under a lowered
     /// Scribe ceiling reaches the local Scribe as bounded frames carrying
-    /// every row once, in order, before the summary, and that after a lost
+    /// every row once before the summary, and that after a lost
     /// ACK the identical slice resubmits identical frame ids.
     ///
     /// # Panics
@@ -1738,11 +1967,10 @@ mod tests {
         settle(&outbox).await;
 
         let submitted = recording.submitted();
-        assert_eq!(
-            submitted[2..4],
-            submitted[..2],
-            "the retry resubmits the identical frames"
-        );
+        let (mut first, mut retry) = (submitted[..2].to_vec(), submitted[2..4].to_vec());
+        first.sort_unstable();
+        retry.sort_unstable();
+        assert_eq!(retry, first, "the retry resubmits the identical frames");
         let frames = retained(recording.received());
         assert_eq!(
             frames.len(),
@@ -1750,6 +1978,122 @@ mod tests {
             "every frame after the retry is new"
         );
         assert_bounded_detail(&frames, DETAIL_FEATURES);
+    }
+
+    /// A Scribe that acknowledges through `inner` after yielding, recording
+    /// the most submissions it held at once.
+    #[derive(Default)]
+    struct Overlapping {
+        /// Records every acknowledged frame.
+        inner: Arc<RecordingScribe>,
+        /// Submissions currently held.
+        active: AtomicUsize,
+        /// Most submissions held at once.
+        peak: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for Overlapping {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Holds `frame` across a few scheduler yields, so submissions the
+        /// sink keeps in flight overlap here, then acknowledges it through
+        /// the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's refusal.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// Proves a slice's frames await Scribe together rather than one at a
+    /// time, never more than [`FRAMES_IN_FLIGHT`] at once, within the frame
+    /// budget, and that every summary is acknowledged after every detail row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when frames are submitted one at a time, exceed the bound or
+    /// the budget, lose a row, or a summary precedes a detail frame.
+    #[tokio::test]
+    async fn a_slice_keeps_a_bounded_number_of_frames_in_flight() {
+        const JUDGMENTS: usize = 8;
+        let scribe = Arc::new(Overlapping::default());
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            SMALL_REQUEST_BYTES,
+        );
+        let tenant = DataTenantId::new_v7();
+        let attribution = background();
+        for _ in 0..JUDGMENTS {
+            outbox.stage(
+                tenant,
+                drift_result(&uid(), attribution, DETAIL_FEATURES, 0),
+            );
+        }
+        settle(&outbox).await;
+
+        let frames = scribe.inner.received();
+        assert!(
+            frames.len() > FRAMES_IN_FLIGHT,
+            "the slice needs more frames than may be in flight: {}",
+            frames.len()
+        );
+        let peak = scribe.peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=FRAMES_IN_FLIGHT).contains(&peak),
+            "frames overlap within the bound: {peak}"
+        );
+        let budget = frame_budget(SMALL_REQUEST_BYTES);
+        assert!(frames.iter().all(|frame| frame.ipc.len() <= budget));
+        let summaries = frames
+            .iter()
+            .position(|frame| frame.table == "vala.verification.results")
+            .expect("summaries were written");
+        let rows = |table: &str| {
+            frames
+                .iter()
+                .filter(|frame| frame.table == table)
+                .map(|frame| frame.rows)
+                .sum::<usize>()
+        };
+        assert!(
+            frames[summaries..]
+                .iter()
+                .all(|frame| frame.table == "vala.verification.results"),
+            "every summary follows every detail frame"
+        );
+        assert_eq!(
+            rows("vala.drift.result_features"),
+            JUDGMENTS * DETAIL_FEATURES
+        );
+        assert_eq!(rows("vala.verification.results"), JUDGMENTS);
     }
 
     /// Proves a single row larger than the budget is still submitted alone
@@ -1947,11 +2291,13 @@ mod tests {
             .into_iter()
             .partition(|frame| frame.tenant == tenant);
         assert_bounded_detail(&mine, DETAIL_FEATURES);
+        let mut others = others
+            .iter()
+            .map(|frame| frame.table.as_str())
+            .collect::<Vec<_>>();
+        others.sort_unstable();
         assert_eq!(
-            others
-                .iter()
-                .map(|frame| frame.table.as_str())
-                .collect::<Vec<_>>(),
+            others,
             ["vala.gateway.calls", "vala.traces.spans"],
             "the other tenant's capture is written"
         );

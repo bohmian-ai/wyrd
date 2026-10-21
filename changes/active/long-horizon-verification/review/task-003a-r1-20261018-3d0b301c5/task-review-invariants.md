@@ -1,0 +1,99 @@
+# TASK-003a cumulative invariant review
+
+Result: **PASS**. No proposed material findings.
+
+## Immutable subject and authority
+
+- Repository: `/home/thorrester/Documents/GitHub/wyrd-worktrees/long-horizon-verification-task-001`.
+- Base: `22335c2c40a5ad24c27bfa0d4686f4da49f922c5`.
+- Candidate: `3d0b301c51cfe6e50cbbde41b8b2ee3dfc2e9fb4`.
+- Latest-fix base: `7cda4e93159ab328de2a74068d5e1978a2590818`.
+- Original task read from the cumulative base; candidate spec revision 18 and the prior TASK-003a verdict, finding validation, and amended R1 task supply current remediation authority. Older TASK-001 packets are superseded.
+
+This is an independent invariant implementation review. I inspected the cumulative changed-file inventory and relevant original and latest-fix diffs, expanded changed owners through their producers, writers, consumers and sibling paths, and did not read current-round sibling reports. HEAD remained the candidate. Only this report was written.
+
+Authority applied: AGENTS.md and supplied repository instructions; architecture/agent-rules.md; spec-driven-development and maintainer-style references; current grouped-verification design at architecture/wyrd-design.md:1275–1356; doctrine's server/client/contract boundaries; Bifrost's eager builtin, tenant, published-cut and stream-terminal rules; original A1–A11 and revision-18 failure/duration amendments. CodeGraph preceded source navigation. Implementation evidence was assessed as evidence, never substituted for source or authority.
+
+## Producer-to-consumer audit
+
+### Acknowledgement, scheduling and transactional ownership
+
+`ScribeWrite::group_activity` (`scribe_outbox.rs:275`) extracts only the recorded authenticated owner, subject, source Verifier and group from inputs/results. Audit, captures and spans contribute no group activity. `ScribeSink::schedule_groups` (`:766`) deduplicates those tuples within the acknowledged non-lost slice and opens one tenant transaction through the existing WyrdPostgres owner. `write` (`:1015`) performs this fallible scheduling before counting terminal loss and consuming submission reservations. A failed transaction returns Scheduling through the existing outbox retry; replay uses existing frame identities rather than a new ledger. Production boot supplies the WyrdPostgres owner at `boot/mod.rs:888`. Request paths acquire no new SQL lookup or write.
+
+`RECORD_GROUP_ACTIVITY_SQL` (`verifier_executions.rs:198`) matches owner plus frozen exact source subject/Verifier identities, deduplicates binding/group matches and uses PostgreSQL statement time plus the authored interval. No producer timestamp or clamp remains. The sole new table contains tenant/binding/group/due_at, has the composite binding FK/cascade, due indexes and forced tenant/operator RLS (`20261018000000_verification_group_pending.sql:10–41`). Scheduling and pending deletion writers were traced through the queue, Scribe sink and scheduler; no parallel owner or hidden request-side writer was found.
+
+`claim_due_group` (`verifier_executions.rs:1762`) holds the pending-row lock until its caller transaction ends. `hand_off_groups` (`scheduler.rs:363`) takes a shared execution permit before acquiring/claiming, calls `hand_off`, and deletes pending only after a successful or duplicate enqueue or recorded terminal refusal. Its selected commit is awaited. Read, enqueue, refusal-write or cancellation failure drops the transaction and leaves pending. A concurrent activity upsert waits on that row; after deletion/commit it inserts fresh pending work. The permit is released before runner evaluation. The runner's ClaimLoop also takes the same capacity before claims and holds it through work (`claims.rs:247–288`); Operator delivery retains its separate real permit boundary. Cron and grouping remain separate futures under `VerificationScheduler::run` (`scheduler.rs:157`) and ordinary cron still advances its own cursor.
+
+### Failure classification and truthful refused executions
+
+`binding_activity` (`verification.rs:102,552`) retains the actual Card-bound principal independently of its active predicate. `DueGroup` carries that identity and `active` separately. Missing attribution remains a retryable infrastructure condition; lapsed/retired owner activity is terminal. `BackgroundAuthority::resolve` (`authority.rs:275`) reuses TenantTokenIssuer::recover: store/database errors propagate, known inactive principal/tenant/connection refusals become Rejected, and missing issuer/SYSTEM or corrupt/unrepresentable authority remains Unavailable. Its cron sibling intentionally maps refusal to the existing no-authority skip path (`scheduler.rs:316`), preserving ordinary scheduling semantics.
+
+Query authorization still runs through `ScheduledQueryCaller::authenticated`, the same public stream entry and table admission. GroupPollError preserves HTTP 403 denials as Denied and retries other query/stream/degraded/decode errors (`groups.rs:64–76,189–211`). Terminal owner/query refusal uses the tenant's real SYSTEM actor and stored owner principal. `refuse_group` (`verifier_executions.rs:1822`) inserts via INSERT_GROUP_ERROR_SQL (`:261`) with no authority, inputs, routes, digest, source snapshot, result, lease or verdict; it records a structured error, terminal status and settled time. It neither runs readiness/evaluation nor invokes `complete`, so it cannot dispatch an Operator. The same transaction consumes pending. A failed insert propagates and rolls back both effects.
+
+The migration's authority exception is restricted to an errored, zero-attempt, settled group with no result or lease token (`verification_group_pending.sql:51–100`); runnable authority is still mandatory. Actual production writers were reviewed rather than treating arbitrary direct SQL mutations as application paths. Existing manual and scheduled inserts retain authority/input contracts. CLAIM_SQL selects only pending/retrying/expired-running rows (`verifier_executions.rs:351`), and ClaimedRow still requires AcceptedAuthority and the ordinary input shapes. Refused rows cannot reach that decoder. STATUS_SQL does not decode authority and returns the error/group/owner; BINDING_TARGETS_SQL includes the new execution in the existing latest-created execution pointer (`:511–541`). Read authorization is unchanged.
+
+### Visible values, source identity and settlement
+
+Sources retains the existing exact source binding grammar, uses SQL string literal escaping and owner/source tuple predicates, and reads inputs plus results in a single successful UNION statement (`groups.rs:248–316`). It consults neither source execution SQL status nor acceptance/completion inventories. `Visible` and `Earliest` (`:367–457`) retain earliest physical input by execution and earliest result by result ID, select the greatest visible result `(ingest time,result ID)`, union input/result membership, and order by earliest input else earliest result then execution ID. Slot lists reuse their source tuple's order; Payloads returns null for missing values, unwraps JSON/trace declarations, and preserves failed outcomes and non-JSON declaration values (`:518–551`). Prior execution inputs remain pinned through normal claims/retries.
+
+`PinnedGroup::new` (`verifier_executions.rs:1067`) uses existing serde_jcs and SHA-256 over binding/group, ordered execution/result identities and pinned inputs. Digest excludes poll time, physical duplicate counts, status and attempts. The partial unique group-snapshot index permits distinct overlapping snapshots and makes unchanged snapshots idempotent regardless of status. `enqueue_group` reuses resolve_binding/readiness and returns the exact conflicting digest's execution (`:1865–1914`). No outstanding-execution gate remains.
+
+`complete` (`:2015`) locks the existing binding, applies a lease-fenced settlement, skips comparison on replay, and compares the latest other group verdict by settled_at/execution_id. The first verdict is a baseline, equality creates no dispatch and a change uses existing unique Operator dispatches with frozen previous/current context. Errored pre-admission rows have no group_verdict and cannot become predecessors. Ordinary manual and schedule settlement/dispatch paths retain their behavior.
+
+One candidate hypothesis was rejected: the missing-table fallback in GroupPoller assumes an input surface when probing results. This is not a reachable results-only builtin topology in the supported server: BuiltinTables::ensure_tenant/reconcile provisions the entire inventory (`components/platform/builtins.rs:75–118`), provisioning ensures it before promotion (`provisioning.rs:288`) and boot reconciles before role activation (`boot/mod.rs:507`). Bifrost design:140–147 explicitly makes unwritten builtins queryable and empty. No new fallback machinery or accepted-visibility barrier is justified.
+
+### Shared decoders and contract reach
+
+TriggerDuration::parse (`trigger.rs:103`) is the single positive finite-duration owner. Nine-digit parsing bounds multiplication; values above 31536000 seconds fail, and accepted authored text remains unchanged. Standalone and inline Trigger decoding goes through it. The SQL now uses the accepted duration exactly. No upgrade compatibility path or configurable second limit was introduced.
+
+InlineableRef's manual decoder (`reference.rs:147`) preserves original precedence: CardRef, sibling, inline body, then string path. It buffers through existing serde_json::Value to return the inline body's actual failure. Its live consumers include Agent prompts, check Agents, Trigger bindings and both Operator lists; reference/sibling/path forms remain unchanged. InputSlot's visitor (`card/verifier/mod.rs:318`) dispatches source strings through existing SourceText and maps through a tagged remote mirror with the same JSON/media/trace/samples variants, defaults and deny_unknown_fields. It does not add a second source grammar or change serialization/schema. Both changes address demonstrated shared-owner error masking; a consumer-only guard would duplicate it. Existing decoder, removed-fields, fixture and whole-spec evidence exercises the broader acceptance set.
+
+## Acceptance matrix
+
+Verification entries below distinguish supplied focused evidence from this review's source checks. C1–C13 are original task selectors; P1–P8 are the amended R1 selectors. No benchmark is qualified.
+
+| Requirement / acceptance / constraint | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A1: after-only Trigger, support facts, refresh, no request SQL, authenticated owner/source | trigger.rs:35–55,103; BindingProjector service.rs:1356; Scribe extraction/scheduling; queue activity SQL | C7/C8 supplied; strengthened P3 raw standalone/inline write refusal, accepted bounds and six-fact readback; P7/P8 | PASS |
+| A2: visible union, identity dedup, null alignment, latest result/order, immutable snapshots and late rows | groups.rs Sources/Visible/Payloads; PinnedGroup; claim reconstruction | C3/C6/C8 supplied; P4 late-evidence rerun; pure visible_rows_select_and_order and values_unwrap_inputs_and_outcomes | PASS |
+| A3: content identity, equal/late IDs, unchanged snapshots once, distinct overlap; remove coverage/finality/discovery | PinnedGroup::new; INSERT_GROUP_SQL/EXISTING_SNAPSHOT_SQL; snapshot unique index; pending-only scheduler | C6/C8/C9 supplied; P2/P4; cumulative deletion audit | PASS |
+| A4: baseline/equal/change/recovery and replay in settlement order | LOCK_GROUP_BINDING_SQL, COMPLETE_SQL, PREVIOUS_GROUP_SQL, complete and existing dispatch key | C2/C9 supplied; P2 deliberately settles later admission first and replays baseline/change; Python/TS C2 webhook reruns | PASS |
+| A5: original coding/no-trace source evidence and optional live authorized Agent read | Sources pins original values; hosted/runner retain ordinary engine and Agent tool boundary | C3 supplied and R1 focused Rust C3; owner-grant journey retained at Rust:3218 | PASS |
+| A6: 20 and 21 media items, empty/failed values, ordinary item retries; no custom ceiling | source ceiling config/helper/runner bypass removed; runner Grouped uses normal pinned inputs | C4/C10 supplied; R1 MCP C10; media/empty unit assertions retained | PASS |
+| A7: tenant/owner/group/source isolation, mixed runtimes, ordinary ungrouped path | TenantConn/RLS; exact frozen tuples; authenticated owner extraction; C1 foreign child processes | P3 one real Rust/Python/TS conversation; C1/C5/C8 supplied; R1 C5 | PASS |
+| A8: TASK-002 scheduled samples/checks; TASK-003 reservations, admission, drain and tenant progress | ordinary cron sibling, ClaimLoop permit ownership, Scribe schedule-before-reservation ordering; removed-fields decode remains strict | C11/C12 supplied; P5/P6 same eligible bound source/group pressure and accepted retry readback; whole-spec 768 tests supplied | PASS |
+| A9: Rust/Python/TS wire/stubs, served OpenAPI/MCP and docs agree | GroupSnapshot only sources; after-only settings; authored Python typing; generated TS; architecture/docs terminology | C7/C10 supplied; P8/codegen check; Python/TS lint/typecheck/docs checks supplied | PASS |
+| A10: original functional closure, credible focused evidence; benchmark deferred | original task evidence plus cumulative/R1 source and assertion audit; existing driver unchanged | C1–C13 original recorded runs; R1 P1–P8/C2/C3/C5/C10 and static lane counts recorded | PASS, functional scope only |
+| A11: post-ACK pending, debounce/consume, rollback/cancellation/arrival, batch/capacity and separate cron progress | ScribeSink::write; pending migration; scheduler handoff transaction; shared permits/separate loops | C13 now observes actual scheduler run, query fault retention, real ACK blocked on pending row, bounded 32-item pass and refusal-write rollback; P1 | PASS |
+| INV-001–005: retained owner boundaries, authenticated scope/RLS, immutable values, finite existing process capacity and ordinary errors | source paths above; no new queue, language-owned durable core, transport or resource owner | source audit and supplied boundary/lint/contract evidence | PASS |
+| Revision 18 failure visibility: terminal genuine owner/auth refusal, retry Wyrd blockage, no fabricated authority/input/result/Operator | scheduler hand_off, BackgroundAuthority, GroupPollError; refuse_group and NULL shape; latest/status consumers | P1 unconfigured/recovered/lapsed/retired/query-denied and failed-insert cases; P2 shape/claim rejection; P3 public revoked-owner readback | PASS |
+| Revision 18 duration maximum: standalone and inline rejection above fixed 365d; exact accepted value | shared TriggerDuration, inline decoder, SQL interval without clamp | P7 all equivalent units; P2 exact simultaneous 365d versus 1h due-time delta; P3 raw HTTP negative/accepted cases; P8 | PASS |
+| Required shared parser/negative-fixture regressions | shared decoder precedence/defaults; invalid corpus relocation; coding-child actual Verifier absence assertion | 768/768 spec evidence, focused decoder RED/GREEN and C3/P3 runtime evidence | PASS |
+| Explicit cleanup without deleting live semantics | DueGroup projections removed; fixture metadata/ref/webhook renames atomic; retained source predicates, group readbacks, grant test, due/cron state | supplied active-reference search plus source/diff inspection; focused fixture/SDK/MCP checks | PASS |
+| Non-goals: no source reconciliation, completion waiting, hard finality, history API, ceiling, recovery ledger, adoption/serialization gate, quota or benchmark machinery | cumulative runtime/schema diff | static source review; N/A for accepted limits | PASS |
+
+## Stable prior-finding closure
+
+| Prior ID | Disposition and source validation |
+|---|---|
+| FIND-TASK-003a-1 | CLOSED under revised rev18 authority, superseding the earlier blanket-retention recommendation. Retry paths return None/error before consume; terminal inactivity/auth rejection inserts truthful error then consumes atomically; P1/P2/P3 assert visibility and rollback. |
+| FIND-TASK-003a-2 | CLOSED under owner-approved fixed-year bound. No hidden SQL cap; shared parser rejects >365d at both write shapes; P2 proves accepted duration exactness. Earlier million-hour acceptance is superseded, not a missing case. |
+| FIND-TASK-003a-3 | CLOSED. Grouped::foreign_turn (Rust journey:1329) invokes actual Python and Node processes, each public SDK against the same bound server/key/bundle/group. C1:1455 retains six ordered facts, queued/replayed and ownerless/denied boundaries; P3 passed as recorded. |
+| FIND-TASK-003a-4 | CLOSED. C13:647–1028 now uses actual scheduler::run during held read, creates cron due only after observing the hold, retains query fault across idle/full-capacity passes, observes real Scribe activity SQL blocked on the row lock, then asserts fresh pending. Existing claim/32-item/cancel proof stays. |
+| FIND-TASK-003a-5 | CLOSED. Python C11:1007 and TS C11 pressure registered support turn-check on the same group they retry/read. Python pinned turns are exactly one pressured value; TS additionally pins the retry execution ID. Input count retains refusal/accepted-row accounting and neighbor progress. |
+| FIND-TASK-003a-6 | CLOSED at cited sites. Visible::input/result now describe key/earliest retention, Firsts documents optional ordering anchors, Support::activity documents the invalid-GroupId panic. Material new refusal/decoder operations document their effects/errors. |
+| HUMAN-CLEANUP 1 | CLOSED, no FIND ID. Removed only unused DueGroup projections; due_at storage/filter/order/index, frozen binding/source targets and live cron DueBinding state remain. |
+| HUMAN-CLEANUP 2 | CLOSED, no FIND ID. Runner describes ordinary pinned lists; guide admits schedule and group_end; MCP descriptions no longer promise retired coverage. |
+| HUMAN-CLEANUP 3 | CLOSED, no FIND ID. Six verifier fixture names/metadata and callers, group readback helpers and refund webhook path changed together; negative fixtures and active assertions remain. |
+
+## Findings and rejected extensions
+
+No new source-local finding IDs are proposed; no prior FIND remains open. The delete/reuse/native ladder is satisfied by extending existing scheduler, queue, Scribe, query and shared parser owners, using existing transactions, serde_jcs/SHA-256 and native child processes. Removed projections/coverage/ceiling code are deletion, not replacement machinery. No added remediation for accepted ACK visibility, post-ACK loss, retention/outbox loss, continuous postponement, overlapping settlement order, durable backlog or fairness limits is justified.
+
+The NULL terminal schema was checked against actual producers and claim/status consumers. Arbitrary privileged SQL could fabricate other terminal state, but no task-required production writer was shown to do so; this is not asserted as a reachable defect or used to demand schema hardening. Shared decoder errors intentionally become more specific while public accepted forms remain intact. No extra abstraction, framework or dependency is recommended.
+
+## Verification notes and limits
+
+This reviewer ran no builds, tests, Postgres, providers, load or benchmarks. Root owns coordinated sequential reruns. I read the original and R1 focused command/count results, diagnoses, RED/GREEN claims, and the relevant strengthened test bodies; supplied results are not claimed as fresh execution. Read-only `git diff --check 22335c2...3d0b301` passed and `git rev-parse HEAD` returned the exact candidate. Report directories are the only review writes.
+
+Residual verification risk is the normal distinction between source review and dynamic qualification: full deployed SDK journeys and crash/recovery scenarios were not freshly executed here. REQ-015/AC-009 remain deliberately pending, and this PASS makes no performance or benchmark-readiness claim.

@@ -1,16 +1,17 @@
-//! Per-execution verification telemetry: classification, phases, and waits.
+//! Per-execution verification profile: classification, phases, overhead.
 //!
 //! [`ExecutionTelemetry`] is the one owner of a Verifier execution's metric
-//! lifetime, whether a queued attempt or a direct request. It counts the
-//! attempt when it starts, accumulates each [`Phase`]'s elapsed intervals, and
-//! records the dependency and provider waits measured inside the engine.
-//! Every Verifier runs through the one building-block engine, so series are
-//! labelled by `mode` only. Finishing emits
-//! one attempt observation and at most one sample per applicable phase;
-//! dropping it — on error, cancellation, or shutdown — still returns the
-//! active gauge exactly once. Engine overhead is the engine's elapsed time
-//! less the union of the waits clipped to it, so nested or concurrent waits
-//! are subtracted once and synchronous folding or scoring stays local work.
+//! lifetime, whether a queued attempt or a direct request: the runtime's
+//! analog of Bifrost's per-query profile. It starts when the work reaches
+//! the runtime (a direct request's HTTP arrival, a queued attempt's claim),
+//! accumulates each [`Phase`]'s scoped intervals, and hands the engine a
+//! [`BlockClock`] that records every action and check the Verifier runs.
+//! Finishing emits one profile: the whole execution, the Verifier's own
+//! block time, and the overhead between them (the execution less the union
+//! of its blocks), plus at most one sample per applicable phase. Dropping
+//! it unfinished, on error, cancellation, or shutdown, still returns the
+//! active gauge exactly once. Every Verifier runs through the one
+//! building-block engine, so series are labelled by `mode` only.
 
 use std::future::Future;
 use std::sync::Mutex;
@@ -18,12 +19,14 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
+use vala_verify::blocks::BlockClock;
 
 use crate::app::metrics::{
-    VERIFICATION_ACTIVE_RUNS, VERIFICATION_ENGINE_OVERHEAD_SECONDS,
-    VERIFICATION_PHASE_DURATION_SECONDS, VERIFICATION_RUN_ATTEMPTS_TOTAL,
-    VERIFICATION_RUN_DURATION_SECONDS, VERIFICATION_RUN_FAILURES_TOTAL,
+    VERIFICATION_ACTIVE_RUNS, VERIFICATION_OVERHEAD_SECONDS, VERIFICATION_PHASE_DURATION_SECONDS,
+    VERIFICATION_RUN_ATTEMPTS_TOTAL, VERIFICATION_RUN_DURATION_SECONDS,
+    VERIFICATION_RUN_FAILURES_TOTAL, VERIFICATION_SUBMIT_SECONDS, VERIFICATION_VERIFIER_SECONDS,
 };
+use crate::http::middleware::metrics::RequestArrival;
 
 /// One measured `[start, end)` interval on the process-monotonic clock.
 type Interval = (Instant, Instant);
@@ -50,10 +53,14 @@ impl ExecutionMode {
 
 /// The closed `phase` dimension of `wyrd_verification_phase_duration_seconds`.
 ///
-/// `Engine` is the inclusive parent of `InputRead` and `Prepare`; phases
-/// overlap and are never summed.
+/// `Engine` is the inclusive parent of `Prepare`, and the blocks the
+/// Verifier runs inside it are its own execution, not overhead; phases
+/// overlap and are never summed. A direct execution's time outside every
+/// phase is its HTTP decode and the request's middleware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Authorize the caller and reserve the result's staging slots.
+    Admit,
     /// Resolve the exact registered Verifier.
     Load,
     /// Authorized queued evidence retrieval; direct execution has none.
@@ -62,17 +69,21 @@ pub enum Phase {
     Prepare,
     /// Inclusive engine dispatch through judgment.
     Engine,
+    /// Stage a direct execution's inputs and result on the Scribe outbox.
+    Stage,
     /// Queued fenced durable state transition.
     Settlement,
 }
 
 impl Phase {
     /// Every phase, in emission order.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
+        Self::Admit,
         Self::Load,
         Self::InputRead,
         Self::Prepare,
         Self::Engine,
+        Self::Stage,
         Self::Settlement,
     ];
 
@@ -80,91 +91,54 @@ impl Phase {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Admit => "admit",
             Self::Load => "load",
             Self::InputRead => "input_read",
             Self::Prepare => "prepare",
             Self::Engine => "engine",
+            Self::Stage => "stage",
             Self::Settlement => "settlement",
         }
     }
 }
 
 /// Measured intervals per phase, indexed like [`Phase::ALL`].
-type Ledger = [Vec<Interval>; 5];
-
-/// Shareable recorder of one execution's dependency, evidence, and provider waits.
-///
-/// Cloning shares the same interval list, so a wait measured inside a spawned
-/// task, such as a judge invocation on the engine's task set, joins
-/// the execution that owns it.
-#[derive(Debug, Clone, Default)]
-pub struct WaitSink {
-    /// Measured waits, in completion order.
-    intervals: std::sync::Arc<Mutex<Vec<Interval>>>,
-}
-
-impl WaitSink {
-    /// Await `future` as one wait.
-    ///
-    /// The wait starts when this is called and is recorded when `future`
-    /// completes; a future dropped before completion records nothing. This
-    /// is a combinator rather than an `async fn` so `future` is held once:
-    /// an `async fn` keeps its future argument and the awaited value as two
-    /// copies, and every engine wraps a whole Bifrost query in waits.
-    pub fn wait<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
-        let start = Instant::now();
-        future.map(move |output| {
-            self.record(start, Instant::now());
-            output
-        })
-    }
-
-    /// Record one `[start, end)` wait measured by the caller.
-    pub fn record(&self, start: Instant, end: Instant) {
-        self.lock().push((start, end));
-    }
-
-    /// Lock the intervals, recovering them from a poisoned lock.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Interval>> {
-        self.intervals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
+type Ledger = [Vec<Interval>; 7];
 
 /// Owner of one verification execution's metrics lifetime.
 ///
-/// Created when a queued attempt is claimed or a direct request enters the
-/// runtime; it counts the attempt and raises the active gauge at once and
-/// lowers the gauge exactly once on drop. A direct execution
-/// dropped before [`finish`](Self::finish) — a client disconnect — finishes
-/// as `cancelled`.
+/// Created when a direct request reaches the server or a queued attempt is
+/// claimed; it counts the attempt and raises the active gauge at once and
+/// lowers the gauge exactly once on drop. A direct execution dropped before
+/// [`finish`](Self::finish), a client disconnect, finishes as `cancelled`.
 #[derive(Debug)]
 pub struct ExecutionTelemetry {
     /// How the execution was admitted.
     mode: ExecutionMode,
-    /// When the execution entered the runtime.
+    /// When the execution reached the runtime.
     started: Instant,
     /// Measured phase intervals.
     ledger: Mutex<Ledger>,
-    /// Waits measured inside the engine.
-    waits: WaitSink,
+    /// Every block the engine ran for this execution.
+    clock: BlockClock,
     /// Whether the execution's outcome was emitted.
     finished: bool,
 }
 
 impl ExecutionTelemetry {
-    /// Start accounting for one `mode` execution: count the attempt and raise
-    /// the active gauge.
+    /// Start accounting for one `mode` execution from `since` — a direct
+    /// request's HTTP arrival at this server, or a queued run's claim — or
+    /// from now when there is neither (an MCP call): count the attempt and
+    /// raise the active gauge.
     #[must_use]
-    pub fn start(mode: ExecutionMode) -> Self {
+    pub fn start(mode: ExecutionMode, since: Option<Instant>) -> Self {
         metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode.as_str()).increment(1);
         metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => mode.as_str()).increment(1.0);
         Self {
             mode,
-            started: Instant::now(),
+            started: since.unwrap_or_else(Instant::now),
             ledger: Mutex::default(),
-            waits: WaitSink::default(),
+            clock: BlockClock::default(),
             finished: false,
         }
     }
@@ -175,17 +149,31 @@ impl ExecutionTelemetry {
         self.mode
     }
 
+    /// The clock the engine records this execution's blocks on.
+    #[must_use]
+    pub fn clock(&self) -> BlockClock {
+        self.clock.clone()
+    }
+
     /// Await `future` as one interval of `phase`.
     ///
     /// The interval starts when this is called and is recorded when `future`
-    /// completes; a future dropped before completion records nothing. Like
-    /// [`WaitSink::wait`], it is a combinator so `future` is held once.
+    /// completes; a future dropped before completion records nothing. This
+    /// is a combinator rather than an `async fn` so `future` is held once.
     pub fn phase<F: Future>(&self, phase: Phase, future: F) -> impl Future<Output = F::Output> {
         let start = Instant::now();
         future.map(move |output| {
             self.record_phase(phase, start, Instant::now());
             output
         })
+    }
+
+    /// Run `work` synchronously as one interval of `phase`.
+    pub fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let output = work();
+        self.record_phase(phase, start, Instant::now());
+        output
     }
 
     /// Await `future` as one `prepare` interval inside a `verification.prepare` span.
@@ -205,18 +193,7 @@ impl ExecutionTelemetry {
         self.lock()[index].push((start, end));
     }
 
-    /// Await `future` as one dependency, evidence, or provider wait.
-    pub fn wait<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
-        self.waits.wait(future)
-    }
-
-    /// The shareable sink recording this execution's waits.
-    #[must_use]
-    pub fn waits(&self) -> WaitSink {
-        self.waits.clone()
-    }
-
-    /// Emit the execution's duration, phases, overhead, and failure under `outcome`.
+    /// Emit the execution's profile under `outcome`.
     ///
     /// `failed` marks an unsuccessful execution outcome; a completed failed
     /// judgment is not one. Phases with no interval emit no sample. The
@@ -226,8 +203,10 @@ impl ExecutionTelemetry {
         self.finished = true;
     }
 
-    /// Emit the outcome families of [`finish`](Self::finish).
+    /// Emit the outcome families of [`finish`](Self::finish): each phase,
+    /// the whole execution, the Verifier's block time, and the overhead.
     fn emit(&self, outcome: &'static str, failed: bool) {
+        let total = self.started.elapsed();
         let ledger = self.lock();
         let mode = self.mode.as_str();
         for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
@@ -240,15 +219,11 @@ impl ExecutionTelemetry {
                 .record(union(intervals).as_secs_f64());
             }
         }
-        let engine = &ledger[3];
-        if !engine.is_empty() {
-            metrics::histogram!(
-                VERIFICATION_ENGINE_OVERHEAD_SECONDS,
-                "mode" => mode,
-                "outcome" => outcome
-            )
-            .record(overhead(engine, &self.waits.lock()).as_secs_f64());
-        }
+        let verifier = union(&self.clock.intervals());
+        metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
+            .record(verifier.as_secs_f64());
+        metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)
+            .record(total.saturating_sub(verifier).as_secs_f64());
         if failed {
             metrics::counter!(
                 VERIFICATION_RUN_FAILURES_TOTAL,
@@ -262,7 +237,7 @@ impl ExecutionTelemetry {
             "mode" => mode,
             "outcome" => outcome
         )
-        .record(self.started.elapsed().as_secs_f64());
+        .record(total.as_secs_f64());
     }
 
     /// Lock the ledger, recovering it from a poisoned lock.
@@ -287,42 +262,13 @@ impl Drop for ExecutionTelemetry {
     }
 }
 
-/// Measures the waits of one streaming read as the gaps between folds.
-///
-/// A streaming evidence read interleaves IO with synchronous folding. Each
-/// [`folding`](Self::folding) call closes the wait since the previous fold
-/// and [`folded`](Self::folded) reopens it, so fold CPU stays local work.
-#[derive(Debug)]
-pub struct StreamWaits<'a> {
-    /// The sink of the execution the waits belong to.
-    waits: &'a WaitSink,
-    /// Start of the wait in progress.
-    since: Instant,
-}
-
-impl<'a> StreamWaits<'a> {
-    /// Open a wait at the start of a streaming read.
-    #[must_use]
-    pub fn open(telemetry: &'a ExecutionTelemetry) -> Self {
-        Self {
-            waits: &telemetry.waits,
-            since: Instant::now(),
-        }
-    }
-
-    /// Close the current wait as a batch arrives for folding.
-    pub fn folding(&self) {
-        self.waits.record(self.since, Instant::now());
-    }
-
-    /// Reopen the wait once a batch has been folded.
-    pub fn folded(&mut self) {
-        self.since = Instant::now();
-    }
-
-    /// Close the final wait when the stream settles.
-    pub fn close(self) {
-        self.waits.record(self.since, Instant::now());
+/// Record one background submission's server time under `outcome`: from
+/// its HTTP `arrival` until it was staged or refused. A submission that did
+/// not arrive over HTTP (an MCP tool call) has no arrival and records none.
+pub fn record_submission(arrival: Option<RequestArrival>, outcome: &'static str) {
+    if let Some(arrival) = arrival {
+        metrics::histogram!(VERIFICATION_SUBMIT_SECONDS, "outcome" => outcome)
+            .record(arrival.instant().elapsed().as_secs_f64());
     }
 }
 
@@ -352,25 +298,9 @@ fn union(intervals: &[Interval]) -> Duration {
     total
 }
 
-/// Engine elapsed time less the union of `waits` clipped to the engine.
-///
-/// Each wait is clipped to each engine interval, so a wait straddling the
-/// engine boundary or overlapping another wait is subtracted once.
-fn overhead(engine: &[Interval], waits: &[Interval]) -> Duration {
-    let clipped: Vec<Interval> = engine
-        .iter()
-        .flat_map(|(open, close)| {
-            waits
-                .iter()
-                .map(move |(start, end)| ((*start).max(*open), (*end).min(*close)))
-        })
-        .collect();
-    union(engine).saturating_sub(union(&clipped))
-}
-
 #[cfg(test)]
 mod tests {
-    //! Proof of classification and the wait-union arithmetic.
+    //! Proof of the profile's overhead arithmetic and cancellation.
 
     use super::*;
 
@@ -379,37 +309,52 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    /// Nested and concurrent waits are subtracted once, waits outside the
-    /// engine are clipped away, and an engine without waits is all overhead.
+    /// Overlapping intervals count once and disjoint ones add.
     #[test]
-    fn overhead_subtracts_the_union_of_clipped_waits_once() {
+    fn union_counts_overlap_once() {
         let t = Instant::now();
-        let engine = [(at(t, 0), at(t, 100))];
-        let waits = [
+        let intervals = [
             (at(t, 10), at(t, 40)),
             (at(t, 20), at(t, 30)),
             (at(t, 35), at(t, 50)),
-            (at(t, 90), at(t, 150)),
+            (at(t, 90), at(t, 100)),
         ];
-        assert_eq!(overhead(&engine, &waits), Duration::from_millis(50));
-        assert_eq!(overhead(&engine, &[]), Duration::from_millis(100));
-        assert_eq!(overhead(&engine, &[(at(t, 0), at(t, 200))]), Duration::ZERO);
+        assert_eq!(union(&intervals), Duration::from_millis(50));
+        assert_eq!(union(&[]), Duration::ZERO);
     }
 
-    /// A streaming read's fold time stays local work: only the gaps between
-    /// folds are waits.
+    /// The overhead is the whole execution from its arrival less the
+    /// Verifier's block time: a profile started at an earlier arrival
+    /// counts the time before it, and block time is subtracted.
+    ///
+    /// # Panics
+    /// Panics when the rendered exposition lacks either family or the
+    /// overhead omits the time since arrival.
     #[test]
-    fn streaming_fold_time_is_not_a_wait() {
-        let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
-        let engine_start = Instant::now();
-        let mut waits = StreamWaits::open(&telemetry);
-        waits.folding();
-        std::thread::sleep(Duration::from_millis(20));
-        waits.folded();
-        waits.close();
-        let engine_end = Instant::now();
-        let local = overhead(&[(engine_start, engine_end)], &telemetry.waits.lock());
-        assert!(local >= Duration::from_millis(20), "{local:?}");
+    fn overhead_is_the_execution_less_its_blocks() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let arrival = Instant::now()
+            .checked_sub(Duration::from_millis(30))
+            .expect("invariant: the monotonic clock is past 30 ms");
+        metrics::with_local_recorder(&recorder, || {
+            ExecutionTelemetry::start(ExecutionMode::Direct, Some(arrival))
+                .finish("completed", false);
+        });
+        let text = handle.render();
+        let sum = |family: &str| {
+            text.lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "{family}_sum{{mode=\"direct\",outcome=\"completed\"}}"
+                    ))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("{family} missing: {text}"))
+        };
+        assert!(sum("wyrd_verification_overhead_seconds") >= 0.030, "{text}");
+        assert!(sum("wyrd_verification_verifier_seconds") < 0.030, "{text}");
     }
 
     /// A direct execution dropped before finishing — a client disconnect —
@@ -423,8 +368,8 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            drop(ExecutionTelemetry::start(ExecutionMode::Direct));
-            drop(ExecutionTelemetry::start(ExecutionMode::Queued));
+            drop(ExecutionTelemetry::start(ExecutionMode::Direct, None));
+            drop(ExecutionTelemetry::start(ExecutionMode::Queued, None));
         });
         let text = handle.render();
         assert!(

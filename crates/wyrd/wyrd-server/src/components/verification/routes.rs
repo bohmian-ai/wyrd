@@ -27,7 +27,9 @@ use crate::components::auth::Caller;
 use crate::components::storage::routes::extract_idempotency_key;
 use crate::http::error::{WyrdErrorResponse, path_rejection};
 use crate::http::middleware::edge_timeout::EdgeTimer;
+use crate::http::middleware::metrics::RequestArrival;
 use crate::state::AppState;
+use crate::verification::telemetry::record_submission;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -235,14 +237,21 @@ async fn local_evidence(
 )]
 async fn enqueue(
     State(state): State<AppState>,
+    arrival: Option<Extension<RequestArrival>>,
     caller: Caller,
     headers: HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<EnqueueVerificationResponse>), WyrdErrorResponse> {
     let key = extract_idempotency_key(&headers)?;
     let request: VerificationRequest = decode_body(body).await?;
-    let response = VerificationControl::new(&state).enqueue(&caller, request, key.as_ref())?;
-    Ok((StatusCode::ACCEPTED, Json(response)))
+    let response = VerificationControl::new(&state).enqueue(&caller, request, key.as_ref());
+    let outcome = if response.is_ok() {
+        "staged"
+    } else {
+        "refused"
+    };
+    record_submission(arrival.map(|Extension(arrival)| arrival), outcome);
+    Ok((StatusCode::ACCEPTED, Json(response?)))
 }
 
 /// Read one execution's status, dispatches, and result once visible.
@@ -336,6 +345,7 @@ async fn get_execution(
 )]
 async fn execute(
     State(state): State<AppState>,
+    arrival: Option<Extension<RequestArrival>>,
     edge_timer: Option<Extension<EdgeTimer>>,
     caller: Caller,
     body: Body,
@@ -347,6 +357,7 @@ async fn execute(
                 &caller,
                 &request,
                 edge_timer.map(|Extension(timer)| timer).as_ref(),
+                arrival.map(|Extension(arrival)| arrival),
             )
             .await?,
     ))

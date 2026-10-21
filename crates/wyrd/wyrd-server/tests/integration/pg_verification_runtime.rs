@@ -815,7 +815,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         .iter()
         .map(|outcome| {
             count(&format!(
-                r#"wyrd_verification_engine_overhead_seconds_count{{{queued},outcome="{outcome}"}}"#
+                r#"wyrd_verification_overhead_seconds_count{{{queued},outcome="{outcome}"}}"#
             ))
         })
         .sum();
@@ -924,7 +924,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         "verification.load",
         "verification.engine",
         "verification.settle",
-        "complete",
+        "complete_many",
     ] {
         assert!(
             names.contains(&phase),
@@ -2658,6 +2658,132 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
     claim_first_round(3, 2).await;
 }
 
+/// A burst of queued runs in one tenant is claimed in the runner's first
+/// round up to its free slots, through repeated passes over the single due
+/// tenant, not one run per round.
+///
+/// # Panics
+/// Panics when a submission is refused, the first round claims another
+/// count, or a run does not complete.
+#[tokio::test]
+async fn a_burst_in_one_tenant_is_claimed_in_one_round() {
+    const BURST: usize = 5;
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    let mut runs = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        runs.push(harness.submit().await);
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let limits = RuntimeLimits {
+        execution_slots: BURST + 3,
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &script);
+    wait_until("the burst executions", || script.entered() == BURST).await;
+    let round = first_runner_round(&logs);
+    assert!(
+        round.contains("due=1") && round.contains(&format!("claimed={BURST}")),
+        "the first round claims the whole burst of its one tenant: {round}"
+    );
+    script.release();
+    for run in runs {
+        wait_execution_in(&harness.seed, run, status("completed")).await;
+    }
+    runtime.stop().await;
+}
+
+/// A runner whose execution slots fill while its one tenant still has
+/// queued runs claims the rest from the carried tenant as slots free,
+/// without reading the due tenants again.
+///
+/// # Panics
+/// Panics when a submission is refused, no runner round claims from carried
+/// tenants, or a run does not complete.
+#[tokio::test]
+async fn a_saturated_runner_claims_from_its_carried_tenants() {
+    const BURST: usize = 5;
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    let mut runs = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        runs.push(harness.submit().await);
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let limits = RuntimeLimits {
+        execution_slots: 2,
+        poll_interval: Duration::from_secs(30),
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &script);
+    wait_until("the slotted executions", || script.entered() == 2).await;
+    script.release();
+    for run in runs {
+        wait_execution_in(&harness.seed, run, status("completed")).await;
+    }
+    let text = logs.text();
+    let mut rounds = text
+        .lines()
+        .filter(|line| line.contains("claim round") && line.contains(r#"capability="runner""#));
+    assert!(
+        rounds.any(|line| line.contains("scanned=false") && !line.contains("claimed=0")),
+        "a round claims from the carried tenant without a due read:\n{text}"
+    );
+    runtime.stop().await;
+}
+
+/// A submission accepted by this process wakes its idle runner at once, so
+/// the run settles long before the 30-second poll interval would claim it.
+///
+/// # Panics
+/// Panics when seeding or the request fails, or the run does not settle
+/// within ten seconds.
+#[tokio::test]
+async fn a_local_submission_wakes_an_idle_runner() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let verifier = harness
+        .seed
+        .verifier("woken-assertion", &assertion_spec())
+        .await
+        .expect("assertion Verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("woken-run-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let limits = RuntimeLimits {
+        poll_interval: Duration::from_secs(30),
+        ..Harness::limits()
+    };
+    let runtime = harness.spawn(&limits, &EngineScript::default());
+    wait_until("the runner's first empty round", || {
+        logs.text()
+            .lines()
+            .any(|line| line.contains("claim round") && line.contains(r#"capability="runner""#))
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        traced_enqueue(
+            &harness,
+            &jwt,
+            &verifier,
+            "00-4bf92f3577b34da6a3ce929d0e0e4737-00f067aa0ba902b7-01",
+        ),
+    )
+    .await
+    .expect("the woken runner settles the run well before its poll interval");
+    runtime.stop().await;
+}
+
 /// Seed `tenants` tenants with one claimable run each, hold the engine on a
 /// runner with `slots` execution slots, and assert its first claim round
 /// claims `min(tenants, slots)` before every run completes on release.
@@ -2708,15 +2834,16 @@ async fn claim_first_round(tenants: usize, slots: usize) {
     runtime.stop().await;
 }
 
-/// A second run of the same Verifier on one process resolves it from the
-/// process cache without reading its Card, and a run whose Verifier was
-/// deleted settles `errored` without executing or writing.
+/// A second run of the same target on one process resolves it from the
+/// process cache without reading its Cards, and a run whose subject or
+/// Verifier was deleted while it waited settles `errored` without executing
+/// or writing, once the deletion's notification reaches the cache.
 ///
 /// # Panics
-/// Panics when the second run reads the Card, the deleted Verifier's run
+/// Panics when the second run reads the target, a run of a deleted Card
 /// executes or settles otherwise, or anything more is written.
 #[tokio::test]
-async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
+async fn verification_targets_are_cached_and_a_deleted_card_errors() {
     let logs = LogCapture::install();
     let harness = Harness::start().await;
     let script = EngineScript::default();
@@ -2732,25 +2859,45 @@ async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
     let misses = logs
         .text()
         .lines()
-        .filter(|line| line.contains("Verifier Card cache miss"))
+        .filter(|line| line.contains("verification target cache miss"))
         .count();
-    assert_eq!(misses, 1, "only the first run reads the Verifier Card");
+    assert_eq!(misses, 1, "only the first run reads its target");
 
-    let orphan = harness.submit().await;
-    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
-        .bind(harness.verifier.as_uuid())
-        .execute(&harness.assertion)
+    let (gone, _) = harness
+        .seed
+        .service("gone")
         .await
-        .expect("the Verifier is deleted");
-    let runtime = harness.spawn(&Harness::limits(), &script);
-    let row = harness.wait_execution(orphan, status("errored")).await;
-    assert_eq!(row.error_code.as_deref(), Some(VERIFIER_UNAVAILABLE));
-    assert_eq!(script.entered(), 2, "a deleted Verifier never executes");
+        .expect("subject registers");
+    let cache = &harness.server.state().verifier_cards;
+    for (subject, deleted, code) in [
+        (&gone, &gone, "WYRD_VERIFICATION_400_INVALID_TARGET"),
+        (&harness.subject, &harness.verifier, VERIFIER_UNAVAILABLE),
+    ] {
+        let orphan = harness
+            .seed
+            .submit(&harness.verifier, subject, BTreeMap::new())
+            .await
+            .expect("submission is accepted");
+        let before = cache.invalidations();
+        sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+            .bind(deleted.as_uuid())
+            .execute(&harness.assertion)
+            .await
+            .expect("the Card is deleted");
+        wait_until("the deletion reaches the cache", || {
+            cache.invalidations() != before
+        })
+        .await;
+        let runtime = harness.spawn(&Harness::limits(), &script);
+        let row = harness.wait_execution(orphan, status("errored")).await;
+        assert_eq!(row.error_code.as_deref(), Some(code));
+        runtime.stop().await;
+    }
+    assert_eq!(script.entered(), 2, "a deleted Card's run never executes");
     assert_eq!(
         harness.writes().await,
         vec![RESULTS.to_owned(), RESULTS.to_owned()]
     );
-    runtime.stop().await;
 }
 
 /// A run executing longer than its lease keeps it through renewal on the

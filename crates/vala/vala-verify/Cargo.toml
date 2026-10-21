@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 jsonpath-rust = { workspace = true }
 jsonschema = { workspace = true }
+metrics = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -35,6 +36,7 @@ vala-drift = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 workspace-hack.workspace = true
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

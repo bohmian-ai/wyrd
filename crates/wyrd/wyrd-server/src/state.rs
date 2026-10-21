@@ -1,5 +1,6 @@
 //! Shared axum application state.
 
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ use crate::config::{
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
+use crate::verification::cache::VerifierCardCache;
 use crate::verification::health::VerificationHealth;
 use crate::verification::hosted::blocks::HostedBlocks;
 use crate::verification::submissions::SubmissionOutbox;
@@ -2181,11 +2183,38 @@ impl BifrostShutdownReport {
 
 /// Process-wide handle registry. One instance is shared by all HTTP handlers.
 ///
-/// Foundation commits append their owned handles here, for example storage,
-/// auth verification, and policy evaluation. This skeleton ships only the
-/// runtime database pools that already survive boot.
+/// Tower clones the middleware stack, and the state each layer holds, on every
+/// request, so a clone is one reference-count increment on the shared
+/// [`AppStateInner`]. Fields read through [`Deref`]. A write through
+/// [`DerefMut`] copies the handles first when other clones share them, so a
+/// clone keeps the value semantics of a plain copy: mutating one never changes
+/// another.
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState(Arc<AppStateInner>);
+
+impl Deref for AppState {
+    type Target = AppStateInner;
+
+    /// Borrow the shared handles.
+    fn deref(&self) -> &AppStateInner {
+        &self.0
+    }
+}
+
+impl DerefMut for AppState {
+    /// Borrow the handles mutably, copying them out of the shared allocation
+    /// first when another clone still holds it.
+    fn deref_mut(&mut self) -> &mut AppStateInner {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+/// The handles [`AppState`] shares.
+///
+/// Foundation commits append their owned handles here, for example storage,
+/// auth verification, and policy evaluation.
+#[derive(Clone)]
+pub struct AppStateInner {
     /// Composed production Postgres handle. Single DB access path for all routes.
     pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
@@ -2256,6 +2285,11 @@ pub struct AppState {
     /// verification and the queued runner build every engine over; `None`
     /// until boot starts it, and then neither verification surface runs.
     pub verification_blocks: Option<Arc<HostedBlocks>>,
+    /// The one resolution of verification targets, shared by direct verify,
+    /// submission acceptance, and the queued runner; it is the submission
+    /// writer's own cache when this process has one. Targets serve only
+    /// while the server's listener hears every change that could alter them.
+    pub verifier_cards: Arc<VerifierCardCache>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2288,7 +2322,12 @@ impl AppState {
             },
             Arc::clone,
         );
-        Self {
+        let verifier_cards = bifrost
+            .submissions()
+            .map_or_else(Arc::default, |submissions| {
+                submissions.sink().verifier_cards()
+            });
+        Self(Arc::new(AppStateInner {
             postgres,
             storage,
             bifrost,
@@ -2314,9 +2353,10 @@ impl AppState {
             verification: Arc::default(),
             operator_keys: Arc::new(OperatorKeys::default()),
             verification_blocks: None,
+            verifier_cards,
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
-        }
+        }))
     }
 
     /// Run every Verifier execution over `blocks`.

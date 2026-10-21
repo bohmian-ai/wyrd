@@ -22,7 +22,7 @@
 //! the item pending.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -224,11 +224,17 @@ impl VerificationScheduler {
     /// # Cancellation
     /// See [`Self::schedule_tenant`]: cancellation rolls back an uncommitted
     /// occurrence and never interrupts a selected commit.
+    #[tracing::instrument(name = "verification.schedule.pass", skip_all, fields(pass = "cron"))]
     pub async fn pass(&self, stop: &CancellationToken) -> Result<Vec<ScheduleTick>, SqlError> {
+        let started = Instant::now();
         let tenants = tokio::select! {
             biased;
             () = stop.cancelled() => return Ok(Vec::new()),
-            tenants = self.queue.tenants_with_due_bindings(&self.operator, TENANTS_PER_PASS) => tenants?,
+            tenants = self.queue.tenants_with_due_bindings(&self.operator, TENANTS_PER_PASS) => tenants,
+        };
+        let tenants = match tenants {
+            Ok(tenants) => tenants,
+            Err(error) => return record_pass("cron", started, Err(SqlError::from(error))),
         };
         let mut ticks = Vec::new();
         for tenant in tenants {
@@ -239,7 +245,7 @@ impl VerificationScheduler {
                 tracing::warn!(%tenant, %error, "tenant verification schedule failed");
             }
         }
-        Ok(ticks)
+        record_pass("cron", started, Ok(ticks))
     }
 
     /// Hand off every expired pending group PostgreSQL considers due until
@@ -255,6 +261,7 @@ impl VerificationScheduler {
     ///
     /// # Cancellation
     /// As [`Self::pass`].
+    #[tracing::instrument(name = "verification.schedule.pass", skip_all, fields(pass = "group"))]
     pub async fn group_pass(
         &self,
         stop: &CancellationToken,
@@ -262,10 +269,15 @@ impl VerificationScheduler {
         let Some(groups) = &self.groups else {
             return Ok(Vec::new());
         };
+        let started = Instant::now();
         let tenants = tokio::select! {
             biased;
             () = stop.cancelled() => return Ok(Vec::new()),
-            tenants = self.queue.tenants_with_due_groups(&self.operator, TENANTS_PER_PASS) => tenants?,
+            tenants = self.queue.tenants_with_due_groups(&self.operator, TENANTS_PER_PASS) => tenants,
+        };
+        let tenants = match tenants {
+            Ok(tenants) => tenants,
+            Err(error) => return record_pass("group", started, Err(SqlError::from(error))),
         };
         let mut handed = Vec::new();
         for tenant in tenants {
@@ -279,7 +291,7 @@ impl VerificationScheduler {
                 tracing::warn!(%tenant, %error, "tenant group handoff failed");
             }
         }
-        Ok(handed)
+        record_pass("group", started, Ok(handed))
     }
 
     /// Commit up to [`TICKS_PER_TENANT`] due occurrences of `tenant`, one
@@ -371,6 +383,7 @@ impl VerificationScheduler {
             let Ok(_permit) = groups.capacity.try_acquire() else {
                 return Ok(());
             };
+            let started = Instant::now();
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
                 let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
@@ -385,12 +398,13 @@ impl VerificationScheduler {
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
-                applied = applied => applied?,
+                applied = applied => applied,
             };
-            let Some((conn, handoff)) = applied else {
-                return Ok(());
+            let (conn, handoff) = match applied {
+                Ok(Some(applied)) => applied,
+                other => return record_pass("group_handoff", started, other.map(drop)),
             };
-            conn.commit().await?;
+            record_pass("group_handoff", started, conn.commit().await)?;
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
                 "outcome" => group_label(handoff)
@@ -430,7 +444,12 @@ impl VerificationScheduler {
         conn: &mut TenantConn<'_>,
         due: &DueGroup,
     ) -> Result<Option<GroupHandoff>, SqlError> {
-        let pending = |reason: &dyn std::fmt::Display| {
+        let pending = |label: &'static str, reason: &dyn std::fmt::Display| {
+            metrics::counter!(
+                crate::app::metrics::VERIFICATION_GROUP_HANDOFFS_BLOCKED_TOTAL,
+                "reason" => label
+            )
+            .increment(1);
             tracing::warn!(
                 binding_id = %due.binding_id,
                 group_id = %due.group_id,
@@ -440,14 +459,20 @@ impl VerificationScheduler {
             None
         };
         let Some(owner) = due.owner else {
-            return Ok(pending(&"the owner has no Card-bound principal"));
+            return Ok(pending(
+                "no_owner_principal",
+                &"the owner has no Card-bound principal",
+            ));
         };
         let Some(system) = system_principal_id(conn)
             .await
             .map_err(SqlError::Query)?
             .map(PrincipalId::new)
         else {
-            return Ok(pending(&"the tenant has no SYSTEM principal"));
+            return Ok(pending(
+                "no_system_principal",
+                &"the tenant has no SYSTEM principal",
+            ));
         };
         let refusal = 'refusal: {
             if !due.active {
@@ -460,7 +485,10 @@ impl VerificationScheduler {
                 Ok(authority) => authority,
                 Err(AuthorityRefusal::Rejected(error)) => break 'refusal error,
                 Err(AuthorityRefusal::Unavailable) => {
-                    return Ok(pending(&"the owner authority is unavailable"));
+                    return Ok(pending(
+                        "authority_unavailable",
+                        &"the owner authority is unavailable",
+                    ));
                 }
             };
             match groups
@@ -473,7 +501,7 @@ impl VerificationScheduler {
                     return Ok(Some(GroupHandoff::AlreadyEnqueued(id)));
                 }
                 Ok(EnqueueOutcome::Refused(refusal)) => {
-                    return Ok(pending(&format!("{refusal:?}")));
+                    return Ok(pending("enqueue_refused", &format!("{refusal:?}")));
                 }
                 Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
                 Err(GroupPollError::Incomplete(executions)) if due.overdue => {
@@ -487,8 +515,11 @@ impl VerificationScheduler {
                         details: serde_json::json!({ "execution_ids": executions }),
                     };
                 }
-                Err(error @ (GroupPollError::Read(_) | GroupPollError::Incomplete(_))) => {
-                    return Ok(pending(&error));
+                Err(error @ GroupPollError::Read(_)) => {
+                    return Ok(pending("snapshot_read", &error));
+                }
+                Err(error @ GroupPollError::Incomplete(_)) => {
+                    return Ok(pending("snapshot_incomplete", &error));
                 }
             }
         };
@@ -544,6 +575,26 @@ fn record_depth(queue: &'static str, counts: QueueCounts) {
     }
 }
 
+/// Record one scheduler pass or handoff of `pass` begun at `started` into
+/// the schedule-pass histogram, labelled by whether `result` succeeded, and
+/// return `result` unchanged so the caller can propagate it with `?`.
+///
+/// # Errors
+/// Returns `result`'s own error untouched.
+fn record_pass<T>(
+    pass: &'static str,
+    started: Instant,
+    result: Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    metrics::histogram!(
+        crate::app::metrics::VERIFICATION_SCHEDULE_PASS_SECONDS,
+        "pass" => pass,
+        "outcome" => if result.is_ok() { "ok" } else { "error" }
+    )
+    .record(started.elapsed().as_secs_f64());
+    result
+}
+
 /// Stable telemetry label of one committed group handoff.
 const fn group_label(handoff: GroupHandoff) -> &'static str {
     match handoff {
@@ -563,5 +614,38 @@ const fn tick_label(outcome: ScheduleOutcome) -> &'static str {
         ScheduleOutcome::Skipped(ScheduleSkip::AuthorityUnavailable) => "authority_unavailable",
         ScheduleOutcome::Skipped(ScheduleSkip::Refused(_)) => "refused",
         ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule) => "invalid_schedule",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Scheduler pass telemetry.
+
+    use super::*;
+
+    /// A pass is timed under its `pass` with the outcome of its result, and
+    /// the result passes through unchanged.
+    ///
+    /// # Panics
+    /// Panics when a result changes or a labelled sample is missing.
+    #[test]
+    fn passes_are_timed_by_pass_and_outcome() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(record_pass("cron", Instant::now(), Ok(3)).ok(), Some(3));
+        let failed: Result<(), _> = Err(SqlError::from(sqlx::Error::RowNotFound));
+        assert!(record_pass("group_handoff", Instant::now(), failed).is_err());
+        let rendered = handle.render();
+        for (pass, outcome) in [("cron", "ok"), ("group_handoff", "error")] {
+            let sample = format!(
+                "{}_count{{pass=\"{pass}\",outcome=\"{outcome}\"}} 1",
+                crate::app::metrics::VERIFICATION_SCHEDULE_PASS_SECONDS
+            );
+            assert!(
+                rendered.contains(&sample),
+                "{sample} missing from {rendered}"
+            );
+        }
     }
 }

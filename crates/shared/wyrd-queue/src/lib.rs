@@ -32,7 +32,7 @@ pub mod variant;
 pub use batch_builder::{PreparedRows, RowPreflight, is_reserved_column};
 pub use bounded_arrow::{
     ArrowIpcMaterialError, ArrowIpcMaterialFacts, ArrowIpcMaterialPlan,
-    ArrowIpcMaterializedCapacity, BoundedArrowIpc,
+    ArrowIpcMaterializedCapacity, BoundedArrowIpc, retained_bytes,
 };
 pub use config::QueueConfig;
 pub use error::WyrdQueueError;

@@ -1631,3 +1631,74 @@ async fn capacity_refusal_stops_the_execution_without_judging() {
     assert_eq!(script.calls(), ["action:draft", "action:draft"]);
     assert_eq!(step(&retried, "draft").attempts, 2);
 }
+
+/// Every action attempt and check is timed into the block histogram under
+/// its block and kind: a judged assertion and a succeeded action record
+/// `ok`, and a check whose executor failed records `error`.
+///
+/// # Panics
+/// Panics when the outcome fails or the rendered exposition lacks a series.
+#[tokio::test(start_paused = true)]
+async fn every_block_is_timed_by_block_kind_and_outcome() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [
+            {"id": "yes", "statement": "Answered yes", "check": {"kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": "yes"}},
+            {"id": "coded", "statement": "Code judged", "check": code_check(json!({"x": "inputs.answer"}))}
+        ],
+        "steps": [{"id": "work", "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script::default());
+    run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": "yes"}),
+    )
+    .await
+    .expect("outcome");
+    let text = handle.render();
+    for series in [
+        r#"block="check",kind="assert",outcome="ok""#,
+        r#"block="check",kind="code",outcome="error""#,
+        r#"block="action",kind="code",outcome="ok""#,
+    ] {
+        assert!(
+            text.contains(&format!(
+                "wyrd_verification_block_duration_seconds_count{{{series}}} 1"
+            )),
+            "{series}: {text}"
+        );
+    }
+}
+
+/// The execution's block clock records one interval per action attempt and
+/// check, so the host can subtract the Verifier's own time from the whole
+/// execution.
+///
+/// # Panics
+/// Panics when the outcome fails or the clock holds another count.
+#[tokio::test(start_paused = true)]
+async fn block_clock_records_every_block_once() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [
+            {"id": "yes", "statement": "Answered yes", "check": {"kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": "yes"}}
+        ],
+        "steps": [{"id": "work", "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script::default());
+    let clock = super::BlockClock::default();
+    run(
+        &engine(&script, InMemoryTraceSource::new(), 4).with_clock(clock.clone()),
+        &spec,
+        json!({"answer": "yes"}),
+    )
+    .await
+    .expect("outcome");
+    let intervals = clock.intervals();
+    assert_eq!(intervals.len(), 2, "one action and one check");
+    assert!(intervals.iter().all(|(start, end)| start <= end));
+}

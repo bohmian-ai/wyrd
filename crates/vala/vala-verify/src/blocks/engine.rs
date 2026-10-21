@@ -57,6 +57,110 @@ use crate::walk::{Prepared, RunLedger, walk};
 /// Requirement reason of an `each` assertion whose selector matched nothing.
 const EMPTY_SELECTION: &str = "empty_selection";
 
+/// Histogram of every action attempt and check the engine runs, seconds,
+/// labelled `block` (`action` or `check`), `kind` (the block kind), and
+/// `outcome` (`ok`, or `error` when the block failed rather than judged).
+/// It times the block itself, after its concurrency permit; the host
+/// registers its buckets.
+pub const BLOCK_DURATION_SECONDS: &str = "wyrd_verification_block_duration_seconds";
+
+/// The intervals one execution's actions and checks ran, shared by every
+/// block of that execution.
+///
+/// This is the Verifier's own execution time: the host subtracts its union
+/// from the whole execution to get the runtime's overhead. The engine
+/// records into it; the host reads it once the execution settles. Cloning
+/// shares the same record.
+#[derive(Debug, Clone, Default)]
+pub struct BlockClock {
+    /// `[start, end)` of every finished block, in completion order.
+    intervals: Arc<std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+}
+
+impl BlockClock {
+    /// Every finished block's `[start, end)`, in completion order; blocks
+    /// may overlap when they ran concurrently.
+    #[must_use]
+    pub fn intervals(&self) -> Vec<(std::time::Instant, std::time::Instant)> {
+        self.lock().clone()
+    }
+
+    /// Record one finished block.
+    fn record(&self, start: std::time::Instant, end: std::time::Instant) {
+        self.lock().push((start, end));
+    }
+
+    /// Lock the record, recovering it from a poisoned lock: no code path
+    /// panics while holding it, and timing must never fail an execution.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(std::time::Instant, std::time::Instant)>> {
+        self.intervals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Times one action attempt or check into [`BLOCK_DURATION_SECONDS`] and the
+/// execution's [`BlockClock`].
+///
+/// Every label is a static string, so recording allocates nothing; a timer
+/// dropped without [`BlockTimer::finish`], by cancellation, records nothing.
+struct BlockTimer<'a> {
+    /// The execution's record of block time.
+    clock: &'a BlockClock,
+    /// `action` or `check`.
+    block: &'static str,
+    /// The block kind, such as `assert` or `agent`.
+    kind: &'static str,
+    /// When the block started.
+    started: std::time::Instant,
+}
+
+impl<'a> BlockTimer<'a> {
+    /// Start timing one `block` of `kind` into `clock`.
+    fn start(clock: &'a BlockClock, block: &'static str, kind: &'static str) -> Self {
+        Self {
+            clock,
+            block,
+            kind,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Record the block's interval on the clock and its elapsed time under
+    /// `ok` (`outcome="ok"`) or a failure (`outcome="error"`).
+    fn finish(self, ok: bool) {
+        let ended = std::time::Instant::now();
+        self.clock.record(self.started, ended);
+        metrics::histogram!(
+            BLOCK_DURATION_SECONDS,
+            "block" => self.block,
+            "kind" => self.kind,
+            "outcome" => if ok { "ok" } else { "error" }
+        )
+        .record((ended - self.started).as_secs_f64());
+    }
+}
+
+/// The `kind` label of an action.
+const fn action_kind(action: &Action) -> &'static str {
+    match action {
+        Action::Extract { .. } => "extract",
+        Action::Agent(_) => "agent",
+        Action::Code(_) => "code",
+    }
+}
+
+/// The `kind` label of a check.
+const fn check_kind(check: &Check) -> &'static str {
+    match check {
+        Check::Assert { .. } => "assert",
+        Check::Trace(_) => "trace",
+        Check::Agent(_) => "agent",
+        Check::Code(_) => "code",
+        Check::Drift(_) => "drift",
+    }
+}
+
 /// An execution-wide failure: no verdict was produced.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -113,6 +217,8 @@ pub struct VerificationEngine {
     /// The host's evidence reader, asked to admit the pinned evidence
     /// before any block runs; `None` admits what slot validation accepts.
     evidence: Option<Arc<dyn EvidenceReader>>,
+    /// Where every block's run interval is recorded.
+    clock: BlockClock,
 }
 
 impl VerificationEngine {
@@ -135,7 +241,16 @@ impl VerificationEngine {
             drift: Arc::new(DriftChecks::default()),
             permits: Arc::new(Semaphore::new(concurrency.get())),
             evidence: None,
+            clock: BlockClock::default(),
         }
+    }
+
+    /// Record every block's run interval on `clock`, the host's measure of
+    /// the Verifier's own execution time.
+    #[must_use]
+    pub fn with_clock(mut self, clock: BlockClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Admit each execution's pinned evidence through `evidence` before any
@@ -378,9 +493,18 @@ impl VerificationEngine {
     /// surfaces as [`EngineError::DeadlineExceeded`] instead of a step
     /// failure.
     ///
+    /// Each attempt is timed into [`BLOCK_DURATION_SECONDS`] after the
+    /// permit is held, inside a debug `verification.block` span.
+    ///
     /// # Errors
     /// Returns [`EngineError::Busy`] as soon as an attempt is refused process
     /// capacity, without spending the step's retries or settling the step.
+    #[tracing::instrument(
+        name = "verification.block",
+        level = "debug",
+        skip_all,
+        fields(block = "action", kind = action_kind(&step.action), id = step.id.as_str())
+    )]
     async fn attempt(
         &self,
         step: &Step,
@@ -404,6 +528,7 @@ impl VerificationEngine {
                 workspace: bindings.workspace.clone(),
                 deadline: timeout.unwrap_or(deadline),
             };
+            let timer = BlockTimer::start(&self.clock, "action", action_kind(&step.action));
             let result = match timeout {
                 Some(at) => timeout_at(at, self.actions.execute(call))
                     .await
@@ -414,6 +539,7 @@ impl VerificationEngine {
                     }),
                 None => self.actions.execute(call).await,
             };
+            timer.finish(result.is_ok());
             match result {
                 Err(BlockError::Busy { reason }) => return Err(EngineError::Busy(reason)),
                 Err(error) if error.is_retryable() && attempts <= step.retries => {
@@ -436,9 +562,20 @@ impl VerificationEngine {
     /// assertion selecting no value, with reason [`EMPTY_SELECTION`], so an
     /// empty selection never passes vacuously.
     ///
+    /// The check is timed into [`BLOCK_DURATION_SECONDS`] after the permit
+    /// is held, inside a debug `verification.block` span; a check that could
+    /// not judge (an uncomparable value, an unreadable trace, a failed or
+    /// refused executor) records `outcome="error"`.
+    ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
     /// process capacity, which is never judged.
+    #[tracing::instrument(
+        name = "verification.block",
+        level = "debug",
+        skip_all,
+        fields(block = "check", kind = check_kind(&requirement.check), id = requirement.id.as_str())
+    )]
     async fn judge(
         &self,
         requirement: &Requirement,
@@ -447,7 +584,8 @@ impl VerificationEngine {
         deadline: Instant,
     ) -> Result<Judged, EngineError> {
         let _permit = self.permits.acquire().await;
-        Ok(match &requirement.check {
+        let timer = BlockTimer::start(&self.clock, "check", check_kind(&requirement.check));
+        let (judged, ok) = match &requirement.check {
             Check::Assert {
                 each,
                 operator,
@@ -455,23 +593,18 @@ impl VerificationEngine {
                 ..
             } => {
                 let observed = inputs.get("value").map_or(Value::Null, json);
-                match (each, &observed) {
+                let compared = match (each, &observed) {
                     (Some(_), Value::Array(items)) if items.is_empty() => {
-                        Judged::inconclusive(EMPTY_SELECTION.to_owned())
+                        timer.finish(true);
+                        return Ok(Judged::inconclusive(EMPTY_SELECTION.to_owned()));
                     }
-                    (Some(_), _) => Judged::compared(evaluate_item_mode(
-                        &requirement.id,
-                        operator,
-                        expected,
-                        &observed,
-                    )),
-                    (None, _) => Judged::compared(evaluate_single(
-                        &requirement.id,
-                        operator,
-                        expected,
-                        &observed,
-                    )),
-                }
+                    (Some(_), _) => {
+                        evaluate_item_mode(&requirement.id, operator, expected, &observed)
+                    }
+                    (None, _) => evaluate_single(&requirement.id, operator, expected, &observed),
+                };
+                let ok = compared.is_ok();
+                (Judged::compared(compared), ok)
             }
             Check::Trace(trace) => self.trace(&requirement.id, trace, &inputs, deadline).await,
             Check::Agent(_) | Check::Code(_) => {
@@ -489,42 +622,56 @@ impl VerificationEngine {
                     deadline,
                 };
                 match self.checks.execute(call).await {
-                    Ok(output) => Judged::cited(output, &sources),
-                    Err(BlockError::Busy { reason }) => return Err(EngineError::Busy(reason)),
-                    Err(error) => Judged::inconclusive(reason(&error)),
+                    Ok(output) => (Judged::cited(output, &sources), true),
+                    Err(BlockError::Busy { reason }) => {
+                        timer.finish(false);
+                        return Err(EngineError::Busy(reason));
+                    }
+                    Err(error) => (Judged::inconclusive(reason(&error)), false),
                 }
             }
-            Check::Drift(drift) => Judged::checked(self.drift.judge(&requirement.id, drift)),
-        })
+            Check::Drift(drift) => (
+                Judged::checked(self.drift.judge(&requirement.id, drift)),
+                true,
+            ),
+        };
+        timer.finish(ok);
+        Ok(judged)
     }
 
     /// Compare the selected span value of the declared trace.
     ///
     /// A trace that is not supplied or cannot be read is inconclusive; a
-    /// selector matching nothing compares `null`.
+    /// selector matching nothing compares `null`. Returns the judgment and
+    /// whether the check judged (`false` when it could not read or compare).
     async fn trace(
         &self,
         id: &TaskId,
         trace: &TraceCheck,
         inputs: &BTreeMap<String, CallInput>,
         deadline: Instant,
-    ) -> Judged {
+    ) -> (Judged, bool) {
         let Some(CallValue::Evidence(InputDeclaration::Trace { trace_id })) =
             inputs.get("on").map(|input| &input.value)
         else {
-            return Judged::inconclusive(format!("`{}` supplied no trace", trace.on));
+            return (
+                Judged::inconclusive(format!("`{}` supplied no trace", trace.on)),
+                false,
+            );
         };
         let wait = deadline.saturating_duration_since(Instant::now());
         let spans = match self.traces.fetch(*trace_id, wait).await {
             Ok(spans) => spans,
-            Err(error) => return Judged::inconclusive(error.to_string()),
+            Err(error) => {
+                tracing::debug!(requirement = id.as_str(), %error, "trace evidence unreadable");
+                return (Judged::inconclusive(error.to_string()), false);
+            }
         };
         let document = project_spans(*trace_id, &spans);
-        Judged::compared(
-            extract_jsonpath_from(&document, &trace.span_selector).and_then(|observed| {
-                evaluate_single(id, &trace.operator, &trace.expected, &observed)
-            }),
-        )
+        let compared = extract_jsonpath_from(&document, &trace.span_selector)
+            .and_then(|observed| evaluate_single(id, &trace.operator, &trace.expected, &observed));
+        let ok = compared.is_ok();
+        (Judged::compared(compared), ok)
     }
 }
 

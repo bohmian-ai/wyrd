@@ -7,7 +7,7 @@
 //! connections, so forced RLS applies. Each fixture owns its own database, so
 //! cross-tenant counts are exact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::{Value, json};
@@ -40,11 +40,13 @@ use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
+use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
-    ExecutionOrigin, ExecutionStatus, GroupActivity, GroupSelection, PinnedGroup, QueueCounts,
-    RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, Settlement, Submission,
-    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    Cause, ClaimedExecution, Completion, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority,
+    ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus, GroupActivity,
+    GroupSelection, PinnedGroup, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
+    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus,
+    VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -528,12 +530,44 @@ async fn accept(
     conn: &mut TenantConn<'_>,
     submission: &Submission,
 ) -> SubmissionOutcome {
+    let batch = std::slice::from_ref(submission);
+    let refused = refusals(conn, batch).await;
     let outcomes = queue
-        .accept_submissions(conn, std::slice::from_ref(submission))
+        .accept_submissions(conn, batch, &refused)
         .await
         .expect("submission batch accepts");
     assert_eq!(outcomes.len(), 1, "one outcome per submission");
     outcomes[0]
+}
+
+/// Resolve every target of `submissions` through `wyrd.verification_target`
+/// as the server's writer does, keeping the refused ones.
+///
+/// # Panics
+/// Panics when a target read fails.
+async fn refusals(
+    conn: &mut TenantConn<'_>,
+    submissions: &[Submission],
+) -> HashMap<(Uuid, Uuid), EnqueueRefusal> {
+    let tenant = conn.data_tenant_id();
+    let mut refused = HashMap::new();
+    for submission in submissions {
+        let request = &submission.request;
+        let target = VerificationTargets::new(conn.transaction(), tenant)
+            .read(&request.verifier_card_uid, &request.card_uid)
+            .await
+            .expect("target reads");
+        if let Some(refusal) = target.refusal() {
+            refused.insert(
+                (
+                    request.verifier_card_uid.as_uuid(),
+                    request.card_uid.as_uuid(),
+                ),
+                refusal,
+            );
+        }
+    }
+    refused
 }
 
 /// Accept one valid submission and return its execution.
@@ -582,9 +616,10 @@ fn engine_error() -> VerificationError {
 /// Panics when the claim fails or nothing is runnable.
 async fn claim(queue: &VerifierExecutionQueue, conn: &mut TenantConn<'_>) -> ClaimedExecution {
     queue
-        .claim(conn, Duration::minutes(5))
+        .claim(conn, Duration::minutes(5), 1)
         .await
         .expect("claim runs")
+        .pop()
         .expect("an execution is runnable")
 }
 
@@ -751,10 +786,10 @@ async fn unrunnable_targets_are_refused() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5))
+            .claim(&mut conn, Duration::minutes(5), 1)
             .await
             .expect("claim runs")
-            .is_none(),
+            .is_empty(),
         "a refused submission never runs"
     );
 
@@ -827,7 +862,7 @@ async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
     );
     assert_eq!(
         queue
-            .accept_submissions(&mut conn, &[original.clone(), retry])
+            .accept_submissions(&mut conn, &[original.clone(), retry], &HashMap::new())
             .await
             .expect("replayed batch accepts"),
         vec![
@@ -1012,7 +1047,11 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
     let mut probe = fixture.tenant_conn().await.expect("probe opens");
     let later_accept = async {
         let outcome = queue
-            .accept_submissions(&mut later, &[original.clone(), conflicting.clone()])
+            .accept_submissions(
+                &mut later,
+                &[original.clone(), conflicting.clone()],
+                &HashMap::new(),
+            )
             .await
             .expect("later batch accepts");
         later.commit().await.expect("later commits");
@@ -1345,10 +1384,10 @@ async fn reclaimed_lease_fences_the_stale_token() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5))
+            .claim(&mut conn, Duration::minutes(5), 1)
             .await
             .expect("claim runs")
-            .is_none(),
+            .is_empty(),
         "a live lease is not reclaimable"
     );
     expire_deadlines(&mut conn, execution).await;
@@ -1519,10 +1558,10 @@ async fn retries_back_off_then_exhaust_to_errored() {
         assert_eq!(status.state.error, Some(engine_error()));
         assert!(
             queue
-                .claim(&mut conn, Duration::minutes(5))
+                .claim(&mut conn, Duration::minutes(5), 1)
                 .await
                 .expect("early claim runs")
-                .is_none(),
+                .is_empty(),
             "a retry is not claimable before its backoff"
         );
         expire_deadlines(&mut conn, execution).await;
@@ -1612,10 +1651,10 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5))
+            .claim(&mut conn, Duration::minutes(5), 1)
             .await
             .expect("claim runs")
-            .is_none(),
+            .is_empty(),
         "an exhausted expired lease is not reclaimed"
     );
     let status = queue
@@ -1920,10 +1959,10 @@ async fn queue_state_is_tenant_isolated() {
     );
     assert!(
         queue
-            .claim(&mut foreign, Duration::minutes(5))
+            .claim(&mut foreign, Duration::minutes(5), 1)
             .await
             .expect("foreign claim runs")
-            .is_none()
+            .is_empty()
     );
     assert!(schedule_next_due(&queue, &mut foreign).await.is_none());
     let dispatches: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.operator_dispatches")
@@ -2140,10 +2179,10 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5))
+            .claim(&mut conn, Duration::minutes(5), 1)
             .await
             .expect("early claim runs")
-            .is_none(),
+            .is_empty(),
         "the database refuses a execution whose own backoff has not elapsed"
     );
 
@@ -3000,10 +3039,10 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5))
+            .claim(&mut conn, Duration::minutes(5), 1)
             .await
             .expect("claim runs")
-            .is_none(),
+            .is_empty(),
         "a refusal is never claimed"
     );
     assert!(
@@ -3054,4 +3093,324 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
             .await
             .expect("nested transaction rolls back");
     }
+}
+
+/// A verification's target reads both Cards, the Verifier's readiness, and
+/// the SYSTEM principal in one statement, only within the bound tenant, and
+/// refuses a connection already bound to another tenant.
+///
+/// # Panics
+/// Panics when the read misses a Card, the readiness, or the principal, sees
+/// another tenant's rows, or rebinds a connection bound to another tenant.
+#[tokio::test]
+async fn a_verification_target_reads_its_tenant_in_one_statement() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let system = provision_system_principal(&mut setup, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, _) = declare_service(&mut setup, &actor, "svc").await;
+    let verifier = register_verifier(&mut setup, &actor, "assert", drift("psi")).await;
+    setup.commit().await.expect("setup commits");
+
+    let mut conn = fixture
+        .wyrd_postgres()
+        .conn()
+        .await
+        .expect("plain connection");
+    let target = VerificationTargets::new(&mut conn, tenant)
+        .read(&verifier, &owner)
+        .await
+        .expect("target reads");
+    assert_eq!(target.readiness, VerifierReadiness::Ready);
+    assert_eq!(target.refusal(), None);
+    assert_eq!(
+        target.verifier.map(|row| row.card_uid),
+        Some(verifier.as_uuid())
+    );
+    assert_eq!(
+        target.subject.map(|row| row.card_uid),
+        Some(owner.as_uuid())
+    );
+    assert_eq!(target.system_principal, Some(system));
+
+    let itself = VerificationTargets::new(&mut conn, tenant)
+        .read(&verifier, &verifier)
+        .await
+        .expect("a self-target reads");
+    assert!(itself.verifier.is_some() && itself.subject.is_some());
+
+    let other = fixture
+        .seed_additional_tenant(&format!("target-{}", Uuid::now_v7()))
+        .await
+        .expect("second tenant seeds");
+    let foreign = VerificationTargets::new(&mut conn, other)
+        .read(&verifier, &owner)
+        .await
+        .expect("another tenant reads");
+    assert!(foreign.verifier.is_none() && foreign.subject.is_none());
+    assert_eq!(
+        foreign.refusal(),
+        Some(EnqueueRefusal::NotReady(
+            VerifierReadiness::VerifierUnavailable
+        ))
+    );
+
+    let mut bound = fixture
+        .tenant_conn()
+        .await
+        .expect("bound transaction opens");
+    let refused = VerificationTargets::new(bound.transaction(), other)
+        .read(&verifier, &owner)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a connection bound to another tenant is refused"
+    );
+}
+
+/// One claim statement takes up to its limit of runnable executions, each
+/// under its own lease token, and never more than are runnable.
+///
+/// # Panics
+/// Panics when a claim takes more than its limit, repeats an execution or a
+/// lease token, or leaves a runnable execution unclaimed.
+#[tokio::test]
+async fn a_claim_takes_up_to_its_limit_in_one_statement() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let mut submitted_ids = BTreeSet::new();
+    for _ in 0..3 {
+        let sub = submission(tenant, authority(&actor), request(&verifier, &owner), None);
+        submitted_ids.insert(submitted(&queue, &mut conn, &sub).await);
+    }
+
+    let first = queue
+        .claim(&mut conn, Duration::minutes(5), 2)
+        .await
+        .expect("claim runs");
+    let rest = queue
+        .claim(&mut conn, Duration::minutes(5), 5)
+        .await
+        .expect("claim runs");
+    let drained = queue
+        .claim(&mut conn, Duration::minutes(5), 5)
+        .await
+        .expect("claim runs");
+
+    assert_eq!((first.len(), rest.len()), (2, 1));
+    assert!(drained.is_empty(), "nothing is left to claim");
+    let leases: Vec<_> = first.iter().chain(&rest).map(|c| c.lease).collect();
+    let claimed_ids: BTreeSet<_> = leases.iter().map(|l| l.execution_id).collect();
+    assert_eq!(
+        claimed_ids, submitted_ids,
+        "every execution is claimed once"
+    );
+    for (i, lease) in leases.iter().enumerate() {
+        assert!(
+            leases[i + 1..]
+                .iter()
+                .all(|other| other.token != lease.token),
+            "each claim carries its own lease token"
+        );
+    }
+}
+
+/// One batch decides its submissions in order against each other, not only
+/// against committed rows: a later submission reusing an earlier one's key
+/// for a different request conflicts with it, and a repeated execution ID
+/// replays, though neither earlier row was written when they were decided.
+///
+/// # Panics
+/// Panics when an outcome, or a stored status or error code, differs.
+#[tokio::test]
+async fn a_batch_decides_its_submissions_against_each_other() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let mut changed = request(&verifier, &owner);
+    changed.run_id = Some(RunId::from_string("app-run-batch".to_owned()));
+    let keyed = submission(
+        tenant,
+        authority(&actor),
+        request(&verifier, &owner),
+        Some("k"),
+    );
+    let conflicting = submission(tenant, authority(&actor), changed, Some("k"));
+    let unkeyed = submission(tenant, authority(&actor), request(&verifier, &owner), None);
+
+    let outcomes = queue
+        .accept_submissions(
+            &mut conn,
+            &[
+                keyed.clone(),
+                conflicting.clone(),
+                unkeyed.clone(),
+                unkeyed.clone(),
+            ],
+            &HashMap::new(),
+        )
+        .await
+        .expect("batch accepts");
+
+    assert_eq!(
+        outcomes,
+        vec![
+            SubmissionOutcome::Accepted,
+            SubmissionOutcome::Conflict {
+                original: keyed.execution_id
+            },
+            SubmissionOutcome::Accepted,
+            SubmissionOutcome::Replayed(unkeyed.execution_id),
+        ]
+    );
+    for pending in [keyed.execution_id, unkeyed.execution_id] {
+        assert_eq!(
+            status(&queue, &mut conn, pending).await.state.status,
+            VerificationExecutionStatus::Pending
+        );
+    }
+    let conflict = status(&queue, &mut conn, conflicting.execution_id)
+        .await
+        .state;
+    assert_eq!(
+        conflict.error.map(|error| error.code),
+        Some("WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT".to_owned())
+    );
+}
+
+/// One batch completes many executions with exactly the effects of
+/// completing each alone: a failed binding run dispatches each of its
+/// Operators once, a passed submission dispatches nothing, a completion whose
+/// lease no longer holds is stale and changes nothing, and replaying the
+/// batch re-applies idempotently without new dispatches.
+///
+/// # Panics
+/// Panics when a settlement, status, or dispatch count differs.
+#[tokio::test]
+async fn a_batch_completes_many_executions_like_complete() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(
+        &mut conn,
+        &owner,
+        &verifier,
+        vec![
+            FrozenTarget::Uid(uid()),
+            FrozenTarget::Digest("sha256:operator".to_owned()),
+        ],
+    )
+    .await;
+    let failed = scheduled(&queue, &mut conn, binding).await;
+    let failed_claim = claim(&queue, &mut conn).await;
+    assert_eq!(failed_claim.lease.execution_id, failed);
+    let passed = submitted(
+        &queue,
+        &mut conn,
+        &submission(tenant, authority(&actor), request(&verifier, &owner), None),
+    )
+    .await;
+    let passed_claim = claim(&queue, &mut conn).await;
+    let held = submitted(
+        &queue,
+        &mut conn,
+        &submission(tenant, authority(&actor), request(&verifier, &owner), None),
+    )
+    .await;
+    let held_claim = claim(&queue, &mut conn).await;
+    assert_eq!(
+        (
+            passed_claim.lease.execution_id,
+            held_claim.lease.execution_id
+        ),
+        (passed, held)
+    );
+
+    let completion = |lease: ExecutionLease, verdict| Completion {
+        lease,
+        result_id: VerificationResultId::new_v7(),
+        verdict,
+        summary: "drift detected".to_owned(),
+        drift: Some(DRIFT_COUNTS),
+    };
+    let batch = vec![
+        completion(failed_claim.lease, VerificationVerdict::Failed),
+        completion(passed_claim.lease, VerificationVerdict::Passed),
+        completion(
+            ExecutionLease {
+                execution_id: held,
+                token: passed_claim.lease.token,
+            },
+            VerificationVerdict::Passed,
+        ),
+    ];
+    for _ in 0..2 {
+        assert_eq!(
+            queue
+                .complete_many(&mut conn, &batch)
+                .await
+                .expect("batch completes"),
+            vec![
+                Settlement::Applied,
+                Settlement::Applied,
+                Settlement::StaleLease
+            ]
+        );
+    }
+
+    for execution in [failed, passed] {
+        assert_eq!(
+            status(&queue, &mut conn, execution).await.state.status,
+            VerificationExecutionStatus::Completed
+        );
+    }
+    assert_eq!(
+        status(&queue, &mut conn, held).await.state.status,
+        VerificationExecutionStatus::Running,
+        "a stale completion changes nothing"
+    );
+    assert_eq!(
+        status(&queue, &mut conn, failed)
+            .await
+            .state
+            .dispatches
+            .len(),
+        2
+    );
+    let dispatches: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.operator_dispatches")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("dispatches count");
+    assert_eq!(
+        dispatches, 2,
+        "only the failed binding run dispatches, once"
+    );
 }

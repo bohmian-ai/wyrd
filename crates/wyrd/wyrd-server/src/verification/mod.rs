@@ -10,8 +10,9 @@
 //! another reclaims its leases.
 
 pub mod authority;
-mod cache;
+pub(crate) mod cache;
 mod claims;
+mod completions;
 pub mod drift;
 pub mod engines;
 #[cfg(feature = "test-support")]

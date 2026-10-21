@@ -272,30 +272,6 @@ fn compression_slack(data: &ArrayData) -> usize {
     )
 }
 
-/// Sums the Arrow value, offset, and validity bytes `batch`'s logical rows retain.
-///
-/// Slices of one shared backing allocation contribute only their own logical
-/// range, so native IPC backing aliased by several columns is counted once.
-/// This is the expanded-data metric every ingest decoder bounds before WAL.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] when Arrow cannot size a
-/// column's logical range or the sum overflows.
-pub(crate) fn retained_slice_bytes(batch: &RecordBatch) -> Result<usize, ScribeError> {
-    batch.columns().iter().try_fold(0_usize, |total, column| {
-        column
-            .to_data()
-            .get_slice_memory_size()
-            .ok()
-            .and_then(|bytes| total.checked_add(bytes))
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: usize::MAX,
-            })
-    })
-}
-
 /// Measures one caller batch's expanded data: its retained Arrow bytes plus
 /// the Scribe-managed columns stamping will add for its rows.
 ///
@@ -309,7 +285,11 @@ pub(crate) fn retained_slice_bytes(batch: &RecordBatch) -> Result<usize, ScribeE
 /// Returns [`ScribeError::DecodedPayloadTooLarge`] when Arrow cannot size a
 /// column or the checked sum overflows.
 pub(crate) fn expanded_bytes(batch: &RecordBatch) -> Result<usize, ScribeError> {
-    retained_slice_bytes(batch)?
+    wyrd_queue::retained_bytes(batch)
+        .ok_or(ScribeError::DecodedPayloadTooLarge {
+            bytes: usize::MAX,
+            limit: usize::MAX,
+        })?
         .checked_add(managed_projection_bytes(batch.num_rows(), 36)?)
         .ok_or(ScribeError::DecodedPayloadTooLarge {
             bytes: usize::MAX,

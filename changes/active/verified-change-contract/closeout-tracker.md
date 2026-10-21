@@ -269,8 +269,8 @@ pub type ObservationRunOutbox = Outbox<ObservationRunSink>;
 | Step | Status |
 |---|---|
 | Merge the approved branches into `wyrd/verified-change-contract/TASK-008` | Pending |
-| `mise run bench:capacity` (default run) with results recorded (review finding 13) | Pending |
-| `mise run bench:capacity -- --profile` | Pending |
+| `mise run bench:capacity` (default run) with results recorded (review finding 13) | **Retired.** The owner deleted the REQ-171 mixed benchmark; verification capacity is `bench:verification:capacity` (long-horizon-verification). |
+| `mise run bench:capacity -- --profile` | **Retired** with the benchmark above. |
 | Scenario 7: optimizations with before/after numbers, or a recorded justification for none | Pending |
 | Replace every `GATE_PENDING` in the CLOSE-01 matrix | Pending |
 | `mise run gate`, run once | Pending |

@@ -64,12 +64,13 @@ VALA_TENANT_CONN_OWNER_ALLOWLIST = {
 # Owners whose one statement binds its own tenant for RLS inside the SQL
 # function it calls, so it runs as a single autocommit round trip on a plain
 # request-role connection with no transaction around it. A bound transaction
-# would add `BEGIN`/`SET LOCAL`/`COMMIT` round trips to the Oracle cut, the
-# hottest per-query read. Each entry names the file and the exact struct; the
-# struct must own a `PgConnection` and a `DataTenantId`, and only its own
-# methods are exempt.
-VALA_STATEMENT_TENANT_OWNERS = {
+# would add `BEGIN`/`SET LOCAL`/`COMMIT` round trips to the hottest per-request
+# reads: the Oracle cut and a direct verification's target. Each entry names
+# the file and the exact struct; the struct must own a `PgConnection` and a
+# `DataTenantId`, and only its own methods are exempt.
+STATEMENT_TENANT_OWNERS = {
     "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs": "OracleTableCuts",
+    "crates/wyrd/wyrd-sql/src/queries/verification_target.rs": "VerificationTargets",
 }
 
 
@@ -153,7 +154,30 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
                 )
             continue
 
+        if relative in STATEMENT_TENANT_OWNERS:
+            check_statement_tenant_owner(relative, body, code, failures)
+            continue
+
         check_tenant_query_file(relative, body, code, failures)
+
+
+def check_statement_tenant_owner(
+    relative: str, body: str, code: str, failures: list[str]
+) -> None:
+    """Check a module whose owner binds its tenant inside its one statement.
+
+    Its public async fns must be methods of the allowlisted struct (or take a
+    `TenantConn`/`OperatorPool`), and every other tenant-query rule runs with
+    the statement's explicit tenant predicate in place of a `TenantConn`.
+    """
+    for fn_name in tenant_conn_owner_violations(code, STATEMENT_TENANT_OWNERS[relative]):
+        failures.append(
+            f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
+            "take an OperatorPool, or be a method of the struct owning its statement tenant"
+        )
+    check_tenant_query_file(
+        relative, body, code, failures, exempt_tenant_conn_param=True, statement_tenant=True
+    )
 
 
 def check_vala_query_modules(failures: list[str]) -> None:
@@ -195,7 +219,7 @@ def check_vala_query_modules(failures: list[str]) -> None:
 
         if relative in VALA_TENANT_CONN_OWNER_ALLOWLIST:
             for fn_name in tenant_conn_owner_violations(
-                code, VALA_STATEMENT_TENANT_OWNERS.get(relative)
+                code, STATEMENT_TENANT_OWNERS.get(relative)
             ):
                 failures.append(
                     f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
@@ -220,6 +244,7 @@ def check_tenant_query_file(
     failures: list[str],
     *,
     exempt_tenant_conn_param: bool = False,
+    statement_tenant: bool = False,
 ) -> None:
     """Run every tenant-query SQL rule against one module.
 
@@ -242,7 +267,12 @@ def check_tenant_query_file(
         # is a method of a tenant-owning or TenantConn-owning struct, so the
         # RLS boundary is re-established by an explicit tenant predicate on
         # every statement instead of by a threaded TenantConn parameter.
-        if references_tenant_schema(code) and not (
+        # A statement owner's SQL function applies the predicate itself, so the
+        # module must instead bind its owned tenant as the statement's argument.
+        if statement_tenant:
+            if not re.search(r"\.bind\(\s*self\.data_tenant_id\b", code):
+                failures.append(f"{relative}: statement owner must bind self.data_tenant_id")
+        elif references_tenant_schema(code) and not (
             re.search(r"data_tenant_id\s*=\s*\$", code)
             or re.search(r"wyrd\.current_tenant\(\)", code)
         ):
@@ -475,7 +505,7 @@ def tenant_conn_owner_violations(code: str, statement_owner: str | None = None) 
     cross-tenant work, or it is a method of the very struct that owns the
     connection. The last ground is receiver-exact on purpose — an unrelated
     struct's `&self` in the same module is not evidence of anything.
-    `statement_owner` names the one struct in `VALA_STATEMENT_TENANT_OWNERS`
+    `statement_owner` names the one struct in `STATEMENT_TENANT_OWNERS`
     whose methods also pass, and only while it owns a `PgConnection` and the
     `DataTenantId` its statement binds.
     """

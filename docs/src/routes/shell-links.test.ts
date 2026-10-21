@@ -78,6 +78,7 @@ function buildFixtureSite(pages: Record<string, string>): string {
   const skip = new Set(['node_modules', 'build', '.svelte-kit', 'src/content/docs'].map((dir) => path.join(DOCS, dir)));
   cpSync(DOCS, docs, { recursive: true, filter: (src) => !skip.has(src) });
   cpSync(path.join(DOCS, '../Cargo.toml'), path.join(root, 'Cargo.toml'));
+  symlinkSync(path.join(DOCS, '../examples'), path.join(root, 'examples'));
   symlinkSync(path.join(DOCS, 'node_modules'), path.join(docs, 'node_modules'));
   for (const [name, body] of Object.entries(pages)) {
     const file = path.join(docs, 'src/content/docs', name);

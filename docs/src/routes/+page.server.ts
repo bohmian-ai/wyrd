@@ -1,12 +1,15 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { highlight, REPO_ROOT } from '$lib/mdsvex/highlight.js';
+import { highlight } from '$lib/mdsvex/highlight.js';
 
 // The landing page's Declare → Observe → Verify example is the Quickstart:
-// its Cards and programs are read from examples/quickstart, which the SDK
-// journeys run, and highlighted at build time.
+// its Cards and programs come from examples/quickstart, which the SDK journeys
+// run. Vite inlines them at build time, so the built server reads no files.
+const sources: Record<string, string> = import.meta.glob('../../../examples/quickstart/*', {
+  query: '?raw',
+  import: 'default',
+  eager: true
+});
 
-const quickstart = (file: string) => readFileSync(path.join(REPO_ROOT, 'examples/quickstart', file), 'utf8');
+const quickstart = (file: string) => sources[`../../../examples/quickstart/${file}`];
 
 // The `VerificationResult` that `verify` returns for the Quickstart's failing
 // answer. The wire shape is in crates/wyrd-spec/src/verification/execution.rs;

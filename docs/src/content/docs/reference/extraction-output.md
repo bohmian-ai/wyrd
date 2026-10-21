@@ -62,6 +62,7 @@ type XlsxOutput = {
 
 - Sheets are in workbook order; cells row by row, left to right. Empty cells are left out, so look a cell up by `address`, such as `B2`.
 - `value` is the stored value, or a formula's last saved result; formulas are never recalculated. Dates are Excel serial numbers.
+- `formula` is the formula text with a leading `=`, or `null`.
 - An error cell has `value: null` and the error, such as `#DIV/0!`, in `error`.
 
 ## CSV
@@ -106,6 +107,17 @@ A `json_pointer` locator addresses this extracted JSON for DOCX and XLSX, such a
 | `doc`, `xls`, `ppt` | Convert to `docx`, `xlsx`, or `pptx` |
 | `zip`, `tar_gz` | Put them in a step Agent's `workspace` |
 
-## If it fails
+## Failures
 
-The step fails and the requirements that need it are `inconclusive` when the file does not parse as its format, a PDF is encrypted, a text file is not UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/reference/verification-runtime-limits/)). Each result records the extractor version `wyrd-extract/1`.
+The step fails, and the requirements that need it are `inconclusive`, when:
+
+| Condition | Formats |
+| --- | --- |
+| The file does not parse as its format | All |
+| The PDF is encrypted | `pdf` |
+| The text is not UTF-8 | `text`, `markdown`, `html` |
+| The archive exceeds `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES`, `WYRD_VERIFICATION_ARCHIVE_MAX_MIB`, or `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | `docx`, `xlsx`, `pptx` |
+| Pages or slides exceed `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` | `pdf`, `pptx` |
+| Extracted text exceeds `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` | All |
+
+Limits are in [Verification runtime limits](/reference/verification-runtime-limits/). Each result records the extractor version `wyrd-extract/1`.

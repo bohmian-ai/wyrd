@@ -38,6 +38,18 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 
 `_MIB` and `_KIB` are binary units; `_MS` is milliseconds. A `media` slot's `max_bytes` can lower `FILE_MAX_MIB` for that slot, never raise it. No setting disables a limit or worker isolation.
 
+## Server TOML file
+
+`wyrd-server` reads the first file found, in this order. Environment variables override its values.
+
+| Order | File |
+| ---: | --- |
+| 1 | The path in `WYRD_CONFIG_PATH`; startup fails if it does not exist |
+| 2 | `/etc/wyrd/server.toml` |
+| 3 | `~/.config/wyrd/server.toml` |
+
+With no file, the server uses its defaults and environment variables.
+
 ## Startup rules
 
 The server refuses to start, naming the variable, when a value is empty, not a positive integer, or overflows once scaled to bytes, or when `WYRD_VERIFICATION_ENABLED` is not `1` or `0`. It also refuses these combinations, naming both variables (prefix `WYRD_VERIFICATION_` omitted):

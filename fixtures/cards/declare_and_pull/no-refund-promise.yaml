@@ -5,10 +5,13 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  description: The agent never promises a refund.
   inputs:
     answer: {type: json}
   requirements:
     - id: no-refund-promise
-      statement: The answer does not promise a guaranteed refund
-      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}
+      statement: The answer never promises a guaranteed refund
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund

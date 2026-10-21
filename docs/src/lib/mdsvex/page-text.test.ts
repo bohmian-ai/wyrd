@@ -15,8 +15,8 @@ describe('pageText', () => {
     expect(text).toContain('state = WyrdState.declare("support-reply.yaml")');
     expect(text).toContain('let state = WyrdState::declare("support-reply.yaml").await?;');
     expect(text).toContain('const state = await WyrdState.declare("support-reply.yaml");');
-    expect(text).toContain('```yaml title="refund-limit.yaml"');
-    expect(text).toContain('verifier: ./refund-limit.yaml');
+    expect(text).toContain('```yaml title="no-refund-promise.yaml"');
+    expect(text).toContain('verifier: ./no-refund-promise.yaml');
     expect(text).not.toMatch(/<\/?(CodeFromFile|LangTabs?|Tabs?|Aside)\b/);
     expect(text).not.toContain('ANCHOR');
   });
@@ -36,6 +36,11 @@ describe('pageText', () => {
         '</LangTab>',
         '</LangTabs>',
         '<Aside type="caution" title="Careful">Read this.</Aside>',
+        '<Aside type="note" title="Block">',
+        '',
+        'Table.',
+        '',
+        '</Aside>',
         '```html',
         '<Tab label="literal">',
         '```'
@@ -44,6 +49,8 @@ describe('pageText', () => {
     expect(text).toContain('**one.yaml**');
     expect(text).toContain('**Python**');
     expect(text).toContain('**Careful:** Read this.');
+    expect(text).toContain('**Block:**\n\nTable.');
+    expect(text).not.toMatch(/[ \t]$/m);
     expect(text).toContain('```html\n<Tab label="literal">\n```');
   });
 

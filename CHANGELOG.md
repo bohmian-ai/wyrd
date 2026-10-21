@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- wyrd-server: the HTTP listener now defaults to `127.0.0.1:8080` instead of
+  `0.0.0.0:8080`, matching the gRPC default. A server reached directly rather
+  than through a same-host proxy must set `WYRD_SERVER_BIND`, for example
+  `0.0.0.0:8080`. Listener collision checks now also reject a wildcard bind
+  that overlaps another listener's port.
 - skald-agentic: `skald-agent` (live agent, bounded tool loop, and `SKALD_AGENT_*` catalog) and `skald-workflow` (explicit-binding
   Agent DAG with native, Wyrd gateway, and bound external gateway routes,
   bounded execution with retries, deadlines, and cancellation, and the

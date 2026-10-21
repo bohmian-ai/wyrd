@@ -10,13 +10,14 @@ from pathlib import Path
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = [DOCS_ROOT / "src" / "content" / "docs", DOCS_ROOT / "CONTRIBUTING.md"]
-# Cargo is forbidden only where it drives this repository's workspace: a
-# reader's own project (`cargo new`, `cargo add`, `cargo run`) has no mise.
+# Cargo and uv are forbidden only where they drive this repository: a
+# reader's own project (`cargo run`, `uv run quickstart.py`) has no mise.
 FORBIDDEN = re.compile(
     r"^\s*(?:[$>]?\s*)?("
     r"cargo\s+(?:test|nextest|clippy|fmt|check|build|bench)\b"
     r"|cargo\b.*\s(?:-p|--package|--workspace|--manifest-path)\b"
-    r"|uv\s+run(?:\s|$)|pnpm(?:\s|$))"
+    r"|uv\s+run\s+(?:--(?:project|directory|package)\b|(?:python\s+)?scripts/)"
+    r"|pnpm(?:\s|$))"
 )
 FENCE = re.compile(r"^\s*```(?P<info>.*)$")
 ALLOWED_HINTS = {"internal", "contributor", "maintainer"}
@@ -70,10 +71,12 @@ def main() -> int:
 
 
 def self_check() -> None:
-    """Pin which Cargo commands count as bypassing the task runner."""
-    for line in ["cargo test", "cargo nextest run --locked", "cargo run -p wyrd-server", "cargo build --workspace"]:
+    """Pin which Cargo and uv commands count as bypassing the task runner."""
+    for line in ["cargo test", "cargo nextest run --locked", "cargo run -p wyrd-server", "cargo build --workspace",
+                 "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest"]:
         assert FORBIDDEN.match(line), line
-    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.3.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.3.0 --locked"]:
+    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.3.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.3.0 --locked",
+                 "uv run quickstart.py", "uv run wyrd server dev"]:
         assert not FORBIDDEN.match(line), line
 
 

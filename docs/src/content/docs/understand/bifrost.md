@@ -6,7 +6,13 @@ section: Understand
 order: 4
 ---
 
-Bifrost is the analytical warehouse inside every Wyrd server. Observations, verdicts, traces, audit records, and your own rows all land in it, and you query them with SQL.
+Bifrost is the analytical warehouse inside every Wyrd server. Observations, verdicts, traces, audit records, and caller-owned rows all land in it as tables that read-only SQL can query:
+
+```sql
+SELECT verdict, count(*) AS executions
+FROM vala.verification.results
+GROUP BY verdict
+```
 
 ## How it is put together
 
@@ -19,7 +25,7 @@ Bifrost is the analytical warehouse inside every Wyrd server. Observations, verd
 
 One server runs all four. A larger deployment can split them across pods with `WYRD_TARGET`.
 
-Tables are Apache Iceberg tables of Parquet files in your object store, with the catalog in Postgres. The `vala.datasets` namespace is yours. Wyrd writes every other namespace.
+Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `vala.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
 
 ## Two ways in
 
@@ -29,7 +35,7 @@ Inside a running service, `run.observe.*` writes rows tied to the run and the ex
 
 A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read recent unpublished rows on a best-effort basis, so a row written seconds ago may not appear yet.
 
-Every query ends with a status: `success`, `degraded` when recent rows may be missing, or `failed`. The SDKs raise on `failed`.
+Every query ends with a status: `success`, `degraded` when recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/api/errors/).
 
 ## Next
 

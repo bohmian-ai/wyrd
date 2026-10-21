@@ -7,7 +7,7 @@
 Set up a local server, then run one verification, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
-- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript.
+- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
 
 ## Home
 
@@ -15,9 +15,9 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 ## Get started
 
-- [What Wyrd verifies](/wyrd/get-started/introduction/): Wyrd judges what an AI system did against criteria you declared, and ties every judgment to the exact versions involved.
+- [What Wyrd does](/wyrd/get-started/introduction/): Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 - [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
-- [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then judge a passing and a failing reply from one Python, Rust, or TypeScript program.
+- [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
 
 ## Operate
 
@@ -25,7 +25,7 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 ## Understand
 
-- [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a defined component of your system.
+- [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
 - [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.

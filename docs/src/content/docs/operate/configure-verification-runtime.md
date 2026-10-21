@@ -11,7 +11,7 @@ Decide which processes run Verifiers and how much Python each runs at once. Ever
 
 ## Choose which processes run Verifiers
 
-Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the server TOML file (`WYRD_CONFIG_PATH`, else `/etc/wyrd/server.toml`, else `~/.config/wyrd/server.toml`). Route verification traffic to the processes that keep it on.
+Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the [server TOML file](/reference/verification-runtime-limits/#server-toml-file). Route verification traffic to the processes that keep it on.
 
 ## Size the worker pool
 
@@ -31,3 +31,7 @@ Settings are read at startup; restart to apply a change.
 | `environment variable WYRD_VERIFICATION_... could not be parsed` | Set a positive integer |
 | Two variable names in a startup error | Fix the pair; see [startup rules](/reference/verification-runtime-limits/#startup-rules) |
 | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` from `verify` | The process has verification off or no free worker; retry or route to another process |
+
+## Next
+
+[Verification runtime limits](/reference/verification-runtime-limits/) lists every setting, its default, and what happens when a limit is reached.

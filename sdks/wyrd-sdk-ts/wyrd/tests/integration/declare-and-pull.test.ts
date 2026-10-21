@@ -55,7 +55,7 @@ test("service graph declares and pulls", async ({ cards, desk }) => {
 
 test("runs the Quickstart script from a directory holding only its Cards", async ({ server: _ }) => {
   const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
-  for (const file of ["refund-limit.yaml", "support-reply.yaml"]) cpSync(join(QUICKSTART, file), join(reader, file));
+  for (const file of ["no-refund-promise.yaml", "support-reply.yaml"]) cpSync(join(QUICKSTART, file), join(reader, file));
   const ref = (kind: string, name: string) => `default/${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
   const printed = () =>
     execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
@@ -63,12 +63,12 @@ test("runs the Quickstart script from a directory holding only its Cards", async
   const first = printed();
   expect(first).toMatch(
     new RegExp(
-      `^passed: the comparison held\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "refund-limit")}\\n` +
-        `failed: operator LessThanOrEquals returned false\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "refund-limit")}\\n$`,
+      `^passed: the comparison held\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "no-refund-promise")}\\n` +
+        `failed: operator NotContains returned false\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "no-refund-promise")}\\n$`,
     ),
   );
   expect(printed()).toBe(first);
-  expect(readdirSync(reader).sort()).toEqual(["refund-limit.yaml", "support-reply.yaml"]);
+  expect(readdirSync(reader).sort()).toEqual(["no-refund-promise.yaml", "support-reply.yaml"]);
 });
 
 test("declares a ready verification state", async ({ server, model: _ }) => {
@@ -78,8 +78,8 @@ test("declares a ready verification state", async ({ server, model: _ }) => {
 
   const state = await WyrdState.declare(service);
   const run = state.run();
-  const passed = await run.observe.verify("refund-limit", { refund: 40 }, { positional: true });
-  const failed = await run.observe.verify("refund-limit", { refund: 250 }, { positional: true });
+  const passed = await run.observe.verify("no-refund-promise", { answer: "Your refund request is approved." });
+  const failed = await run.observe.verify("no-refund-promise", { answer: "You have a guaranteed refund." });
   expect([passed.outcome.verdict, failed.outcome.verdict]).toEqual(["passed", "failed"]);
   expect((await WyrdState.declare(service)).rootRef).toEqual(state.rootRef);
 
@@ -87,8 +87,8 @@ test("declares a ready verification state", async ({ server, model: _ }) => {
   await expect(WyrdState.declare(service, { client: reader })).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
-  const verifier = join(quickstart, "refund-limit.yaml");
-  writeFileSync(verifier, readFileSync(verifier, "utf8").replace("expected: 100", "expected: 50"));
+  const verifier = join(quickstart, "no-refund-promise.yaml");
+  writeFileSync(verifier, readFileSync(verifier, "utf8").replace("expected: guaranteed refund", "expected: guaranteed"));
   await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_REGISTRY_409_SPEC_DRIFT" });
   rmSync(verifier);
   await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_LOADER_400_INVALID_ENVELOPE" });

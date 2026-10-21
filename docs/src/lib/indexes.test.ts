@@ -48,7 +48,7 @@ describe('machine-readable indexes follow published pages', () => {
     const pages = [...full.matchAll(/^Page: \/wyrd(\/[^\s]*)$/gm)].map((m) => m[1]);
     expect(pages).toEqual(sidebar.flatMap((group) => group.items.map((item) => item.path)));
     expect(full).toContain('state = WyrdState.declare("support-reply.yaml")');
-    expect(full).toContain('```yaml title="support-reply.yaml"\n# The subject: a Service verified by refund-limit.\napiVersion: wyrd/v1\nkind: Service');
+    expect(full).toContain('```yaml title="support-reply.yaml"\n# The subject: your support agent\'s Service, verified by no-refund-promise.\napiVersion: wyrd/v1\nkind: Service');
     expect(full).not.toMatch(/<\/?(CodeFromFile|LangTabs?|Tabs?|Aside)\b|ANCHOR(_END)?:/);
   });
 });

@@ -9,36 +9,145 @@ Every published docs page in sidebar order, generated from the docs content tree
 Set up a local server, then run one verification, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
-- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript.
+- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
 
-# What Wyrd verifies
+# What Wyrd does
 
 Page: /wyrd/get-started/introduction/
 
-> Wyrd judges what an AI system did against criteria you declared, and ties every judgment to the exact versions involved.
+> Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 
-Wyrd is open-source verification and assurance infrastructure for AI systems. You declare what a part of your system must do. Wyrd judges evidence of what it did against that declaration and returns a verdict. Every verdict names the exact versions of the system and of the check that produced it.
+Your agent, model, or service needs to behave correctly, both before you ship a change and while it runs. Wyrd verifies that. You declare your system and the requirements it must meet. Wyrd checks each result against them, tells you which requirements failed and why, and records which version of your system produced it.
 
-Verification is the judgment: did this behavior meet the declared criteria? Assurance is what accumulates from it: durable evidence that lets you show later which version was checked, against which criteria, with what result.
+## An example
 
-## From declaration to judgment
+A support agent must never promise a guaranteed refund. This Verifier states that requirement, and its check is an assertion:
 
-| You declare | You supply | Wyrd returns |
-| --- | --- | --- |
-| A Verifier: the criteria, such as "the refund is at most 100 dollars" | Evidence of one behavior, as JSON | `passed` or `failed`, with a reason for each criterion |
-| A subject, such as a Service, that the Verifier is bound to | | The exact subject and Verifier identities behind the verdict |
+```yaml title="no-refund-promise.yaml"
+# The Verifier: a support answer never promises a guaranteed refund.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: default
+spec:
+  inputs:
+    answer: { type: json }
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund
 
-Declarations are Cards: small versioned YAML documents. A Card's name and version always mean the same content; changing the content needs a new version. That is what makes a verdict attributable: it points at one fixed declaration, not whatever the file says today.
+```
 
-A `failed` verdict is a successful answer. The check ran and the behavior did not meet the criteria. A request Wyrd cannot carry out, such as one without permission, is refused with an error instead, and produces no verdict.
+A second file, `support-reply.yaml`, describes the agent's Service and binds this Verifier to it. This program declares both and verifies two answers:
+
+**Python**
+
+```python title="quickstart.py"
+from wyrd import WyrdState
+
+# Declare the Service and the Verifier it references, and get a ready state.
+state = WyrdState.declare("support-reply.yaml")
+run = state.run()
+
+for answer in ("Your refund request is approved.", "You have a guaranteed refund."):
+    result = run.observe.verify("no-refund-promise", answer=answer)
+    print(f"{result.verdict}: {result.requirements[0]['reason']}")
+    print(f"  subject:  {result.subject}")
+    print(f"  verifier: {result.verifier}")
+
+```
+
+**Rust**
+
+```rust title="src/main.rs"
+//! The docsite Quickstart in Rust: declare a Service and the Verifier it
+//! references, then judge a passing and a failing answer.
+
+use wyrd_ai::WyrdError;
+use wyrd_ai::serde_json::json;
+use wyrd_ai::state::WyrdState;
+
+/// Declares `support-reply.yaml` from the working directory, verifies two
+/// answers against `no-refund-promise`, and prints each verdict with its reason
+/// and the exact subject and Verifier identities.
+///
+/// # Errors
+///
+/// Returns the [`WyrdError`] of a refused declaration or verification.
+#[tokio::main]
+async fn main() -> Result<(), WyrdError> {
+    // Declare the Service and the Verifier it references, and get a ready state.
+    let state = WyrdState::declare("support-reply.yaml").await?;
+    let run = state.run();
+
+    for answer in [
+        "Your refund request is approved.",
+        "You have a guaranteed refund.",
+    ] {
+        let result = run
+            .observe()
+            .verify("no-refund-promise", json!(answer))
+            .await?;
+        let reason = &result.outcome.requirements[0].reason;
+        println!("{}: {reason}", result.outcome.verdict);
+        println!("  subject:  {}", result.subject);
+        println!("  verifier: {}", result.verifier);
+    }
+    Ok(())
+}
+
+```
+
+**TypeScript**
+
+```typescript title="quickstart.ts"
+import { type CardRef, WyrdState } from "wyrd-ai";
+
+// Declare the Service and the Verifier it references, and get a ready state.
+const state = await WyrdState.declare("support-reply.yaml");
+const run = state.run();
+
+const id = (ref: CardRef) => `${ref.space}/${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
+for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
+  const result = await run.observe.verify("no-refund-promise", { answer });
+  console.log(`${result.outcome.verdict}: ${result.outcome.requirements[0].reason}`);
+  console.log(`  subject:  ${id(result.subject)}`);
+  console.log(`  verifier: ${id(result.verifier)}`);
+}
+
+```
+
+```text
+passed: the comparison held
+  subject:  default/Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+failed: operator NotContains returned false
+  subject:  default/Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+```
+
+In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy: see [Author a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/).
+
+## How it fits your system
+
+1. **Declare.** In YAML, describe your Service and the parts it is built from, such as an Agent, a Prompt, and a Model. Bind Verifiers to those parts, and declare them from your code or the CLI. Every declaration has a version, so changing your prompt means a new version.
+2. **Verify.** Send each result to Wyrd. Wait for the verdict, or let Wyrd verify in the background while your system keeps serving.
+3. **Read the verdicts.** Each requirement passes or fails with a reason. Wyrd keeps every verdict with the exact versions involved, so you can later ask which results failed after a prompt change.
 
 ## Where Wyrd stops
 
-Wyrd judges your system; it does not run it. Your model, agent, or service runs in your own runtime, and your code sends Wyrd the evidence to judge. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
+Wyrd verifies your system; your code runs it. Wyrd can route your model calls through its gateway, but your code owns the agent and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
 
 | Your application owns | The Wyrd server owns |
 | --- | --- |
-| Your code, models, and data | Cards and their versions |
+| Your code, models, and data | Your declarations and their versions |
 | Running and deploying them | Verdicts and the evidence behind them |
 | Deciding what to do with a verdict | Who may declare and verify, and the audit of those decisions |
 
@@ -46,7 +155,7 @@ The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call the same 
 
 ## Next
 
-[Set up Wyrd](/wyrd/get-started/setup/) starts a local server. [Run your first verification](/wyrd/get-started/quickstart/) then declares a Verifier and judges one passing and one failing reply.
+[Set up Wyrd](/wyrd/get-started/setup/) starts a local server. [Run your first verification](/wyrd/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply.
 
 # Set up Wyrd
 
@@ -69,19 +178,25 @@ Install Wyrd, start a local server, and leave it running. Your code finds the se
 **Python**
 
 ```bash
+uv init quickstart && cd quickstart
 uv add "wyrd-ai==0.3.0"
 ```
+
+Run the CLI as `uv run wyrd`.
 
 **Rust**
 
 ```bash
 cargo install wyrd-cli --version 0.3.0 --locked
+cargo new quickstart && cd quickstart
 cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```
 
 **TypeScript**
 
 ```bash
+mkdir quickstart && cd quickstart
+npm init -y && npm pkg set type=module
 npm install wyrd-ai
 ```
 
@@ -89,13 +204,42 @@ Run the CLI as `npx wyrd`.
 
 ## Start the server
 
-In its own terminal:
+In its own terminal, in `quickstart`:
+
+**Interactive**
 
 ```bash
 wyrd server dev
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers. When it prints this, it's ready:
+When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers.
+
+**Programmatic**
+
+```bash
+export WYRD_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
+wyrd server dev --tenant acme --non-interactive
+```
+
+It never prompts. If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready, for scripts and agents.
+
+**wyrd server dev options:**
+
+| Option | Meaning |
+| --- | --- |
+| `--tenant <TENANT>` | Tenant to create on first run. Defaults to the saved tenant. |
+| `--non-interactive` | Never prompt. Reports every missing input together and exits before any download, migration, or setup. |
+| `--format <text\|json>` | `json` never prompts, prints one line of JSON on stdout when ready, keeps serving, and writes progress to the log file it names. Default `text`. |
+| `--bind <ADDR>` | HTTP listen address, `127.0.0.1:<port>`. Overrides `WYRD_SERVER_BIND`. Default `127.0.0.1:8080`. |
+| `--grpc-bind <ADDR>` | gRPC listen address, `127.0.0.1:<port>`. Overrides `WYRD_GRPC_BIND`. Default `127.0.0.1:50051`. |
+| `--storage-url <URL>` | Storage URL without credentials, query, or fragment. Overrides `WYRD_STORAGE_URL`. Default is a local directory. |
+| `--host <HOST>` | MCP host to connect, repeatable: `codex`, `claude-code`, `copilot-cli`, `vscode`, `cursor`, `pi`, `hermes`. None unless named. |
+| `--gateway-file <PATH>` | Gateway document to apply once ready, and on every restart. |
+| `--skip-gateway` | Skip the gateway offer. |
+
+The database URL comes only from `WYRD_DATABASE_URL` or the saved setting, never an option. Each input resolves as option, then environment variable, then saved setting, then default. Settings are saved, so later runs reuse them.
+
+When it prints this, it's ready:
 
 ```text
 Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
@@ -105,7 +249,7 @@ It also prints a root credential once. Save it; it recovers a lost tenant key.
 
 ## Check it works
 
-In a second terminal, from `quickstart`:
+In a second terminal, in `quickstart`:
 
 ```bash
 wyrd list
@@ -118,7 +262,7 @@ An empty list means you're connected.
 | You see | Fix |
 | --- | --- |
 | `is a superuser` or `BYPASSRLS` | Use a database user that isn't a superuser |
-| `WYRD_CLI_503_SERVER_DEV` naming `listener` | Port 8080 is taken: set `WYRD_SERVER_BIND=127.0.0.1:18080` and rerun |
+| `WYRD_CLI_503_SERVER_DEV` naming `listener` | Port 8080 is taken: rerun with `--bind 127.0.0.1:18080` |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Unset `WYRD_CONFIG_HOME`, `WYRD_API_KEY`, and `WYRD_SERVER_URL`, or match the server terminal |
 
 ## Next
@@ -129,47 +273,47 @@ An empty list means you're connected.
 
 Page: /wyrd/get-started/quickstart/
 
-> Declare a Verifier and the Service it checks in two YAML files, then judge a passing and a failing reply from one Python, Rust, or TypeScript program.
+> Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
 
-You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to judge two support replies against one rule: a refund is at most 100 dollars. One reply passes and one fails, and each verdict names the exact versions that produced it.
+You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to verify two support answers against one requirement: the answer never promises a guaranteed refund. One answer passes and one fails, and each verdict names the exact versions that produced it.
 
-No model, provider key, or application is involved. You supply the reply as JSON, so this shows Wyrd judging declared criteria, not measuring a system that ran.
+No model, provider key, or application is involved: you supply each answer as text.
 
 ## Prerequisites
 
 - The server from [Set up Wyrd](/wyrd/get-started/setup/), running in its own terminal.
 - The `quickstart` directory from setup, with the SDK for your language installed. Run everything below there, in a second terminal.
 
-## 1. Declare the criteria
+## 1. Declare the requirement
 
-Save the Verifier in your `quickstart` directory as `refund-limit.yaml`. Its one requirement checks the `refund` field of a JSON input named `reply`:
+Save the Verifier in your `quickstart` directory as `no-refund-promise.yaml`. Its one requirement checks that the input named `answer` never contains `guaranteed refund`:
 
-```yaml title="refund-limit.yaml"
-# The Verifier: the refund in a reply is at most 100 dollars.
+```yaml title="no-refund-promise.yaml"
+# The Verifier: a support answer never promises a guaranteed refund.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: refund-limit
+  name: no-refund-promise
   version: 1.0.0
   space: default
 spec:
   inputs:
-    reply: { type: json }
+    answer: { type: json }
   requirements:
-    - id: within-limit
-      statement: The refund is at most 100 dollars
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
       check:
         kind: assert
-        path: inputs.reply.refund
-        operator: less_than_or_equals
-        expected: 100
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund
 
 ```
 
 Save the subject beside it as `support-reply.yaml`. It is a Service, and `verified_by` binds the Verifier to it by relative path:
 
 ```yaml title="support-reply.yaml"
-# The subject: a Service verified by refund-limit.
+# The subject: your support agent's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -178,13 +322,13 @@ metadata:
   space: default
 spec:
   verified_by:
-    - verifier: ./refund-limit.yaml
+    - verifier: ./no-refund-promise.yaml
 
 ```
 
 Each file is one Card, named and versioned in its `metadata`. A Card's name and version always mean the same content, which is what lets a verdict point at exactly what was checked.
 
-## 2. Verify two replies
+## 2. Verify two answers
 
 Save the program and run it from the `quickstart` directory, so it finds both YAML files there:
 
@@ -197,8 +341,8 @@ from wyrd import WyrdState
 state = WyrdState.declare("support-reply.yaml")
 run = state.run()
 
-for reply in ({"refund": 40}, {"refund": 250}):
-    result = run.observe.verify("refund-limit", reply)
+for answer in ("Your refund request is approved.", "You have a guaranteed refund."):
+    result = run.observe.verify("no-refund-promise", answer=answer)
     print(f"{result.verdict}: {result.requirements[0]['reason']}")
     print(f"  subject:  {result.subject}")
     print(f"  verifier: {result.verifier}")
@@ -206,21 +350,21 @@ for reply in ({"refund": 40}, {"refund": 250}):
 ```
 
 ```bash
-python quickstart.py
+uv run quickstart.py
 ```
 
 **Rust**
 
 ```rust title="src/main.rs"
 //! The docsite Quickstart in Rust: declare a Service and the Verifier it
-//! references, then judge a passing and a failing refund.
+//! references, then judge a passing and a failing answer.
 
 use wyrd_ai::WyrdError;
 use wyrd_ai::serde_json::json;
 use wyrd_ai::state::WyrdState;
 
 /// Declares `support-reply.yaml` from the working directory, verifies two
-/// replies against `refund-limit`, and prints each verdict with its reason
+/// answers against `no-refund-promise`, and prints each verdict with its reason
 /// and the exact subject and Verifier identities.
 ///
 /// # Errors
@@ -232,8 +376,14 @@ async fn main() -> Result<(), WyrdError> {
     let state = WyrdState::declare("support-reply.yaml").await?;
     let run = state.run();
 
-    for reply in [json!({ "refund": 40 }), json!({ "refund": 250 })] {
-        let result = run.observe().verify("refund-limit", reply).await?;
+    for answer in [
+        "Your refund request is approved.",
+        "You have a guaranteed refund.",
+    ] {
+        let result = run
+            .observe()
+            .verify("no-refund-promise", json!(answer))
+            .await?;
         let reason = &result.outcome.requirements[0].reason;
         println!("{}: {reason}", result.outcome.verdict);
         println!("  subject:  {}", result.subject);
@@ -258,8 +408,8 @@ const state = await WyrdState.declare("support-reply.yaml");
 const run = state.run();
 
 const id = (ref: CardRef) => `${ref.space}/${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
-for (const reply of [{ refund: 40 }, { refund: 250 }]) {
-  const result = await run.observe.verify("refund-limit", { reply });
+for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
+  const result = await run.observe.verify("no-refund-promise", { answer });
   console.log(`${result.outcome.verdict}: ${result.outcome.requirements[0].reason}`);
   console.log(`  subject:  ${id(result.subject)}`);
   console.log(`  verifier: ${id(result.verifier)}`);
@@ -271,40 +421,42 @@ for (const reply of [{ refund: 40 }, { refund: 250 }]) {
 node quickstart.ts
 ```
 
-`WyrdState.declare` reads `support-reply.yaml` and the Verifier it references, declares both Cards to the server, and returns a state ready to use. `verify` sends one reply as the Verifier's `reply` input and waits for the verdict. Every language prints the same:
+`verify` sends each answer as the Verifier's `answer` input and returns its verdict. Every language prints the same:
 
 ```text
 passed: the comparison held
   subject:  default/Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/refund-limit@1.0.0#<uid>
-failed: operator LessThanOrEquals returned false
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+failed: operator NotContains returned false
   subject:  default/Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/refund-limit@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-Each verdict names the subject and the Verifier by space, kind, name, version, and the server-assigned `uid` of that exact declaration. The server assigns each `uid` when the Card is first declared, so yours differ from these.
+Each verdict names the subject and the Verifier by space, kind, name, version, and `uid`. The server assigns each `uid` when the Card is first declared, so yours differ.
 
-The second verdict is `failed`, and it is still a successful call: the check ran, and 250 is more than 100. The result holds one entry per requirement with its `id`, `outcome`, `reason`, and the `actual` value it judged.
+The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund. The result holds one entry per requirement with its `id`, `outcome`, `reason`, and the `actual` value it judged.
 
-Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities. It leaves no files behind.
+Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities.
 
-## 3. Change the rule
+## 3. Change the requirement
 
-Edit `refund-limit.yaml` to `expected: 50` and run the program again. It stops with `WYRD_REGISTRY_409_SPEC_DRIFT`: `refund-limit@1.0.0` already means the declaration with 100, and a version never changes meaning. To change the rule, give it a new version: set `version: 1.1.0` in `refund-limit.yaml`. The Service now references different content too, so set its `version: 1.1.0` as well. Run again, and the verdicts name `support-reply@1.1.0` and `refund-limit@1.1.0`.
+Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program again. It stops with `WYRD_REGISTRY_409_SPEC_DRIFT`: `no-refund-promise@1.0.0` already means the declaration that checks `guaranteed refund`, and a version never changes meaning.
 
-## Errors are not verdicts
+To change the requirement, give it a new version: set `version: 1.1.0` in `no-refund-promise.yaml`. The Service now references different content too, so set its `version: 1.1.0` as well. Run again, and the verdicts name `support-reply@1.1.0` and `no-refund-promise@1.1.0`.
 
-A refused request fails with a `WyrdError` carrying a stable `code`, raised in Python and TypeScript and returned as `Err` in Rust, and produces no verdict. For example, a credential with only the `viewer` role cannot declare Cards or run a Verifier, and either call fails with `WYRD_PERMISSION_403_DENIED_RBAC`.
+**Errors are not verdicts:** A request Wyrd refuses, such as one without permission, produces no verdict. It raises a `WyrdError` with a stable `code` in Python and TypeScript and returns it as `Err` in Rust; [Errors](/wyrd/api/errors/) lists every code.
 
-| You see | Cause | Fix |
-| --- | --- | --- |
-| `transport unavailable` | The server is not running | Start it as in [Set up Wyrd](/wyrd/get-started/setup/#start-the-server) |
-| `WYRD_CLIENT_401_NO_CREDENTIALS` | This terminal sees a different config directory | Use the same `WYRD_CONFIG_HOME` as the server terminal |
-| `WYRD_REGISTRY_409_SPEC_DRIFT` | A file changed but its version did not | Bump `metadata.version`, or revert the change |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | A file is missing or not a valid Card | Run from the directory that holds both YAML files |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks permission to declare or verify | Use the tenant administrator key that setup saved |
+## If it fails
 
-The verdicts are also recorded on the server, written in batches, so they can take a moment to appear in queries. The result your code receives is complete when `verify` returns.
+| You see | Fix |
+| --- | --- |
+| `transport unavailable` | Start the server as in [Set up Wyrd](/wyrd/get-started/setup/#start-the-server) |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
+
+## Next
+
+[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
 
 # Configure the verification runtime
 
@@ -316,7 +468,7 @@ Decide which processes run Verifiers and how much Python each runs at once. Ever
 
 ## Choose which processes run Verifiers
 
-Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the server TOML file (`WYRD_CONFIG_PATH`, else `/etc/wyrd/server.toml`, else `~/.config/wyrd/server.toml`). Route verification traffic to the processes that keep it on.
+Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_VERIFICATION_ENABLED=0`, or `enabled = false` under `[verification]` in the [server TOML file](/wyrd/reference/verification-runtime-limits/#server-toml-file). Route verification traffic to the processes that keep it on.
 
 ## Size the worker pool
 
@@ -337,13 +489,17 @@ Settings are read at startup; restart to apply a change.
 | Two variable names in a startup error | Fix the pair; see [startup rules](/wyrd/reference/verification-runtime-limits/#startup-rules) |
 | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` from `verify` | The process has verification off or no free worker; retry or route to another process |
 
+## Next
+
+[Verification runtime limits](/wyrd/reference/verification-runtime-limits/) lists every setting, its default, and what happens when a limit is reached.
+
 # Cards, versions, and relationships
 
 Page: /wyrd/understand/cards-versions-and-relationships/
 
-> A Service declaration is a set of versioned Cards, each one a defined component of your system.
+> A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 
-A Card is a versioned declaration of one part of your system, or of one rule for checking it.
+A Card is a versioned declaration of one AI system component, or of one Verifier that checks components. Every observation and verdict points back to an exact Card version.
 
 ## The shape of a Card
 
@@ -352,7 +508,7 @@ These are the two Cards from [Run your first verification](/wyrd/get-started/qui
 **support-reply.yaml**
 
 ```yaml title="support-reply.yaml"
-# The subject: a Service verified by refund-limit.
+# The subject: your support agent's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -361,50 +517,50 @@ metadata:
   space: default
 spec:
   verified_by:
-    - verifier: ./refund-limit.yaml
+    - verifier: ./no-refund-promise.yaml
 
 ```
 
-**refund-limit.yaml**
+**no-refund-promise.yaml**
 
-```yaml title="refund-limit.yaml"
-# The Verifier: the refund in a reply is at most 100 dollars.
+```yaml title="no-refund-promise.yaml"
+# The Verifier: a support answer never promises a guaranteed refund.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: refund-limit
+  name: no-refund-promise
   version: 1.0.0
   space: default
 spec:
   inputs:
-    reply: { type: json }
+    answer: { type: json }
   requirements:
-    - id: within-limit
-      statement: The refund is at most 100 dollars
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
       check:
         kind: assert
-        path: inputs.reply.refund
-        operator: less_than_or_equals
-        expected: 100
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund
 
 ```
 
-You write `apiVersion`, `kind`, `metadata`, and `spec`. The server adds `relationships` and `status`.
+An author writes `apiVersion`, `kind`, `metadata`, and `spec`. The server adds `relationships` and `status`.
 
-A Card is identified by `space`, `kind`, `name`, and `version`. A space groups related Cards. If you leave it out, it comes from `wyrd.toml` or is `default`.
+A Card is identified by `space`, `kind`, `name`, and `version`. A space groups related Cards. An omitted space comes from `wyrd.toml`, or is `default`.
 
 ## Versions are exact
 
 A reference names either a file, relative to the file it is in, or a declared Card at an exact version:
 
 ```yaml
-verifier: ./refund-limit.yaml
-verifier: {kind: Verifier, name: refund-limit, version: 1.0.0}
+verifier: ./no-refund-promise.yaml
+verifier: {kind: Verifier, name: no-refund-promise, version: 1.0.0}
 ```
 
-So a declared Service records exactly which Cards it was built from, and a verdict points back to exactly what ran. To pick up a new version, change the reference and declare again.
+So a declared Service records exactly which Cards it was built from, and a verdict points back to exactly what ran. A Card moves to a new version of a dependency only when its reference changes and it is declared again.
 
-`metadata.version` is optional. Without it, Wyrd records `0.1.0`, then the next patch version each time the content changes. Re-declaring an exact version with different content fails with `WYRD_REGISTRY_409_SPEC_DRIFT`.
+`metadata.version` is optional. Without it, Wyrd records `0.1.0`, then the next patch version each time the content changes. Declaring unchanged content keeps the current version. Re-declaring an exact version with different content fails with `WYRD_REGISTRY_409_SPEC_DRIFT`.
 
 ## Relationships come from references
 
@@ -412,10 +568,10 @@ The server reads every reference in a Card's `spec` and records it in both direc
 
 ```text
 Service support-reply
-└── Verifier refund-limit
+└── Verifier no-refund-promise
 ```
 
-From any Card you can see what it depends on and what depends on it. A running service may record observations only about Cards in its own graph.
+Every Card therefore shows what it depends on and what depends on it. A running service may record observations only about Cards in its own graph.
 
 ## Next
 
@@ -427,31 +583,31 @@ Page: /wyrd/understand/how-verification-works/
 
 > Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
 
-A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`.
+A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. A binding attaches the Verifier to the Card it checks, and the server records every verdict with the exact versions it judged.
 
 ## The parts of a Verifier
 
 This is the Verifier from [Run your first verification](/wyrd/get-started/quickstart/):
 
-```yaml title="refund-limit.yaml"
-# The Verifier: the refund in a reply is at most 100 dollars.
+```yaml title="no-refund-promise.yaml"
+# The Verifier: a support answer never promises a guaranteed refund.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  name: refund-limit
+  name: no-refund-promise
   version: 1.0.0
   space: default
 spec:
   inputs:
-    reply: { type: json }
+    answer: { type: json }
   requirements:
-    - id: within-limit
-      statement: The refund is at most 100 dollars
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
       check:
         kind: assert
-        path: inputs.reply.refund
-        operator: less_than_or_equals
-        expected: 100
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund
 
 ```
 
@@ -466,38 +622,38 @@ A Verifier never names what it checks. A binding supplies the subject, so one Ve
 
 ## Bindings
 
-A Service binds a Verifier under `verified_by`, as `support-reply` binds `refund-limit`. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+A Service binds a Verifier under `verified_by`, as `support-reply` binds `no-refund-promise`. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
 
 ## verify and submit
 
 `verify` runs the Verifier now and returns the result. A `failed` verdict is an ordinary value, not an exception:
 
 ```python
-result = run.observe.verify("refund-limit", {"refund": 40})
+result = run.observe.verify("no-refund-promise", answer="Your refund request is approved.")
 ```
 
-`submit` queues the work on the server and returns an execution you can wait on, here or from another process:
+`submit` queues the work on the server and returns an execution that any process holding it can wait on:
 
 ```python
-execution = run.observe.submit("refund-limit", {"refund": 250})
+execution = run.observe.submit("no-refund-promise", answer="You have a guaranteed refund.")
 result = execution.wait(60)
 ```
 
-Drift Verifiers take samples over a time window, so they accept only `submit`.
+Drift Verifiers judge samples over a time window, so they refuse `verify`. Their `submit` records samples, and a scheduled binding judges the window.
 
 ## Verdicts
 
-With `all`, any failed requirement fails the Verifier. Otherwise any inconclusive requirement makes it inconclusive. Otherwise it passes.
+With `all`, any failed requirement fails the Verifier. Otherwise any inconclusive requirement makes it inconclusive. Otherwise it passes. Requirements that are `not_applicable` do not count, and a Verifier with no applicable requirement is inconclusive.
 
 `inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
 
 ## Results
 
-Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. You can query both with SQL.
+Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
 
 ## Operators
 
-An Operator reacts when a binding's background work fails, by sending a Slack or PagerDuty notification or calling a URL. `verify` never runs Operators.
+An Operator reacts when a submitted or scheduled execution of a binding returns `failed`, by sending a Slack or PagerDuty notification or calling a URL. `verify` never runs Operators.
 
 ## Next
 
@@ -509,11 +665,11 @@ Page: /wyrd/understand/runs-observations-and-evidence/
 
 > How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 
-An observation is a record of what your declared service actually did, tied to the exact Card version and run that produced it.
+An observation is a record of what a declared service actually did. Each one is tied to the exact Card version and the run that produced it.
 
 ## A run is one invocation
 
-A run is one execution of your service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
+A run is one execution of a service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
 
 **Python**
 
@@ -541,28 +697,28 @@ const answer = await answerQuestion(question);
 await run.observe.record("vala.datasets.tickets", { question, answer });
 ```
 
-`state` holds the exact Card versions your service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
+`state` holds the exact Card versions the service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
 
 ## Where observations land
 
 Observations go to Bifrost, the Wyrd data plane:
 
-| You record | Lands in |
+| Recorded with | Lands in |
 | --- | --- |
-| `observe.record(table, row)` | Your own `vala.datasets.<name>` table |
+| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
 | `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
 | Drift samples, with `observe.submit` | `vala.drift.observations` |
 | OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
 
-Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE`.
+Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
 
 ## Recording is buffered
 
-`observe.*` calls queue the row and return at once. `shutdown` sends everything still queued, so call it before your process exits. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
+`observe.*` calls queue the row; a returned call means the row is queued, not stored. `shutdown` sends everything still queued, so a process that exits without it loses those rows. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
 
 A row the server has stored can take a moment to show up in queries. [Bifrost](/wyrd/understand/bifrost/) explains why.
 
-## Query the evidence
+## Evidence joins on the run
 
 Observations and verdicts share `run_id`, so one SQL query joins what a run saw to how it was judged:
 
@@ -582,7 +738,13 @@ Page: /wyrd/understand/bifrost/
 
 > Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
 
-Bifrost is the analytical warehouse inside every Wyrd server. Observations, verdicts, traces, audit records, and your own rows all land in it, and you query them with SQL.
+Bifrost is the analytical warehouse inside every Wyrd server. Observations, verdicts, traces, audit records, and caller-owned rows all land in it as tables that read-only SQL can query:
+
+```sql
+SELECT verdict, count(*) AS executions
+FROM vala.verification.results
+GROUP BY verdict
+```
 
 ## How it is put together
 
@@ -595,7 +757,7 @@ Bifrost is the analytical warehouse inside every Wyrd server. Observations, verd
 
 One server runs all four. A larger deployment can split them across pods with `WYRD_TARGET`.
 
-Tables are Apache Iceberg tables of Parquet files in your object store, with the catalog in Postgres. The `vala.datasets` namespace is yours. Wyrd writes every other namespace.
+Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `vala.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
 
 ## Two ways in
 
@@ -605,7 +767,7 @@ Inside a running service, `run.observe.*` writes rows tied to the run and the ex
 
 A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read recent unpublished rows on a best-effort basis, so a row written seconds ago may not appear yet.
 
-Every query ends with a status: `success`, `degraded` when recent rows may be missing, or `failed`. The SDKs raise on `failed`.
+Every query ends with a status: `success`, `degraded` when recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/wyrd/api/errors/).
 
 ## Next
 
@@ -617,11 +779,11 @@ Page: /wyrd/understand/identity-and-authorization/
 
 > Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
 
-Every call to the Wyrd server is made as a principal, and the principal's roles decide what it may do.
+Every call to the Wyrd server is made as a principal, and the principal's roles decide what it may do. Wyrd checks the permission before the operation proceeds and records the decision.
 
 ## Tenants
 
-A principal belongs to exactly one tenant. A tenant is a hard isolation boundary: PostgreSQL row-level security keeps every query inside its tenant. Platform administrators create and suspend tenants but hold no authority inside one.
+Every person, Service, Agent, and automation acting on Cards and evidence belongs to exactly one tenant. A tenant is a hard isolation boundary: PostgreSQL row-level security keeps every query inside its tenant. Platform administrators create and suspend tenants but are never implicitly authorized over a tenant's resources.
 
 ## Principals
 
@@ -633,7 +795,7 @@ A principal belongs to exactly one tenant. A tenant is a hard isolation boundary
 
 ## Credentials
 
-A caller presents a long-lived credential, such as an API key in `WYRD_API_KEY`, and the server exchanges it for an access token that lasts 5 minutes. The SDKs and CLI renew the token for you. A role change reaches a running service when its token is next renewed.
+A caller presents a long-lived credential, such as an API key in `WYRD_API_KEY`, and the server exchanges it for an access token that lasts 5 minutes. The SDKs and CLI renew the token automatically. A role change reaches a running service when its token is next renewed.
 
 ## Roles
 
@@ -646,7 +808,7 @@ A permission is written `resource:action`, such as `cards:write`. A role is a se
 | `editor` | A person or CI job that changes declarations |
 | `admin` | The tenant administrator |
 
-Roles apply to the whole tenant. A space groups Cards; it is not an access boundary.
+The built-in roles apply to the whole tenant. A space groups Cards; it is not an access boundary.
 
 ## Every decision is audited
 
@@ -681,7 +843,7 @@ spec:
 | `steps` | list of [steps](#steps) | `[]` | Work that prepares evidence before requirements run |
 | `requirements` | list of [requirements](#requirements) | `[]` | What must be true; each has one check |
 | `decide` | [`all` or `{pass_rate: {threshold}}`](#decide) | `all` | How requirement outcomes become the verdict |
-| `context_capture` | object | none | What run context to keep with the result |
+| `context_capture` | `full`, `hash`, or `redact` | `full` | How a check's `actual` value is stored: as extracted, as its SHA-256 hex digest, or omitted |
 
 Step and requirement `id`s share one namespace.
 
@@ -695,6 +857,8 @@ A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. `jso
 | `media` | `formats` (required), `max_bytes` | A file in one of `formats`, no larger than `max_bytes` |
 | `trace` | none | The run's trace spans |
 | `samples` | `features` (required) | Feature values over a window, for drift checks |
+
+A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order. `samples` and source slots are always required.
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
 
@@ -718,7 +882,7 @@ A step's result is `steps.<id>.output`.
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/wyrd/reference/extraction-output/) gives for its format |
 | `agent` | `agent`, `inputs`, `workspace` | The Agent's response, shaped by its Prompt `response_format` |
-| `code` | `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
+| `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
 - `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to references. Tools are in [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/).
@@ -819,10 +983,12 @@ A citation names the original slot, never an extract step. An invalid citation i
 
 ## Decide
 
-| Value | Passes when |
+| Value | Verdict |
 | --- | --- |
-| `all` | Every applicable requirement passes |
-| `{pass_rate: {threshold}}` | At least `threshold` of applicable requirements pass; `threshold` is above 0 and at most 1 |
+| `all` | `failed` if any requirement fails; otherwise `inconclusive` if any is inconclusive; otherwise `passed` |
+| `{pass_rate: {threshold}}` | `passed` when the passed share of applicable requirements, inconclusive ones included in the count, reaches `threshold`; `threshold` is above 0 and at most 1 |
+
+`not_applicable` requirements are excluded. With no applicable requirement, the verdict is `inconclusive`.
 
 ## Rejections
 
@@ -875,7 +1041,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | --- | --- | --- | --- |
 | `wyrd.guide` | Any caller | `{topic}` → `{topic, steps, examples}` | Static workflow guidance |
 
-`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; replace angle-bracket placeholders with discovered values.
+`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; angle-bracket placeholders stand for discovered values.
 
 ## Cards and verification
 
@@ -889,7 +1055,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. Pass `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
@@ -910,7 +1076,7 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 | `max_bytes` | 4 MiB | 16 MiB |
 | `deadline_ms` | Server policy | 4,294,967,295 ms; minimum 1 |
 
-Use one DataFusion SQL `SELECT` with fully qualified names and a `LIMIT`. Rows are positional arrays in `columns` order. Trust a result only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
+`sql` is one DataFusion SQL `SELECT` with fully qualified table names. Rows are positional arrays in `columns` order. A result is complete only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
 
 ## Principal credentials
 
@@ -958,9 +1124,9 @@ Gateway tools address resources by exact `name` and never call a model.
 
 A managed secret is write-only. A credential still referenced by a deployment cannot be deleted.
 
-## If it fails
+## Errors
 
-A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem; read its `code` and remediation.
+A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem with `code` and remediation.
 
 | Code | Cause |
 | --- | --- |
@@ -1028,6 +1194,7 @@ type XlsxOutput = {
 
 - Sheets are in workbook order; cells row by row, left to right. Empty cells are left out, so look a cell up by `address`, such as `B2`.
 - `value` is the stored value, or a formula's last saved result; formulas are never recalculated. Dates are Excel serial numbers.
+- `formula` is the formula text with a leading `=`, or `null`.
 - An error cell has `value: null` and the error, such as `#DIV/0!`, in `error`.
 
 ## CSV
@@ -1072,9 +1239,20 @@ A `json_pointer` locator addresses this extracted JSON for DOCX and XLSX, such a
 | `doc`, `xls`, `ppt` | Convert to `docx`, `xlsx`, or `pptx` |
 | `zip`, `tar_gz` | Put them in a step Agent's `workspace` |
 
-## If it fails
+## Failures
 
-The step fails and the requirements that need it are `inconclusive` when the file does not parse as its format, a PDF is encrypted, a text file is not UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each result records the extractor version `wyrd-extract/1`.
+The step fails, and the requirements that need it are `inconclusive`, when:
+
+| Condition | Formats |
+| --- | --- |
+| The file does not parse as its format | All |
+| The PDF is encrypted | `pdf` |
+| The text is not UTF-8 | `text`, `markdown`, `html` |
+| The archive exceeds `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES`, `WYRD_VERIFICATION_ARCHIVE_MAX_MIB`, or `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | `docx`, `xlsx`, `pptx` |
+| Pages or slides exceed `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` | `pdf`, `pptx` |
+| Extracted text exceeds `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` | All |
+
+Limits are in [Verification runtime limits](/wyrd/reference/verification-runtime-limits/). Each result records the extractor version `wyrd-extract/1`.
 
 # Verification runtime limits
 
@@ -1112,6 +1290,18 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | All `code.run` calls of one Agent step together, across its retries |
 
 `_MIB` and `_KIB` are binary units; `_MS` is milliseconds. A `media` slot's `max_bytes` can lower `FILE_MAX_MIB` for that slot, never raise it. No setting disables a limit or worker isolation.
+
+## Server TOML file
+
+`wyrd-server` reads the first file found, in this order. Environment variables override its values.
+
+| Order | File |
+| ---: | --- |
+| 1 | The path in `WYRD_CONFIG_PATH`; startup fails if it does not exist |
+| 2 | `/etc/wyrd/server.toml` |
+| 3 | `~/.config/wyrd/server.toml` |
+
+With no file, the server uses its defaults and environment variables.
 
 ## Startup rules
 
@@ -1159,7 +1349,7 @@ A Verifier's Agent calls server built-in tools, named in its `tool_names`. There
 | `fs.search` | Finds matching locations in workspace files | Workspace only |
 | `code.run` | Runs sandboxed Python against the workspace | Workspace only |
 
-Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls`: tool, arguments, output SHA-256, and returned bytes.
+Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
 
 ## Rules
 
@@ -1177,7 +1367,7 @@ Every call needs both a `tool:invoke` grant and the tool's resource permission. 
 
 The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
 
-## If it fails
+## Errors
 
 | Code | Cause |
 | --- | --- |
@@ -1185,6 +1375,7 @@ The scope is `all` or one exact tool name, never a pattern. A call runs as the p
 | `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
 | `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
 | `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |
 
 # Error codes
 

@@ -20,6 +20,7 @@ application passes to ``agents.set_trace_processors``; Wyrd never registers it.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
 from concurrent.futures import Future, wait
@@ -54,10 +55,18 @@ else:
 _CARD_UID = "wyrd.card_uid"
 _RUN_ID = "wyrd.run_id"
 
-# The Run scope stack lives entirely in this one context value: a tuple of
-# ``(card_uid, run_id)`` pairs, innermost last. Entry and exit each attach a new
-# value and never detach, so no token or per-scope state exists outside it.
+# The Run scope stack is a tuple of ``(card_uid, run_id)`` pairs, innermost
+# last, held in this OpenTelemetry context value. Entry and exit each attach a
+# new value and never detach, so no token or per-scope state exists outside it.
 _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE else None
+
+# The same stack, mirrored in a plain context variable. Server instrumentation
+# attaches a context it extracted from request headers, which starts empty and
+# so drops ``_SCOPE_KEY``; this variable survives that attach, so spans the
+# instrumentation starts inside a Run still find it.
+_SCOPE_VAR: contextvars.ContextVar[tuple[tuple[str, str], ...]] = contextvars.ContextVar(
+    "wyrd.run_scope", default=()
+)
 
 # Private marker set on a provider object once it accepted the Wyrd processor,
 # so later Run entries skip it. ``_INSTALL_LOCK`` makes the check-and-add
@@ -85,7 +94,7 @@ class _RunCorrelationProcessor:
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         try:
-            stack = _scope_stack(parent_context)
+            stack = _scope_stack(parent_context) or _SCOPE_VAR.get()
             if stack:
                 card_uid, run_id = stack[-1]
                 span.set_attribute(_CARD_UID, card_uid)
@@ -147,6 +156,7 @@ def _enter_run(card_uid: str, run_id: str) -> None:
     """
     if not _OTEL_AVAILABLE:
         return
+    _SCOPE_VAR.set((*_SCOPE_VAR.get(), (card_uid, run_id)))
     try:
         install_run_correlation()
         stack = _scope_stack()
@@ -175,6 +185,9 @@ def _exit_run(card_uid: str, run_id: str) -> None:
     """
     if not _OTEL_AVAILABLE:
         return
+    mirrored = _SCOPE_VAR.get()
+    if mirrored and mirrored[-1] == (card_uid, run_id):
+        _SCOPE_VAR.set(mirrored[:-1])
     try:
         stack = _scope_stack()
         if stack and stack[-1] == (card_uid, run_id):

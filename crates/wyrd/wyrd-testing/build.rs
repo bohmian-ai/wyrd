@@ -18,6 +18,9 @@ fn main() {
         .ancestors()
         .nth(3)
         .expect("OUT_DIR sits three levels under the profile directory");
-    println!("cargo:rustc-env=WYRD_TESTING_PROFILE_DIR={}", profile.display());
+    println!(
+        "cargo:rustc-env=WYRD_TESTING_PROFILE_DIR={}",
+        profile.display()
+    );
     println!("cargo:rerun-if-changed=build.rs");
 }

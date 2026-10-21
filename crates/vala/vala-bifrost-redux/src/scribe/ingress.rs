@@ -19,7 +19,7 @@ use vala_sql::ValaPostgres;
 
 use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, SERVER_WRITE_PRINCIPAL};
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::reference::CardRefScope;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
@@ -61,8 +61,7 @@ fn validate_decoded_request_size(
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for tenant mismatch, any other
-/// system-owner frame, or row-carried attribution from any other principal,
-/// and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
+/// system-owner frame, and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
 fn validate_logical_transport_frame(
     frame: &ScribeIngressFrame,
     request_limit_bytes: usize,
@@ -72,10 +71,6 @@ fn validate_logical_transport_frame(
     if frame.authenticated_tenant != frame.principal.tenant_id
         || (frame.authenticated_tenant == wyrd_spec::DataTenantId::SYSTEM_OWNER
             && !system_audit_publication)
-    {
-        return Err(ScribeError::InvalidFrame);
-    }
-    if frame.attribution == StampedAttribution::Rows && frame.principal.id != SERVER_WRITE_PRINCIPAL
     {
         return Err(ScribeError::InvalidFrame);
     }
@@ -867,9 +862,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{
-        Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, SERVER_WRITE_PRINCIPAL,
-    };
+    use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
     use wyrd_spec::request_id::RequestId;
 
     /// After its first `PostgreSQL` read the admission clock answers from its
@@ -1146,44 +1139,6 @@ mod tests {
             validate_logical_transport_frame(&caller, usize::MAX),
             Err(ScribeError::InvalidFrame)
         ));
-    }
-
-    /// Row-carried attribution passes transport validation only from the
-    /// reserved server-write principal; any other principal, as a client
-    /// token's would be, is refused.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an admission decision differs from the server-write-only
-    /// rule.
-    #[test]
-    fn row_attribution_admits_only_the_server_write_principal() {
-        let tenant = crate::test_support::tenant();
-        let principal = |id| {
-            Principal::new(
-                id,
-                PrincipalKind::User,
-                tenant,
-                Vec::new(),
-                PermissionSet::new(),
-            )
-        };
-        let mut caller = decoded_size_frame(
-            tenant,
-            &principal(PrincipalId::new(uuid::Uuid::now_v7())),
-            "x".to_owned(),
-        );
-        caller.attribution = StampedAttribution::Rows;
-        assert!(matches!(
-            validate_logical_transport_frame(&caller, usize::MAX),
-            Err(ScribeError::InvalidFrame)
-        ));
-
-        let mut server =
-            decoded_size_frame(tenant, &principal(SERVER_WRITE_PRINCIPAL), "x".to_owned());
-        server.attribution = StampedAttribution::Rows;
-        validate_logical_transport_frame(&server, usize::MAX)
-            .expect("the server writer may name each row's pair");
     }
 
     /// An oversized decoded request is refused at the pre-WAL size gate while

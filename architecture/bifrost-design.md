@@ -1419,8 +1419,9 @@ principal. Only the server-internal capture writer writes them, together with
 the capture spans in `vala.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
 Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
-batch carries the verified pair it was produced under, which Scribe stamps as
-`sub_principal_id` and `act_principal_id`: the call's pair for gateway
+row carries the verified pair it was produced under, which Scribe validates as
+principal ids and stamps as `sub_principal_id` and `act_principal_id`, so one
+tenant's batch may hold rows of many callers: the call's pair for gateway
 capture, the caller's pair for a `verify` result and its inputs, the submitting
 caller's pair for `submit` inputs, and the execution's accepted subject with
 the tenant `System` principal as actor for a queued result. A `submit`
@@ -1431,9 +1432,11 @@ death, and the execution then never becomes visible. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `vala.system.audit_log` explicitly,
-carries no token, and always carries that subject and actor pair. Audit rows
-carry their own identities as row content, so an audit batch submits the
-no-verified-caller sentinel pair. It is refused for any
+carries no token, and its rows carry their own subject and actor pairs. Audit
+rows carry their own identities as row content, so an audit batch submits the
+no-verified-caller sentinel pair. Every outbox frame names that
+no-verified-caller marker as its transport principal; it grants nothing. It is
+refused for any
 other table, and for the reserved system tenant unless the table is
 `vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,

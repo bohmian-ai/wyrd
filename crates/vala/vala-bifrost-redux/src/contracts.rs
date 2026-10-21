@@ -66,10 +66,10 @@ pub enum StampedAttribution {
     Frame(Attribution),
     /// Each row carries its own pair as `sub_principal_id` and
     /// `act_principal_id` values, so one server-internal frame can hold rows
-    /// of many callers. Scribe admits this only from
-    /// [`SERVER_WRITE_PRINCIPAL`](wyrd_spec::auth::SERVER_WRITE_PRINCIPAL),
-    /// which no token can name, and still stamps the managed columns itself
-    /// after validating every value is a principal id.
+    /// of many callers of one tenant. Only server-owned writers construct it:
+    /// public Gate ingestion always derives [`Self::Frame`] from the verified
+    /// token. Scribe still stamps the managed columns itself after validating
+    /// every value is a principal id.
     Rows,
 }
 

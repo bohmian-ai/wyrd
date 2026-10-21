@@ -69,18 +69,22 @@ identity is not a registered AI-system component.
 
 Gateway capture is a server-internal write that holds no token, evaluates no
 permission, and writes no audit decision. Its rows carry the verified
-subject/actor pair the call ran under. The reserved
-`SERVER_WRITE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never appears in
-a token: every issuer refuses it, every verifier rejects a token naming it, it
-never appears in a delegation chain, and it never replaces the invocation
-caller in audit. Gate refuses every public write to `vala.gateway.calls`. A pod
-without Scribe sends its outbox writes over the peer plane's capture RPC,
-admitted by `wyrd-peer` mTLS alone. Each request carries the subject/actor
-pair the local writer would stamp, and the RPC accepts only the six
-server-internal destinations: retained audit history, the two capture tables,
+subject/actor pair the call ran under. Two boundaries protect that
+attribution. First, public Gate ingestion derives every row's pair from the
+verified token and refuses supplied SUB/ACT columns; only server-owned outbox
+writes carry per-row pairs, and Scribe validates each as a principal id.
+Second, outbox lanes and batches are tenant-scoped: Scribe compares the
+authenticated tenant with the frame's principal tenant and binds the tenant's
+physical location, so callers of one tenant may share a frame but tenants never
+do. Outbox frames name `PLATFORM_AUDIT_PRINCIPAL`, the no-verified-caller
+marker, as their transport principal; it grants nothing and never replaces a
+row's verified pair or the invocation caller in audit. Gate refuses every
+public write to `vala.gateway.calls`. A pod without Scribe sends its outbox
+writes over the peer plane's capture RPC, admitted by `wyrd-peer` mTLS alone.
+Each request's rows carry the subject/actor pairs the local writer would
+stamp, and the RPC accepts only the six server-internal destinations: retained audit history, the two capture tables,
 and the three Verifier result tables. Only audit history may name the reserved
-system tenant; an audit row keeps its decision pair as content and travels
-under the `PLATFORM_AUDIT_PRINCIPAL` transport identity. A compromised cluster
+system tenant; an audit row keeps its decision pair as content. A compromised cluster
 member, already out of scope, is the only caller that could misuse it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,

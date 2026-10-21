@@ -183,10 +183,15 @@ not a passive integration or inventory product.
     is a grant held at platform scope, not a property of a kind, and neither
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
-    carry the verified pair the call ran under. The reserved
-    `SERVER_WRITE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never
-    appears in a token: every issuer refuses it, every verifier rejects a
-    token naming it, and it never replaces the invocation caller in audit.
+    carry the verified pair the call ran under. Two existing boundaries,
+    not a transport identity, protect that attribution: public Gate
+    ingestion always stamps the verified token's pair and refuses supplied
+    SUB/ACT columns, so only server-owned outbox writes (directly or over
+    the mTLS peer capture RPC) send per-row pairs, which Scribe still
+    validates as principal ids; and every outbox lane and batch is one
+    tenant's slice, which Scribe checks against the authenticated tenant
+    before binding the tenant's physical location. Different verified pairs
+    may share one tenant's frame; tenants never do.
     `PLATFORM_AUDIT_PRINCIPAL` is the single no-verified-caller marker. It
     fills both `sub_principal_id` and `act_principal_id` on an audited
     decision with no verified identity and on a creation row no verified

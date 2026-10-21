@@ -20,7 +20,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalKindTag, SERVER_WRITE_PRINCIPAL};
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRefScope;
 
@@ -176,22 +176,16 @@ impl IssuingKey {
 
     /// Mint a tenant access token for one resolved grant.
     ///
-    /// The public tenant access-token path. It refuses the reserved
-    /// [`SERVER_WRITE_PRINCIPAL`], which gateway capture stamps on its
-    /// server-internal writes and which never appears in a token, then signs
-    /// through [`Self::sign_access_token`].
+    /// The public tenant access-token path; it signs through
+    /// [`Self::sign_access_token`].
     ///
     /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved capture
-    /// identity, and otherwise every error of [`Self::sign_access_token`].
+    /// Every error of [`Self::sign_access_token`].
     pub fn issue_access_token(
         &self,
         grant: AccessGrant,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if grant.principal.id == SERVER_WRITE_PRINCIPAL {
-            return Err(IssueError::InvalidPrincipalKind);
-        }
         self.sign_access_token(grant, ttl)
     }
 
@@ -210,9 +204,6 @@ impl IssuingKey {
         grant: AccessGrant,
         ttl: Duration,
     ) -> Result<AccessTokenClaims, IssueError> {
-        if grant.principal.id == SERVER_WRITE_PRINCIPAL {
-            return Err(IssueError::InvalidPrincipalKind);
-        }
         self.build_access_claims(grant, ttl)
     }
 
@@ -328,12 +319,10 @@ impl IssuingKey {
     /// `issued_at` is supplied by the caller rather than sampled here so that
     /// the signed `exp` and the durable refresh row that records it are derived
     /// from one clock. Callers that persist the token pass the `PostgreSQL`
-    /// issuance instant of their own transaction. The reserved capture
-    /// identity is refused before signing: it never appears in a token.
+    /// issuance instant of their own transaction.
     ///
     /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] for the SYSTEM kind or
-    /// [`SERVER_WRITE_PRINCIPAL`], and an error when TTL is invalid or signing fails.
+    /// Returns [`IssueError::InvalidPrincipalKind`] for the SYSTEM kind, and an error when TTL is invalid or signing fails.
     #[tracing::instrument(
         level = "debug",
         skip(self),
@@ -354,7 +343,7 @@ impl IssuingKey {
         issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if principal_kind == PrincipalKindTag::System || principal_id == SERVER_WRITE_PRINCIPAL {
+        if principal_kind == PrincipalKindTag::System {
             return Err(IssueError::InvalidPrincipalKind);
         }
         let (iat, exp) = timestamps(issued_at, ttl)?;
@@ -388,8 +377,7 @@ impl IssuingKey {
     /// principal's grant at verification time rather than frozen here.
     ///
     /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved
-    /// [`SERVER_WRITE_PRINCIPAL`], [`IssueError::Signing`] when the token
+    /// Returns [`IssueError::Signing`] when the token
     /// cannot be signed, and a timestamp error when the issued-at or expiry
     /// cannot be computed.
     pub fn issue_platform_access_token(
@@ -398,9 +386,6 @@ impl IssuingKey {
         credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if principal_id == SERVER_WRITE_PRINCIPAL {
-            return Err(IssueError::InvalidPrincipalKind);
-        }
         let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let claims = PlatformAccessTokenClaims {
             sub: principal_id.to_string(),
@@ -518,7 +503,7 @@ mod tests {
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalKindTag, SERVER_WRITE_PRINCIPAL};
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -563,47 +548,6 @@ mod tests {
         assert_eq!(claims.act, None);
         assert_eq!(claims.iss, "wyrd");
         assert_eq!(claims.jti.len(), 26);
-    }
-
-    /// Proves no public issue path mints the reserved capture identity, in
-    /// any principal kind or delegation shape.
-    ///
-    /// # Panics
-    ///
-    /// Panics when any reserved shape yields a token or a different error.
-    #[test]
-    fn issue_access_token_refuses_the_reserved_capture_identity() {
-        let key = issuing_key();
-        let caller = ActClaim {
-            sub: user_principal().id.to_string(),
-            principal: user_principal(),
-            act: None,
-        };
-        for (kind, act) in [
-            (PrincipalKindTag::User, None),
-            (PrincipalKindTag::Service, None),
-            (PrincipalKindTag::Service, Some(Box::new(caller))),
-        ] {
-            let reserved = TokenPrincipalRef {
-                id: SERVER_WRITE_PRINCIPAL,
-                kind,
-                ..user_principal()
-            };
-            assert!(matches!(
-                key.issue_access_token(
-                    AccessGrant {
-                        act,
-                        ..grant(reserved, vec![role("editor")])
-                    },
-                    Duration::minutes(5),
-                ),
-                Err(IssueError::InvalidPrincipalKind)
-            ));
-        }
-        assert!(matches!(
-            key.issue_platform_access_token(SERVER_WRITE_PRINCIPAL, None, Duration::minutes(5)),
-            Err(IssueError::InvalidPrincipalKind)
-        ));
     }
 
     /// Build a Card-bound principal reference for the issuance tests.
@@ -1039,26 +983,6 @@ mod tests {
         assert_eq!(claims.sub, claims.principal_id.to_string());
         assert_eq!(claims.tenant_id, tenant_id());
         assert_eq!(claims.jti.len(), 26);
-    }
-
-    /// Refresh issuance refuses the reserved capture identity under every
-    /// kind, so no long-lived credential can ever be minted for it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when any reserved shape yields a token or a different error.
-    #[test]
-    fn issue_refresh_token_refuses_the_reserved_capture_identity() {
-        for kind in [PrincipalKindTag::Service, PrincipalKindTag::User] {
-            let result = issuing_key().issue_refresh_token(
-                kind,
-                SERVER_WRITE_PRINCIPAL,
-                tenant_id(),
-                Utc::now(),
-                Duration::days(30),
-            );
-            assert!(matches!(result, Err(IssueError::InvalidPrincipalKind)));
-        }
     }
 
     #[test]

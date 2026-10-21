@@ -71,7 +71,7 @@ use vala_bifrost_redux::tables::{
 use wyrd_runtime::outbox::{Outbox, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, SERVER_WRITE_PRINCIPAL};
+use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
@@ -454,23 +454,22 @@ impl ScribeBatch {
     /// Scribe stamps each row's own subject and actor, which it carries as
     /// content, and authorizes each row's `card_uid` against the UID-bearing
     /// Cards the rows name, which the producing owner authorized before
-    /// staging. Audit decisions carry their pair as content, so an audit
-    /// frame submits the unresolved pair under the platform audit principal,
-    /// the one principal Scribe admits for the system owner's audit history;
-    /// every other frame is row-attributed under the reserved server-write
-    /// principal, the one principal Scribe admits row-carried pairs from. The
-    /// transport principal carries no permission, since every write here is
-    /// server-internal and evaluates none.
+    /// staging. Every frame names the platform audit principal, the
+    /// no-verified-caller marker, as its required tenant principal; it grants
+    /// nothing, since every write here is server-internal and evaluates no
+    /// permission. Audit decisions carry their pair as content, so an audit
+    /// frame submits the unresolved pair; every other frame is row-attributed
+    /// with each row's verified subject and actor.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let (transport, attribution) = match self.table {
-            ScribeTable::AuditLog => (PLATFORM_AUDIT_PRINCIPAL, Attribution::unresolved().into()),
-            _ => (SERVER_WRITE_PRINCIPAL, StampedAttribution::Rows),
+        let attribution = match self.table {
+            ScribeTable::AuditLog => Attribution::unresolved().into(),
+            _ => StampedAttribution::Rows,
         };
         ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
             attribution,
             principal: Principal::new(
-                transport,
+                PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,
                 self.tenant,
                 Vec::new(),
@@ -1341,10 +1340,7 @@ mod tests {
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
     use wyrd_runtime::audit::AuditStage;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{
-        Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag,
-        SERVER_WRITE_PRINCIPAL,
-    };
+    use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::gateway::GatewayCaptureMode;
@@ -1520,9 +1516,9 @@ mod tests {
     /// callers admitted under different requests share one row frame and one
     /// span frame, every row carrying its own write's subject and actor and
     /// naming its own admitting request, and the summary frame is submitted
-    /// last although it was staged first. Every frame is row-attributed under
-    /// the server-write principal. The capture frames share a phase and
-    /// arrive in either order.
+    /// last although it was staged first. Every frame names the no-caller
+    /// marker as its transport principal; the verified pairs live on the rows.
+    /// The capture frames share a phase and arrive in either order.
     ///
     /// # Panics
     ///
@@ -1583,7 +1579,7 @@ mod tests {
         assert!(
             received
                 .iter()
-                .all(|frame| frame.principal == SERVER_WRITE_PRINCIPAL)
+                .all(|frame| frame.principal == PLATFORM_AUDIT_PRINCIPAL)
         );
         assert!(
             received

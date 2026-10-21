@@ -31,7 +31,7 @@ uv add "wyrd-ai==0.3.0"
 
 ```bash
 cargo install wyrd-cli --version 0.3.0 --locked
-cargo add wyrd-ai@0.3.0
+cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```
 
 </LangTab>

@@ -4,6 +4,7 @@ description: Run inference through a named Wyrd gateway deployment from the Open
 pillar: wyrd
 section: Connect
 order: 2
+draft: true
 status: runnable
 ---
 

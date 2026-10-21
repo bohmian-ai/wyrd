@@ -1,8 +1,8 @@
 //! The docsite Quickstart in Rust: declare a Service and the Verifier it
 //! references, then judge a passing and a failing refund.
 
-use serde_json::json;
 use wyrd_ai::WyrdError;
+use wyrd_ai::serde_json::json;
 use wyrd_ai::state::WyrdState;
 
 /// Declares `support-reply.yaml` from the working directory, verifies two

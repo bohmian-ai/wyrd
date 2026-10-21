@@ -8,7 +8,6 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
 - [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and judge a passing and a failing reply from Python, Rust, or TypeScript.
-- [Error catalog](/wyrd/api/errors/): every stable error code and its remediation.
 
 ## Home
 
@@ -20,31 +19,9 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 - [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript and start a local server.
 - [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then judge a passing and a failing reply from one Python, Rust, or TypeScript program.
 
-## Build and verify
-
-- [Define a Service](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service as a folder of Card files, with exact component versions and a table for the rows it records, then validate it locally.
-- [Bind a Verifier](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
-- [Declare and inspect a Service](/wyrd/build-and-verify/declare/declare-and-inspect/): Declare a Service and every Card it references in one call, then read back its exact versions and the relationships the server derived.
-- [Record a run and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Pull your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
-- [Write and query custom data with Bifrost](/wyrd/build-and-verify/observe/write-and-query-custom-data-with-bifrost/): Connect to Bifrost directly to register a table, load rows, and query any table you can read with SQL.
-- [Author a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier Card from its inputs and requirements, starting with a one-line assertion and working up to a model judge that cites a document.
-- [Verify a request in real time](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/): Call a bound Verifier from your service while a request is in flight, act on the verdict, and read the requirement breakdown.
-- [Monitor drift](/wyrd/build-and-verify/verify/monitor-drift/): Compare the inputs your service sees with a healthy baseline on a schedule, and get paged when they shift.
-- [Run a verification and inspect its evidence](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/): Queue a Verifier with submit, follow its execution from any process, tell a failed verdict from a check that never ran, and read the stored evidence.
-- [Respond to a failed verification](/wyrd/build-and-verify/verify/respond-to-a-failed-verification/): Page someone when a submitted or scheduled Verifier fails, with an Operator Card, an operator connection, and on_failure, then check that the page was delivered.
-
-## Connect
-
-- [Set up the LLM gateway](/wyrd/connect/set-up-the-llm-gateway/): Store a provider key with the Wyrd server, name a deployment for it, and call the model through Wyrd with your Wyrd credential.
-- [Make gateway requests from a framework](/wyrd/connect/call-wyrd-from-a-stock-client/): Run inference through a named Wyrd gateway deployment from the OpenAI, Anthropic, and Google GenAI SDKs, the OpenAI Agents SDK, and Pydantic AI.
-- [Connect an agent through MCP](/wyrd/connect/connect-an-agent-through-mcp/): Give Claude Code, Codex, Cursor, Copilot, Pi, or Hermes Agent Wyrd's tools with wyrd mcp install, against a local or deployed server.
-
 ## Operate
 
-- [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/): Prepare PostgreSQL with a platform login and a tenant login, migrate it, start the server, and create the first tenant.
-- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
-- [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/): Understand the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
-- [Troubleshoot a deployment](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
+- [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 
 ## Understand
 
@@ -56,11 +33,11 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 ## Reference
 
-- [Verifier Card](/wyrd/reference/verifier-card/): Every field of a Verifier spec, its input slots, steps, checks, operators, references, citations, and outcomes.
-- [MCP tools](/wyrd/reference/mcp-tools/): Exact Wyrd tool names, permissions, argument and result shapes, refusals, and query limits.
-- [Extraction output](/wyrd/reference/extraction-output/): The exact JSON an extract step returns for every media format, how to address it from assertions and citations, and what extraction does not do.
-- [Verification runtime limits](/wyrd/reference/verification-runtime-limits/): Server environment settings that bound Verifier files, extraction, workspaces, Python code, and real-time deadlines, with their defaults and startup rules.
-- [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/): The built-in tools a Verifier's Agent can call, how they are selected, and the permissions every call needs.
+- [Verifier Card](/wyrd/reference/verifier-card/): Fields, input slots, steps, checks, operators, references, citations, and refusals of a Verifier spec.
+- [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
+- [Extraction output](/wyrd/reference/extraction-output/): The JSON an extract step returns for each media format.
+- [Verification runtime limits](/wyrd/reference/verification-runtime-limits/): Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
+- [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
 - [Error codes](/wyrd/api/errors/): Every stable Wyrd error code with its HTTP status, title, and fix.
 - [HTTP API](/wyrd/api/openapi/): Where a Wyrd server serves its OpenAPI document and how to use it.
 

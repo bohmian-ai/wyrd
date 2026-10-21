@@ -20,9 +20,9 @@
     'Get started': { blurb: 'Learn what Wyrd verifies and set up a local server.', kicker: 'Start' },
     'Build and verify': { blurb: 'Declare an AI system, observe its behavior, and verify it.', kicker: 'How-to' },
     Connect: { blurb: 'Use the SDKs, CLI, MCP, and the AI Gateway.', kicker: 'How-to' },
-    Operate: { blurb: 'Deploy Wyrd for a team and manage sign-in and access.', kicker: 'Operate' },
+    Operate: { blurb: 'Configure how a Wyrd server runs verification.', kicker: 'Operate' },
     Understand: { blurb: 'How Cards, verification, Bifrost, and identity fit together.', kicker: 'Explain' },
-    Reference: { blurb: 'Card schemas, APIs, CLI commands, errors, and configuration.', kicker: 'Look up' }
+    Reference: { blurb: 'The Verifier Card, MCP tools, the HTTP API, errors, and runtime limits.', kicker: 'Look up' }
   };
   const doors = navGroups().map((group) => ({ label: group.label, path: group.items[0].path, ...DOORS[group.label] }));
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];

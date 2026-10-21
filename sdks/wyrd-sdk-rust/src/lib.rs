@@ -167,6 +167,11 @@ pub mod cli {
 /// The stable, catalogued error every SDK capability returns.
 pub use wyrd_spec::error::WyrdError;
 
+/// The JSON crate whose `Value` verification inputs and Observations carry,
+/// re-exported so callers build them with `wyrd_ai::serde_json::json!`
+/// without a direct dependency.
+pub use serde_json;
+
 /// A registered Card envelope, as [`cards::Cards::get`] returns it, and its
 /// typed spec.
 pub use wyrd_spec::envelope::{Card, Spec};

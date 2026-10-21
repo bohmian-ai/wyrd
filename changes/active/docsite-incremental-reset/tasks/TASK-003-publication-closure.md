@@ -211,10 +211,28 @@ Choosing draft instead of conditional retention is explicitly in scope.
 ## Authority Links
 
 - [Approved spec revision 7 and exact disposition table](../spec.md)
-- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
-- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
+- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
+- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-design.md)
 - [Bifrost authority](../../../../architecture/bifrost-design.md)
 - [Security authority](../../../../architecture/wyrd-security-posture.md)
 - [Operations authority](../../../../architecture/operations/README.md)
-- [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
-- [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Implementation execution](../../../../changes/implementation-execution.md)
+- [Testing workflows](../../../../TESTING.md)
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 32 pages have evidence-backed dispositions matching production | `../dispositions.md` (32 rows); 16 pages `draft: true` | Built routes: 16 pages + landing; a11y checks 16 pages | PASS |
+| Conditional retention earned; unproven procedures withdrawn | 8 conditional procedures withdrawn; configure-verification-runtime, 5 concepts, 7 references retained and trimmed to Setup-page density per user direction | Source review per row; runtime/catalog tests below | PASS |
+| Only valid published destinations; omitted onboarding/reference and empty sections pass | `generate_llms_txt.py` `START`/`render_start`; `check_links.py` `target_page`/`is_draft` | Scenario 1 and 2 selectors pass; `docs:linkcheck` passes on final corpus | PASS |
+| Site and indexes independent of application examples, including drafts and landing | `svelte.config.js` `stripDrafts`; landing Verifier inline in `+page.server.ts`; published pages embed only `examples/quickstart` | Scenario 3 builds a fixture with no `examples/` beside it, a draft embedding a missing app file, and real Pagefind search (`zebracorn` → none; published token → its page) | PASS |
+| Python application journey stays runnable; MCP catalog runtime proof | No application files changed | `test_support_desk.py::test_published_quickstart_declares_observes_and_verifies` 1 passed; `discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout` passed | PASS |
+| Visuals, a11y, themes intact | No style/layout changes; two landing blurbs reworded | `docs:check` (96 tests, build, a11y AA light+dark) passes; keyboard/responsive manual review not performed | PASS (manual review open) |
+
+Commands: the three exact Scenario selectors; `mise run docs:check`; `mise run docs:svelte:check` (0 errors);
+`cargo nextest run -p wyrd-server --lib -E 'test(=config::tests::verification_limits_env_applies_and_refuses) | test(=verification::hosted::tests::memory_ceilings_cap_live_workers)'`;
+under `with-test-postgres.sh`: `-p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout)'` and
+`-p wyrd-server --test integration --run-ignored=all -E 'test(=sandbox_worker::sandbox_bounds_workers_and_waiters) | test(=pg_hosted_artifacts::capacity_refusal_is_busy_at_every_hosted_consumer) | test(=pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees)'`; `git diff --check`.
+
+Limits: a draft's frontmatter (title, description) still compiles into the client content map; its body does not. The landing Verifier is now page-owned and no longer backed by an application test. Two page-text tests that pinned withdrawn record-a-run content were removed; the range-embed test now uses Quickstart source. Non-goals held: no server/SDK/CLI changes, no new registry, loader, or crawler. Uncommitted `examples/quickstart/quickstart.rs`, `sdks/wyrd-sdk-rust/*`, and `get-started/setup.md` edits predate this task and are not part of it.

@@ -445,7 +445,7 @@ selection.
 - **Verification side (b1b8f25f7):** `CreateTableRequest { table, user_fields, tenant, physical_layout }`.
 - **Forge side (2880705a0):** Adds `pub audit: Option<AuditEvent>` (an audit event committed with the control row), and the test passes `audit: None`.
 - **Resolution:** The merged `CreateTableRequest` has no `audit` field. The `audit: None` line in `configured_default_deadline_is_shared_by_local_and_forwarded_queries` is deleted.
-- **Why:** Audit has one write path, the non-blocking outbox to `vala.audit_staging` (AGENTS.md §2). Committing audit inline with a catalog row contradicts that, so the verification side wins.
+- **Why:** Audit has one write path, the non-blocking outbox to `vala.audit_staging` (AGENTS.md). Committing audit inline with a catalog row contradicts that, so the verification side wins.
 - **Replay rule:** Delete every `audit: None` and `audit: Some(..)` in `CreateTableRequest` literals. bifrost-variant 509f972c6 has them in `src/bifrost/forge_harness.rs`, `query_fixture.rs` and `scribe_workload.rs`.
 - **Commit:** ce866229d
 
@@ -525,7 +525,7 @@ selection.
   - In published.rs the existing float_cmp `#[expect]` moves below Forge's `# Panics` doc.
   - In distributed.rs, `Duration::from_secs(180)` becomes `from_mins(3)`, `from_secs(120)` becomes `from_mins(2)`, and `.map(|group| group.num_rows())` becomes `.map(parquet::file::metadata::RowGroupMetaData::num_rows)`.
   - In src/capacity.rs `Percentiles`, `use num_traits::ToPrimitive;` is added and `(... .ceil() as usize)` becomes `let rank = (q * sorted.len() as f64).ceil().to_usize().unwrap_or(0); let index = rank.clamp(1, sorted.len()) - 1;`.
-- **Why:** These are needed for the `mise run lints` (`--all-features`) gate. AGENTS.md §12 forbids `#[allow]`, so suppressions use `#[expect]` with a reason, and the rest are rewritten.
+- **Why:** These are needed for the `mise run lints` (`--all-features`) gate. AGENTS.md forbids `#[allow]`, so suppressions use `#[expect]` with a reason, and the rest are rewritten.
 - **Replay rule:** After merging bifrost-variant, run `mise run lints` and fix each finding in Forge-origin wyrd-testing code with the same idioms: `Box::pin` large futures, `#[expect(clippy::float_cmp, reason=...)]` only where equality is exact, `from_mins`/`from_hours`, method paths instead of closures, `ToPrimitive` instead of `as` casts. Never add `#[allow]`.
 - **Commit:** ce866229d
 
@@ -855,7 +855,7 @@ The variant forked from Forge at `5ab92b003`. These first-parent Forge commits u
 
 ### L63. Forge packet review records and authority docs
 - **Kind:** forge-delta-missing-from-variant
-- **Files:** AGENTS.md, architecture/agent-rules.md, architecture/bifrost-design.md, architecture/references/languages/maintainer-style.md, changes/active/forge-concurrent-planning/**, crates/vala/vala-bifrost-redux/src/oracle/analytical_supervisor.rs (docs)
+- **Files:** AGENTS.md, AGENTS.md, architecture/bifrost-design.md, agent_docs/maintainer-style.md, changes/active/forge-concurrent-planning/**, crates/vala/vala-bifrost-redux/src/oracle/analytical_supervisor.rs (docs)
 - **Verification side (b1b8f25f7):** Absent.
 - **Forge side (2880705a0):** Spec revision 12, the packet-wide review of 7fcb45fc1, TASK-PACKET-R2 evidence, and corrected Analytical ownership docs.
 - **Resolution:** HEAD keeps them.

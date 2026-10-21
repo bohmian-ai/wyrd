@@ -90,4 +90,4 @@ unpublished artifact or new product/deployment capability.
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
 - [Bifrost design](../../../../architecture/bifrost-design.md)
-- [Architecture constraints](../../../../architecture/references/doctrine/architecture-constraints.md)
+- [Architecture constraints](../../../../architecture/wyrd-design.md)

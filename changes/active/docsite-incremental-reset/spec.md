@@ -283,8 +283,7 @@ Delete the code that exists only for the removed behavior: `wyrd-interfaces`,
 SDK Model/Data hydration and interface overrides, and Model/Data artifact
 upload, pull, and trust. Artifact upload and integrity remain. Update the
 kind list and positioning wording in `AGENTS.md`, `architecture/wyrd-design.md`,
-`architecture/wyrd-doctrine.mdx`, and
-`architecture/references/doctrine/positioning-and-vocabulary.md`, and
+`architecture/wyrd-design.md`, and
 regenerate the derived contracts. Wyrd has no released compatibility promise
 for these kinds: stored envelopes of removed kinds and of old Model/Data
 shapes are removed by migration, with no compatibility read path or alias.
@@ -397,13 +396,13 @@ artifacts blocks publication and must be reported.
   incremental docsite reset, full page disposition, and first small journey.
 
 - [Repository standards](../../../AGENTS.md)
-- [Agent rules](../../../architecture/agent-rules.md)
+- [Agent rules](../../../AGENTS.md)
 - [Protocol authority](../../../architecture/wyrd-design.md)
-- [Public doctrine](../../../architecture/wyrd-doctrine.mdx)
+- [Public doctrine](../../../architecture/wyrd-design.md)
 - [Bifrost authority for retained explanations](../../../architecture/bifrost-design.md)
 - [Security authority](../../../architecture/wyrd-security-posture.md)
-- [Spec workflow](../../../architecture/references/languages/spec-driven-development.md)
-- [Testing workflow](../../../architecture/references/languages/testing-workflows.md)
+- [Spec workflow](../../../changes/spec-driven-development.md)
+- [Testing workflow](../../../TESTING.md)
 - [Current docsite product guidance](../../../docs/PRODUCT.md)
 - [Current contributor guidance](../../../docs/CONTRIBUTING.md)
 - [Earlier approved rebuild](../developer-docsite-rebuild/spec.md)

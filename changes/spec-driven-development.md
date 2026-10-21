@@ -1,21 +1,23 @@
 # Spec-Driven Development
 
-This reference defines Wyrd's human-approved, spec-driven development workflow
-and its test-driven execution discipline. It governs change specifications,
-implementation tasks, task review, remediation, and final change verification.
-It does not replace `AGENTS.md` or the architecture authorities.
+This file defines Wyrd's human-approved, spec-driven development workflow and
+its test-driven execution discipline: change specifications, implementation
+tasks, task review, remediation, and final change verification. Execution
+discipline for one task is in
+[implementation execution](implementation-execution.md).
 
 ## Authority
 
-Apply change authority in this order:
+Apply instructions in this order, for spec-driven changes and bounded direct
+instructions alike:
 
 1. current user instructions and explicitly approved outcomes;
-2. `AGENTS.md`, `architecture/agent-rules.md`, and every applicable architecture
-   authority;
-3. the approved change specification revision;
+2. applicable `AGENTS.md` files and every applicable architecture authority;
+3. the approved change specification revision, when the work belongs to one;
 4. ready implementation and remediation tasks derived from that revision;
 5. tests that express the mapped specification obligations;
-6. implementation and review evidence.
+6. repository conventions consistent with the authorities above;
+7. local implementation preferences.
 
 Tests and code never silently redefine an approved specification. When a task,
 test, repository discovery, or implementation conflicts with a requirement,
@@ -284,35 +286,9 @@ required.
 
 ## Test command precision
 
-Use `mise run <task>` for the repository's module-, crate-, family-,
-environment-, or aggregate-level lanes. Inspect `mise.toml` before selecting a
-lane.
-
-Every named test in a task must also carry its exact focused command. Run the
-repository-pinned toolchain through `mise exec --`. For Rust this normally uses
-`cargo nextest run`, an explicit package and target, and an exact test
-expression. Examples:
-
-```bash
-mise exec -- cargo nextest run --locked -p <crate> --lib \
-  -E 'test(=module::tests::test_name)'
-
-mise exec -- cargo nextest run --locked -p <crate> --test <target> \
-  -E 'test(=test_name)'
-```
-
-When the test requires repository-managed Postgres or another environment, the
-exact command must include the owning setup wrapper or use the narrowest
-environment-owning `mise` task. Confirm existing test names from source and,
-when needed, `mise exec -- cargo nextest list`. A new test name may be explicitly
-marked planned: confirm its existing package, target, runner and setup during
-planning, then confirm the actual selector after adding the test, before RED.
-Do not invent targets or present a planned test as already existing. Avoid
-positional filters that can accidentally select no test.
-
-Named Python and TypeScript tests likewise carry the exact repository-native
-pytest or package-runner command, path, and selector plus any required setup.
-Do not replace a named-test command with only a package-wide `mise run` lane.
+Every named test in a task carries its exact focused command, as defined in
+[`TESTING.md`](../TESTING.md#named-tests). A package-wide `mise run` lane never
+replaces a named-test command.
 
 ## TDD execution
 

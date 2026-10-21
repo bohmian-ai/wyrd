@@ -69,7 +69,7 @@ Read before editing:
 6. `changes/active/wyrd-ui-foundation/reviews/TASK-001-visual-acceptance.md`.
 7. `architecture/wyrd-design.md`, especially Service, observation identity,
    publication bindings, relationships, Eval, Drift, Trigger, and Operator.
-8. `architecture/wyrd-doctrine.mdx`.
+8. `architecture/wyrd-design.md`.
 9. `architecture/bifrost-design.md`, especially typed observation queries and
    tenant-scoped analytical projection.
 10. `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md`.

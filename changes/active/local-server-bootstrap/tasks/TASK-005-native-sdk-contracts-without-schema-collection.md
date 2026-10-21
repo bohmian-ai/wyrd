@@ -324,12 +324,12 @@ typing. Reversible wrapper/declaration mechanics remain implementation-owned.
 - [Approved spec revision 6](../spec.md): REQ-017–REQ-019, INV-005, D-006,
   AC-009–AC-010; prior bootstrap obligations remain intact.
 - [AGENTS.md](../../../../AGENTS.md), especially §§2, 5, 7–12, 14 and 16.
-- [Agent rules](../../../../architecture/agent-rules.md).
+- [Agent rules](../../../../AGENTS.md).
 - [Protocol authority](../../../../architecture/wyrd-design.md) and
-  [doctrine](../../../../architecture/wyrd-doctrine.mdx).
-- [PyO3 boundaries](../../../../architecture/references/languages/pyo3-boundaries.md),
-  [Python API/stubs](../../../../architecture/references/languages/python-api-and-stubs.md),
-  [TypeScript guide](../../../../architecture/references/languages/typescript-guide.md).
-- [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md),
-  [implementation execution](../../../../architecture/references/languages/implementation-execution.md),
-  [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+  [doctrine](../../../../architecture/wyrd-design.md).
+- [PyO3 boundaries](../../../../sdks/wyrd-sdk-python/AGENTS.md),
+  [Python API/stubs](../../../../sdks/wyrd-sdk-python/AGENTS.md),
+  [TypeScript guide](../../../../sdks/wyrd-sdk-ts/AGENTS.md).
+- [Spec-driven development](../../../../changes/spec-driven-development.md),
+  [implementation execution](../../../../changes/implementation-execution.md),
+  [testing workflows](../../../../TESTING.md).

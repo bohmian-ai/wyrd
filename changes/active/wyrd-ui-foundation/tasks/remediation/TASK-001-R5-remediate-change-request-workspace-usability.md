@@ -88,7 +88,7 @@ Read before editing:
 2. `changes/active/wyrd-ui-foundation/tasks/TASK-001-route-mapped-svg-mocks.md`.
 3. `changes/active/wyrd-ui-foundation/tasks/remediation/TASK-001-R1-remediate-product-mock-composition.md`.
 4. `changes/active/wyrd-ui-foundation/reviews/TASK-001-visual-acceptance.md`.
-5. `architecture/wyrd-design.md` and `architecture/wyrd-doctrine.mdx`.
+5. `architecture/wyrd-design.md` and `architecture/wyrd-design.md`.
 6. `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md`.
 7. `crates/wyrd/wyrd-server/wyrd-ui/brand/renders/workbench.html` and
    `styleguide.html`.

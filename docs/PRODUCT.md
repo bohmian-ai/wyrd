@@ -87,10 +87,9 @@ Hosted Wyrd SaaS workflows are out of scope until explicitly added.
 
 ## Evidence on Hand
 
-- Protocol and product authority: `architecture/wyrd-design.md` and
-  `architecture/wyrd-doctrine.mdx`.
+- Protocol and product authority: `architecture/wyrd-design.md`.
 - Repository contribution and contract rules: `AGENTS.md` and
-  `architecture/agent-rules.md`.
+  `agent_docs/`.
 - Approved brand assets and constraints:
   `crates/wyrd/wyrd-server/wyrd-ui/brand`.
 - Existing documentation implementation and content: `docs/`.

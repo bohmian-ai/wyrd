@@ -86,7 +86,7 @@ new public Bifrost behavior.
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
 - [Bifrost design](../../../../architecture/bifrost-design.md)
-- [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+- [Testing workflow](../../../../TESTING.md)
 
 ## MCP investigation slice evidence
 

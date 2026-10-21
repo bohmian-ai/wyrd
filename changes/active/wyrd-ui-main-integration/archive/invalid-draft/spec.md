@@ -370,16 +370,10 @@ generation tool remain implementation-owned within the requirements above.
 ## Authority links
 
 - `AGENTS.md`
-- `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
-- `architecture/references/README.md`
-- `architecture/references/doctrine/positioning-and-vocabulary.md`
-- `architecture/references/doctrine/architecture-constraints.md`
-- `architecture/references/architecture/patterns.md`
-- `architecture/references/domain/telemetry-observations.md`
-- `architecture/references/domain/evaluation.md`
-- `architecture/references/domain/drift-monitoring.md`
-- `architecture/references/languages/spec-driven-development.md`
-- `architecture/references/languages/testing-workflows.md`
+- `.agents/skills/wyrd-advise/references/telemetry-observations.md`
+- `.agents/skills/wyrd-advise/references/evaluation.md`
+- `.agents/skills/wyrd-advise/references/drift-monitoring.md`
+- `changes/spec-driven-development.md`
+- `TESTING.md`

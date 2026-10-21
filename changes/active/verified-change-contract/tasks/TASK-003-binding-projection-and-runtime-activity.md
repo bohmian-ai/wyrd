@@ -184,7 +184,6 @@ or weakened RLS/audit behavior.
 - `changes/active/verified-change-contract/spec.md`
 - `changes/active/verified-change-contract/architecture/verification-control-flow.html`
 - `architecture/wyrd-security-posture.md`
-- `architecture/agent-rules.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

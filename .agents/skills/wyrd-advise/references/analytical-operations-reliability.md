@@ -156,7 +156,7 @@ repair paths that bypass tenant or audit checks.
 ## Stable Wyrd anchors
 
 - Bifrost lifecycle: `architecture/bifrost-design.md`.
-- SQL and audit boundaries: `architecture/agent-rules.md`.
+- SQL and audit boundaries: `AGENTS.md` and `crates/wyrd/wyrd-sql/AGENTS.md`.
 - Engine owners: `crates/vala/vala-bifrost-redux/`.
 - Catalog/control state: `crates/vala/vala-sql/`.
 - Serving lifecycle: `crates/wyrd/wyrd-server/`.

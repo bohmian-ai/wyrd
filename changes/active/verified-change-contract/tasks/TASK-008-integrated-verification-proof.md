@@ -173,10 +173,9 @@ does not justify weakening proof.
 - `changes/active/verified-change-contract/spec.md`
 - all documents under `changes/active/verified-change-contract/architecture/`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
 - `architecture/wyrd-security-posture.md`
-- `architecture/references/languages/testing-workflows.md`
+- `TESTING.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

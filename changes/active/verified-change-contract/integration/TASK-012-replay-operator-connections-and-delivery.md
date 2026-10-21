@@ -227,7 +227,6 @@ or repairable red gate alone is not a material stop condition.
 - `changes/active/verified-change-contract/review/TASK-007-r6/verdict.md` on `vcc/task-007` (historical source verdict)
 - `architecture/wyrd-design.md`
 - `architecture/wyrd-security-posture.md`
-- `architecture/agent-rules.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

@@ -147,8 +147,8 @@ consumers, affected examples/tests/fixtures, manifests and lockfiles. Remove
 or data utilities still needed by surviving capabilities.
 
 Update `AGENTS.md`, `architecture/wyrd-design.md`,
-`architecture/wyrd-doctrine.mdx`, and
-`architecture/references/doctrine/positioning-and-vocabulary.md`; regenerate
+`architecture/wyrd-design.md`, and
+`architecture/wyrd-design.md`; regenerate
 derived contracts/docs through their owners. This is consumer closure, not a
 general documentation rewrite or permission to edit other change packets.
 
@@ -208,7 +208,7 @@ ordinary field naming and private structure remain implementation-owned.
 
 - [Approved spec revision 8](../spec.md), REQ-008/AC-009
 - [Declaration dependency](TASK-005-declare-ready-state.md), subject to revision 8
-- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
-- [Protocol](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), and [vocabulary](../../../../architecture/references/doctrine/positioning-and-vocabulary.md)
+- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
+- [Protocol](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-design.md), and [vocabulary](../../../../architecture/wyrd-design.md)
 - [Security](../../../../architecture/wyrd-security-posture.md) and [Bifrost boundary](../../../../architecture/bifrost-design.md)
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), and [testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Spec workflow](../../../../changes/spec-driven-development.md), [implementation execution](../../../../changes/implementation-execution.md), and [testing workflows](../../../../TESTING.md)

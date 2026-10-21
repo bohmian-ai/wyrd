@@ -425,8 +425,8 @@ None.
 
 ## Authority and revision history
 
-- `AGENTS.md` §§2, 9, 11; `architecture/wyrd-design.md`;
-  `architecture/wyrd-doctrine.mdx`; `architecture/wyrd-security-posture.md`;
+- `AGENTS.md`; `architecture/wyrd-design.md`;
+  `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`;
   `architecture/operations/deployment-and-release.md`.
 - `changes/active/verified-change-contract/spec.md` REQ-153–REQ-158,
   especially REQ-156–REQ-157. An approved revision supersedes only the

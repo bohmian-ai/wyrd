@@ -95,7 +95,7 @@ cancelled, indeterminate, and failed checks remain distinct terminal states.
 ## Stable Wyrd anchors
 
 - Verifier contract: `architecture/wyrd-design.md` §Verifier.
-- Authoring types: `crates/wyrd-spec/src/card/blocks/`.
+- Authoring types: `crates/wyrd-spec/src/card/verifier/`.
 - Result types: `crates/wyrd-spec/src/verification/execution.rs`.
 
 ## Primary grounding

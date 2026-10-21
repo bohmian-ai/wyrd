@@ -142,7 +142,7 @@ credential or permission contract different from the approved shared path.
 ## Authority Links
 
 `changes/active/local-server-bootstrap/spec.md` revision 5;
-`AGENTS.md` §§2, 9, 11; `architecture/references/languages/agent-harness.md`;
+`AGENTS.md`; `agent_docs/agent-surfaces.md`;
 `architecture/wyrd-security-posture.md`.
 
 ## Implementation Evidence

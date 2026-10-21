@@ -163,8 +163,8 @@ the current selector's source classification are implementation-owned.
 ## Authority Links
 
 - [Approved spec revision 7](../spec.md)
-- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)
-- [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
-- [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
+- [Spec workflow](../../../../changes/spec-driven-development.md)
+- [Implementation execution](../../../../changes/implementation-execution.md)
+- [Testing workflows](../../../../TESTING.md)
 - [Earlier packet](../../developer-docsite-rebuild/spec.md)

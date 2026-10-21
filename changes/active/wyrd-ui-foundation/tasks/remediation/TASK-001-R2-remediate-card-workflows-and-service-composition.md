@@ -70,7 +70,7 @@ Read before editing:
 4. `changes/active/wyrd-ui-foundation/reviews/TASK-001-visual-acceptance.md`.
 5. `architecture/wyrd-design.md`, especially Prompt, Agent, Service, Drift,
    Eval, Trigger, Operator, relationships, and reference directions.
-6. `architecture/wyrd-doctrine.mdx`.
+6. `architecture/wyrd-design.md`.
 7. `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md`.
 8. `crates/wyrd/wyrd-server/wyrd-ui/brand/renders/workbench.html`.
 9. `crates/wyrd/wyrd-server/wyrd-ui/brand/renders/styleguide.html`.

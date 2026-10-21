@@ -127,11 +127,11 @@ within the approved experience is implementation-owned.
 ## Authority Links
 
 - [Approved spec revision 7](../spec.md) and [executable prerequisite](TASK-001-minimal-local-verification.md)
-- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
-- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)
-- [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
-- [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
+- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-design.md)
+- [Spec workflow](../../../../changes/spec-driven-development.md)
+- [Implementation execution](../../../../changes/implementation-execution.md)
+- [Testing workflows](../../../../TESTING.md)
 
 ## Implementation Evidence
 

@@ -308,10 +308,8 @@ client-behavior work outside this specification.
 ## Authority and context
 
 - [`AGENTS.md`](../../../AGENTS.md)
-- [`architecture/agent-rules.md`](../../../architecture/agent-rules.md)
 - [`architecture/wyrd-design.md`](../../../architecture/wyrd-design.md)
-- [`architecture/wyrd-doctrine.mdx`](../../../architecture/wyrd-doctrine.mdx)
 - [`architecture/bifrost-design.md`](../../../architecture/bifrost-design.md)
-- [`architecture/references/languages/spec-driven-development.md`](../../../architecture/references/languages/spec-driven-development.md)
+- [`changes/spec-driven-development.md`](../../../changes/spec-driven-development.md)
 - [Canonical brand design](../../../crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md)
 - [Existing documentation product brief](../../../docs/PRODUCT.md)

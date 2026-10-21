@@ -173,9 +173,8 @@ reference model, a new permission, or changes to approved Drift/Eval semantics.
 - `changes/active/verified-change-contract/spec.md`
 - `changes/active/verified-change-contract/architecture/verification-control-flow.html`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/wyrd-security-posture.md`
-- `architecture/references/languages/spec-driven-development.md`
+- `changes/spec-driven-development.md`
 - `AGENTS.md`
 
 

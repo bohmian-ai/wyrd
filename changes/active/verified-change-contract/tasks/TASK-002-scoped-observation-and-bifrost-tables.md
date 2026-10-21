@@ -215,7 +215,7 @@ schema supplied by callers, or weakened reserved-table/scope authorization.
 - `changes/active/verified-change-contract/architecture/logic/run_api.md`
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
 - `architecture/bifrost-design.md`
-- `architecture/references/languages/testing-workflows.md`
+- `TESTING.md`
 - `AGENTS.md`
 
 ## Implementation Record
@@ -288,7 +288,7 @@ use `vala.datasets.*` and the rule is stated with them.
 
 Running every Bifrost lane to completion on a Linux host exposed eight defects
 that had been masked behind each other. None originates in this task's write
-set; each is fixed here rather than recorded as known, per AGENTS.md §12.
+set; each is fixed here rather than recorded as known, per AGENTS.md.
 
 | Commit | Layer | Defect |
 |---|---|---|

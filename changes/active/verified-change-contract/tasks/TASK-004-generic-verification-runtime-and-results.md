@@ -244,7 +244,7 @@ concurrency limits, or changed audit cardinality.
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
 - `architecture/wyrd-security-posture.md`
 - `architecture/bifrost-design.md`
-- `architecture/references/languages/implementation-execution.md`
+- `changes/implementation-execution.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

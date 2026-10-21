@@ -86,4 +86,4 @@ documented declaration outcome, or if a public contract change is required.
 - [Approved specification](../spec.md)
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
-- [Positioning and vocabulary](../../../../architecture/references/doctrine/positioning-and-vocabulary.md)
+- [Positioning and vocabulary](../../../../architecture/wyrd-design.md)

@@ -40,6 +40,6 @@ None. Both Jev ingress forms are required. The single-message JSON shape is the 
 
 ## Authority and revision
 
-- `AGENTS.md` §§2, 9–11; `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`; `architecture/references/architecture/patterns.md`.
+- `AGENTS.md`; `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`; `architecture/wyrd-design.md`.
 - Provider grounding: [TypeSafe Jev API](https://docs.typesafe.ai/api), [Jev models](https://docs.typesafe.ai/models), [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/), [DeepSeek Responses](https://api-docs.deepseek.com/api/create-response/), [DeepSeek Anthropic format](https://api-docs.deepseek.com/guides/anthropic_api/), [DeepSeek issue #35](https://github.com/bohmian-ai/wyrd/issues/35).
 - Revision 1 — draft, 2026-09-25: native Jev provider and qualified DeepSeek support.

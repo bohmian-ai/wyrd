@@ -251,8 +251,8 @@ installation hook; do not monkey-patch it.
 - `changes/active/verified-change-contract/architecture/logic/run_api.md`
 - `architecture/wyrd-design.md`
 - `architecture/bifrost-design.md`
-- `architecture/references/domain/telemetry-observations.md`
-- `architecture/references/languages/testing-workflows.md`
+- `.agents/skills/wyrd-advise/references/telemetry-observations.md`
+- `TESTING.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

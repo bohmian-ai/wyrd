@@ -204,11 +204,11 @@ journey aggregate belongs in this task.
 ## Authority Links
 
 - [Approved spec revision 7](../spec.md)
-- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
-- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-doctrine.mdx)
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md)
-- [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
-- [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
+- [Protocol](../../../../architecture/wyrd-design.md) and [doctrine](../../../../architecture/wyrd-design.md)
+- [Spec workflow](../../../../changes/spec-driven-development.md)
+- [Implementation execution](../../../../changes/implementation-execution.md)
+- [Testing workflows](../../../../TESTING.md)
 - Use `$wyrd-implement`; consult the security and operations authorities before
   publishing their corresponding claims.
 
@@ -264,7 +264,7 @@ macOS blocker diagnosis:
   `shared_memory_cap` (`crates/vala/vala-bifrost-redux/src/resources.rs`)
   requires that cap ≤ process memory − 1 GiB server minimum. Every macOS host
   without the variable fails. Present in 0.2.0 and at HEAD. The
-  `cfg!(target_os = "macos")` probe also conflicts with AGENTS.md §2.
+  `cfg!(target_os = "macos")` probe also conflicts with AGENTS.md.
 - **Fix site:** the CLI's memory supply (outside this task's write set), then a
   release. Until then Setup cannot publish a workaround-free macOS path.
 

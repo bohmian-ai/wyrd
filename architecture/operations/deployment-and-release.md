@@ -14,6 +14,10 @@ contain multiple replicas and role-targeted pods behind one gateway.
 | Cloud SaaS | Multi-tenant | Shared serving fleet with full tenant separation in identity, RLS, object paths, encryption, resource admission, audit, telemetry, and generated artifacts |
 | Enterprise cloud | One tenant per deployment | The same server and protocol contracts, isolated storage and keys, and no in-tree commercial feature or compatibility fork |
 
+Every topology keeps the platform login and pool. Self-hosted deployments
+provision and recover tenants through it, Cloud SaaS keeps it a small audited
+pool, and enterprise cloud holds it as a break-glass credential.
+
 Replicas may enable a subset of server roles through the canonical target
 configuration. Targeting changes activated subsystems and resource ownership;
 it does not create another public service, protocol, or durable contract.
@@ -179,7 +183,8 @@ The release pipeline must:
    contract.
 2. Acquire one deployment-scoped migration lease.
 3. Verify the source schema and application compatibility range.
-4. Apply Wyrd and Vala migrations in their declared order.
+4. Apply `wyrd_sql::migrate`, then `vala_sql::migrate`, so tenant-aware
+   `vala.*` rows can reference Wyrd control-plane state. Skald has no step.
 5. Verify schema invariants, RLS policies, role grants, required sentinels, and
    migration checksums.
 6. Exit the migrate process. Application replicas re-verify migration

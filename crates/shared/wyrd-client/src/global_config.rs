@@ -16,12 +16,12 @@ pub struct GlobalConfig {
     /// Client connection and credential settings.
     #[serde(default)]
     pub client: ClientSection,
-    /// Non-secret settings `wyrd server dev` resolved and reuses on restart.
+    /// Non-secret settings `wyrd init` resolved and reuses on restart.
     #[serde(default)]
     pub dev: DevSection,
 }
 
-/// Local development selection saved by `wyrd server dev`.
+/// Local development selection saved by `wyrd init`.
 ///
 /// Every value is non-secret; database URLs live in the protected
 /// `credentials.toml` `[dev]` table instead. Paths are absolute so a restart
@@ -41,7 +41,7 @@ pub struct DevSection {
     pub bifrost_data_dir: Option<String>,
 }
 
-/// Database URLs `wyrd server dev` keeps in the protected credentials file.
+/// Database URLs `wyrd init` keeps in the protected credentials file.
 #[derive(Default, Deserialize)]
 struct DevDatabaseFile {
     /// `[dev]`; absent means nothing saved.

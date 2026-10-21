@@ -273,7 +273,7 @@ credential.
   inside the authenticated payload, so an envelope copied into another
   tenant's or credential's row does not open. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
-- `wyrd server dev` keeps local database URLs and the tenant key only in the
+- `wyrd init` keeps local database URLs and the tenant key only in the
   protected `credentials.toml`; `config.toml` `[dev]` holds non-secret
   settings. Gateway documents name provider keys as `local_env` sources the
   CLI resolves at apply time, and the server applies a composite document

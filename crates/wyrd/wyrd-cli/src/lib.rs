@@ -15,6 +15,8 @@ mod client;
 pub mod declaration;
 pub mod error;
 pub mod gateway;
+/// `wyrd init`: local server bootstrap and its guided setup handoff.
+pub mod init;
 pub mod load;
 /// `wyrd mcp`: MCP host installation and the host-facing stdio proxy.
 pub mod mcp;
@@ -139,7 +141,7 @@ pub fn install_tracing(json: bool) -> Result<(), error::WyrdCliError> {
 
 /// Open `path` for appending diagnostics, creating it and its directory.
 ///
-/// Shared by JSON mode's CLI tracing log and `server dev`'s diagnostic log, so
+/// Shared by JSON mode's CLI tracing log and `wyrd init`'s diagnostic log, so
 /// both keep machine streams clean the same way.
 ///
 /// # Errors

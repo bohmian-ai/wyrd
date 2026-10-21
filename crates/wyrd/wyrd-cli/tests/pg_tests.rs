@@ -133,7 +133,7 @@ impl LocalDev {
     /// settled before panic.
     async fn start(&mut self, hosts: &[&str]) {
         let mut command = self.command();
-        command.args(["server", "dev", "--tenant", "local"]);
+        command.args(["init", "--tenant", "local"]);
         for host in hosts {
             command.args(["--host", host]);
         }
@@ -148,8 +148,7 @@ impl LocalDev {
     async fn start_json(&mut self) {
         let mut command = self.command();
         command.args([
-            "server",
-            "dev",
+            "init",
             "--tenant",
             "local",
             "--non-interactive",
@@ -161,7 +160,7 @@ impl LocalDev {
         assert_eq!(ready["ready"], true);
     }
 
-    /// Spawn the prepared `server dev` command and wait for readiness.
+    /// Spawn the prepared `wyrd init` command and wait for readiness.
     ///
     /// # Panics
     /// Panics as [`LocalDev::start`] does.
@@ -519,8 +518,7 @@ async fn server_dev_first_run_is_client_ready() {
     )
     .expect("non-loopback server file");
     let json_args = [
-        "server",
-        "dev",
+        "init",
         "--tenant",
         "local",
         "--non-interactive",
@@ -696,7 +694,7 @@ async fn server_dev_first_run_is_client_ready() {
     assert!(!diagnostics.contains("wyrd_sk_") && !diagnostics.contains(local.dsn.expose_secret()));
 }
 
-/// Decode a JSON-mode `server dev` refusal: nonzero exit, empty stdout, and
+/// Decode a JSON-mode `wyrd init` refusal: nonzero exit, empty stdout, and
 /// one `WYRD_CLI_503_SERVER_DEV` document as the whole of stderr.
 ///
 /// # Panics
@@ -748,7 +746,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
             format!("http://{}", proxy.local_addr().expect("proxy address")),
         )
         .env("NO_PROXY", "")
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -780,7 +778,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let missing = local
         .command()
         .env_remove("WYRD_DATABASE_URL")
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .output()
         .await
         .expect("missing input");
@@ -789,7 +787,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let exposed = local
         .command()
         .env("WYRD_GRPC_BIND", "0.0.0.0:50051")
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .output()
         .await
         .expect("non-loopback gRPC input");
@@ -809,7 +807,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let refused = local
         .command()
         .env("WYRD_DATABASE_URL", restricted.as_str())
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .output()
         .await
         .expect("restricted migration");
@@ -825,7 +823,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         .env("APP_ENV", "production")
         .env_remove("WYRD_SIGNING_KEY_FILE")
         .env_remove("WYRD_SIGNING_KEY_PEM")
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .output()
         .await
         .expect("hardened startup");
@@ -848,7 +846,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         local
             .command()
             .env("PATH", tools.path())
-            .args(["server", "dev", "--tenant", "local"])
+            .args(["init", "--tenant", "local"])
             .output()
             .await
             .expect("missing Node"),
@@ -861,7 +859,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         local
             .command()
             .env("PATH", tools.path())
-            .args(["server", "dev", "--tenant", "local"])
+            .args(["init", "--tenant", "local"])
             .output()
             .await
             .expect("incompatible Node"),
@@ -872,7 +870,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     refused_ui(
         local
             .command()
-            .args(["server", "dev", "--tenant", "local"])
+            .args(["init", "--tenant", "local"])
             .output()
             .await
             .expect("missing UI payload"),
@@ -883,7 +881,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     refused_ui(
         local
             .command()
-            .args(["server", "dev", "--tenant", "local"])
+            .args(["init", "--tenant", "local"])
             .output()
             .await
             .expect("occupied UI listener"),
@@ -957,7 +955,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
             command.env("WYRD_PLATFORM_CREDENTIAL", platform);
         }
         let refused = command
-            .args(["server", "dev", "--tenant", "another", "--non-interactive"])
+            .args(["init", "--tenant", "another", "--non-interactive"])
             .output()
             .await
             .expect("unselected key");
@@ -994,7 +992,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let mut command = elsewhere.command();
     command
         .env("WYRD_SIGNING_KEY_PEM", signing.expose_secret())
-        .args(["server", "dev", "--tenant", "local"]);
+        .args(["init", "--tenant", "local"]);
     elsewhere.start_with(command).await;
     let token = elsewhere
         .client()
@@ -1037,7 +1035,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
                 .as_str(),
         )
         .env("WYRD_BIFROST_DATA_DIR", data.join("bifrost"))
-        .args(["server", "dev", "--non-interactive"])
+        .args(["init", "--non-interactive"])
         .output()
         .await
         .expect("login-masked key");
@@ -1074,7 +1072,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     let switched = local
         .command()
         .env("WYRD_DATABASE_URL", other_dsn.expose_secret())
-        .args(["server", "dev", "--non-interactive"])
+        .args(["init", "--non-interactive"])
         .output()
         .await
         .expect("another database");
@@ -1141,7 +1139,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         let refused = local
             .command()
             .env("WYRD_CONFIG_HOME", remote.path())
-            .args(["server", "dev", "--tenant", "local", "--non-interactive"])
+            .args(["init", "--tenant", "local", "--non-interactive"])
             .output()
             .await
             .expect("remote selection");
@@ -1164,7 +1162,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         .expect("read-only directory");
     let failed = partial
         .command()
-        .args(["server", "dev", "--tenant", "local"])
+        .args(["init", "--tenant", "local"])
         .output()
         .await
         .expect("failed one-time persistence");
@@ -1199,7 +1197,7 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
             command.env("WYRD_PLATFORM_CREDENTIAL", platform);
         }
         let retried = command
-            .args(["server", "dev", "--non-interactive"])
+            .args(["init", "--non-interactive"])
             .output()
             .await
             .expect("lost-key retry");
@@ -1236,7 +1234,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
     let fresh = local
         .command()
         .env_remove("WYRD_DATABASE_URL")
-        .args(["server", "dev", "--non-interactive"])
+        .args(["init", "--non-interactive"])
         .output()
         .await
         .expect("missing inputs");
@@ -1263,7 +1261,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
     ] {
         let output = local
             .command()
-            .args(["server", "dev", "--non-interactive"])
+            .args(["init", "--non-interactive"])
             .args(refused)
             .output()
             .await
@@ -1302,7 +1300,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
         .env_remove("WYRD_SERVER_BIND")
         .env_remove("WYRD_GRPC_BIND")
         .env_remove("WYRD_BIFROST_DATA_DIR")
-        .args(["server", "dev", "--non-interactive"]);
+        .args(["init", "--non-interactive"]);
     local.start_with(command).await;
     let restarted = GlobalConfig::local_api_key(&local.environment())
         .expect("protected")
@@ -1330,7 +1328,7 @@ async fn server_dev_saved_settings_survive_working_directory_change() {
     moved
         .current_dir(elsewhere.path())
         .env_remove("WYRD_DATABASE_URL")
-        .args(["server", "dev", "--non-interactive"]);
+        .args(["init", "--non-interactive"]);
     local.start_with(moved).await;
     let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
     assert_eq!(
@@ -1379,7 +1377,7 @@ const LOCAL_PROVIDER_KEY: &str = "sk-local-dev-managed-secret";
 /// Supplied sealing key, base64 of 32 bytes, that a deployment retains.
 const SUPPLIED_SEALING_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
-/// A fresh `wyrd server dev` deployment seals a quickstart-form managed
+/// A fresh `wyrd init` deployment seals a quickstart-form managed
 /// secret on first boot with no extra key step, delivers it to a local
 /// provider through the gateway, and keeps delivering it after a bare rerun
 /// from another working directory. The sealing key is generated, or supplied
@@ -1427,7 +1425,7 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
             "inline" => first.env("WYRD_SEALING_KEY_BASE64", SUPPLIED_SEALING_KEY),
             _ => &mut first,
         };
-        first.args(["server", "dev", "--tenant", "local"]);
+        first.args(["init", "--tenant", "local"]);
         local.start_with(first).await;
         let retained = local.home.path().join("wyrd/server/sealing.key");
         if source != "generated" {
@@ -1474,7 +1472,7 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
             if run == "rerun" {
                 let mut bare = local.command();
                 bare.current_dir(&elsewhere)
-                    .args(["server", "dev", "--non-interactive"]);
+                    .args(["init", "--non-interactive"]);
                 local.start_with(bare).await;
             }
             let token = local
@@ -1508,7 +1506,7 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
                 "WYRD_SEALING_KEY_BASE64",
                 "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
             )
-            .args(["server", "dev", "--non-interactive"])
+            .args(["init", "--non-interactive"])
             .output()
             .await
             .expect("different key");

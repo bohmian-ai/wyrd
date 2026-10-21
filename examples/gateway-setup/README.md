@@ -23,7 +23,7 @@ fixtures.
    the PostgreSQL URL:
 
    ```bash
-   wyrd server dev --tenant acme --gateway-file gateway.json
+   wyrd init --tenant acme --gateway-file gateway.json
    ```
 
    Or apply the document to a server that is already running. Reapplying

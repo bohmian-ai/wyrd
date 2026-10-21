@@ -130,7 +130,7 @@ export function supportApi(support: Support) {
 
 if (import.meta.main) {
   // ANCHOR: startup
-  // WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd server dev` saved, say which server to use and who the app is.
+  // WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd init` saved, say which server to use and who the app is.
   const client = WyrdClient.connect();
   // The declared Service, pulled by `npm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });

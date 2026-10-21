@@ -232,6 +232,25 @@ impl McpInstallReport {
         }
     }
 
+    /// Tell the person how to start each connected host on `prompt` in the
+    /// current directory: the exact command for a host whose CLI accepts an
+    /// initial prompt, otherwise where to get the prompt to paste. Nothing is
+    /// launched.
+    pub(crate) fn print_handoff(&self, prompt: &str) {
+        for outcome in self.hosts.iter().filter(|outcome| outcome.status.connected()) {
+            match outcome.host.launch(prompt) {
+                Some(command) => println!(
+                    "Start {} on the setup prompt in this directory:\n{command}",
+                    outcome.host.label()
+                ),
+                None => println!(
+                    "Start {} in this directory and paste the output of `wyrd init --print-prompt`, or select its Wyrd MCP prompt `setup`.",
+                    outcome.host.label()
+                ),
+            }
+        }
+    }
+
     /// Keep a fully connected report, or refuse naming every failed host.
     ///
     /// # Errors

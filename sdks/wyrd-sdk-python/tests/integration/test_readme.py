@@ -55,7 +55,7 @@ def test_readme_declares_observes_and_verifies(
 
     # The override unwinds before the server restores the session environment.
     with WyrdTestServer(verification_runtime=True) as server, monkeypatch.context() as env:
-        # The README reader uses the tenant administrator that `wyrd server dev` saves.
+        # The README reader uses the tenant administrator that `wyrd init` saves.
         env.setenv("WYRD_API_KEY", server.tenant_admin_key())
         subprocess.run(["bash", "-euc", declare], check=True)
         assert (tmp_path / ".wyrd-bundle").is_dir()

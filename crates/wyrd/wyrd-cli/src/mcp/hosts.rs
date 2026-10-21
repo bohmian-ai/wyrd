@@ -85,8 +85,24 @@ impl McpHost {
         }
     }
 
+    /// The POSIX shell command that starts this host in the current
+    /// directory with `prompt` as its first message, when its CLI takes one.
+    ///
+    /// The prompt is one single-quoted argument, so a shell passes it
+    /// literally with no expansion.
+    pub(crate) fn launch(self, prompt: &str) -> Option<String> {
+        let program = match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude",
+            Self::CopilotCli | Self::Vscode | Self::Cursor | Self::Pi | Self::Hermes => {
+                return None;
+            }
+        };
+        Some(format!("{program} '{}'", prompt.replace('\'', r"'\''")))
+    }
+
     /// The product name shown in the interactive prompt.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex CLI/IDE",
             Self::ClaudeCode => "Claude Code",
@@ -754,6 +770,26 @@ pub(crate) fn selected<T: Copy>(detected: &[T], answer: &str) -> Option<Vec<T>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch command passes the real setup prompt to a POSIX shell as one
+    /// literal argument; hosts without an initial-prompt CLI get none.
+    ///
+    /// # Panics
+    /// Panics when the shell receives different bytes or a host's launch
+    /// support differs.
+    #[test]
+    fn launch_preserves_the_setup_prompt_literally() {
+        let prompt = format!("{}it's $HOME `id` \\ \"q\"", wyrd_spec::mcp::setup_prompt("1.2.3"));
+        let command = McpHost::ClaudeCode.launch(&prompt).expect("Claude Code launches");
+        let quoted = command.strip_prefix("claude ").expect("program first");
+        let echoed = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .expect("sh runs");
+        assert_eq!(String::from_utf8(echoed.stdout).expect("UTF-8"), prompt);
+        assert!(McpHost::Codex.launch(&prompt).is_some_and(|c| c.starts_with("codex '")));
+        assert!(McpHost::Cursor.launch(&prompt).is_none());
+    }
 
     /// The prompt lists every detected host and maps numbers, `all`, and an
     /// empty answer onto the selection, re-asking after an invalid answer.

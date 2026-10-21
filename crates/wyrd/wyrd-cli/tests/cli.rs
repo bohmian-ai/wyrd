@@ -1,5 +1,3 @@
-use clap::Parser as _;
-
 #[path = "auth_issue_key_journey.rs"]
 mod auth_issue_key_journey;
 #[path = "card_lifecycle.rs"]
@@ -26,14 +24,94 @@ mod secret_sources;
 #[path = "server_install.rs"]
 mod server_install;
 
-/// Local bootstrap is an installed CLI capability rather than a checkout script.
+/// `wyrd init --print-prompt` prints only this release's setup prompt and
+/// touches nothing: an unreadable saved configuration is never read, the
+/// selected server and database listener see no connection, and neither the
+/// configuration nor home directory changes. Setup options conflict with it,
+/// help names it, and the removed `server dev` spelling is unknown.
 ///
 /// # Panics
-/// Panics when the installed CLI cannot select local startup.
+/// Panics when printing differs from the shared prompt, has side effects, or
+/// accepts a setup option, or when the removed command still parses.
 #[test]
-fn server_dev_selects_installed_local_startup() {
-    wyrd_cli::Cli::try_parse_from(["wyrd", "server", "dev", "--tenant", "local"])
-        .expect("local setup is exposed by the installed CLI");
+fn guided_init_print_prompt_is_offline() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener binds");
+    listener
+        .set_nonblocking(true)
+        .expect("listener becomes non-blocking");
+    let address = listener.local_addr().expect("listener address");
+    let home = tempfile::tempdir().expect("isolated home");
+    let config = home.path().join("wyrd");
+    std::fs::create_dir(&config).expect("config directory");
+    std::fs::write(config.join("config.toml"), "not = [valid").expect("unreadable config");
+    let server = format!("http://{address}");
+    let database = format!("postgres://wyrd@{address}/wyrd");
+    let environment = [
+        ("HOME", home.path().to_str().expect("UTF-8 home")),
+        ("WYRD_CONFIG_HOME", config.to_str().expect("UTF-8 config")),
+        ("WYRD_SERVER_URL", server.as_str()),
+        ("WYRD_DATABASE_URL", database.as_str()),
+    ];
+    let listing = || {
+        let mut entries = walk(home.path());
+        entries.sort();
+        entries
+    };
+    let before = listing();
+
+    let printed = principal_journey::run_cli_with_env(&["init", "--print-prompt"], &environment);
+    assert!(printed.status.success(), "{printed:?}");
+    assert!(printed.stderr.is_empty(), "{printed:?}");
+    assert_eq!(
+        String::from_utf8(printed.stdout).expect("UTF-8 prompt"),
+        wyrd_spec::mcp::setup_prompt(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(listing(), before, "printing writes nothing");
+
+    for conflict in [
+        &["init", "--print-prompt", "--format", "json"][..],
+        &["init", "--print-prompt", "--format", "text"][..],
+        &["init", "--print-prompt", "--tenant", "local"][..],
+        &["init", "--print-prompt", "--non-interactive"][..],
+        &["init", "--print-prompt", "--host", "codex"][..],
+        &["server", "dev", "--tenant", "local"][..],
+        &["server", "dev", "--print-prompt"][..],
+    ] {
+        let refused = principal_journey::run_cli_with_env(conflict, &environment);
+        assert_eq!(refused.status.code(), Some(64), "{conflict:?}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{conflict:?}");
+    }
+    assert_eq!(listing(), before, "refusals write nothing");
+    assert_eq!(
+        listener.accept().map(|_| ()).map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "no server or database connection"
+    );
+
+    let help = principal_journey::run_cli_with_env(&["init", "--help"], &environment);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--print-prompt"));
+    let root = principal_journey::run_cli_with_env(&["--help"], &environment);
+    let root = String::from_utf8(root.stdout).expect("UTF-8 help");
+    assert!(root.lines().any(|line| line.trim_start().starts_with("init ")));
+    let server = principal_journey::run_cli_with_env(&["server", "--help"], &environment);
+    let server = String::from_utf8(server.stdout).expect("UTF-8 help");
+    assert!(!server.lines().any(|line| line.trim_start().starts_with("dev")), "{server}");
+}
+
+/// Every path beneath `root`, relative to it, with its file contents.
+fn walk(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root).expect("readable directory") {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            found.push((path.clone(), Vec::new()));
+            found.extend(walk(&path));
+        } else {
+            found.push((path.clone(), std::fs::read(&path).expect("readable file")));
+        }
+    }
+    found
 }
 
 /// PostgreSQL-backed installed local-server lifecycle journeys.

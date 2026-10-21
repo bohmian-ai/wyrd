@@ -309,7 +309,7 @@ async fn delete_credential_with(
 }
 
 /// Apply credentials and deployments in one server transaction over an
-/// assembled `client`, the path behind `deployment put` and `server dev`.
+/// assembled `client`, the path behind `deployment put` and `wyrd init`.
 ///
 /// # Errors
 /// Returns the server's permission, invalid-configuration, conflict, or

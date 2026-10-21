@@ -50,7 +50,7 @@ def reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def server(reader: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WyrdTestServer]:
-    """A server the reader's script reaches as the tenant administrator `wyrd server dev` saves."""
+    """A server the reader's script reaches as the tenant administrator `wyrd init` saves."""
     with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
         with monkeypatch.context() as env:
             env.setenv("WYRD_SERVER_URL", server.base_url)

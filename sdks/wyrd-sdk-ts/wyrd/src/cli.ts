@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { runWyrdCli } = require("../index.cjs") as typeof import("../index.cjs");
 
 // This foreground command delegates shutdown to Tokio's signal handler.
-if (process.argv[2] === "server" && process.argv[3] === "dev") {
+if (process.argv[2] === "init") {
   process.on("SIGINT", () => {});
   process.on("SIGTERM", () => {});
 }

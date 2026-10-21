@@ -451,7 +451,7 @@ PROVIDER_KEY_VARIABLES = (
     "GEMINI_API_KEY",
     "TYPESAFE_API_KEY",
 )
-"""Provider keys ``wyrd server dev`` offers; removed so only a test opts in to the offer."""
+"""Provider keys ``wyrd init`` offers; removed so only a test opts in to the offer."""
 
 
 @contextmanager
@@ -523,7 +523,7 @@ def installed_local_cli(
 ) -> Iterator[None]:
     """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends.
 
-    ``extra`` appends further ``server dev`` arguments, such as a gateway file.
+    ``extra`` appends further ``wyrd init`` arguments, such as a gateway file.
     """
     command_env = dict(env)
     master, slave = pty.openpty() if terminal else (-1, -1)
@@ -532,7 +532,7 @@ def installed_local_cli(
         command_env["CODEX_HOME"] = str(home / "codex")
     with tempfile.TemporaryFile(mode="w+") as errors:
         child = subprocess.Popen(
-            [cli_path, "server", "dev", "--tenant", tenant, *extra],
+            [cli_path, "init", "--tenant", tenant, *extra],
             cwd=home,
             env=command_env,
             stdin=slave if terminal else subprocess.DEVNULL,
@@ -892,7 +892,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
             via = f"http://127.0.0.1:{proxy.server_address[1]}"
             try:
                 failed = subprocess.run(
-                    [cli_path, "server", "dev", "--tenant", "acme", "--gateway-file", str(lost)],
+                    [cli_path, "init", "--tenant", "acme", "--gateway-file", str(lost)],
                     cwd=home,
                     env={
                         **env,
@@ -977,7 +977,7 @@ def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], se
     master, slave = pty.openpty()
     try:
         child = subprocess.Popen(
-            [cli_path, "server", "dev"],
+            [cli_path, "init"],
             cwd=home,
             env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
             stdin=slave,
@@ -1043,7 +1043,7 @@ def restart_on_another_listener(
     key = tomllib.loads(protected.read_text())["default"]["api_key"]
     master, slave = pty.openpty()
     child = subprocess.Popen(
-        [cli_path, "server", "dev", "--bind", rebound],
+        [cli_path, "init", "--bind", rebound],
         cwd=home,
         env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
         stdin=slave,
@@ -1095,7 +1095,7 @@ def test_installed_cli_guided_setup() -> None:
         database = env.pop("WYRD_DATABASE_URL")
         env.update(secrets)
         unattended = subprocess.run(
-            [cli_path, "server", "dev", "--non-interactive"],
+            [cli_path, "init", "--non-interactive"],
             cwd=home,
             env=env,
             capture_output=True,
@@ -1110,7 +1110,7 @@ def test_installed_cli_guided_setup() -> None:
         master, slave = pty.openpty()
         stderr = tempfile.TemporaryFile()  # noqa: SIM115 - read after the child exits
         child = subprocess.Popen(
-            [cli_path, "server", "dev"],
+            [cli_path, "init"],
             cwd=home,
             env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
             stdin=slave,

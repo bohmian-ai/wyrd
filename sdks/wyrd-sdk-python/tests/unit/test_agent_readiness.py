@@ -1,6 +1,6 @@
 """The live agent-readiness lane's decisions, without agents, credentials, or a server.
 
-Process doubles stand in for an agent and for ``wyrd server dev`` only to
+Process doubles stand in for an agent and for ``wyrd init`` only to
 force failures and deadlines; the real two-agent journey is
 ``mise run test:agent-readiness:smoke:live``.
 """

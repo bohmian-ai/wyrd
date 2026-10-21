@@ -1,5 +1,6 @@
-//! Installed-server orchestration for local development. Durable operations
-//! remain the installed server's `migrate` and `setup` commands.
+//! `wyrd init`: installed-server orchestration for local development and its
+//! guided setup handoff. Durable operations remain the installed server's
+//! `migrate` and `setup` commands.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal as _, Write as _};
@@ -26,8 +27,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::registry::ListCardsRequest;
 use wyrd_utils::secret::read_secret_file;
 
-use super::install::compatible;
-use super::{InstalledServer, ServerInstaller};
+use crate::server::{InstalledServer, ServerInstaller, compatible};
 use crate::card::OutputFormat;
 use crate::client::map_client_error;
 use crate::error::WyrdCliError;
@@ -41,7 +41,7 @@ use crate::terminal::Terminal;
 /// argument, canonical environment variable, saved `[dev]` setting, then a
 /// terminal prompt; secrets are never accepted as arguments.
 #[derive(Debug, Args)]
-pub struct DevArgs {
+pub struct InitArgs {
     /// Tenant to provision on first use; an active tenant is never reissued.
     /// Defaults to the saved tenant, else is asked on a terminal.
     #[arg(long)]
@@ -77,6 +77,10 @@ pub struct DevArgs {
     /// progress and server output to the diagnostic log it names.
     #[arg(long, default_value_t)]
     format: OutputFormat,
+    /// Print this release's setup prompt and exit. Reads no configuration,
+    /// contacts no server, changes nothing, and accepts no setup option.
+    #[arg(long, exclusive = true)]
+    print_prompt: bool,
 }
 
 /// Effective local deployment inputs, resolved once before any side effect,
@@ -143,7 +147,7 @@ struct DevServer {
     diagnostics: Diagnostics,
 }
 
-/// Where `server dev` writes progress, notices, and the serving child's
+/// Where `wyrd init` writes progress, notices, and the serving child's
 /// output: the terminal in text mode, else an append-only diagnostic log, so
 /// JSON mode keeps stdout and stderr for its machine documents.
 enum Diagnostics {
@@ -237,7 +241,7 @@ impl Diagnostics {
     }
 }
 
-/// `server dev`'s readiness: what a fresh client and MCP host use, printed
+/// `wyrd init`'s readiness: what a fresh client and MCP host use, printed
 /// once while the server keeps running in the foreground.
 #[derive(serde::Serialize)]
 struct DevReady {
@@ -263,6 +267,8 @@ struct DevReady {
     mcp: Option<McpInstallReport>,
     /// JSON mode's diagnostic log.
     log: Option<PathBuf>,
+    /// This release's setup prompt, as `wyrd init --print-prompt` prints it.
+    setup_prompt: String,
 }
 
 impl DevReady {
@@ -285,6 +291,11 @@ impl DevReady {
     }
 }
 
+/// The setup prompt labelled with this CLI's release.
+fn setup_prompt() -> String {
+    wyrd_spec::mcp::setup_prompt(env!("CARGO_PKG_VERSION"))
+}
+
 /// `url` without userinfo, query, or fragment, any of which may carry a
 /// storage credential.
 fn redacted(url: &str) -> String {
@@ -300,8 +311,10 @@ fn redacted(url: &str) -> String {
     )
 }
 
-impl DevArgs {
+impl InitArgs {
     /// Compose local setup and remain attached until interruption or exit.
+    ///
+    /// `--print-prompt` prints [`setup_prompt`] before any of that and exits.
     ///
     /// # Errors
     /// Refuses invalid local inputs, an incomplete active installation (with
@@ -315,6 +328,10 @@ impl DevArgs {
     /// # Panics
     /// Panics if the compile-time package version is not valid semver.
     pub async fn run(self) -> Result<ExitCode, WyrdCliError> {
+        if self.print_prompt {
+            print!("{}", setup_prompt());
+            return Ok(ExitCode::SUCCESS);
+        }
         let installer = ServerInstaller::official()?;
         let interrupted = interruption();
         tokio::pin!(interrupted);
@@ -837,7 +854,10 @@ impl DevServer {
         };
         if format == OutputFormat::Text {
             match &mcp {
-                Some(report) => report.print_text(),
+                Some(report) => {
+                    report.print_text();
+                    report.print_handoff(&setup_prompt());
+                }
                 None if offer => {
                     println!("MCP setup skipped; connect a host later with wyrd mcp install.");
                 }
@@ -857,6 +877,7 @@ impl DevServer {
             gateway,
             mcp,
             log: diagnostics.path().map(Path::to_path_buf),
+            setup_prompt: setup_prompt(),
         };
         match format {
             OutputFormat::Text => ready.print_text(),

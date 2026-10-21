@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use crate::auth::AuthCommand;
 use crate::card::{DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs};
 use crate::gateway::GatewayCommand;
+use crate::init::InitArgs;
 use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
 use crate::platform::PlatformCommand;
@@ -57,6 +58,7 @@ impl Cli {
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
             Command::Gateway(command) => command.dispatch().await,
+            Command::Init(args) => args.run().await.map_err(Into::into),
             Command::Server(command) => command.dispatch().await.map_err(Into::into),
             Command::Mcp(command) => command.dispatch().await,
         }
@@ -97,6 +99,11 @@ pub enum Command {
     Query(QueryCommand),
     /// Administer tenant gateway credentials, deployments, and policies.
     Gateway(GatewayCommand),
+    /// Migrate, start, and configure a local Wyrd server, then hand off the
+    /// guided setup prompt; stays in the foreground until interrupted.
+    /// PostgreSQL is supplied externally. --print-prompt only prints the
+    /// setup prompt.
+    Init(InitArgs),
     /// Install and manage the official Wyrd server for this host.
     #[command(subcommand)]
     Server(ServerCommand),

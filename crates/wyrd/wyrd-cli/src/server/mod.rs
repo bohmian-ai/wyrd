@@ -3,14 +3,13 @@
 //! The CLI owns release artifacts and a foreground child. Migration,
 //! credentials, and durable Wyrd state stay with the server it installs.
 
-mod dev;
 mod install;
 
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-pub use dev::DevArgs;
+pub(crate) use install::compatible;
 pub use install::{InstalledServer, ServerInstaller};
 
 use crate::card::{OutputFormat, print_json};
@@ -22,9 +21,6 @@ pub enum ServerCommand {
     /// Install, or update to, the newest stable official server release for
     /// this host after verifying its signature and digest.
     Install(InstallArgs),
-    /// Migrate, start, and configure an installed local server; keep it in
-    /// the foreground until interrupted. PostgreSQL is supplied externally.
-    Dev(DevArgs),
 }
 
 /// Arguments for `wyrd server install`.
@@ -45,11 +41,8 @@ impl ServerCommand {
     /// # Errors
     /// Returns the installer's [`WyrdCliError`] when the host is unsupported,
     /// the release is unavailable, unverified, or incompatible, or local IO
-    /// fails. Local development also reports the failed startup stage and
-    /// settles its child; committed server state and saved files remain.
     pub async fn dispatch(self) -> Result<ExitCode, WyrdCliError> {
         match self {
-            Self::Dev(args) => args.run().await,
             Self::Install(args) => {
                 let installed = ServerInstaller::official()?.install().await?;
                 match args.format {

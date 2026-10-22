@@ -27,13 +27,13 @@
 //! task that sends `UNLISTEN *` and waits for the answer, which never comes
 //! over a stalled path, so the task and its pool slot would be retained until
 //! the operating system gives up on the socket. A failed listener's
-//! connection is therefore swapped for a fresh pool connection, and the
-//! stalled one is closed without waiting on its peer; see
-//! [`NotificationListener::discard`].
+//! connection is therefore swapped for a fresh connection opened outside the
+//! pool, so the swap never waits on a free pool slot, and the stalled one is
+//! closed without waiting on its peer; see [`NotificationListener::discard`].
 
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgConnection, PgListener};
 use sqlx::{Acquire as _, Connection as _, PgPool};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -284,16 +284,18 @@ impl NotificationListener {
     /// returning it when it could not be released yet.
     ///
     /// `listener` must still hold its connection, so borrowing it cannot
-    /// reconnect. The connection is swapped for a fresh one detached from
-    /// the pool and the failed one is closed without a goodbye; dropping the
-    /// listener then sends its `UNLISTEN *` over the healthy connection and
-    /// returns it to the pool in the failed one's place, so no pool slot or
-    /// cleanup task stays behind. When no fresh connection arrives within the
-    /// probe timeout the listener is returned for a later attempt, so at
-    /// most one failed connection is retained per listener.
+    /// reconnect. The connection is swapped for a fresh one opened with the
+    /// pool's connect options but outside the pool, so the swap needs no free
+    /// pool slot, and the failed one is closed without a goodbye; dropping
+    /// the listener then sends its `UNLISTEN *` over the healthy connection
+    /// and returns it to the pool in the failed one's place, so no pool slot
+    /// or cleanup task stays behind. When the database accepts no fresh
+    /// connection within the probe timeout the listener is returned for a
+    /// later attempt, so at most one failed connection is retained per
+    /// listener.
     async fn discard(&self, mut listener: PgListener) -> Option<PgListener> {
         let replaced = tokio::time::timeout(self.probe_timeout, async {
-            let fresh = self.pool.acquire().await?.detach();
+            let fresh = PgConnection::connect_with(&self.pool.connect_options()).await?;
             let held = (&mut listener).acquire().await?;
             Ok::<_, sqlx::Error>(std::mem::replace(held, fresh))
         })

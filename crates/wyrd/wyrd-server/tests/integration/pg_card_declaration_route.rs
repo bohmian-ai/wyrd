@@ -4849,6 +4849,14 @@ async fn flat_card_http_contract() {
         .await
         .expect("spaced list responds");
     assert_space_refusal(listed, "query").await;
+    let versions = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/Prompt/flat-http/versions?space=default"),
+        )
+        .await
+        .expect("spaced versions read responds");
+    assert_space_refusal(versions, "query").await;
 
     let uid = card_ref["uid"].clone();
     for space in ["default", "nowhere"] {

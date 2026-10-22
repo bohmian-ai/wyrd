@@ -248,7 +248,8 @@ async fn get_latest_card_http(
 /// The identity line is the tenant's flat `kind`/`name`.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
+/// Returns `WYRD_SPEC_400_VALIDATION` for an unknown or mistyped query key,
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
 /// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`, and the errors
 /// of [`service::list_card_versions`].
 #[utoipa::path(
@@ -279,8 +280,9 @@ async fn list_versions_http(
     State(state): State<AppState>,
     caller: Caller,
     Path((kind, name)): Path<(String, String)>,
-    Query(query): Query<VersionListQuery>,
+    query: Result<Query<VersionListQuery>, QueryRejection>,
 ) -> Result<Json<ListVersionsResponse>, WyrdErrorResponse> {
+    let query = card_query(query)?;
     let kind = parse_card_kind(&kind)?;
     let name = parse_name(&name)?;
     authorize_card_read(
@@ -718,8 +720,12 @@ impl CardRefQuery {
     }
 }
 
+/// Query of the `versions` route; any other key, such as the removed `space`,
+/// is refused.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionListQuery {
+    /// Include prerelease versions in the listing.
     #[serde(default)]
     include_prerelease: bool,
 }

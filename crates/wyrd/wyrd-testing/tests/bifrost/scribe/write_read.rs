@@ -1401,9 +1401,9 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let writer = cluster.server(0).expect("pod 0");
     let reader = cluster.server(1).expect("pod 1");
     let tenant = writer.data_tenant_id();
-    let table = register_composite_table(&writer, tenant, &unique_table("composite_peer")).await;
-    let writer_client = tenant_client(&writer, tenant).await;
-    let reader_client = tenant_client(&reader, tenant).await;
+    let table = register_composite_table(writer, tenant, &unique_table("composite_peer")).await;
+    let writer_client = tenant_client(writer, tenant).await;
+    let reader_client = tenant_client(reader, tenant).await;
     super::support::append_batch(
         &writer_client,
         &table,

@@ -82,18 +82,17 @@ impl PromotedObjectFooter {
             .map_err(|refusal| format!("promoted object was not sealed by Bifrost: {refusal}"))?
             .to_owned();
         let root = metadata.file_metadata().schema();
-        let table_schema = match table_schemas
+        let table_schema = if let Some(schema) = table_schemas
             .iter()
             .find(|schema| verify_registered_field_ids(root, schema).is_ok())
         {
-            Some(schema) => Arc::clone(schema),
-            None => {
-                let first = table_schemas
-                    .first()
-                    .ok_or_else(|| "promoted object has no table schema to match".to_owned())?;
-                verify_registered_field_ids(root, first)?;
-                Arc::clone(first)
-            }
+            Arc::clone(schema)
+        } else {
+            let first = table_schemas
+                .first()
+                .ok_or_else(|| "promoted object has no table schema to match".to_owned())?;
+            verify_registered_field_ids(root, first)?;
+            Arc::clone(first)
         };
         let written = usize::try_from(file_size)
             .map_err(|_| "promoted object size exceeds address space".to_owned())?;

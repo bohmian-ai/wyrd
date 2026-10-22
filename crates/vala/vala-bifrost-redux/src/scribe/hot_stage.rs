@@ -47,7 +47,7 @@ use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::assembly::{
     ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
 };
-use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::tables::AuditLogTable;
 
 /// Only staged-record version this server reads or writes.
@@ -453,8 +453,10 @@ impl StagedHotSourceRecordV1 {
             layout_fingerprint,
             self.revision,
             partition,
-            NodeId::new(self.node_id),
-            WriterEpoch::new(self.writer_epoch),
+            StreamIdentity::new(
+                NodeId::new(self.node_id),
+                WriterEpoch::new(self.writer_epoch),
+            ),
         ))
     }
 
@@ -1208,8 +1210,7 @@ mod tests {
             )
             .expect("a fixed hour boundary")
             .into(),
-            NodeId::new(Uuid::from_u128(11)),
-            WriterEpoch::new(6),
+            StreamIdentity::new(NodeId::new(Uuid::from_u128(11)), WriterEpoch::new(6)),
         )
     }
 

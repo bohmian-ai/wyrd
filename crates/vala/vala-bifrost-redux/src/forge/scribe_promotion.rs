@@ -343,9 +343,8 @@ fn validate_promoted_object(
                 "promotion evidence names partition spec {spec_id}, which the table does not retain"
             ),
         })?;
-    if i64::try_from(record.sort_order_id)
-        .ok()
-        .and_then(|order_id| metadata.sort_order_by_id(order_id))
+    if metadata
+        .sort_order_by_id(i64::from(record.sort_order_id))
         .is_none()
     {
         return Err(ForgeError::Invariant {
@@ -392,7 +391,7 @@ fn validate_promoted_object(
         })?
         .time();
     let field_id =
-        crate::catalog::TimeAxis::iceberg_field_id(&spec).ok_or_else(|| ForgeError::Invariant {
+        crate::catalog::TimeAxis::iceberg_field_id(spec).ok_or_else(|| ForgeError::Invariant {
             detail: "table partition spec has no time partition field".to_owned(),
         })?;
     // Promotion is fail-closed: bounds that would merely retain a file at

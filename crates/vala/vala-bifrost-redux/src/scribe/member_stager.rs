@@ -32,7 +32,7 @@ use crate::scribe::hot_stage::{
     RECORD_FILE_NAME, ScribeHotStage, StagedHotSourceRecordV1, StagedLsnRange, StagedRunFile,
 };
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 
 /// Rows decoded by the bounded preflight that proves a run is readable.
 const PREFLIGHT_BATCH_ROWS: usize = 1_024;
@@ -186,8 +186,7 @@ impl ScribeMemberStager {
             request.layout,
             request.frozen.seal_key.revision,
             request.frozen.seal_key.partition.clone(),
-            request.origin.node_id,
-            request.origin.writer_epoch,
+            StreamIdentity::new(request.origin.node_id, request.origin.writer_epoch),
         );
         let member = StagedMemberId::new(request.origin.shard, request.origin.generation);
         let directory = self.stage.member_directory(&key, member);

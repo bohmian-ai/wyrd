@@ -838,8 +838,7 @@ impl ScribeStagingRuntime {
             layout.as_ref(),
             key.revision(),
             key.partition().clone(),
-            key.node_id(),
-            key.writer_epoch(),
+            StreamIdentity::new(key.node_id(), key.writer_epoch()),
         );
         if resolved != *key {
             return Err(ScribeError::Internal {

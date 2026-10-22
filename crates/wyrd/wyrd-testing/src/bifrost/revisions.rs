@@ -30,6 +30,10 @@ pub const COMPOSITE_ROWS: i64 = 12;
 ///
 /// Relative so rows stay inside Scribe's event-time acceptance window, and a
 /// closed day so Forge treats its partitions as complete.
+///
+/// # Panics
+///
+/// Never in practice: midnight is representable on every day.
 #[must_use]
 pub fn composite_first_hour_micros() -> i64 {
     super::forge_harness::default_fixture_day()
@@ -113,10 +117,13 @@ pub fn composite_batch() -> RecordBatch {
                 )
                 .with_timezone("UTC"),
             ),
-            Arc::new(arrow::array::StringArray::from_iter(
-                rows.clone()
-                    .map(|row| [Some("a"), Some("b"), None][(row % 3) as usize]),
-            )),
+            Arc::new(arrow::array::StringArray::from_iter(rows.clone().map(
+                |row| match row % 3 {
+                    0 => Some("a"),
+                    1 => Some("b"),
+                    _ => None,
+                },
+            ))),
             Arc::new(Int64Array::from_iter_values(
                 rows.clone().map(|row| row % 5),
             )),
@@ -183,7 +190,7 @@ impl WyrdTestServer {
                 .requirement(TableRequirement::DefaultSortOrderIdMatch {
                     default_sort_order_id: metadata.default_sort_order_id(),
                 }),
-            |action, update| action.update(update),
+            iceberg::transaction::ApplyUpdatesAction::update,
         );
         ApplyTransactionAction::apply(action, transaction)
             .expect("revision applies")
@@ -296,7 +303,7 @@ impl WyrdTestServer {
                 .map(|field| {
                     if field.name == "customer" {
                         let mut renamed = field.as_ref().clone();
-                        renamed.name = "client".to_owned();
+                        "client".clone_into(&mut renamed.name);
                         Arc::new(renamed)
                     } else {
                         Arc::clone(field)

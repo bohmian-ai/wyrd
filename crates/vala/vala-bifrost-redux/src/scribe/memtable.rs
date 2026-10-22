@@ -2118,25 +2118,24 @@ fn projection_indices(
         .any(|field| field_id(field).is_some());
     let mut projection: Vec<(FieldRef, Option<usize>)> = Vec::with_capacity(required.len());
     for field in required {
-        let (target, index) = match field_id(field).filter(|_| schema_has_ids) {
-            Some(id) => (
+        let (target, index) = if let Some(id) = field_id(field).filter(|_| schema_has_ids) {
+            (
                 Arc::clone(field),
                 schema
                     .fields()
                     .iter()
                     .position(|column| field_id(column).as_ref() == Some(&id)),
-            ),
-            None => {
-                let index = schema
-                    .index_of(field.name())
-                    .map_err(|_| ScribeError::Internal {
-                        detail: format!(
-                            "live-tail required column is not in the table schema: {}",
-                            field.name()
-                        ),
-                    })?;
-                (Arc::clone(&schema.fields()[index]), Some(index))
-            }
+            )
+        } else {
+            let index = schema
+                .index_of(field.name())
+                .map_err(|_| ScribeError::Internal {
+                    detail: format!(
+                        "live-tail required column is not in the table schema: {}",
+                        field.name()
+                    ),
+                })?;
+            (Arc::clone(&schema.fields()[index]), Some(index))
         };
         if index.is_some() && projection.iter().any(|(_, kept)| *kept == index) {
             return Err(ScribeError::Internal {

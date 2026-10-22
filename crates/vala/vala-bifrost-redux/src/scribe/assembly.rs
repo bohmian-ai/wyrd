@@ -51,7 +51,7 @@ use crate::catalog::TableRef;
 use crate::catalog::layout::{PartitionTransform, PhysicalLayout};
 use crate::catalog::{LayoutRevision, PhysicalPartition};
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 
 /// Exact compatibility scope shared by every member of one assembly claim.
 ///
@@ -96,8 +96,7 @@ impl ScribeAssemblyKey {
         layout: &PhysicalLayout,
         revision: LayoutRevision,
         partition: PhysicalPartition,
-        node_id: NodeId,
-        writer_epoch: WriterEpoch,
+        stream: StreamIdentity,
     ) -> Self {
         Self {
             tenant,
@@ -106,8 +105,8 @@ impl ScribeAssemblyKey {
             layout_fingerprint: layout_fingerprint(layout),
             revision,
             partition,
-            node_id,
-            writer_epoch,
+            node_id: stream.node_id,
+            writer_epoch: stream.writer_epoch,
         }
     }
 
@@ -125,8 +124,7 @@ impl ScribeAssemblyKey {
         layout_fingerprint: [u8; 32],
         revision: LayoutRevision,
         partition: PhysicalPartition,
-        node_id: NodeId,
-        writer_epoch: WriterEpoch,
+        stream: StreamIdentity,
     ) -> Self {
         Self {
             tenant,
@@ -135,8 +133,8 @@ impl ScribeAssemblyKey {
             layout_fingerprint,
             revision,
             partition,
-            node_id,
-            writer_epoch,
+            node_id: stream.node_id,
+            writer_epoch: stream.writer_epoch,
         }
     }
 
@@ -1311,8 +1309,7 @@ mod tests {
             &layout(None),
             LayoutRevision::INITIAL,
             partition(hours),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
+            StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
         )
     }
 
@@ -1547,8 +1544,7 @@ mod tests {
                 &layout(None),
                 LayoutRevision::INITIAL,
                 partition(0),
-                NodeId::new(uuid::Uuid::from_u128(9)),
-                WriterEpoch::new(4),
+                StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
             ),
             ScribeAssemblyKey::new(
                 tenant,
@@ -1557,8 +1553,7 @@ mod tests {
                 &layout(None),
                 LayoutRevision::INITIAL,
                 partition(0),
-                NodeId::new(uuid::Uuid::from_u128(9)),
-                WriterEpoch::new(5),
+                StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(5)),
             ),
         ] {
             assert_ne!(
@@ -2177,8 +2172,7 @@ mod tests {
             &layout(Some(TimeGranularityWire::Hour)),
             LayoutRevision::INITIAL,
             partition(0),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
+            StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
         );
         let daily = ScribeAssemblyKey::new(
             tenant,
@@ -2187,8 +2181,7 @@ mod tests {
             &layout(Some(TimeGranularityWire::Day)),
             LayoutRevision::INITIAL,
             partition(0),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
+            StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
         );
         assert_ne!(hourly, daily);
     }

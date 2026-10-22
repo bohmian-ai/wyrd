@@ -491,9 +491,10 @@ impl AccessJourney {
 
 /// `all` reaches only the open deployment, deployment and exact-model grants
 /// reach the granted one, a denied target is refused before provider IO and
-/// never rescued by a fallback, a denied fallback is skipped, a model outside
-/// the allowlist is unavailable, and `/v1/models` lists only what each
-/// caller may invoke.
+/// never rescued by a fallback, a denied fallback is skipped, one provider
+/// failure leaves its deployment serving the next call, a model outside the
+/// allowlist is unavailable, and `/v1/models` lists only what each caller may
+/// invoke.
 ///
 /// # Panics
 /// Panics when a status, error code, listing, or upstream call differs.
@@ -584,6 +585,14 @@ async fn deployment_invocation_access_and_visibility() {
         Some(&open),
         "the denied fallback is never dispatched"
     );
+    // One retryable refusal never locks the deployment: the next call still
+    // reaches the provider and answers.
+    assert_eq!(
+        journey.chat(&everyone, "openai-primary/gpt-4o").await,
+        (200, None),
+        "one provider failure leaves its deployment serving"
+    );
+    assert_eq!(journey.upstream_keys().await.last(), Some(&open));
 
     assert_eq!(journey.models(&everyone).await, ["openai-primary/gpt-4o"]);
     assert_eq!(

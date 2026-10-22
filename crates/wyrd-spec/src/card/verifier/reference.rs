@@ -523,6 +523,112 @@ impl utoipa::PartialSchema for Reference {
 #[cfg(feature = "server")]
 impl utoipa::ToSchema for Reference {}
 
+/// A group Verifier's declared source-list order, authored as `order_by`.
+///
+/// Every list is ordered by the server-recorded input time, then execution
+/// ID, unless an input key orders it first; that default also breaks ties of
+/// an input key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderBy {
+    /// `recorded_at`: the time the server recorded each source execution's
+    /// inputs, then execution ID. The default when `order_by` is absent.
+    RecordedAt,
+    /// `inputs.<slot>...`: a key read from the value of a source slot that
+    /// reads a source input; numbers sort before strings before anything
+    /// else, ascending.
+    Input(Reference),
+}
+
+/// Authored text of [`OrderBy::RecordedAt`].
+const RECORDED_AT: &str = "recorded_at";
+
+/// Generated-schema description of an `order_by` declaration.
+const ORDER_DESCRIPTION: &str = "Group source-list order: recorded_at (server-recorded input \
+     time, the default) or inputs.<slot> with .field and [n] selectors naming a sortable key \
+     of a source slot that reads a source input. Ties order by recorded_at, then execution ID.";
+
+impl OrderBy {
+    /// Parses `recorded_at` or an input reference.
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] when the text is neither `recorded_at` nor
+    /// a valid reference.
+    pub fn parse(text: &str) -> Result<Self, ReferenceError> {
+        if text == RECORDED_AT {
+            return Ok(Self::RecordedAt);
+        }
+        Reference::parse(text).map(Self::Input)
+    }
+}
+
+impl fmt::Display for OrderBy {
+    /// Writes the authored text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RecordedAt => f.write_str(RECORDED_AT),
+            Self::Input(reference) => reference.fmt(f),
+        }
+    }
+}
+
+impl Serialize for OrderBy {
+    /// Writes the order as its authored text.
+    ///
+    /// # Errors
+    /// Returns the serializer's error.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderBy {
+    /// Reads order text and parses it.
+    ///
+    /// # Errors
+    /// Returns a custom error when the value is not a string or the text is
+    /// neither `recorded_at` nor a valid reference.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for OrderBy {
+    /// Names the order schema in generated definitions.
+    fn schema_name() -> String {
+        "OrderBy".to_owned()
+    }
+
+    /// Describes an order as a string naming its two forms.
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, SchemaObject};
+
+        SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(ORDER_DESCRIPTION.to_owned()),
+                ..Metadata::default()
+            })),
+            instance_type: Some(InstanceType::String.into()),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for OrderBy {
+    /// Describes an order as its authored string form.
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some(ORDER_DESCRIPTION))
+            .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for OrderBy {}
+
 #[cfg(test)]
 mod tests {
     //! Reference text parsing, printing, and serde refusals.

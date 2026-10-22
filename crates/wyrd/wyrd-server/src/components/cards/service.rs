@@ -18,7 +18,7 @@ use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    InputSlot, OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus,
+    InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding, VerificationStatus,
 };
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
@@ -1370,11 +1370,13 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                         BindingActivation::Schedule { cron, tz }
                     }
                     TriggerActivation::GroupEnd { after } => {
+                        let (sources, order_by) = self
+                            .group_sources(occurrence, &subject, site, &verifier_card_uid)
+                            .await?;
                         BindingActivation::GroupEnd(GroupEndSettings {
                             after,
-                            sources: self
-                                .group_sources(occurrence, &subject, site, &verifier_card_uid)
-                                .await?,
+                            sources,
+                            order_by,
                         })
                     }
                 };
@@ -1405,7 +1407,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     }
 
     /// Pin each source input of a `group_end` binding's Verifier to the exact
-    /// source binding it reads.
+    /// source binding it reads, with the Verifier's declared `order_by`.
     ///
     /// The Verifier is read back by UID inside this transaction; each source
     /// resolves within the same `site` through [`source_binding`], which
@@ -1422,7 +1424,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         subject: &CardUid,
         site: &[VerificationBinding],
         verifier: &CardUid,
-    ) -> Result<BTreeMap<SlotName, GroupSource>, WyrdError> {
+    ) -> Result<(BTreeMap<SlotName, GroupSource>, Option<OrderBy>), WyrdError> {
         let Spec::Verifier(verifier) = sql_get_card_by_uid(self.conn, verifier).await?.spec else {
             return Err(WyrdError::internal(
                 "bound Verifier UID is not a Verifier Card",
@@ -1449,7 +1451,7 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                 },
             );
         }
-        Ok(sources)
+        Ok((sources, verifier.order_by))
     }
 }
 

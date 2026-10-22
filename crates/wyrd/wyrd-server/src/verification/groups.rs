@@ -8,9 +8,11 @@
 //! execution and results by result ID at their earliest ingest; each
 //! execution's selected result is its latest visible one by
 //! `(wyrd_ingested_at, result_id)`. Per source slot one list holds every
-//! source execution with a visible input or result, ordered by earliest
-//! input ingest time, else earliest result ingest time, then execution ID;
-//! an absent value is null. Inputs are staged before results, so a visible
+//! source execution with a visible input or result, ordered by the group
+//! Verifier's pinned `order_by` key when it declares one, then by the input's
+//! server-recorded `recorded_at`, then execution ID; an absent value is null.
+//! Ingest time never orders a list: Scribe stamps it once per batch and
+//! promises no cross-batch order. Inputs are staged before results, so a visible
 //! result without its input means the read caught rows mid-publication; that
 //! read pins nothing and the group is retried. The pinned snapshot's content digest makes an
 //! unchanged re-read enqueue nothing. Every row time is Bifrost's managed
@@ -31,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_spec::card::verifier::{SourceField, SourceText};
+use wyrd_spec::card::verifier::{OrderBy, PathSegment, SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ExecutionId, IdError, SlotName, VerificationResultId};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
@@ -247,6 +249,67 @@ struct Sources {
     tuples: Vec<(String, String)>,
     /// The owner and source-tuple filter of every source read.
     eligible: String,
+    /// The pinned input-key `order_by`, when the group Verifier declares
+    /// one; `recorded_at` is the default order and needs none.
+    order: Option<Order>,
+}
+
+/// A group Verifier's declared input-key list order: a key read from one
+/// source tuple's input values.
+struct Order {
+    /// Index into [`Sources::tuples`] of the ordered source binding.
+    tuple: usize,
+    /// The source input the key is read from.
+    field: SourceField,
+    /// Path from that input's value to the key.
+    path: Vec<PathSegment>,
+}
+
+impl Order {
+    /// Stably sort `list` by each execution's key in `payloads`, so equal
+    /// keys keep their default order.
+    fn sort(&self, list: &mut [(ExecutionId, Option<VerificationResultId>)], payloads: &Payloads) {
+        let values: BTreeMap<ExecutionId, Value> = list
+            .iter()
+            .map(|(execution, _)| (*execution, payloads.value(*execution, &self.field)))
+            .collect();
+        list.sort_by(|(left, _), (right, _)| {
+            Self::compare(self.key(&values[left]), self.key(&values[right]))
+        });
+    }
+
+    /// The key `value` sorts by: the value at [`Self::path`], absent when
+    /// the path does not resolve.
+    fn key<'v>(&self, value: &'v Value) -> Option<&'v Value> {
+        self.path
+            .iter()
+            .try_fold(value, |value, segment| match segment {
+                PathSegment::Field(name) => value.get(name),
+                PathSegment::Index(index) => value.get(index),
+                PathSegment::Wildcard => None,
+            })
+    }
+
+    /// Compares two keys: numbers ascending, then strings ascending, then
+    /// any other or missing key, which compare equal.
+    fn compare(left: Option<&Value>, right: Option<&Value>) -> std::cmp::Ordering {
+        /// The class of a key and its number, for cross-class ordering.
+        fn class(key: Option<&Value>) -> (u8, f64) {
+            match key {
+                Some(Value::Number(number)) => (0, number.as_f64().unwrap_or(f64::NAN)),
+                Some(Value::String(_)) => (1, 0.0),
+                _ => (2, 0.0),
+            }
+        }
+        let ((left_class, left_number), (right_class, right_number)) = (class(left), class(right));
+        left_class
+            .cmp(&right_class)
+            .then(left_number.total_cmp(&right_number))
+            .then_with(|| match (left, right) {
+                (Some(Value::String(left)), Some(Value::String(right))) => left.cmp(right),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
 }
 
 /// One source slot: what it reads, from which source tuple.
@@ -269,7 +332,7 @@ impl Sources {
     ///
     /// # Errors
     /// Returns [`GroupPollError::Read`] when a pinned declaration no longer
-    /// parses.
+    /// parses or the pinned `order_by` names no source slot.
     fn new(settings: &GroupEndSettings, owner: &str) -> Result<Self, GroupPollError> {
         let mut tuples: Vec<(String, String)> = Vec::new();
         let mut slots = Vec::new();
@@ -309,18 +372,38 @@ impl Sources {
             ObservationWindow::text(owner),
             if any.is_empty() { "false" } else { &any }
         );
+        let order = match &settings.order_by {
+            Some(OrderBy::Input(order)) => Some(order),
+            Some(OrderBy::RecordedAt) | None => None,
+        };
+        let order = order
+            .map(|order| {
+                slots
+                    .iter()
+                    .find(|slot| Some(&slot.name) == order.slot())
+                    .map(|slot| Order {
+                        tuple: slot.tuple,
+                        field: slot.field.clone(),
+                        path: order.path.clone(),
+                    })
+                    .ok_or_else(|| malformed(format!("order_by {order} names no source slot")))
+            })
+            .transpose()?;
         Ok(Self {
             slots,
             tuples,
             eligible,
+            order,
         })
     }
 
     /// The one statement reading every visible source row matching `group`:
     /// `(surface, card_uid, verifier_card_uid, execution_id, result_id, at,
-    /// payload)`, inputs alone without a `results` table. `at` is the managed
-    /// `wyrd_ingested_at`; `payload` is the input declarations or result
-    /// outcome, read only for a surface some slot reads.
+    /// recorded, payload)`, inputs alone without a `results` table. `at` is
+    /// the managed `wyrd_ingested_at`; `recorded` is the server-recorded
+    /// input time, or a result's execution start; `payload` is the input
+    /// declarations or result outcome, read only for a surface some slot
+    /// reads.
     // ponytail: reads every row of the group, growing with its size; page it
     // if the group-end benchmark shows one read matters.
     fn read(&self, group: &str, results: bool) -> String {
@@ -328,7 +411,7 @@ impl Sources {
         let inputs = format!(
             "SELECT 'i' AS surface, card_uid, verifier_card_uid, execution_id, \
              CAST(NULL AS VARCHAR) AS result_id, wyrd_ingested_at AS at, \
-             CASE WHEN {} THEN inputs END AS payload \
+             recorded_at AS recorded, CASE WHEN {} THEN inputs END AS payload \
              FROM vala.verification.execution_inputs WHERE {} AND {group}",
             self.slots.iter().any(input),
             self.eligible,
@@ -339,7 +422,7 @@ impl Sources {
         format!(
             "{inputs} UNION ALL SELECT 'r' AS surface, card_uid, verifier_card_uid, \
              execution_id, result_id, wyrd_ingested_at AS at, \
-             CASE WHEN {} THEN outcome END AS payload \
+             started_at AS recorded, CASE WHEN {} THEN outcome END AS payload \
              FROM vala.verification.results WHERE {} AND {group}",
             self.slots.iter().any(|slot| !input(slot)),
             self.eligible,
@@ -369,6 +452,7 @@ impl Sources {
         let mut visible = Visible::default();
         for batch in batches {
             let times = times(batch, "at")?;
+            let recorded = self::times(batch, "recorded")?;
             let payload = column(batch, "payload")?;
             for row in 0..batch.num_rows() {
                 let Some(tuple) = self.tuple(batch, row)? else {
@@ -376,6 +460,7 @@ impl Sources {
                 };
                 let execution = id(batch, row)?;
                 let at = instant(times, row)?;
+                let recorded = instant(recorded, row)?;
                 let value = if payload.is_null(row) {
                     Value::Null
                 } else {
@@ -386,9 +471,9 @@ impl Sources {
                         .ok_or_else(|| GroupPollError::Read("null result_id".to_owned()))?
                         .parse()
                         .map_err(|error: IdError| malformed(error))?;
-                    visible.result(result, tuple, execution, at, value);
+                    visible.result(result, tuple, execution, at, recorded, value);
                 } else {
-                    visible.input(tuple, execution, at, value);
+                    visible.input(tuple, execution, at, recorded, value);
                 }
             }
         }
@@ -401,25 +486,22 @@ impl Sources {
 struct Earliest {
     /// Its earliest managed `wyrd_ingested_at`.
     at: DateTime<Utc>,
+    /// That row's server-recorded input time, or its result's execution
+    /// start, which orders lists.
+    recorded: DateTime<Utc>,
     /// The payload of that earliest row.
     value: Value,
 }
 
 impl Earliest {
-    /// Insert a row at `at` with `value` under `key`, or keep the earlier.
-    fn keep<K: Ord, T>(
-        rows: &mut BTreeMap<K, (T, Self)>,
-        key: K,
-        owner: T,
-        at: DateTime<Utc>,
-        value: Value,
-    ) {
+    /// Insert `row` under `key`, or keep the earlier-ingested row.
+    fn keep<K: Ord, T>(rows: &mut BTreeMap<K, (T, Self)>, key: K, owner: T, row: Self) {
         match rows.entry(key) {
             Entry::Vacant(vacant) => {
-                vacant.insert((owner, Self { at, value }));
+                vacant.insert((owner, row));
             }
-            Entry::Occupied(mut known) if at < known.get().1.at => {
-                known.get_mut().1 = Self { at, value };
+            Entry::Occupied(mut known) if row.at < known.get().1.at => {
+                known.get_mut().1 = row;
             }
             Entry::Occupied(_) => {}
         }
@@ -443,8 +525,20 @@ impl Visible {
     /// An execution can appear in several Bifrost rows (replays, later
     /// files); only the payload with the earliest `wyrd_ingested_at` is kept,
     /// so the pinned input and the list order are stable across re-reads.
-    fn input(&mut self, tuple: usize, execution: ExecutionId, at: DateTime<Utc>, value: Value) {
-        Earliest::keep(&mut self.inputs, execution, tuple, at, value);
+    fn input(
+        &mut self,
+        tuple: usize,
+        execution: ExecutionId,
+        at: DateTime<Utc>,
+        recorded: DateTime<Utc>,
+        value: Value,
+    ) {
+        let row = Earliest {
+            at,
+            recorded,
+            value,
+        };
+        Earliest::keep(&mut self.inputs, execution, tuple, row);
     }
 
     /// Record one result row of `execution` under `tuple`, keyed by its
@@ -459,9 +553,15 @@ impl Visible {
         tuple: usize,
         execution: ExecutionId,
         at: DateTime<Utc>,
+        recorded: DateTime<Utc>,
         value: Value,
     ) {
-        Earliest::keep(&mut self.results, result, (tuple, execution), at, value);
+        let row = Earliest {
+            at,
+            recorded,
+            value,
+        };
+        Earliest::keep(&mut self.results, result, (tuple, execution), row);
     }
 
     /// Source executions with a visible result but no visible input, in ID
@@ -479,25 +579,26 @@ impl Visible {
         missing
     }
 
-    /// Each execution of `tuple` in list order with its selected result:
-    /// by earliest input time, else earliest result time, then execution ID.
-    /// The selected result is the greatest `(at, result_id)`.
+    /// Each execution of `tuple` in default list order with its selected
+    /// result: by its input's recorded time, else its earliest result's
+    /// execution start, then execution ID. The selected result is the
+    /// greatest `(at, result_id)`.
     fn executions(&self, tuple: usize) -> Vec<(ExecutionId, Option<VerificationResultId>)> {
-        /// An execution's two optional ordering anchors: the ingest time of
-        /// its earliest input, then of its earliest result. Either is absent
+        /// An execution's two optional ordering anchors: its input's recorded
+        /// time, then its earliest result's execution start. Either is absent
         /// when the snapshot holds no such row; the input anchor wins.
         type Firsts = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
         let mut order: BTreeMap<ExecutionId, Firsts> = BTreeMap::new();
         let mut selected: BTreeMap<ExecutionId, (DateTime<Utc>, VerificationResultId)> =
             BTreeMap::new();
         for (execution, (_, input)) in self.inputs.iter().filter(|(_, (t, _))| *t == tuple) {
-            order.entry(*execution).or_default().0 = Some(input.at);
+            order.entry(*execution).or_default().0 = Some(input.recorded);
         }
         for (result, ((_, execution), row)) in
             self.results.iter().filter(|(_, ((t, _), _))| *t == tuple)
         {
             let first = &mut order.entry(*execution).or_default().1;
-            *first = Some(first.map_or(row.at, |known| known.min(row.at)));
+            *first = Some(first.map_or(row.recorded, |known| known.min(row.recorded)));
             let pick = (row.at, *result);
             selected
                 .entry(*execution)
@@ -515,7 +616,9 @@ impl Visible {
     }
 
     /// Pin the snapshot of `due` from these rows: per slot one list aligned
-    /// to its source's executions, each value null when absent.
+    /// to its source's executions, each value null when absent. The ordered
+    /// tuple's list is stably re-sorted by the declared key, so ties keep the
+    /// default order.
     ///
     /// # Errors
     /// Returns [`sqlx::Error::Encode`] when the snapshot cannot be digested.
@@ -528,9 +631,12 @@ impl Visible {
                 .collect(),
             outcomes: BTreeMap::new(),
         };
-        let lists: Vec<_> = (0..sources.tuples.len())
+        let mut lists: Vec<_> = (0..sources.tuples.len())
             .map(|tuple| self.executions(tuple))
             .collect();
+        if let Some(order) = &sources.order {
+            order.sort(&mut lists[order.tuple], &payloads);
+        }
         for (execution, result) in lists.iter().flatten() {
             if let Some(result) = result {
                 payloads
@@ -723,15 +829,15 @@ mod tests {
         results.sort_unstable();
         let [early, late, tied] = results;
         let mut visible = Visible::default();
-        visible.input(0, b, at(10), json!("b-late"));
-        visible.input(0, b, at(9), json!("b"));
-        visible.result(early, 0, b, at(12), json!("first"));
-        visible.result(late, 0, b, at(15), json!("second"));
-        visible.result(late, 0, b, at(20), json!("replayed"));
-        visible.input(0, a, at(10), json!("a"));
-        visible.result(tied, 0, c, at(5), json!("only"));
-        visible.input(0, d, at(10), json!("d"));
-        visible.input(1, other, at(1), json!("other"));
+        visible.input(0, b, at(10), at(10), json!("b-late"));
+        visible.input(0, b, at(9), at(9), json!("b"));
+        visible.result(early, 0, b, at(12), at(12), json!("first"));
+        visible.result(late, 0, b, at(15), at(15), json!("second"));
+        visible.result(late, 0, b, at(20), at(20), json!("replayed"));
+        visible.input(0, a, at(10), at(10), json!("a"));
+        visible.result(tied, 0, c, at(5), at(5), json!("only"));
+        visible.input(0, d, at(10), at(10), json!("d"));
+        visible.input(1, other, at(1), at(1), json!("other"));
         assert_eq!(
             visible.executions(0),
             [(c, Some(tied)), (b, Some(late)), (a, None), (d, None)]
@@ -739,6 +845,62 @@ mod tests {
         assert_eq!(visible.inputs[&b].1.value, json!("b"));
         assert_eq!(visible.results[&late].1.value, json!("second"));
         assert_eq!(visible.executions(1), [(other, None)]);
+    }
+
+    /// Lists order by recorded input time, not ingest time: rows of one
+    /// batch share an ingest time, and a later batch may be recorded first.
+    ///
+    /// # Panics
+    /// Panics when a list orders by ingest time or execution ID first.
+    #[test]
+    fn recorded_time_orders_lists() {
+        let mut ids = [(); 3].map(|()| ExecutionId::new_v7());
+        ids.sort_unstable();
+        let [first, second, third] = ids;
+        let mut visible = Visible::default();
+        visible.input(0, third, at(10), at(1), json!(null));
+        visible.input(0, first, at(10), at(3), json!(null));
+        visible.input(0, second, at(5), at(2), json!(null));
+        assert_eq!(
+            visible.executions(0),
+            [(third, None), (second, None), (first, None)]
+        );
+    }
+
+    /// A declared input key orders numbers, then strings, then missing or
+    /// other keys; equal keys keep their default order.
+    ///
+    /// # Panics
+    /// Panics when the declared order sorts otherwise or is unstable.
+    #[test]
+    fn declared_key_orders_lists() {
+        let ids = [(); 7].map(|()| ExecutionId::new_v7());
+        let turn = |value: Value| json!({"turn": {"kind": "json", "value": {"turn": value}}});
+        let values = [
+            turn(json!("b")),
+            json!({}),
+            turn(json!(10)),
+            turn(json!(2)),
+            turn(json!("a")),
+            turn(json!(2)),
+            turn(json!(true)),
+        ];
+        let payloads = Payloads {
+            inputs: ids.iter().copied().zip(values).collect(),
+            outcomes: BTreeMap::new(),
+        };
+        let order = Order {
+            tuple: 0,
+            field: SourceField::Input("turn".parse().expect("slot name")),
+            path: vec![PathSegment::Field("turn".to_owned())],
+        };
+        let mut list: Vec<_> = ids.iter().map(|id| (*id, None)).collect();
+        order.sort(&mut list, &payloads);
+        let [b, missing, ten, two, a, two_again, other] = ids;
+        assert_eq!(
+            list.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [two, two_again, ten, a, b, missing, other]
+        );
     }
 
     /// Values unwrap JSON and trace inputs, keep other declarations, read

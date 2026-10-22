@@ -1291,9 +1291,10 @@ impl OutboxSink for ScribeSink {
 
     /// A gateway capture and every audit decision lane by their request
     /// correlation ID, so one call's decision and capture share a lane and
-    /// different calls spread. Every other write takes lane 0: Verifier
-    /// inputs and results keep the arrival order the group read orders
-    /// executions by, and server spans need no spread.
+    /// different calls spread. Every other write takes lane 0, so an
+    /// execution's inputs commit no later than its results and server spans
+    /// need no spread. No reader relies on cross-batch commit order: group
+    /// lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
         let request_id = match item {
             ScribeWrite::Capture(capture) => Some(capture.request_id()),

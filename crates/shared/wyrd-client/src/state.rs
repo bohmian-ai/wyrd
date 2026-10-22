@@ -1037,7 +1037,7 @@ impl WyrdState {
     /// Resolve an alias to the pure Verifier spec borrowed from its envelope.
     ///
     /// Returns the declarative building blocks directly: `inputs`, `steps`,
-    /// `requirements`, `decide`, and `context_capture`. Drift and Agent
+    /// `requirements`, `decide`, `context_capture`, and `order_by`. Drift and Agent
     /// judging are requirement check kinds inside those blocks, so one
     /// accessor covers every Verifier and no per-check accessor exists.
     ///

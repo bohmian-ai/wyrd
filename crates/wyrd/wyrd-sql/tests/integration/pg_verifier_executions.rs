@@ -2650,6 +2650,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
                 verifier_card_uid: source.clone(),
             },
         )]),
+        order_by: None,
     };
     let operator = FrozenTarget::Digest("sha256:operator".to_owned());
     let lasting = |verifier: &CardUid, after: &str| NewBinding {

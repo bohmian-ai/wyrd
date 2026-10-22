@@ -286,16 +286,15 @@ export declare class NativeCards {
    * # Arguments
    *
    * * `kind` - The Card kind, such as `Model`.
-   * * `space` - The Card space.
    * * `name` - The Card name.
    *
    * # Errors
    *
    * Returns a napi error only when the reference cannot be serialized; a
-   * malformed kind, space, or name (`WYRD_SPEC_400_VALIDATION`), no Active
+   * malformed kind or name (`WYRD_SPEC_400_VALIDATION`), no Active
    * version, and registry failures are returned in the result.
    */
-  resolveLatest(kind: string, space: string, name: string): Promise<NativeLifecycleResult>
+  resolveLatest(kind: string, name: string): Promise<NativeLifecycleResult>
   /**
    * Pulls one Card graph into a published local bundle.
    *

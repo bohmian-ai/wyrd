@@ -17,7 +17,7 @@ use wyrd_client::state::{DeclareOptions, TelemetryFlushFailure, WyrdState};
 use wyrd_client::verify::Submission;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 use wyrd_spec::{Prompt, ResponseType};
 
@@ -215,20 +215,18 @@ impl NativeCards {
     /// # Arguments
     ///
     /// * `kind` - The Card kind, such as `Model`.
-    /// * `space` - The Card space.
     /// * `name` - The Card name.
     ///
     /// # Errors
     ///
     /// Returns a napi error only when the reference cannot be serialized; a
-    /// malformed kind, space, or name (`WYRD_SPEC_400_VALIDATION`), no Active
+    /// malformed kind or name (`WYRD_SPEC_400_VALIDATION`), no Active
     /// version, and registry failures are returned in the result.
     #[napi]
     pub fn resolve_latest<'env>(
         &self,
         env: &'env Env,
         kind: String,
-        space: String,
         name: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let cards = self.cards.clone();
@@ -240,12 +238,11 @@ impl NativeCards {
             let parsed = (
                 serde_json::from_value::<CardKind>(serde_json::Value::String(kind))
                     .map_err(|error| invalid("kind", &error)),
-                SpaceName::new(space).map_err(|error| invalid("space", &error)),
                 CardName::new(name).map_err(|error| invalid("name", &error)),
             );
             let result = match parsed {
-                (Ok(kind), Ok(space), Ok(name)) => cards.resolve_latest(kind, space, name).await,
-                (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => Err(error),
+                (Ok(kind), Ok(name)) => cards.resolve_latest(kind, name).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
             };
             NativeLifecycleResult::outcome(result)
         })

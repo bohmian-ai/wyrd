@@ -78,7 +78,7 @@ const VERIFIES = ["verifier:run", "gateway:invoke"];
 /** The investigator's one tool turn: one call of each of {@link TOOLS}, in order. */
 const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
-    card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0", space: "default" },
+    card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
   toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM vala.verification.results LIMIT 1", max_rows: 1 }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
@@ -174,7 +174,7 @@ const test = serverTest({ provider: upstream, verificationRuntime: true, perTest
     await cards.pull(receipt.root, bundle);
     const root = declared(receipt);
     const client = WyrdClient.connect({
-      credential: (await cli.issueKey({ ...root, space: root.space ?? "default" })).key,
+      credential: (await cli.issueKey(root)).key,
     });
     const state = WyrdState.fromPath(bundle, { client });
     await state.startBifrost();

@@ -57,7 +57,7 @@ test("runs the Quickstart script from a directory holding only its Cards", async
   const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
   for (const file of ["no-refund-promise.yaml", "support-reply.yaml"])
     cpSync(join(QUICKSTART, file), join(reader, file));
-  const ref = (kind: string, name: string) => `default/${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
+  const ref = (kind: string, name: string) => `${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
   const printed = () =>
     execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
 
@@ -108,9 +108,39 @@ test("declares a ready verification state", async ({ server, model: _ }) => {
 });
 
 test("latest version resolves to the declared card", async ({ cards, desk }) => {
-  expect(await cards.resolveLatest("Service", "default", "support-desk")).toMatchObject(desk.root);
-  await expect(cards.resolveLatest("Service", "default", "never-registered")).rejects.toMatchObject({
+  expect(await cards.resolveLatest("Service", "support-desk")).toMatchObject(desk.root);
+  await expect(cards.resolveLatest("Service", "never-registered")).rejects.toMatchObject({
     code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+  });
+});
+
+test("flat card identity round trip", async ({ cards, desk }) => {
+  const { kind, name, version, uid } = desk.root;
+  expect(Object.keys(desk.root).sort()).toEqual(["kind", "name", "uid", "version"]);
+  const text = `${kind}/${name}@${version}#${uid}`;
+  expect(text).toMatch(/^Service\/support-desk@1\.0\.0#[0-9a-f-]+$/);
+
+  expect(await cards.get(text)).toMatchObject({ kind: "Service", metadata: { name, version, uid } });
+  expect(await cards.get(`${kind}/${name}@${version}`)).toMatchObject({ metadata: { uid } });
+  const bundle = bundleDir();
+  expect(await cards.pull(text, bundle)).toMatchObject({ mode: "complete", root: desk.root });
+  expect(WyrdState.fromPath(bundle).rootRef).toEqual(desk.root);
+
+  await expect(cards.get(JSON.stringify({ kind, name, version, space: "default" }))).rejects.toMatchObject({
+    status: 400,
+    detail: expect.stringContaining("unknown field `space`"),
+  });
+  await expect(cards.get(`default/${kind}/${name}@${version}`)).rejects.toMatchObject({ status: 400 });
+  const spaced = join(bundleDir(), "spaced.yaml");
+  writeFileSync(
+    spaced,
+    readFileSync(DESK, "utf8").replace("  name: support-desk\n", "  name: support-desk\n  space: prod\n"),
+  );
+  await expect(cards.declareFromPath(spaced)).rejects.toMatchObject({
+    code: "WYRD_LOADER_400_INVALID_ENVELOPE",
+    details: {
+      diagnostics: [expect.objectContaining({ message: expect.stringContaining("unknown field `space`") })],
+    },
   });
 });
 
@@ -176,7 +206,7 @@ test("reader cannot declare cards", async ({ server, desk: _ }) => {
 test("cli declare get and pull round trip the graph", async ({ server, desk }) => {
   const client = WyrdClient.connect({ credential: server.apiKey });
   const declaredGraph = await cli.declare(DESK, { client });
-  const selector = { kind: "Service", space: "default", name: "support-desk", version: "1.0.0" };
+  const selector = { kind: "Service", name: "support-desk", version: "1.0.0" };
   const bundle = bundleDir();
 
   const envelope = await cli.get(selector, { client });
@@ -189,7 +219,7 @@ test("cli declare get and pull round trip the graph", async ({ server, desk }) =
 });
 
 test("refused cli command raises its catalog code", async ({ server: _ }) => {
-  const missing = { kind: "Service", space: "default", name: "no-such-service", version: "1.0.0" };
+  const missing = { kind: "Service", name: "no-such-service", version: "1.0.0" };
   await expect(cli.get(missing)).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
   await expect(cli.pull(missing, bundleDir())).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
 });

@@ -1622,7 +1622,7 @@ export class Cards {
    * including a Drift Verifier's `status.verification.baseline` state. Other
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
-   * @param ref - A Card reference, or its `space/Kind/name@version` text.
+   * @param ref - A Card reference, or its `Kind/name@version[#uid]` text.
    * @returns The declared envelope.
    * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
    * a transport or authorization failure.
@@ -1647,15 +1647,14 @@ export class Cards {
    * Resolve the latest Active version of one named Card to its exact reference.
    *
    * @param kind - The Card kind, such as `Model`.
-   * @param space - The Card space.
    * @param name - The Card name.
    * @returns The exact reference, carrying its `uid`.
    * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` for a malformed
-   * kind, space, or name, else the registry's not-found or a transport or
+   * kind or name, else the registry's not-found or a transport or
    * authorization failure.
    */
-  async resolveLatest(kind: string, space: string, name: string): Promise<CardRef> {
-    return lifecycleValue<CardRef>(await this.#native.resolveLatest(kind, space, name));
+  async resolveLatest(kind: string, name: string): Promise<CardRef> {
+    return lifecycleValue<CardRef>(await this.#native.resolveLatest(kind, name));
   }
 
   /**

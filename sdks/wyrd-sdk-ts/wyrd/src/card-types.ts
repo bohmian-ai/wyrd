@@ -388,7 +388,9 @@ export type CardLifecycleStatus = "pending" | "active" | "deprecated" | "failed"
 export type CardName = string;
 
 /**
- * Reference to a registered Card by kind, name, version, optional space, and optional UID.
+ * Reference to a registered Card by kind, name, one version, and optional UID.
+ *
+ * Identity is `(kind, name, version)` within the authenticated tenant; the canonical text form is `Kind/name@version[#uid]`. Unknown fields, such as the removed `space`, are refused.
  */
 export interface CardRef {
   /**
@@ -400,15 +402,9 @@ export interface CardRef {
    */
   readonly name: CardName;
   /**
-   * Space pinning identity together with `name` and `version`.
-   *
-   * Authors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.
-   */
-  readonly space?: SpaceName | null;
-  /**
    * Optional server-resolved durable UID.
    *
-   * Authors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.
+   * Authors identify a dependency with `(kind, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.
    */
   readonly uid?: CardUid | null;
   /**
@@ -455,10 +451,6 @@ export interface CardSummary {
    * Card name.
    */
   readonly name: CardName;
-  /**
-   * Workspace.
-   */
-  readonly space: SpaceName;
   /**
    * BLAKE3-hex spec hash.
    */
@@ -2496,10 +2488,6 @@ export interface ListCardsRequest {
    */
   readonly name?: CardName | null;
   /**
-   * Optional workspace filter.
-   */
-  readonly space?: SpaceName | null;
-  /**
    * Optional lifecycle filter.
    */
   readonly status?: CardLifecycleStatus | null;
@@ -2683,10 +2671,6 @@ export interface Metadata {
    * Code-origin provenance: the repository commit this card was declared from. Populated on the register path for cards authored in a repo; `None` for cards with no code origin (e.g. UI-authored).
    */
   readonly origin?: Origin | null;
-  /**
-   * Optional space.
-   */
-  readonly space?: SpaceName | null;
   /**
    * Spec content hash.
    */
@@ -4765,7 +4749,7 @@ export interface ServiceComponent {
 }
 
 /**
- * Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.
+ * Server-side runtime declaration; tenancy is the registering tenant.
  */
 export interface ServiceRuntime {
   /**
@@ -4960,11 +4944,6 @@ export type SourceCompletionOutcome = "complete" | "unavailable";
  * Group source reference: verifiers.<name>.inputs.<slot> or verifiers.<name>.requirements.<requirement>.outcome, selecting one whole slot or requirement outcome per source execution.
  */
 export type SourceText = string;
-
-/**
- * Human-visible namespace for Cards and Runs.
- */
-export type SpaceName = string;
 
 /**
  * OTel-canonical span event.

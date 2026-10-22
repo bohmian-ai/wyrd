@@ -37,7 +37,6 @@ export const observedService = (options: ServerOptions = {}) =>
           kind: "Service",
           name: "observed-service",
           version: "1.0.0",
-          space: "default",
         });
         await use(issued.key);
       },

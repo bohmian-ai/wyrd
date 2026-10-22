@@ -26,17 +26,15 @@ export interface CheckReport {
   readonly ok: boolean;
   readonly cards: readonly {
     readonly kind: string;
-    readonly space: string | null;
     readonly name: string;
     readonly version: string | null;
   }[];
   readonly diagnostics: readonly CheckDiagnostic[];
 }
 
-/** Card selector: a `uid` with `kind`, or `kind`, `space`, and `name`; `version` narrows either. */
+/** Card selector: a `uid` with `kind`, or `kind` and `name`; `version` narrows either. */
 export interface CliCardSelector {
   readonly kind?: string;
-  readonly space?: string;
   readonly name?: string;
   readonly version?: string;
   readonly uid?: string;
@@ -113,7 +111,6 @@ export declare const cli: {
       readonly kind: string;
       readonly name: string;
       readonly version: string;
-      readonly space: string;
       readonly label?: string;
       readonly expiresInSeconds?: number;
     },

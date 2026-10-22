@@ -934,10 +934,10 @@ async fn declare_component_card(
         .canonical_hash_with_bytes()
         .expect("component spec hashes");
     sqlx::query(
-        "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, space, name, version, spec, \
+        "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, name, version, spec, \
          spec_hash, artifact_hash, labels, annotations, status, sub_principal_id, act_principal_id) \
-         SELECT $1, root.data_tenant_id, $2, $3, $4, $5, $6, $7, NULL, '{}'::jsonb, '{}'::jsonb, \
-         'active', root.sub_principal_id, root.act_principal_id FROM wyrd.cards root WHERE root.card_uid = $8",
+         SELECT $1, root.data_tenant_id, $2, $3, $4, $5, $6, NULL, '{}'::jsonb, '{}'::jsonb, \
+         'active', root.sub_principal_id, root.act_principal_id FROM wyrd.cards root WHERE root.card_uid = $7",
     )
     .bind(
         component
@@ -947,13 +947,6 @@ async fn declare_component_card(
             .as_uuid(),
     )
     .bind(CardKind::Service.wire_name())
-    .bind(
-        component
-            .space
-            .as_ref()
-            .expect("fixture card ref carries a space")
-            .as_str(),
-    )
     .bind(component.name.as_str())
     .bind(component.version.as_str())
     .bind(serde_json::to_value(&component_spec).expect("component spec encodes"))
@@ -974,21 +967,15 @@ async fn declare_component_card(
         .await
         .expect("the authored root Card is retired");
     sqlx::query(
-        "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, space, name, version, spec, \
+        "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, name, version, spec, \
          spec_hash, artifact_hash, labels, annotations, status, sub_principal_id, act_principal_id) \
-         SELECT $1, component.data_tenant_id, $2, $3, $4, $5, $6, $7, NULL, '{}'::jsonb, \
+         SELECT $1, component.data_tenant_id, $2, $3, $4, $5, $6, NULL, '{}'::jsonb, \
          '{}'::jsonb, 'active', component.sub_principal_id, \
          component.act_principal_id FROM wyrd.cards component \
-         WHERE component.card_uid = $8",
+         WHERE component.card_uid = $7",
     )
     .bind(root.uid.as_ref().expect("root uid is set").as_uuid())
     .bind(CardKind::Service.wire_name())
-    .bind(
-        root.space
-            .as_ref()
-            .expect("fixture card ref carries a space")
-            .as_str(),
-    )
     .bind(root.name.as_str())
     .bind(root.version.as_str())
     .bind(serde_json::to_value(&root_spec).expect("root spec encodes"))
@@ -1018,16 +1005,9 @@ async fn registry_card_uid(
 ) -> String {
     let pool = server.pg_fixture().superuser_pool().expect("registry pool");
     let uid: uuid::Uuid = sqlx::query_scalar(
-        "SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND space = $2 AND name = $3 \
-         AND version = $4",
+        "SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND name = $2 AND version = $3",
     )
     .bind(card.kind.wire_name())
-    .bind(
-        card.space
-            .as_ref()
-            .expect("fixture card ref carries a space")
-            .as_str(),
-    )
     .bind(card.name.as_str())
     .bind(card.version.as_str())
     .fetch_one(&pool)

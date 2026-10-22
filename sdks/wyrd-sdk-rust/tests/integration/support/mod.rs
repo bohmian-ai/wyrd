@@ -226,21 +226,13 @@ impl Deployment {
     /// # Panics
     /// Panics when the CLI refuses to issue the key.
     pub async fn service_key(&self, card: &CardRef) -> String {
-        let [kind, name, version, space] = coordinates(card);
-        cli::issue_key(
-            &kind,
-            &name,
-            &version,
-            &space,
-            None,
-            None,
-            Some(self.admin()),
-        )
-        .await
-        .expect("the CLI issues the Service key")
-        .key
-        .expose()
-        .to_owned()
+        let [kind, name, version] = coordinates(card);
+        cli::issue_key(&kind, &name, &version, None, None, Some(self.admin()))
+            .await
+            .expect("the CLI issues the Service key")
+            .key
+            .expose()
+            .to_owned()
     }
 
     /// Bootstrap an administrator in a new tenant `slug` and return its key.
@@ -525,16 +517,13 @@ pub fn ancestry<'a>(timeline: &'a [SpanRecord], span: &'a SpanRecord) -> Vec<&'a
     chain
 }
 
-/// The `kind`, `name`, `version`, and `space` arguments the card-selecting
-/// CLI functions take for `card`; an unpinned space is `default`.
-pub fn coordinates(card: &CardRef) -> [String; 4] {
+/// The `kind`, `name`, and `version` arguments the card-selecting CLI
+/// functions take for `card`.
+pub fn coordinates(card: &CardRef) -> [String; 3] {
     [
         card.kind.wire_name().to_owned(),
         card.name.as_str().to_owned(),
         card.version.to_string(),
-        card.space
-            .as_ref()
-            .map_or_else(|| "default".to_owned(), ToString::to_string),
     ]
 }
 

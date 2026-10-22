@@ -27,9 +27,6 @@ pub struct IssueKeyArgs {
     /// Card version (e.g. 1.0.0).
     #[arg(long, value_name = "VERSION")]
     pub version: String,
-    /// Card space.
-    #[arg(long, value_name = "SPACE")]
-    pub space: String,
     /// Optional label stored with the key row.
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
@@ -58,12 +55,11 @@ pub async fn issue_key(
     kind: &str,
     name: &str,
     version: &str,
-    space: &str,
     label: Option<&str>,
     expires_in_seconds: Option<u32>,
     client: Option<WyrdClient>,
 ) -> Result<IssueKeyResponse, WyrdError> {
-    let card_ref = card_ref(kind, name, version, space)?;
+    let card_ref = card_ref(kind, name, version)?;
     let client = crate::client::explicit_or_ambient(client)?;
     request(client, card_ref, label, expires_in_seconds)
         .await
@@ -75,13 +71,8 @@ pub async fn issue_key(
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] naming `card` when the
 /// coordinates do not form a `CardRef`.
-pub(crate) fn card_ref(
-    kind: &str,
-    name: &str,
-    version: &str,
-    space: &str,
-) -> Result<CardRef, WyrdCliError> {
-    let card_ref = format!("{space}/{kind}/{name}@{version}");
+pub(crate) fn card_ref(kind: &str, name: &str, version: &str) -> Result<CardRef, WyrdCliError> {
+    let card_ref = format!("{kind}/{name}@{version}");
     card_ref
         .parse()
         .map_err(|error| WyrdCliError::InvalidArgument {
@@ -126,7 +117,7 @@ async fn request(
 /// the server's stable Wyrd error when the caller is unauthorized or the card is
 /// unknown.
 pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
-    let card_ref = card_ref(&args.kind, &args.name, &args.version, &args.space)?;
+    let card_ref = card_ref(&args.kind, &args.name, &args.version)?;
     let client = crate::client::from_global(Some(args.server.as_str()))?;
     let response = request(
         client,
@@ -169,8 +160,6 @@ mod tests {
             "my-svc",
             "--version",
             "1.0.0",
-            "--space",
-            "default",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
@@ -185,12 +174,31 @@ mod tests {
             "my-svc",
             "--version",
             "1.0.0",
-            "--space",
-            "default",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
         assert!(parsed.is_err(), "must require --kind");
+    }
+
+    /// Card space is not a CLI coordinate, so `--space` is refused as an
+    /// unknown argument rather than ignored.
+    #[test]
+    fn issue_key_refuses_removed_space_flag() {
+        let error = Cli::try_parse_from([
+            "wyrd",
+            "--kind",
+            "Service",
+            "--name",
+            "my-svc",
+            "--version",
+            "1.0.0",
+            "--space",
+            "default",
+            "--server",
+            "https://acme.wyrd.cloud",
+        ])
+        .expect_err("--space is refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -203,8 +211,6 @@ mod tests {
             "my-agent",
             "--version",
             "2.3.1",
-            "--space",
-            "prod",
             "--server",
             "https://acme.wyrd.cloud",
             "--label",

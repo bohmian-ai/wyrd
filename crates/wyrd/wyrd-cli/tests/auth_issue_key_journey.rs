@@ -74,11 +74,6 @@ async fn auth_issue_key_cli_journey() {
             card.name.to_string(),
             "--version".to_owned(),
             card.version.to_string(),
-            "--space".to_owned(),
-            card.space
-                .as_ref()
-                .expect("the fixture card names a space")
-                .to_string(),
             "--label".to_owned(),
             "cli journey".to_owned(),
             "--server".to_owned(),

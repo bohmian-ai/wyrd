@@ -481,7 +481,6 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         "Agent",
         "ask-agent",
         "1.0.0",
-        "default",
         None,
         None,
         Some(inference.deployment.admin()),
@@ -581,7 +580,6 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
         "Agent",
         "ask-agent",
         "1.0.0",
-        "default",
         None,
         None,
         Some(admin.clone()),
@@ -595,14 +593,8 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
             issued.card_ref.kind,
             issued.card_ref.name.as_str(),
             issued.card_ref.version.to_string(),
-            issued.card_ref.space.as_ref().map(ToString::to_string)
         ),
-        (
-            CardKind::Agent,
-            "ask-agent",
-            "1.0.0".to_owned(),
-            Some("default".to_owned())
-        )
+        (CardKind::Agent, "ask-agent", "1.0.0".to_owned(),)
     );
     assert!(issued.key.expose().starts_with(&issued.prefix));
     assert_eq!(

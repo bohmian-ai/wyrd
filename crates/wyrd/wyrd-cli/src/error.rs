@@ -188,7 +188,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_DELETE_SELECTOR_EXACT",
         status = 400,
         title = "Delete selector is not exact",
-        remediation = "Pass --uid, or pass --kind, --space, --name, and --version."
+        remediation = "Pass --uid, or pass --kind, --name, and --version."
     )]
     DeleteSelectorRequiresExact,
 

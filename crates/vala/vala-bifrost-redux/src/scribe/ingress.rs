@@ -785,7 +785,11 @@ const ADMISSION_CLOCK_REANCHOR: std::time::Duration = std::time::Duration::from_
 /// `statement_timestamp()` per batch costs a pool acquire and a round trip on
 /// every request. The clock instead reads it once, pairs it with a local
 /// [`Instant`], and answers each later admission with the anchor plus the
-/// monotonic time elapsed since. The node's wall clock is never consulted, so
+/// monotonic time elapsed since. The local instant is taken before the read
+/// is sent, so it never trails the `PostgreSQL` instant it pairs with: a
+/// stamp may run ahead of `PostgreSQL` time by one read's round trip, but is
+/// never behind it, and a row admitted after `PostgreSQL` time `F` is stamped
+/// at or after `F`. The node's wall clock is never consulted, so
 /// replicas still agree to within one anchor's drift, and the anchor is
 /// re-read after [`ADMISSION_CLOCK_REANCHOR`] so that drift stays bounded. An
 /// engine without control `PostgreSQL` has no durable state to agree with and
@@ -838,10 +842,11 @@ impl AdmissionClock {
             Some(anchor) if anchor.1.elapsed() < ADMISSION_CLOCK_REANCHOR => anchor,
             _ => {
                 let mut conn = postgres.tenant_conn(tenant).await?;
+                let sent = Instant::now();
                 let instant =
                     vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn).await?;
                 conn.commit().await?;
-                let anchor = (instant.timestamp_micros(), Instant::now());
+                let anchor = (instant.timestamp_micros(), sent);
                 *self
                     .anchor
                     .lock()
@@ -882,13 +887,14 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
 
     /// After its first `PostgreSQL` read the admission clock answers from its
-    /// anchor: a later admission needs no database trip and never runs
-    /// backwards.
+    /// anchor: a later admission needs no database trip, never runs
+    /// backwards, and is never behind `PostgreSQL` time read before it.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot start, the first read fails, or the
-    /// clock reaches `PostgreSQL` again after its pool is closed.
+    /// Panics when the fixture cannot start, the first read fails, a stamp
+    /// precedes an earlier `PostgreSQL` instant, or the clock reaches
+    /// `PostgreSQL` again after its pool is closed.
     #[tokio::test]
     async fn admission_clock_answers_from_its_anchor() {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -902,6 +908,10 @@ mod tests {
             .now_micros(tenant)
             .await
             .expect("anchors on PostgreSQL");
+        let floor: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(postgres.pool())
+            .await
+            .expect("reads PostgreSQL time");
         postgres.pool().close().await;
         let second = clock
             .now_micros(tenant)
@@ -909,6 +919,10 @@ mod tests {
             .expect("answers from the anchor");
 
         assert!(second >= first, "{second} precedes {first}");
+        assert!(
+            second >= floor.timestamp_micros(),
+            "{second} precedes PostgreSQL time {floor} read before it"
+        );
     }
 
     /// The Scribe ingress boundary carries no OTLP signal payload (S4).

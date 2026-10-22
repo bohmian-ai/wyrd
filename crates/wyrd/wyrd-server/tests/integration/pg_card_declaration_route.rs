@@ -1347,9 +1347,8 @@ async fn verifier_contract_refusals_leave_no_writes() {
         }
     };
 
-    // The declaration body is decoded by the plain JSON extractor, whose
-    // rejection is a 422 text body naming the failure rather than a Wyrd
-    // problem document; the refusal and its no-write boundary are what hold.
+    // A body the typed envelope cannot decode is refused as the stable
+    // validation problem whose reason names the failure, before any write.
     let undecodable = |label: &str, request: Request<Body>, needle: &str| {
         let server = &server;
         let jwt = jwt.as_str();
@@ -1361,12 +1360,19 @@ async fn verifier_contract_refusals_leave_no_writes() {
                 .await
                 .expect("undecodable registration responds");
             let status = response.status();
-            let bytes = to_bytes(response.into_body(), 1 << 20)
-                .await
-                .expect("response body reads");
-            let text = String::from_utf8_lossy(&bytes);
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {text}");
-            assert!(text.contains(needle.as_str()), "{label}: {text}");
+            let problem = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {problem}");
+            assert_eq!(
+                problem["code"], "WYRD_SPEC_400_VALIDATION",
+                "{label}: {problem}"
+            );
+            assert_eq!(problem["details"]["location"], "body", "{label}: {problem}");
+            assert!(
+                problem["details"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(needle.as_str())),
+                "{label}: {problem}"
+            );
         }
     };
 
@@ -1513,6 +1519,31 @@ async fn verifier_contract_refusals_leave_no_writes() {
 ///
 /// # Panics
 /// Panics when a count cannot be read or any count is non-zero.
+/// Assert a removed `space` selector is refused as the stable validation problem.
+///
+/// `location` is the request part the typed extractor refused, `query` or
+/// `body`; the problem must name it and the rejected `space` field.
+///
+/// # Panics
+/// Panics when the response is not a 400 `application/problem+json`
+/// `WYRD_SPEC_400_VALIDATION` problem naming the location and `space`.
+async fn assert_space_refusal(response: Response<Body>, location: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    let problem = response_json(response).await;
+    assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{problem}");
+    assert_eq!(problem["details"]["location"], location, "{problem}");
+    assert!(
+        problem["details"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("unknown field `space`")),
+        "{problem}"
+    );
+}
+
 async fn assert_no_declaration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -4703,6 +4734,13 @@ async fn flat_card_http_contract() {
             .body(Body::empty())
             .expect("read request builds")
     };
+    let delete = |uri: &str| {
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("delete request builds")
+    };
 
     let declared = server
         .oneshot_authenticated(
@@ -4768,24 +4806,121 @@ async fn flat_card_http_contract() {
         )
         .await
         .expect("spaced declaration responds");
-    let status = spaced.status();
-    let refusal = String::from_utf8(
-        to_bytes(spaced.into_body(), usize::MAX)
-            .await
-            .expect("refusal body reads")
-            .to_vec(),
-    )
-    .expect("refusal body is UTF-8");
-    assert!(status.is_client_error(), "{status}: {refusal}");
-    assert!(refusal.contains("unknown field `space`"), "{refusal}");
-    let never = server
+    assert_space_refusal(spaced, "body").await;
+    assert_no_declaration_writes(&server, "flat-http-spaced", "flat-spaced").await;
+
+    let nested = server
         .oneshot_authenticated(
             &jwt,
-            get("/v1/cards/by-ref?kind=Prompt&name=flat-spaced&version=1.0.0"),
+            request_with_body(
+                "flat-http-nested",
+                json!({
+                    "submissions": [{
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Agent",
+                        "metadata": {"name": "flat-nested", "version": "1.0.0"},
+                        "spec": {
+                            "prompt": {
+                                "kind": "Prompt",
+                                "name": "flat-http",
+                                "space": "default",
+                                "version": "1.0.0"
+                            },
+                            "execution_route": {"kind": "native"}
+                        },
+                        "artifacts": []
+                    }]
+                }),
+            ),
         )
         .await
-        .expect("refused card read responds");
-    assert_eq!(never.status(), StatusCode::NOT_FOUND);
+        .expect("nested spaced declaration responds");
+    assert_eq!(nested.status(), StatusCode::BAD_REQUEST);
+    let problem = response_json(nested).await;
+    assert_eq!(
+        problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+        "{problem}"
+    );
+    assert!(problem.to_string().contains("space"), "{problem}");
+    assert_no_declaration_writes(&server, "flat-http-nested", "flat-nested").await;
+
+    let listed = server
+        .oneshot_authenticated(&jwt, get("/v1/cards?kind=Prompt&space=default"))
+        .await
+        .expect("spaced list responds");
+    assert_space_refusal(listed, "query").await;
+
+    let uid = card_ref["uid"].clone();
+    for space in ["default", "nowhere"] {
+        let selector =
+            format!("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0&space={space}");
+        let read = server
+            .oneshot_authenticated(&jwt, get(&selector))
+            .await
+            .expect("spaced by-ref read responds");
+        assert_space_refusal(read, "query").await;
+        let deleted = server
+            .oneshot_authenticated(&jwt, delete(&selector))
+            .await
+            .expect("spaced by-ref delete responds");
+        assert_space_refusal(deleted, "query").await;
+        let kept = server
+            .oneshot_authenticated(
+                &jwt,
+                get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+            )
+            .await
+            .expect("flat read after refused delete responds");
+        assert_eq!(kept.status(), StatusCode::OK);
+        let card = response_json(kept).await["card"].clone();
+        assert_eq!(card["metadata"]["uid"], uid);
+        assert_eq!(card["status"]["phase"], "active", "{card}");
+    }
+
+    let unparsable = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "flat-http-syntax")
+                .body(Body::from("{\"submissions\": ["))
+                .expect("syntax request builds"),
+        )
+        .await
+        .expect("syntax refusal responds");
+    assert_eq!(unparsable.status(), StatusCode::BAD_REQUEST);
+    let untyped = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header("Idempotency-Key", "flat-http-untyped")
+                .body(Body::from("{}"))
+                .expect("content-type request builds"),
+        )
+        .await
+        .expect("content-type refusal responds");
+    assert_eq!(untyped.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let removed = server
+        .oneshot_authenticated(
+            &jwt,
+            delete("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("flat delete responds");
+    assert_eq!(removed.status(), StatusCode::OK);
+    let gone = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("read after delete responds");
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
 
     server.shutdown().await.expect("test server shuts down");
 }

@@ -6,8 +6,10 @@
 //! every protected route.
 
 use axum::Json;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::envelope::CardKind;
@@ -109,6 +111,15 @@ pub(crate) async fn get_card_for(
 }
 
 /// Fetch one Card by its exact kind/name/version identity.
+///
+/// The query names the flat identity alone; it is decoded strictly, so a
+/// removed `space` selector is refused before authorization or any read.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` for an unknown, missing, or mistyped query
+/// key, `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind, name, or
+/// version, and the permission and registry errors of
+/// [`get_card_by_ref_for`].
 #[utoipa::path(
     get,
     path = "/cards/by-ref",
@@ -139,9 +150,9 @@ pub(crate) async fn get_card_for(
 async fn get_card_by_ref_http(
     State(state): State<AppState>,
     caller: Caller,
-    Query(query): Query<CardRefQuery>,
+    query: Result<Query<CardRefQuery>, QueryRejection>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
-    let card_ref = query.into_card_ref()?;
+    let card_ref = card_query(query)?.into_card_ref()?;
     Ok(Json(get_card_by_ref_for(&state, &caller, &card_ref).await?))
 }
 
@@ -179,6 +190,14 @@ pub(crate) async fn get_card_by_ref_for(
 }
 
 /// Resolve the newest stable Active Card in an identity line.
+///
+/// The identity line is the tenant's flat `kind`/`name`; the audited resource
+/// names that line because no version or UID is known yet.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
+/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`, and the
+/// not-found and availability errors of [`service::get_latest_card`].
 #[utoipa::path(
     get,
     path = "/cards/{kind}/{name}/latest",
@@ -225,6 +244,13 @@ async fn get_latest_card_http(
 }
 
 /// List versions in one exact Card identity line.
+///
+/// The identity line is the tenant's flat `kind`/`name`.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
+/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`, and the errors
+/// of [`service::list_card_versions`].
 #[utoipa::path(
     get,
     path = "/cards/{kind}/{name}/versions",
@@ -270,6 +296,14 @@ async fn list_versions_http(
 }
 
 /// List tenant-visible Card summaries with keyset pagination.
+///
+/// The strict [`ListCardsRequest`] query is decoded through [`card_query`], so
+/// its decode refusals, including a removed `space` filter, answer as Wyrd
+/// problems rather than framework text.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` for an unknown or mistyped query key and
+/// the permission, filter, cursor, and registry errors of [`list_cards_for`].
 #[utoipa::path(
     get,
     path = "/cards",
@@ -302,9 +336,11 @@ async fn list_versions_http(
 async fn list_cards_http(
     State(state): State<AppState>,
     caller: Caller,
-    Query(query): Query<ListCardsRequest>,
+    query: Result<Query<ListCardsRequest>, QueryRejection>,
 ) -> Result<Json<ListCardsResponse>, WyrdErrorResponse> {
-    Ok(Json(list_cards_for(&state, &caller, query).await?))
+    Ok(Json(
+        list_cards_for(&state, &caller, card_query(query)?).await?,
+    ))
 }
 
 /// Authorize, audit, and list Cards for HTTP and MCP through the same operation.
@@ -418,31 +454,47 @@ async fn list_artifacts_http(
 /// `operators:invoke` for an Operator-bearing request, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
+/// A body whose JSON does not match the flat envelope, such as one naming
+/// `metadata.space`, is `WYRD_SPEC_400_VALIDATION` at location `body`;
+/// malformed JSON, a missing JSON content type, and an oversized body keep
+/// their native 400, 415, and typed 413 responses. A `space` inside a nested
+/// reference in `spec` reaches the service decoder and is
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC`.
 pub(crate) async fn declare_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
-    Json(body): Json<DeclareCardRequest>,
-) -> Result<(StatusCode, Json<wyrd_spec::registry::DeclareCardResponse>), WyrdErrorResponse> {
-    // `require_authenticated` on the `/v1` router has already verified the
-    // access token and the `Caller` extractor has materialized its principal.
-    // This check is intentionally route-local: authentication answers "who is
-    // calling?" while this capability check answers "may they declare cards?".
-    authorize_card_write(&state, &caller, "card.declaration.create", "cards")?;
-    if service::dispatches_operators(&body) {
-        audit::authorize(
-            &state,
-            &caller,
-            &Permission::operator_invoke(),
-            "card.declaration.create",
-            "operators",
-        )?;
+    body: Result<Json<DeclareCardRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::JsonDataError(rejection)) => {
+            return invalid_shape("body", rejection.body_text()).into_response();
+        }
+        Err(rejection) => return rejection.into_response(),
+    };
+    let declared: Result<_, WyrdErrorResponse> = async {
+        // `require_authenticated` on the `/v1` router has already verified the
+        // access token and the `Caller` extractor has materialized its principal.
+        // This check is intentionally route-local: authentication answers "who is
+        // calling?" while this capability check answers "may they declare cards?".
+        authorize_card_write(&state, &caller, "card.declaration.create", "cards")?;
+        if service::dispatches_operators(&body) {
+            audit::authorize(
+                &state,
+                &caller,
+                &Permission::operator_invoke(),
+                "card.declaration.create",
+                "operators",
+            )?;
+        }
+        let idempotency_key = extract_required_idempotency_key(&headers)?;
+        let response =
+            service::declare_card(&state, &caller, idempotency_key.as_str(), body).await?;
+        Ok((StatusCode::CREATED, Json(response)))
     }
-    let idempotency_key = extract_required_idempotency_key(&headers)?;
-    service::declare_card(&state, &caller, idempotency_key.as_str(), body)
-        .await
-        .map(|response| (StatusCode::CREATED, Json(response)))
-        .map_err(WyrdErrorResponse::from)
+    .await;
+    declared.into_response()
 }
 
 /// Complete a Pending Card after the client-side storage transfer finishes.
@@ -573,8 +625,12 @@ async fn delete_card_http(
 /// The `card:write` verdict is staged exactly once before the soft-delete
 /// runs, whatever its outcome. Storage cleanup runs after the delete commits.
 ///
+/// The query is decoded strictly: a removed `space` selector, or any other
+/// unknown key, is refused before authorization, so it never deletes a Card.
+///
 /// # Errors
-/// Returns a validation error for an invalid kind, name, or version,
+/// Returns `WYRD_SPEC_400_VALIDATION` for an unknown, missing, or mistyped
+/// query key, a validation error for an invalid kind, name, or version,
 /// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
@@ -611,9 +667,9 @@ async fn delete_card_http(
 async fn delete_card_by_ref_http(
     State(state): State<AppState>,
     caller: Caller,
-    Query(query): Query<DeleteCardRefQuery>,
+    query: Result<Query<CardRefQuery>, QueryRejection>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
-    let card_ref = query.into_card_ref()?;
+    let card_ref = card_query(query)?.into_card_ref()?;
     authorize_card_write(
         &state,
         &caller,
@@ -626,21 +682,28 @@ async fn delete_card_by_ref_http(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Exact `kind`/`name`/`version` selector of the `by-ref` read and delete routes.
+///
+/// It names the flat Card identity and nothing else: an unknown key, such as
+/// the removed `space`, is refused before the selector reaches authorization,
+/// the registry, or a delete, so an obsolete selector never acts on a Card.
 #[derive(Debug, Deserialize)]
-struct DeleteCardRefQuery {
-    kind: String,
-    name: String,
-    version: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CardRefQuery {
+    /// Card kind wire name, such as `Prompt`.
     kind: String,
+    /// Card name within the kind.
     name: String,
+    /// One exact Card version.
     version: String,
 }
 
 impl CardRefQuery {
+    /// Parse the selector into the UID-free [`CardRef`] the routes authorize.
+    ///
+    /// # Errors
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the kind, name, or
+    /// version is not well formed.
     fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
         Ok(CardRef {
             kind: parse_card_kind(&self.kind)?,
@@ -661,30 +724,35 @@ struct VersionListQuery {
     include_prerelease: bool,
 }
 
-impl DeleteCardRefQuery {
-    fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
-        let kind = CardKind::from_wire_name(&self.kind).ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
-                "kind is not a valid Card kind",
-            ))
-        })?;
-        let name = CardName::new(self.name).map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
-                "name is invalid: {error}"
-            )))
-        })?;
-        let version = self.version.parse().map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
-                "version is invalid: {error}"
-            )))
-        })?;
-        Ok(CardRef {
-            kind,
-            name,
-            version,
-            uid: None,
-        })
-    }
+/// Decode a Card route query, refusing a malformed one as a Wyrd problem.
+///
+/// A bare `Query` extractor answers with Axum's plain-text 400, which bypasses
+/// the stable problem contract.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` at location `query` when a key is
+/// unknown, such as the removed `space`, missing, or not the expected type.
+fn card_query<T>(extracted: Result<Query<T>, QueryRejection>) -> Result<T, WyrdErrorResponse> {
+    extracted
+        .map(|Query(query)| query)
+        .map_err(|rejection| invalid_shape("query", rejection.body_text()))
+}
+
+/// Refuse a Card request part the typed extractor could not decode.
+///
+/// The decoder's reason names the failing field path and the unknown or
+/// missing key, so a caller sending the removed `space` learns which field to
+/// drop. Card selectors and envelopes carry no secret material. Syntax,
+/// content-type, and body-limit rejections never come here: they keep their
+/// native 400, 415, and typed 413 responses.
+fn invalid_shape(location: &str, reason: String) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::Validation {
+        message: format!(
+            "card request {location} does not match the contract; Cards are named by kind, \
+             name, and version"
+        ),
+        details: serde_json::json!({ "location": location, "reason": reason }),
+    })
 }
 
 fn single_card_response(outcome: CardDeclarationOutcome) -> DeclareCardResponse {

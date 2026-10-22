@@ -2322,10 +2322,11 @@ async fn agent_contracts_replace_workflow() {
     )
     .await
     .expect("Workflow registration answers");
-    assert_eq!(workflow.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(workflow.status(), StatusCode::BAD_REQUEST);
     let refusal = workflow.text().await.expect("refusal body reads");
     assert!(
-        refusal.contains("unknown card kind: Workflow"),
+        refusal.contains("WYRD_SPEC_400_VALIDATION")
+            && refusal.contains("unknown card kind: Workflow"),
         "Workflow is not a Card kind: {refusal}"
     );
 

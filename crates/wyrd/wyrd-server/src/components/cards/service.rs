@@ -172,6 +172,14 @@ pub async fn get_latest_card(
 }
 
 /// List versions in one card identity line, excluding deleted rows.
+///
+/// The line is the caller tenant's flat `kind`/`name`; the read runs in one
+/// tenant transaction that commits before the response is built.
+///
+/// # Errors
+/// Returns registry unavailability when the tenant connection, version read,
+/// or commit fails, and `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for a stored
+/// version that no longer parses.
 pub async fn list_card_versions(
     state: &AppState,
     caller: &Caller,
@@ -186,6 +194,18 @@ pub async fn list_card_versions(
 }
 
 /// List metadata-only Cards with deterministic tenant-scoped keyset pagination.
+///
+/// A `Deleted` status filter answers empty without a read. Otherwise one
+/// tenant transaction reads the page and commits before each row is projected
+/// through [`summary_from_row`].
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE` for a negative or
+/// oversized limit, `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable
+/// cursor, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for an invalid version
+/// range, the query errors of an invalid metadata filter or cursor mismatch,
+/// registry unavailability when the connection, read, or commit fails, and
+/// the decode errors of [`summary_from_row`].
 pub async fn list_cards(
     state: &AppState,
     caller: &Caller,
@@ -450,6 +470,16 @@ fn verify_card_hashes(
     Ok(())
 }
 
+/// Project one stored registry row onto its metadata-only list summary.
+///
+/// The summary carries the flat `kind`/`name`/`version` identity, its UID,
+/// hashes, lifecycle, and timestamps; it never reads the Card blob.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the stored status, kind,
+/// or name no longer decodes, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for a
+/// stored version that no longer parses, and the Card UID error for an invalid
+/// stored UID.
 fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
     let status = CardStatus::from_db_str(&row.status)
         .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
@@ -1716,6 +1746,14 @@ fn submission_card(submission: &CardSubmission) -> Result<Card, WyrdError> {
 }
 
 /// Find the authored submission represented by a graph node.
+///
+/// A submission matches on flat `kind` and `name`, and on `version` only when
+/// it authored an exact pin; an unpinned submission matches the node's
+/// allocated version.
+///
+/// # Errors
+/// Returns an internal error when no submission matches, which means graph
+/// construction lost the node's authored submission.
 fn find_submission<'a>(
     submissions: &'a [CardSubmission],
     node: &CardRef,

@@ -1883,14 +1883,15 @@ impl ShardOwner {
                     MAX(file_ordinal)::smallint AS last_ordinal \
              FROM vala.file_list \
              WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 \
-               AND partition_granularity=$3 AND partition_start=$4 \
-               AND node_id=$5 AND writer_epoch=$6 \
+               AND partition_granularity=$3 AND partition_start=$4 AND partition_dimensions=$5 \
+               AND node_id=$6 AND writer_epoch=$7 \
              GROUP BY wal_lsn_min, wal_lsn_max",
         )
         .bind(replayed.seal_key.table.namespace.as_str())
         .bind(&replayed.seal_key.table.name)
         .bind(replayed.seal_key.partition.time().granularity_str())
         .bind(replayed.seal_key.partition.time().start_utc())
+        .bind(replayed.seal_key.partition.dimension_bytes())
         .bind(replayed.stream.node_id.as_uuid())
         .bind(replayed.stream.writer_epoch.as_i64())
         .fetch_all(&mut **conn.transaction())
@@ -6205,6 +6206,112 @@ mod tests {
             )
             .expect("overlapping durable ranges")
             .is_empty()
+        );
+    }
+
+    /// Same-hour composite partitions whose published WAL ranges interleave
+    /// are each suppressed on replay by their own range only.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a row cannot be inserted, or the
+    /// replayed partition is not suppressed exactly.
+    #[tokio::test]
+    async fn replay_suppression_reads_only_its_own_composite_partition() {
+        use wyrd_spec::vala::api::PartitionValueWire;
+
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        let superuser = database.superuser_pool().expect("superuser pool");
+        let tenant = database.data_tenant_id();
+        let table = TableRef::new(BifrostNamespace::Bifrost, "composite-replay");
+        let hour = crate::catalog::TimeGranularity::Hour
+            .bucket(chrono::Utc::now())
+            .expect("now buckets");
+        let customer = |name: &str| {
+            crate::catalog::PhysicalPartition::new(
+                0,
+                hour,
+                0,
+                vec![Some(PartitionValueWire::Utf8(name.to_owned()))],
+            )
+            .expect("one dimension")
+        };
+        let (a, b) = (customer("a"), customer("b"));
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        for (partition, lsn_min, lsn_max) in [(&a, 4_i64, 8_i64), (&b, 6, 6)] {
+            sqlx::query(
+                "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, \
+                 file_size, row_count, min_event_time, max_event_time, partition_granularity, \
+                 partition_start, partition_dimensions, node_id, writer_epoch, wal_lsn_min, \
+                 wal_lsn_max, file_checksum, promotion_record) \
+                 VALUES ($1, $2, $3, $4, $5, 1, 1, $6, $6, 'hour', $6, $7, $8, 1, $9, $10, $11, \
+                 '{}'::jsonb)",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(tenant.as_uuid())
+            .bind(table.namespace.as_str())
+            .bind(&table.name)
+            .bind(format!("composite/{lsn_min}.parquet"))
+            .bind(hour.start_utc())
+            .bind(partition.dimension_bytes())
+            .bind(node.as_uuid())
+            .bind(lsn_min)
+            .bind(lsn_max)
+            .bind("0".repeat(64))
+            .execute(&superuser)
+            .await
+            .expect("insert a published range");
+        }
+        let key = SealKey::new(tenant, table, a);
+        let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
+            batch_id: [marker; 16],
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_count: 2,
+            wal_lsn: WalLsn::new(lsn),
+            rows_accepted: 1,
+            append_slice_id: crate::scribe::preprocess::AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes([marker; 16]),
+                seal_key: key.clone(),
+                slice_index: 0,
+            },
+            schema_fingerprint: [0; 32],
+        };
+        let append_metas = vec![meta(1, 4), meta(2, 8)];
+        let replayed = crate::scribe::replay::ReplayedSealKey {
+            stream,
+            seal_key: key,
+            shard_id: 0,
+            data_records: Vec::new(),
+            append_metas,
+            wal_segments: Vec::new(),
+            commits: Vec::new(),
+        };
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, _budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        owner.control_postgres = Some(Arc::new(database.vala_postgres().clone()));
+
+        assert_eq!(
+            owner
+                .resolve_published_replay_batches(&replayed)
+                .await
+                .expect("published ranges read"),
+            HashSet::from([[1; 16], [2; 16]]),
+            "a same-hour partition's interleaved range is not this partition's"
         );
     }
 

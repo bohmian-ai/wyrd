@@ -110,16 +110,30 @@ impl PhysicalPartition {
         &self.values
     }
 
-    /// Appends the canonical binary encoding: spec id, time tag and start,
-    /// time index, value count, then each value as a type tag and payload.
+    /// Appends the canonical binary encoding: the time tag and start, then
+    /// [`Self::encode_dimensions`].
     ///
     /// Digests and WAL slices hash or store exactly these bytes, so the
     /// encoding is injective: a different spec, time, type, or value always
     /// encodes differently.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.spec_id.to_be_bytes());
         out.push(self.time.granularity_tag());
         out.extend_from_slice(&self.time.start_unix_micros().to_be_bytes());
+        self.encode_dimensions(out);
+    }
+
+    /// Appends everything but the time partition: spec id, time index, value
+    /// count, then each value as a type tag and payload.
+    ///
+    /// Durable rows that already store the time partition in their own
+    /// columns store these bytes beside it.
+    ///
+    /// # Panics
+    ///
+    /// Never: [`Self::new`] bounds the value count and Arrow bounds a string
+    /// below `u32::MAX` bytes.
+    pub fn encode_dimensions(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.spec_id.to_be_bytes());
         out.push(self.time_index);
         out.push(u8::try_from(self.values.len()).expect("invariant: at most two dimensions"));
         for value in &self.values {
@@ -146,6 +160,14 @@ impl PhysicalPartition {
         }
     }
 
+    /// Returns [`Self::encode_dimensions`] as one owned buffer.
+    #[must_use]
+    pub fn dimension_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_dimensions(&mut out);
+        out
+    }
+
     /// Returns the canonical binary encoding as one owned buffer.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -162,43 +184,49 @@ impl PhysicalPartition {
     /// unknown tag, non-UTF-8 text, a noncanonical time start, or an invalid
     /// shape, so corrupt durable evidence fails closed.
     pub fn decode(bytes: &[u8]) -> Result<Self, PhysicalPartitionError> {
-        let mut cursor = bytes;
-        let mut take = |length: usize| -> Result<&[u8], PhysicalPartitionError> {
-            if cursor.len() < length {
-                return Err(PhysicalPartitionError::Truncated);
-            }
-            let (head, rest) = cursor.split_at(length);
-            cursor = rest;
-            Ok(head)
-        };
-        let spec_id = i32::from_be_bytes(fixed(take(4)?)?);
-        let tag = take(1)?[0];
-        let start = i64::from_be_bytes(fixed(take(8)?)?);
-        let time = TimePartition::from_durable(tag, start)?;
-        let time_index = take(1)?[0];
-        let count = take(1)?[0];
+        let mut cursor = Cursor(bytes);
+        let tag = cursor.take(1)?[0];
+        let start = i64::from_be_bytes(fixed(cursor.take(8)?)?);
+        Self::from_dimension_bytes(TimePartition::from_durable(tag, start)?, cursor.0)
+    }
+
+    /// Restores an identity from its time partition and exactly the bytes
+    /// [`Self::encode_dimensions`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPartitionError`] for truncated or trailing bytes, an
+    /// unknown tag, non-UTF-8 text, or an invalid shape.
+    pub fn from_dimension_bytes(
+        time: TimePartition,
+        bytes: &[u8],
+    ) -> Result<Self, PhysicalPartitionError> {
+        let mut cursor = Cursor(bytes);
+        let spec_id = i32::from_be_bytes(fixed(cursor.take(4)?)?);
+        let time_index = cursor.take(1)?[0];
+        let count = cursor.take(1)?[0];
         let mut values = Vec::with_capacity(usize::from(count).min(MAX_PARTITION_DIMENSIONS));
         for _ in 0..count {
-            values.push(match take(1)?[0] {
+            values.push(match cursor.take(1)?[0] {
                 VALUE_NULL => None,
                 VALUE_UTF8 => {
-                    let length = u32::from_be_bytes(fixed(take(4)?)?);
+                    let length = u32::from_be_bytes(fixed(cursor.take(4)?)?);
                     let length =
                         usize::try_from(length).map_err(|_| PhysicalPartitionError::Truncated)?;
-                    let text = std::str::from_utf8(take(length)?)
+                    let text = std::str::from_utf8(cursor.take(length)?)
                         .map_err(|_| PhysicalPartitionError::Utf8)?;
                     Some(PartitionValueWire::Utf8(text.to_owned()))
                 }
-                VALUE_INT32 => Some(PartitionValueWire::Int32(i32::from_be_bytes(fixed(take(
-                    4,
-                )?)?))),
-                VALUE_INT64 => Some(PartitionValueWire::Int64(i64::from_be_bytes(fixed(take(
-                    8,
-                )?)?))),
+                VALUE_INT32 => Some(PartitionValueWire::Int32(i32::from_be_bytes(fixed(
+                    cursor.take(4)?,
+                )?))),
+                VALUE_INT64 => Some(PartitionValueWire::Int64(i64::from_be_bytes(fixed(
+                    cursor.take(8)?,
+                )?))),
                 other => return Err(PhysicalPartitionError::UnknownValueTag(other)),
             });
         }
-        if !cursor.is_empty() {
+        if !cursor.0.is_empty() {
             return Err(PhysicalPartitionError::Trailing);
         }
         Self::new(spec_id, time, time_index, values)
@@ -288,6 +316,25 @@ impl PhysicalPartition {
             })
             .collect::<Option<Vec<_>>>()?;
         Self::new(spec.spec_id(), time, time_index, values).ok()
+    }
+}
+
+/// Reads a canonical encoding front to back, failing on truncation.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    /// Takes the next `length` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPartitionError::Truncated`] when fewer remain.
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PhysicalPartitionError> {
+        if self.0.len() < length {
+            return Err(PhysicalPartitionError::Truncated);
+        }
+        let (head, rest) = self.0.split_at(length);
+        self.0 = rest;
+        Ok(head)
     }
 }
 

@@ -3587,7 +3587,7 @@ mod tests {
                 row_count: 1,
                 min_event_time: now,
                 max_event_time: now,
-                partition,
+                partition: partition.into(),
                 node_id: self.actor.node_id.as_uuid(),
                 writer_epoch: self.actor.writer_epoch.as_i64(),
                 wal_lsn_min: lsn.0,

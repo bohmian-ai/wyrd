@@ -1287,3 +1287,217 @@ fn wal_segments(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
     }
     segments
 }
+
+/// One hour in microseconds.
+const COMPOSITE_HOUR_MICROS: i64 = 3_600_000_000;
+/// 2026-10-06T00:00:00Z in microseconds, the first composite hour.
+const COMPOSITE_FIRST_HOUR_MICROS: i64 = 1_791_244_800_000_000;
+/// Rows in the composite lifecycle batch.
+const COMPOSITE_ROWS: i64 = 12;
+
+/// Registers a table partitioned by hour, nullable customer identity, and a
+/// four-way shard bucket through the real catalog.
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
+async fn register_composite_table(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    name: &str,
+) -> String {
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
+    super::support::register(
+        server,
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, name),
+        composite_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+        Some(PhysicalLayoutWire {
+            time_column: Some("event_time".to_owned()),
+            partition_by: vec![
+                PartitionFieldWire::new("event_time", PartitionTransformWire::Hour),
+                PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+                PartitionFieldWire {
+                    buckets: Some(4),
+                    ..PartitionFieldWire::new("shard", PartitionTransformWire::Bucket)
+                },
+            ],
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        }),
+    )
+    .await;
+    format!("vala.datasets.{name}")
+}
+
+/// The composite table's user schema.
+fn composite_schema() -> arrow::datatypes::SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "event_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("customer", DataType::Utf8, true),
+        Field::new("shard", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// Row `value` spans two hours, customers `a`, `b`, and null, and five shards.
+fn composite_batch() -> RecordBatch {
+    let rows = 0..COMPOSITE_ROWS;
+    RecordBatch::try_new(
+        composite_schema(),
+        vec![
+            Arc::new(
+                arrow::array::TimestampMicrosecondArray::from_iter_values(rows.clone().map(
+                    |row| COMPOSITE_FIRST_HOUR_MICROS + (row % 2) * COMPOSITE_HOUR_MICROS + row,
+                ))
+                .with_timezone("UTC"),
+            ),
+            Arc::new(arrow::array::StringArray::from_iter(
+                rows.clone()
+                    .map(|row| [Some("a"), Some("b"), None][(row % 3) as usize]),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.clone().map(|row| row % 5),
+            )),
+            Arc::new(Int64Array::from_iter_values(rows)),
+        ],
+    )
+    .expect("composite batch")
+}
+
+/// Requires every composite row once, and exact results for filters on each
+/// partition dimension.
+///
+/// # Panics
+///
+/// Panics when any read differs.
+async fn assert_composite_reads(client: &wyrd_client::WyrdClient, table: &str, stage: &str) {
+    let all: Vec<i64> = (0..COMPOSITE_ROWS).collect();
+    let pick = |keep: fn(i64) -> bool| {
+        all.iter()
+            .copied()
+            .filter(|row| keep(*row))
+            .collect::<Vec<_>>()
+    };
+    for (filter, expected) in [
+        ("TRUE", all.clone()),
+        ("customer IS NULL", pick(|row| row % 3 == 2)),
+        ("customer = 'a'", pick(|row| row % 3 == 0)),
+        ("shard = 3", pick(|row| row % 5 == 3)),
+        (
+            &*format!(
+                "event_time >= to_timestamp_micros({})",
+                COMPOSITE_FIRST_HOUR_MICROS + COMPOSITE_HOUR_MICROS
+            ),
+            pick(|row| row % 2 == 1),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "{stage}: `{filter}` returns each matching row once"
+        );
+    }
+}
+
+/// Composite and null partitions read back exactly once while active, staged,
+/// and published, across restarts on a retained root, through a resent batch,
+/// and from a peer pod.
+///
+/// # Panics
+///
+/// Panics when any stage reads a missing, duplicated, or misfiled row.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composite_partitions_survive_lifecycle_and_peers() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("composite_lifecycle");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let client = tenant_client(&server, tenant).await;
+    let batch_id = uuid::Uuid::now_v7();
+    super::support::append_batch(&client, &table, batch_id, &composite_batch())
+        .await
+        .expect("the composite batch is acknowledged");
+    assert_composite_reads(&client, &table, "active").await;
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_composite_reads(&client, &table, "replayed").await;
+
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    assert_composite_reads(&client, &table, "staged").await;
+    drop(scribe);
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_composite_reads(&client, &table, "restored staged").await;
+
+    server.flush_bifrost().await.expect("publishes");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        COMPOSITE_ROWS as u64
+    );
+    assert_composite_reads(&client, &table, "published").await;
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    let resent = super::support::append_batch(&client, &table, batch_id, &composite_batch()).await;
+    server.flush_bifrost().await.expect("drains");
+    assert_composite_reads(&client, &table, &format!("resent {resent:?}")).await;
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        COMPOSITE_ROWS as u64
+    );
+    server.shutdown().await.expect("the server drains cleanly");
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod cluster starts");
+    let writer = cluster.server(0).expect("pod 0");
+    let reader = cluster.server(1).expect("pod 1");
+    let tenant = writer.data_tenant_id();
+    let table = register_composite_table(&writer, tenant, &unique_table("composite_peer")).await;
+    let writer_client = tenant_client(&writer, tenant).await;
+    let reader_client = tenant_client(&reader, tenant).await;
+    super::support::append_batch(
+        &writer_client,
+        &table,
+        uuid::Uuid::now_v7(),
+        &composite_batch(),
+    )
+    .await
+    .expect("the peer batch is acknowledged");
+    assert_composite_reads(&reader_client, &table, "peer active").await;
+    let scribe = writer.bifrost_scribe().expect("pod 0 owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    assert_composite_reads(&reader_client, &table, "peer staged").await;
+    writer.flush_bifrost().await.expect("publishes");
+    assert_composite_reads(&reader_client, &table, "peer published").await;
+}

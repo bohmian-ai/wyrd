@@ -683,6 +683,7 @@ mod completeness_tests {
             }],
             decide: Decide::All,
             context_capture: None,
+            order_by: None,
         }
     }
 

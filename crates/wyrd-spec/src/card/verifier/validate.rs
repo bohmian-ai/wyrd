@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use skald_spec::{Prompt, ResponseType};
 
 use super::extract::ExtractOutput;
-use super::reference::{Reference, ReferenceRoot};
+use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
@@ -205,6 +205,9 @@ where
         let spec = self.spec;
         for (slot, input) in &spec.inputs {
             validate_slot(slot, input)?;
+        }
+        if let Some(order) = &spec.order_by {
+            validate_order(spec, order)?;
         }
         self.validate_evidence_mode()?;
         if let Decide::PassRate { threshold } = spec.decide
@@ -845,6 +848,44 @@ fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
 /// # Errors
 /// Returns [`WyrdError::Validation`] with rule `operator` carrying the
 /// operator's own refusal.
+/// Refuses an `order_by` on a Verifier without source slots, and an input
+/// key that is not `inputs.<slot>` over a declared source slot reading a
+/// source input or that selects through a `[*]` wildcard.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] with rule `order_by` at path `order_by`.
+fn validate_order(spec: &VerifierSpec, order: &OrderBy) -> Result<(), WyrdError> {
+    let refuse = |message| invalid("order_by", "order_by", message);
+    if !spec
+        .inputs
+        .values()
+        .any(|input| matches!(input, InputSlot::Source(_)))
+    {
+        return Err(refuse(
+            "order_by orders group source lists; declare a source slot",
+        ));
+    }
+    let OrderBy::Input(order) = order else {
+        return Ok(());
+    };
+    let slot = order
+        .slot()
+        .ok_or_else(|| refuse("order_by must read inputs.<slot>"))?;
+    let Some(InputSlot::Source(source)) = spec.inputs.get(slot) else {
+        return Err(refuse("order_by must name a declared source slot"));
+    };
+    if !matches!(
+        source.parse().map(|source| source.field),
+        Ok(SourceField::Input(_))
+    ) {
+        return Err(refuse("order_by must name a source slot reading an input"));
+    }
+    if order.has_wildcard() {
+        return Err(refuse("order_by selects one value, not [*]"));
+    }
+    Ok(())
+}
+
 fn validate_operator(
     operator: &crate::verification::ComparisonOperator,
     path: &str,
@@ -1176,6 +1217,65 @@ mod tests {
         assert_eq!(
             rule(&json!({"inputs": {"group_id": "verifiers.turn-verifier.inputs.turn"}})),
             "slot"
+        );
+    }
+
+    /// `order_by` round-trips and validates as `recorded_at` or an input key
+    /// over a source slot reading an input; any other target, an unparsable
+    /// order, a wildcard, or an order without source slots is refused, under
+    /// rule `order_by` at path `order_by` once decoded.
+    ///
+    /// # Panics
+    /// Panics when a valid order is refused, an invalid order is accepted or
+    /// refused under the wrong rule, or the order does not round-trip.
+    #[test]
+    fn verifier_spec_orders_source_lists() {
+        let body = |order: &str| {
+            json!({
+                "inputs": {
+                    "turns": "verifiers.turn-verifier.inputs.turn",
+                    "checks": "verifiers.turn-verifier.requirements.on-topic.outcome",
+                    "plain": {"type": "json"},
+                },
+                "order_by": order,
+            })
+        };
+        for order in [
+            "recorded_at",
+            "inputs.turns",
+            "inputs.turns.turn",
+            "inputs.turns.at[0]",
+        ] {
+            let spec = parse(&body(order));
+            spec.validate().expect("order validates");
+            assert_eq!(
+                serde_json::to_value(&spec).expect("serializes")["order_by"],
+                order
+            );
+        }
+        for order in [
+            "inputs.checks",
+            "inputs.plain",
+            "inputs.missing",
+            "inputs.turns[*].turn",
+            "steps.a.output",
+        ] {
+            assert_eq!(
+                parse(&body(order))
+                    .validate()
+                    .map_err(|error| match error {
+                        WyrdError::Validation { details, .. } => details,
+                        other => panic!("expected a validation refusal, got {other:?}"),
+                    })
+                    .expect_err(order),
+                json!({"rule": "order_by", "path": "order_by"}),
+                "{order}"
+            );
+        }
+        assert!(serde_json::from_value::<VerifierSpec>(body("turns")).is_err());
+        assert_eq!(
+            rule(&json!({"inputs": {"plain": {"type": "json"}}, "order_by": "recorded_at"})),
+            "order_by"
         );
     }
 

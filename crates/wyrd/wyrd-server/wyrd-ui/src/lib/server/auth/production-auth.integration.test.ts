@@ -339,27 +339,32 @@ async function expectNoSecrets(browser: Browser, tenant: string, session: string
 /**
  * A BFF replica started after sign-in, as a rollout replaces one: the same
  * build and configuration as the fixture's first replica, in front of server
- * replica A. Resolves to its URL and a function that stops it.
+ * replica A. It binds port 0 so the OS assigns a free port, and resolves to
+ * the URL it reports listening on and a function that stops it; it rejects if
+ * the replica exits first.
  */
 async function freshBff(): Promise<{ url: string; stop: () => void }> {
-  const port = 20_000 + Math.floor(Math.random() * 20_000);
   const child = spawn('node', ['build'], {
     env: {
       ...process.env,
       HOST: '127.0.0.1',
-      PORT: String(port),
+      PORT: '0',
       ORIGIN: journey.origin,
       WYRD_SERVER_URL: journey.servers[0]
     },
-    stdio: 'inherit'
+    stdio: ['ignore', 'pipe', 'inherit']
   });
-  const url = `http://127.0.0.1:${port}`;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (await fetch(`${url}/`).then(() => true, () => false)) return { url, stop: () => child.kill() };
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  child.kill();
-  throw new Error(`the fresh BFF on port ${port} never answered`);
+  const url = await new Promise<string>((resolve, reject) => {
+    let output = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      output += chunk.toString();
+      process.stdout.write(chunk);
+      const listening = /Listening on (http:\/\/\S+)/.exec(output);
+      if (listening) resolve(listening[1]);
+    });
+    child.once('exit', (code) => reject(new Error(`the fresh BFF exited with ${code} before listening`)));
+  });
+  return { url, stop: () => child.kill() };
 }
 
 test('production SSO crosses replicas', async () => {

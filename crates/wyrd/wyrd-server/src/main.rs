@@ -1,6 +1,8 @@
+use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
+use mimalloc::MiMalloc;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpConfig;
@@ -23,10 +25,74 @@ use wyrd_sql::{MIGRATION_LEASE_WAIT, PoolConfig, SqlError, WyrdPostgres};
 /// Process-wide allocator for the server binary and its Monty workers.
 ///
 /// mimalloc serves every allocation; a worker process also counts its heap
-/// against its session's memory budget (see [`worker`]). Library crates
-/// never install an allocator, so embedders keep theirs.
+/// against its session's memory budget (see [`worker`]). Only this binary
+/// references mimalloc: a library that did would link mimalloc, and its
+/// load-time initialization, into every embedder such as the Python SDK.
 #[global_allocator]
-static GLOBAL: worker::CountingMiMalloc = worker::CountingMiMalloc;
+static GLOBAL: CountingMiMalloc = CountingMiMalloc;
+
+/// mimalloc, plus the worker's live-byte count that enforces Monty's memory
+/// limits and a null check that ends a worker deliberately.
+///
+/// Counting starts in `main`, after the runtime's few pre-`main`
+/// allocations, so a free of one of those saturates the count at zero rather
+/// than wrapping; the count can undercount by at most those bytes.
+struct CountingMiMalloc;
+
+// SAFETY: every method forwards its arguments unchanged to `MiMalloc` and
+// returns what `MiMalloc` returned (or diverges). No pointer is fabricated,
+// aliased or freed here, so this upholds exactly the invariants `MiMalloc`
+// upholds.
+#[expect(
+    unsafe_code,
+    reason = "a global allocator is unsafe; the counting it adds is safe"
+)]
+unsafe impl GlobalAlloc for CountingMiMalloc {
+    /// Charge `layout` to a worker's budget, then allocate it from mimalloc.
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        worker::charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { MiMalloc.alloc(layout) };
+        if ptr.is_null() {
+            worker::refused(layout.size());
+        }
+        ptr
+    }
+
+    /// Refund `layout` to a worker's budget, then free it through mimalloc.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        worker::refund(layout.size());
+        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
+        unsafe { MiMalloc.dealloc(ptr, layout) };
+    }
+
+    /// Charge `layout`, then take mimalloc's pre-zeroed allocation.
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        worker::charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { MiMalloc.alloc_zeroed(layout) };
+        if ptr.is_null() {
+            worker::refused(layout.size());
+        }
+        ptr
+    }
+
+    /// Charge or refund the size change, then let mimalloc resize in place
+    /// when it can.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        match new_size.checked_sub(layout.size()) {
+            Some(growth) => worker::charge(growth),
+            None => worker::refund(layout.size() - new_size),
+        }
+        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
+        // `new_size` is the caller's — all forwarded unchanged.
+        let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
+        if new_ptr.is_null() {
+            worker::refused(new_size);
+        }
+        new_ptr
+    }
+}
 
 const EX_CONFIG: i32 = 78;
 const EX_SOFTWARE: i32 = 70;

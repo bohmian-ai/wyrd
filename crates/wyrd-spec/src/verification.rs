@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::drift::DriftMethod;
 use crate::card::trigger::TriggerDuration;
-use crate::card::verifier::SourceText;
+use crate::card::verifier::{OrderBy, SourceText};
 use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId, SlotName};
 
 pub use ids::{JsonPath, TaskId};
@@ -246,6 +246,9 @@ pub struct GroupEndSettings {
     pub after: TriggerDuration,
     /// The exact source binding each source slot of the group Verifier reads.
     pub sources: BTreeMap<SlotName, GroupSource>,
+    /// The group Verifier's declared list order; absent means `recorded_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<OrderBy>,
 }
 
 /// One source slot's pinned binding: the recorded owner/subject/Verifier
@@ -281,8 +284,8 @@ pub struct GroupSourceSnapshot {
     /// The authored source declaration.
     pub reference: SourceText,
     /// The source executions the slot's list holds one value for, in list
-    /// order: earliest input ingest time (earliest result ingest time for a
-    /// result-only execution), then execution ID.
+    /// order: the binding's `order_by` input key when declared, then the
+    /// server-recorded input time, then execution ID.
     pub execution_ids: Vec<ExecutionId>,
 }
 

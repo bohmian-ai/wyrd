@@ -5377,17 +5377,21 @@ mod tests {
     /// poisoned lock is observed on the production settlement path rather than
     /// by calling the failure directly. The chunk response must surface the
     /// poisoned-lock error, and the owner must be left with no replay chunk, no
-    /// pending generations, and every immutable byte returned to the baseline.
+    /// pending generations, and an empty immutable ledger. The completed
+    /// `current` generation retires, so its bytes stay charged while this
+    /// helper still holds its payload and return exactly when that last
+    /// holder drops, settling the root at the baseline.
     ///
     /// # Panics
     ///
     /// Panics if the response does not settle within one second, does not name
-    /// the poisoned identity owner lock, or if any ownership survives.
+    /// the poisoned identity owner lock, or if any ownership survives the last
+    /// payload holder.
     async fn settle_poisoned_advance(
         owner: &mut ShardOwner,
         budget: &crate::resources::ScribeResources,
         baseline: &crate::resources::ResourceSnapshot,
-        current: &Arc<ImmutableGeneration>,
+        current: Arc<ImmutableGeneration>,
         current_key: &SealKey,
         next: Arc<ImmutableGeneration>,
         next_key: &SealKey,
@@ -5396,7 +5400,7 @@ mod tests {
         owner.pending_generations.insert(
             current_key.clone(),
             VecDeque::from([PendingGeneration {
-                generation: Arc::clone(current),
+                generation: Arc::clone(&current),
                 binding: crate::catalog::TenantTableBinding::resolve((
                     current_key.tenant,
                     current_key.table.clone(),
@@ -5464,6 +5468,15 @@ mod tests {
         assert!(owner.replay_chunk.is_none());
         assert!(owner.pending_generations.is_empty());
         assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("retired payload still held")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes + current.arrow_bytes,
+            "the held payload keeps its retired generation charged"
+        );
+        drop((current, next_for_poison));
         assert_eq!(
             budget
                 .snapshot()
@@ -5677,7 +5690,7 @@ mod tests {
             &mut owner,
             &budget,
             &baseline,
-            &current,
+            current,
             &current_key,
             next,
             &next_key,
@@ -6791,6 +6804,7 @@ mod tests {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            charge: Arc::clone(&frozen.charge),
             replay_identity: std::sync::Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
@@ -8127,6 +8141,113 @@ mod tests {
             budget.memory_snapshot().scribe_total_bytes,
             charged.scribe_total_bytes - arrow_bytes,
             "the last holder returns the exact bytes"
+        );
+    }
+
+    /// A retired generation's Arrow stays charged while persistence still
+    /// holds its production-converted payload or the frozen snapshot staging
+    /// rebuilt from it, after every memtable, capture, and read holder is gone.
+    ///
+    /// The payload comes from [`ImmutableGeneration::from_frozen`], as replay,
+    /// selective sealing, and rotation build it, and the snapshot from the
+    /// payload, as staging builds it. Two payload `Arc`s model a pending front
+    /// and the persistence worker. Each physical holder can be the last one,
+    /// so the root keeps the bytes and refuses growth into them until the
+    /// snapshot, dropped last, returns them exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if retirement or any non-final drop returns the charge while a
+    /// persistence holder remains, the snapshot's rows are unreadable, or the
+    /// final drop returns anything other than the generation's exact bytes.
+    #[tokio::test]
+    async fn a_retired_generation_stays_charged_while_persistence_holds_it() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let capture =
+            crate::scribe::memtable::LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("capture")
+                .expect("unregistered capture");
+        let read = capture
+            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .expect("projected read");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let (seal_id, arrow_bytes) = (frozen.seal_id, frozen.arrow_bytes);
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let payload = Arc::new(ImmutableGeneration::from_frozen(
+            &frozen,
+            (key.tenant, key.table.clone()),
+            stream,
+            Vec::new(),
+            wal_handle.clone(),
+        ));
+        let worker = Arc::clone(&payload);
+        let snapshot = payload.frozen_snapshot();
+        drop((frozen, capture, read));
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
+        owner
+            .memtable
+            .complete_staged(seal_id, owner_staged_member(seal_id))
+            .expect("owner completion");
+        owner
+            .memory_ownership
+            .reserve_immutable(arrow_bytes)
+            .expect("immutable ledger ownership");
+        owner.retained_generations.insert(
+            seal_id,
+            RetainedGeneration {
+                arrow_bytes,
+                memory_released: false,
+                wal_segments: Vec::new(),
+                wal: wal_handle,
+                replay_identity: Arc::new(Mutex::new(None)),
+            },
+        );
+        let charged = budget.memory_snapshot();
+        owner.retire_committed().await.expect("retirement");
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        let retained = budget.memory_snapshot();
+        assert_eq!(
+            retained.scribe_total_bytes, charged.scribe_total_bytes,
+            "persistence holders keep the charge through retirement"
+        );
+        let refreed = retained.scribe_limit_bytes - retained.scribe_total_bytes + arrow_bytes;
+        assert!(
+            budget
+                .try_reserve_maintenance(MemoryCategory::Active, refreed)
+                .is_err(),
+            "growth into the retained bytes is refused"
+        );
+        drop(payload);
+        drop(worker);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes,
+            "the snapshot keeps the charge after the last payload drops"
+        );
+        assert_eq!(snapshot.batches.len(), 1);
+        assert_eq!(snapshot.batches[0].num_rows(), 1);
+        drop(snapshot);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes - arrow_bytes,
+            "the last persistence holder returns the exact bytes"
         );
     }
 

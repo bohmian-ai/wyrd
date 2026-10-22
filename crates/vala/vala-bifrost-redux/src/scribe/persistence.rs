@@ -514,6 +514,12 @@ pub struct ImmutableGeneration {
     pub row_count: usize,
     /// Estimated Arrow bytes retained by the generation.
     pub arrow_bytes: usize,
+    /// Shared charge of the frozen generation whose buffers `rows` holds.
+    ///
+    /// Conversion from that generation clones this `Arc` instead of creating
+    /// an owner, so retirement keeps the bytes charged while persistence or a
+    /// staging snapshot still holds the rows.
+    pub(crate) charge: Arc<crate::scribe::memory::RetainedArrowCharge>,
     /// Replay-only committed identity retained through publication.
     pub(crate) replay_identity: Mutex<Option<crate::scribe::memory::ReplayIdentityOwnership>>,
     /// Monotonic active-generation open time.
@@ -524,6 +530,10 @@ pub struct ImmutableGeneration {
 
 impl ImmutableGeneration {
     /// Detach a frozen memtable snapshot into a persistence payload.
+    ///
+    /// The payload shares the frozen generation's Arrow buffers and its
+    /// retained charge, so persistence counts as one more holder of the same
+    /// root-backed bytes rather than an uncharged copy.
     #[must_use]
     pub fn from_frozen(
         frozen: &FrozenMemtable,
@@ -559,13 +569,19 @@ impl ImmutableGeneration {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            charge: Arc::clone(&frozen.charge),
             replay_identity: Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
         }
     }
 
-    fn frozen_snapshot(&self) -> FrozenMemtable {
+    /// Rebuilds the frozen generation staging encodes from this payload.
+    ///
+    /// The snapshot shares the payload's buffers and retained charge, so it
+    /// keeps the generation's bytes charged for as long as staging holds it,
+    /// even after every payload `Arc` has dropped.
+    pub(crate) fn frozen_snapshot(&self) -> FrozenMemtable {
         FrozenMemtable {
             seal_id: self.generation_id.0,
             shard_id: self.shard_id,
@@ -578,7 +594,7 @@ impl ImmutableGeneration {
             opened_at: self.opened_at,
             closed_at: self.closed_at,
             arrow_bytes: self.arrow_bytes,
-            charge: Arc::default(),
+            charge: Arc::clone(&self.charge),
         }
     }
 }
@@ -3160,6 +3176,7 @@ mod tests {
                 }],
                 row_count: 1,
                 arrow_bytes: 1,
+                charge: Arc::default(),
                 replay_identity: Mutex::new(None),
                 opened_at: std::time::Instant::now(),
                 closed_at: std::time::Instant::now(),

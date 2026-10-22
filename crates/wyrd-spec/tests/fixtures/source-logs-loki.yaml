@@ -4,7 +4,6 @@
 apiVersion: wyrd/v1
 kind: Source
 metadata:
-  space: prod
   name: service-logs
   version: 1.0.0
 

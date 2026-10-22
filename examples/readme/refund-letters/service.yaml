@@ -1,7 +1,7 @@
 # refund-letters/service.yaml
 apiVersion: wyrd/v1
 kind: Service
-metadata: {name: refund-letters, version: 1.0.0, space: default}
+metadata: {name: refund-letters, version: 1.0.0 }
 spec:
   service_type: agent
   tables:

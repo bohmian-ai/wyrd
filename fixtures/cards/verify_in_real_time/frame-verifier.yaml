@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: frame-verifier
   version: 1.0.0
-  space: default
 spec:
   description: One application-sampled frame shows a person wearing a badge.
   inputs:

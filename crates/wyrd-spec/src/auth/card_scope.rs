@@ -72,7 +72,7 @@ impl CardScope {
 mod tests {
     use super::CardScope;
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
+    use crate::ids::{CardName};
     use crate::reference::CardRef;
     use wyrd_semver::VersionBlock;
 
@@ -81,7 +81,6 @@ mod tests {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

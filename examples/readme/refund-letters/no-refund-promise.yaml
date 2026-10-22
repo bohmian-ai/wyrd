@@ -1,7 +1,7 @@
 # refund-letters/no-refund-promise.yaml: a simple assertion
 apiVersion: wyrd/v1
 kind: Verifier
-metadata: {name: no-refund-promise, version: 1.0.0, space: default}
+metadata: {name: no-refund-promise, version: 1.0.0 }
 spec:
   inputs:
     letter: {type: json}

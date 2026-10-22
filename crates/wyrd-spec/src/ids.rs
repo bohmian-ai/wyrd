@@ -65,11 +65,6 @@ macro_rules! id_type {
     };
 }
 
-id_type!(
-    SpaceName,
-    "Human-visible namespace for Cards and Runs.",
-    validate_token
-);
 id_type!(CardName, "Human-visible Card name.", validate_token);
 id_type!(CardUid, "Resolved immutable Card UID.", validate_uuid7);
 

@@ -1,7 +1,7 @@
 # refund-letters/agent.yaml
 apiVersion: wyrd/v1
 kind: Agent
-metadata: {name: letter-writer, version: 1.0.0, space: default}
+metadata: {name: letter-writer, version: 1.0.0 }
 spec:
   prompt:
     provider: openai

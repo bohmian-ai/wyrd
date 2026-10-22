@@ -3,13 +3,11 @@ kind: Agent
 metadata:
   name: ref-agent
   version: 1.0.0
-  space: default
 spec:
   prompt:
     kind: Prompt
     name: desk-prompt
     version: 1.0.0
-    space: default
   execution_route:
     kind: native
   run_config:

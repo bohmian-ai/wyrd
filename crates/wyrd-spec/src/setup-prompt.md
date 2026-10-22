@@ -82,7 +82,7 @@ write a machine-specific path into a project file.
 5. Run it from the directory holding both YAML files, with the project's own
    tool: `uv run quickstart.py`, `cargo run`, or `node quickstart.ts`. It
    prints one `passed` and one `failed` verdict, each naming its subject as
-   `default/Service/support-reply@1.0.0#<uid>`. A `failed` verdict is a
+   `Service/support-reply@1.0.0#<uid>`. A `failed` verdict is a
    result, not an error.
 
 6. Confirm the stored evidence through MCP. Call `cards.get` with
@@ -99,6 +99,6 @@ write a machine-specific path into a project file.
    `passed` and one `failed` row with the same `run_id`.
 
 7. Report the Service identity
-   `default/Service/support-reply@1.0.0#<uid>`, the `run_id`, and both
+   `Service/support-reply@1.0.0#<uid>`, the `run_id`, and both
    verdicts. Then point the person to the Wyrd documentation's
    "Choose your path" page for the next step.

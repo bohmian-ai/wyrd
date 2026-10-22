@@ -4,7 +4,6 @@ kind: Service
 metadata:
   name: latency-steady
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./latency-control.yaml

@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: event-verifier
   version: 1.0.0
-  space: default
 spec:
   description: Every sampled frame of one door event shows a badged person.
   inputs:

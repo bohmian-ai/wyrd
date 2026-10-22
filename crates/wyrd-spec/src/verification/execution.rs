@@ -464,7 +464,7 @@ mod tests {
             "inputs": {
                 "answer": {"kind": "json", "value": {"text": "yes"}},
                 "policy": {"kind": "file", "sha256": digest, "size_bytes": 10, "format": "pdf", "filename": "p.pdf"},
-                "deck": {"kind": "artifact", "artifact": {"kind": "Artifact", "space": "legal", "name": "decks", "version": "1.0.0"}, "path": "q3.pptx"},
+                "deck": {"kind": "artifact", "artifact": {"kind": "Artifact", "name": "decks", "version": "1.0.0"}, "path": "q3.pptx"},
                 "trace": {"kind": "trace", "trace_id": "0af7651916cd43dd8448eb211c80319c"}
             },
             "execution_route_overrides": {"judge": {"kind": "wyrd_gateway", "deployment": "eu-west"}}
@@ -495,8 +495,8 @@ mod tests {
     fn verification_result_round_trips_documented_outcome() {
         let result = json!({
             "execution_id": ExecutionId::new_v7(),
-            "verifier": {"kind": "Verifier", "space": "legal", "name": "msa-policy", "version": "1.0.0"},
-            "subject": {"kind": "Agent", "space": "legal", "name": "drafter", "version": "1.0.0"},
+            "verifier": {"kind": "Verifier", "name": "msa-policy", "version": "1.0.0"},
+            "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
             "outcome": {
                 "verdict": "failed",
                 "requirements": [{

@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Trigger
 metadata:
-  space: wyrd-team
   name: churn-classifier-drift-schedule
   version: "1.0.0"
 spec:

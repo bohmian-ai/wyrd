@@ -716,7 +716,7 @@ mod tests {
             serde_json::json!({
                 "id": id, "statement": "stable",
                 "check": {"kind": "drift", "on": "inputs.current", "method": "Spc",
-                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["latency"]},
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["latency"]},
                     "condition": {"kind": "Statistical"},
                     "profile": {"kind": "Spc", "sample_size": 5}}
             })

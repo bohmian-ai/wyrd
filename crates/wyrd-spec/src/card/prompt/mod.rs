@@ -85,7 +85,6 @@ pub(crate) mod prompt_support {
                         .into(),
                 ),
                 bump: None,
-                space: None,
                 uid: None,
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
@@ -608,7 +607,6 @@ mod prompt_promptref_tests {
     use super::prompt_support::{openai_chat_request, prompt_spec};
     use crate::PromptRef;
     use crate::envelope::CardKind;
-    use crate::ids::SpaceName;
     use crate::reference::CardRef;
 
     #[test]
@@ -617,7 +615,6 @@ mod prompt_promptref_tests {
             kind: CardKind::Prompt,
             name: "support_prompt".parse().expect("valid card name"),
             version: "1.0.0".parse().expect("valid version"),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         });
 

@@ -8,13 +8,18 @@ use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{CardKind, Spec};
-use crate::ids::{CardName, CardUid, SpaceName};
+use crate::ids::{CardName, CardUid};
 use crate::refs::ReferenceSlotVisitor;
 use wyrd_semver::VersionBlock;
 
-/// Reference to a registered Card by kind, name, version, optional space, and optional UID.
+/// Reference to a registered Card by kind, name, one version, and optional UID.
+///
+/// Identity is `(kind, name, version)` within the authenticated tenant; the
+/// canonical text form is `Kind/name@version[#uid]`. Unknown fields, such as
+/// the removed `space`, are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct CardRef {
     /// Referenced Card kind.
     pub kind: CardKind,
@@ -22,15 +27,9 @@ pub struct CardRef {
     pub name: CardName,
     /// Exact referenced Card version.
     pub version: VersionBlock,
-    /// Space pinning identity together with `name` and `version`.
-    ///
-    /// Authors may omit it; the loader inherits the enclosing card's resolved
-    /// metadata space before the reference crosses a wire boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
     /// Optional server-resolved durable UID.
     ///
-    /// Authors identify a dependency with `(kind, space, name, version)` and
+    /// Authors identify a dependency with `(kind, name, version)` and
     /// may omit this field. The server resolves that reference to a [`CardUid`]
     /// before registration; the UID is then used for durable authorization and
     /// lineage without changing the authored reference identity.
@@ -47,8 +46,6 @@ pub struct CardRef {
 pub struct CardRefIdentity {
     /// Card kind.
     pub kind: CardKind,
-    /// Optional authored space; resolved references must carry one.
-    pub space: Option<SpaceName>,
     /// Card name.
     pub name: CardName,
     /// Exact version string.
@@ -60,7 +57,7 @@ pub struct CardRefIdentity {
 /// Loaders rewrite `Path` values to `Sibling` values before submitting a request;
 /// the server rejects unresolved paths at the wire boundary. Authored `Ref`
 /// values remain external references even when they identify a submitted card.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum Ref {
@@ -74,6 +71,37 @@ pub enum Ref {
     /// A local authored path awaiting loader resolution.
     #[cfg_attr(feature = "server", schema(value_type = String))]
     Path(PathBuf),
+}
+
+/// Decode the authored forms as `untagged` does, but report an object that is
+/// no sibling by the [`CardRef`] error, so a removed or misspelled reference
+/// field names its cause instead of "did not match any variant".
+impl<'de> Deserialize<'de> for Ref {
+    /// Buffer the value: a string is a path, an object with `sibling` is a
+    /// sibling, and any other value must be a [`CardRef`].
+    ///
+    /// # Errors
+    /// Returns the [`CardRef`] decode error when no form matches.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The wire shape of [`Ref::Sibling`].
+        #[derive(Deserialize)]
+        struct Sibling {
+            /// Exact identity of the sibling submission.
+            sibling: CardRef,
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(path) => Ok(Self::Path(path.into())),
+            serde_json::Value::Object(ref object) if object.contains_key("sibling") => {
+                Sibling::deserialize(value)
+                    .map(|Sibling { sibling }| Self::Sibling { sibling })
+                    .map_err(D::Error::custom)
+            }
+            value => CardRef::deserialize(value)
+                .map(Self::Ref)
+                .map_err(D::Error::custom),
+        }
+    }
 }
 
 impl Ref {
@@ -164,9 +192,22 @@ impl<'de, T: DeserializeOwned> Deserialize<'de> for InlineableRef<T> {
         match (T::deserialize(&value), value) {
             (Ok(body), _) => Ok(Self::Inline(Box::new(body))),
             (Err(_), serde_json::Value::String(path)) => Ok(Self::Path(path.into())),
+            (Err(_), value @ serde_json::Value::Object(_)) if looks_like_card_ref(&value) => {
+                CardRef::deserialize(value)
+                    .map(Self::Ref)
+                    .map_err(D::Error::custom)
+            }
             (Err(error), _) => Err(D::Error::custom(error)),
         }
     }
+}
+
+/// True when an object carries every [`CardRef`] identity field, so a failed
+/// decode is a malformed reference rather than a malformed inline body.
+fn looks_like_card_ref(value: &serde_json::Value) -> bool {
+    ["kind", "name", "version"]
+        .iter()
+        .all(|field| value.get(field).is_some())
 }
 
 impl<T> InlineableRef<T> {
@@ -261,7 +302,6 @@ impl CardRef {
     pub fn identity_key(&self) -> CardRefIdentity {
         CardRefIdentity {
             kind: self.kind.clone(),
-            space: self.space.clone(),
             name: self.name.clone(),
             version: self.version.as_str().to_owned(),
         }
@@ -270,11 +310,10 @@ impl CardRef {
     /// True when two card refs share the exact named identity tuple.
     ///
     /// The optional `uid` is ignored — authorization is identity-based on
-    /// `(kind, space, name, version)` only.
+    /// `(kind, name, version)` only.
     #[must_use]
     pub fn same_identity(&self, other: &CardRef) -> bool {
         self.kind == other.kind
-            && self.space == other.space
             && self.name == other.name
             && self.version == other.version
     }
@@ -282,7 +321,7 @@ impl CardRef {
 
 /// A principal's card authorization set.
 ///
-/// Authorization is identity-based on `(kind, name, version, space)`. The
+/// Authorization is identity-based on `(kind, name, version)`. The
 /// optional resolved `uid` is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CardRefScope(Vec<CardRef>);
@@ -308,7 +347,7 @@ impl CardRefScope {
 
     /// Build a scope and guarantee that `root` is the first member.
     ///
-    /// Duplicate identity (same `(kind, name, version, space)`, ignoring `uid`)
+    /// Duplicate identity (same `(kind, name, version)`, ignoring `uid`)
     /// is removed. Root is always retained as the first element.
     ///
     /// A duplicate that carries a resolved `uid` donates it to the retained
@@ -381,7 +420,7 @@ impl CardRefScope {
     }
 }
 
-/// Serializes as a JSON array of `Display` strings (`"space/Kind/name@version"`).
+/// Serializes as a JSON array of `Display` strings (`"Kind/name@version"`).
 ///
 /// This is the canonical wire encoding for `card_ref_scope` members in JWT claims
 /// and HTTP payloads. Individual `card_ref` fields use an object shape instead —
@@ -522,10 +561,7 @@ impl fmt::Display for CardRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}/{}/{}@{}",
-            self.space
-                .as_ref()
-                .map_or("<missing-space>", SpaceName::as_str),
+            "{}/{}@{}",
             self.kind.wire_name(),
             self.name,
             self.version
@@ -548,12 +584,10 @@ impl FromStr for CardRef {
         let (before_version, version) = head
             .rsplit_once('@')
             .ok_or(CardRefParseError::MissingVersion)?;
+        if before_version.matches('/').count() > 1 {
+            return Err(CardRefParseError::TooManySegments);
+        }
         let mut parts = before_version.split('/');
-        let space = parts
-            .next()
-            .ok_or(CardRefParseError::MissingSpace)?
-            .parse()
-            .map_err(CardRefParseError::Space)?;
         let kind = parts
             .next()
             .ok_or(CardRefParseError::MissingKind)
@@ -563,15 +597,11 @@ impl FromStr for CardRef {
             .ok_or(CardRefParseError::MissingName)?
             .parse()
             .map_err(CardRefParseError::Name)?;
-        if parts.next().is_some() {
-            return Err(CardRefParseError::TooManySegments);
-        }
 
         Ok(Self {
             kind,
             name,
             version: version.parse().map_err(CardRefParseError::Version)?,
-            space: Some(space),
             uid,
         })
     }
@@ -587,9 +617,6 @@ fn parse_card_kind(value: &str) -> Result<CardKind, CardRefParseError> {
 /// Card reference text parse error.
 #[derive(Debug, thiserror::Error)]
 pub enum CardRefParseError {
-    /// Missing space segment.
-    #[error("card ref is missing space")]
-    MissingSpace,
     /// Missing kind segment.
     #[error("card ref is missing kind")]
     MissingKind,
@@ -600,14 +627,11 @@ pub enum CardRefParseError {
     #[error("card ref is missing @version")]
     MissingVersion,
     /// Too many slash-delimited segments.
-    #[error("card ref must be space/kind/name@version[#uid]")]
+    #[error("card ref must be Kind/name@version[#uid]")]
     TooManySegments,
     /// Unknown card kind.
     #[error("unknown card kind: {0}")]
     Kind(String),
-    /// Space failed validation.
-    #[error("invalid space: {0}")]
-    Space(crate::ids::IdError),
     /// Name failed validation.
     #[error("invalid name: {0}")]
     Name(crate::ids::IdError),
@@ -632,7 +656,6 @@ mod tests {
             kind: CardKind::Artifact,
             name: CardName::new("weights").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -643,14 +666,13 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new("billing").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
 
         let text = card_ref.to_string();
         let parsed: CardRef = text.parse().expect("card ref parses");
 
-        assert_eq!(text, "prod/Service/billing@1.0.0");
+        assert_eq!(text, "Service/billing@1.0.0");
         assert_eq!(parsed, card_ref);
     }
 
@@ -677,7 +699,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "prod/Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"
+            "Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"
         );
         assert_eq!(parsed, card_ref);
     }
@@ -704,7 +726,7 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(&bytes).expect("json is utf8"),
-            r#"{"kind":"Artifact","name":"weights","version":"1.0.0","space":"prod","uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"}"#
+            r#"{"kind":"Artifact","name":"weights","version":"1.0.0","uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"}"#
         );
     }
 
@@ -733,15 +755,10 @@ mod tests {
             kind: CardKind::Model,
             name: CardName::new("churn").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         };
         let json = serde_json::to_string(&card_ref).expect("serialize");
-        assert!(
-            json.contains(r#""space":"default""#),
-            "space must serialize"
-        );
-        assert!(!json.contains("uid"), "uid=None must skip");
+        assert_eq!(json, r#"{"kind":"Model","name":"churn","version":"1.0.0"}"#);
     }
 
     /// The compact claim encoding is the only Card-scope contract on the wire,
@@ -770,7 +787,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"["prod/Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11","prod/Model/scorer@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"]"#,
+            r#"["Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11","Model/scorer@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"]"#,
             "compact claim encoding carries every resolved uid"
         );
         assert_eq!(parsed, scope, "round trip preserves the whole scope");
@@ -822,7 +839,6 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new("system-prompt").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: Some(authored_uid),
         };
         let lookup_ref = CardRef {
@@ -850,16 +866,52 @@ mod tests {
         );
     }
 
+    /// Flat identity is `Kind/name@version[#uid]`: kind, name, and version
+    /// separate identities, the UID does not, and every removed space form is
+    /// refused with a message naming the expected shape.
     #[test]
-    fn card_ref_accepts_missing_authored_space() {
-        let json = r#"{"kind":"Model","name":"churn","version":"1.0.0"}"#;
-        let card_ref =
-            serde_json::from_str::<CardRef>(json).expect("space is optional while authored");
-        assert!(card_ref.space.is_none());
+    fn flat_card_reference_contract() {
+        let card_ref: CardRef = "Service/checkout@1.0.0".parse().expect("flat ref parses");
+        assert_eq!(card_ref.kind, CardKind::Service);
+        assert_eq!(card_ref.name.as_str(), "checkout");
+        assert_eq!(card_ref.version.as_str(), "1.0.0");
+        assert_eq!(card_ref.to_string(), "Service/checkout@1.0.0");
+
+        let other_kind = CardRef {
+            kind: CardKind::Agent,
+            ..card_ref.clone()
+        };
+        assert!(!card_ref.same_identity(&other_kind), "kind is identity");
+
+        let error = "prod/Service/checkout@1.0.0"
+            .parse::<CardRef>()
+            .expect_err("space-bearing text is refused");
+        assert!(
+            error.to_string().contains("Kind/name@version"),
+            "refusal names the flat shape: {error}"
+        );
+
+        let error = serde_json::from_str::<CardRef>(
+            r#"{"kind":"Service","name":"checkout","version":"1.0.0","space":"prod"}"#,
+        )
+        .expect_err("space field is refused");
+        assert!(error.to_string().contains("unknown field `space`"), "{error}");
+
+        let error = serde_json::from_str::<Ref>(
+            r#"{"kind":"Service","name":"checkout","version":"1.0.0","space":"prod"}"#,
+        )
+        .expect_err("space field is refused in a reference slot");
+        assert!(error.to_string().contains("unknown field `space`"), "{error}");
+
+        let error = serde_json::from_str::<InlineableRef<skald_spec::Prompt>>(
+            r#"{"kind":"Prompt","name":"answer","version":"1.0.0","space":"prod"}"#,
+        )
+        .expect_err("space field is refused in an inlineable slot");
+        assert!(error.to_string().contains("unknown field `space`"), "{error}");
     }
 
     #[test]
-    fn card_ref_identity_ignores_uid_but_includes_version_and_space() {
+    fn card_ref_identity_ignores_uid_but_includes_version() {
         let first = sample_ref();
         let with_uid = CardRef {
             uid: Some(
@@ -871,15 +923,9 @@ mod tests {
 
         let different_version = CardRef {
             version: VersionBlock::parse("2.0.0").expect("static version is valid"),
-            ..first.clone()
-        };
-        assert!(!first.same_identity(&different_version));
-
-        let different_space = CardRef {
-            space: Some(SpaceName::new("staging").expect("static space is valid")),
             ..first
         };
-        assert!(!with_uid.same_identity(&different_space));
+        assert!(!with_uid.same_identity(&different_version));
     }
 
     /// Build a verification binding whose Verifier, Trigger, and Operator

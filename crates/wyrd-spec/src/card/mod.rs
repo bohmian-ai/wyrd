@@ -75,7 +75,7 @@ mod data_methods_tests {
     };
     use crate::card::{FieldSpec, Inequality};
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, ColumnName, SpaceName, SplitName};
+    use crate::ids::{CardName, ColumnName, SplitName};
     use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
@@ -108,7 +108,6 @@ mod data_methods_tests {
             kind: CardKind::Artifact,
             name: CardName::new("artifact").unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         })
     }
@@ -213,7 +212,7 @@ mod data_roundtrip_tests {
     };
     use crate::card::{FieldSpec, Inequality};
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
+    use crate::ids::{CardName, ColumnName, QueryName, SplitName};
     use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
@@ -234,7 +233,6 @@ mod data_roundtrip_tests {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         })
     }
@@ -809,7 +807,7 @@ mod model_methods_tests {
         XgboostMeta,
     };
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, ColumnName, SpaceName};
+    use crate::ids::{CardName, ColumnName};
     use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
@@ -826,7 +824,6 @@ mod model_methods_tests {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         })
     }
@@ -1137,7 +1134,7 @@ mod model_roundtrip_tests {
         TaskType, TensorflowMeta, TfSaveFormat, TorchMeta, TorchSaveFormat, XgboostMeta,
     };
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, ColumnName, SpaceName};
+    use crate::ids::{CardName, ColumnName};
     use crate::reference::{CardRef, Ref};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -1156,7 +1153,6 @@ mod model_roundtrip_tests {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         })
     }
@@ -1879,7 +1875,7 @@ mod drift_validation_tests {
     };
     use crate::envelope::CardKind;
     use crate::error::WyrdError;
-    use crate::ids::{CardName, FeatureName, SpaceName};
+    use crate::ids::{CardName, FeatureName};
     use crate::reference::{CardRef, Ref};
     use serde_json::json;
     use wyrd_semver::VersionBlock;
@@ -1890,7 +1886,6 @@ mod drift_validation_tests {
             kind,
             name: CardName::new(name).expect("valid card name"),
             version: VersionBlock::parse(version).expect("valid version"),
-            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         })
     }
@@ -2475,7 +2470,6 @@ mod envelope_roundtrip_tests {
                 name: CardName::new("support_prompt").unwrap(),
                 version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
                 bump: None,
-                space: None,
                 uid: None,
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),

@@ -1,7 +1,7 @@
 # refund-letters/names-order.yaml: parse the document, then check it
 apiVersion: wyrd/v1
 kind: Verifier
-metadata: {name: names-order, version: 1.0.0, space: default}
+metadata: {name: names-order, version: 1.0.0 }
 spec:
   inputs:
     letter: {type: media, formats: [markdown]}

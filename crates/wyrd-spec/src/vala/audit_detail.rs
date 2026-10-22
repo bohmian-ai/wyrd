@@ -1304,7 +1304,7 @@ mod tests {
                 "scope_hash" => serde_json::json!({
                     "kind": "card_scope_mint",
                     "mint_kind": "refresh",
-                    "root_card_ref": {"kind": "Agent", "name": "worker", "version": "1.0.0", "space": "prod"},
+                    "root_card_ref": {"kind": "Agent", "name": "worker", "version": "1.0.0"},
                     "scope_hash": value,
                     "scope_members": []
                 }),
@@ -1339,8 +1339,8 @@ mod tests {
                 r#"{"api_key_id":"00000000-0000-0000-0000-000000000002","expires_at":"2026-01-02T03:04:05Z","kind":"credential_issuance","target_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
             ),
             (
-                r#"{"kind":"token_exchange","expires_at":"2026-01-02T03:04:05Z","delegation_chain":[{"space":"prod","version":"1.0.0","name":"worker","kind":"Agent"}],"actor_principal_id":"00000000-0000-0000-0000-000000000001","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
-                r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"kind":"token_exchange","expires_at":"2026-01-02T03:04:05Z","delegation_chain":[{"version":"1.0.0","name":"worker","kind":"Agent"}],"actor_principal_id":"00000000-0000-0000-0000-000000000001","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
             ),
             (
                 r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"outcome":"denied","kind":"authz_check"}"#,
@@ -1351,8 +1351,8 @@ mod tests {
                 r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","before_spec_hash":null,"card_kind":"Agent","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","kind":"card_declaration","operation":"declare","outcome":"created"}"#,
             ),
             (
-                r#"{"scope_members":[{"kind":"Agent","name":"worker","version":"1.0.0","space":"prod"}],"root_card_ref":{"space":"prod","name":"root","version":"1.0.0","kind":"Agent"},"scope_hash":"scope-digest","mint_kind":"refresh","kind":"card_scope_mint","scope_member_count":1,"failure_code":null}"#,
-                r#"{"failure_code":null,"kind":"card_scope_mint","mint_kind":"refresh","root_card_ref":{"kind":"Agent","name":"root","space":"prod","version":"1.0.0"},"scope_hash":"scope-digest","scope_member_count":1,"scope_members":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}]}"#,
+                r#"{"scope_members":[{"kind":"Agent","name":"worker","version":"1.0.0"}],"root_card_ref":{"name":"root","version":"1.0.0","kind":"Agent"},"scope_hash":"scope-digest","mint_kind":"refresh","kind":"card_scope_mint","scope_member_count":1,"failure_code":null}"#,
+                r#"{"failure_code":null,"kind":"card_scope_mint","mint_kind":"refresh","root_card_ref":{"kind":"Agent","name":"root","version":"1.0.0"},"scope_hash":"scope-digest","scope_member_count":1,"scope_members":[{"kind":"Agent","name":"worker","version":"1.0.0"}]}"#,
             ),
             (
                 r#"{"status_code":200,"storage_path":" cards/a ","backend":"s3","operation":"complete","kind":"storage","upload_id":null,"error_code":null}"#,

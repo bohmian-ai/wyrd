@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Data
 metadata:
-  space: wyrd-team
   name: churn-classifier-data
   version: "1.4.2"
 spec:

@@ -5,7 +5,6 @@ kind: Agent
 metadata:
   name: policy-judge
   version: 1.0.0
-  space: support
 spec:
   execution_route: {kind: wyrd_gateway, deployment: openai}
   run_config: {max_iterations: 1}

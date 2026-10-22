@@ -4,7 +4,6 @@ kind: Service
 metadata:
   name: support-reply
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./no-refund-promise.yaml

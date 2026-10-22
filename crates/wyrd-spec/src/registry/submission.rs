@@ -284,7 +284,6 @@ mod tests {
                 name: "audit-a".parse().expect("test name is valid"),
                 version: None,
                 bump: None,
-                space: Some("default".parse().expect("test space is valid")),
                 uid: None,
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),
@@ -303,7 +302,7 @@ mod tests {
             "submissions": [{
                 "apiVersion": "wyrd/v1",
                 "kind": "Audit",
-                "metadata": {"name": "audit-a", "space": "default"},
+                "metadata": {"name": "audit-a"},
                 "spec": {}
             }]
         }))
@@ -336,7 +335,7 @@ mod tests {
     fn create_card_response_carries_root_outcomes_and_upload_plans() {
         let response = DeclareCardResponse {
             root: serde_json::from_value(json!({
-                "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
+                "kind": "Audit", "name": "audit-a", "version": "1.0.0"
             }))
             .expect("card ref deserializes"),
             outcomes: Vec::new(),
@@ -354,7 +353,7 @@ mod tests {
     fn registration_receipt_excludes_internal_upload_plans() {
         let response = DeclareCardResponse {
             root: serde_json::from_value(json!({
-                "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
+                "kind": "Audit", "name": "audit-a", "version": "1.0.0"
             }))
             .expect("card ref deserializes"),
             outcomes: Vec::new(),

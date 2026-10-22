@@ -7,7 +7,6 @@ kind: Service
 metadata:
   name: policy-desk
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./policy-review.yaml

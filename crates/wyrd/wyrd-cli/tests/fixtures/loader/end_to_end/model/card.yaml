@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Model
 metadata:
-  space: wyrd-team
   name: churn-classifier
   version: "1.4.2"
   labels:
@@ -27,6 +26,5 @@ spec:
   # External `ref:` variant — resolved against the registry at register time.
   card_refs:
     - kind: Data
-      space: wyrd-team
       name: churn-classifier-data
       version: "1.4.2"

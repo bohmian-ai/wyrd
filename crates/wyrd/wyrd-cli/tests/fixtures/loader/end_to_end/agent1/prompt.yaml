@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
-  space: wyrd-team
   name: churn-triage-prompt
   version: 1.0.0
 spec:

@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: refund-turn
   version: 1.0.0
-  space: default
 spec:
   description: Each refund turn records the order fact it promised against.
   inputs:

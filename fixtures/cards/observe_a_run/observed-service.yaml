@@ -3,7 +3,6 @@ kind: Service
 metadata:
   name: observed-service
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:
@@ -14,7 +13,6 @@ spec:
         kind: Model
         name: observed-model
         version: 1.0.0
-        space: default
       verified_by:
         - verifier: ./observed-drift.yaml
           runs_on: {kind: schedule, cron: "0 0 * * *"}

@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: conversation-verifier
   version: 1.0.0
-  space: default
 spec:
   description: A whole support conversation answered every turn.
   inputs:

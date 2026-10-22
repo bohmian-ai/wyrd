@@ -590,6 +590,755 @@ The URL is stored in that agent's entry only. Remote servers must use `https://`
 
 [Run your first verification](/wyrd/get-started/quickstart/), then ask your agent to explain its verdicts.
 
+# Services
+
+Page: /wyrd/build-and-verify/declare/define-a-service/
+
+> Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
+
+Declare the Service your app runs: the components it is built from, each at an exact version, and the tables it records rows into. Every verdict then names exactly what it checked.
+
+You need a running server from [Set up Wyrd](/wyrd/get-started/setup/). This page builds the `support-desk` Service; the finished files are in `examples/support-desk-app/service/`.
+
+## 1. Write the components
+
+Each component is its own YAML file with an exact `metadata.version`. The support desk has an Agent and the Prompt it runs, and the Agent points at the Prompt by relative path:
+
+**support-agent.yaml**
+
+```yaml title="support-agent.yaml"
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: support-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt: ./support-prompt.yaml
+  execution_route:
+    kind: wyrd_gateway
+    deployment: openai
+  tool_names: []
+  run_config:
+    max_iterations: 1
+
+```
+
+**support-prompt.yaml**
+
+```yaml title="support-prompt.yaml"
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: support-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  messages:
+  - role: user
+    content: 'Answer the customer: {{question}}'
+
+```
+
+`execution_route` says how the Agent reaches its model: `wyrd_gateway` sends it through the [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/) deployment named `openai`. Use `{kind: native}` when your own code calls the model.
+
+A hosted model such as `gpt-4o` needs no file of its own. Declare a `Model` only for a model you own and version, such as a trained classifier, so verdicts attach to its exact version.
+
+## 2. Write the Service
+
+The Service gives each component an `alias`, the name your code uses at runtime, such as `run.for_card("agent")`:
+
+```yaml title="support-desk.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  tables:
+    - name: tickets  # becomes vala.datasets.tickets
+      schema:
+        type: object
+        properties:  # in column order
+          question: {type: string}
+          answer: {type: string}
+        required: [question, answer]
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml  # relative to this file
+    - alias: prompt
+      ref: ./support-prompt.yaml
+```
+
+A `ref` can also name a component that is already declared, such as `{kind: Model, name: churn-classifier, version: 1.4.2}`. Every reference names one exact version, never a range.
+
+## 3. Check it
+
+```bash
+wyrd declare --check support-desk.yaml
+```
+
+It loads the Service and every file it references, validates them without contacting the server, and lists each one. Fix anything it reports before you declare.
+
+## 4. Declare it
+
+```bash
+wyrd declare support-desk.yaml
+```
+
+It declares every file the Service references, dependencies first, creates the `tickets` table, and prints one line per file with its outcome. Run it again: unchanged files come back `idempotent_noop`, so declaring is safe to repeat.
+
+**From code:**
+
+`WyrdState.declare("support-desk.yaml")` declares the same files and returns the Service ready to use, as in [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/#3-call-it-and-read-the-verdict).
+
+## 5. Read it back
+
+The server records which component references which, in both directions. Fetch the Service and list its components:
+
+**Python**
+
+```python
+from wyrd.cards import CardRef, Cards
+
+card = Cards().get(CardRef("Service", "support-desk", "1.0.0", space="default"))
+for edge in card.relationships["outbound_refs"]:
+    print(edge.get("alias"), edge["ref"])
+```
+
+**Rust**
+
+```rust
+use wyrd_ai::cards::{CardRef, CardSelector, Cards};
+
+let service: CardRef = "default/Service/support-desk@1.0.0".parse()?;
+let card = Cards::connect().await?.get(CardSelector::exact(service)).await?;
+for edge in &card.relationships.outbound_refs {
+    println!("{edge:?}");
+}
+```
+
+**TypeScript**
+
+```typescript
+import { Cards } from "wyrd-ai";
+
+const card = await (await Cards.connect()).get("default/Service/support-desk@1.0.0");
+for (const edge of card.relationships.outbound_refs) console.log(edge.alias, edge.ref);
+```
+
+It prints one line per component, with its alias and exact version. Fetching `support-prompt` instead shows, under `inbound_refs`, both the Agent and the Service that use it.
+
+## 6. Change a component
+
+A declared version never changes. To change the Prompt, set a new `version` in `support-prompt.yaml`, then bump the Agent and the Service that reference it, since they now point at different content. Declare again: the new Service version records the new Prompt, and verdicts from the old version still name the old one.
+
+**Set the space once:**
+
+`space` groups related files, such as a team's. Instead of writing it in every file, put a `wyrd.toml` next to them or in a parent directory:
+
+```toml
+[defaults]
+space = "support"
+```
+
+A file's own `metadata.space` still wins.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Fix the file `details.diagnostics` names: a missing `apiVersion` or `kind`, a path to no file, or a missing exact `version` |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | That version is already declared with different content: bump its `version` |
+| `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | Declare the referenced component first, or fix the `ref` |
+| `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
+
+## Next
+
+[Bind a Verifier](/wyrd/build-and-verify/declare/bind-a-verifier/) to say how the Service is checked.
+
+# Bindings
+
+Page: /wyrd/build-and-verify/declare/bind-a-verifier/
+
+> Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
+
+Attach each Verifier to what it checks, and choose who runs it: your code, or a schedule.
+
+This page uses the `support-desk` Service from [Services](/wyrd/build-and-verify/declare/define-a-service/). The Verifiers it binds are written in [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/).
+
+## 1. Bind Verifiers your code calls
+
+Add a `verified_by` list to the Service, or to one of its components. Each entry names a Verifier file:
+
+```yaml title="support-desk.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  # The Service's own Verifier checks every answer the desk gives.
+  verified_by:
+    - verifier: ./no-refund-promise.yaml
+  tables:
+    - name: tickets
+      schema:
+        type: object
+        properties:
+          question: {type: string}
+          answer: {type: string}
+        required: [question, answer]
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./ticket-complete.yaml
+        - verifier: ./follows-policy.yaml
+    - alias: prompt
+      ref: ./support-prompt.yaml
+
+```
+
+Where you bind a Verifier decides where your code calls it:
+
+| Bound on | Call it as |
+| --- | --- |
+| The Service | `run.observe.verify("no-refund-promise", ...)` |
+| The `agent` component | `run.for_card("agent").observe.verify("ticket-complete", ...)` |
+
+Check the bindings:
+
+```bash
+wyrd declare --check support-desk.yaml
+```
+
+It lists the Service, its components, and each bound Verifier. A Verifier with no `runs_on` runs only when your code calls `verify` or `submit`, as in [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/).
+
+## 2. Run a Verifier on a schedule
+
+A schedule judges samples your service recorded over time, such as request latency, instead of one request. Add `runs_on` with a Trigger:
+
+```yaml title="latency-watch.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: latency-watch
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./latency-shift.yaml
+      runs_on: {kind: schedule, cron: "0 0 * * *"}  # midnight; add tz to use another zone than UTC
+```
+
+Only a Verifier whose inputs are `samples` can run on a schedule. The [drift recipe](/wyrd/build-and-verify/verify/verifier-recipes/#drift) writes one.
+
+## 3. React to a failure
+
+Add `on_failure` with the Operators to run after a `failed` verdict:
+
+**latency-watch.yaml**
+
+```yaml title="latency-watch.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: latency-watch
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./latency-shift.yaml
+      runs_on: ./daily.yaml
+      on_failure:
+        - ./alert-on-call.yaml
+
+```
+
+**daily.yaml**
+
+```yaml title="daily.yaml"
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  name: daily
+  version: 1.0.0
+  space: default
+spec:
+  description: Once a day at midnight UTC.
+  kind: schedule
+  cron: "0 0 * * *"
+
+```
+
+**alert-on-call.yaml**
+
+```yaml title="alert-on-call.yaml"
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: alert-on-call
+  version: 1.0.0
+  space: default
+spec:
+  description: Page the on-call hook when latency shifts. The origin comes from the connection.
+  kind: http
+  method: post
+  url: /hooks/latency-shift
+  auth:
+    scheme: bearer
+    connection: on-call-hooks
+  body:
+    execution_id: "{{execution_id}}"
+    summary: "{{summary}}"
+
+```
+
+The Trigger now lives in its own file, so several bindings can share it. Each day at midnight UTC, the server judges the day's `latency` samples and, on a `failed` verdict, posts to the on-call hook. Declaring an `on_failure` binding needs the `operators:invoke` permission.
+
+**Judge a whole conversation:**
+
+A `group_end` Trigger judges every turn sharing a `group_id` once the conversation goes quiet, and `on_verdict_change` runs Operators when that verdict changes. See the [grouped recipe](/wyrd/build-and-verify/verify/verifier-recipes/#grouped-session).
+
+## Binding fields
+
+| Field | Required | Holds |
+| --- | --- | --- |
+| `verifier` | Yes | A path to the Verifier's file, or a declared Verifier |
+| `runs_on` | No | A `schedule` or `group_end` Trigger, as a path, a declared Trigger, or inline. Absent, only your code runs the Verifier |
+| `on_failure` | No | Operators to run after a `failed` verdict. Not allowed with `group_end` |
+| `on_verdict_change` | No | Operators to run when a `group_end` verdict changes |
+
+Any other field is rejected.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_SDK_404_UNKNOWN_VERIFIER` from `verify` or `submit` | Call it on the Service or component that binds it, or add the binding |
+| `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | The same Verifier is bound twice on one subject: remove one |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | A schedule is set on a Verifier that doesn't judge `samples`: remove `runs_on` and call it from code |
+| `WYRD_PERMISSION_403_DENIED_RBAC` when you declare | Declare `on_failure` with a credential that has `operators:invoke` |
+
+## Next
+
+[Declare the Service](/wyrd/build-and-verify/declare/define-a-service/#4-declare-it), then [verify inside a Run](/wyrd/build-and-verify/observe/record-a-run-and-observations/).
+
+# Runs and observations
+
+Page: /wyrd/build-and-verify/observe/record-a-run-and-observations/
+
+> Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
+
+Wrap each request your app handles in a Run. Everything inside it (the model call, the rows you record, and each verdict) is tied to that Run and to the exact Card version that produced it, so you can read the whole request back with one query.
+
+You need the support-desk Service from [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/wyrd/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
+
+```bash
+uv add "wyrd-ai[otel,gateway]==0.3.0" openai
+```
+
+## 1. Connect at startup
+
+Once, when your app starts:
+
+```python title="desk.py"
+from openai import DefaultHttpxClient, OpenAI
+from wyrd import WyrdClient, WyrdState
+
+client = WyrdClient()  # finds the server and credential wyrd init saved
+state = WyrdState.declare("service/support-desk.yaml", client)
+state.start_bifrost()    # the writer for rows and verdict inputs
+state.start_telemetry()  # exports spans started inside a Run
+
+# Your model calls go through Wyrd's gateway. http_auth signs each call and
+# ties it to the Run it is made in.
+gateway = OpenAI(
+    base_url=f"{client.server_url}/v1",
+    api_key="wyrd",  # placeholder; http_auth replaces it
+    http_client=DefaultHttpxClient(auth=client.http_auth),
+)
+prompt = state.prompt("prompt").prompt  # the Service's declared Prompt
+```
+
+`start_bifrost` is the first server call, so a wrong URL or credential fails here, at startup.
+
+## 2. Answer inside a Run
+
+Open a Run per request, and a view of the agent for the work the agent does:
+
+```python title="desk.py"
+def answer(question: str):
+    with state.run() as run, run.for_card("agent") as agent:
+        # Fill the Prompt's {{question}}; a missing variable raises instead of sending.
+        messages = prompt.render(question=question).messages
+        # Recorded by the gateway under this Run and the agent.
+        reply = gateway.chat.completions.create(model="openai/gpt-4o", messages=messages)
+        text = reply.choices[0].message.content
+
+        # A row in the Service's tickets table, tagged with this Run.
+        run.observe.record("vala.datasets.tickets", {"question": question, "answer": text})
+        return run, agent, text
+```
+
+`openai/gpt-4o` is `<deployment>/<model>`: the [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/) deployment, then the model it sends upstream.
+
+## 3. Verify the answer
+
+Call each Verifier on the view it is bound to. `no-refund-promise` is bound to the Service, so it runs on `run`; `ticket-complete` is bound to the agent, so it runs on `agent`:
+
+```python title="desk.py"
+run, agent, text = answer("Can I get my money back?")
+
+checked = run.observe.verify("no-refund-promise", answer=text)
+ticket = agent.observe.verify("ticket-complete", ticket={"answer": text, "order_id": "A-1001"})
+print(checked.verdict, ticket.verdict)
+```
+
+```text
+passed passed
+```
+
+`verify` waits for the verdict. For a slow check, such as a model judge, `submit` queues it and returns an execution instead:
+
+```python title="desk.py"
+from wyrd import verify
+
+execution = agent.observe.submit("follows-policy", letter=verify.File("letter.md"))
+print(execution.id)
+```
+
+Read it back later, from any process, by that ID:
+
+```python
+status = verify.Execution.connect(execution_id, client).status()
+print(status["status"])  # pending, running, or completed
+```
+
+## 4. Shut down cleanly
+
+Rows and spans are sent in batches. Send what is still queued when the process stops:
+
+```python
+state.shutdown()
+```
+
+A process killed without it can lose its last rows and spans.
+
+## 5. Read the Run back
+
+Every row the Run produced carries its `run_id`, so one query joins the ticket, the gateway call, and each verdict:
+
+```sql title="run.sql"
+SELECT t.question, t.answer, g.call_id, r.verdict
+FROM vala.datasets.tickets t
+JOIN vala.gateway.calls g ON g.run_id = t.run_id
+JOIN vala.verification.results r ON r.run_id = t.run_id
+WHERE t.run_id = $1
+```
+
+```python
+from wyrd.bifrost import Bifrost
+
+rows = Bifrost().sql(open("run.sql").read(), [run.run_id]).to_arrow().to_pylist()
+print(rows)
+```
+
+Rows become queryable a few seconds after `shutdown`. An empty result right away is not proof they are missing; query again.
+
+**In production:**
+
+Pull the exact Service version at deploy time with `wyrd pull`, load it with `WyrdState.from_path`, and give the app a key bound to that Service. [ASGI apps](/wyrd/connect/integrate-asgi/) shows it.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `state.start_bifrost()` at startup, before any `observe` call |
+| `WYRD_SDK_404_UNKNOWN_VERIFIER` | Call the Verifier on the view it is bound to: `run` for the Service, `agent` for the agent |
+| `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Declare the table under the Service's `spec.tables` |
+| `WYRD_VALA_403_BIFROST_CARD_SCOPE` at `shutdown` | Use a key issued for this Service version |
+
+## Next
+
+[Runs and evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
+
+# Write a Verifier
+
+Page: /wyrd/build-and-verify/verify/author-a-verifier/
+
+> Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
+
+Build the Verifiers for a support desk: one assertion, one Python check, and one model judge. Each step adds a check, binds it, and shows the verdict your code gets back.
+
+You need a running server from [Set up Wyrd](/wyrd/get-started/setup/). The files live in a `service/` directory next to your program.
+
+## 1. Write an assertion
+
+A Verifier names the evidence it takes and what must be true of it. This one fails any answer that promises a guaranteed refund:
+
+```yaml title="service/no-refund-promise.yaml"
+# The Service-wide check: whatever component answers, the desk never promises
+# a guaranteed refund. One assertion, no model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: support
+spec:
+  description: A support answer never promises a guaranteed refund.
+  inputs:
+    answer: {type: json}  # a named slot your code fills; json takes any JSON value
+  requirements:  # each requirement gets its own verdict
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund  # shown in results
+      # compare the value at path with expected; no model runs
+      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}
+
+```
+
+An assertion runs no model, so its verdict is deterministic and returns in milliseconds. Every field is listed in the [Verifier Card reference](/wyrd/reference/verifier-card/).
+
+## 2. Bind it and check it
+
+A Verifier runs only on what it is bound to. Add it under `verified_by` in your Service:
+
+```yaml title="service/support-desk.yaml"
+spec:
+  verified_by:
+    - verifier: ./no-refund-promise.yaml  # runs on the Service itself
+```
+
+Check every file without declaring anything:
+
+```bash
+wyrd declare --check service/support-desk.yaml
+```
+
+A misspelled field or a reference to a slot that does not exist fails here, naming the field.
+
+## 3. Call it and read the verdict
+
+Open a Run for each request your app handles, and verify the answer inside it:
+
+```python title="app.py"
+from wyrd import WyrdState
+
+state = WyrdState.declare("service/support-desk.yaml")  # declares only what changed
+
+with state.run() as run:  # one Run per request; everything inside is tied to it
+    answer = support_agent("Can I get my money back?")  # your agent's own code
+    # answer= fills the Verifier's answer slot; verify waits for the verdict
+    result = run.observe.verify("no-refund-promise", answer=answer)
+
+print(result.verdict)
+for requirement in result.requirements:  # one outcome and reason per requirement
+    print(requirement["id"], requirement["outcome"], requirement["reason"])
+```
+
+```bash
+uv run python app.py
+```
+
+```text
+passed
+no-refund-promise passed ...
+```
+
+A `failed` verdict is an ordinary return, not an exception: the check ran and the answer broke the rule.
+
+## 4. Add a Python check
+
+When one operator cannot express the rule, write it in Python. This Verifier names every field a ticket is missing:
+
+```yaml title="service/ticket-complete.yaml"
+# A code check: sandboxed Python reads the ticket and names every field the
+# help desk needs that is missing. No model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ticket-complete
+  version: 1.0.0
+  space: support
+spec:
+  description: A support ticket carries the fields the help desk needs.
+  inputs:
+    ticket: {type: json}
+  requirements:
+    - id: ticket-complete
+      statement: The ticket has an answer and an order id
+      check:
+        kind: code
+        entrypoint: check  # the function Wyrd calls
+        inputs: {ticket: inputs.ticket}  # its arguments, read from the evidence
+        source:
+          inline: |
+            def check(ticket):
+                missing = [field for field in ("answer", "order_id") if not ticket.get(field)]
+                return {  # the requirement's verdict
+                    "outcome": "failed" if missing else "passed",
+                    "reason": "missing " + ", ".join(missing) if missing else "all fields present",
+                    "citations": [{"slot": "ticket", "locator": {"json_pointer": ""}}],
+                }
+
+```
+
+The function must return the requirement's [verdict](/wyrd/reference/verifier-card/#verdicts-and-citations), with exactly these fields:
+
+| Field | Value |
+| --- | --- |
+| `outcome` | `passed`, `failed`, or `inconclusive` |
+| `reason` | One sentence shown in the result |
+| `citations` | Where in the evidence the decision rests, as `{slot, locator}` |
+
+Any other shape, or an exception, makes the requirement `inconclusive`, and so does a `passed` outcome without a citation. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
+
+Tickets come from the agent, so bind this Verifier to the agent component rather than the whole Service:
+
+```yaml title="service/support-desk.yaml"
+spec:
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./ticket-complete.yaml
+```
+
+Verify on the Run's view of that component, inside the same `with` block:
+
+```python
+result = run.for_card("agent").observe.verify("ticket-complete", ticket={"answer": answer, "order_id": "A-1001"})
+print(result.verdict)  # passed
+```
+
+## 5. Add a model judge
+
+Some rules need judgment. `follows-policy` asks a model whether a refund decision letter follows the refund policy, which lives in the judge Agent's prompt:
+
+**follows-policy.yaml**
+
+```yaml title="service/follows-policy.yaml"
+# The support agent writes a refund decision letter; this Verifier checks the
+# letter against the refund policy. The policy is fixed in policy-judge's
+# prompt, so the letter is the only evidence the app sends, and a new policy
+# means a new judge and Verifier version. The judge calls a model, so the app
+# runs this one in the background.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: follows-policy
+  version: 1.0.0
+  space: support
+spec:
+  description: A refund decision letter follows the refund policy.
+  inputs:
+    letter: {type: media, formats: [markdown], max_bytes: 1048576}
+  steps:
+    # Turn the uploaded file into text the judge can read and cite by line.
+    - id: read-letter
+      action: {kind: extract, from: inputs.letter}
+  requirements:
+    - id: follows-policy
+      statement: The letter's refund decision follows the refund policy
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs:
+          claim: requirement.statement
+          letter: steps.read-letter.output
+
+```
+
+**policy-judge.yaml**
+
+```yaml title="service/policy-judge.yaml"
+# A tool-less judge. The refund policy lives in its prompt, so every verdict
+# names the exact policy it applied. It returns a Verdict that cites the
+# lines of the letter it relied on.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: policy-judge
+  version: 1.0.0
+  space: support
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-6-luna
+    system: |
+      You check refund decision letters against this refund policy:
+      1. Refunds of up to 100 dollars are approved within 30 days of purchase.
+      2. Larger refunds need a manager's approval.
+      Cite the lines of the letter your judgment rests on.
+    messages:
+      - role: user
+        content: "Claim: {{claim}}. Letter: {{letter}}"
+    response_format:
+      type: object
+      properties:
+        outcome: {type: string, enum: [passed, failed, inconclusive]}
+        reason: {type: string}
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: string}
+              locator:
+                type: object
+                properties:
+                  lines:
+                    type: object
+                    properties:
+                      start: {type: integer}
+                      end: {type: integer}
+                    required: [start, end]
+                    additionalProperties: false
+                required: [lines]
+                additionalProperties: false
+            required: [slot, locator]
+            additionalProperties: false
+      required: [outcome, reason, citations]
+      additionalProperties: false
+
+```
+
+The judge calls its model through your server's [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its `response_format` must be the same verdict schema, or declaring the Verifier fails. Bind `follows-policy` beside `ticket-complete` on the agent.
+
+A model call takes seconds, so submit the letter and collect the verdict later instead of waiting in the request:
+
+```python
+from wyrd import verify
+
+# inside the same with block
+execution = run.for_card("agent").observe.submit("follows-policy", letter=verify.File("letter.md"))
+result = execution.wait(timeout=60)  # or later, from any process: verify.Execution.connect(id)
+print(result.verdict)  # passed
+```
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_REGISTRY_400_INVALID_CARD_SPEC` naming an unknown field | Fix the spelling against the [Verifier Card reference](/wyrd/reference/verifier-card/) |
+| `WYRD_SPEC_400_VALIDATION` with rule `unknown_reference` | Match the slot or step `id` the reference names |
+| `WYRD_SDK_404_UNKNOWN_VERIFIER` | Verify on the view the Verifier is bound to: `run` for the Service, `run.for_card("agent")` for the agent |
+| `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` from the judge | Create the deployment the judge's `execution_route` names, as in [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/) |
+
+## Next
+
+Copy a check for your own case from [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/).
+
 # Recipes
 
 Page: /wyrd/build-and-verify/verify/verifier-recipes/
@@ -1000,6 +1749,126 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 ## Next
 
 [How verification works](/wyrd/understand/how-verification-works/) explains steps, verdicts, and where each check runs.
+
+# LLM gateway
+
+Page: /wyrd/connect/set-up-the-llm-gateway/
+
+> Store a provider key on your Wyrd server, create a deployment for it, and call the model through Wyrd with your Wyrd credential.
+
+Call OpenAI through your Wyrd server. Your code signs in to Wyrd, Wyrd adds the provider key and records the call, and the key never leaves the server.
+
+You need a running server from [Set up Wyrd](/wyrd/get-started/setup/) and an OpenAI key in `OPENAI_API_KEY`.
+
+**Already offered at setup:**
+
+If you accepted the gateway offer during `wyrd init`, the `openai` deployment exists. Skip to step 3.
+
+## 1. Store the key
+
+```bash
+wyrd gateway credential put --file - <<JSON
+{"name": "openai-key", "provider": "openai", "source": {"managed_secret": {"secret": "$OPENAI_API_KEY"}}}
+JSON
+```
+
+The key goes to the server over stdin, so it never lands in a file or your shell history. The server encrypts it, and every read of it is redacted.
+
+## 2. Create the deployment
+
+A deployment names a provider and the key to call it with. Your code addresses models through it. The name is yours, so one provider can have several deployments, such as one per team or caller, each with its own key:
+
+```bash
+wyrd gateway deployment put --file - <<'JSON'
+{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}
+JSON
+```
+
+## 3. Turn on recording
+
+A new tenant records no calls. Record each call's caller, model, outcome, and token usage, without the prompt or reply:
+
+```bash
+wyrd gateway capture-policy put --file - <<'JSON'
+{"mode": "metadata", "payload_fields": []}
+JSON
+```
+
+Calls made before this step are never recorded.
+
+## 4. Make a request
+
+```bash
+uv add "wyrd-ai[gateway]==0.3.0" openai
+```
+
+```python title="call.py"
+from openai import DefaultHttpxClient, OpenAI
+from wyrd import WyrdClient
+
+wyrd = WyrdClient()  # finds the server and credential wyrd init saved
+client = OpenAI(
+    base_url=f"{wyrd.server_url}/v1",
+    api_key="wyrd",  # placeholder; http_auth replaces it with your Wyrd token
+    http_client=DefaultHttpxClient(auth=wyrd.http_auth),
+)
+
+reply = client.chat.completions.create(
+    model="openai/gpt-4o",  # <deployment>/<model>
+    messages=[{"role": "user", "content": "Say hi."}],
+)
+print(reply.choices[0].message.content)
+```
+
+```bash
+uv run python call.py
+```
+
+It prints the model's reply. OpenAI received `gpt-4o` with your stored key and never saw your Wyrd token.
+
+## 5. Check the call was recorded
+
+```python title="calls.py"
+from wyrd.bifrost import Bifrost
+
+rows = Bifrost().sql(
+    "SELECT requested_model, outcome FROM vala.gateway.calls ORDER BY started_at DESC LIMIT 1"
+).to_arrow().to_pylist()
+print(rows)
+```
+
+```bash
+uv run python calls.py
+```
+
+```text
+[{'requested_model': {'deployment': 'openai', 'model': 'gpt-4o'}, 'outcome': 'succeeded'}]
+```
+
+Rows appear a few seconds after the call. If the result is empty, query again.
+
+## Add another provider
+
+Repeat steps 1 and 2 with that provider's key and authentication:
+
+| Provider | `provider` and `adapter` | `auth` |
+| --- | --- | --- |
+| OpenAI | `openai` | `{"bearer": {"credential": "openai-key"}}` |
+| Anthropic | `anthropic` | `{"api_key_header": {"header": "x-api-key", "credential": "anthropic-key"}}` |
+| Gemini | `gemini` | `{"api_key_header": {"header": "x-goog-api-key", "credential": "gemini-key"}}` |
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | Check the deployment name with `wyrd gateway deployment list` |
+| `WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE` | Check the key with `wyrd gateway credential get openai-key`, and that the provider is reachable |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` | Run `wyrd init` in this directory, or set `WYRD_API_KEY` |
+| The query in step 5 stays empty | Run `wyrd gateway capture-policy get`; if it says `disabled`, repeat step 3 |
+
+## Next
+
+Judge answers with a model in [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/#5-add-a-model-judge).
 
 # ASGI apps
 

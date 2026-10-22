@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Observe
 order: 1
-draft: true
 status: runnable
 ---
 
@@ -127,7 +126,7 @@ Rows become queryable a few seconds after `shutdown`. An empty result right away
 
 <Aside type="note" title="In production">
 
-Pull the exact Service version at deploy time with `wyrd pull`, load it with `WyrdState.from_path`, and give the app a key bound to that Service. [Deploy for a team](/operate/deploy-wyrd-for-a-team/) has the steps.
+Pull the exact Service version at deploy time with `wyrd pull`, load it with `WyrdState.from_path`, and give the app a key bound to that Service. [ASGI apps](/connect/integrate-asgi/) shows it.
 
 </Aside>
 
@@ -142,4 +141,4 @@ Pull the exact Service version at deploy time with `wyrd pull`, load it with `Wy
 
 ## Next
 
-[Background checks](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) shows the full life of a submitted check and its evidence.
+[Runs and evidence](/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.

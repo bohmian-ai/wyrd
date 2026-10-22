@@ -22,10 +22,15 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 ## Build and verify
 
+- [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
+- [Bindings](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
+- [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
+- [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 - [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
 
 ## Connect
 
+- [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/): Store a provider key on your Wyrd server, create a deployment for it, and call the model through Wyrd with your Wyrd credential.
 - [ASGI apps](/wyrd/connect/integrate-asgi/): Add WyrdMiddleware to a FastAPI, Starlette, Django, or Litestar app to start Wyrd with the app, verify inside one Run per request, and drain queued evidence at shutdown.
 
 ## Operate

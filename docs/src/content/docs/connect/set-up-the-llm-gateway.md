@@ -4,7 +4,6 @@ description: Store a provider key on your Wyrd server, create a deployment for i
 pillar: wyrd
 section: Connect
 order: 1
-draft: true
 status: runnable
 ---
 
@@ -122,4 +121,4 @@ Repeat steps 1 and 2 with that provider's key and authentication:
 
 ## Next
 
-Judge answers with a model in [Write a Verifier](/build-and-verify/verify/author-a-verifier/#5-add-a-model-judge), or call the gateway from another framework in [Gateway from any client](/connect/call-wyrd-from-a-stock-client/).
+Judge answers with a model in [Write a Verifier](/build-and-verify/verify/author-a-verifier/#5-add-a-model-judge).

@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Declare
 order: 2
-draft: true
 status: runnable
 ---
 
@@ -51,7 +50,7 @@ spec:
       runs_on: {kind: schedule, cron: "0 0 * * *"}  # midnight; add tz to use another zone than UTC
 ```
 
-Only a Verifier whose inputs are `samples` can run on a schedule. [Drift](/build-and-verify/verify/monitor-drift/) shows how to write one and record its samples.
+Only a Verifier whose inputs are `samples` can run on a schedule. The [drift recipe](/build-and-verify/verify/verifier-recipes/#drift) writes one.
 
 ## 3. React to a failure
 

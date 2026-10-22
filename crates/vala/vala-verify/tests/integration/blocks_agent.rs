@@ -551,6 +551,141 @@ async fn check_agent_keeps_only_valid_citations() {
     assert_eq!(output.verdict.outcome, VerificationVerdict::Inconclusive);
 }
 
+/// An Agent Card whose inline portable Prompt over `{{response}}` declares
+/// `format` as its `response_format`, decoded the way Cards are.
+///
+/// # Panics
+/// Panics when the Agent does not decode.
+fn named_judge(format: Value) -> AgentCall {
+    let spec: AgentSpec = serde_json::from_value(json!({
+        "prompt": {"provider": "openai", "model": "gpt-test",
+            "messages": [{"role": "user", "content": "Judge: {{response}}"}],
+            "response_format": format},
+        "execution_route": {"kind": "native"},
+    }))
+    .expect("the named-format Agent decodes");
+    AgentCall {
+        agent: InlineableRef::Inline(Box::new(spec)),
+        inputs: BTreeMap::new(),
+        workspace: BTreeMap::new(),
+    }
+}
+
+/// A check Agent's answer must satisfy its whole declared `verdict` format:
+/// valid custom data, including exact size and depth boundaries and failed
+/// judgments, is kept; missing, wrong, null, undeclared, oversized, or too
+/// deep data and unknown envelope members are terminal without echoing the
+/// answer; the plain format refuses any data; and a citation-less pass is
+/// still inconclusive.
+///
+/// # Panics
+/// Panics when an invalid answer is accepted, a valid one is refused, or a
+/// refusal echoes the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_agent_validates_custom_data() {
+    let data = json!({"type": "object", "properties": {"score": {"type": "number"}, "note": {"type": "string"}, "tree": {}},
+        "required": ["score", "note"], "additionalProperties": false});
+    let custom = named_judge(json!({"kind": "verdict", "data": data}));
+    let cited = json!([{"slot": "deck", "locator": {"page": 3}}]);
+    let answer = |outcome: &str, extra: Value| {
+        let mut body = json!({"outcome": outcome, "reason": "judged", "citations": cited});
+        body.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        openai_text_response(&body.to_string())
+    };
+    let deep = |containers: usize| {
+        let mut tree = json!(1);
+        for _ in 1..containers {
+            tree = json!([tree]);
+        }
+        tree
+    };
+    let note = |bytes: usize| "é".repeat(bytes / 2);
+    let exact = 65_536 - json!({"score": 1, "note": ""}).to_string().len();
+    let accepted = [
+        (
+            "passed",
+            json!({"data": {"score": 0.92, "note": "information_disclosure"}}),
+        ),
+        (
+            "failed",
+            json!({"data": {"score": 0.1, "note": "\u{1}\n\"quoted\""}}),
+        ),
+        ("failed", json!({"data": {"score": 1, "note": note(exact)}})),
+        (
+            "failed",
+            json!({"data": {"score": 1, "note": "", "tree": deep(16)}}),
+        ),
+    ];
+    for (outcome, extra) in accepted {
+        let executor =
+            executor(vec![answer(outcome, extra.clone())]).with_evidence(Arc::new(PinnedDeck));
+        let output = check(&executor, &custom, from_deck(json!("x")))
+            .await
+            .unwrap_or_else(|error| panic!("{outcome}: {error}"));
+        assert_eq!(
+            serde_json::to_value(&output.verdict.data).expect("data"),
+            extra["data"]
+        );
+    }
+
+    let secret = "s3cr3t-payload";
+    let refused = [
+        json!({}),
+        json!({"data": null}),
+        json!({"data": {"score": secret, "note": secret}}),
+        json!({"data": {"score": 1}}),
+        json!({"data": {"score": 1, "note": secret, "extra": secret}}),
+        json!({"data": {"score": 1, "note": secret}, "confidence": secret}),
+        json!({"data": {"score": 1, "note": format!("{secret}{}", note(exact))}}),
+        json!({"data": {"score": 1, "note": secret, "tree": deep(17)}}),
+    ];
+    for extra in refused {
+        let executor =
+            executor(vec![answer("passed", extra.clone())]).with_evidence(Arc::new(PinnedDeck));
+        match check(&executor, &custom, from_deck(json!("x"))).await {
+            Err(BlockError::Terminal { reason }) => {
+                assert!(
+                    !reason.contains(secret),
+                    "{extra}: the refusal echoes the answer: {reason}"
+                );
+            }
+            other => panic!("{extra}: expected a terminal refusal, got {other:?}"),
+        }
+    }
+
+    for format in [json!("verdict"), json!({"kind": "verdict"})] {
+        let plain = named_judge(format.clone());
+        let executor = executor(vec![
+            answer("failed", json!({})),
+            answer("failed", json!({"data": {"score": 1}})),
+            answer("passed", json!({"citations": []})),
+        ])
+        .with_evidence(Arc::new(PinnedDeck));
+        let output = check(&executor, &plain, from_deck(json!("x")))
+            .await
+            .expect("plain Verdict");
+        assert_eq!(output.verdict.outcome, VerificationVerdict::Failed);
+        assert_eq!(output.verdict.data, None);
+        assert!(
+            matches!(
+                check(&executor, &plain, from_deck(json!("x"))).await,
+                Err(BlockError::Terminal { .. })
+            ),
+            "{format}: the plain format refuses data"
+        );
+        let uncited = check(&executor, &plain, from_deck(json!("x")))
+            .await
+            .expect("uncited pass");
+        assert_eq!(
+            uncited.verdict.outcome,
+            VerificationVerdict::Inconclusive,
+            "{format}"
+        );
+    }
+}
+
 /// A check Agent answer outside the Verdict schema is terminal.
 ///
 /// # Panics

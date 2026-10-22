@@ -1,0 +1,18 @@
+# A judge declaring the plain `verdict` response format: no handwritten
+# schema and no format prose in its Prompt.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: plain-judge
+  version: 1.0.0
+  space: default
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Judge whether this answer is polite: {{answer}}"
+    response_format: verdict

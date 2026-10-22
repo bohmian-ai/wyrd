@@ -1,0 +1,25 @@
+# A judge returning a Verdict with a score and a category as custom data.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: scored-judge
+  version: 1.0.0
+  space: default
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "SCORE: rate how helpful this answer is: {{answer}}"
+    response_format:
+      kind: verdict
+      data:
+        type: object
+        properties:
+          score: {type: number, minimum: 0, maximum: 1}
+          category: {type: string}
+        required: [score, category]
+        additionalProperties: false

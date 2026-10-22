@@ -1,0 +1,111 @@
+# Custom Verdict data: Agent and code checks declare the `verdict` response
+# format, plain or with a `data` schema, on whole-Verifier and step
+# requirements. An answer containing `BAD-DATA` makes both scored checks
+# return data their schema refuses, and `HUGE-DATA` data past the
+# 65,536-byte bound.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: scored-review
+  version: 1.0.0
+  space: default
+spec:
+  description: A support answer is judged with a score and a category.
+  inputs:
+    answer:
+      type: json
+      schema:
+        type: object
+        properties: {text: {type: string}}
+        required: [text]
+  steps:
+    - id: tally
+      action:
+        kind: code
+        entrypoint: tally
+        inputs: {answer: inputs.answer}
+        source:
+          inline: |
+            def tally(answer):
+                return {"words": len(answer["text"].split())}
+      requirements:
+        - id: tally-counted
+          statement: The answer has words
+          check:
+            kind: code
+            entrypoint: check
+            inputs: {answer: inputs.answer, tally: steps.tally.output}
+            response_format:
+              kind: verdict
+              data:
+                type: object
+                properties: {words: {type: integer, minimum: 0}}
+                required: [words]
+                additionalProperties: false
+            source:
+              inline: |
+                def check(answer, tally):
+                    return {
+                        "outcome": "passed" if tally["words"] else "failed",
+                        "reason": "counted the words",
+                        "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                        "data": {"words": tally["words"]},
+                    }
+  requirements:
+    - id: polite
+      statement: The answer is polite
+      check:
+        kind: agent
+        agent: ./plain-judge.yaml
+        inputs: {answer: inputs.answer.text}
+    - id: on-topic
+      statement: The answer is on topic
+      check:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          run_config: {max_iterations: 1}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "Judge whether this answer is on topic: {{answer}}"
+            response_format: {kind: verdict}
+        inputs: {answer: inputs.answer.text}
+    - id: helpful
+      statement: The answer is helpful
+      check:
+        kind: agent
+        agent: ./scored-judge.yaml
+        inputs: {answer: inputs.answer.text}
+    - id: well-formed
+      statement: The answer is well formed
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {answer: inputs.answer}
+        response_format:
+          kind: verdict
+          data:
+            type: object
+            properties:
+              score: {type: number, minimum: 0, maximum: 1}
+              category: {type: string}
+            required: [score, category]
+            additionalProperties: false
+        source:
+          inline: |
+            def check(answer):
+                text = answer["text"]
+                data = {"score": 0.5, "category": "format"}
+                if "BAD-DATA" in text:
+                    data = {"score": "high", "category": "format"}
+                if "HUGE-DATA" in text:
+                    data = {"score": 0.5, "category": "x" * 70000}
+                return {
+                    "outcome": "failed",
+                    "reason": "scored the format",
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                    "data": data,
+                }

@@ -515,10 +515,7 @@ jobs:
   # each supports (ubuntu-22.04 for the gnu bundles the debian images and
   # native installs run, rockylinux-9 for rocky), so the runner's own glibc
   # never reaches a bundle. Every bundle carries the
-  # production UI in ui/; native installs run it on the system Node. The arm
-  # runner cannot finish the fat LTO link of wyrd-server even with swap: it
-  # thrashes until the runner loses contact with GitHub, so arm links with thin
-  # LTO.
+  # production UI in ui/; native installs run it on the system Node.
   build-server:
     name: server - ${{ matrix.bundle }}
     needs: locate-build
@@ -536,12 +533,10 @@ jobs:
           - os: ubuntu-22.04-arm
             build: bundle-in ubuntu-22.04
             bundle: aarch64-unknown-linux-gnu
-            lto: thin
     runs-on: ${{ matrix.os }}
     env:
       BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
       WYRD_PROFILE: dist
-      CARGO_PROFILE_DIST_LTO: ${{ matrix.lto || 'fat' }}
     steps: &build-server-steps
       - uses: actions/checkout@v7
 
@@ -584,8 +579,7 @@ jobs:
           retention-days: 1
 
   # The macOS bundle is its own job so the images, which never use it, do not
-  # wait on the slowest build. Fat LTO on the 7 GB macOS runner takes about
-  # three hours; thin LTO keeps this local-development bundle near an hour.
+  # wait on the slowest build.
   build-server-macos:
     name: server - ${{ matrix.bundle }}
     needs: locate-build
@@ -596,12 +590,10 @@ jobs:
           - os: macos-15
             build: bundle
             bundle: aarch64-apple-darwin
-            lto: thin
     runs-on: ${{ matrix.os }}
     env:
       BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
       WYRD_PROFILE: dist
-      CARGO_PROFILE_DIST_LTO: ${{ matrix.lto }}
     steps: *build-server-steps
 
   # Each image copies a tested Linux bundle and compiles nothing; arm64 builds

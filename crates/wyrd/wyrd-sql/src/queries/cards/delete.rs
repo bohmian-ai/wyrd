@@ -17,7 +17,7 @@ use crate::row_types::cards::{CardRow, CardStatus, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
 const SELECT_FOR_DELETE: &str = r"
-    SELECT card_uid, data_tenant_id, kind, space, name, version,
+    SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
@@ -169,16 +169,12 @@ pub async fn soft_delete_card_by_ref(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,
 ) -> Result<CardDeleteState, WyrdError> {
-    let space = card_ref.space.as_ref().ok_or_else(|| {
-        WyrdError::registry_invalid_card_spec("CardRef.space is required for card deletion")
-    })?;
     let uid = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT card_uid FROM wyrd.cards \
-          WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
+          WHERE kind = $1 AND name = $2 AND version = $3 \
           FOR UPDATE",
     )
     .bind(card_ref.kind.wire_name())
-    .bind(space.as_str())
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .fetch_optional(&mut **conn.transaction())

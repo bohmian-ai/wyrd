@@ -68,7 +68,7 @@ async fn insert_card(
     let card: Card = serde_json::from_value(json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": {},
         "relationships": { "outbound": [], "inbound": [] }
     }))

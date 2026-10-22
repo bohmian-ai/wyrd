@@ -18,12 +18,12 @@ use crate::tenant_conn::TenantConn;
 const UPSERT_SQL: &str = r"
 INSERT INTO wyrd.auth_service_accounts
     (id, data_tenant_id, principal_kind, card_kind, card_uid,
-     space, name, version, card_ref, description, status,
+     name, version, card_ref, description, status,
      sub_principal_id, act_principal_id)
 VALUES (gen_random_uuid(), wyrd.current_tenant(), $1, $2, $3,
-        $4, $5, $6, $7, $8, 'active', $9, $10)
+        $4, $5, $6, $7, 'active', $8, $9)
 ON CONFLICT (data_tenant_id, principal_kind, card_kind, card_uid)
-DO UPDATE SET card_ref = EXCLUDED.card_ref, space = EXCLUDED.space,
+DO UPDATE SET card_ref = EXCLUDED.card_ref,
     name = EXCLUDED.name, version = EXCLUDED.version,
     description = EXCLUDED.description, updated_at = now()
 RETURNING id, (xmax = 0) AS inserted
@@ -41,8 +41,7 @@ RETURNING id, (xmax = 0) AS inserted
 ///
 /// # Errors
 ///
-/// Returns `registry_invalid_card_spec` for a Card without `metadata.space`,
-/// `internal` for a non-Service/Agent Card or an unresolved version, and
+/// Returns `internal` for a non-Service/Agent Card or an unresolved version, and
 /// `registry_unavailable` when Postgres rejects the upsert or grant.
 #[tracing::instrument(skip(conn), fields(operation = "card.service_account.upsert"))]
 pub async fn upsert_service_account_from_card(
@@ -60,11 +59,6 @@ pub async fn upsert_service_account_from_card(
             ));
         }
     };
-    let space = card
-        .metadata
-        .space
-        .as_ref()
-        .ok_or_else(|| WyrdError::registry_invalid_card_spec("metadata.space is required"))?;
     let version: &VersionBlock = match card.metadata.version.as_ref() {
         Some(VersionSpec::Pin(version)) => version,
         _ => {
@@ -77,7 +71,6 @@ pub async fn upsert_service_account_from_card(
         kind: card.kind.clone(),
         name: card.metadata.name.clone(),
         version: version.clone(),
-        space: Some(space.clone()),
         uid: Some(card_uid.clone()),
     };
     let card_ref_json: JsonValue =
@@ -86,7 +79,6 @@ pub async fn upsert_service_account_from_card(
         .bind(principal_kind)
         .bind(card.kind.wire_name())
         .bind(card_uid.as_uuid())
-        .bind(space.as_str())
         .bind(card.metadata.name.as_str())
         .bind(version.as_str())
         .bind(card_ref_json)

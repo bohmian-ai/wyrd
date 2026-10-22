@@ -10,7 +10,7 @@ use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::VersionRange;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::query::{MetadataQuery, QueryFieldErrorDetail};
 
 use crate::queries::cards::field_resolver::CardFieldResolver;
@@ -50,8 +50,6 @@ pub struct ListPage<T> {
 pub struct CardQuery {
     /// Restrict to one kind.
     pub kind: Option<CardKind>,
-    /// Restrict to one space.
-    pub space: Option<SpaceName>,
     /// Restrict to one card name.
     pub name: Option<CardName>,
     /// Restrict to versions within a range.
@@ -86,7 +84,6 @@ fn validate_cursor(cursor: &ListCursor) -> Result<(), WyrdError> {
         limit = cursor.limit,
         has_filter = query.filter.is_some(),
         has_kind = query.kind.is_some(),
-        has_space = query.space.is_some(),
         has_name = query.name.is_some(),
         has_version_range = query.version_range.is_some(),
         has_status = query.status.is_some(),
@@ -137,7 +134,6 @@ pub async fn query_cards(
 pub async fn find_card_by_spec_hash(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
     spec_hash: &str,
 ) -> Result<Option<CardRow>, WyrdError> {
@@ -146,7 +142,6 @@ pub async fn find_card_by_spec_hash(
          WHERE status <> 'deleted' AND kind = "
     ));
     qb.push_bind(kind.wire_name());
-    qb.push(" AND space = ").push_bind(space.as_str());
     qb.push(" AND name = ").push_bind(name.as_str());
     qb.push(" AND spec_hash = ").push_bind(spec_hash);
     qb.push(" ORDER BY version_major DESC, version_minor DESC, version_patch DESC LIMIT 1");
@@ -171,27 +166,6 @@ pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Resul
     Ok(found.is_some())
 }
 
-/// Distinct non-deleted space slugs in the tenant, sorted ascending.
-///
-/// # Errors
-/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors or
-/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored space is invalid.
-pub async fn get_unique_spaces(conn: &mut TenantConn<'_>) -> Result<Vec<SpaceName>, WyrdError> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT space FROM wyrd.cards \
-         WHERE status <> 'deleted' \
-         ORDER BY space ASC",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(registry_db_error)?;
-    rows.into_iter()
-        .map(|(space,)| {
-            SpaceName::new(space).map_err(|e| WyrdError::registry_invalid_card_spec(e.to_string()))
-        })
-        .collect()
-}
-
 /// Append all `CardQuery` WHERE predicates to `qb`.
 ///
 /// Does not touch ORDER BY, LIMIT, or the keyset cursor — those are the
@@ -208,9 +182,6 @@ fn push_card_filters(qb: &mut QueryBuilder<Postgres>, query: &CardQuery) -> Resu
     }
     if let Some(kind) = &query.kind {
         qb.push(" AND kind = ").push_bind(kind.wire_name());
-    }
-    if let Some(space) = &query.space {
-        qb.push(" AND space = ").push_bind(space.as_str());
     }
     if let Some(name) = &query.name {
         qb.push(" AND name = ").push_bind(name.as_str());

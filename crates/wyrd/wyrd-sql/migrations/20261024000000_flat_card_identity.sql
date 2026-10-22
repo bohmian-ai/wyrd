@@ -1,9 +1,10 @@
 -- Flat Card identity: (data_tenant_id, kind, name, version).
 --
--- Card space is removed from the registry, its indexes, the principal Card
--- projection, and the verification target. This is a fresh-baseline change:
--- there is no collision mapping, so a database that holds one kind/name/version
--- in two spaces fails the new unique index and must be recreated.
+-- Card space is removed from the registry, its indexes, relationship targets,
+-- the principal Card projection, and the verification target. This is a
+-- fresh-baseline change: there is no collision mapping, so a database that
+-- holds one kind/name/version in two spaces fails the new unique index and
+-- must be recreated.
 
 DROP INDEX IF EXISTS wyrd.cards_identity_unique;
 DROP INDEX IF EXISTS wyrd.idx_cards_version_latest;
@@ -26,6 +27,20 @@ CREATE INDEX idx_cards_version_latest
 CREATE INDEX idx_cards_spec_hash
     ON wyrd.cards (data_tenant_id, kind, name, spec_hash)
     WHERE status = 'active';
+
+ALTER TABLE wyrd.card_relationships
+    DROP CONSTRAINT card_relationships_identity_unique,
+    DROP COLUMN target_space,
+    ADD CONSTRAINT card_relationships_identity_unique
+        UNIQUE (
+            data_tenant_id,
+            card_uid,
+            relation_kind,
+            target_kind,
+            target_name,
+            target_version,
+            target_uid
+        );
 
 ALTER TABLE wyrd.auth_service_accounts
     DROP CONSTRAINT auth_service_accounts_card_binding_check;

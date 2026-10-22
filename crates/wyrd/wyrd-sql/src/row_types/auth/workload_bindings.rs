@@ -7,7 +7,7 @@ use wyrd_spec::reference::CardRef;
 /// SQL row for `wyrd.auth_workload_bindings`.
 ///
 /// `card_ref` is stored as JSONB and decoded to the full structured [`CardRef`]
-/// (kind, name, version, space, uid) — never a flattened string.
+/// (kind, name, version, uid) — never a flattened string.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkloadBindingRow {
     /// Tenant isolation UUID as stored by Postgres.

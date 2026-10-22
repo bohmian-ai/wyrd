@@ -8,7 +8,7 @@ use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::{SemverTriple, VersionBounds};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::ids::CardName;
 
 use crate::tenant_conn::TenantConn;
 
@@ -53,7 +53,7 @@ fn triple_i64(t: SemverTriple) -> Result<(i64, i64, i64), WyrdError> {
     Ok((conv(t.major)?, conv(t.minor)?, conv(t.patch)?))
 }
 
-/// Take a transaction-scoped advisory lock for one `(tenant, kind, space, name)`.
+/// Take a transaction-scoped advisory lock for one `(tenant, kind, name)`.
 ///
 /// Auto-releases on commit or rollback. Distinct card lines proceed in
 /// parallel; rare `hashtext` collisions only cause false contention.
@@ -63,14 +63,12 @@ fn triple_i64(t: SemverTriple) -> Result<(i64, i64, i64), WyrdError> {
 pub async fn lock_version_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
 ) -> Result<(), WyrdError> {
     let objid_key = format!(
-        "{}/{}/{}/{}",
+        "{}/{}/{}",
         conn.data_tenant_id().as_uuid(),
         kind.wire_name(),
-        space.as_str(),
         name.as_str(),
     );
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")

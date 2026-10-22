@@ -9,7 +9,7 @@ use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::{Card, CardKind, SpecCanonicalizationError};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, DeclarationOperationId};
 
@@ -110,8 +110,6 @@ pub struct DeclaredCardRow {
     pub card_uid: CardUid,
     /// Card kind.
     pub kind: CardKind,
-    /// Card space.
-    pub space: SpaceName,
     /// Card name.
     pub name: CardName,
     /// Resolved version.
@@ -258,7 +256,7 @@ pub async fn insert_declaration_operation(
 
 /// Insert one resolved card owned by a declaration operation.
 ///
-/// Writes the Card with its resolved space and pinned version, its creation
+/// Writes the Card with its pinned version, its creation
 /// pair, and the operation that owns it; a `pending` Card is stamped with its
 /// pending time and becomes due for reconciliation once its
 /// `reconcile_delay` has passed on `PostgreSQL`'s clock. The row joins the
@@ -266,8 +264,7 @@ pub async fn insert_declaration_operation(
 /// commits, and the creation pair is never rewritten afterwards.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the Card has no
-/// `metadata.space`, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when its version
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when its version
 /// is not a resolved pin, the spec serialization error when its spec, labels,
 /// or annotations cannot be encoded, and `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with
 /// the database detail logged and redacted, when the insert fails, including
@@ -276,12 +273,6 @@ pub async fn insert_card_row(
     conn: &mut TenantConn<'_>,
     input: NewCardRow<'_>,
 ) -> Result<DeclaredCardRow, WyrdError> {
-    let space = input
-        .card
-        .metadata
-        .space
-        .as_ref()
-        .ok_or_else(|| WyrdError::registry_invalid_card_spec("metadata.space is required"))?;
     let Some(VersionSpec::Pin(version)) = input.card.metadata.version.as_ref() else {
         return Err(WyrdError::registry_invalid_version_block(
             "registration requires a resolved version",
@@ -290,22 +281,21 @@ pub async fn insert_card_row(
     let pending_since = (input.status == CardStatus::Pending).then(Utc::now);
     let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
         r"INSERT INTO wyrd.cards
-               (card_uid, data_tenant_id, kind, space, name, version, spec,
+               (card_uid, data_tenant_id, kind, name, version, spec,
         spec_hash, artifact_hash, labels, annotations, status,
                 sub_principal_id, act_principal_id,
                 declaration_operation_id, pending_since,
                 reconcile_status, reconcile_next_attempt_at)
-           VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
-                   $9, $10, $11, $12, $13, $14, $15,
-                   CASE WHEN $11 = 'pending' THEN 'pending' ELSE 'idle' END,
-                   CASE WHEN $11 = 'pending'
-                        THEN statement_timestamp() + ($16 * interval '1 second')
+           VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7,
+                   $8, $9, $10, $11, $12, $13, $14,
+                   CASE WHEN $10 = 'pending' THEN 'pending' ELSE 'idle' END,
+                   CASE WHEN $10 = 'pending'
+                        THEN statement_timestamp() + ($15 * interval '1 second')
                         ELSE NULL END)
            RETURNING created_at",
     )
     .bind(input.card_uid.as_uuid())
     .bind(input.card.kind.wire_name())
-    .bind(space.as_str())
     .bind(input.card.metadata.name.as_str())
     .bind(version.as_str())
     .bind(serde_json::to_value(&input.card.spec).map_err(WyrdError::from_spec_serialization)?)
@@ -331,7 +321,6 @@ pub async fn insert_card_row(
     Ok(DeclaredCardRow {
         card_uid: input.card_uid,
         kind: input.card.kind.clone(),
-        space: space.clone(),
         name: input.card.metadata.name.clone(),
         version: version.clone(),
         spec_hash: input.spec_hash.to_owned(),
@@ -469,10 +458,6 @@ pub async fn commit_declaration_operation(
 }
 
 /// Resolve exact references to non-terminal cards in one tenant-scoped query.
-///
-/// # Panics
-///
-/// Panics if a reference lacks the space validated earlier in this function.
 pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],
@@ -480,49 +465,33 @@ pub async fn select_card_uids_by_ref_batch(
     if refs.is_empty() {
         return Ok(Vec::new());
     }
-    if refs.iter().any(|card_ref| card_ref.space.is_none()) {
-        return Err(WyrdError::registry_invalid_card_spec(
-            "CardRef.space is required at the registry boundary",
-        ));
-    }
     let mut query = QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid FROM (",
+        "SELECT refs.kind, refs.name, refs.version, cards.card_uid FROM (",
     );
     query.push_values(refs, |mut values, card_ref| {
         values
             .push_bind(card_ref.kind.wire_name())
-            .push_bind(
-                card_ref
-                    .space
-                    .as_ref()
-                    .expect("invariant: CardRef spaces were validated above")
-                    .as_str(),
-            )
             .push_bind(card_ref.name.as_str())
             .push_bind(card_ref.version.as_str());
     });
     query.push(
-        ") AS refs(kind, space, name, version) LEFT JOIN wyrd.cards cards \
+        ") AS refs(kind, name, version) LEFT JOIN wyrd.cards cards \
          ON cards.kind = refs.kind \
-         AND cards.space = refs.space AND cards.name = refs.name AND cards.version = refs.version \
+         AND cards.name = refs.name AND cards.version = refs.version \
               AND cards.status = 'active'",
     );
     let rows = query
-        .build_query_as::<(String, String, String, String, Option<Uuid>)>()
+        .build_query_as::<(String, String, String, Option<Uuid>)>()
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(registry_db_error)?;
     rows.into_iter()
-        .filter_map(|(kind, space, name, version, uid)| {
+        .filter_map(|(kind, name, version, uid)| {
             uid.map(|uid| {
                 let card_ref = refs
                     .iter()
                     .find(|item| {
                         item.kind.wire_name() == kind
-                            && item
-                                .space
-                                .as_ref()
-                                .is_some_and(|item_space| item_space.as_str() == space)
                             && item.name.as_str() == name
                             && item.version.as_str() == version
                     })

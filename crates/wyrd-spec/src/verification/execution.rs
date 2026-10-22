@@ -556,6 +556,11 @@ impl Verdict {
     /// other than `verdict`, and at `response_format.data...` for a data
     /// schema that is not a valid object JSON Schema or whose definitions
     /// collide with the Verdict's own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generated Verdict schema has no `properties` object, an
+    /// invariant of the derived schema.
     pub fn response_format(format: &NamedResponseFormat) -> Result<Map<String, Value>, SkaldError> {
         let invalid = |field: &str, message: &str| SkaldError::PromptInvalid {
             field: field.to_owned(),
@@ -632,6 +637,14 @@ impl Verdict {
     /// Returns the violated bound as a message when `data` exceeds
     /// [`MAX_VERDICT_DATA_BYTES`] or [`MAX_VERDICT_DATA_DEPTH`].
     pub fn check_data_bounds(&self) -> Result<(), String> {
+        /// Containers in the deepest path through `value`.
+        fn depth(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+                Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+                _ => 0,
+            }
+        }
         let Some(data) = &self.data else {
             return Ok(());
         };
@@ -640,14 +653,6 @@ impl Verdict {
             return Err(format!(
                 "verdict data is {bytes} bytes; the limit is {MAX_VERDICT_DATA_BYTES} bytes of compact JSON"
             ));
-        }
-        /// Containers in the deepest path through `value`.
-        fn depth(value: &Value) -> usize {
-            match value {
-                Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
-                Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
-                _ => 0,
-            }
         }
         let nested = 1 + data.values().map(depth).max().unwrap_or(0);
         if nested > MAX_VERDICT_DATA_DEPTH {

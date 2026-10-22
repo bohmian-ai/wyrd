@@ -2,8 +2,12 @@ from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Literal
 
-from ..verify import Execution, Recorded, VerificationResult
+from typing_extensions import TypeVar
+
+from ..verify import DataModel, Execution, Recorded, VerificationResult
 from ._telemetry import record
+
+_Model = TypeVar("_Model", bound=DataModel)
 
 class Run:
     """One invocation, and one Card-scoped view of it.
@@ -112,6 +116,44 @@ class Observe:
                 ``WYRD_VERIFICATION_413_INPUT_TOO_LARGE`` for a file above its
                 slot's ``max_bytes``; ``WYRD_VERIFICATION_422_INPUT_UNSUPPORTED``
                 for a scheduled-window Verifier; otherwise the server's refusal.
+        """
+        ...
+
+    def verify_typed(
+        self,
+        verifier: str,
+        data_type: type[_Model],
+        /,
+        *value: Any,
+        group_id: str | None = None,
+        **inputs: Any,
+    ) -> VerificationResult[_Model]:
+        """``verify``, with every requirement's ``data`` validated as ``data_type``.
+
+        The execution is the ordinary one. Every present ``data`` object,
+        failed requirements included, passes through
+        ``data_type.model_validate`` before the result returns; absent data
+        stays absent. A refusal changes no stored result and reruns nothing.
+        ``verifier`` and ``data_type`` are positional-only, so an input slot
+        named ``data_type`` still passes as a keyword.
+
+        Args:
+            verifier: the name of a Verifier bound to this view's subject.
+            data_type: a model exposing ``model_validate``, such as a
+                Pydantic model class or a ``RootModel`` union.
+            *value: the one value of a single-slot Verifier.
+            group_id: the caller's group, as for ``verify``.
+            **inputs: values keyed by input slot name.
+
+        Returns:
+            The execution's result, its ``data`` typed.
+
+        Raises:
+            WyrdError: As ``verify``;
+                ``WYRD_SDK_422_VERIFICATION_DATA_INVALID`` naming the first
+                requirement and field path ``data_type`` refuses, never the
+                data; ``WYRD_SPEC_400_VALIDATION`` when ``data_type`` has no
+                ``model_validate``.
         """
         ...
 

@@ -342,6 +342,7 @@ use {
         types::{PyAny, PyDict, PyList, PyString, PyTuple},
     },
     serde::de::DeserializeOwned,
+    skald_spec::NamedResponseFormat,
     wyrd_utils::py::WyrdPyResult,
 };
 
@@ -367,7 +368,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
-        let response_format = response_format_from_py(response_format)?;
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
         let mut prompt = match provider {
@@ -454,7 +455,7 @@ impl Prompt {
             prompt = append_py_messages(prompt, messages)?;
         }
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
@@ -478,20 +479,21 @@ impl Prompt {
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let mut prompt = crate::builder::openai_chat(
             model,
             OpenAiChatOptions {
                 system,
                 messages: strings_from_py(messages)?,
-                response_format: response_format_from_py(response_format)?,
+                response_format,
                 output,
                 prompt_cache_key: cache_prompt_key(cache)?,
                 settings: resolve_openai_chat_settings(model_settings)?,
             },
         )?;
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
@@ -514,19 +516,20 @@ impl Prompt {
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let mut prompt = crate::builder::openai_responses(
             model,
             OpenAiResponsesOptions {
                 instructions,
                 messages: strings_from_py(messages)?,
-                response_format: response_format_from_py(response_format)?,
+                response_format,
                 output,
                 settings: resolve_openai_responses_settings(model_settings)?,
             },
         )?;
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
@@ -549,19 +552,20 @@ impl Prompt {
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let mut prompt = crate::builder::anthropic(
             model,
             AnthropicOptions {
                 system,
                 messages: strings_from_py(messages)?,
-                response_format: response_format_from_py(response_format)?,
+                response_format,
                 output,
                 settings: resolve_anthropic_settings(model_settings)?,
             },
         )?;
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
@@ -584,17 +588,18 @@ impl Prompt {
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
-            response_format: response_format_from_py(response_format)?,
+            response_format,
             output,
             settings: resolve_google_settings(model_settings)?,
         };
         let mut prompt = crate::builder::gemini(model, options)?;
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
@@ -617,17 +622,18 @@ impl Prompt {
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
     ) -> WyrdPyResult<Self> {
+        let (response_format, named) = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
-            response_format: response_format_from_py(response_format)?,
+            response_format,
             output,
             settings: resolve_google_settings(model_settings)?,
         };
         let mut prompt = crate::builder::vertex(model, options)?;
         prompt.py_output_cls = py_output_cls;
-        Ok(prompt)
+        named_prompt(prompt, named)
     }
 
     /// Return a copy with a system message applied.
@@ -1349,20 +1355,80 @@ fn request_system_value(request: &ProviderRequest) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
+/// A builder `response_format` and, for a named format such as `"verdict"`
+/// or `{"kind": "verdict", "data": Model}`, that name, which
+/// [`named_prompt`] applies after the builder ran.
 #[cfg(feature = "python")]
-fn response_format_from_py(
-    value: Option<&Bound<'_, PyAny>>,
-) -> WyrdPyResult<Option<ResponseFormat>> {
+type FormatFromPy = (Option<ResponseFormat>, Option<NamedResponseFormat>);
+
+/// Reads a Python `response_format`: a `ResponseFormat`, a JSON Schema or
+/// Pydantic model, a format name, or `{"kind": name, "data": schema}` whose
+/// `data` may itself be a Pydantic model.
+///
+/// # Errors
+///
+/// Raises `WyrdError` for a value that is none of these.
+#[cfg(feature = "python")]
+fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<FormatFromPy> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     if let Ok(format) = value.extract::<PyRef<'_, ResponseFormat>>() {
-        return Ok(Some(format.clone()));
+        return Ok((Some(format.clone()), None));
+    }
+    if let Ok(name) = value.extract::<String>() {
+        return Ok((None, Some(NamedResponseFormat::Name(name))));
+    }
+    if let Ok(named) = value.cast::<PyDict>()
+        && named.contains("kind")?
+    {
+        let mut expanded = serde_json::Map::new();
+        for (key, item) in named.iter() {
+            let key = key.extract::<String>()?;
+            let item = if key == "data" && !item.is_none() {
+                let mut schema = crate::coerce::schema_from_py(&item)?;
+                if is_pydantic_model(value.py(), &item) {
+                    normalize_output_schema(&mut schema);
+                }
+                schema
+            } else {
+                wyrd_utils::py::pyobject_to_json(&item)?
+            };
+            expanded.insert(key, item);
+        }
+        let named = serde_json::from_value(expanded.into())
+            .map_err(|error| PromptBuilderError::Validation(error.to_string()))?;
+        return Ok((None, Some(named)));
     }
 
     let schema = crate::coerce::schema_from_py(value)?;
-    Ok(Some(ResponseFormat::json_schema("response", schema)?))
+    Ok((Some(ResponseFormat::json_schema("response", schema)?), None))
+}
+
+/// Applies a named `response_format` to a built `prompt`: the authored form
+/// carries the name, and Wyrd resolves its schema into the native request.
+///
+/// # Errors
+///
+/// Raises `WyrdError` for an unknown name, an invalid `data` schema, or a
+/// request that already sets its own response format, such as from `output`.
+#[cfg(feature = "python")]
+fn named_prompt(prompt: Prompt, named: Option<NamedResponseFormat>) -> WyrdPyResult<Prompt> {
+    let Some(named) = named else {
+        return Ok(prompt);
+    };
+    let mut authored = prompt
+        .inner
+        .authored()
+        .map_err(PromptBuilderError::from)?
+        .into_owned();
+    authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
+    Ok(Prompt {
+        inner: wyrd_spec::card::prompt::compile_prompt(&authored)
+            .map_err(PromptBuilderError::from)?,
+        ..prompt
+    })
 }
 
 /// `(response_format, retained_pydantic_class)` produced by `output_from_py`.

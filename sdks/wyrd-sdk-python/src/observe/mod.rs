@@ -350,8 +350,33 @@ impl PyObserveHandle {
         let inputs = inputs(py, value, named)?;
         let observe = self.observe().grouped(group_id)?;
         crate::trace::block_on(py, observe.verify(verifier, inputs))
-            .map(PyVerificationResult)
+            .map(PyVerificationResult::plain)
             .map_err(WyrdPyError::from)
+    }
+
+    /// [`PyObserveHandle::verify`], with every requirement's custom `data`
+    /// converted by `data_type.model_validate` before returning.
+    ///
+    /// `verifier` and `data_type` are positional-only, so an input slot named
+    /// `data_type` still passes as a keyword. A refused conversion leaves the
+    /// stored result unchanged and never reruns the Verifier.
+    ///
+    /// # Errors
+    /// As [`PyObserveHandle::verify`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses.
+    #[pyo3(signature = (verifier, data_type, /, *value, group_id=None, **named))]
+    fn verify_typed(
+        &self,
+        py: Python<'_>,
+        verifier: &str,
+        data_type: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyTuple>,
+        group_id: Option<&str>,
+        named: Option<&Bound<'_, PyDict>>,
+    ) -> WyrdPyResult<PyVerificationResult> {
+        let result = self.verify(py, verifier, value, group_id, named)?;
+        PyVerificationResult::typed(py, result.result, data_type)
     }
 
     /// Submit evidence for the bound Verifier `verifier` without waiting.

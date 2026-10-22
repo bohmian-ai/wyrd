@@ -1,5 +1,7 @@
 import os
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing import Any, Generic, Literal, NotRequired, Protocol, TypeAlias, TypedDict
+
+from typing_extensions import TypeVar
 
 from ..cards import CardRef, JsonValue
 from ..client import WyrdClient
@@ -238,11 +240,33 @@ Check: TypeAlias = AssertCheck | TraceCheck | AgentCheck | CodeCheck | DriftChec
 
 RequirementOutcome: TypeAlias = Literal["passed", "failed", "inconclusive", "not_applicable"]
 
-class RequirementResult(TypedDict):
+DataT = TypeVar("DataT", default=dict[str, JsonValue])
+"""The type of each requirement's custom ``data``: JSON by default."""
+
+_Model = TypeVar("_Model", bound="DataModel")
+
+class DataModel(Protocol):
+    """Anything that validates one ``data`` object and returns itself typed.
+
+    A Pydantic model class, including a ``RootModel`` union for mixed shapes,
+    satisfies this by construction; Pydantic itself is not required.
+    """
+
+    @classmethod
+    def model_validate(cls: type[_Model], obj: Any, /) -> _Model:
+        """Validate one custom ``data`` object into an instance of this model.
+
+        Args:
+            obj: the requirement's decoded ``data`` JSON value.
+        """
+        ...
+
+class RequirementResult(TypedDict, Generic[DataT]):
     """One requirement's judgment.
 
     ``check`` is the Verifier Card's check declaration as authored; ``actual``
-    is the JSON value the check read.
+    is the JSON value the check read; ``data`` is the custom data the check's
+    declared ``verdict`` format returned, absent when it declared none.
     """
 
     id: str
@@ -252,6 +276,7 @@ class RequirementResult(TypedDict):
     reason: str
     actual: NotRequired[JsonValue]
     citations: NotRequired[list[Citation]]
+    data: NotRequired[DataT]
     detail: NotRequired[RequirementDetail]
     check: Check
     provenance: NotRequired[CallProvenance]
@@ -291,22 +316,22 @@ class StepResult(TypedDict):
 
 VerificationVerdict: TypeAlias = Literal["passed", "failed", "inconclusive"]
 
-class VerificationOutcome(TypedDict):
+class VerificationOutcome(TypedDict, Generic[DataT]):
     """The decided verdict and its full breakdown."""
 
     verdict: VerificationVerdict
-    requirements: list[RequirementResult]
+    requirements: list[RequirementResult[DataT]]
     steps: list[StepResult]
     evidence: dict[str, InputDeclaration]
 
-class VerificationResultWire(TypedDict):
+class VerificationResultWire(TypedDict, Generic[DataT]):
     """A result as ``Execution.status()`` carries it under ``result``."""
 
     execution_id: str
     run_id: NotRequired[str]
     verifier: CardRefWire
     subject: CardRefWire
-    outcome: VerificationOutcome
+    outcome: VerificationOutcome[DataT]
 
 class VerificationError(TypedDict):
     """A settled execution's secret-free stable error."""
@@ -347,13 +372,13 @@ class GroupSnapshot(TypedDict):
 
     sources: dict[str, GroupSourceSnapshot]
 
-class ExecutionState(TypedDict):
+class ExecutionState(TypedDict, Generic[DataT]):
     """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
     execution_id: str
     status: ExecutionStatus
     error: NotRequired[VerificationError]
-    result: NotRequired[VerificationResultWire]
+    result: NotRequired[VerificationResultWire[DataT]]
     dispatches: list[OperatorDispatchState]
     group_id: NotRequired[str]
     owner_card_uid: NotRequired[str]
@@ -409,10 +434,13 @@ class Recorded:
     later, so there is no execution to wait for.
     """
 
-class VerificationResult:
+class VerificationResult(Generic[DataT]):
     """The attributable result of one Verifier execution.
 
     A ``failed`` verdict is an ordinary return value, not an exception.
+    ``DataT`` is each requirement's ``data`` type: JSON for ordinary reads,
+    the caller's type for ``verify_typed``, ``wait_typed``, and
+    ``status_typed``.
     """
 
     @property
@@ -441,7 +469,7 @@ class VerificationResult:
         ...
 
     @property
-    def requirements(self) -> list[RequirementResult]:
+    def requirements(self) -> list[RequirementResult[DataT]]:
         """Every requirement's judgment as its wire mapping, in plan order."""
         ...
 
@@ -514,6 +542,44 @@ class Execution:
             WyrdError: the client's connection error on first use, the
                 server's not-found error before the execution is visible, and
                 its authorization or transport error.
+        """
+        ...
+
+    def status_typed(self, data_type: type[_Model]) -> ExecutionState[_Model]:
+        """``status``, with a present result's ``data`` validated as ``data_type``.
+
+        Every present ``data`` object, failed requirements included, passes
+        through ``data_type.model_validate``; absent data stays absent. The
+        stored result is never changed.
+
+        Args:
+            data_type: a model exposing ``model_validate``, such as a
+                Pydantic model class.
+
+        Returns:
+            The wire mapping, its result's ``data`` typed.
+
+        Raises:
+            WyrdError: As ``status``;
+                ``WYRD_SDK_422_VERIFICATION_DATA_INVALID`` naming the first
+                requirement and field path ``data_type`` refuses, never the
+                data; ``WYRD_SPEC_400_VALIDATION`` when ``data_type`` has no
+                ``model_validate``.
+        """
+        ...
+
+    def wait_typed(self, timeout: float, data_type: type[_Model]) -> VerificationResult[_Model]:
+        """``wait``, with every present ``data`` validated as ``data_type``.
+
+        Args:
+            timeout: seconds to keep polling.
+            data_type: a model exposing ``model_validate``.
+
+        Returns:
+            The execution's result, its ``data`` typed.
+
+        Raises:
+            WyrdError: As ``wait``, then as ``status_typed`` for ``data``.
         """
         ...
 

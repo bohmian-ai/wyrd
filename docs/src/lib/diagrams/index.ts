@@ -1,4 +1,5 @@
 import { bifrostParts, bifrostPods, bifrostWriteRead } from './bifrost';
+import { wyrdInYourStack } from './stack';
 import type { FigureSpec } from './types';
 import { runLifecycle, verificationPaths } from './verification';
 
@@ -8,7 +9,8 @@ export const DIAGRAMS: Record<string, FigureSpec> = {
   'bifrost-pods': bifrostPods,
   'bifrost-write-read': bifrostWriteRead,
   'verification-paths': verificationPaths,
-  'run-lifecycle': runLifecycle
+  'run-lifecycle': runLifecycle,
+  'wyrd-in-your-stack': wyrdInYourStack
 };
 
 /** Looks up a diagram by name and type, failing the build on a typo. */

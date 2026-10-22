@@ -17,7 +17,7 @@ Page: /wyrd/get-started/introduction/
 
 > Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 
-Your agent, model, or service needs to behave correctly, both before you ship a change and while it runs. Wyrd verifies that. You declare your system and the requirements it must meet. Wyrd checks each result against them, tells you which requirements failed and why, and records which version of your system produced it.
+You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## An example
 
@@ -153,23 +153,19 @@ failed: operator NotContains returned false
 
 In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
 
-## How it fits your system
+## How Wyrd fits your stack
 
-1. **Declare.** In YAML, describe your Service and the parts it is built from, such as an Agent, a Prompt, and a Model. Bind Verifiers to those parts, and declare them from your code or the CLI. Every declaration has a version, so changing your prompt means a new version.
-2. **Verify.** Send each result to Wyrd. Wait for the verdict, or let Wyrd verify in the background while your system keeps serving.
-3. **Read the verdicts.** Each requirement passes or fails with a reason. Wyrd keeps every verdict with the exact versions involved, so you can later ask which results failed after a prompt change.
+_Diagram `wyrd-in-your-stack`: see the web page._
+
+1. **Declare.** Describe your Service and the Verifiers bound to it in YAML. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
+3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
+
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each.
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Wyrd can route your model calls through its gateway, but your code owns the agent and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
-
-| Your application owns | The Wyrd server owns |
-| --- | --- |
-| Your code, models, and data | Your declarations and their versions |
-| Running and deploying them | Verdicts and the evidence behind them |
-| Deciding what to do with a verdict | Who may declare and verify, and the audit of those decisions |
-
-The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call the same server, so a verdict reads the same from each.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
 
 ## Next
 
@@ -179,9 +175,9 @@ The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call the same 
 
 Page: /wyrd/get-started/setup/
 
-> Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, start a local server with wyrd init, and add Wyrd to your project with your coding agent or by hand.
+> Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 
-Install Wyrd, start a local server with `wyrd init`, and leave it running. Your code finds the server on its own. Then add Wyrd to your project with your coding agent, or by hand.
+Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
 
 ## What you need
 
@@ -215,33 +211,51 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 npm init -y && npm pkg set type=module
-npm install wyrd-ai
+npm install wyrd-ai@0.3.0
 ```
 
 Run the CLI as `npx wyrd`.
 
-## Start the server
+## Agent-guided setup
+
+In `quickstart`:
+
+```bash
+wyrd init guided
+```
+
+It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+
+**Another agent, or your own:**
+
+Name the agent with `--host`, such as `wyrd init guided --host claude-code`. For an agent `wyrd` does not launch, start the server by hand, then paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`.
+
+## Manual setup
+
+### 1. Start the server
 
 In its own terminal, in `quickstart`:
-
-**Interactive**
 
 ```bash
 wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers. To have your coding agent add Wyrd to your project, run `wyrd init guided` instead, as in [Add Wyrd to your project](#add-wyrd-to-your-project).
+Enter your database URL and a tenant name when asked, and decline the other offers. When it prints this, it's ready:
 
-**Programmatic**
+```text
+Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
+```
+
+It also prints a root credential once. Save it; it recovers a lost tenant key.
+
+**Start it without prompts:**
 
 ```bash
 export WYRD_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
 wyrd init --tenant acme --non-interactive
 ```
 
-It never prompts. If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready, for scripts and agents.
-
-**wyrd init options:**
+If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready.
 
 | Option | Meaning |
 | --- | --- |
@@ -255,17 +269,9 @@ It never prompts. If an input is missing, it names every missing input and exits
 | `--gateway-file <PATH>` | Gateway document to apply once ready, and on every restart. |
 | `--skip-gateway` | Skip the gateway offer. |
 
-The database URL comes only from `WYRD_DATABASE_URL` or the saved setting, never an option. Each input resolves as option, then environment variable, then saved setting, then default. Settings are saved, so later runs reuse them.
+The database URL comes only from `WYRD_DATABASE_URL` or the saved setting. Settings are saved, so later runs reuse them.
 
-When it prints this, it's ready:
-
-```text
-Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
-```
-
-It also prints a root credential once. Save it; it recovers a lost tenant key.
-
-## Check it works
+### 2. Check it works
 
 In a second terminal, in `quickstart`:
 
@@ -273,139 +279,11 @@ In a second terminal, in `quickstart`:
 wyrd list
 ```
 
-An empty list means you're connected.
+An empty list means you're connected. Your code finds the server the same way, with no configuration.
 
-## Add Wyrd to your project
+### 3. Run your first verification
 
-**Agent-assisted**
-
-Start your coding agent on the setup prompt instead of plain `wyrd init`. In `quickstart`:
-
-```bash
-wyrd init guided
-```
-
-It starts the server as above, asks which installed coding agent to use, connects it to Wyrd, and starts it in `quickstart` on the setup prompt. Name the agent with `--host`, for example `wyrd init guided --host claude-code`, to skip the question. The agent keeps its own permissions and asks for your approvals as usual.
-
-The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear. When it exits, Wyrd keeps serving until you press Ctrl-C. An agent that exits has not proven anything by exiting; its report of the stored verdicts does.
-
-With plain `wyrd init`, a connected agent's start command is printed instead, to run yourself in a second terminal. For any other agent, paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
-
-**The setup prompt:**
-
-````markdown title="setup prompt"
-Add Wyrd to this project and confirm one verification end to end. A person
-started a local Wyrd server with `wyrd init` and connected you to its MCP
-server. Do not start, stop, or restart that server.
-
-Follow these steps in order. Stop at the first step that fails and report the
-step, the Wyrd error `code` when one is printed or returned, otherwise the
-tool's own diagnostic. Never print, copy, or write a credential, and never
-write a machine-specific path into a project file.
-
-1. Confirm the server. Call the Wyrd MCP tool `wyrd.guide` with
-   `{"topic": "start"}`, then `cards.list` with `{"limit": 1}`. Both must
-   succeed. If no Wyrd MCP tool is available, ask the person to connect this
-   host with `wyrd mcp install --host <host>` and reload it.
-
-2. Choose the language. Read the project manifest in the current directory:
-   `pyproject.toml` is Python, `Cargo.toml` is Rust, and `package.json` is
-   TypeScript. When none or more than one is present, or the project uses
-   another language, ask the person to choose Python, Rust, or TypeScript
-   before changing any file.
-
-3. Install the SDK at the release of the `wyrd` CLI. Run `wyrd --version`;
-   it prints `wyrd <version>`. Install exactly that version with the
-   project's own package tool:
-
-   - Python: `uv add "wyrd-ai==<version>"`
-   - Rust: `cargo add wyrd-ai@<version> tokio --features tokio/full`
-   - TypeScript: `npm install wyrd-ai@<version>`
-
-   If that exact version is unavailable, stop and report it. Never install
-   another version.
-
-4. Write the example. Before writing, check whether `support-reply.yaml`,
-   `no-refund-promise.yaml`, or the program file already exists. If one does
-   and its content differs, show the difference and ask before replacing it.
-   Leave every other project file unchanged.
-
-   Save this Verifier as `no-refund-promise.yaml`:
-
-   ```yaml
-   apiVersion: wyrd/v1
-   kind: Verifier
-   metadata:
-     name: no-refund-promise
-     version: 1.0.0
-     space: default
-   spec:
-     inputs:
-       answer: { type: json }
-     requirements:
-       - id: no-refund-promise
-         statement: The answer never promises a guaranteed refund
-         check:
-           kind: assert
-           path: inputs.answer
-           operator: not_contains
-           expected: guaranteed refund
-   ```
-
-   Save this Service beside it as `support-reply.yaml`:
-
-   ```yaml
-   apiVersion: wyrd/v1
-   kind: Service
-   metadata:
-     name: support-reply
-     version: 1.0.0
-     space: default
-   spec:
-     verified_by:
-       - verifier: ./no-refund-promise.yaml
-   ```
-
-   Write the program for the chosen language from the "Run your first
-   verification" page of the Wyrd documentation for this release
-   (`get-started/quickstart/` in `llms-full.txt`): `quickstart.py` for
-   Python, `src/main.rs` for Rust, or `quickstart.ts` for TypeScript. It
-   declares the Service with `WyrdState.declare("support-reply.yaml")`, opens
-   one Run, and verifies two answers with
-   `run.observe.verify("no-refund-promise", ...)`. It needs no model or
-   provider key.
-
-5. Run it from the directory holding both YAML files, with the project's own
-   tool: `uv run quickstart.py`, `cargo run`, or `node quickstart.ts`. It
-   prints one `passed` and one `failed` verdict, each naming its subject as
-   `default/Service/support-reply@1.0.0#<uid>`. A `failed` verdict is a
-   result, not an error.
-
-6. Confirm the stored evidence through MCP. Call `cards.get` with
-   `{"card_ref": {"kind": "Service", "space": "default", "name":
-   "support-reply", "version": "1.0.0"}}` and read its `uid`. Then call
-   `bifrost.query` with this SQL, replacing `<uid>`:
-
-   ```sql
-   SELECT result_id, run_id, card_uid, verdict FROM vala.verification.results WHERE card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
-   ```
-
-   Rows become queryable shortly after the server publishes them; repeat the
-   query for up to a minute before reporting none. Done means at least one
-   `passed` and one `failed` row with the same `run_id`.
-
-7. Report the Service identity
-   `default/Service/support-reply@1.0.0#<uid>`, the `run_id`, and both
-   verdicts. Then point the person to the Wyrd documentation's
-   "Choose your path" page for the next step.
-
-````
-
-Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI's release.
-
-**Manual**
-
-Follow [Run your first verification](/wyrd/get-started/quickstart/), through [Confirm the stored verdicts](/wyrd/get-started/quickstart/#3-confirm-the-stored-verdicts). They are the same steps the setup prompt gives an agent.
+Follow [Run your first verification](/wyrd/get-started/quickstart/). It is the same program the setup prompt gives an agent.
 
 ## If it fails
 
@@ -418,7 +296,7 @@ Follow [Run your first verification](/wyrd/get-started/quickstart/), through [Co
 
 ## Next
 
-[Run your first verification](/wyrd/get-started/quickstart/), then [choose your path](/wyrd/get-started/choose-your-path/).
+[Run your first verification](/wyrd/get-started/quickstart/).
 
 # Run your first verification
 
@@ -632,50 +510,91 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 | You see | Fix |
 | --- | --- |
-| `transport unavailable` | Start the server as in [Set up Wyrd](/wyrd/get-started/setup/#start-the-server) |
+| `transport unavailable` | Start the server as in [Set up Wyrd](/wyrd/get-started/setup/#1-start-the-server) |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
 | No rows after a minute | Check that `<uid>` is the `metadata.uid` that `wyrd get` printed |
 
 ## Next
 
-[Choose your path](/wyrd/get-started/choose-your-path/) for the guides that fit your role. [How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
+[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
 
-# Choose your path
+# Use with your coding agent
 
-Page: /wyrd/get-started/choose-your-path/
+Page: /wyrd/get-started/use-with-your-coding-agent/
 
-> The pages to read next, in order, for adding Wyrd to an application, attributing deployed workloads, or running Wyrd for a team.
+> Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 
-Pick the path that matches what you are doing next. Each lists its pages in order.
+Point your coding agent at the Wyrd docs, then connect it to your Wyrd server so it can read your declarations, verdicts, and evidence.
 
-## Add Wyrd to an application
+## Give your agent the docs
 
-For AI engineers putting the SDK in a service.
+| File | URL | Holds |
+| --- | --- | --- |
+| [`llms.txt`](/wyrd/llms.txt) | `https://docs.bohmian.ai/wyrd/llms.txt` | An index of every page, with where to start |
+| [`llms-full.txt`](/wyrd/llms-full.txt) | `https://docs.bohmian.ai/wyrd/llms-full.txt` | Every page in full, with its YAML and code |
 
-1. [Run your first verification](/wyrd/get-started/quickstart/)
-2. [Integrate Wyrd with FastAPI](/wyrd/connect/integrate-fastapi/)
-3. [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/)
-4. [How verification works](/wyrd/understand/how-verification-works/)
-5. [Verifier Card](/wyrd/reference/verifier-card/)
+Paste either URL into your agent's chat, or add it to the agent's project instructions.
 
-## Deploy and attribute workloads
+## Connect your agent over MCP
 
-For platform teams running services that report to Wyrd under their own identity.
+Starting from scratch? [`wyrd init guided`](/wyrd/get-started/setup/#agent-guided-setup) starts the server, connects your agent, and has it set up your project. To connect an agent to a server that is already running, you need the agent installed and opened once.
 
-1. [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/)
-2. [Identity and authorization](/wyrd/understand/identity-and-authorization/)
-3. [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/)
-4. [MCP tools](/wyrd/reference/mcp-tools/)
+```bash
+wyrd mcp install --host claude-code
+```
 
-## Run Wyrd for a team
+```text
+claude-code: added /Users/you/.claude.json
+```
 
-For operators of a shared Wyrd server.
+Run `wyrd mcp install` without `--host` to pick from the agents it finds. Restart the agent to load the entry. The agent starts `wyrd mcp proxy`, which signs each call with the credential `wyrd init` saved; the agent's configuration file never holds it.
 
-1. [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/)
-2. [Verification runtime limits](/wyrd/reference/verification-runtime-limits/)
-3. [Bifrost](/wyrd/understand/bifrost/)
-4. [Identity and authorization](/wyrd/understand/identity-and-authorization/)
+| Agent | `--host` |
+| --- | --- |
+| Claude Code | `claude-code` |
+| Codex CLI and IDE | `codex` |
+| Cursor | `cursor` |
+| GitHub Copilot CLI | `copilot-cli` |
+| GitHub Copilot in VS Code | `vscode` |
+| Pi | `pi` |
+| Hermes Agent | `hermes` |
+
+## Check it worked
+
+Ask your agent:
+
+```text
+Call the wyrd.guide tool with topic "start" and summarize what it says.
+```
+
+The agent calls `wyrd.guide` and describes the Declare → Observe → Verify workflow. Read tools work at once; write tools need a credential with the matching role. [MCP tools](/wyrd/reference/mcp-tools/) lists every tool and its permission.
+
+## Advanced
+
+### Connect to a deployed server
+
+Sign in to the server, then name it when you install:
+
+```bash
+wyrd auth login --server https://wyrd.example.com --tenant acme
+wyrd mcp install --host claude-code --server https://wyrd.example.com
+```
+
+The URL is stored in that agent's entry only. Remote servers must use `https://`.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_CLI_400_MCP_HOST_SELECTION`, `detected: none` | Install and open the agent once, then rerun |
+| `<host>: conflict: … has a wyrd entry that does not run wyrd mcp proxy` | Rename or remove the other `wyrd` entry, then rerun |
+| The agent log has `WYRD_CLI_401_NO_CREDENTIALS` | Run `wyrd init`, or `wyrd auth login` for a deployed server |
+| The agent log has `WYRD_CLIENT_503_TRANSPORT_DOWN` | Start the server, then restart the agent |
+
+## Next
+
+[Run your first verification](/wyrd/get-started/quickstart/), then ask your agent to explain its verdicts.
 
 # Integrate Wyrd with FastAPI
 

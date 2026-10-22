@@ -35,6 +35,9 @@
   const hasPages = navGroups().length > 0;
   const start = firstPage('Get started');
   const reference = firstPage('Reference');
+  const agent = navGroups()
+    .flatMap((group) => group.items)
+    .find((item) => item.path === '/get-started/use-with-your-coding-agent/');
 
   onMount(() => {
     initLang();
@@ -69,6 +72,7 @@
     <span class="tag">v{__WYRD_VERSION__}</span>
   </a>
   {#if hasPages}<Search />{/if}
+  {#if agent}<a class="head-link" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
   {#if reference}<a class="head-link" href={`${base}${reference.path}`}>Reference</a>{/if}
   <a class="head-link" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
   <button

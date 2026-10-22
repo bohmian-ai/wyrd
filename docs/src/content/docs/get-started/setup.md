@@ -1,13 +1,13 @@
 ---
 title: Set up Wyrd
-description: Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, start a local server with wyrd init, and add Wyrd to your project with your coding agent or by hand.
+description: Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 pillar: wyrd
 section: Get started
 order: 2
 status: runnable
 ---
 
-Install Wyrd, start a local server with `wyrd init`, and leave it running. Your code finds the server on its own. Then add Wyrd to your project with your coding agent, or by hand.
+Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
 
 ## What you need
 
@@ -44,7 +44,7 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 npm init -y && npm pkg set type=module
-npm install wyrd-ai
+npm install wyrd-ai@0.3.0
 ```
 
 Run the CLI as `npx wyrd`.
@@ -52,30 +52,48 @@ Run the CLI as `npx wyrd`.
 </LangTab>
 </LangTabs>
 
-## Start the server
+## Agent-guided setup
+
+In `quickstart`:
+
+```bash
+wyrd init guided
+```
+
+It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+
+<Aside type="note" title="Another agent, or your own">
+
+Name the agent with `--host`, such as `wyrd init guided --host claude-code`. For an agent `wyrd` does not launch, start the server by hand, then paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`.
+
+</Aside>
+
+## Manual setup
+
+### 1. Start the server
 
 In its own terminal, in `quickstart`:
-
-<Tabs>
-<Tab label="Interactive">
 
 ```bash
 wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers. To have your coding agent add Wyrd to your project, run `wyrd init guided` instead, as in [Add Wyrd to your project](#add-wyrd-to-your-project).
+Enter your database URL and a tenant name when asked, and decline the other offers. When it prints this, it's ready:
 
-</Tab>
-<Tab label="Programmatic">
+```text
+Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
+```
+
+It also prints a root credential once. Save it; it recovers a lost tenant key.
+
+<Aside type="note" title="Start it without prompts">
 
 ```bash
 export WYRD_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
 wyrd init --tenant acme --non-interactive
 ```
 
-It never prompts. If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready, for scripts and agents.
-
-<Aside type="note" title="wyrd init options">
+If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready.
 
 | Option | Meaning |
 | --- | --- |
@@ -89,22 +107,11 @@ It never prompts. If an input is missing, it names every missing input and exits
 | `--gateway-file <PATH>` | Gateway document to apply once ready, and on every restart. |
 | `--skip-gateway` | Skip the gateway offer. |
 
-The database URL comes only from `WYRD_DATABASE_URL` or the saved setting, never an option. Each input resolves as option, then environment variable, then saved setting, then default. Settings are saved, so later runs reuse them.
+The database URL comes only from `WYRD_DATABASE_URL` or the saved setting. Settings are saved, so later runs reuse them.
 
 </Aside>
 
-</Tab>
-</Tabs>
-
-When it prints this, it's ready:
-
-```text
-Local Wyrd ready at http://127.0.0.1:8080 for tenant acme.
-```
-
-It also prints a root credential once. Save it; it recovers a lost tenant key.
-
-## Check it works
+### 2. Check it works
 
 In a second terminal, in `quickstart`:
 
@@ -112,40 +119,11 @@ In a second terminal, in `quickstart`:
 wyrd list
 ```
 
-An empty list means you're connected.
+An empty list means you're connected. Your code finds the server the same way, with no configuration.
 
-## Add Wyrd to your project
+### 3. Run your first verification
 
-<Tabs>
-<Tab label="Agent-assisted">
-
-Start your coding agent on the setup prompt instead of plain `wyrd init`. In `quickstart`:
-
-```bash
-wyrd init guided
-```
-
-It starts the server as above, asks which installed coding agent to use, connects it to Wyrd, and starts it in `quickstart` on the setup prompt. Name the agent with `--host`, for example `wyrd init guided --host claude-code`, to skip the question. The agent keeps its own permissions and asks for your approvals as usual.
-
-The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear. When it exits, Wyrd keeps serving until you press Ctrl-C. An agent that exits has not proven anything by exiting; its report of the stored verdicts does.
-
-With plain `wyrd init`, a connected agent's start command is printed instead, to run yourself in a second terminal. For any other agent, paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
-
-<Aside type="note" title="The setup prompt">
-
-<CodeFromFile file="crates/wyrd-spec/src/setup-prompt.md" lang="markdown" title="setup prompt" />
-
-Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI's release.
-
-</Aside>
-
-</Tab>
-<Tab label="Manual">
-
-Follow [Run your first verification](/get-started/quickstart/), through [Confirm the stored verdicts](/get-started/quickstart/#3-confirm-the-stored-verdicts). They are the same steps the setup prompt gives an agent.
-
-</Tab>
-</Tabs>
+Follow [Run your first verification](/get-started/quickstart/). It is the same program the setup prompt gives an agent.
 
 ## If it fails
 
@@ -158,4 +136,4 @@ Follow [Run your first verification](/get-started/quickstart/), through [Confirm
 
 ## Next
 
-[Run your first verification](/get-started/quickstart/), then [choose your path](/get-started/choose-your-path/).
+[Run your first verification](/get-started/quickstart/).

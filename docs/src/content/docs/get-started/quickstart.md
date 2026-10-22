@@ -118,11 +118,11 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 | You see | Fix |
 | --- | --- |
-| `transport unavailable` | Start the server as in [Set up Wyrd](/get-started/setup/#start-the-server) |
+| `transport unavailable` | Start the server as in [Set up Wyrd](/get-started/setup/#1-start-the-server) |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
 | No rows after a minute | Check that `<uid>` is the `metadata.uid` that `wyrd get` printed |
 
 ## Next
 
-[Choose your path](/get-started/choose-your-path/) for the guides that fit your role. [How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/reference/verifier-card/) lists every field you can declare.
+[How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/reference/verifier-card/) lists every field you can declare.

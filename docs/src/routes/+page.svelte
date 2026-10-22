@@ -28,6 +28,7 @@
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];
   // The CTA opens the quickstart once it is published, else the first Get started page.
   const start = startPages.find((item) => item.path === '/get-started/quickstart/') ?? firstPage('Get started');
+  const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
 </script>
 
 <svelte:head>
@@ -48,6 +49,7 @@
     <div class="cta">
       {#if start}
         <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
+        {#if agent}<a class="button" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
         <a class="button" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
       {:else}
         <a class="button primary" href={GITHUB_URL} rel="noreferrer" target="_blank">Wyrd on GitHub →</a>

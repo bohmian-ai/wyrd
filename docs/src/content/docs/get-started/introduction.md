@@ -6,7 +6,7 @@ section: Get started
 order: 1
 ---
 
-Your agent, model, or service needs to behave correctly, both before you ship a change and while it runs. Wyrd verifies that. You declare your system and the requirements it must meet. Wyrd checks each result against them, tells you which requirements failed and why, and records which version of your system produced it.
+You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## An example
 
@@ -56,23 +56,19 @@ failed: operator NotContains returned false
 
 In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
 
-## How it fits your system
+## How Wyrd fits your stack
 
-1. **Declare.** In YAML, describe your Service and the parts it is built from, such as an Agent, a Prompt, and a Model. Bind Verifiers to those parts, and declare them from your code or the CLI. Every declaration has a version, so changing your prompt means a new version.
-2. **Verify.** Send each result to Wyrd. Wait for the verdict, or let Wyrd verify in the background while your system keeps serving.
-3. **Read the verdicts.** Each requirement passes or fails with a reason. Wyrd keeps every verdict with the exact versions involved, so you can later ask which results failed after a prompt change.
+<WyrdDiagram name="wyrd-in-your-stack" />
+
+1. **Declare.** Describe your Service and the Verifiers bound to it in YAML. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
+3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
+
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each.
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Wyrd can route your model calls through its gateway, but your code owns the agent and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
-
-| Your application owns | The Wyrd server owns |
-| --- | --- |
-| Your code, models, and data | Your declarations and their versions |
-| Running and deploying them | Verdicts and the evidence behind them |
-| Deciding what to do with a verdict | Who may declare and verify, and the audit of those decisions |
-
-The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call the same server, so a verdict reads the same from each.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
 
 ## Next
 

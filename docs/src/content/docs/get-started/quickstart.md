@@ -26,8 +26,6 @@ Save the subject beside it as `support-reply.yaml`. It is a Service, and `verifi
 
 <CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
 
-Each file is one Card, named and versioned in its `metadata`. A Card's name and version always mean the same content, which is what lets a verdict point at exactly what was checked.
-
 ## 2. Verify two answers
 
 Save the program and run it from the `quickstart` directory, so it finds both YAML files there:
@@ -73,11 +71,11 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-Each verdict names the subject and the Verifier by space, kind, name, version, and `uid`. The server assigns each `uid` when the Card is first declared, so yours differ.
+Each verdict names the exact version of the Service and Verifier it checked. Your `uid` values differ; the server assigns them.
 
-The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund. The result holds one entry per requirement with its `id`, `outcome`, `reason`, and the `actual` value it judged.
+The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund.
 
-Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities.
+Run the program again. Nothing changed, so you get the same verdicts and `uid` values.
 
 ## 3. Confirm the stored verdicts
 
@@ -112,8 +110,6 @@ Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program agai
 
 To change the requirement, give it a new version: set `version: 1.1.0` in `no-refund-promise.yaml`. The Service now references different content too, so set its `version: 1.1.0` as well. Run again, and the verdicts name `support-reply@1.1.0` and `no-refund-promise@1.1.0`.
 
-<Aside type="note" title="Errors are not verdicts">A request Wyrd refuses, such as one without permission, produces no verdict. It raises a `WyrdError` with a stable `code` in Python and TypeScript and returns it as `Err` in Rust; [Errors](/api/errors/) lists every code.</Aside>
-
 ## If it fails
 
 | You see | Fix |
@@ -125,4 +121,4 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/reference/verifier-card/) lists every field you can declare.
+[How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.

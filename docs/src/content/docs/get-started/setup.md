@@ -54,13 +54,23 @@ Run the CLI as `npx wyrd`.
 
 ## Agent-guided setup
 
-In `quickstart`:
+Let your coding agent finish the setup. Wyrd starts a local server and connects your agent to it, and the agent writes and runs your first verification. Without a coding agent, use [Manual setup](#manual-setup).
+
+In `quickstart`, run:
 
 ```bash
 wyrd init guided
 ```
 
-It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway; press Enter to skip, since the quickstart calls no model. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+It asks for:
+
+- the coding agent to use
+- your database URL, `postgresql://USER:PASSWORD@HOST:5432/DATABASE`
+- a tenant name, such as `acme`
+
+If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway. Press Enter to skip; the quickstart calls no model.
+
+It then starts a local server and hands over to the agent, which runs [Run your first verification](/get-started/quickstart/) and reports one `passed` and one `failed` verdict. Leave the terminal open; the server runs until you press Ctrl-C.
 
 <Aside type="note" title="Another agent, or your own">
 
@@ -95,19 +105,7 @@ wyrd init --tenant acme --non-interactive
 
 If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready.
 
-| Option | Meaning |
-| --- | --- |
-| `--tenant <TENANT>` | Tenant to create on first run. Defaults to the saved tenant. |
-| `--non-interactive` | Never prompt. Reports every missing input together and exits before any download, migration, or setup. |
-| `--format <text\|json>` | `json` never prompts, prints one line of JSON on stdout when ready, keeps serving, and writes progress to the log file it names. Default `text`. |
-| `--bind <ADDR>` | HTTP listen address, `127.0.0.1:<port>`. Overrides `WYRD_SERVER_BIND`. Default `127.0.0.1:8080`. |
-| `--grpc-bind <ADDR>` | gRPC listen address, `127.0.0.1:<port>`. Overrides `WYRD_GRPC_BIND`. Default `127.0.0.1:50051`. |
-| `--storage-url <URL>` | Storage URL without credentials, query, or fragment. Overrides `WYRD_STORAGE_URL`. Default is a local directory. |
-| `--host <HOST>` | MCP host to connect, repeatable: `codex`, `claude-code`, `copilot-cli`, `vscode`, `cursor`, `pi`, `hermes`. None unless named. |
-| `--gateway-file <PATH>` | Gateway document to apply once ready, and on every restart. |
-| `--skip-gateway` | Skip the gateway offer. |
-
-The database URL comes only from `WYRD_DATABASE_URL` or the saved setting. Settings are saved, so later runs reuse them.
+`wyrd init --help` lists every option.
 
 </Aside>
 
@@ -123,7 +121,7 @@ An empty list means you're connected. Your code finds the server the same way, w
 
 ### 3. Run your first verification
 
-Follow [Run your first verification](/get-started/quickstart/). It is the same program the setup prompt gives an agent.
+Follow [Run your first verification](/get-started/quickstart/).
 
 ## If it fails
 

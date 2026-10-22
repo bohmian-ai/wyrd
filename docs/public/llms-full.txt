@@ -218,13 +218,23 @@ Run the CLI as `npx wyrd`.
 
 ## Agent-guided setup
 
-In `quickstart`:
+Let your coding agent finish the setup. Wyrd starts a local server and connects your agent to it, and the agent writes and runs your first verification. Without a coding agent, use [Manual setup](#manual-setup).
+
+In `quickstart`, run:
 
 ```bash
 wyrd init guided
 ```
 
-It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway; press Enter to skip, since the quickstart calls no model. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+It asks for:
+
+- the coding agent to use
+- your database URL, `postgresql://USER:PASSWORD@HOST:5432/DATABASE`
+- a tenant name, such as `acme`
+
+If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway. Press Enter to skip; the quickstart calls no model.
+
+It then starts a local server and hands over to the agent, which runs [Run your first verification](/wyrd/get-started/quickstart/) and reports one `passed` and one `failed` verdict. Leave the terminal open; the server runs until you press Ctrl-C.
 
 **Another agent, or your own:**
 
@@ -257,19 +267,7 @@ wyrd init --tenant acme --non-interactive
 
 If an input is missing, it names every missing input and exits before changing anything. Add `--format json` to print one line of JSON when ready.
 
-| Option | Meaning |
-| --- | --- |
-| `--tenant <TENANT>` | Tenant to create on first run. Defaults to the saved tenant. |
-| `--non-interactive` | Never prompt. Reports every missing input together and exits before any download, migration, or setup. |
-| `--format <text\|json>` | `json` never prompts, prints one line of JSON on stdout when ready, keeps serving, and writes progress to the log file it names. Default `text`. |
-| `--bind <ADDR>` | HTTP listen address, `127.0.0.1:<port>`. Overrides `WYRD_SERVER_BIND`. Default `127.0.0.1:8080`. |
-| `--grpc-bind <ADDR>` | gRPC listen address, `127.0.0.1:<port>`. Overrides `WYRD_GRPC_BIND`. Default `127.0.0.1:50051`. |
-| `--storage-url <URL>` | Storage URL without credentials, query, or fragment. Overrides `WYRD_STORAGE_URL`. Default is a local directory. |
-| `--host <HOST>` | MCP host to connect, repeatable: `codex`, `claude-code`, `copilot-cli`, `vscode`, `cursor`, `pi`, `hermes`. None unless named. |
-| `--gateway-file <PATH>` | Gateway document to apply once ready, and on every restart. |
-| `--skip-gateway` | Skip the gateway offer. |
-
-The database URL comes only from `WYRD_DATABASE_URL` or the saved setting. Settings are saved, so later runs reuse them.
+`wyrd init --help` lists every option.
 
 ### 2. Check it works
 
@@ -283,7 +281,7 @@ An empty list means you're connected. Your code finds the server the same way, w
 
 ### 3. Run your first verification
 
-Follow [Run your first verification](/wyrd/get-started/quickstart/). It is the same program the setup prompt gives an agent.
+Follow [Run your first verification](/wyrd/get-started/quickstart/).
 
 ## If it fails
 
@@ -354,8 +352,6 @@ spec:
     - verifier: ./no-refund-promise.yaml
 
 ```
-
-Each file is one Card, named and versioned in its `metadata`. A Card's name and version always mean the same content, which is what lets a verdict point at exactly what was checked.
 
 ## 2. Verify two answers
 
@@ -461,11 +457,11 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-Each verdict names the subject and the Verifier by space, kind, name, version, and `uid`. The server assigns each `uid` when the Card is first declared, so yours differ.
+Each verdict names the exact version of the Service and Verifier it checked. Your `uid` values differ; the server assigns them.
 
-The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund. The result holds one entry per requirement with its `id`, `outcome`, `reason`, and the `actual` value it judged.
+The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund.
 
-Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities.
+Run the program again. Nothing changed, so you get the same verdicts and `uid` values.
 
 ## 3. Confirm the stored verdicts
 
@@ -504,8 +500,6 @@ Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program agai
 
 To change the requirement, give it a new version: set `version: 1.1.0` in `no-refund-promise.yaml`. The Service now references different content too, so set its `version: 1.1.0` as well. Run again, and the verdicts name `support-reply@1.1.0` and `no-refund-promise@1.1.0`.
 
-**Errors are not verdicts:** A request Wyrd refuses, such as one without permission, produces no verdict. It raises a `WyrdError` with a stable `code` in Python and TypeScript and returns it as `Err` in Rust; [Errors](/wyrd/api/errors/) lists every code.
-
 ## If it fails
 
 | You see | Fix |
@@ -517,7 +511,7 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. [Verifier Card](/wyrd/reference/verifier-card/) lists every field you can declare.
+[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/wyrd/reference/verifier-card/) lists every field you can declare.
 
 # Use with your coding agent
 
@@ -1007,17 +1001,17 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 
 [How verification works](/wyrd/understand/how-verification-works/) explains steps, verdicts, and where each check runs.
 
-# FastAPI
+# ASGI apps
 
-Page: /wyrd/connect/integrate-fastapi/
+Page: /wyrd/connect/integrate-asgi/
 
-> Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
+> Add WyrdMiddleware to a FastAPI, Starlette, Django, or Litestar app to start Wyrd with the app, verify inside one Run per request, and drain queued evidence at shutdown.
 
-Add `WyrdMiddleware` to a FastAPI app. It starts your Service's state when the app starts, opens one Run for each request, and drains queued evidence when the app stops.
+Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Litestar. It starts Wyrd when your app starts, wraps each request in its own Run, and sends queued evidence when your app stops.
 
 ## What you capture
 
-- One Run per HTTP request or WebSocket connection. Every verification and observation the request makes shares that Run's `run_id`.
+- One Run per HTTP request or WebSocket connection. Every verdict and row the request produces shares that Run's `run_id`.
 - Spans your OpenTelemetry instrumentation records inside the Run, tagged with its `wyrd.run_id` and `wyrd.card_uid`.
 
 ## Before you start
@@ -1028,10 +1022,10 @@ Add `WyrdMiddleware` to a FastAPI app. It starts your Service's state when the a
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.3.0" fastapi uvicorn
+uv add "wyrd-ai[otel]==0.3.0" uvicorn
 ```
 
-Pull the Service into the app's directory. Do this at build or deploy time, not when the app starts:
+Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:
 
 ```bash
 uv run wyrd pull --space default --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
@@ -1039,7 +1033,9 @@ uv run wyrd pull --space default --kind Service --name support-reply --version 1
 
 ## Usage
 
-Save the app as `app.py`:
+Each app loads the pulled Service, adds the middleware, and reads the request's Run in its handler:
+
+**FastAPI**
 
 ```python title="app.py"
 """A FastAPI app that verifies each support answer it receives under its own Run.
@@ -1080,13 +1076,113 @@ async def check_reply(reply: Reply, request: Request) -> dict[str, str]:
 
 ```
 
-Run it:
+```bash
+uv run uvicorn app:app
+```
+
+**Starlette**
+
+```python title="app.py"
+import asyncio
+
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
+from wyrd.state import WyrdState
+
+state = WyrdState.from_path(".wyrd-bundle")  # reads local files only
+
+async def check_reply(request):
+    run = request.scope[RUN_SCOPE_KEY]  # this request's Run, opened by the middleware
+    answer = (await request.json())["answer"]
+    # verify waits for the verdict, so it runs off the event loop
+    result = await asyncio.to_thread(run.observe.verify, "no-refund-promise", answer=answer)
+    return JSONResponse({"run_id": run.run_id, "verdict": result.verdict})
+
+app = Starlette(
+    routes=[Route("/replies", check_reply, methods=["POST"])],
+    middleware=[Middleware(WyrdMiddleware, state=state)],
+)
+```
 
 ```bash
 uv run uvicorn app:app
 ```
 
-At startup the middleware starts the state's writer and telemetry before the app starts. At shutdown it waits for the app's own shutdown, then drains, so evidence the app records while stopping is kept. Each request's Run is at `request.scope["wyrd.run"]`.
+**Django**
+
+Wrap the ASGI application in `asgi.py`:
+
+```python title="mysite/asgi.py"
+import os
+
+from django.core.asgi import get_asgi_application
+from wyrd.integrations.asgi import WyrdMiddleware
+from wyrd.state import WyrdState
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mysite.settings")
+application = WyrdMiddleware(get_asgi_application(), state=WyrdState.from_path(".wyrd-bundle"))
+```
+
+Then read the Run in a view:
+
+```python title="replies/views.py"
+import json
+
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from wyrd.integrations.asgi import RUN_SCOPE_KEY
+
+@csrf_exempt  # so the curl below can post without a CSRF token
+def check_reply(request):
+    run = request.scope[RUN_SCOPE_KEY]  # this request's Run, opened by the middleware
+    answer = json.loads(request.body)["answer"]
+    result = run.observe.verify("no-refund-promise", answer=answer)
+    return JsonResponse({"run_id": run.run_id, "verdict": result.verdict})
+```
+
+Add `path("replies", check_reply)` to `urlpatterns` in `urls.py`, then serve it:
+
+```bash
+uv run uvicorn mysite.asgi:application
+```
+
+**Litestar**
+
+```python title="app.py"
+import asyncio
+
+from litestar import Litestar, Request, post
+from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
+from wyrd.state import WyrdState
+
+state = WyrdState.from_path(".wyrd-bundle")  # reads local files only
+
+@post("/replies")
+async def check_reply(request: Request, data: dict[str, str]) -> dict[str, str]:
+    run = request.scope[RUN_SCOPE_KEY]  # this request's Run, opened by the middleware
+    # verify waits for the verdict, so it runs off the event loop
+    result = await asyncio.to_thread(run.observe.verify, "no-refund-promise", answer=data["answer"])
+    return {"run_id": run.run_id, "verdict": result.verdict}
+
+app = WyrdMiddleware(Litestar([check_reply]), state=state)  # wraps any ASGI app
+```
+
+```bash
+uv run uvicorn app:app
+```
+
+What the middleware does:
+
+| When | It |
+| --- | --- |
+| The app starts | Starts Wyrd's writer and telemetry, before your app's own startup. If either fails, the app does not start. |
+| A request arrives | Opens a Run of the Service, puts it at `request.scope["wyrd.run"]`, and runs your handler inside it. |
+| The app stops | Waits for your app's own shutdown, then sends every queued row and span. |
+
+The middleware verifies nothing by itself. Your handler decides what to verify and records it on the request's Run.
 
 ## Verify it worked
 
@@ -1109,13 +1205,26 @@ The reply names the request's Run and a `failed` verdict. A second request retur
 
 ## Advanced
 
-### Choose the Card per request
+### Choose the component per request
 
-By default each Run observes the root Service. Pass `alias`, a function that receives the ASGI scope and returns a Card alias from the bundle, or `None` for the Service. An alias the bundle lacks fails the request before your handler runs.
+By default each Run observes the Service. To observe one of its components instead, pass `alias`, a function from the request's ASGI scope to a component alias, or `None` for the Service:
+
+```python
+def by_path(scope):
+    return "agent" if scope["path"].startswith("/agent/") else None
+
+app.add_middleware(WyrdMiddleware, state=state, alias=by_path)
+```
+
+An alias the bundle lacks fails the request before your handler runs.
+
+### WebSockets
+
+A WebSocket connection is one Run for its whole life, so every message on it shares one `run_id`. To judge each turn of a conversation separately and the conversation as a whole, pass a `group_id` to `verify`, as in the [grouped recipe](/wyrd/build-and-verify/verify/verifier-recipes/#grouped-session).
 
 ### Your own OpenTelemetry instrumentation
 
-Add `WyrdMiddleware` after OpenTelemetry's ASGI or FastAPI instrumentation, so Wyrd's middleware is outermost and the instrumentation's spans start inside the Run. The middleware creates no spans of its own. If your app owns its tracer provider, pass `telemetry=False`: the app installs, exports, and flushes that provider, and calls `wyrd.otel.install_run_correlation(provider)` once to tag spans with the Run.
+Add `WyrdMiddleware` after OpenTelemetry's ASGI or framework instrumentation, so Wyrd's middleware is outermost and the instrumentation's spans start inside the Run. The middleware creates no spans of its own. If your app owns its tracer provider, pass `telemetry=False`: the app installs, exports, and flushes that provider, and calls `wyrd.otel.install_run_correlation(provider)` once to tag spans with the Run.
 
 ### Gunicorn
 
@@ -1126,9 +1235,9 @@ uv add gunicorn
 uv run gunicorn app:app --workers 2 --worker-class uvicorn.workers.UvicornWorker
 ```
 
-Each worker runs the app's lifespan on its own, so each worker starts and drains its own writer and telemetry. Lifespan must stay enabled; without it nothing starts and nothing drains.
+Each worker starts and drains its own writer. Lifespan must stay enabled; without it nothing starts and nothing drains.
 
-A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`, one that exceeds `--graceful-timeout`, or a failed drain can lose queued rows. A failed drain is logged with its Wyrd error code and reported to the server as a failed shutdown.
+A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`, one that exceeds `--graceful-timeout`, or a failed drain can lose queued rows.
 
 ## Reference
 
@@ -1137,15 +1246,15 @@ A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`,
 | Argument | Meaning |
 | --- | --- |
 | `app` | The ASGI app to wrap; `add_middleware` passes it. |
-| `state` | A loaded `WyrdState`. The middleware never declares or registers Cards. |
+| `state` | A loaded `WyrdState`. The middleware never declares or registers anything. |
 | `telemetry` | Whether startup calls `state.start_telemetry()`. Default `True`. |
-| `alias` | Function from the ASGI scope to the Card alias each Run observes. Default: the root Service. |
+| `alias` | Function from the ASGI scope to the component alias each Run observes. Default: the Service. |
 
-Startup or shutdown failures are reported to the server with the Wyrd error code. Other ASGI connection types pass through unchanged.
+`RUN_SCOPE_KEY` is `"wyrd.run"`, the scope key that holds the request's Run. Other ASGI connection types pass through unchanged.
 
 ## Next
 
-[Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
+[Runs and evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
 
 # Verification runtime
 
@@ -1161,7 +1270,7 @@ Every API-serving process runs Verifiers by default. To keep one out, set `WYRD_
 
 ## Size the worker pool
 
-`wyrd-server` runs Python in workers it starts from its own binary; there is nothing to install or configure. Each process has its own pool, and a process that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready.
+The server starts its own Python workers; there is nothing to install. Each process has its own pool, and a process that runs Verifiers starts its first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` workers before it reports ready.
 
 - To run more Python at once, raise `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` and `WYRD_VERIFICATION_MONTY_MAX_WORKERS` together.
 - To give each operation more memory, raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB` with `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, which must exceed it by at least 4 MiB.
@@ -1173,7 +1282,7 @@ Settings are read at startup; restart to apply a change.
 
 | You see | Fix |
 | --- | --- |
-| `hosted Verifier blocks could not start` | The first `WYRD_VERIFICATION_MONTY_MIN_WORKERS` Python workers could not start, so the server refused to start; the rest of the message names the cause |
+| `hosted Verifier blocks could not start` | Fix the cause the rest of the message names, then restart |
 | `environment variable WYRD_VERIFICATION_... could not be parsed` | Set a positive integer |
 | Two variable names in a startup error | Fix the pair; see [startup rules](/wyrd/reference/verification-runtime-limits/#startup-rules) |
 | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` from `verify` | The process has verification off or no free worker; retry or route to another process |

@@ -1240,6 +1240,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A typed verification read could not decode a requirement's custom
+    /// `data` as the caller's type.
+    ///
+    /// Raised locally after the result arrived; the stored result is
+    /// unchanged, nothing reruns, and the payload is never echoed.
+    #[error("[WYRD_SDK_422_VERIFICATION_DATA_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_422_VERIFICATION_DATA_INVALID",
+        status = 422,
+        title = "Verification data does not match the requested type",
+        remediation = "Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type."
+    )]
+    SdkVerificationDataInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload: the `requirement` ID and safe `path`.
+        details: serde_json::Value,
+    },
     /// A verification execution did not settle within the caller's wait.
     ///
     /// The execution may still be queued or running, or its staged
@@ -3774,6 +3792,7 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkVerificationWaitTimedOut { message, details }
+            | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }

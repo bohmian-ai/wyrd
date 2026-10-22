@@ -5789,6 +5789,8 @@ export interface VerificationOutcome {
 
 /**
  * The attributable result of one Verifier execution.
+ *
+ * `T` is the type of each requirement's custom `data`: JSON objects on the wire, or a caller's type after a typed SDK read.
  */
 export interface VerificationResult {
   /**

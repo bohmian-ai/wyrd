@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use skald_spec::{MediaFormat, NamedResponseFormat, SkaldError, check_output_schema};
@@ -154,7 +155,9 @@ pub struct EnqueueVerificationResponse {
 /// briefly lack a visible result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationExecutionState {
+#[schemars(rename = "VerificationExecutionState")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// The execution.
     pub execution_id: ExecutionId,
     /// Lifecycle status, independent of the verdict.
@@ -163,8 +166,10 @@ pub struct VerificationExecutionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<VerificationError>,
     /// The result once completed and visible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<VerificationResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<VerificationResult>))]
+    pub result: Option<VerificationResult<T>>,
     /// Every Operator dispatch of a failed background binding execution or a
     /// changed group verdict, in identity order; empty otherwise. Delivery
     /// completes independently of the execution and never changes its verdict.
@@ -183,9 +188,14 @@ pub struct VerificationExecutionState {
 }
 
 /// The attributable result of one Verifier execution.
+///
+/// `T` is the type of each requirement's custom `data`: JSON objects on the
+/// wire, or a caller's type after a typed SDK read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationResult {
+#[schemars(rename = "VerificationResult")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationResult<T = Map<String, Value>> {
     /// Server-issued execution identity.
     pub execution_id: ExecutionId,
     /// The caller's application Run, when there is one.
@@ -196,17 +206,21 @@ pub struct VerificationResult {
     /// The exact subject judged.
     pub subject: CardRef,
     /// Verdict, breakdown, and evidence.
-    pub outcome: VerificationOutcome,
+    #[cfg_attr(feature = "server", schema(value_type = VerificationOutcome))]
+    pub outcome: VerificationOutcome<T>,
 }
 
 /// Overall verdict with its requirement and step breakdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationOutcome {
+#[schemars(rename = "VerificationOutcome")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationOutcome<T = Map<String, Value>> {
     /// The `decide` rule applied to every applicable requirement.
     pub verdict: VerificationVerdict,
     /// Every requirement, step requirements included.
-    pub requirements: Vec<RequirementResult>,
+    #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementResult>))]
+    pub requirements: Vec<RequirementResult<T>>,
     /// Every step in plan order.
     pub steps: Vec<StepResult>,
     /// The pinned original evidence, by slot.
@@ -216,7 +230,9 @@ pub struct VerificationOutcome {
 /// The judgment of one requirement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct RequirementResult {
+#[schemars(rename = "RequirementResult")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct RequirementResult<T = Map<String, Value>> {
     /// Requirement ID.
     pub id: TaskId,
     /// Owning step of a step requirement.
@@ -237,9 +253,13 @@ pub struct RequirementResult {
     /// Custom data an Agent or code check returned under its declared
     /// `verdict` format; absent when none was declared or the output was
     /// rejected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<Map<String, Value>>")]
-    pub data: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        default,
+        schema_with = "crate::schema::skipped_option::<Map<String, Value>>"
+    )]
+    #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
+    pub data: Option<T>,
     /// Check-specific detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<RequirementDetail>,
@@ -408,6 +428,116 @@ pub struct Verdict {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::schema::skipped_option::<Map<String, Value>>")]
     pub data: Option<Map<String, Value>>,
+}
+
+impl VerificationExecutionState {
+    /// This state with its result's custom data decoded as `T`; a state
+    /// without a result converts unchanged.
+    ///
+    /// # Errors
+    /// Returns the [`VerificationResult::decode_data`] error.
+    pub fn decode_data<T: DeserializeOwned>(
+        self,
+    ) -> Result<VerificationExecutionState<T>, WyrdError> {
+        let Self {
+            execution_id,
+            status,
+            error,
+            result,
+            dispatches,
+            group_id,
+            owner_card_uid,
+            group,
+        } = self;
+        Ok(VerificationExecutionState {
+            execution_id,
+            status,
+            error,
+            result: result.map(VerificationResult::decode_data).transpose()?,
+            dispatches,
+            group_id,
+            owner_card_uid,
+            group,
+        })
+    }
+}
+
+impl VerificationResult {
+    /// This result with every present requirement `data` decoded as `T`.
+    ///
+    /// The SDKs' typed reads use it after the ordinary read: absent data
+    /// stays absent, failed requirements decode too, and the stored result is
+    /// never changed or re-executed. One mismatch fails the whole
+    /// conversion, so no partially typed result is returned.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the first
+    /// requirement whose data does not decode and the failing field path,
+    /// never the data itself.
+    pub fn decode_data<T: DeserializeOwned>(self) -> Result<VerificationResult<T>, WyrdError> {
+        let Self {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            outcome,
+        } = self;
+        let requirements = outcome
+            .requirements
+            .into_iter()
+            .map(RequirementResult::decode_data)
+            .collect::<Result<_, _>>()?;
+        Ok(VerificationResult {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            outcome: VerificationOutcome {
+                verdict: outcome.verdict,
+                requirements,
+                steps: outcome.steps,
+                evidence: outcome.evidence,
+            },
+        })
+    }
+}
+
+impl RequirementResult {
+    /// This requirement with its present `data` decoded as `T`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` with the requirement
+    /// ID and failing field path, never the data.
+    fn decode_data<T: DeserializeOwned>(self) -> Result<RequirementResult<T>, WyrdError> {
+        let data = match self.data {
+            None => None,
+            Some(data) => Some(
+                serde_path_to_error::deserialize(Value::Object(data)).map_err(|error| {
+                    let path = error.path().to_string();
+                    WyrdError::SdkVerificationDataInvalid {
+                        message: format!(
+                            "requirement `{}` data does not match the requested type at `{path}`",
+                            self.id.as_str()
+                        ),
+                        details: serde_json::json!({"requirement": self.id, "path": path}),
+                    }
+                })?,
+            ),
+        };
+        Ok(RequirementResult {
+            id: self.id,
+            step: self.step,
+            statement: self.statement,
+            outcome: self.outcome,
+            reason: self.reason,
+            actual: self.actual,
+            citations: self.citations,
+            data,
+            detail: self.detail,
+            check: self.check,
+            provenance: self.provenance,
+        })
+    }
 }
 
 impl Verdict {
@@ -691,6 +821,62 @@ mod tests {
                 "{record}"
             );
         }
+    }
+
+    /// Typed decoding converts every present requirement `data`, leaves
+    /// absent data absent, and refuses a mismatch with the requirement and
+    /// field path but never the payload, returning no partial result.
+    ///
+    /// # Panics
+    /// Panics when a conversion succeeds or fails on the wrong side.
+    #[test]
+    fn typed_data_decodes_whole_results() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Judge {
+            score: f64,
+        }
+        let requirement = |id: &str, data: Value| {
+            let mut requirement = json!({
+                "id": id, "statement": "s", "outcome": "failed", "reason": "r",
+                "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+            });
+            if !data.is_null() {
+                requirement["data"] = data;
+            }
+            requirement
+        };
+        let result = |requirements: Vec<Value>| -> VerificationResult {
+            serde_json::from_value(json!({
+                "execution_id": ExecutionId::new_v7(),
+                "verifier": {"kind": "Verifier", "name": "judge", "version": "1.0.0"},
+                "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
+                "outcome": {"verdict": "failed", "requirements": requirements, "steps": [], "evidence": {}}
+            }))
+            .expect("result")
+        };
+        let typed = result(vec![
+            requirement("scored", json!({"score": 0.25})),
+            requirement("plain", Value::Null),
+        ])
+        .decode_data::<Judge>()
+        .expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].data,
+            Some(Judge { score: 0.25 })
+        );
+        assert_eq!(typed.outcome.requirements[1].data, None);
+        let error = result(vec![
+            requirement("scored", json!({"score": 0.25})),
+            requirement("secretive", json!({"score": "hunter2"})),
+        ])
+        .decode_data::<Judge>()
+        .expect_err("mismatch");
+        assert_eq!(error.code(), "WYRD_SDK_422_VERIFICATION_DATA_INVALID");
+        assert_eq!(
+            error.problem().details,
+            json!({"requirement": "secretive", "path": "score"})
+        );
+        assert!(!error.to_string().contains("hunter2"), "{error}");
     }
 
     /// Custom Verdict data obeys the inclusive size and depth bounds: exact

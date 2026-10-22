@@ -412,3 +412,31 @@ Follow the [approved spec](../spec.md), [repository rules](../../../../AGENTS.md
 [docs rules](../../../../docs/AGENTS.md), and owning architecture linked by the
 spec. The task remains proposed; this editorial rewrite does not implement,
 commit, approve, or assert readiness.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+| --- | --- | --- | --- |
+| 1: named/plain/custom forms compile; invalid declarations persist no Card | `skald-spec` host-named formats (`d41aaf764`); `Verdict::response_format` and Verifier validation (`526e8ae19`) | `verifier_spec_requires_check_agents_to_produce_a_verdict`, `output_schemas_are_validated`, `native_body_pairs_and_round_trip`; `pg_verification_routes::verdict_declarations_validate_before_persistence` | PASS |
+| 2: validation and inclusive bounds for both kinds; invalid output inconclusive with no data | `vala_verify::blocks::verdict_from`, `Verdict::check_data_bounds` (`526e8ae19`, `372e94026`) | `check_agent_keeps_only_valid_citations`; Rust/Python/TS `invalid_custom_verdict_data_is_inconclusive`; MCP `custom_verdict_data_round_trips` (BAD) | PASS |
+| 3: data survives direct, queued, HTTP, MCP, Bifrost; foreign/scoped readers refused | Outcome Variant carries `data` unchanged | Rust/Python/TS `custom_verdict_data_survives_readback`; `pg_verification_routes::custom_verdict_data_is_tenant_isolated`; MCP `custom_verdict_data_round_trips` | PASS |
+| 4: typed operations decode wholly or raise `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | `decode_data` in `wyrd-spec` (`3cfc62f61`); TS `verifyTyped`/`waitTyped`/`statusTyped` (`3e60f4f97`); Python `verify_typed`/`wait_typed`/`status_typed` (`012535b78`) | `typed_data_decodes_whole_results`; Rust/Python/TS `custom_verdict_data_is_typed_on_return`, `typed_verdict_data_mismatch_keeps_original_result`; TS type tests; `py:typecheck` | PASS |
+| 5: authoring, stubs, generated surfaces, docs, examples, and architecture agree | `068e0710e`, `6b6237961`, `012535b78` | `codegen:check`, `docs:generate` (no drift after commit), `docs:check:commands`, `docs:linkcheck`, `check:examples`; `support_desk_answers_verifies_and_explains_every_request`; `test_verdict_format_keeps_its_name_and_takes_a_model_for_data` | PASS |
+
+Gates: `fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check`,
+`py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`,
+`ts:typecheck`, `ts:napi:check`, `git diff --check` pass. Non-goals stayed out;
+no unrelated files were committed.
+
+Limits and risks:
+
+- RED not observed for scenarios 1–3: production behavior landed before
+  the journeys that now pin it.
+- Payload permission: verification outcomes, including custom `data`, are
+  read through `bifrost_query_read` plus tenant scoping. `gateway_payload_read`
+  gates only `vala.gateway.calls` payload columns. The MCP proof shows a role
+  without query-read is refused. The spec's "elevated payload-read
+  protections" wording does not match this documented posture; spec authority
+  should confirm or narrow it.
+- Python `ty` types `.get("data")` on a generic TypedDict as the default type;
+  subscripting is typed correctly.

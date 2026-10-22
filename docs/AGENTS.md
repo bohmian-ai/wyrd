@@ -23,7 +23,7 @@ Every page is one of four types. Pick it before writing.
   options, flags, or every case.
 - Shows how the reader knows each important step worked.
 - Runs project code and the CLI through the reader's tool: `uv run`,
-  `cargo run`, `npx`. Never asks the reader to activate an environment.
+  `cargo run`, `pnpm`. Never asks the reader to activate an environment.
 - Ends with a call to action under `## Next`.
 
 **Concept** (Understand)
@@ -90,9 +90,9 @@ Copy the named page when writing a new one of the same shape.
 - Use `<LangTabs langs={['python', 'rust', 'typescript']}>` for anything that
   differs by language, in that order.
 - Pin versions in install commands to the documented release.
-- Public pages use the reader's tools (`uv add`, `cargo add`, `npm install`,
+- Public pages use the reader's tools (`uv add`, `cargo add`, `pnpm add`,
   `wyrd ...`), never repository tasks; `scripts/check_commands.py` enforces it.
-  Python uses uv, not pip.
+  Python uses uv, not pip; TypeScript uses pnpm, not npm.
 
 ## Diagrams
 

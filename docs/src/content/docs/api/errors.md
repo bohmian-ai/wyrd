@@ -122,7 +122,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_401_NO_REFRESH_TOKEN` | 401 | No refresh token | Set WYRD_REFRESH_TOKEN to the refresh token to rotate. |
 | `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | MCP host installation failed | Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected. |
 | `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | 409 | Server installation incomplete | Remove the named version directory, then rerun `wyrd server install`; nothing was activated. |
-| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry. |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (uv add --upgrade wyrd-ai, or pnpm add wyrd-ai@latest), then retry. |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | Server release unverified | Retry the install; if it fails again, report the release. The current installation is unchanged. |
 | `WYRD_CLI_500_IO` | 500 | CLI filesystem IO failed | Check file paths and permissions, then retry. |
 | `WYRD_CLI_500_OUTPUT` | 500 | CLI output failed | Retry the command or use --format text. |

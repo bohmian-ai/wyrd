@@ -4,7 +4,7 @@ version = { workspace = true }
 edition = { workspace = true }
 description = "Small shared Wyrd helpers with no server dependencies."
 license = { workspace = true }
-rust-version = { workspace = true }
+rust-version = "1.95"
 repository = { workspace = true }
 authors = { workspace = true }
 [features]

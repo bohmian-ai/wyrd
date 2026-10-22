@@ -3,7 +3,7 @@ name = "wyrd-semver"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
-rust-version = { workspace = true }
+rust-version = "1.95"
 repository = { workspace = true }
 authors = { workspace = true }
 description = "Semver primitives for Wyrd: version values, ranges, bumps, and SQL-pushdown bounds."

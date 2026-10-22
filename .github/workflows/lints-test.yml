@@ -255,6 +255,16 @@ jobs:
         env:
           UV_PYTHON: ${{ matrix.python-version }}
 
+      # A native crash shows only Python frames in faulthandler; macOS writes
+      # the full native stack of every thread to a crash report.
+      - name: Upload native crash reports
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-reports-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ~/Library/Logs/DiagnosticReports/*.ips
+          if-no-files-found: ignore
+
   docs:
     name: docs
     needs: changes

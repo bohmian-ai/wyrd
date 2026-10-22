@@ -1351,8 +1351,9 @@ fn assert_scored(result: &VerificationResult) {
         requirement(result, "tally-counted")
             .step
             .as_ref()
-            .map(|step| step.as_str()),
-        Some("tally")
+            .expect("a step requirement names its step")
+            .as_str(),
+        "tally"
     );
 }
 

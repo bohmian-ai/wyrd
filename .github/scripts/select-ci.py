@@ -39,9 +39,14 @@ GLOBAL = re.compile(
 )
 # Paths that select no verification of their own.
 UNVERIFIED = re.compile(r"^(changes/|architecture/|\.agents/skills/wyrd-advise/references/|[^/]+\.md$)")
-# The docs diagram test reads the wyrd-spec contract bundle, so contract
-# sources are docs inputs as well as Rust packages.
-DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/(src|examples)/|examples/)")
+# The docs diagram test reads the wyrd-spec contract bundle, and the error
+# reference is generated from every `#[wyrd_error]` under crate and SDK `src/`
+# trees (docs/scripts/generate_api_docs.py), so those sources are docs inputs
+# as well as Rust packages.
+DOCS = re.compile(
+    r"^(docs/|openapi\.yaml|crates/wyrd-spec/(src|examples)/|examples/"
+    r"|(crates|sdks)/.+/src/.+\.rs$)"
+)
 # UI also covers the generated token targets so the token drift check fires on a
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.

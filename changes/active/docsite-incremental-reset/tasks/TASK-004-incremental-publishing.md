@@ -1,9 +1,9 @@
 ---
 id: TASK-004
 kind: implementation
-status: proposed
+status: complete
 spec: SPEC-docsite-incremental-reset
-spec_revision: 7
+spec_revision: 9
 requirements: [REQ-004, REQ-006, INV-001, INV-002, INV-003, INV-004, INV-005, AC-003, AC-006, AC-007]
 depends_on: [TASK-003]
 parent_task:
@@ -151,7 +151,7 @@ it does not become an additional implementation task or a repeated task-level ga
 | INV-001, AC-006 | TASK-002/003; TASK-004 preserves checks | Existing site, both themes/responsive/keyboard review, docs gate |
 | INV-002, INV-003 | All tasks | Only the approved REQ-007 ergonomic extension; vocabulary, auth, identities and audit preserved |
 | INV-004 | All tasks | Existing checks retained; generated sources regenerated, not hand-edited |
-| INV-005 | All tasks | First three-page rewrite only; no later-guide/all-language/SaaS/template/CLI-selection expansion |
+| INV-005 | All tasks | Later guides only as REQ-012 slices; no all-language/SaaS/template/CLI-selection expansion |
 
 ## Material Stop Conditions
 
@@ -162,9 +162,48 @@ the current selector's source classification are implementation-owned.
 
 ## Authority Links
 
-- [Approved spec revision 7](../spec.md)
+- [Approved spec revision 9](../spec.md)
 - [Repository standards](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md)
 - [Spec workflow](../../../../changes/spec-driven-development.md)
 - [Implementation execution](../../../../changes/implementation-execution.md)
 - [Testing workflows](../../../../TESTING.md)
 - [Earlier packet](../../developer-docsite-rebuild/spec.md)
+
+## Implementation evidence (spec revision 9)
+
+Capability map revalidated against current source:
+
+- Sample changes already select their checks: `examples/` is in `DOCS`, and the
+  `PYTHON`, `TYPESCRIPT`, and `wyrd-rust-examples` owner rules select
+  `py:test:integration`, `ts:test:integration`, and `test:examples`, each of
+  which runs its language's quickstart journey (`test_docsite_quickstart.py`,
+  `examples/tests/quickstart.rs`). Existing self-tests pin this. No narrow
+  journey task was added: each lane is the owning language suite, and narrowing
+  it would drop journeys that share example Cards (for example
+  `test_support_desk.py`), weakening a conservative selection.
+- Gap closed: `error_catalog` reads every `crates|sdks/**/src/**/*.rs`, but only
+  `wyrd-spec` sources selected docs, so an error added elsewhere left
+  `api/errors.md` stale until an unrelated docs change failed its drift check.
+- Gap closed: publication fired only on `docs/**`, so changed examples,
+  `openapi.yaml`, or error sources did not redeploy.
+- `examples/quickstart/stored-verdicts.sql` selects docs only; its journey in
+  `test_local_development.py` is `local_dev` and is excluded from CI by design,
+  so that proof stays with the released walkthrough (TASK-001/002).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Local snippet change selects docs checks and its journeys | Existing `DOCS`/`PYTHON`/`TYPESCRIPT` rules | `docs example Card runs every language's journeys`, `docs example Rust program runs the examples journeys only` | PASS |
+| Generated-reference sources outside `wyrd-spec` select docs proof | `.github/scripts/select-ci.py` `DOCS` | New cases: crate error source, SDK error source (RED: 2 failed; GREEN: 62 passed), Rust test source leaves docs alone | PASS |
+| Publication triggers cover the same inputs | `.github/workflows/publish-docs.yml` push paths | Static inspection: `examples/**`, `openapi.yaml`, `crates/**/src/**/*.rs`, `sdks/**/src/**/*.rs` | PASS |
+| PRODUCT and CONTRIBUTING describe runnable snippets, evidence, withdrawal, one slice at a time | `docs/PRODUCT.md` principle 3; `docs/CONTRIBUTING.md` "Publishing a page"; `docs/AGENTS.md` rationale and diagram rules (REQ-010/011) | Static inspection | PASS |
+| Old packet superseded with history preserved | `developer-docsite-rebuild/spec.md` already `superseded`, linking this packet | Static inspection; no edit needed | PASS |
+| Existing fallbacks and gates remain effective | No fallback or gate changed | `test-detect-changes.sh` 62/62, `mise run check:ci-selection` 7/7, `git diff --check` | PASS |
+
+Commands: `mise exec -- bash .github/scripts/tests/test-detect-changes.sh`,
+`mise run check:ci-selection`, `git diff --check`. `mise run docs:check` is
+deferred to the pre-commit run. Cost: any Rust `src/` change now also runs the
+docs job; that is the price of keeping the generated error reference current.
+
+## Review verdict
+
+PASS: manually reviewed and approved by the user on 2026-10-21.

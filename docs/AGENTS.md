@@ -50,6 +50,9 @@ Every page is one of four types. Pick it before writing.
   reader makes or explains something they see. Config precedence, credential
   lookup order, file layouts, internal services, and environment variables the
   reader never types belong in reference.
+- **Design rationale.** Why Wyrd works this way goes on an Understand page;
+  the guide links to it in at most one sentence. A sentence that stays true
+  when the reader skips the step is rationale.
 - **Edge cases and alternatives.** Put them in an `<Aside>` with a link, or on
   a concept or reference page.
 - **Failures from other tasks.** End a guide with `## If it fails`: a two-column
@@ -90,6 +93,17 @@ Copy the named page when writing a new one of the same shape.
 - Public pages use the reader's tools (`uv add`, `cargo add`, `npm install`,
   `wyrd ...`), never repository tasks; `scripts/check_commands.py` enforces it.
   Python uses uv, not pip.
+
+## Diagrams
+
+- One diagram answers one stated question. A page has at most one diagram per
+  question.
+- Diagrams live on concept pages and the landing page. A guide may show one at
+  the top only to picture what the reader builds, and links to the concept
+  page for the rest.
+- Draw only shipped behavior, reviewed against the owning section in
+  `architecture/` before publication.
+- Every diagram has a text alternative.
 
 ## Components
 

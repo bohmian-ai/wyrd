@@ -168,6 +168,12 @@ check_selection "docs example Card runs every language's journeys" \
 check_selection "docs example Rust program runs the examples journeys only" \
   "full_gate=false python=false typescript=false ci_lanes~test:examples ci_lanes~check:examples" \
   "examples/quickstart/quickstart.rs"
+check_selection "crate error source regenerates the error reference" "full_gate=false docs=true" \
+  "crates/shared/wyrd-client/src/error.rs"
+check_selection "SDK error source regenerates the error reference" "full_gate=false docs=true" \
+  "sdks/wyrd-sdk-python/src/lib.rs"
+check_selection "Rust test source leaves the docs alone" "full_gate=false docs=false" \
+  "crates/shared/wyrd-client/tests/integration/transport/http.rs"
 check_selection "identity fixture selects the identity journey" "full_gate=false identity=true" \
   "tests/fixtures/identity/dex-config.yaml"
 

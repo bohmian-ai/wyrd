@@ -1,6 +1,6 @@
 ---
 id: SPEC-docsite-incremental-reset
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -13,9 +13,11 @@ and inspect a passing and failing verification without learning an entire
 agent application. Existing readers can still find accurate concepts,
 operational procedures, and contract reference.
 
-This change audits publication of the current corpus and finishes only the
-Introduction, Setup, and Quickstart learning path. Later guides are separate
-bounded changes, not unfinished acceptance obligations of this specification.
+This change audits publication of the current corpus and finishes the
+Introduction, Setup, and Quickstart learning path. Revision 9 adds a visible
+coding-agent entry, architecture and verification diagrams, a rule that keeps
+design rationale out of guides, and an ordered sequence of later guides that
+publish one evidence-backed slice at a time (REQ-009 to REQ-012).
 Documentation uses small, independently executable examples owned in Wyrd.
 The external example repositories are optional supplemental applications.
 
@@ -288,6 +290,64 @@ regenerate the derived contracts. Wyrd has no released compatibility promise
 for these kinds: stored envelopes of removed kinds and of old Model/Data
 shapes are removed by migration, with no compatibility read path or alias.
 
+### REQ-009 — Make the coding-agent path visible
+
+An outside reader looked for "Use with your coding agent" at the top of the
+site and found `llms.txt` only in the footer. The site header on every page
+and the landing hero link to a Get started page, "Use with your coding agent".
+That page holds the `llms.txt` and `llms-full.txt` links and `wyrd mcp install`
+with its printed output and a way to confirm the agent sees Wyrd's tools,
+proven by a released 0.3.0 walkthrough (REQ-002). Host-specific flags and
+remote servers sit in that page's Advanced section. The page replaces
+`connect/connect-an-agent-through-mcp.md`. The footer link remains.
+
+### REQ-010 — Show where Wyrd fits and how it works
+
+The same reader looked for an architecture diagram and found none: the
+existing diagram specs are no longer embedded on any published page. Diagrams
+use the existing diagram specs and components, answer one stated question
+each, have a text alternative, and are reviewed against their owning
+architecture section before publication.
+
+- The Introduction shows Wyrd in an existing stack: the application and its
+  SDK, CI over the CLI, coding agents over MCP, the Wyrd server
+  (declarations, verification engine, Bifrost), PostgreSQL, and object
+  storage. It replaces the ownership table, and its steps read Declare,
+  Observe, Verify.
+- A new Understand page, Architecture, shows a team deployment: the
+  developer-facing endpoint, server replicas, Bifrost targets, PostgreSQL,
+  object storage, the identity provider, the LLM gateway and model provider,
+  and the trust boundary.
+- How verification works shows the parts of verification and where each
+  check kind runs, the verify and submit paths, and the execution lifecycle.
+  Configure the verification runtime shows the processes and limits that run
+  checks.
+- The Bifrost page shows its parts, deployment targets, and the gap between
+  written and queryable data.
+
+An existing diagram that no longer matches its owning architecture section is
+corrected or left out. It is never published with a caveat.
+
+### REQ-011 — Keep rationale out of guides
+
+Text-heavy guides made setup feel complex. Guides hold steps, code, and
+output. Design rationale moves to the owning Understand page, which the guide
+links in at most one sentence; detail that changes no reader decision moves
+to reference. Published guides are revised to this rule as they are touched,
+and contributor guidance states it with the diagram rules of REQ-010.
+
+### REQ-012 — Publish later guides one slice at a time
+
+A Q&A or support-agent builder could not tell what Wyrd does for them; a
+model-judged check is the capability that answers it. After the first path,
+guides publish one at a time in this order: Author a Verifier (assertion,
+Python, and model judge, with the LLM gateway page it requires), Declare a
+Service, Respond to a failed verification, Record a Run and observations,
+then the remaining drafts. Each slice owns a local example under `examples/`
+that extends the Quickstart Service, a journey test that needs no provider
+credentials, and REQ-002 evidence before publication. `choose-your-path` is
+withdrawn; navigation covers its purpose.
+
 ## Invariants, boundaries, and non-goals
 
 - **INV-001:** Retain the approved Wyrd brand, landing visual language,
@@ -302,9 +362,10 @@ shapes are removed by migration, with no compatibility read path or alias.
 - **INV-004:** Generated material changes through its owning source or
   generator. Existing format, link, command, contract, and accessibility gates
   are not weakened to accommodate the reset.
-- **INV-005:** Later guides, all-language tutorial expansion, a complete API
-  catalog rewrite, hosted SaaS documentation, the Python template, and CLI
-  selection are outside this change's completion boundary.
+- **INV-005:** Later guides are in scope only as REQ-012 slices. All-language
+  tutorial parity, a complete API catalog rewrite, hosted SaaS documentation,
+  the Python template, and CLI selection are outside this change's
+  completion boundary. The six navigation sections and their depth remain.
 
 ## Acceptance and evidence
 
@@ -319,6 +380,10 @@ shapes are removed by migration, with no compatibility read path or alias.
 | AC-008 | `WyrdState.declare(path)` prepares a ready state from authored YAML in all first-class SDKs; `from_path` remains offline bundle loading. Without `bundle_dir` no files remain after return, failure, or cancellation. Explicit retained bundles work. Reruns preserve existing declaration rules and errors remain actionable. The public `artifacts` accessor is removed. | Rust/Python/TypeScript real-server declaration-to-verification journeys, no-files-left proof, retained-bundle offline regression, export/type checks for accessor removal, and the exact Quickstart journey. Public onboarding switches only after the new API is released and its walkthrough passes. |
 | AC-009 | The Card kinds and code match REQ-008 across server, wire contracts, SDKs, CLI, MCP, and doctrine; a drift Verifier fits from its Data reference's Parquet; removed kinds and Model/Data payload fields are refused with stable errors. | Drift baseline journey on a real server, refusal journeys for a removed kind and a Model payload, migration test over stored envelopes, `codegen:check`, `check:deps`, SDK export/type checks, and a repository search showing no removed kind or `wyrd-interfaces` reference outside history. |
 | AC-007 | Local snippet and generated-source changes reach docs verification/publication, and the old broad content authority is superseded on approval. | CI/task dependency inspection, updated product/contributor guidance and packet status. |
+| AC-010 | Every page's header and the landing hero reach "Use with your coding agent", whose `wyrd mcp install` step works at the published release. | Built-site link evidence, released 0.3.0 walkthrough, existing MCP install/proxy journey. |
+| AC-011 | The Introduction, Architecture, How verification works, Configure the verification runtime, and Bifrost pages show the REQ-010 diagrams, each matching its owning architecture section. | Diagram review against `wyrd-design.md` and `bifrost-design.md`, accessibility check of the text alternatives, `mise run docs:check`. |
+| AC-012 | Published guides carry steps, code, and output; their rationale lives on Understand pages. | Page review against `docs/AGENTS.md`, including the updated rationale and diagram rules. |
+| AC-013 | Each REQ-012 slice publishes only with its local example and journey test passing; the model-judged check runs without provider credentials in tests. | The slice's narrow journey lane and its released walkthrough. |
 
 Use the narrowest existing journey lanes for changed executable examples and
 `mise run docs:check` for site verification. Planning identifies exact focused
@@ -339,7 +404,9 @@ remain implementation choices.
 
 ## Open material decisions
 
-None. Revision 8 was directed by the user with “strip the part out now,
+None. Revision 9 was approved with "i agree" after the user reviewed the
+coding-agent entry, the diagram set, the rationale rule, and the guide order.
+Revision 8 was directed by the user with “strip the part out now,
 revise the spec”, after agreeing the REQ-008 boundary in conversation. Revision 7 was approved with “agree. update the task”: state owns its
 runtime resources, staging is deleted before return, required backing files
 have a separate owned lifetime, and callers never manage private directories.
@@ -358,6 +425,11 @@ artifacts blocks publication and must be reported.
 
 ## Revision history and authority
 
+- **Revision 9 — 2026-10-21 — approved by the user:** Add REQ-009 to REQ-012
+  and AC-010 to AC-013 from outside-reader feedback: a header and hero entry
+  for coding agents, stack, architecture, verification, and Bifrost diagrams,
+  rationale moved from guides to Understand, and later guides published one
+  slice at a time, starting with Author a Verifier. Amend INV-005.
 - **Revision 8 — 2026-10-20 — directed by the user:** Add REQ-008 and AC-009:
   Model and Data become references, Experiment/Mcp/Policy/Audit Card kinds are
   removed, drift baselines are Data references to Parquet Artifacts, and

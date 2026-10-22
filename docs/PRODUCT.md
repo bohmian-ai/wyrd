@@ -102,7 +102,9 @@ Hosted Wyrd SaaS workflows are out of scope until explicitly added.
 
 1. Lead with the user's job, not Wyrd's internal inventory.
 2. Teach through complete, executable journeys with visible successful results.
-3. Reuse one coherent system example across roles, languages, and interfaces.
+3. Teach each task with a small, independently runnable example under
+   `examples/`, extending the Quickstart Service where it fits. Full
+   applications are optional further reading, never a prerequisite.
 4. Keep concepts concise and put exhaustive machinery in searchable reference.
 5. Project one contract consistently across human and agent-facing surfaces.
 

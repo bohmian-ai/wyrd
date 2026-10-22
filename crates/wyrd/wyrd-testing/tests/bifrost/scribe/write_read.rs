@@ -1501,3 +1501,193 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     writer.flush_bifrost().await.expect("publishes");
     assert_composite_reads(&reader_client, &table, "peer published").await;
 }
+
+/// Returns `batch` with every `value` shifted by `by`, so two batches of one
+/// composite table stay distinguishable on read.
+fn shifted(batch: &RecordBatch, by: i64) -> RecordBatch {
+    let values = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value is Int64");
+    let mut columns = batch.columns().to_vec();
+    columns[3] = Arc::new(Int64Array::from_iter_values(
+        values.values().iter().map(|value| value + by),
+    ));
+    RecordBatch::try_new(batch.schema(), columns).expect("shifted batch")
+}
+
+/// Commits a new default sort order — the current keys plus `value`
+/// descending — straight through the table's Iceberg metadata, and returns its
+/// id. The node's cached revision is evicted so the next admission reads it.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the revision does not commit.
+async fn commit_sort_revision(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    table: &vala_bifrost_redux::catalog::TableRef,
+) -> i32 {
+    use iceberg::spec::{NullOrder, SortDirection, SortField, SortOrder, Transform};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let catalog = server.bifrost_catalog();
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+        .expect("binding resolves");
+    let physical = catalog
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .expect("physical table loads");
+    let metadata = physical.metadata();
+    let order_id = metadata
+        .sort_orders_iter()
+        .map(|order| order.order_id)
+        .max()
+        .expect("a registered table has a sort order")
+        + 1;
+    let value_id = metadata
+        .current_schema()
+        .field_by_name("value")
+        .expect("value is a column")
+        .id;
+    let order = SortOrder::builder()
+        .with_order_id(order_id)
+        .with_fields(
+            metadata
+                .default_sort_order()
+                .fields
+                .iter()
+                .cloned()
+                .chain([SortField {
+                    source_id: value_id,
+                    transform: Transform::Identity,
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::Last,
+                }])
+                .collect(),
+        )
+        .build_unbound()
+        .expect("sort order builds");
+    let transaction = Transaction::new(&physical);
+    let action = transaction
+        .apply_updates()
+        .requirement(iceberg::TableRequirement::DefaultSortOrderIdMatch {
+            default_sort_order_id: metadata.default_sort_order_id(),
+        })
+        .update(iceberg::TableUpdate::AddSortOrder { sort_order: order })
+        .update(iceberg::TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+    ApplyTransactionAction::apply(action, transaction)
+        .expect("revision applies")
+        .commit(catalog.iceberg_catalog().as_ref())
+        .await
+        .expect("revision commits");
+    catalog.evict_committed_revision(table, tenant);
+    i32::try_from(order_id).expect("sort order id fits i32")
+}
+
+/// A batch accepted before a sort-order revision keeps that revision through
+/// staging, restart, and publication, while a batch admitted after it is
+/// written under the new one; a retry across the revision is acknowledged
+/// without a duplicate row and a changed payload under the same id is refused.
+///
+/// # Panics
+///
+/// Panics when a row is missing or duplicated, a retry is misjudged, or a
+/// published object names the wrong sort order.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn accepted_batch_revision_survives_alteration_and_restart() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("accepted_revision");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
+    let client = tenant_client(&server, tenant).await;
+    let accepted = uuid::Uuid::now_v7();
+    super::support::append_batch(&client, &table, accepted, &composite_batch())
+        .await
+        .expect("the first batch is acknowledged");
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    drop(scribe);
+
+    let revised = commit_sort_revision(&server, tenant, &table_ref).await;
+    super::support::append_batch(&client, &table, accepted, &composite_batch())
+        .await
+        .expect("a retry across the revision is acknowledged");
+    let later = shifted(&composite_batch(), COMPOSITE_ROWS);
+    super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &later)
+        .await
+        .expect("the post-revision batch is acknowledged");
+    let all: Vec<i64> = (0..2 * COMPOSITE_ROWS).collect();
+    let read_all = |client: wyrd_client::WyrdClient| {
+        let table = table.clone();
+        async move {
+            super::support::read_sql(
+                &client,
+                &format!("SELECT value FROM {table} ORDER BY value"),
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        read_all(client).await,
+        all,
+        "active and staged rows read once"
+    );
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "restored rows read once"
+    );
+    super::support::append_batch(&client, &table, accepted, &composite_batch())
+        .await
+        .expect("a retry after restart is acknowledged");
+    server.flush_bifrost().await.expect("publishes");
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "published rows read once"
+    );
+
+    let mut rows_by_order = std::collections::BTreeMap::new();
+    for file in server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), &name)
+        .await
+        .expect("published hot files are inspectable")
+    {
+        *rows_by_order
+            .entry(file.promotion_record.sort_order_id)
+            .or_insert(0_u64) += file.row_count;
+    }
+    assert_eq!(
+        rows_by_order,
+        std::collections::BTreeMap::from([
+            (
+                vala_bifrost_redux::catalog::layout::BIFROST_SORT_ORDER_ID,
+                COMPOSITE_ROWS as u64
+            ),
+            (revised, COMPOSITE_ROWS as u64),
+        ]),
+        "each batch publishes under the sort order it was accepted under"
+    );
+    assert!(
+        super::support::append_batch(&client, &table, accepted, &shifted(&composite_batch(), 1))
+            .await
+            .is_err(),
+        "a changed payload under an accepted batch id is refused"
+    );
+    assert_eq!(read_all(client).await, all, "the refusal stores nothing");
+}

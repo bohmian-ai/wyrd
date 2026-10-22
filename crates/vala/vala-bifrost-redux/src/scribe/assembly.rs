@@ -191,6 +191,18 @@ impl ScribeAssemblyKey {
         &self.table
     }
 
+    /// Returns the seal key every member's generation was frozen under, the
+    /// key hot authority for those generations is registered by.
+    #[must_use]
+    pub fn seal_key(&self) -> crate::scribe::seal_key::SealKey {
+        crate::scribe::seal_key::SealKey::new(
+            self.tenant,
+            self.table.clone(),
+            self.partition.clone(),
+        )
+        .with_revision(self.revision)
+    }
+
     /// Returns the revision every member was accepted under.
     #[must_use]
     pub const fn revision(&self) -> LayoutRevision {

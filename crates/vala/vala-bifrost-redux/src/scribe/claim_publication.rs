@@ -134,11 +134,7 @@ impl ClaimPublisher {
             return Ok(());
         };
         let key = request.claim.key();
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.partition().clone(),
-        );
+        let seal_key = key.seal_key();
         let object_keys = if object_identities.is_empty() {
             vec![request.object_base.to_owned()]
         } else {
@@ -207,11 +203,7 @@ impl ClaimPublisher {
             return Ok(false);
         };
         let key = claim.key();
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.partition().clone(),
-        );
+        let seal_key = key.seal_key();
         for member in claim.members() {
             let authority = hot_sources
                 .authority(
@@ -258,11 +250,7 @@ impl ClaimPublisher {
             return Ok(());
         };
         let key = request.claim.key();
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.partition().clone(),
-        );
+        let seal_key = key.seal_key();
         let generations: Vec<_> = request
             .claim
             .members()
@@ -307,11 +295,7 @@ impl ClaimPublisher {
         };
         hot_sources
             .release(
-                &crate::scribe::seal_key::SealKey::new(
-                    key.tenant(),
-                    key.table().clone(),
-                    key.partition().clone(),
-                ),
+                &key.seal_key(),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
                     member.generation(),
@@ -348,11 +332,7 @@ impl ClaimPublisher {
         };
         hot_sources
             .drain_leases(
-                &crate::scribe::seal_key::SealKey::new(
-                    key.tenant(),
-                    key.table().clone(),
-                    key.partition().clone(),
-                ),
+                &key.seal_key(),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
                     member.generation(),
@@ -759,11 +739,7 @@ impl ClaimPublisher {
             return Ok(());
         };
         match hot_sources.release(
-            &crate::scribe::seal_key::SealKey::new(
-                key.tenant(),
-                key.table().clone(),
-                key.partition().clone(),
-            ),
+            &key.seal_key(),
             crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation()),
         ) {
             Ok(_) | Err(crate::scribe::hot_source::HotSourceError::Unregistered { .. }) => Ok(()),

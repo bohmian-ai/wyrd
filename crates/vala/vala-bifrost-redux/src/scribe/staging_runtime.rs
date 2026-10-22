@@ -419,11 +419,7 @@ impl ScribeStagingRuntime {
         };
         hot_sources
             .advance(
-                &crate::scribe::seal_key::SealKey::new(
-                    key.tenant(),
-                    key.table().clone(),
-                    key.partition().clone(),
-                ),
+                &key.seal_key(),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
                     member.generation(),
@@ -713,11 +709,7 @@ impl ScribeStagingRuntime {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
         };
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.partition().clone(),
-        );
+        let seal_key = key.seal_key();
         for member in members {
             let id = member.record().member();
             let wal = member.record().wal_range();
@@ -1867,7 +1859,7 @@ mod tests {
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
     ) {
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition().clone());
+        let seal_key = key.seal_key();
         for member in member_ids {
             assert_eq!(
                 hot_sources
@@ -2292,7 +2284,7 @@ mod tests {
     ) {
         let claim_id = claim.to_string();
         let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition().clone());
+        let seal_key = key.seal_key();
         let ordinal = |member: &StagedMemberId| {
             crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation())
         };

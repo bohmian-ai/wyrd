@@ -574,8 +574,7 @@ pub async fn insert_artifact_set_fenced(
         (None, 0) => 0,
         (None, _) => {
             return Err(SqlError::InvariantViolation {
-                detail: "writer-v2 publication committed without a publication revision"
-                    .to_owned(),
+                detail: "writer-v2 publication committed without a publication revision".to_owned(),
             });
         }
     };

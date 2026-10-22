@@ -3665,7 +3665,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_publication_committed_before_revision_tracking_recovers_at_revision_zero() {
         let fixture = PublicationRecoveryFixture::start().await;
-        fixture.persist("generation-1", b"pre-revision set", (1, 2)).await;
+        fixture
+            .persist("generation-1", b"pre-revision set", (1, 2))
+            .await;
         assert_eq!(fixture.recover().await.expect("fresh recovery"), 1);
         assert_eq!(fixture.revision().await, Some(1));
         sqlx::query("DELETE FROM vala.bifrost_table_publication_revisions WHERE node_id=$1")
@@ -3674,21 +3676,38 @@ mod tests {
             .await
             .expect("model the pre-revision committed state");
 
-        fixture.persist("generation-1", b"pre-revision set", (1, 2)).await;
+        fixture
+            .persist("generation-1", b"pre-revision set", (1, 2))
+            .await;
         assert_eq!(
-            fixture.recover().await.expect("pre-revision replay recovers"),
+            fixture
+                .recover()
+                .await
+                .expect("pre-revision replay recovers"),
             1
         );
         assert_eq!(fixture.file_rows().await, 1, "the replay inserts nothing");
-        assert_eq!(fixture.revision().await, None, "the replay invents no revision");
+        assert_eq!(
+            fixture.revision().await,
+            None,
+            "the replay invents no revision"
+        );
         assert_eq!(fixture.recover().await.expect("cleaned recovery"), 0);
 
-        fixture.persist("generation-2", b"post-revision set", (3, 4)).await;
+        fixture
+            .persist("generation-2", b"post-revision set", (3, 4))
+            .await;
         assert_eq!(fixture.recover().await.expect("fresh publication"), 1);
         assert_eq!(fixture.revision().await, Some(1));
-        fixture.persist("generation-2", b"post-revision set", (3, 4)).await;
+        fixture
+            .persist("generation-2", b"post-revision set", (3, 4))
+            .await;
         assert_eq!(fixture.recover().await.expect("exact replay"), 1);
         assert_eq!(fixture.file_rows().await, 2);
-        assert_eq!(fixture.revision().await, Some(1), "a replay keeps its revision");
+        assert_eq!(
+            fixture.revision().await,
+            Some(1),
+            "a replay keeps its revision"
+        );
     }
 }

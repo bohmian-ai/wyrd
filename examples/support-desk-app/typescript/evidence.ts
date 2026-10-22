@@ -3,7 +3,7 @@
  * carries its `run_id`, so one join links the ticket to the agent's
  * span, its gateway call, and each verdict.
  *
- *   npm run evidence -- <run_id>
+ *   pnpm run evidence -- <run_id>
  */
 
 import { Bifrost, type WyrdClient } from "wyrd-ai";
@@ -43,6 +43,6 @@ export async function evidence(runId: string, client?: WyrdClient) {
 
 if (import.meta.main) {
   const runId = process.argv[2];
-  if (!runId) throw new Error("usage: npm run evidence -- <run_id>");
+  if (!runId) throw new Error("usage: pnpm run evidence -- <run_id>");
   console.table(await evidence(runId));
 }

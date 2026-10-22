@@ -24,7 +24,7 @@ write a machine-specific path into a project file.
 
    - Python: `uv add "wyrd-ai==<version>"`
    - Rust: `cargo add wyrd-ai@<version> tokio --features tokio/full`
-   - TypeScript: `npm install wyrd-ai@<version>`
+   - TypeScript: `pnpm add wyrd-ai@<version>`
 
    If that exact version is unavailable, stop and report it. Never install
    another version.

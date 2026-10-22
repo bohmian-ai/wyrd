@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 /** The Cards this repository declares. */
 export const SERVICE_DIR = resolve(import.meta.dirname, "../service");
 
-/** Where `npm run deploy` pulls the declared Service; `BUNDLE_DIR` overrides it. */
+/** Where `pnpm run deploy` pulls the declared Service; `BUNDLE_DIR` overrides it. */
 export const BUNDLE_DIR = process.env.BUNDLE_DIR ?? resolve(import.meta.dirname, "../.wyrd-bundle");
 
 /** The Bifrost table the Service declares. */

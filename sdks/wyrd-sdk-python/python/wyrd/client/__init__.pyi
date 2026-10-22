@@ -85,7 +85,7 @@ class WyrdClient:
 
         Raises:
             ImportError: ``httpx`` or ``httpx2`` is missing; install
-                ``wyrd[gateway]``.
+                ``wyrd-ai[gateway]``.
         """
         ...
 

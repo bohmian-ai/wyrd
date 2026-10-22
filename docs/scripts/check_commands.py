@@ -10,14 +10,16 @@ from pathlib import Path
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = [DOCS_ROOT / "src" / "content" / "docs", DOCS_ROOT / "CONTRIBUTING.md"]
-# Cargo and uv are forbidden only where they drive this repository: a
-# reader's own project (`cargo run`, `uv run quickstart.py`) has no mise.
+# Cargo, uv, and pnpm are forbidden only where they drive this repository: a
+# reader's own project (`cargo run`, `uv run quickstart.py`, `pnpm add`) has
+# no mise.
 FORBIDDEN = re.compile(
     r"^\s*(?:[$>]?\s*)?("
     r"cargo\s+(?:test|nextest|clippy|fmt|check|build|bench)\b"
     r"|cargo\b.*\s(?:-p|--package|--workspace|--manifest-path)\b"
     r"|uv\s+run\s+(?:--(?:project|directory|package)\b|(?:python\s+)?scripts/)"
-    r"|pnpm(?:\s|$))"
+    r"|pnpm\s+(?:test|check|build|dev|preview|install|exec\s+vitest)\b"
+    r"|pnpm\b.*\s(?:-C|--dir|--filter)\b)"
 )
 FENCE = re.compile(r"^\s*```(?P<info>.*)$")
 ALLOWED_HINTS = {"internal", "contributor", "maintainer"}
@@ -71,12 +73,14 @@ def main() -> int:
 
 
 def self_check() -> None:
-    """Pin which Cargo and uv commands count as bypassing the task runner."""
+    """Pin which Cargo, uv, and pnpm commands count as bypassing the task runner."""
     for line in ["cargo test", "cargo nextest run --locked", "cargo run -p wyrd-server", "cargo build --workspace",
-                 "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest"]:
+                 "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest",
+                 "pnpm test", "pnpm check", "pnpm install --frozen-lockfile", "pnpm -C docs build"]:
         assert FORBIDDEN.match(line), line
     for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.3.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.3.0 --locked",
-                 "uv run quickstart.py", "uv run wyrd init"]:
+                 "uv run quickstart.py", "uv run wyrd init",
+                 "pnpm init && pnpm pkg set type=module", "pnpm add wyrd-ai@0.3.0", "pnpm wyrd init"]:
         assert not FORBIDDEN.match(line), line
 
 

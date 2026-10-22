@@ -132,7 +132,7 @@ if (import.meta.main) {
   // ANCHOR: startup
   // WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd init` saved, say which server to use and who the app is.
   const client = WyrdClient.connect();
-  // The declared Service, pulled by `npm run deploy`.
+  // The declared Service, pulled by `pnpm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
   await state.startBifrost(); // writes tickets to Bifrost
   await state.startTelemetry(); // exports spans to Wyrd

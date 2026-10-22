@@ -19,6 +19,16 @@ Page: /wyrd/get-started/introduction/
 
 You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
+## How Wyrd fits your stack
+
+_Diagram `wyrd-in-your-stack`: see the web page._
+
+1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+2. **Observe.** Your app sends Bifrost, Wyrd's data plane, everything it produces as it runs: telemetry, its own data, and the evidence it submits to verify. Bifrost keeps all of it queryable with SQL beside every verdict.
+3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
+
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/wyrd/understand/architecture/) shows what a team deployment runs.
+
 ## An example
 
 A support agent must never promise a guaranteed refund. The Service describes the agent and binds a Verifier, which states that requirement as an assertion:
@@ -153,16 +163,6 @@ failed: operator NotContains returned false
 
 In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
 
-## How Wyrd fits your stack
-
-_Diagram `wyrd-in-your-stack`: see the web page._
-
-1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
-2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
-3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
-
-Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/wyrd/understand/architecture/) shows what a team deployment runs.
-
 ## Where Wyrd stops
 
 Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
@@ -185,7 +185,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 | --- | --- |
 | OS | macOS on Apple silicon, or Linux (x86_64 or arm64) |
 | PostgreSQL | 16, with a user that owns the database (not a superuser) |
-| Language | Python 3.11, Rust 1.99, or Node.js 22.18 |
+| Language | Python 3.11, Rust 1.95, or Node.js 22.18 |
 
 ## Install
 
@@ -210,11 +210,11 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 
 ```bash
 mkdir quickstart && cd quickstart
-npm init -y && npm pkg set type=module
-npm install wyrd-ai@0.3.0
+pnpm init && pnpm pkg set type=module
+pnpm add wyrd-ai@0.3.0
 ```
 
-Run the CLI as `npx wyrd`.
+Run the CLI as `pnpm wyrd`.
 
 ## Agent-guided setup
 
@@ -465,7 +465,7 @@ Run the program again. Nothing changed, so you get the same verdicts and `uid` v
 
 ## 3. Confirm the stored verdicts
 
-The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `pnpm wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
 
 ```bash
 wyrd get --space default --kind Service --name support-reply --version 1.0.0
@@ -2192,7 +2192,7 @@ The server calls model providers with keys you configure, for model-judged check
 
 ## Next
 
-[How verification works](/wyrd/understand/how-verification-works/) follows one check through the server. [Bifrost](/wyrd/understand/bifrost/) covers the evidence store.
+[How verification works](/wyrd/understand/how-verification-works/) follows one check through the server. [Bifrost](/wyrd/understand/bifrost/) covers the data plane.
 
 # How verification works
 
@@ -3218,7 +3218,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_401_NO_REFRESH_TOKEN` | 401 | No refresh token | Set WYRD_REFRESH_TOKEN to the refresh token to rotate. |
 | `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | MCP host installation failed | Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected. |
 | `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | 409 | Server installation incomplete | Remove the named version directory, then rerun `wyrd server install`; nothing was activated. |
-| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry. |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (uv add --upgrade wyrd-ai, or pnpm add wyrd-ai@latest), then retry. |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | Server release unverified | Retry the install; if it fails again, report the release. The current installation is unchanged. |
 | `WYRD_CLI_500_IO` | 500 | CLI filesystem IO failed | Check file paths and permissions, then retry. |
 | `WYRD_CLI_500_OUTPUT` | 500 | CLI output failed | Retry the command or use --format text. |

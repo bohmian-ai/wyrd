@@ -4,7 +4,7 @@
  * repeat deploy replaces the bundle only once the new pull is complete, so a
  * refused pull keeps the previous one.
  *
- *   npm run deploy
+ *   pnpm run deploy
  */
 
 import { join } from "node:path";

@@ -281,7 +281,7 @@ An empty list means you're connected. Your code finds the server the same way, w
 
 ### 3. Run your first verification
 
-Follow [Run your first verification](/wyrd/get-started/quickstart/).
+Follow [Run your first verification](/wyrd/get-started/quickstart/), through [Confirm the stored verdicts](/wyrd/get-started/quickstart/#3-confirm-the-stored-verdicts).
 
 ## If it fails
 

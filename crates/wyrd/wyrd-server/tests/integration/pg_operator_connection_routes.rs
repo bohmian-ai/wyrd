@@ -629,7 +629,7 @@ async fn register_operator(
 ) -> (StatusCode, Value) {
     let body = json!({ "submissions": [{
         "apiVersion": "wyrd/v1", "kind": "Operator",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": spec, "artifacts": []
     }] });
     let request = Request::builder()

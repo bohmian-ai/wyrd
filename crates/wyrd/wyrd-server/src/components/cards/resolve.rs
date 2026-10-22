@@ -212,7 +212,7 @@ impl EffectiveSpecs {
         conn: &mut TenantConn<'_>,
         submissions: &[CardSubmission],
     ) -> Result<ResolvedRefs, WyrdError> {
-        let siblings = sibling_identities(submissions)?;
+        let siblings = sibling_identities(submissions);
         let mut refs = Vec::new();
 
         for submission in submissions {
@@ -248,7 +248,7 @@ impl EffectiveSpecs {
 
     /// Decode every pinned submission into the identity cache.
     ///
-    /// Submissions without a resolved space and version cannot be a sibling
+    /// Submissions without a resolved version cannot be a sibling
     /// target, so they are skipped rather than cached under a partial identity.
     ///
     /// # Errors
@@ -256,17 +256,13 @@ impl EffectiveSpecs {
     fn new(submissions: &[CardSubmission], resolved: ResolvedRefs) -> Result<Self, WyrdError> {
         let mut siblings = HashMap::new();
         for submission in submissions {
-            let (Some(space), Some(version)) = (
-                &submission.metadata.space,
-                submission.metadata.resolved_pin(),
-            ) else {
+            let Some(version) = submission.metadata.resolved_pin() else {
                 continue;
             };
             let identity = CardRef {
                 kind: submission.kind.clone(),
                 name: submission.metadata.name.clone(),
                 version: version.clone(),
-                space: Some(space.clone()),
                 uid: None,
             }
             .identity_key();
@@ -898,28 +894,21 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
 ///
 /// Auto-versioned and scoped submissions cannot be sibling targets because a
 /// sibling reference carries an exact version before declaration resolves.
-fn sibling_identities(
-    submissions: &[CardSubmission],
-) -> Result<BTreeSet<CardRefIdentity>, WyrdError> {
+fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<CardRefIdentity> {
     submissions
         .iter()
-        .map(|submission| {
-            let space = submission.metadata.space.as_ref().ok_or_else(|| {
-                WyrdError::registry_invalid_card_spec("metadata.space is required")
-            })?;
-            Ok(submission.metadata.resolved_pin().cloned().map(|version| {
+        .filter_map(|submission| {
+            submission.metadata.resolved_pin().cloned().map(|version| {
                 CardRef {
                     kind: submission.kind.clone(),
                     name: submission.metadata.name.clone(),
                     version,
-                    space: Some(space.clone()),
                     uid: None,
                 }
                 .identity_key()
-            }))
+            })
         })
-        .collect::<Result<Vec<_>, WyrdError>>()
-        .map(|identities| identities.into_iter().flatten().collect())
+        .collect()
 }
 
 /// Return the exact identity used for sibling matching and UID binding.
@@ -930,12 +919,8 @@ fn sibling_key(card_ref: &CardRef) -> CardRefIdentity {
 /// Format a reference for deterministic comparison and actionable errors.
 fn display_ref(card_ref: &CardRef) -> String {
     format!(
-        "{}/{}/{}@{}",
+        "{}/{}@{}",
         card_ref.kind.wire_name(),
-        card_ref
-            .space
-            .as_ref()
-            .map_or("<missing-space>", |space| space.as_str()),
         card_ref.name,
         card_ref.version
     )
@@ -963,16 +948,11 @@ mod tests {
             kind: CardKind::Prompt,
             name: name.parse().expect("test_setup: reference name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test_setup: reference version is valid"),
-            space: Some(
-                "default"
-                    .parse()
-                    .expect("test_setup: reference space is valid"),
-            ),
             uid: None,
         }
     }
 
-    /// A `default` space Prompt submission `name` pinned to `1.0.0` with a
+    /// A Prompt submission `name` pinned to `1.0.0` with a
     /// minimal portable spec.
     ///
     /// # Panics
@@ -987,11 +967,6 @@ mod tests {
                     VersionBlock::parse("1.0.0").expect("test_setup: submission version is valid"),
                 )),
                 bump: None,
-                space: Some(
-                    "default"
-                        .parse()
-                        .expect("test_setup: submission space is valid"),
-                ),
                 uid: None,
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),
@@ -1055,17 +1030,6 @@ mod tests {
             .expect("test_setup: sibling prompt is accepted");
 
         assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn sibling_identity_requires_space() {
-        let mut child = submission("child");
-        child.metadata.space = None;
-
-        let error =
-            sibling_identities(&[child]).expect_err("test_setup: missing space must be rejected");
-
-        assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
     }
 
     #[test]
@@ -1149,7 +1113,7 @@ mod tests {
             VersionBlock::parse("2.0.0").expect("test_setup: version is valid"),
         ));
 
-        let identities = sibling_identities(&[first, second]).expect("identities resolve");
+        let identities = sibling_identities(&[first, second]);
         assert_eq!(identities.len(), 2);
     }
 
@@ -1161,7 +1125,7 @@ mod tests {
         scoped.metadata.version =
             Some(VersionSpec::parse("1").expect("test_setup: scope is valid"));
 
-        let identities = sibling_identities(&[scoped]).expect("scoped submission is accepted");
+        let identities = sibling_identities(&[scoped]);
 
         assert!(identities.is_empty());
     }

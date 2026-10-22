@@ -103,7 +103,7 @@ impl Registered {
         let card = temp.path().join("evidence.yaml");
         std::fs::write(
             &card,
-            "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: hosted-evidence\n  version: 1.0.0\n  space: default\nartifacts:\n  - relative_path: notes.txt\n    content_type: text/plain\n  - relative_path: check.py\n    content_type: text/x-python\nspec:\n  artifact_kind: dataset\n",
+            "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: hosted-evidence\n  version: 1.0.0\nartifacts:\n  - relative_path: notes.txt\n    content_type: text/plain\n  - relative_path: check.py\n    content_type: text/x-python\nspec:\n  artifact_kind: dataset\n",
         )
         .expect("card writes");
         let input = build_declaration_input(load(&card).expect("loader tree builds"))

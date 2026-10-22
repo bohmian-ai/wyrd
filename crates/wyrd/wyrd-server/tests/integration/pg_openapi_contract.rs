@@ -231,8 +231,8 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards",
         "/v1/cards/by-uid/{kind}/{card_uid}",
         "/v1/cards/by-ref",
-        "/v1/cards/{kind}/{space}/{name}/latest",
-        "/v1/cards/{kind}/{space}/{name}/versions",
+        "/v1/cards/{kind}/{name}/latest",
+        "/v1/cards/{kind}/{name}/versions",
         "/v1/cards/{card_uid}/artifacts",
         "/v1/cards/{card_uid}/complete",
         "/v1/cards/download/init",
@@ -1434,7 +1434,6 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
         parameter_names,
         BTreeSet::from([
             "kind",
-            "space",
             "name",
             "version_range",
             "status",
@@ -2309,8 +2308,7 @@ async fn agent_contracts_replace_workflow() {
             .json(&serde_json::json!({ "submissions": submissions }))
             .send()
     };
-    let metadata =
-        |name: &str| serde_json::json!({ "name": name, "version": "1.0.0", "space": "default" });
+    let metadata = |name: &str| serde_json::json!({ "name": name, "version": "1.0.0" });
 
     let workflow = register(
         "t12-workflow",
@@ -2394,7 +2392,7 @@ async fn agent_contracts_replace_workflow() {
         "spec": {
             "prompt": {
                 "kind": "Prompt", "name": "t12-prompt",
-                "version": "1.0.0", "space": "default"
+                "version": "1.0.0"
             },
             "execution_route": { "kind": "native" }
         },

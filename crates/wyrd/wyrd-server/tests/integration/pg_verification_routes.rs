@@ -676,7 +676,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         .expect("role seeds");
 
     let subject_ref: CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vr-service", "version": "1.0.0", "space": "default"
+        "kind": "Service", "name": "vr-service", "version": "1.0.0"
     }))
     .expect("subject ref decodes");
     let owner = server

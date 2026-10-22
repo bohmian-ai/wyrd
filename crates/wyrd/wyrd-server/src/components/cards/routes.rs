@@ -12,7 +12,7 @@ use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     CardDeclarationOutcome, DeclareCardRequest, DeclareCardResponse, DeleteCardResponse,
@@ -50,7 +50,7 @@ pub fn cards_router() -> OpenApiRouter<AppState> {
     ),
     responses(
         (status = 200, description = "Hydrated Card", body = GetCardResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -108,19 +108,18 @@ pub(crate) async fn get_card_for(
     Ok(response)
 }
 
-/// Fetch one Card by its exact kind/space/name/version identity.
+/// Fetch one Card by its exact kind/name/version identity.
 #[utoipa::path(
     get,
     path = "/cards/by-ref",
     params(
         ("kind" = String, Query, description = "Exact Card kind"),
-        ("space" = String, Query, description = "Exact Card space"),
         ("name" = String, Query, description = "Exact Card name"),
         ("version" = String, Query, description = "Exact Card version")
     ),
     responses(
         (status = 200, description = "Hydrated Card", body = GetCardResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -182,15 +181,14 @@ pub(crate) async fn get_card_by_ref_for(
 /// Resolve the newest stable Active Card in an identity line.
 #[utoipa::path(
     get,
-    path = "/cards/{kind}/{space}/{name}/latest",
+    path = "/cards/{kind}/{name}/latest",
     params(
         ("kind" = String, Path, description = "Card kind"),
-        ("space" = String, Path, description = "Card space"),
         ("name" = String, Path, description = "Card name")
     ),
     responses(
         (status = 200, description = "Latest Active Card", body = GetCardResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -210,18 +208,17 @@ pub(crate) async fn get_card_by_ref_for(
 async fn get_latest_card_http(
     State(state): State<AppState>,
     caller: Caller,
-    Path((kind, space, name)): Path<(String, String, String)>,
+    Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
-    let space = parse_space(&space)?;
     let name = parse_name(&name)?;
     authorize_card_read(
         &state,
         &caller,
         "card.read.latest",
-        &format!("card:{}/{space}/{name}", kind.wire_name()),
+        &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::get_latest_card(&state, &caller, kind, space, name)
+    service::get_latest_card(&state, &caller, kind, name)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -230,16 +227,15 @@ async fn get_latest_card_http(
 /// List versions in one exact Card identity line.
 #[utoipa::path(
     get,
-    path = "/cards/{kind}/{space}/{name}/versions",
+    path = "/cards/{kind}/{name}/versions",
     params(
         ("kind" = String, Path, description = "Card kind"),
-        ("space" = String, Path, description = "Card space"),
         ("name" = String, Path, description = "Card name"),
         ("include_prerelease" = Option<bool>, Query, description = "Include prerelease versions")
     ),
     responses(
         (status = 200, description = "Card versions", body = ListVersionsResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -256,19 +252,18 @@ async fn get_latest_card_http(
 async fn list_versions_http(
     State(state): State<AppState>,
     caller: Caller,
-    Path((kind, space, name)): Path<(String, String, String)>,
+    Path((kind, name)): Path<(String, String)>,
     Query(query): Query<VersionListQuery>,
 ) -> Result<Json<ListVersionsResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
-    let space = parse_space(&space)?;
     let name = parse_name(&name)?;
     authorize_card_read(
         &state,
         &caller,
         "card.read.versions",
-        &format!("card:{}/{space}/{name}", kind.wire_name()),
+        &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::list_card_versions(&state, &caller, kind, space, name, query.include_prerelease)
+    service::list_card_versions(&state, &caller, kind, name, query.include_prerelease)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -280,7 +275,6 @@ async fn list_versions_http(
     path = "/cards",
     params(
         ("kind" = Option<String>, Query, description = "Filter by Card kind"),
-        ("space" = Option<String>, Query, description = "Filter by Card space"),
         ("name" = Option<String>, Query, description = "Filter by Card name"),
         ("version_range" = Option<String>, Query, description = "Filter by semver range"),
         ("status" = Option<String>, Query, description = "Filter by lifecycle status"),
@@ -334,7 +328,7 @@ pub(crate) async fn list_cards_for(
     responses(
         (status = 200, description = "Artifact inventory",
          body = wyrd_spec::registry::ArtifactInventoryResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -530,7 +524,7 @@ async fn complete_card_http(
     ),
     responses(
         (status = 200, description = "Card deleted", body = DeleteCardResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -574,13 +568,13 @@ async fn delete_card_http(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Delete one Card by its exact kind/space/name/version identity.
+/// Delete one Card by its exact kind/name/version identity.
 ///
 /// The `card:write` verdict is staged exactly once before the soft-delete
 /// runs, whatever its outcome. Storage cleanup runs after the delete commits.
 ///
 /// # Errors
-/// Returns a validation error for an invalid kind, space, name, or version,
+/// Returns a validation error for an invalid kind, name, or version,
 /// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
@@ -588,13 +582,12 @@ async fn delete_card_http(
     path = "/cards/by-ref",
     params(
         ("kind" = String, Query, description = "Exact Card kind"),
-        ("space" = String, Query, description = "Exact Card space"),
         ("name" = String, Query, description = "Exact Card name"),
         ("version" = String, Query, description = "Exact Card version")
     ),
     responses(
         (status = 200, description = "Card deleted", body = DeleteCardResponse),
-        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The Card kind, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -636,7 +629,6 @@ async fn delete_card_by_ref_http(
 #[derive(Debug, Deserialize)]
 struct DeleteCardRefQuery {
     kind: String,
-    space: String,
     name: String,
     version: String,
 }
@@ -644,7 +636,6 @@ struct DeleteCardRefQuery {
 #[derive(Debug, Deserialize)]
 struct CardRefQuery {
     kind: String,
-    space: String,
     name: String,
     version: String,
 }
@@ -653,7 +644,6 @@ impl CardRefQuery {
     fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
         Ok(CardRef {
             kind: parse_card_kind(&self.kind)?,
-            space: Some(parse_space(&self.space)?),
             name: parse_name(&self.name)?,
             version: self.version.parse().map_err(|error| {
                 WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
@@ -678,11 +668,6 @@ impl DeleteCardRefQuery {
                 "kind is not a valid Card kind",
             ))
         })?;
-        let space = SpaceName::new(self.space).map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
-                "space is invalid: {error}"
-            )))
-        })?;
         let name = CardName::new(self.name).map_err(|error| {
             WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
                 "name is invalid: {error}"
@@ -697,7 +682,6 @@ impl DeleteCardRefQuery {
             kind,
             name,
             version,
-            space: Some(space),
             uid: None,
         })
     }
@@ -714,13 +698,12 @@ fn single_card_response(outcome: CardDeclarationOutcome) -> DeclareCardResponse 
 /// Render one exact Card reference as a stable audit resource string.
 ///
 /// Identity-line routes have no UID to name yet, so the decision row records the
-/// kind/space/name/version the caller asked for. Keeping one renderer means every
+/// kind/name/version the caller asked for. Keeping one renderer means every
 /// such row is comparable across read and delete routes.
 fn card_resource(card_ref: &CardRef) -> String {
     format!(
-        "card:{}/{}/{}@{}",
+        "card:{}/{}@{}",
         card_ref.kind.wire_name(),
-        card_ref.space.as_ref().map_or("-", SpaceName::as_str),
         card_ref.name,
         card_ref.version,
     )
@@ -772,14 +755,6 @@ fn parse_card_kind(value: &str) -> Result<CardKind, WyrdErrorResponse> {
         WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
             "kind is not a valid Card kind",
         ))
-    })
-}
-
-fn parse_space(value: &str) -> Result<SpaceName, WyrdErrorResponse> {
-    SpaceName::new(value.to_owned()).map_err(|error| {
-        WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
-            "space is invalid: {error}"
-        )))
     })
 }
 

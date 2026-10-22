@@ -36,7 +36,6 @@ pub(crate) async fn resolve_card_scope(
             let parsed = get_card_by_ref(
                 conn,
                 card_ref.kind.clone(),
-                &card_ref.space,
                 &card_ref.name,
                 &card_ref.version,
             )

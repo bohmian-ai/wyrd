@@ -2548,8 +2548,6 @@ pub struct WorkloadBindingEntry {
     pub kind: String,
     /// Card name.
     pub name: String,
-    /// Space that pins the card identity.
-    pub space: String,
     /// Exact card version (no version range).
     pub version: String,
 }
@@ -3573,7 +3571,6 @@ impl WyrdServerConfig {
                     ("subject", binding.subject.as_str()),
                     ("kind", binding.kind.as_str()),
                     ("name", binding.name.as_str()),
-                    ("space", binding.space.as_str()),
                     ("version", binding.version.as_str()),
                 ] {
                     if value.is_empty() {
@@ -5396,7 +5393,6 @@ minimum_slots = 2
             audience = "my-audience"
             kind = "service"
             name = "my-model"
-            space = "prod"
             version = "1.0.0"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
@@ -5407,7 +5403,6 @@ minimum_slots = 2
         assert_eq!(binding.audience.as_deref(), Some("my-audience"));
         assert_eq!(binding.kind, "service");
         assert_eq!(binding.name, "my-model");
-        assert_eq!(binding.space, "prod");
         assert_eq!(binding.version, "1.0.0");
     }
 
@@ -5440,7 +5435,6 @@ minimum_slots = 2
             subject = "system:serviceaccount:ns/sa"
             kind = "model"
             name = "my-model"
-            space = "prod"
             version = "1.0.0"
             extra_field = "bad"
         "#;
@@ -5586,7 +5580,6 @@ minimum_slots = 2
             subject = "system:serviceaccount:default/my-sa"
             kind = "model"
             name = "my-model"
-            space = "prod"
             version = "1.0.0"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
@@ -5607,7 +5600,6 @@ minimum_slots = 2
             subject = ""
             kind = "model"
             name = "my-model"
-            space = "prod"
             version = "1.0.0"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
@@ -5628,7 +5620,6 @@ minimum_slots = 2
             subject = "system:serviceaccount:default/my-sa"
             kind = "model"
             name = "my-model"
-            space = "prod"
             version = ""
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
@@ -5687,7 +5678,6 @@ minimum_slots = 2
             subject = "system:serviceaccount:default/my-sa"
             kind = "model"
             name = "my-model"
-            space = "prod"
             version = "1.0.0"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");

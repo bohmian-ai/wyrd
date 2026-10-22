@@ -216,7 +216,7 @@ impl<'a> TokenGrants<'a> {
             Err(error) => {
                 let wyrd = map_exchange_error_to_wyrd(&mut conn, &parsed.prefix, error).await;
                 stage_scope_mint_failure_audit(
-                    &*self.state.scribe_outbox,
+                    &**self.state.bifrost.scribe_outbox(),
                     parsed.tenant_id,
                     self.request_id,
                     MINT_KIND_API_KEY_EXCHANGE,
@@ -365,7 +365,7 @@ impl<'a> TokenGrants<'a> {
                 }
                 let wyrd = WyrdError::from(error);
                 stage_scope_mint_failure_audit(
-                    &*self.state.scribe_outbox,
+                    &**self.state.bifrost.scribe_outbox(),
                     tenant_id,
                     self.request_id,
                     MINT_KIND_REFRESH,
@@ -385,7 +385,7 @@ impl<'a> TokenGrants<'a> {
     fn issuer(&self) -> Result<wyrd_auth::issuance::TenantTokenIssuer, WyrdError> {
         self.state
             .auth
-            .tenant_issuer(&self.state.scribe_outbox)
+            .tenant_issuer(self.state.bifrost.scribe_outbox())
             .ok_or_else(not_configured)
     }
 }
@@ -562,7 +562,8 @@ async fn issue_key(
     // The decision is staged as soon as it is made; the issued key is
     // recorded separately once its transaction commits.
     state
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .stage(audited_caller.data_tenant_id, decision);
     let tenant = caller.principal().tenant_id;
     let mut conn = state
@@ -579,7 +580,7 @@ async fn issue_key(
         .await
         .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
     service.audit(
-        &*state.scribe_outbox,
+        &**state.bifrost.scribe_outbox(),
         tenant,
         &issued,
         &audited_caller.principal,
@@ -892,7 +893,7 @@ mod pg_tests {
         .expect("issue key succeeds");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );
@@ -989,7 +990,7 @@ mod pg_tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );

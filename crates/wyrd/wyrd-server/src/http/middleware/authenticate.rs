@@ -314,10 +314,12 @@ mod pg_tests {
         let state = test_state().await;
         let jwt = mint_test_user_jwt(&state, tenant, chrono::Duration::minutes(5));
         let issuing_key = state.auth.issuing_key.clone();
-        let state = state.with_auth(crate::components::auth::ServerAuth {
-            issuing_key,
-            token_verifier: None,
-            ..crate::components::auth::ServerAuth::default()
+        let state = state.with_owners_for_test(|owners| {
+            owners.auth = crate::components::auth::ServerAuth {
+                issuing_key,
+                token_verifier: None,
+                ..crate::components::auth::ServerAuth::default()
+            }
         });
 
         let response = test_router(state)
@@ -366,15 +368,17 @@ mod pg_tests {
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
         let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
-        crate::test_support::test_app_state(
-            postgres,
-            Arc::new(StorageHandle::new(signer)),
-            crate::test_support::test_catalog().await,
-        )
-        .with_auth(crate::components::auth::ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..crate::components::auth::ServerAuth::default()
+        crate::state::AppState::from_owners_for_test(crate::state::AppStateInner {
+            auth: crate::components::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..crate::components::auth::ServerAuth::default()
+            },
+            ..crate::test_support::test_owners(
+                postgres,
+                Arc::new(StorageHandle::new(signer)),
+                crate::test_support::test_catalog().await,
+            )
         })
     }
 

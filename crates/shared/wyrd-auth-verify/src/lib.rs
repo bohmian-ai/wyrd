@@ -25,7 +25,7 @@ use wyrd_runtime::{
 };
 use wyrd_spec::DataTenantId;
 pub use wyrd_spec::auth::TokenAudience;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
+use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 
@@ -824,11 +824,10 @@ impl AccessTokenClaims {
     /// appears in a token, so every `system` claim set is refused.
     ///
     /// # Errors
-    /// Returns an error when the token names the reserved capture identity or
-    /// a `system` principal, the delegation chain is too deep or malformed, or
+    /// Returns an error when the token names a `system` principal, the
+    /// delegation chain is too deep or malformed, or
     /// the expiry timestamp is out of range.
     pub fn into_verified(&self) -> Result<VerifiedToken, AuthError> {
-        self.enforce_reserved_capture_identity()?;
         let kind = wire_kind_into_principal_kind(
             self.principal.kind,
             self.principal.card_ref.as_ref(),
@@ -853,27 +852,6 @@ impl AccessTokenClaims {
             delegation_chain,
             exp,
         })
-    }
-}
-
-impl AccessTokenClaims {
-    /// Rejects claims that name the reserved gateway capture identity.
-    ///
-    /// Gateway capture is a server-internal write that holds no token, so
-    /// [`GATEWAY_CAPTURE_PRINCIPAL`], like the platform audit principal, never
-    /// appears in one. Signing-key possession is the issuance control; this
-    /// check keeps a defect in any issue path from minting a usable token
-    /// under that identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AuthError::InvalidToken`] when the token names the reserved
-    /// capture identity, in any shape.
-    fn enforce_reserved_capture_identity(&self) -> Result<(), AuthError> {
-        if self.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
-            return Err(AuthError::InvalidToken);
-        }
-        Ok(())
     }
 }
 
@@ -974,10 +952,6 @@ fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, 
         if out.len() >= MAX_DELEGATION_DEPTH {
             return Err(AuthError::DelegationDepthExceeded);
         }
-        // The reserved capture identity acts only as itself, never as a delegator.
-        if layer.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
-            return Err(AuthError::InvalidToken);
-        }
         let kind = wire_kind_into_principal_kind(
             layer.principal.kind,
             layer.principal.card_ref.as_ref(),
@@ -1071,7 +1045,6 @@ mod tests {
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::GATEWAY_CAPTURE_PRINCIPAL;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
@@ -1239,44 +1212,6 @@ mod tests {
             verified.delegation_chain[1].principal.card_ref(),
             current_actor.card_ref.as_ref()
         );
-    }
-
-    /// Proves the reserved capture identity never verifies: a token naming it
-    /// is refused even in the card-free `Service` shape a capture token once
-    /// carried, and an actor layer naming it is refused too.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either claim set verifies or fails with another error.
-    #[test]
-    fn reserved_capture_identity_never_verifies() {
-        let capture = TokenPrincipalRef {
-            id: GATEWAY_CAPTURE_PRINCIPAL,
-            kind: PrincipalKindTag::Service,
-            ..user_ref()
-        };
-        let rejected = [
-            AccessTokenClaims {
-                sub: GATEWAY_CAPTURE_PRINCIPAL.to_string(),
-                principal: capture.clone(),
-                ..claims_with_times(now() + 300, now())
-            },
-            AccessTokenClaims {
-                act: Some(Box::new(ActClaim {
-                    sub: GATEWAY_CAPTURE_PRINCIPAL.to_string(),
-                    principal: capture,
-                    act: None,
-                })),
-                ..claims_with_times(now() + 300, now())
-            },
-        ];
-        for claims in rejected {
-            let result = claims.into_verified();
-            assert!(
-                matches!(result, Err(AuthError::InvalidToken)),
-                "{claims:?} -> {result:?}"
-            );
-        }
     }
 
     /// A Card-free service is a valid machine principal: Card binding is a

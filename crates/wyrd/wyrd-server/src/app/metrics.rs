@@ -142,6 +142,38 @@ pub const OPERATOR_DISPATCH_ATTEMPTS_TOTAL: &str = "wyrd_operator_dispatch_attem
 /// Claim-to-settlement latency of one Operator attempt, by `outcome`.
 pub const OPERATOR_DISPATCH_DURATION_SECONDS: &str = "wyrd_operator_dispatch_duration_seconds";
 
+/// A governed gateway call's arrival until its answer, or stream end, was
+/// handed to the response body.
+pub const GATEWAY_DURATION_SECONDS: &str = "wyrd_gateway_duration_seconds";
+/// [`GATEWAY_DURATION_SECONDS`] less the provider exchange time the call
+/// waited on: the server overhead of one call.
+pub const GATEWAY_OVERHEAD_SECONDS: &str = "wyrd_gateway_overhead_seconds";
+/// Provider exchange time one call waited on, summed across its attempts.
+pub const GATEWAY_UPSTREAM_SECONDS: &str = "wyrd_gateway_upstream_seconds";
+/// One request-path phase of a governed gateway call.
+pub const GATEWAY_PHASE_DURATION_SECONDS: &str = "wyrd_gateway_phase_duration_seconds";
+/// A governed call's receipt until its execution task settled it.
+pub const GATEWAY_REQUEST_DURATION_SECONDS: &str = "wyrd_gateway_request_duration_seconds";
+/// One provider attempt's wall-clock duration.
+pub const GATEWAY_ATTEMPT_DURATION_SECONDS: &str = "wyrd_gateway_attempt_duration_seconds";
+/// A governed call's receipt until its answer reached the caller.
+pub const GATEWAY_TIME_TO_FIRST_BYTE_SECONDS: &str = "wyrd_gateway_time_to_first_byte_seconds";
+/// A governed call's receipt until its execution task started.
+pub const GATEWAY_QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
+
+/// Gateway latency families sharing [`VERIFICATION_DURATION_BUCKETS`], so a
+/// sub-millisecond overhead p99 is resolvable.
+const GATEWAY_DURATION_FAMILIES: &[&str] = &[
+    GATEWAY_DURATION_SECONDS,
+    GATEWAY_OVERHEAD_SECONDS,
+    GATEWAY_UPSTREAM_SECONDS,
+    GATEWAY_PHASE_DURATION_SECONDS,
+    GATEWAY_REQUEST_DURATION_SECONDS,
+    GATEWAY_ATTEMPT_DURATION_SECONDS,
+    GATEWAY_TIME_TO_FIRST_BYTE_SECONDS,
+    GATEWAY_QUEUE_DELAY_SECONDS,
+];
+
 /// Verification latency families sharing [`VERIFICATION_DURATION_BUCKETS`].
 const VERIFICATION_DURATION_FAMILIES: &[&str] = &[
     VERIFICATION_RUN_DURATION_SECONDS,
@@ -292,6 +324,14 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             )
             .map_err(MetricsError::Buckets)?;
     }
+    for family in GATEWAY_DURATION_FAMILIES {
+        builder = builder
+            .set_buckets_for_metric(
+                Matcher::Full((*family).to_owned()),
+                VERIFICATION_DURATION_BUCKETS,
+            )
+            .map_err(MetricsError::Buckets)?;
+    }
     for family in BIFROST_P99_DURATION_FAMILIES {
         builder = builder
             .set_buckets_for_metric(
@@ -418,6 +458,33 @@ mod tests {
                 output.contains(&format!("{family}_sum")),
                 "missing sum for {family}"
             );
+        }
+    }
+
+    /// Every gateway duration family renders the fine verification buckets,
+    /// so an overhead under 1 ms lands below the `le="0.001"` bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a family renders without those buckets, count, or sum.
+    #[test]
+    fn gateway_duration_families_render_buckets() {
+        let handle = get_handle();
+        for family in GATEWAY_DURATION_FAMILIES {
+            metrics::histogram!(*family, "operation" => "chat_completions").record(0.0004);
+        }
+        let output = handle.render();
+        for family in GATEWAY_DURATION_FAMILIES {
+            for suffix in [
+                "_bucket{operation=\"chat_completions\",le=\"0.0005\"}",
+                "_count",
+                "_sum",
+            ] {
+                assert!(
+                    output.contains(&format!("{family}{suffix}")),
+                    "missing {suffix} for {family}"
+                );
+            }
         }
     }
 

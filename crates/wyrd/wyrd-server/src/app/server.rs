@@ -30,7 +30,6 @@ use crate::grpc::{
     serve_grpc_with_listener, serve_peer_grpc_with_listener,
 };
 use crate::state::{AppState, BifrostShutdownReport};
-use crate::verification::{RuntimeLimits, VerificationRuntime};
 
 type BoxWorker = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -102,8 +101,8 @@ pub struct WyrdServer {
 impl WyrdServer {
     /// Assemble the server around a fully-built core `AppState`.
     ///
-    /// Creates the gRPC health reporter/service pair here so the reporter stored
-    /// in `AppState.grpc_health` and the mounted health service come from the
+    /// Creates the gRPC health reporter/service pair here so the reporter the
+    /// readiness loop drives and the mounted health service come from the
     /// same `health_reporter()` call.
     ///
     /// Does **not** install the Prometheus recorder — that is a process-global
@@ -126,8 +125,6 @@ impl WyrdServer {
         metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     ) -> Result<Self, ServerBootError> {
         let (reporter, health_service) = wyrd_tonic::tonic_health::server::health_reporter();
-        // Store this reporter in state so readiness drives THIS health service.
-        let state = state.with_grpc_health(reporter.clone());
 
         let grpc_router = build_app_grpc(
             &state,
@@ -146,7 +143,7 @@ impl WyrdServer {
         // so a target that should serve the peer plane but composed no private
         // router is reported unready instead of quietly serving nothing.
         if config.bifrost.peer.is_enabled() {
-            state.peer_plane.require();
+            state.health.peer_plane.require();
         }
         let http_router = crate::http::build_router(state.clone());
 
@@ -458,19 +455,6 @@ impl BoundServer {
         self.http_addr
     }
 
-    /// Compose this process's verification runtime from its configuration.
-    ///
-    /// Results are written through the process's capture writer. The drain
-    /// grace is clipped inside the server's shutdown budget so released
-    /// leases settle before teardown aborts the task.
-    fn verification_runtime(&self) -> Option<VerificationRuntime> {
-        let limits = RuntimeLimits::default()
-            .within_server_drain(Duration::from_millis(self.config.shutdown.drain_ms));
-        VerificationRuntime::builder(&self.state)
-            .limits(limits)
-            .build()
-    }
-
     /// The bound gRPC address, or `None` when the mode does not serve gRPC.
     #[must_use]
     pub fn grpc_addr(&self) -> Option<SocketAddr> {
@@ -549,7 +533,7 @@ impl BoundServer {
         }
 
         // Health: publish the initial snapshot before driving it.
-        publish_initial_health(&self.state.readiness, &mut self.reporter).await;
+        publish_initial_health(&self.state.health.readiness, &mut self.reporter).await;
 
         // Core workers.
         set.spawn(worker_task(
@@ -564,7 +548,7 @@ impl BoundServer {
         set.spawn(worker_task(
             TaskId::Worker("health_status"),
             drive_health_status(
-                self.state.readiness.clone(),
+                self.state.health.readiness.clone(),
                 self.reporter.clone(),
                 shutdown.clone(),
             ),
@@ -612,33 +596,6 @@ impl BoundServer {
                             },
                         }
                     }
-                },
-            ));
-        }
-        // Oracle's cut cache serves only while this listener hears every
-        // `vala.file_list` change, so it runs wherever Oracle plans queries.
-        if self.state.bifrost.oracle_peer_service().is_some()
-            && let Some(catalog) = self.state.bifrost.catalog().map(Arc::clone)
-        {
-            let shutdown = shutdown.clone();
-            set.spawn(worker_task(
-                TaskId::Worker("oracle_cut_cache"),
-                async move {
-                    catalog.watch_cuts(shutdown).await;
-                },
-            ));
-        }
-        // Resolved verification targets serve only while this listener hears
-        // every Card, drift baseline, and SYSTEM principal change that could
-        // alter them, so it runs wherever Verifiers execute.
-        if self.state.verification_blocks.is_some() {
-            let targets = Arc::clone(&self.state.verifier_cards);
-            let pool = self.state.postgres.wyrd().app_pool().clone();
-            let shutdown = shutdown.clone();
-            set.spawn(worker_task(
-                TaskId::Worker("verifier_card_cache"),
-                async move {
-                    targets.watch(&pool, shutdown).await;
                 },
             ));
         }
@@ -697,18 +654,6 @@ impl BoundServer {
             ));
         }
 
-        // One supervised verification runtime per API-serving process: the
-        // durable queue coordinates every replica, so no leader is elected.
-        if self.config.verification.enabled
-            && self.config.role.serves_api()
-            && let Some(runtime) = self.verification_runtime()
-        {
-            set.spawn(worker_task(
-                TaskId::Worker("verification_runtime"),
-                runtime.run(shutdown.clone()),
-            ));
-        }
-
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {
             set.spawn(worker_task(TaskId::Worker(name), worker));
@@ -739,7 +684,7 @@ impl BoundServer {
             let token = shutdown.clone();
             // Published here rather than at bind time, so readiness reports the
             // plane as up only while the serving task actually holds it.
-            let peer_plane = Arc::clone(&self.state.peer_plane);
+            let peer_plane = Arc::clone(&self.state.health.peer_plane);
             let bifrost = Arc::clone(&self.state.bifrost);
             peer_plane.mark_serving();
             set.spawn(fallible_task(TaskId::BifrostPeer, async move {
@@ -832,31 +777,27 @@ impl BoundServer {
             forge.mark_supervision_drained(supervised_drained);
         }
 
-        // Transport admission has stopped, so no further MCP request can start.
-        // Close the tracker and wait for the work already in flight inside the
-        // unchanged process deadline. `timeout_at` polls the tracker before the
-        // deadline, so an already-empty tracker returns immediately even when
-        // the supervised drain consumed the whole budget. A tracker still
-        // holding tokens at the deadline is a lifecycle failure: reporting a
-        // clean drain there would claim a settlement that never happened.
-        self.state.mcp_tasks.close();
-        let mcp_drained = tokio::time::timeout_at(deadline, self.state.mcp_tasks.wait())
-            .await
-            .is_ok();
-        // Gateway calls refuse admission once shutdown begins; accounting of
-        // the calls already accepted, including streams that settle after
-        // their response, drains within the same deadline.
-        self.state.gateway_tasks.close();
-        let gateway_drained = tokio::time::timeout_at(deadline, self.state.gateway_tasks.wait())
-            .await
-            .is_ok();
+        // Transport admission has stopped and gateway calls refuse admission
+        // once shutdown begins, so no producer can start new work. Settle the
+        // producers in order inside the unchanged process deadline: gateway
+        // call accounting, MCP in-flight work, then the hosted sandbox both
+        // may still be using. Each wait polls before the deadline, so settled
+        // work returns immediately even when the supervised drain consumed
+        // the whole budget; work still running at the deadline is a lifecycle
+        // failure rather than a clean drain.
+        let gateway_drained = self.state.gateway.drain(deadline).await;
+        let mcp_drained = self.state.mcp.drain(deadline).await;
+        let hosted_closed = self.state.verification.close_hosted(deadline).await;
         let terminal = match terminal {
             Some(message) => Some(message),
+            None if !gateway_drained => Some(
+                "gateway call accounting did not drain before the shutdown deadline".to_owned(),
+            ),
             None if !mcp_drained => {
                 Some("MCP in-flight work did not drain before the shutdown deadline".to_owned())
             }
-            None if !gateway_drained => Some(
-                "gateway call accounting did not drain before the shutdown deadline".to_owned(),
+            None if !hosted_closed => Some(
+                "hosted Verifier sandbox did not settle before the shutdown deadline".to_owned(),
             ),
             None => None,
         };
@@ -870,7 +811,8 @@ impl BoundServer {
         // logged by the outbox.
         let unwritten = self
             .state
-            .scribe_outbox
+            .bifrost
+            .scribe_outbox()
             .shutdown(outbox_shutdown_deadline(deadline))
             .await;
         if unwritten != 0 {
@@ -944,9 +886,11 @@ impl BoundServer {
         // The Scribe outbox has drained, so no acknowledged inputs row can
         // still stage a submission; queue what the submission outbox holds.
         // Losses are counted and logged by the outbox.
-        if let Some(outbox) = self.state.bifrost.submissions() {
-            outbox.shutdown(deadline).await;
-        }
+        self.state
+            .verification
+            .submissions()
+            .shutdown(deadline)
+            .await;
         tracing::info!("wyrd-server shutdown complete");
         server_shutdown_result(terminal, bifrost_shutdown_error, report)
     }
@@ -1021,12 +965,14 @@ mod pg_tests {
             WyrdAuthVerifySettings::default(),
         ));
         let storage = Arc::new(StorageHandle::new(signer));
-        let shutdown = tokio_util::sync::CancellationToken::new();
         let bifrost = crate::state::Bifrost::test_shell(Arc::clone(&verifier));
-        AppState::new(postgres, storage, bifrost, shutdown).with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
+        AppState::from_owners_for_test(crate::state::AppStateInner {
+            auth: ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..ServerAuth::default()
+            },
+            ..crate::test_support::shell_owners(postgres, storage, bifrost)
         })
     }
 

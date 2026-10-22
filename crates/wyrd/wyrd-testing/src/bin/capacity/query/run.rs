@@ -32,9 +32,9 @@ use crate::query::Result;
 use crate::query::logs::{self, Logs};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{self, Case, Fixture, Rows};
-use wyrd_testing::capacity::driver_cpu_seconds;
+use wyrd_testing::capacity::{self, Selection};
 use wyrd_testing::profile::{Capture, Profile};
-use wyrd_testing::release_server::{LocalServer, MemoryPeak, Metrics};
+use wyrd_testing::release_server::{LocalServer, Metrics};
 
 /// Untimed load before each window, so connection setup is not measured.
 const WARMUP: Duration = Duration::from_secs(2);
@@ -332,14 +332,10 @@ impl ProfileDelta {
 
 /// Server state at the start of a window, closed into a [`Usage`].
 struct Window {
-    /// Window start.
-    started: Instant,
-    /// Server CPU microseconds at start.
-    server_cpu_us: u64,
+    /// Server CPU, peak memory, and driver CPU since the start.
+    resources: capacity::Window,
     /// Server OOM kills at start.
     oom_kills: u64,
-    /// Peak-memory window reset at start.
-    peak: MemoryPeak,
     /// `oracle_query_bytes_scanned_total` at start.
     scanned_bytes: f64,
     /// Each [`SCAN_COUNTERS`] entry at start.
@@ -354,8 +350,6 @@ struct Window {
     pool_acquires: f64,
     /// Each [`WRITE_SERIES`] entry at start, by its key.
     write: BTreeMap<&'static str, f64>,
-    /// This process's CPU seconds at start.
-    driver_cpu_seconds: f64,
 }
 
 impl Window {
@@ -365,11 +359,10 @@ impl Window {
     ///
     /// Returns scrape or memory-peak failures.
     async fn open(server: &LocalServer) -> Result<Self> {
-        let metrics = server.metrics().await?;
+        let (resources, metrics) = capacity::Window::open(server, Selection::RESOURCES).await?;
         Ok(Self {
-            server_cpu_us: server.cpu_usec(),
+            resources,
             oom_kills: server.oom_kills(),
-            peak: server.memory_peak()?,
             scanned_bytes: metrics.sum("oracle_query_bytes_scanned_total", &[]),
             scan_counts: SCAN_COUNTERS.map(|name| metrics.sum(name, &[])),
             query_profile: QUERY_PROFILE.read(&metrics),
@@ -380,8 +373,6 @@ impl Window {
                 .iter()
                 .map(|(key, family, labels)| (*key, metrics.sum(family, labels)))
                 .collect(),
-            driver_cpu_seconds: driver_cpu_seconds(),
-            started: Instant::now(),
         })
     }
 
@@ -391,12 +382,11 @@ impl Window {
     ///
     /// Returns scrape or memory-peak failures.
     async fn close(self, server: &LocalServer) -> Result<Usage> {
-        let seconds = self.started.elapsed().as_secs_f64();
-        let metrics = server.metrics().await?;
+        let (resources, metrics) = self.resources.close(server).await?;
         Ok(Usage {
-            seconds,
-            server_cpu_seconds: server.cpu_usec().saturating_sub(self.server_cpu_us) as f64 / 1e6,
-            peak_memory_bytes: self.peak.read()?,
+            seconds: resources.seconds,
+            server_cpu_seconds: resources.server_cpu_seconds,
+            peak_memory_bytes: resources.peak_memory_bytes,
             oom_kills: server.oom_kills().saturating_sub(self.oom_kills),
             scanned_bytes: metrics.sum("oracle_query_bytes_scanned_total", &[])
                 - self.scanned_bytes,
@@ -414,7 +404,7 @@ impl Window {
                     (*key, metrics.sum(family, labels) - before)
                 })
                 .collect(),
-            driver_cpu_seconds: driver_cpu_seconds() - self.driver_cpu_seconds,
+            driver_cpu_seconds: resources.driver_cpu_seconds,
         })
     }
 }

@@ -5,13 +5,13 @@
 
 use std::time::Duration;
 
-use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,7 @@ use super::invocation::{
 };
 use super::multipart::{FileSink, FormReader};
 use super::service::{GatewayAdministration, invalid, unavailable};
+use super::telemetry::IngressClock;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
@@ -914,12 +915,14 @@ pub(crate) async fn get_capture(
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     openai_call(
         &state,
         caller,
+        clock.map(|Extension(clock)| clock),
         typed_body::<GatewayChatCompletionsRequest>(request).map(|body| (body, None)),
         GatewayOperation::ChatCompletions,
         Some(&headers),
@@ -967,12 +970,14 @@ pub(crate) async fn chat_completions(
 pub(crate) async fn responses(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     openai_call(
         &state,
         caller,
+        clock.map(|Extension(clock)| clock),
         typed_body::<GatewayResponsesRequest>(request).map(|body| (body, None)),
         GatewayOperation::Responses,
         Some(&headers),
@@ -1012,11 +1017,13 @@ pub(crate) async fn responses(
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     openai_call(
         &state,
         caller,
+        clock.map(|Extension(clock)| clock),
         typed_body::<GatewayEmbeddingsRequest>(request).map(|body| (body, None)),
         GatewayOperation::Embeddings,
         None,
@@ -1056,9 +1063,17 @@ pub(crate) async fn embeddings(
 pub(crate) async fn image_generations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    json_media(&state, caller, request, OpenAiMediaRoute::ImageGenerations).await
+    json_media(
+        &state,
+        caller,
+        clock.map(|Extension(clock)| clock),
+        request,
+        OpenAiMediaRoute::ImageGenerations,
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -1092,6 +1107,7 @@ pub(crate) async fn image_generations(
 pub(crate) async fn image_edits(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -1099,11 +1115,19 @@ pub(crate) async fn image_edits(
         OpenAiMediaRoute::ImageEdits,
         &headers,
         request.map(Body::from),
-        state.limits.body_bytes,
+        state.settings.limits.body_bytes,
         FileSink::Memory,
     )
     .await;
-    openai_call(&state, caller, request, GatewayOperation::Images, None).await
+    openai_call(
+        &state,
+        caller,
+        clock.map(|Extension(clock)| clock),
+        request,
+        GatewayOperation::Images,
+        None,
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -1138,6 +1162,7 @@ pub(crate) async fn image_edits(
 pub(crate) async fn image_variations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -1145,11 +1170,19 @@ pub(crate) async fn image_variations(
         OpenAiMediaRoute::ImageVariations,
         &headers,
         request.map(Body::from),
-        state.limits.body_bytes,
+        state.settings.limits.body_bytes,
         FileSink::Memory,
     )
     .await;
-    openai_call(&state, caller, request, GatewayOperation::Images, None).await
+    openai_call(
+        &state,
+        caller,
+        clock.map(|Extension(clock)| clock),
+        request,
+        GatewayOperation::Images,
+        None,
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -1185,9 +1218,17 @@ pub(crate) async fn image_variations(
 pub(crate) async fn audio_speech(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    json_media(&state, caller, request, OpenAiMediaRoute::AudioSpeech).await
+    json_media(
+        &state,
+        caller,
+        clock.map(|Extension(clock)| clock),
+        request,
+        OpenAiMediaRoute::AudioSpeech,
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -1225,12 +1266,14 @@ pub(crate) async fn audio_speech(
 pub(crate) async fn audio_transcriptions(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     audio_form(
         &state,
         caller,
+        clock.map(|Extension(clock)| clock),
         &headers,
         body,
         OpenAiMediaRoute::AudioTranscriptions,
@@ -1273,12 +1316,14 @@ pub(crate) async fn audio_transcriptions(
 pub(crate) async fn audio_translations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     audio_form(
         &state,
         caller,
+        clock.map(|Extension(clock)| clock),
         &headers,
         body,
         OpenAiMediaRoute::AudioTranslations,
@@ -1299,6 +1344,7 @@ pub(crate) async fn audio_translations(
 async fn audio_form(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<IngressClock>,
     headers: &HeaderMap,
     body: Body,
     route: OpenAiMediaRoute,
@@ -1309,7 +1355,7 @@ async fn audio_form(
                 route,
                 headers,
                 Ok(body),
-                state.limits.audio_upload_bytes,
+                state.settings.limits.audio_upload_bytes,
                 FileSink::Spool,
             )
             .await
@@ -1320,7 +1366,7 @@ async fn audio_form(
             "was not read",
         ))),
     };
-    openai_call(state, caller, request, GatewayOperation::Audio, None).await
+    openai_call(state, caller, clock, request, GatewayOperation::Audio, None).await
 }
 
 /// Runs a JSON media `route` of its operation family, whose body must decode
@@ -1330,6 +1376,7 @@ async fn audio_form(
 async fn json_media(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<IngressClock>,
     request: Result<Json<Value>, JsonRejection>,
     route: OpenAiMediaRoute,
 ) -> Response {
@@ -1350,6 +1397,7 @@ async fn json_media(
     openai_call(
         state,
         caller,
+        clock,
         body.map(|body| (body, Some(media))),
         operation,
         None,
@@ -1422,12 +1470,13 @@ pub(crate) async fn models(
 async fn openai_call(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<IngressClock>,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
     headers: Option<&HeaderMap>,
 ) -> Response {
     let result = match caller {
-        Ok(caller) => invoke_openai(state, &caller, request, operation, headers).await,
+        Ok(caller) => invoke_openai(state, &caller, clock, request, operation, headers).await,
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     match result {
@@ -1881,6 +1930,7 @@ async fn form_body(
 async fn invoke_openai(
     state: &AppState,
     caller: &Caller,
+    clock: Option<IngressClock>,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
     headers: Option<&HeaderMap>,
@@ -1902,6 +1952,7 @@ async fn invoke_openai(
     };
     let usage_bound = usage_bound(operation, &body);
     GatewayInvocation::new(state)
+        .parsed(clock, operation)
         .invoke(
             caller,
             GatewayCallRequest {

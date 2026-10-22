@@ -15,6 +15,7 @@ use sqlx::{AssertSqlSafe, Connection as _};
 
 pub mod dsn;
 pub mod error;
+pub mod listener;
 pub mod operator_pool;
 pub mod pool;
 pub mod postgres;
@@ -25,6 +26,7 @@ pub mod schema_check;
 pub mod tenant_conn;
 
 pub use error::SqlError;
+pub use listener::NotificationListener;
 pub use operator_pool::OperatorPool;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;

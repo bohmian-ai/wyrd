@@ -37,6 +37,33 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
+/// The `/mcp` surface's in-flight work.
+///
+/// Every tool invocation holds a [`tokio_util::task::TaskTracker`] token for
+/// the life of its work, including cancellation cleanup; shutdown drains it
+/// through [`Self::drain`] after transport admission stops, so a pod cannot
+/// report a clean drain while a tool is still settling.
+#[derive(Default)]
+pub struct Mcp {
+    /// In-flight tool work.
+    pub tasks: tokio_util::task::TaskTracker,
+}
+
+impl Mcp {
+    /// Wait until every in-flight tool's work finished or `deadline` passes,
+    /// returning whether it drained.
+    ///
+    /// Closing the tracker makes its wait complete once empty; an
+    /// already-empty tracker returns immediately even at the deadline.
+    /// Cancelling the wait leaves the tracker closed and its work running.
+    pub async fn drain(&self, deadline: tokio::time::Instant) -> bool {
+        self.tasks.close();
+        tokio::time::timeout_at(deadline, self.tasks.wait())
+            .await
+            .is_ok()
+    }
+}
+
 pub(crate) mod bifrost;
 pub(crate) mod cards;
 mod gateway;
@@ -166,7 +193,7 @@ impl WyrdMcpHandler {
     /// test server must ask for it explicitly.
     fn probe_descriptors(&self) -> Vec<Tool> {
         #[cfg(feature = "test-support")]
-        if self.state.mcp_context_probe {
+        if self.state.test_hooks.mcp_context_probe {
             return vec![probe::descriptor()];
         }
         Vec::new()
@@ -273,7 +300,7 @@ impl WyrdMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         #[cfg(feature = "test-support")]
-        if self.state.mcp_context_probe && request.name == probe::TOOL_NAME {
+        if self.state.test_hooks.mcp_context_probe && request.name == probe::TOOL_NAME {
             let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
             let (principal, _) = Self::request_context(&context).map_err(wyrd_error_to_mcp)?;
             return probe::invoke(&self.state, caller, &principal, request, context)
@@ -284,7 +311,7 @@ impl WyrdMcpHandler {
         // Every Bifrost tool holds an MCP tracker token for its whole path, so
         // process shutdown waits for the work it cancelled rather than racing
         // the result back out.
-        let _token = self.state.mcp_tasks.token();
+        let _token = self.state.mcp.tasks.token();
         let outcome = match request.name.as_ref() {
             guide::GUIDE => {
                 let _caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;

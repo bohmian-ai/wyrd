@@ -222,7 +222,7 @@ pub async fn invoke(
     // Held for the whole invocation, including cancellation cleanup and result
     // construction, so process shutdown cannot report a clean drain while this
     // work is still settling.
-    let _token = state.mcp_tasks.token();
+    let _token = state.mcp.tasks.token();
     let cancelled = match arguments.hold_id.as_deref() {
         None => false,
         Some(hold_id) => {

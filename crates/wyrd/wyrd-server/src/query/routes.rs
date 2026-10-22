@@ -296,12 +296,14 @@ pub(crate) async fn sync_query(
     };
     #[cfg(feature = "test-support")]
     let fault = state
+        .test_hooks
         .query_stream_fault
         .as_ref()
         .and_then(super::super::state::QueryStreamFaultController::claim);
     #[cfg(feature = "test-support")]
     let stall = match fault {
         Some(crate::state::QueryStreamFault::StallAfterSchema) => state
+            .test_hooks
             .query_stream_fault
             .as_ref()
             .and_then(super::super::state::QueryStreamFaultController::claim_stall),
@@ -312,6 +314,7 @@ pub(crate) async fn sync_query(
     #[cfg(feature = "test-support")]
     if matches!(fault, Some(crate::state::QueryStreamFault::CaptureProbe))
         && let Some(capture) = state
+            .test_hooks
             .query_stream_fault
             .as_ref()
             .and_then(super::super::state::QueryStreamFaultController::claim_capture)

@@ -1,7 +1,7 @@
 //! The `wyrd-server subprocess` Monty worker and the allocator that bounds it.
 //!
-//! The server's Monty pool spawns its own executable as `wyrd-server
-//! subprocess` with an empty environment and speaks Monty's framed protocol
+//! The server's Monty pool spawns the `wyrd-server` executable it was given
+//! as `wyrd-server subprocess` with an empty environment and speaks Monty's framed protocol
 //! over stdio, so one binary ships both the server and its Python workers.
 //! Isolation is Monty's own and identical on every platform: sandboxed Python
 //! has no host files, network, subprocesses, environment, or host callbacks;
@@ -9,25 +9,26 @@
 //! or refuses. A worker that crashes, aborts, or exceeds its budget ends only
 //! its own process; the pool replaces it.
 //!
-//! [`CountingMiMalloc`] is the binary's global allocator. In the server it is
-//! mimalloc behind one relaxed flag load. In a worker it also feeds
-//! [`LIVE_MEMORY`], which Monty's soft memory limit reads, and ends the
-//! process with [`OOM_EXIT_CODE`] past the session's memory budget plus
-//! Monty's headroom, so the parent reports `MemoryError` without OS-specific
-//! limits.
+//! The `wyrd-server` binary owns the global allocator and calls [`dispatch`]
+//! first in `main`. Its allocator reports every size change through
+//! [`charge`], [`refund`] and [`refused`]: in the server they are one relaxed
+//! flag load, and in a worker they feed [`LIVE_MEMORY`], which Monty's soft
+//! memory limit reads, and end the process with [`OOM_EXIT_CODE`] past the
+//! session's memory budget plus Monty's headroom, so the parent reports
+//! `MemoryError` without OS-specific limits. This library never references an
+//! allocator itself, so embedders such as the Python and TypeScript SDK
+//! builds link none and keep their own.
 //!
 //! The serve loop mirrors `monty-runtime`'s `subprocess` shell over
 //! [`monty_proto::worker::Child`]. Each worker serves one checkout and exits,
 //! so no interpreter state crosses invocations.
 
-use std::alloc::{GlobalAlloc, Layout};
 use std::fmt;
 use std::io::{self, Write};
 use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use mimalloc::MiMalloc;
 use monty_proto::worker::{Child, EventSink, HandleOutcome, fatal_error_event, protocol_violation};
 use monty_proto::{FrameError, FrameReader, pb, write_frame};
 use monty_types::{BASELINE_MEMORY, LIVE_MEMORY, OOM_EXIT_CODE, memory_limit_with_headroom};
@@ -54,72 +55,12 @@ const EX_PROTOCOL: u8 = 76;
 /// `sysexits.h` configuration error: the interpreter thread could not start.
 const EX_CONFIG: u8 = 78;
 
-/// mimalloc, plus the worker's live-byte count that enforces Monty's memory
-/// limits and a null check that ends a worker deliberately.
-///
-/// Counting starts in `main`, after the runtime's few pre-`main`
-/// allocations, so a free of one of those saturates the count at zero rather
-/// than wrapping; the count can undercount by at most those bytes.
-pub struct CountingMiMalloc;
-
-// SAFETY: every method forwards its arguments unchanged to `MiMalloc` and
-// returns what `MiMalloc` returned (or diverges). No pointer is fabricated,
-// aliased or freed here, so this upholds exactly the invariants `MiMalloc`
-// upholds.
-#[expect(
-    unsafe_code,
-    reason = "a global allocator is unsafe; the counting it adds is safe"
-)]
-unsafe impl GlobalAlloc for CountingMiMalloc {
-    /// Charge `layout` to a worker's budget, then allocate it from mimalloc.
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        charge(layout.size());
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { MiMalloc.alloc(layout) };
-        if ptr.is_null() {
-            refused(layout.size());
-        }
-        ptr
-    }
-
-    /// Refund `layout` to a worker's budget, then free it through mimalloc.
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        refund(layout.size());
-        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
-        unsafe { MiMalloc.dealloc(ptr, layout) };
-    }
-
-    /// Charge `layout`, then take mimalloc's pre-zeroed allocation.
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        charge(layout.size());
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { MiMalloc.alloc_zeroed(layout) };
-        if ptr.is_null() {
-            refused(layout.size());
-        }
-        ptr
-    }
-
-    /// Charge or refund the size change, then let mimalloc resize in place
-    /// when it can.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        match new_size.checked_sub(layout.size()) {
-            Some(growth) => charge(growth),
-            None => refund(layout.size() - new_size),
-        }
-        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
-        // `new_size` is the caller's — all forwarded unchanged.
-        let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
-        if new_ptr.is_null() {
-            refused(new_size);
-        }
-        new_ptr
-    }
-}
-
 /// Add `size` to a worker's live total, ending the worker past its hard limit.
+///
+/// The binary's global allocator calls this before every allocation and
+/// growth; outside a worker it returns after one relaxed flag load.
 #[inline]
-fn charge(size: usize) {
+pub fn charge(size: usize) {
     if !COUNTING.load(Ordering::Relaxed) {
         return;
     }
@@ -136,8 +77,10 @@ fn charge(size: usize) {
 /// Return `size` to a worker's live total, saturating at zero for a block
 /// allocated before counting began. `Relaxed` throughout: the count only has
 /// to be eventually right, and no other memory is published through it.
+///
+/// The binary's global allocator calls this on every free and shrink.
 #[inline]
-fn refund(size: usize) {
+pub fn refund(size: usize) {
     if COUNTING.load(Ordering::Relaxed) {
         let _ = LIVE_MEMORY.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
             Some(live.saturating_sub(size))
@@ -145,10 +88,12 @@ fn refund(size: usize) {
     }
 }
 
-/// End a worker whose allocation mimalloc refused; the server keeps Rust's
-/// default allocation-failure handling.
+/// End a worker whose allocation the allocator refused; the server keeps
+/// Rust's default allocation-failure handling.
+///
+/// The binary's global allocator calls this when it returns null.
 #[cold]
-fn refused(size: usize) {
+pub fn refused(size: usize) {
     if COUNTING.load(Ordering::Relaxed) {
         out_of_memory(format_args!(
             "monty worker: allocation of {size} bytes failed"
@@ -175,12 +120,24 @@ fn out_of_memory(reason: fmt::Arguments<'_>) -> ! {
     process::exit(OOM_EXIT_CODE);
 }
 
+/// Run this process as a Monty pool worker when the pool spawned it.
+///
+/// Returns `Some` exit code after serving the worker protocol when the only
+/// argument is [`SUBPROCESS_ARG`], and `None` for every other invocation so
+/// the caller continues as the server. The binary calls this first in
+/// `main`, before any runtime, CLI, or telemetry exists, so a worker process
+/// holds only the interpreter thread and its own heap count.
+#[must_use]
+pub fn dispatch() -> Option<ExitCode> {
+    std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from(SUBPROCESS_ARG)])
+        .then(run)
+}
+
 /// Run this process as a Monty pool worker: start counting the heap, then
 /// serve the protocol on a dedicated interpreter thread until it ends.
-///
-/// Called by `main` when the pool spawned the binary with [`SUBPROCESS_ARG`],
-/// before anything else allocates on the worker's behalf.
-pub fn run() -> ExitCode {
+fn run() -> ExitCode {
     COUNTING.store(true, Ordering::Relaxed);
     thread::Builder::new()
         .name("monty-worker".to_owned())

@@ -493,6 +493,7 @@ pub(crate) fn relay_media(
         cancel,
         sender,
         capture,
+        last_byte: None,
     };
     tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
@@ -511,6 +512,8 @@ struct MediaRelay {
     sender: mpsc::Sender<Vec<u8>>,
     /// Selected response bytes kept for capture; `None` keeps nothing.
     capture: Option<MediaCapture>,
+    /// When the last upstream body chunk arrived.
+    last_byte: Option<std::time::Instant>,
 }
 
 impl MediaRelay {
@@ -538,6 +541,8 @@ impl MediaRelay {
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture,
+            last_byte: self.last_byte,
+            relay: Duration::ZERO,
         })
         .ok();
     }
@@ -563,6 +568,7 @@ impl MediaRelay {
                 Ok(None) => return GatewayCallOutcome::Succeeded,
                 Err(_) => return GatewayCallOutcome::Failed,
             };
+            self.last_byte = Some(std::time::Instant::now());
             relayed = relayed.saturating_add(bytes.len());
             if relayed > self.limit {
                 return GatewayCallOutcome::Failed;
@@ -614,6 +620,8 @@ pub(crate) fn relay(
         cancel,
         sender,
         capture,
+        last_byte: None,
+        busy: Duration::ZERO,
     };
     tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
@@ -640,6 +648,11 @@ struct Relay {
     sender: mpsc::Sender<Vec<u8>>,
     /// Selected response content kept for capture; `None` keeps nothing.
     capture: Option<StreamCapture>,
+    /// When the last upstream body chunk arrived.
+    last_byte: Option<std::time::Instant>,
+    /// Time spent decoding, translating, and framing chunks, excluding waits
+    /// on the provider and on the caller.
+    busy: Duration,
 }
 
 impl Relay {
@@ -682,6 +695,8 @@ impl Relay {
             terminal_at: Utc::now(),
             usage,
             capture: self.capture.take().and_then(StreamCapture::finish),
+            last_byte: self.last_byte,
+            relay: self.busy,
         })
         .ok();
     }
@@ -744,6 +759,8 @@ impl Relay {
                 Ok(None) => break,
                 Err(_) => return failed(Stop::Upstream, &decoder, &self.frames),
             };
+            let received = std::time::Instant::now();
+            self.last_byte = Some(received);
             let mut out = Vec::new();
             let mut read = 0;
             while read < bytes.len() && !finished {
@@ -778,6 +795,7 @@ impl Relay {
                 bytes.truncate(read);
                 out.push(bytes);
             }
+            self.busy += received.elapsed();
             for frame in out {
                 if let Err(ended) = self.deliver(frame).await {
                     return match ended {

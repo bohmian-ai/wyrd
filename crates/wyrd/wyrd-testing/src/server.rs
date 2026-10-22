@@ -1,12 +1,12 @@
 //! Real-socket Wyrd server test harness.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,16 +43,11 @@ use vala_bifrost_redux::resources::{
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::storage::BifrostStorage;
-use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::JwksCache;
-use wyrd_auth_verify::{
-    ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
-};
+use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::{SealingKeyring, SecretKey};
@@ -62,22 +57,19 @@ use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::data_root::BifrostDataRoot;
-use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
-use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
+use wyrd_server::boot::{BifrostExternalDependencies, BootedServer, StartInputs};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
-    BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    GatewayConfig, IssuerEntry, OperatorKeySource, OperatorKeysConfig, ServeMode,
-    WorkloadBindingEntry,
+    BifrostRuntimeRole, BifrostTarget, ForgeRuntimeConfig, GatewayConfig, IssuerEntry,
+    OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::state::{
-    BifrostBuildInputs, BifrostShutdownReport, BifrostTestControls, ComposedBifrost,
-    QueryStreamFault, QueryStreamFaultController, ScribeCoordinationRuntime,
+    BifrostShutdownReport, BifrostTestControls, EngineWorker, QueryStreamFault,
+    QueryStreamFaultController, ScribeCoordinationRuntime, TestHooks,
 };
 use wyrd_server::verification::hosted::HostedLimits;
-use wyrd_server::verification::hosted::blocks::HostedBlocks;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
@@ -201,10 +193,6 @@ fn serve_task_outcome(
 /// else that steers or inspects server state. The remaining public methods are
 /// runtime-only facilities for the Rust server, Bifrost, and reliability
 /// tiers; they are not part of the SDK test contract.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag records one independent opt-in the harness started with"
-)]
 pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
@@ -224,20 +212,16 @@ pub struct WyrdTestServer {
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
-    /// Optional bounded drain budget applied to the bound production server.
-    ///
-    /// Copied into `WyrdServerConfig.shutdown.drain_ms` when this server binds,
-    /// so a journey can exercise the real expired-deadline branch of production
-    /// shutdown rather than a test substitute for it.
-    shutdown_drain_for_test: Option<Duration>,
     /// Test-only request to panic the bound serve task after its drain returns.
     serve_task_panic_for_test: bool,
-    /// Whether the bound production server composes its verification runtime.
-    ///
-    /// Copied into `WyrdServerConfig.verification.enabled` when this server
-    /// binds. Off by default so ordinary journeys never race a background
-    /// scheduler or runner over the queue they assert on.
-    verification_runtime: bool,
+    /// The configuration [`AppState::start`] composed this server from,
+    /// which a bound server serves under with its listener addresses.
+    config: Box<WyrdServerConfig>,
+    /// Engine-owned background work startup returned, run by the bound
+    /// production supervisor; an unbound server leaves its caches cold.
+    /// The mutex only makes the `Send` futures shareable with Python's
+    /// thread-safe wrapper; binding takes them through `&mut self`.
+    workers: std::sync::Mutex<Vec<EngineWorker>>,
     /// Whether this server's Bifrost owner has been drained or aborted.
     ///
     /// Set when a bound production serve task returns its drain report, or
@@ -564,6 +548,8 @@ pub struct WyrdTestServerBuilder {
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
     /// Optional bounded drain budget copied into the bound server's config.
     shutdown_drain_for_test: Option<Duration>,
+    /// Proxy every runtime Postgres pool dials instead of the database.
+    postgres_proxy_for_test: Option<Arc<crate::listener_stall::ListenerStallProxy>>,
     /// Whether the bound server composes its verification runtime.
     verification_runtime: bool,
     /// Storage I/O bounds this server's one Bifrost storage owner resolves.
@@ -578,6 +564,12 @@ pub struct WyrdTestServerBuilder {
     mcp_context_probe: bool,
     /// Operator connection key source; `None` generates a file key.
     operator_keys: Option<OperatorKeysConfig>,
+    /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
+    /// prewarmed worker.
+    verification_limits: Option<HostedLimits>,
+    /// Hosted Verifier worker executable replacing the shipped same-profile
+    /// `wyrd-server`, so a journey can prove a bad worker fails startup.
+    verification_worker: Option<std::path::PathBuf>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -694,11 +686,14 @@ impl Default for WyrdTestServerBuilder {
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
+            postgres_proxy_for_test: None,
             verification_runtime: false,
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
             operator_keys: None,
+            verification_limits: None,
+            verification_worker: None,
         }
     }
 }
@@ -934,7 +929,8 @@ impl WyrdTestServer {
                 // drain Bifrost with no supervised Forge task to join.
                 self.inner
                     .state
-                    .scribe_outbox
+                    .bifrost
+                    .scribe_outbox()
                     .shutdown(deadline.into_std())
                     .await;
                 bifrost.mark_unsupervised_for_test();
@@ -1236,7 +1232,8 @@ impl WyrdTestServer {
         let unwritten = self
             .inner
             .state
-            .scribe_outbox
+            .bifrost
+            .scribe_outbox()
             .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
             .await;
         if unwritten != 0 {
@@ -1581,7 +1578,7 @@ impl WyrdTestServer {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
         let admission = runtime.oracle_runtime_inspection();
-        let scribe_pending = self.inner.state.scribe_outbox.pending();
+        let scribe_pending = self.inner.state.bifrost.scribe_outbox().pending();
         let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
@@ -1908,7 +1905,8 @@ impl WyrdTestServer {
         let residual = self
             .inner
             .state
-            .scribe_outbox
+            .bifrost
+            .scribe_outbox()
             .settle(std::time::Instant::now() + budget)
             .await;
         Ok(residual as u64)
@@ -2921,7 +2919,7 @@ impl WyrdTestServer {
         wyrd_auth::platform_sessions::PlatformSessions::new(
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
-            std::sync::Arc::clone(&self.inner.state.scribe_outbox) as _,
+            std::sync::Arc::clone(self.inner.state.bifrost.scribe_outbox()) as _,
         )
         .issue_federated(
             &issuer,
@@ -3010,7 +3008,7 @@ impl WyrdTestServer {
             .inner
             .state
             .auth
-            .tenant_issuer(&self.inner.state.scribe_outbox)
+            .tenant_issuer(self.inner.state.bifrost.scribe_outbox())
             .ok_or_else(|| WyrdTestServerError::Auth("no issuing key".to_owned()))?;
         let exchanged = issuer
             .issue(
@@ -3990,10 +3988,9 @@ impl WyrdTestServer {
             .parse()
             .expect("static loopback socket addr is valid");
         let (http_bind, grpc_bind) = self.requested_bind.unwrap_or((loopback, loopback));
-        let mut config = WyrdServerConfig::default();
+        let mut config = WyrdServerConfig::clone(&self.config);
         config.http.bind = http_bind;
         config.grpc.bind = grpc_bind;
-        config.role = self.forge_process_role();
         // Peer mode only when a test supplied a cluster identity; the default
         // server runs its Bifrost roles in-process with no private listener.
         if let Some(peer_tls) = &self.peer_tls {
@@ -4004,15 +4001,17 @@ impl WyrdTestServer {
             config.bifrost.peer.address = Some(bind.to_string());
             config.bifrost.peer.tls_dir = Some(peer_tls.dir.clone());
         }
-        config.metrics.enabled = false;
-        config.serve.mode = ServeMode::Both;
-        config.verification.enabled = self.verification_runtime;
-        if let Some(drain) = self.shutdown_drain_for_test {
-            config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
-        }
 
-        let server = WyrdServer::new(config, state)
-            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
+        let workers = std::mem::take(
+            self.workers
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let server = workers.into_iter().fold(
+            WyrdServer::new(config, state)
+                .map_err(|e| WyrdTestServerError::Start(e.to_string()))?,
+            |server, (name, worker)| server.spawn_worker(name, worker),
+        );
         let bound = server
             .bind(ServeMode::Both)
             .await
@@ -4173,9 +4172,9 @@ impl WyrdTestServerBuilder {
     ///
     /// Edge behaviour that only manifests at a boundary — a body-size refusal,
     /// a request timeout, a concurrency cap — is unreachable at the production
-    /// defaults inside a test. This knob feeds the profile through the same
-    /// `AppState::with_limits` the server uses, so the router under test is the
-    /// composed production router with one configuration value changed.
+    /// defaults inside a test. This knob sets `WyrdServerConfig.limits`, which
+    /// [`AppState::start`] reads exactly as production does, so the router
+    /// under test is the composed production router with one value changed.
     #[must_use]
     pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
         self.limits = Some(limits);
@@ -4277,6 +4276,24 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Start the hosted Verifier blocks under `limits` instead of the
+    /// defaults with no prewarmed worker, through the same Deployment limits
+    /// configuration production reads.
+    #[must_use]
+    pub const fn with_verification_limits_for_test(mut self, limits: HostedLimits) -> Self {
+        self.verification_limits = Some(limits);
+        self
+    }
+
+    /// Start the hosted Verifier blocks over `worker` instead of the shipped
+    /// same-profile `wyrd-server`, through the same startup input production
+    /// fills with its own executable.
+    #[must_use]
+    pub fn with_verification_worker_for_test(mut self, worker: std::path::PathBuf) -> Self {
+        self.verification_worker = Some(worker);
+        self
+    }
+
     /// Force the bound readiness phase to fail and exercise startup rollback.
     #[must_use]
     pub fn with_readiness_failure_for_test(mut self) -> Self {
@@ -4333,6 +4350,21 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub const fn with_shutdown_drain_for_test(mut self, drain: Duration) -> Self {
         self.shutdown_drain_for_test = Some(drain);
+        self
+    }
+
+    /// Route every runtime Postgres pool this server opens through `proxy`,
+    /// so a journey can silently stall the server's notification listeners
+    /// while its request connections keep flowing.
+    ///
+    /// Only the runtime pools move; fixture setup and the test's own
+    /// superuser reads still dial the database directly.
+    #[must_use]
+    pub fn with_postgres_proxy_for_test(
+        mut self,
+        proxy: Arc<crate::listener_stall::ListenerStallProxy>,
+    ) -> Self {
+        self.postgres_proxy_for_test = Some(proxy);
         self
     }
 
@@ -4769,91 +4801,25 @@ impl WyrdTestServerBuilder {
         // AppState must observe the same pool so query and rewrite admission
         // share accounting rather than silently creating independent budgets.
         let tenant_id = fixture.data_tenant_id();
-        let (runtime_wyrd, runtime_vala) = fixture
-            .fresh_runtime_handles()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-
-        let issuing_key = Arc::new(
-            IssuingKey::from_ed_pem(
-                crate::keys::private_key_pem(),
-                Kid::new("test").expect("static kid is valid"),
-                "wyrd",
-            )
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
-        let mut decoding_keys = HashMap::new();
-        decoding_keys.insert(
-            Kid::new("test").expect("static kid is valid"),
-            Arc::new(
-                public_key_from_pem(crate::keys::public_key_pem().as_bytes())
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            ),
-        );
-        let verify_settings = self.auth_verify_settings.unwrap_or_default();
-
-        // Postgres-backed boot, mirroring a self-hosted deployment: discover and
-        // seed `[[trusted_issuers]]` into Postgres, then seed `[[workload_bindings]]`
-        // (which FK-reference them). A deterministic test sealing key encrypts any
-        // client secret on write and decrypts it on read. The production Pg
-        // resolvers then serve issuers/bindings per-request, including on the
-        // verifier's external (foreign-OIDC) path.
-        let sealing_key = self
-            .sealing_keyring
-            .clone()
-            .unwrap_or_else(|| Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32]))));
-        // The same boot step production runs: always rewrap, logging (not
-        // failing on) a rewrap error while a key is configured.
-        rewrap_sealed_secrets(
-            Some(fixture.operator_pool().clone()),
-            Some(Arc::clone(&sealing_key)),
-        )
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_trusted_issuers(
-            &runtime_wyrd,
-            tenant_id,
-            &self.trusted_issuer_configs,
-            Some(sealing_key.as_ref()),
-        )
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_workload_bindings(&runtime_wyrd, tenant_id, &bindings)
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-
-        let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            runtime_wyrd.clone(),
-            Some(Arc::clone(&sealing_key)),
-        ));
-        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(runtime_wyrd.clone()));
-
-        let verifier = Arc::new(TokenVerifier::new(
-            decoding_keys,
-            "wyrd",
-            verify_settings.clone(),
-        ));
-        let external_verifier = Arc::new(ExternalVerifier::new(
-            Arc::new(JwksCache::new(
-                wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                Duration::from_mins(5),
-                Duration::from_secs(5),
-            )),
-            Arc::clone(&issuer_resolver),
-            verify_settings,
-        ));
-
-        let exchange_settings = if let Some(ttl) = self.access_ttl {
-            TokenExchangeSettings {
-                access_ttl: ttl,
-                ..TokenExchangeSettings::default()
+        let (runtime_wyrd, runtime_vala) = match &self.postgres_proxy_for_test {
+            Some(proxy) => {
+                let dsns = fixture
+                    .runtime_dsns()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+                    .and_then(|dsns| {
+                        proxy
+                            .route(&dsns)
+                            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+                    })?;
+                let wyrd = wyrd_sql::WyrdPostgres::connect_from_dsns(&dsns).await;
+                let vala = vala_sql::ValaPostgres::connect_from_dsns(&dsns).await;
+                wyrd.and_then(|wyrd| Ok((wyrd, vala?)))
             }
-        } else {
-            TokenExchangeSettings::default()
-        };
+            None => fixture.fresh_runtime_handles().await,
+        }
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
+        let start = |error: String| WyrdTestServerError::Start(error);
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4997,127 +4963,128 @@ impl WyrdTestServerBuilder {
             .as_ref()
             .map(TestBifrostPeerTls::bifrost_peer_tls)
             .transpose()?;
-        let mut bifrost_config = BifrostRuntimeConfig::default();
-        bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        let mut config = WyrdServerConfig {
+            role: target,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         if let Some(capacity) = self.scribe_outbox_capacity {
-            bifrost_config.scribe.outbox_capacity = capacity;
+            config.bifrost.scribe.outbox_capacity = capacity;
         }
-        bifrost_config.storage = self.bifrost_storage_io;
+        config.bifrost.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {
-            bifrost_config.oracle = oracle;
+            config.bifrost.oracle = oracle;
         }
-        let forge_runtime = ForgeRuntimeConfig {
+        config.forge = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
         };
-        let shutdown = CancellationToken::new();
-        let ComposedBifrost {
-            bifrost: bifrost_runtime,
-            coordination_runtime,
-            compaction_runtime,
-            data_root: bifrost_data_root,
-        } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
-            target,
-            deployment_profile: DeploymentProfile::Development,
-            postgres: postgres.as_ref().clone(),
-            bifrost_storage: Arc::clone(&bifrost_storage),
-            catalog: Arc::clone(&bifrost),
-            resources: bifrost_resources,
-            cluster: cluster_registry,
-            token_verifier: Arc::clone(&verifier),
-            peer_tls,
-            config: bifrost_config,
-            forge_config: forge_runtime,
-            node_id,
-            // Must agree with `WyrdTestServer::grpc_url`: the address published
-            // into cluster membership is dialed by peer transports, and a TLS
-            // transport refuses a peer advertising a plaintext scheme.
-            // Membership carries the private peer endpoint, never the public
-            // gRPC one: a selected node and fence must be dialed on the
-            // mutually authenticated plane. The port is reserved before this
-            // point so the advertised value is the address the listener holds.
-            // A server without peer mode publishes production's undialable
-            // process-local marker instead.
-            advertise_addr: self.peer_bind.map_or_else(
-                || format!("local://{}", node_id.as_uuid()),
-                |bind| format!("https://{bind}"),
-            ),
-            data_root,
-            shutdown: shutdown.clone(),
-            test_controls: Some(test_controls),
-        })
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let query_stream_fault = QueryStreamFaultController::default();
-        let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
-            .with_query_stream_fault(query_stream_fault.clone())
-            .with_auth(wyrd_server::components::auth::ServerAuth {
-                issuing_key: Some(Arc::clone(&issuing_key)),
-                token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
-                external_verifier: Some(external_verifier),
-                token_exchange_settings: exchange_settings,
-                trusted_issuer_resolver: Some(issuer_resolver),
-                workload_binding_resolver: Some(binding_resolver),
-                sealing_key: Some(sealing_key),
-                human_connections: None,
-                platform_login: None,
-            })
-            .with_gateway(test_gateway_config(
-                fixture.data_tenant_id(),
-                self.gateway_vault_backend.clone(),
-            )?);
-        let start = |error: String| WyrdTestServerError::Start(error);
-        // The login owners stage on the state's process Scribe outbox, so they
-        // attach once the state exists.
-        state.auth.human_connections = Some(HumanConnections::new(
-            state.postgres.wyrd().clone(),
-            state.auth.sealing_key.clone(),
-            DeploymentProfile::Development.screened_http(),
-            Arc::clone(&state.scribe_outbox) as _,
-        ));
-        state.auth.platform_login = Some(wyrd_auth::platform_login::PlatformLogin::new(
-            fixture.operator_pool().clone(),
-            state.auth.sealing_key.clone(),
-            Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
-                fixture.operator_pool().clone(),
-                Arc::clone(&issuing_key),
-                Arc::clone(&state.scribe_outbox) as _,
-            )),
-            DeploymentProfile::Development.screened_http(),
-        ));
+        config.gateway = test_gateway_config(tenant_id, self.gateway_vault_backend.clone())?;
         if let Some(endpoints) = self.gateway_endpoints {
-            let resolver = state
-                .gateway
-                .credential_resolver(state.auth.sealing_key.clone())
-                .map_err(|error| start(error.to_string()))?;
-            state = state.with_gateway_engine(wyrd_gateway::GatewayEngine::new(
-                resolver,
-                wyrd_gateway::DeploymentHealth::default(),
-                Arc::new(
-                    wyrd_gateway::HttpProviderDispatch::new(
-                        skald_providers::EndpointPolicy::new(false),
-                        endpoints,
-                    )
-                    .map_err(|error| start(error.to_string()))?,
-                ),
-            ));
+            config.gateway.endpoints = endpoints;
         }
         if let Some(limits) = self.limits {
-            state = state.with_limits(limits);
+            config.limits = wyrd_server::config::LimitsConfig {
+                body_bytes: limits.body_bytes,
+                audio_upload_bytes: limits.audio_upload_bytes,
+                timeout_ms: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+                concurrency: limits.concurrency,
+            };
         }
-        state = state.with_mcp_context_probe(self.mcp_context_probe);
-        state.authz.permission_check = Arc::new(RbacCheck);
-        let (forge_publisher, _forge_inbox) = staging_file_channel(16)
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        // Hosted blocks always start, so direct verification runs; only an
+        // opted-in server runs the queued runtime over them.
+        config.verification.enabled = true;
+        config.verification.limits = self.verification_limits.unwrap_or(HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        });
         let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
             Some(config) => (config, None),
             None => generated_operator_keys()?,
         };
-        state = state.with_operator_keys(
-            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys)
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        config.verification.operator_keys = operator_keys;
+        config.auth.tenant_slug = Some(
+            fixture
+                .tenant_slug()
+                .parse()
+                .map_err(|error: wyrd_spec::ids::IdError| start(error.to_string()))?,
         );
-        state = state.with_verification_blocks(Arc::new(test_verification_blocks().await?));
+        config.trusted_issuers = self.trusted_issuer_configs.clone();
+        config.workload_bindings = self.workload_binding_configs.clone();
+        if let Some(drain) = self.shutdown_drain_for_test {
+            config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
+        }
+        config.metrics.enabled = false;
+        config.serve.mode = ServeMode::Both;
+        let query_stream_fault = QueryStreamFaultController::default();
+        let BootedServer {
+            state,
+            coordination_runtime,
+            compaction_runtime,
+            data_root: bifrost_data_root,
+            workers,
+        } = Box::pin(AppState::start(
+            &config,
+            StartInputs {
+                dependencies: BifrostExternalDependencies {
+                    postgres,
+                    storage,
+                    bifrost_storage,
+                    catalog: Arc::clone(&bifrost),
+                    resources: bifrost_resources,
+                    cluster: cluster_registry,
+                    node_id,
+                    // Must agree with `WyrdTestServer::grpc_url`: the address
+                    // published into cluster membership is dialed by peer
+                    // transports, and a TLS transport refuses a peer
+                    // advertising a plaintext scheme. Membership carries the
+                    // private peer endpoint, never the public gRPC one. The
+                    // port is reserved before this point so the advertised
+                    // value is the address the listener holds. A server
+                    // without peer mode publishes production's undialable
+                    // process-local marker instead.
+                    advertise_addr: self.peer_bind.map_or_else(
+                        || format!("local://{}", node_id.as_uuid()),
+                        |bind| format!("https://{bind}"),
+                    ),
+                    data_root,
+                },
+                signing_key: crate::keys::private_key_pem(),
+                sealing_key: Some(self.sealing_keyring.clone().unwrap_or_else(|| {
+                    Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32])))
+                })),
+                verify_settings: self.auth_verify_settings.unwrap_or_default(),
+                token_exchange: self.access_ttl.map_or_else(
+                    TokenExchangeSettings::default,
+                    |access_ttl| TokenExchangeSettings {
+                        access_ttl,
+                        ..TokenExchangeSettings::default()
+                    },
+                ),
+                permission_check: Arc::new(RbacCheck),
+                peer_tls,
+                worker: self.verification_worker.take().unwrap_or_else(|| {
+                    Path::new(env!("WYRD_TESTING_PROFILE_DIR"))
+                        .join(format!("wyrd-server{}", std::env::consts::EXE_SUFFIX))
+                }),
+                bifrost_test_controls: Some(test_controls),
+                test_hooks: TestHooks {
+                    mcp_context_probe: self.mcp_context_probe,
+                    query_stream_fault: Some(query_stream_fault.clone()),
+                    omit_token_verifier: self.omit_token_verifier,
+                    hold_verification_runner: !self.verification_runtime,
+                },
+            },
+        ))
+        .await
+        .map_err(|error| start(error.to_string()))?;
+        let issuing_key = state
+            .auth
+            .issuing_key
+            .clone()
+            .ok_or_else(|| start("startup composed no issuing key".to_owned()))?;
+        let (forge_publisher, _forge_inbox) = staging_file_channel(16)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let router = build_router(state.clone());
 
         Ok(WyrdTestServer {
@@ -5153,9 +5120,9 @@ impl WyrdTestServerBuilder {
             peer_bind: self.peer_bind,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
-            shutdown_drain_for_test: self.shutdown_drain_for_test,
-            verification_runtime: self.verification_runtime,
             serve_task_panic_for_test: self.serve_task_panic_for_test,
+            config: Box::new(config),
+            workers: std::sync::Mutex::new(workers),
             bifrost_settled: false,
         })
     }
@@ -6109,25 +6076,4 @@ mod tests {
             &TYPESCRIPT_SETUP,
         );
     }
-}
-
-/// Hosted Verifier blocks for a test server: the default Deployment limits
-/// with no prewarmed worker. Only a Verifier that runs
-/// Python spawns the Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else
-/// the `build:server` `wyrd-server`, which serves as its own worker.
-///
-/// # Errors
-/// Returns [`WyrdTestServerError::Start`] when the sandbox pool cannot start.
-async fn test_verification_blocks() -> Result<HostedBlocks, WyrdTestServerError> {
-    let worker = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/release/wyrd-server"),
-        PathBuf::from,
-    );
-    let limits = HostedLimits {
-        monty_min_workers: 0,
-        ..HostedLimits::default()
-    };
-    HostedBlocks::start(worker, limits)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))
 }

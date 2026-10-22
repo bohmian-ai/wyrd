@@ -8,8 +8,15 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::components::auth::ServerAuth;
+use crate::components::gateway::Gateway;
+use crate::components::health::Health;
+use crate::components::operators::keys::OperatorKeys;
+use crate::config::{BifrostTarget, DeploymentProfile, GatewayConfig};
+use crate::mcp::Mcp;
 use crate::postgres::ServerPostgres;
-use crate::state::{AppState, Bifrost};
+use crate::state::{AppState, AppStateInner, Bifrost, LimitsConfig, ServerSettings, TestHooks};
+use crate::verification::Verification;
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -135,24 +142,77 @@ fn shell_decoding_keys()
     keys
 }
 
-/// Constructs a non-Bifrost unit-test application shell around shared dependencies.
-pub fn test_app_state(
+/// The owners of a unit-test application shell over `bifrost`:
+/// development settings, default auth, a gateway over the default
+/// configuration, and verification with no hosted blocks. A test changes one
+/// owner with struct-update syntax and assembles it with
+/// [`AppState::from_owners_for_test`].
+///
+/// # Panics
+/// Panics outside a Tokio runtime, because the submission writer task is
+/// spawned immediately, or if the default gateway cannot be built.
+pub fn shell_owners(
+    postgres: Arc<ServerPostgres>,
+    storage: Arc<StorageHandle>,
+    bifrost: Arc<Bifrost>,
+) -> AppStateInner {
+    let verification = Verification::new(postgres.wyrd().clone(), None, OperatorKeys::default());
+    AppStateInner {
+        settings: ServerSettings {
+            deployment_profile: DeploymentProfile::Development,
+            role: BifrostTarget::All,
+            limits: LimitsConfig::default(),
+        },
+        postgres,
+        storage,
+        bifrost,
+        auth: ServerAuth::default(),
+        gateway: Gateway::from_config(
+            GatewayConfig::default(),
+            DeploymentProfile::Development,
+            None,
+        )
+        .expect("the default gateway builds"),
+        verification,
+        mcp: Mcp::default(),
+        health: Health::default(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        test_hooks: TestHooks::default(),
+    }
+}
+
+/// The [`shell_owners`] of a non-Bifrost unit-test shell over `catalog`,
+/// whose Bifrost verifies tokens with a static key.
+///
+/// # Panics
+/// See [`shell_owners`].
+pub fn test_owners(
     postgres: Arc<ServerPostgres>,
     storage: Arc<StorageHandle>,
     catalog: Arc<BifrostCatalog>,
-) -> AppState {
+) -> AppStateInner {
     let verifier = Arc::new(TokenVerifier::new(
         shell_decoding_keys(),
         "wyrd",
         WyrdAuthVerifySettings::default(),
     ));
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    AppState::new(
+    shell_owners(
         postgres,
         storage,
         Bifrost::test_shell_with_catalog(verifier, catalog),
-        shutdown,
     )
+}
+
+/// A unit-test application shell over [`test_owners`].
+///
+/// # Panics
+/// See [`test_owners`].
+pub fn test_app_state(
+    postgres: Arc<ServerPostgres>,
+    storage: Arc<StorageHandle>,
+    catalog: Arc<BifrostCatalog>,
+) -> AppState {
+    AppState::from_owners_for_test(test_owners(postgres, storage, catalog))
 }
 
 /// Return a server Postgres owner over the shared fixture's exact runtime handles.
@@ -191,7 +251,15 @@ pub(crate) fn test_tenant() -> wyrd_spec::DataTenantId {
 /// # Panics
 /// Panics when the shared fixture cannot start.
 pub(crate) async fn test_state() -> AppState {
-    test_app_state(test_server_postgres(), test_storage(), test_catalog().await)
+    AppState::from_owners_for_test(test_state_owners().await)
+}
+
+/// The [`test_owners`] of [`test_state`], for a test that changes one.
+///
+/// # Panics
+/// Panics when the shared fixture cannot start; see [`test_owners`].
+pub(crate) async fn test_state_owners() -> AppStateInner {
+    test_owners(test_server_postgres(), test_storage(), test_catalog().await)
 }
 
 /// A fresh user in the fixture tenant holding exactly `permissions`.

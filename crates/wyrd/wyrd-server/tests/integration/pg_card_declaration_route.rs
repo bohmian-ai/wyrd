@@ -197,6 +197,38 @@ async fn wait_for_reconciliation_state(
     );
 }
 
+/// Assert a freshly declared heavy Card is not yet due for reconciliation:
+/// its first deadline sits past the client's ten-minute presigned upload
+/// window, so the reconciler cannot race the client's own completion.
+///
+/// # Panics
+/// Panics when the Card cannot be read or is already due before the window
+/// closes.
+async fn assert_awaits_client_upload(server: &WyrdTestServer, card_uid: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let (attempts, deferred): (i32, bool) = sqlx::query_as(
+        "SELECT reconcile_attempts, \
+                reconcile_next_attempt_at > statement_timestamp() + interval '9 minutes' \
+           FROM wyrd.cards WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("card reconciliation deadline reads");
+    conn.commit().await.expect("deadline read commits");
+    assert_eq!(
+        attempts, 0,
+        "reconciler claimed a Card awaiting its client upload"
+    );
+    assert!(
+        deferred,
+        "heavy Card was due before its upload window closed"
+    );
+}
+
 /// Make a pending reconciliation claim immediately eligible for the next pass.
 async fn make_reconciliation_due(server: &WyrdTestServer, card_uid: &CardUid) {
     let mut conn = server
@@ -1977,6 +2009,8 @@ async fn card_reconciler_recovers_after_storage_retry() {
         .expect("upload entry names its upload")
         .to_owned();
 
+    assert_awaits_client_upload(&server, &card_uid).await;
+    make_reconciliation_due(&server, &card_uid).await;
     wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
 
     assert!(upload_url.starts_with("/v1/cards/upload/local/"));
@@ -2072,6 +2106,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
         .expect("response contains card UID");
 
+    make_reconciliation_due(&server, &card_uid).await;
     wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
     make_reconciliation_due(&server, &card_uid).await;
     wait_for_reconciliation_state(&server, &card_uid, 2, "pending").await;
@@ -3854,7 +3889,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .expect("tenant connection opens");
     let queue = VerifierExecutionQueue::default();
     let state = server.state();
-    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
+    let authority =
+        BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox()));
     let mut outcomes = Vec::new();
     while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
         let accepted = match due.owner() {

@@ -6,6 +6,7 @@ pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
 pub mod claim_sample;
+pub(crate) mod committed_batches;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
@@ -718,7 +719,7 @@ impl ScribeImpl {
             ScribeIngressFrame {
                 attributed_cards: None,
                 authenticated_tenant: frame.principal.tenant_id,
-                attribution: wyrd_spec::auth::Attribution::direct(frame.principal.id),
+                attribution: wyrd_spec::auth::Attribution::direct(frame.principal.id).into(),
                 principal: frame.principal,
                 table: frame.table,
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),

@@ -69,18 +69,22 @@ identity is not a registered AI-system component.
 
 Gateway capture is a server-internal write that holds no token, evaluates no
 permission, and writes no audit decision. Its rows carry the verified
-subject/actor pair the call ran under. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never appears in
-a token: every issuer refuses it, every verifier rejects a token naming it, it
-never appears in a delegation chain, and it never replaces the invocation
-caller in audit. Gate refuses every public write to `vala.gateway.calls`. A pod
-without Scribe sends its outbox writes over the peer plane's capture RPC,
-admitted by `wyrd-peer` mTLS alone. Each request carries the subject/actor
-pair the local writer would stamp, and the RPC accepts only the six
-server-internal destinations: retained audit history, the two capture tables,
+subject/actor pair the call ran under. Two boundaries protect that
+attribution. First, public Gate ingestion derives every row's pair from the
+verified token and refuses supplied SUB/ACT columns; only server-owned outbox
+writes carry per-row pairs, and Scribe validates each as a principal id.
+Second, outbox lanes and batches are tenant-scoped: Scribe compares the
+authenticated tenant with the frame's principal tenant and binds the tenant's
+physical location, so callers of one tenant may share a frame but tenants never
+do. Outbox frames name `PLATFORM_AUDIT_PRINCIPAL`, the no-verified-caller
+marker, as their transport principal; it grants nothing and never replaces a
+row's verified pair or the invocation caller in audit. Gate refuses every
+public write to `vala.gateway.calls`. A pod without Scribe sends its outbox
+writes over the peer plane's capture RPC, admitted by `wyrd-peer` mTLS alone.
+Each request's rows carry the subject/actor pairs the local writer would
+stamp, and the RPC accepts only the six server-internal destinations: retained audit history, the two capture tables,
 and the three Verifier result tables. Only audit history may name the reserved
-system tenant; an audit row keeps its decision pair as content and travels
-under the `PLATFORM_AUDIT_PRINCIPAL` transport identity. A compromised cluster
+system tenant; an audit row keeps its decision pair as content. A compromised cluster
 member, already out of scope, is the only caller that could misuse it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
@@ -540,20 +544,27 @@ Audit cardinality follows authorization decisions, not HTTP requests and not
 engine mechanics. Permissions are blocking; audits are non-blocking. Every
 audited surface stages its decision in memory on the one process Scribe outbox
 once the decision is known, outside the operation's transaction, and never
-waits for the write. The outbox admits a finite process capacity
-(`scribe.outbox_capacity`) covering queued, waiting, retrying, and in-flight
-writes. An audit decision staged past its share is not queued: it is logged,
-counted in `outbox_events_lost_total{outbox="scribe"}`, and dropped, and the
-operation is neither refused nor delayed. Its one background writer
-groups each tenant slice by destination, encodes Arrow frames with
+waits for the write. The outbox admits a finite process capacity, by writes
+(`scribe.outbox_capacity`, default 65,536) and by accounted bytes
+(`scribe.outbox_bytes`, default 1 GiB, counting at least every captured
+payload and object a write holds), covering queued, waiting, retrying, and
+in-flight writes. An audit decision or gateway capture staged past its share
+of either is shed, not queued: it is counted in
+`outbox_events_lost_total{outbox="scribe",reason="shed"}` and logged at most
+once per tenant per second with the count shed, and the operation is neither
+refused nor delayed. Its one background writer spreads each tenant's writes
+over a few lanes, keeping one request's decisions and capture in one lane and
+all Verifier evidence in one lane, groups each lane's slice by destination, encodes Arrow frames with
 content-derived batch ids, and submits them to the local Scribe or over the
 mutually authenticated peer plane to a Scribe pod. A retryable failure is
 logged with its tenant, counted in `outbox_write_failures_total{outbox="scribe"}`,
 and resubmitted as the identical slice, which Scribe's durable batch-id fence
 absorbs when the earlier acknowledgement was lost. A terminal rejection is
-logged, counted in `outbox_events_lost_total{outbox="scribe"}`, and consumed.
-Writes Scribe has not acknowledged are lost on abrupt process death or when
-graceful shutdown reaches its deadline; observable loss is counted, and loss
+logged, counted in `outbox_events_lost_total{outbox="scribe",reason="rejected"}`,
+and consumed; a process that reaches no Scribe counts its writes with
+`reason="unreachable"`. Writes Scribe has not acknowledged are lost on abrupt
+process death or when graceful shutdown reaches its deadline; the shutdown loss
+is counted with `reason="shutdown"`, and loss
 never changes the originating permission decision. Scribe batch commits and
 Forge maintenance transitions evaluate no permission: they are recorded as
 lineage in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no

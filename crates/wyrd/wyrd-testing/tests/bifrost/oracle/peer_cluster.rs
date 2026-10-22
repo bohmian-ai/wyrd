@@ -242,16 +242,16 @@ impl PeerCluster {
         let deadline = tokio::time::Instant::now() + READY_DEADLINE;
         loop {
             let state = self.server(index)?.state();
-            let snapshot = state.readiness.load_full();
-            if snapshot.all_ok() && state.peer_plane.is_satisfied() {
+            let snapshot = state.health.readiness.load_full();
+            if snapshot.all_ok() && state.health.peer_plane.is_satisfied() {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
                     "pod {index} never became ready: {snapshot:?} peer_required={} \
                      peer_serving={}",
-                    state.peer_plane.is_required(),
-                    state.peer_plane.is_serving(),
+                    state.health.peer_plane.is_required(),
+                    state.health.peer_plane.is_serving(),
                 )
                 .into());
             }

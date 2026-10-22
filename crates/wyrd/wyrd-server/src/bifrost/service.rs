@@ -263,7 +263,7 @@ mod pg_tests {
     ) -> Vec<AuditDecision> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );

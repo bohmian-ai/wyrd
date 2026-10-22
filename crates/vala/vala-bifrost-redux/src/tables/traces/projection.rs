@@ -14,7 +14,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
@@ -166,15 +166,23 @@ pub struct SpanOutputWidths {
     pub link: usize,
 }
 
+/// Projected span schema, built once: every span batch shares this `Arc`, so
+/// batches of one destination compare by pointer and no row rebuilds or
+/// frees the schema tree.
+static SPAN_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| projected_signal_schema(SPAN_FIELDS));
+
+/// Span output widths, derived once from the constant span ledger.
+static SPAN_WIDTHS: LazyLock<SpanOutputWidths> = LazyLock::new(|| SpanOutputWidths {
+    row: fixed_row_bytes(SPAN_SCHEMA.fields()),
+    event: fixed_row_bytes(&Fields::from(vec![SPAN_EVENT_ELEMENT.to_arrow()])),
+    link: fixed_row_bytes(&Fields::from(vec![SPAN_LINK_ELEMENT.to_arrow()])),
+});
+
 impl SpanOutputWidths {
-    /// Derives the widths from the canonical span ledger.
+    /// The widths of the canonical span ledger, derived once per process.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            row: fixed_row_bytes(projected_signal_schema(SPAN_FIELDS).fields()),
-            event: fixed_row_bytes(&Fields::from(vec![SPAN_EVENT_ELEMENT.to_arrow()])),
-            link: fixed_row_bytes(&Fields::from(vec![SPAN_LINK_ELEMENT.to_arrow()])),
-        }
+        *SPAN_WIDTHS
     }
 }
 
@@ -681,7 +689,7 @@ impl SpanColumns {
             utf8_opt_column(&self.run_id),
         ];
 
-        RecordBatch::try_new(projected_signal_schema(SPAN_FIELDS), columns)
+        RecordBatch::try_new(Arc::clone(&SPAN_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical span batch: {error}")))
     }
 }

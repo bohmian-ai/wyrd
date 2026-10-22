@@ -16,8 +16,16 @@ history lives in git; this document states one architecture.
 
 `wyrd-server` is the only network-serving surface. It owns listeners, TLS,
 authentication, authorization, request limits, boot readiness, and server
-lifecycle for Bifrost HTTP, gRPC, and MCP operations. Vala owns the Bifrost
-engine and its three cohesive subsystems:
+lifecycle for Bifrost HTTP, gRPC, and MCP operations. Production and the test
+harness start the same complete graph through one `AppState::start`; the
+resulting state is immutable. Each engine owns its caches and refresh tasks
+and returns them as startup workers that the one server supervisor runs: Bifrost
+owns the only Scribe outbox, and Verification owns its hosted blocks, queued
+submission outbox, and Operator keys. Shutdown stops transports and new claims,
+then drains the gateway, MCP, and verification (runner, then the Monty pool is
+closed and its workers reaped), the Scribe outbox, Bifrost, the verifier
+submission outbox, and telemetry, in that order, under one deadline. Vala owns
+the Bifrost engine and its three cohesive subsystems:
 
 - **Scribe** owns pod-local ingestion, WAL durability, active and immutable
   rows, durable local staging, hot-object publication, and bounded live-tail
@@ -85,8 +93,9 @@ authenticated principal.
 
 Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
 Required, non-null `sub_principal_id` and `act_principal_id` record who the
-row's work was for and who performed it, stamped from verified attribution and
-never from row values: a direct publisher is both, a delegated one records the
+row's work was for and who performed it. Public writes are stamped from the
+verified token and refuse supplied values; server-owned outbox writes carry
+each row's own verified pair, which Scribe validates. A direct publisher is both, a delegated one records the
 party it acts for as subject and itself as actor. None participates in row
 identity.
 
@@ -483,6 +492,16 @@ SLICE record, appends each complete batch's COMMIT record, and makes both
 durable with one sync over every segment the cycle touched before it records
 the batch fences. No request is acknowledged before that sync and its fence
 commit.
+
+An honest retry of a batch that is already fenced and visible is the one
+exception: its data was synced by the earlier attempt, so re-queueing it would
+only make it wait behind fresh writes' syncs before the fence suppressed it.
+After preprocessing, Scribe compares the request with a bounded pod-local index
+of batches its shards fenced and made visible. When the tenant, batch id,
+logical table, logical slice-set digest, and slice count all match, the request
+is acknowledged at once with no first commit and nothing is rewritten. A miss,
+an evicted entry, or any mismatch takes the shard path, where the durable fence
+remains the only authority for first commits and identity contradictions.
 
 Each write request carries one profile in the Oracle query-profile pattern,
 emitted once when the request settles as
@@ -961,7 +980,7 @@ Scribe as a `vala.system.audit_log` row in a per-tenant batch, like every other
 audit event. Rows are not held for that write; a retryable failure is logged,
 counted through `outbox_write_failures_total{outbox="scribe"}`, and retried with
 the identical batch, and a terminal rejection is logged, counted through
-`outbox_events_lost_total{outbox="scribe"}`, and consumed. The
+`outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and consumed. The
 `outbox_pending{outbox="scribe"}` gauge reports writes the process still owns
 before Scribe acknowledges them or their loss is counted, and shutdown drains
 the outbox to its deadline. One logical query produces one read-audit event; distributed stages
@@ -1439,8 +1458,9 @@ principal. Only the server-internal capture writer writes them, together with
 the capture spans in `vala.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
 Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
-batch carries the verified pair it was produced under, which Scribe stamps as
-`sub_principal_id` and `act_principal_id`: the call's pair for gateway
+row carries the verified pair it was produced under, which Scribe validates as
+principal ids and stamps as `sub_principal_id` and `act_principal_id`, so one
+tenant's batch may hold rows of many callers: the call's pair for gateway
 capture, the caller's pair for a `verify` result and its inputs, the submitting
 caller's pair for `submit` inputs, and the execution's accepted subject with
 the tenant `System` principal as actor for a queued result. A `submit`
@@ -1451,9 +1471,11 @@ death, and the execution then never becomes visible. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `vala.system.audit_log` explicitly,
-carries no token, and always carries that subject and actor pair. Audit rows
-carry their own identities as row content, so an audit batch submits the
-no-verified-caller sentinel pair. It is refused for any
+carries no token, and its rows carry their own subject and actor pairs. Audit
+rows carry their own identities as row content, so an audit batch submits the
+no-verified-caller sentinel pair. Every outbox frame names that
+no-verified-caller marker as its transport principal; it grants nothing. It is
+refused for any
 other table, and for the reserved system tenant unless the table is
 `vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,

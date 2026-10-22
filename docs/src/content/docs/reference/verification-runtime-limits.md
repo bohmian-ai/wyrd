@@ -14,7 +14,6 @@ These limits protect a server that runs Verifiers for many tenants. They are env
 | Environment variable | Default | Bounds |
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers. `1` or `0`; also `[verification] enabled` in TOML |
-| `WYRD_VERIFICATION_MONTY_WORKER` | the running `wyrd-server` | Executable the pool starts as `<path> subprocess` for each Python worker |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
 | `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
 | `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |
@@ -48,7 +47,7 @@ These limits protect a server that runs Verifiers for many tenants. They are env
   - `MONTY_PROCESS_MEMORY_MIB` too small for `MONTY_MEMORY_MIB` plus Monty's 4 MiB allocator headroom;
   - `FILE_MAX_MIB` above `FILES_MAX_MIB`;
   - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`.
-- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the worker binary is missing or the first `MONTY_MIN_WORKERS` workers cannot start.
+- When the runtime is enabled, the server refuses to start with `hosted Verifier blocks could not start` if the first `MONTY_MIN_WORKERS` workers, started from its own binary, cannot start. With `MONTY_MIN_WORKERS=0` workers start on first use, and a worker that cannot start fails that operation instead.
 - No setting disables a limit or an isolation protection.
 
 A Verifier can lower a limit for one slot, such as `max_bytes` on a `media` slot, never raise it. Step, Agent, and request deadlines apply too; the earliest one wins.
@@ -91,7 +90,7 @@ Always on, whatever the settings, and identical on macOS and Linux:
 | Limit reached | Result |
 | --- | --- |
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
-| The server's verification staging is full (`scribe.outbox_capacity`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
+| The server's verification staging is full (`scribe.outbox_capacity` or `scribe.outbox_bytes`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
 | No Python worker or workspace free | Queued: the execution stays queued and its attempt is refunded. Direct: `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
 | Any other limit inside a step or check, including a spent `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |

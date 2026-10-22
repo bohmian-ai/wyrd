@@ -110,7 +110,7 @@ wyrd-gateway = { workspace = true }
 skald-providers = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
-wyrd-sql = { workspace = true }
+wyrd-sql = { workspace = true, features = ["test-support"] }
 wyrd-storage = { workspace = true }
 wyrd-telemetry = { workspace = true }
 wyrd-tls = { workspace = true }

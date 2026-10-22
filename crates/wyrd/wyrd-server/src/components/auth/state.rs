@@ -12,8 +12,10 @@ use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 
-/// Authentication handles: token issuance + verification + issuer/binding resolution.
-#[derive(Clone, Default)]
+/// Authentication and authorization: token issuance and verification,
+/// issuer/binding resolution, human and platform logins, and the permission
+/// check every authorized operation evaluates.
+#[derive(Clone)]
 pub struct ServerAuth {
     /// Ed25519 key used to sign access and API-key tokens. Required for any token-issuance route.
     pub issuing_key: Option<Arc<IssuingKey>>,
@@ -43,6 +45,28 @@ pub struct ServerAuth {
     pub platform_login: Option<PlatformLogin>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
+    /// RBAC permission evaluator; an embedding deployment may supply its own
+    /// at startup.
+    pub permission_check: Arc<dyn PermissionCheck>,
+}
+
+impl Default for ServerAuth {
+    /// No issuance, verification, resolvers, or logins, with RBAC permission
+    /// checks; unit-test shells start from this.
+    fn default() -> Self {
+        Self {
+            issuing_key: None,
+            token_verifier: None,
+            external_verifier: None,
+            trusted_issuer_resolver: None,
+            workload_binding_resolver: None,
+            sealing_key: None,
+            human_connections: None,
+            platform_login: None,
+            token_exchange_settings: TokenExchangeSettings::default(),
+            permission_check: Arc::new(RbacCheck),
+        }
+    }
 }
 
 impl ServerAuth {
@@ -61,20 +85,5 @@ impl ServerAuth {
                 Arc::clone(audit) as _,
             )
         })
-    }
-}
-
-/// Authorization handles: RBAC evaluation.
-#[derive(Clone)]
-pub struct ServerAuthz {
-    /// RBAC permission evaluator. Defaults to `RbacCheck`.
-    pub permission_check: Arc<dyn PermissionCheck>,
-}
-
-impl Default for ServerAuthz {
-    fn default() -> Self {
-        Self {
-            permission_check: Arc::new(RbacCheck),
-        }
     }
 }

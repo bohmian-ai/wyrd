@@ -807,7 +807,7 @@ async fn production_boot_requires_every_active_tenant_key() {
         ..WyrdServerConfig::default()
     };
     let engine = base64::engine::general_purpose::STANDARD;
-    let mut state = server.state().clone();
+    let state = server.state();
 
     let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
     let unreachable = format!("http://{}", closed.local_addr().expect("addr"));
@@ -821,8 +821,8 @@ async fn production_boot_requires_every_active_tenant_key() {
         ("malformed key", malformed.uri()),
         ("wrong-length key", short.uri()),
     ] {
-        state.operator_keys = std::sync::Arc::new(vault_keys(&addr));
-        let refused = wyrd_server::boot::verify_operator_keys(&state, &production)
+        let keys = vault_keys(&addr);
+        let refused = wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &production)
             .await
             .expect_err(case)
             .to_string();
@@ -835,8 +835,8 @@ async fn production_boot_requires_every_active_tenant_key() {
     }
 
     let readable = vault_serving(Some(engine.encode([4_u8; 32]))).await;
-    state.operator_keys = std::sync::Arc::new(vault_keys(&readable.uri()));
-    wyrd_server::boot::verify_operator_keys(&state, &production)
+    let keys = vault_keys(&readable.uri());
+    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &production)
         .await
         .expect("readable 32-byte keys boot");
     let reads = readable.received_requests().await.expect("recorded").len();
@@ -845,13 +845,13 @@ async fn production_boot_requires_every_active_tenant_key() {
         "every active tenant, including the fixture, is checked: {reads}"
     );
 
-    state.operator_keys = std::sync::Arc::new(vault_keys(&unreachable));
-    wyrd_server::boot::verify_operator_keys(&state, &WyrdServerConfig::default())
+    let keys = vault_keys(&unreachable);
+    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &WyrdServerConfig::default())
         .await
         .expect("development defers key failures");
     let mut single_tenant = production.clone();
     single_tenant.auth.tenant_slug = Some(wyrd_spec::TenantSlug::new("acme").expect("slug"));
-    wyrd_server::boot::verify_operator_keys(&state, &single_tenant)
+    wyrd_server::boot::verify_operator_keys(&keys, &state.postgres, &single_tenant)
         .await
         .expect("an explicitly single-tenant deployment defers key failures");
 }

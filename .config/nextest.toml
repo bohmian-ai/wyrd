@@ -77,22 +77,26 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(wyrd-testing) and binary(capacity) and (test(=tests::a_stalled_tenant_setup_stops_the_run_by_its_deadline) or test(=tests::a_slow_replica_stop_leaves_the_runtime_free))'
 test-group = 'release-server-ports'
-# Every other server-booting test starts its own WyrdTestServer,
-# which holds about 14 Postgres connections: an 8-connection app pool
-# (WYRD_DB_MAX_CONNECTIONS, scripts/postgres/with-test-postgres.sh), the
-# migrator and platform-admin pools of 2 each, and its fixture-database
-# connections. The default profile runs one test per CPU, so a wide host
-# oversubscribes max_connections=400 (docker-compose.yml) and servers fail to
-# start with "too many clients". A `PgFixture` opens the same Wyrd and Vala
-# serving pools, so every `pg_*tests` module costs as much as a server and
-# shares the cap. Sixteen at once is about 224 connections, leaving headroom for
-# the capped groups above and the tests outside them. Binaries already in
-# `postgres-fixtures` keep that group: the first matching override wins.
+# Every other server-booting test starts its own WyrdTestServer. A server
+# opens one set of serving pools and its fixture keeps another, each capped by
+# scripts/postgres/with-test-postgres.sh: an 8-connection app pool
+# (WYRD_DB_MAX_CONNECTIONS), an 8-connection Vala pool
+# (WYRD_DB_MAX_CONNECTIONS_VALA), and a 2-connection platform-admin pool, so
+# about 36 at most, plus brief migrator and superuser connections while its
+# database is created. Pools fill lazily and a test rarely holds more than a
+# third of that. The default profile runs one test per CPU, so a wide host
+# oversubscribes max_connections=400 (docker-compose.yml), and SQLx reports the
+# refused connections as pool timeouts. A `PgFixture` opens the same serving
+# pools, so every `pg_*tests` module and the wyrd-sql and vala-sql `pg_*`
+# integration modules cost as much as a server and share the cap. Sixteen at
+# once plus the six `postgres-fixtures` stays under the limit at typical use.
+# Binaries already in `postgres-fixtures` keep that group: the first matching
+# override wins.
 [test-groups.pg-servers]
 max-threads = 16
 
 [[profile.default.overrides]]
-filter = '(package(wyrd-server) and binary(integration) and test(/^pg_/)) or test(/pg_[a-z_]*tests::/)'
+filter = '((package(wyrd-server) | package(wyrd-sql) | package(vala-sql)) and binary(integration) and test(/^pg_/)) or test(/pg_[a-z_]*tests::/)'
 test-group = 'pg-servers'
 
 [profile.journey]

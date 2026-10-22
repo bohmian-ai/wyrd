@@ -12,7 +12,7 @@
 //! disabled policy never reaches this module.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::Schema;
@@ -40,6 +40,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::{CARD_UID, RUN_ID};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -50,7 +51,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 use super::invocation::GatewayCallSubject;
-use crate::scribe_outbox::{ScribeTable, project_spans};
+use crate::scribe_outbox::{Owner, ScribeTable, project_spans};
 use crate::state::AppState;
 
 /// Value substituted for a redacted secret.
@@ -180,8 +181,6 @@ pub struct CallCapture {
     /// One span's admitted-adapter provider and fields per attempt, in
     /// ordinal order.
     spans: Vec<(&'static str, GatewayAttemptSpanFieldsV1)>,
-    /// Request that admitted the call, published with both batches.
-    request_id: RequestId,
     /// Subject and actor pair both batches are stamped with.
     attribution: Attribution,
     /// Authorized Run and Card the row is correlated to.
@@ -197,7 +196,8 @@ impl CallCapture {
     /// Usage, cost, and pricing come only from the appended ledger entries, so
     /// unknown values stay null. `Metadata` writes both payload columns null;
     /// `Payload` writes only the selected fields, each redacted and
-    /// canonicalized.
+    /// canonicalized. Arrow rows are built later by [`Self::project`], for
+    /// many captures at once.
     ///
     /// # Errors
     ///
@@ -250,6 +250,7 @@ impl CallCapture {
         let payload = GatewayCallPayloadV1 {
             schema_version: 1,
             call_id: facts.call_id,
+            request_id: facts.request_id,
             operation: facts.operation,
             ingress_dialect: ingress_dialect(facts.ingress, facts.operation),
             requested_model: facts.requested,
@@ -284,76 +285,105 @@ impl CallCapture {
             payload,
             objects,
             spans,
-            request_id: facts.request_id,
             attribution: facts.attribution,
             subject: facts.subject,
             trace: facts.trace,
         })
     }
 
-    /// Builds the one-row `vala.gateway.calls` batch over the table's user
-    /// fields followed by its `card_uid` and `run_id` correlation inputs.
+    /// The call's request correlation ID, which its audit decision carries
+    /// too, so the Scribe outbox writes both in one lane.
+    pub(crate) fn request_id(&self) -> &str {
+        self.payload.request_id.as_str()
+    }
+
+    /// Bytes of captured content this capture holds: both payload columns'
+    /// texts and every referenced object, which the Scribe outbox accounts
+    /// against its byte limit.
+    pub(crate) fn content_bytes(&self) -> usize {
+        let payloads = [
+            &self.payload.request_payload_json,
+            &self.payload.response_payload_json,
+        ];
+        payloads
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            + self.objects.bytes()
+    }
+
+    /// Builds one `vala.gateway.calls` batch holding one row per capture, in
+    /// order, over the table's user fields followed by its `card_uid` and
+    /// `run_id` correlation inputs.
     ///
-    /// The correlation inputs carry the authorized subject's Card UID, which
+    /// The correlation inputs carry each authorized subject's Card UID, which
     /// Scribe confirms against the frame's attributed UIDs, and its Run, each
     /// null when the subject names none; both are null for an uncorrelated
     /// call.
     ///
-    /// The scalar columns decode from the serialized payload; the
-    /// `request_payload` and `response_payload` Variant columns encode the
-    /// payload's redacted canonical JSON texts, keeping their JSON types.
+    /// The scalar columns decode from the serialized payloads in one decoder
+    /// pass; the `request_payload` and `response_payload` Variant columns
+    /// encode the payloads' redacted canonical JSON texts, keeping their JSON
+    /// types. Every batch shares one schema `Arc`.
     ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the row
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows
     /// and [`CaptureDrop::Payload`] when a selected payload exceeds a Variant
     /// limit.
-    pub(crate) fn calls_batch(&self) -> Result<RecordBatch, CaptureDrop> {
-        let mut fields = CallsTable::arrow_fields();
-        fields.extend(correlation_fields());
-        let schema = Arc::new(Schema::new(fields));
-        let scalars = Schema::new(
-            schema
-                .fields()
-                .iter()
-                .filter(|field| !is_payload_column(field.name()))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        let mut decoder = ReaderBuilder::new(Arc::new(scalars))
+    pub(crate) fn calls_batch(captures: &[&Self]) -> Result<RecordBatch, CaptureDrop> {
+        let (schema, scalars) = &*CALLS_SCHEMAS;
+        let mut decoder = ReaderBuilder::new(Arc::clone(scalars))
+            .with_batch_size(captures.len().max(1))
             .build_decoder()
             .map_err(|_| CaptureDrop::Projection)?;
+        let payloads = captures
+            .iter()
+            .map(|capture| &capture.payload)
+            .collect::<Vec<_>>();
         decoder
-            .serialize(std::slice::from_ref(&self.payload))
+            .serialize(&payloads)
             .map_err(|_| CaptureDrop::Projection)?;
         let decoded = decoder
             .flush()
             .ok()
             .flatten()
             .ok_or(CaptureDrop::Projection)?;
-        let mut columns = schema
+        let subject = |pick: fn(&GatewayCallSubject) -> Option<&str>| -> ArrayRef {
+            Arc::new(StringArray::from_iter(
+                captures
+                    .iter()
+                    .map(|capture| capture.subject.as_ref().and_then(pick)),
+            ))
+        };
+        let columns = schema
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                REQUEST_PAYLOAD => payload_column(self.payload.request_payload_json.as_deref()),
-                RESPONSE_PAYLOAD => payload_column(self.payload.response_payload_json.as_deref()),
+                REQUEST_PAYLOAD => payload_column(
+                    captures
+                        .iter()
+                        .map(|capture| capture.payload.request_payload_json.as_deref()),
+                ),
+                RESPONSE_PAYLOAD => payload_column(
+                    captures
+                        .iter()
+                        .map(|capture| capture.payload.response_payload_json.as_deref()),
+                ),
+                CARD_UID => Ok(subject(|subject| {
+                    subject.card_uid.as_ref().map(CardUid::as_str)
+                })),
+                RUN_ID => Ok(subject(|subject| {
+                    subject.run_id.as_ref().map(RunId::as_str)
+                })),
                 name => decoded
                     .column_by_name(name)
                     .cloned()
                     .ok_or(CaptureDrop::Projection),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(subject) = &self.subject {
-            let user = columns.len() - 2;
-            columns.truncate(user);
-            columns.push(Arc::new(StringArray::from(vec![
-                subject.card_uid.as_ref().map(CardUid::as_str),
-            ])));
-            columns.push(Arc::new(StringArray::from(vec![
-                subject.run_id.as_ref().map(RunId::as_str),
-            ])));
-        }
-        RecordBatch::try_new(schema, columns).map_err(|_| CaptureDrop::Projection)
+        RecordBatch::try_new(Arc::clone(schema), columns).map_err(|_| CaptureDrop::Projection)
     }
 
     /// The OTLP attempt spans [`Self::spans_batch`] projects, one per attempt
@@ -381,26 +411,31 @@ impl CallCapture {
             .collect()
     }
 
-    /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
+    /// Builds one canonical `vala.traces.spans` batch of every capture's
+    /// attempt spans, capture by capture in ordinal order, in one projection.
     ///
-    /// Every span shares one trace, so they link to each other and to the row
-    /// by `gateway_call_id`: when the call continued a caller's trace, that
-    /// trace, each span a child of the exported `gateway.call` span, and
-    /// otherwise a trace whose id is the call id. Span ids derive from the call id and attempt ordinal, so they
-    /// stay distinct when many calls share a caller's trace. Each carries exactly the
+    /// Every span of a call shares one trace, so they link to each other and
+    /// to the row by `gateway_call_id`: when the call continued a caller's
+    /// trace, that trace, each span a child of the exported `gateway.call`
+    /// span, and otherwise a trace whose id is the call id. Span ids derive
+    /// from the call id and attempt ordinal, so they stay distinct when many
+    /// calls share a caller's trace. Each carries exactly the
     /// [`GatewayAttemptSpanFieldsV1`] attributes, nulls omitted, plus the
     /// standard GenAI operation, provider, and request-model attributes.
-    /// Returns `None` for a call with no attempt.
+    /// Returns `None` when no capture made an attempt.
     ///
     /// # Errors
     ///
     /// Returns [`CaptureDrop::Projection`] when the canonical projection fails
-    /// or rejects a span.
-    pub(crate) fn spans_batch(&self) -> Result<Option<RecordBatch>, CaptureDrop> {
-        if self.spans.is_empty() {
+    /// or rejects any span, so every span of the batch lands or none does.
+    pub(crate) fn spans_batch(captures: &[&Self]) -> Result<Option<RecordBatch>, CaptureDrop> {
+        let mut spans = Vec::new();
+        for capture in captures {
+            spans.extend(capture.otlp_spans()?);
+        }
+        if spans.is_empty() {
             return Ok(None);
         }
-        let spans = self.otlp_spans()?;
         let resource = ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![attribute(
@@ -424,33 +459,50 @@ impl CallCapture {
             .ok_or(CaptureDrop::Projection)
     }
 
-    /// The row batch and, when the call made attempts, the span batch, each
-    /// with the destination it is staged for.
+    /// Projects the captures of `group`, each with its slice position, into
+    /// one row batch and one span batch, each with its destination and every
+    /// row's slice position and subject/actor pair.
+    ///
+    /// The outbox writer calls this once per slice, so the per-batch cost of
+    /// building Arrow columns is paid once per frame, not once per call. A
+    /// row batch has one row per capture; a span batch one row per attempt,
+    /// so its owners repeat each capture's once per attempt.
     ///
     /// # Errors
     ///
-    /// Returns the projection drop of either batch.
-    pub(crate) fn batches(&self) -> Result<Vec<(ScribeTable, RecordBatch)>, CaptureDrop> {
-        let mut batches = vec![(ScribeTable::Calls, self.calls_batch()?)];
-        if let Some(spans) = self.spans_batch()? {
-            batches.push((ScribeTable::Spans, spans));
+    /// Returns the drop of [`Self::calls_batch`] or [`Self::spans_batch`];
+    /// the caller then projects each capture alone, so one capture that
+    /// cannot project never drops the others.
+    pub(crate) fn project(
+        group: &[(usize, &Self)],
+    ) -> Result<Vec<(ScribeTable, RecordBatch, Vec<Owner>)>, CaptureDrop> {
+        let captures = group
+            .iter()
+            .map(|(_, capture)| *capture)
+            .collect::<Vec<_>>();
+        let mut projected = vec![(
+            ScribeTable::Calls,
+            Self::calls_batch(&captures)?,
+            group
+                .iter()
+                .map(|(index, capture)| (*index, capture.attribution))
+                .collect(),
+        )];
+        if let Some(spans) = Self::spans_batch(&captures)? {
+            let owners = group
+                .iter()
+                .flat_map(|(index, capture)| {
+                    std::iter::repeat_n((*index, capture.attribution), capture.spans.len())
+                })
+                .collect();
+            projected.push((ScribeTable::Spans, spans, owners));
         }
-        Ok(batches)
+        Ok(projected)
     }
 
     /// Tenant the record belongs to.
     pub(crate) const fn tenant(&self) -> DataTenantId {
         self.tenant
-    }
-
-    /// Request that admitted the call, which both batches carry.
-    pub(crate) const fn request_id(&self) -> &RequestId {
-        &self.request_id
-    }
-
-    /// Subject and actor pair both batches are stamped with.
-    pub(crate) const fn attribution(&self) -> Attribution {
-        self.attribution
     }
 
     /// Writes and verifies every object the row references, then releases
@@ -589,6 +641,11 @@ impl std::fmt::Debug for PayloadObjects {
 }
 
 impl PayloadObjects {
+    /// Total length of every object held.
+    fn bytes(&self) -> usize {
+        self.objects.values().map(Vec::len).sum()
+    }
+
     /// Records `bytes` under their canonical digest and returns the reference
     /// that replaces them in the captured payload.
     ///
@@ -656,21 +713,41 @@ impl PayloadObjects {
     }
 }
 
+/// The `vala.gateway.calls` row schema with its correlation inputs, and the
+/// same schema without the two payload columns, which the JSON row decoder
+/// builds. Built once, so every row shares both `Arc`s: rows of one frame
+/// compare by pointer and no row rebuilds or frees the schema tree.
+static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
+    let mut fields = CallsTable::arrow_fields();
+    fields.extend(correlation_fields());
+    let scalars = fields
+        .iter()
+        .filter(|field| !is_payload_column(field.name()))
+        .cloned()
+        .collect::<Vec<_>>();
+    (
+        Arc::new(Schema::new(fields)),
+        Arc::new(Schema::new(scalars)),
+    )
+});
+
 /// Whether `name` is one of the two Variant payload columns of
 /// `vala.gateway.calls`, which the JSON row decoder cannot build.
 fn is_payload_column(name: &str) -> bool {
     name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
 }
 
-/// Encodes one optional canonical JSON payload text as a one-row Variant
-/// column; an unselected payload is a null row.
+/// Encodes optional canonical JSON payload texts as a Variant column, one row
+/// per text; an unselected payload is a null row.
 ///
 /// # Errors
 ///
-/// Returns [`CaptureDrop::Payload`] when the text is not JSON or exceeds a
-/// Variant limit, so the capture is dropped rather than stored partially.
-fn payload_column(text: Option<&str>) -> Result<ArrayRef, CaptureDrop> {
-    VariantColumnBuilder::encode("payload", [text], EncodedVariant::from_json_text)
+/// Returns [`CaptureDrop::Payload`] when a text is not JSON or exceeds a
+/// Variant limit, so the captures are dropped rather than stored partially.
+fn payload_column<'a>(
+    texts: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<ArrayRef, CaptureDrop> {
+    VariantColumnBuilder::encode("payload", texts, EncodedVariant::from_json_text)
         .map_err(|_| CaptureDrop::Payload)
 }
 
@@ -1002,8 +1079,8 @@ pub(crate) mod tests {
     use wyrd_spec::ids::ProviderDeploymentName;
 
     use super::{
-        AnyValueKind, CallCapture, CallFacts, CaptureDrop, PayloadObjects, object_path,
-        request_content,
+        AnyValueKind, CallCapture, CallFacts, CaptureDrop, PayloadObjects, ScribeTable,
+        object_path, request_content,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1091,7 +1168,7 @@ pub(crate) mod tests {
         assert_eq!(capture.payload.attempt_count, 1);
         assert_eq!(capture.payload.usage, None, "unknown usage stays null");
 
-        let calls = capture.calls_batch().expect("calls batch");
+        let calls = CallCapture::calls_batch(&[&capture]).expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
         for column in ["card_uid", "run_id", "request_payload", "response_payload"] {
             let array = calls.column_by_name(column).expect(column);
@@ -1100,11 +1177,50 @@ pub(crate) mod tests {
 
         assert_eq!(capture.spans.len(), 1);
         assert_eq!(capture.spans[0].1.gateway_call_id, capture.payload.call_id);
-        let spans = capture
-            .spans_batch()
+        let spans = CallCapture::spans_batch(&[&capture])
             .expect("spans project")
             .expect("one attempt yields spans");
         assert_eq!(spans.num_rows(), 1);
+    }
+
+    /// Proves a group projects into one row batch and one span batch whose
+    /// owners follow the rows, each with its call's own subject and actor:
+    /// one row per call, and one span row per attempt, so a three-attempt
+    /// call owns three span rows.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
+    #[test]
+    fn a_group_projects_in_bulk_with_each_rows_owner() {
+        let single = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+            .expect("metadata projects");
+        let mut retried = facts(policy(GatewayCaptureMode::Metadata, &[]));
+        let template = retried.attempts.remove(0);
+        retried.attempts = (1..=3)
+            .map(|ordinal| AttemptRecord {
+                ordinal: NonZeroU32::new(ordinal).expect("ordinal"),
+                ..template.clone()
+            })
+            .collect();
+        let retried = CallCapture::from_facts(retried).expect("metadata projects");
+
+        let projected = CallCapture::project(&[(4, &single), (7, &retried)]).expect("projects");
+        let (one, other) = (single.attribution, retried.attribution);
+        let shape = projected
+            .iter()
+            .map(|(table, batch, owners)| (*table, batch.num_rows(), owners.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                (ScribeTable::Calls, 2, vec![(4, one), (7, other)]),
+                (
+                    ScribeTable::Spans,
+                    4,
+                    vec![(4, one), (7, other), (7, other), (7, other)]
+                ),
+            ]
+        );
     }
 
     /// Proves each retained attempt span names its admitted adapter's
@@ -1176,10 +1292,8 @@ pub(crate) mod tests {
     fn unresolved_call_nulls_resolved_model_children() {
         let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
         facts.resolved = None;
-        let calls = CallCapture::from_facts(facts)
-            .expect("metadata projects")
-            .calls_batch()
-            .expect("calls batch");
+        let capture = CallCapture::from_facts(facts).expect("metadata projects");
+        let calls = CallCapture::calls_batch(&[&capture]).expect("calls batch");
         let resolved = calls
             .column_by_name("resolved_model")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StructArray>())
@@ -1381,14 +1495,14 @@ pub(crate) mod recording {
     use bytes::Bytes;
     use vala_bifrost_redux::catalog::{TableRef, TableUid};
     use vala_bifrost_redux::contracts::{
-        FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+        FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
     };
     use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::CardRefScope;
-    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
     use crate::state::AppState;
@@ -1429,16 +1543,15 @@ pub(crate) mod recording {
         pub(crate) tenant: DataTenantId,
         /// Transport principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
-        /// Subject and actor pair Scribe stamps on the frame's rows.
-        pub(crate) attribution: Attribution,
+        /// Subject and actor pair Scribe stamps on each of the frame's rows,
+        /// in row order: the frame's one pair, or each row's own.
+        pub(crate) pairs: Vec<Attribution>,
         /// Card UIDs Scribe authorizes `card_uid` against: the frame's
         /// attributed UIDs when it carries them, otherwise its principal's
         /// signed scope.
         pub(crate) card_scope: Vec<CardUid>,
         /// Fully qualified destination table.
         pub(crate) table: String,
-        /// Request the frame was admitted under.
-        pub(crate) request_id: RequestId,
         /// Rows the frame's IPC stream carries.
         pub(crate) rows: usize,
         /// The frame's IPC stream.
@@ -1453,18 +1566,55 @@ pub(crate) mod recording {
             Self {
                 tenant: frame.authenticated_tenant,
                 principal: frame.principal.id,
-                attribution: frame.attribution,
+                pairs: Self::pairs(frame.attribution, rows, &ipc),
                 card_scope: frame
                     .attributed_cards
                     .clone()
                     .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids))
                     .unwrap_or_default(),
                 table: frame.table.fqn(),
-                request_id: frame.request_id.clone(),
                 rows,
                 ipc,
                 batch_id: frame.batch_id,
             }
+        }
+    }
+
+    impl Received {
+        /// The pair Scribe stamps on each of `rows` rows of `ipc` under
+        /// `attribution`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when a row-attributed stream does not decode or a row's
+        /// subject or actor is missing or not a principal id.
+        fn pairs(attribution: StampedAttribution, rows: usize, ipc: &Bytes) -> Vec<Attribution> {
+            let StampedAttribution::Frame(pair) = attribution else {
+                return StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
+                    .expect("the row-attributed stream opens")
+                    .flat_map(|batch| {
+                        let batch = batch.expect("the row-attributed batch decodes");
+                        let column = |name: &str| {
+                            batch
+                                .column_by_name(name)
+                                .and_then(|column| column.as_string_opt::<i32>())
+                                .expect("each row carries its principal")
+                                .iter()
+                                .map(|id| {
+                                    id.and_then(|id| id.parse::<PrincipalId>().ok())
+                                        .expect("a row's principal is a principal id")
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        column(SUB_PRINCIPAL_ID)
+                            .into_iter()
+                            .zip(column(ACT_PRINCIPAL_ID))
+                            .map(|(sub, act)| Attribution::new(sub, act))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+            };
+            vec![pair; rows]
         }
     }
 
@@ -1505,9 +1655,18 @@ pub(crate) mod recording {
         ///
         /// Owners built from `state` before this call keep the replaced
         /// outbox, so record before deriving any.
-        pub(crate) fn record(self: &Arc<Self>, mut state: AppState) -> AppState {
-            state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(self) as _, None);
-            state
+        ///
+        /// # Panics
+        /// Panics when `state` or its Bifrost shell is already shared.
+        pub(crate) fn record(self: &Arc<Self>, state: AppState) -> AppState {
+            let mut owners = state.into_owners_for_test();
+            Arc::get_mut(&mut owners.bifrost)
+                .expect("a recorded shell's Bifrost is not yet shared")
+                .replace_scribe_outbox_for_test(ScribeSink::local_outbox(
+                    Arc::clone(self) as _,
+                    None,
+                ));
+            AppState::from_owners_for_test(owners)
         }
 
         /// Every acknowledged `vala.system.audit_log` row, in arrival order.
@@ -1572,6 +1731,49 @@ pub(crate) mod recording {
         /// Rows across every acknowledged frame.
         pub(crate) fn rows(&self) -> usize {
             self.received().iter().map(|frame| frame.rows).sum()
+        }
+
+        /// Every acknowledged `vala.gateway.calls` row as a JSON object of
+        /// its scalar columns, in arrival order; the Variant payload columns
+        /// are omitted.
+        ///
+        /// A call's usage, cost, and pricing live only on this row and its
+        /// attempt spans, so this is how a test reads what a call accounted.
+        ///
+        /// # Panics
+        ///
+        /// Panics when a call frame is not one readable Arrow IPC stream or
+        /// its scalar columns cannot be written as JSON.
+        pub(crate) fn calls(&self) -> Vec<serde_json::Map<String, serde_json::Value>> {
+            let mut writer = arrow::json::ArrayWriter::new(Vec::new());
+            for frame in self
+                .received()
+                .iter()
+                .filter(|frame| frame.table == ScribeTable::Calls.fqn())
+            {
+                for batch in StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
+                    .expect("the call stream opens")
+                {
+                    let batch = batch.expect("the call batch decodes");
+                    let scalars = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, field)| !super::is_payload_column(field.name()))
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    writer
+                        .write(&batch.project(&scalars).expect("scalar columns project"))
+                        .expect("the call row writes as JSON");
+                }
+            }
+            writer.finish().expect("the call rows finish");
+            let json = writer.into_inner();
+            if json.is_empty() {
+                return Vec::new();
+            }
+            serde_json::from_slice(&json).expect("call rows are JSON objects")
         }
 
         /// Every acknowledged IPC stream as lossy text, for content checks.

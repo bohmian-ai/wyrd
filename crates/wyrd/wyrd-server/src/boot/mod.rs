@@ -7,6 +7,7 @@ pub mod issuer;
 pub mod node_identity;
 
 use crate::config::ForgeRuntimeConfig;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::resources::ResourcePlan;
@@ -39,11 +40,14 @@ use vala_bifrost_redux::scribe::{
     ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
 use wyrd_auth::connections::HumanConnections;
+use wyrd_auth::issuance::TokenExchangeSettings;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
 use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
+use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
@@ -59,16 +63,20 @@ use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
-use crate::components::auth::{ServerAuth, ServerAuthz};
+use crate::components::auth::ServerAuth;
+use crate::components::gateway::Gateway;
+use crate::components::health::Health;
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
+use crate::mcp::Mcp;
 use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{
-    AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
-    ScribeCoordinationRuntime,
+    AppState, EngineWorker, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError,
+    Scribe, ScribeCoordinationRuntime, ServerSettings,
 };
 use crate::verification::hosted::blocks::HostedBlocks;
+use crate::verification::{RuntimeLimits, Verification, VerificationRuntime};
 
 /// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
 /// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
@@ -78,45 +86,32 @@ const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 /// Longest boot waits for the Oracle to finish startup before failing.
 const ORACLE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Caller-supplied overrides applied to core `AppState` before
-/// `production_validate`. Enterprise uses this to inject a real ABAC policy
-/// hook + audit writer through the same seam production hardening enforces.
-///
-/// Defaults are all `None` — core (OSS) boot supplies its own defaults and
-/// applies no overrides.
-#[derive(Default)]
-pub struct StateOverrides {
-    /// Replace authorization handles (policy hook + RBAC + audit writer).
-    pub authz: Option<ServerAuthz>,
-    /// Test-only failure injected after Scribe activation to exercise rollback.
-    #[cfg(feature = "test-support")]
-    pub fail_after_scribe_activation: bool,
-}
-
-/// External process dependencies prepared before the one Bifrost composition call.
-struct BifrostExternalDependencies {
+/// External process dependencies prepared before the one Bifrost composition
+/// call: production builds them from the environment, and the test harness
+/// from its fixtures.
+pub struct BifrostExternalDependencies {
     /// Shared production PostgreSQL handles.
-    postgres: Arc<ServerPostgres>,
+    pub postgres: Arc<ServerPostgres>,
     /// Shared object-storage handle.
-    storage: Arc<StorageHandle>,
+    pub storage: Arc<StorageHandle>,
     /// This node's one Bifrost storage owner.
     ///
     /// Retained so every co-located role shares one pointer-identical owner,
     /// one request ceiling, and one shutdown, rather than each role composing
     /// its own view of the same backend.
-    bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
+    pub bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared Bifrost catalog.
-    catalog: Arc<BifrostCatalog>,
+    pub catalog: Arc<BifrostCatalog>,
     /// One root-derived role resource graph.
-    resources: BifrostRoleResources,
+    pub resources: BifrostRoleResources,
     /// One shared current-ready cluster registry.
-    cluster: Arc<ClusterRegistry>,
+    pub cluster: Arc<ClusterRegistry>,
     /// Stable physical node identity.
-    node_id: ClusterNodeId,
+    pub node_id: ClusterNodeId,
     /// Private endpoint advertised by selected roles.
-    advertise_addr: String,
+    pub advertise_addr: String,
     /// Exclusively owned local root for every Bifrost-managed path.
-    data_root: BifrostDataRoot,
+    pub data_root: BifrostDataRoot,
 }
 
 /// Owns resources created only when the Scribe role is selected.
@@ -884,7 +879,10 @@ pub async fn compose_bifrost(
             peer_tls.as_ref(),
         ),
         scribe_config.ingest_request_bytes,
-        scribe_config.outbox_capacity,
+        wyrd_runtime::outbox::OutboxLimits {
+            items: scribe_config.outbox_capacity,
+            bytes: scribe_config.outbox_bytes,
+        },
         Some(postgres.wyrd().clone()),
     );
     let scribe = if let Some(parts) = scribe {
@@ -974,8 +972,6 @@ pub async fn compose_bifrost(
     let interceptor =
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
-    let submissions =
-        crate::verification::submissions::SubmissionSink::outbox(postgres.wyrd().clone());
     let gate = match scribe.as_ref() {
         Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
             Arc::clone(runtime.ingest()),
@@ -1002,7 +998,6 @@ pub async fn compose_bifrost(
             token_verifier,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
-            submissions,
             scribe_outbox,
             membership_poller,
             #[cfg(feature = "test-support")]
@@ -1084,7 +1079,7 @@ pub fn spawn_forge_worker(
 
 /// One booted server state paired with the coordination-runtime owner it needs.
 ///
-/// [`build_state`] produces two values with different ownership rules: the
+/// [`AppState::start`] produces two values with different ownership rules: the
 /// cloneable [`AppState`] handed to every route, and the single non-`Clone`
 /// [`ScribeCoordinationRuntime`]. Returning them as one named value keeps the
 /// caller from publishing the state while silently dropping the executor that
@@ -1108,6 +1103,9 @@ pub struct BootedServer {
     /// Held for the life of the process so no second replica can open this
     /// node's WAL identity while it runs.
     pub data_root: BifrostDataRoot,
+    /// Engine-owned background work the caller's supervisor runs until the
+    /// state's shutdown token is cancelled; see [`AppState::start`].
+    pub workers: Vec<EngineWorker>,
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -1126,152 +1124,288 @@ pub fn production_guards(config: &WyrdServerConfig) {
     }
 }
 
-/// Start the hosted Verifier blocks of an API-serving process with the
-/// verification runtime enabled, and attach them to `state`.
-///
-/// Other processes keep `state` unchanged, so their verification routes
-/// answer unavailable.
-///
-/// # Errors
-/// Returns [`ServerBootError::VerificationBlocks`] when no Monty worker path
-/// was resolved or the sandbox pool cannot start.
-async fn attach_verification_blocks(
-    state: AppState,
-    config: &WyrdServerConfig,
-) -> Result<AppState, ServerBootError> {
-    if !(config.verification.enabled && config.role.serves_api()) {
-        return Ok(state);
-    }
-    let worker = config.verification.monty_worker.clone().ok_or_else(|| {
-        ServerBootError::VerificationBlocks(
-            "no Monty worker path; set WYRD_VERIFICATION_MONTY_WORKER".to_owned(),
-        )
-    })?;
-    let blocks = HostedBlocks::start(worker, config.verification.limits)
-        .await
-        .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?;
-    Ok(state.with_verification_blocks(Arc::new(blocks)))
-}
-
-/// Assemble production `AppState` from config, applying `overrides` before
-/// production validation.
-///
-/// Creates the shared shutdown `CancellationToken` internally and stores it in
-/// the returned state. The gRPC health reporter is left as the `AppState::new`
-/// default; `WyrdServer::new` replaces it with the reporter paired to the
-/// health service it mounts.
-///
-/// Returns the composed [`AppState`] together with the single
-/// [`ScribeCoordinationRuntime`] owner produced by [`compose_bifrost`]. The
-/// caller must retain that owner for at least as long as it runs the server:
-/// dropping it early releases the executor hosting the live Scribe shard lanes.
-///
-/// # Errors
-/// Returns [`ServerBootError`] on database/storage/bifrost boot, auth handle
-/// construction, federation seeding, or production validation failure.
-pub async fn build_state(
-    config: &WyrdServerConfig,
-    telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
-    overrides: StateOverrides,
-) -> Result<BootedServer, ServerBootError> {
-    let shutdown = CancellationToken::new();
-    let dsns = ResolvedDsns::from_env()?;
-    let external = build_bifrost_external_dependencies(&dsns, &config.bifrost, config.role).await?;
-    let sealing_key = build_sealing_keyring(config)?;
-    let signing_key = resolve_signing_key(config)?;
-    let auth = install_auth(
-        external.postgres.as_ref(),
-        config,
-        &signing_key,
-        sealing_key.clone(),
-    )?;
-    let verifier = auth
-        .token_verifier
-        .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
-    let peer_tls = build_bifrost_peer_tls(&config.bifrost.peer)?;
-    let crate::state::ComposedBifrost {
-        bifrost,
-        coordination_runtime,
-        compaction_runtime,
-        data_root,
-    } = compose_bifrost(crate::state::BifrostBuildInputs {
-        target: config.role,
-        deployment_profile: config.deployment_profile,
-        postgres: external.postgres.as_ref().clone(),
-        bifrost_storage: Arc::clone(&external.bifrost_storage),
-        catalog: Arc::clone(&external.catalog),
-        resources: external.resources,
-        cluster: Arc::clone(&external.cluster),
-        token_verifier: verifier,
-        peer_tls,
-        config: config.bifrost.clone(),
-        forge_config: config.forge,
-        node_id: external.node_id,
-        advertise_addr: external.advertise_addr,
-        data_root: external.data_root,
-        shutdown: shutdown.clone(),
-        #[cfg(feature = "test-support")]
-        test_controls: None,
-    })
-    .await?;
+/// Everything [`AppState::start`] composes the process from besides its
+/// configuration: the dependency graph, key material, and the engine
+/// settings the test harness substitutes.
+pub struct StartInputs {
+    /// External dependencies Bifrost and the state compose over.
+    pub dependencies: BifrostExternalDependencies,
+    /// Wyrd workload signing key PEM; see [`resolve_signing_key`].
+    pub signing_key: SecretString,
+    /// Deployment sealing keyring, or `None` for a secret-free deployment.
+    pub sealing_key: Option<Arc<SealingKeyring>>,
+    /// Token verification settings shared by request and external
+    /// verification.
+    pub verify_settings: WyrdAuthVerifySettings,
+    /// Token exchange settings issuance applies.
+    pub token_exchange: TokenExchangeSettings,
+    /// Permission check every authorization decision runs through; an
+    /// extending deployment substitutes its own.
+    pub permission_check: Arc<dyn PermissionCheck>,
+    /// Private peer-plane TLS identity, present only in peer mode.
+    pub peer_tls: Option<BifrostPeerTls>,
+    /// The `wyrd-server` executable the hosted Python sandbox spawns as its
+    /// worker.
+    pub worker: PathBuf,
+    /// Deterministic Bifrost controls of a test server.
     #[cfg(feature = "test-support")]
-    if overrides.fail_after_scribe_activation {
-        bifrost.abort();
-        return Err(ServerBootError::Scribe(
-            "test-injected failure after Scribe activation".to_owned(),
-        ));
-    }
-    let state = AppState::new(
-        external.postgres,
-        external.storage,
-        bifrost,
-        shutdown.clone(),
-    )
-    .with_auth(auth);
-    let state = attach_human_logins(state, config, sealing_key.clone());
-    let state = attach_config_fields(state, config, telemetry)?;
-    let state = attach_verification_blocks(state, config).await?;
-    if let Err(error) = seed_federation(&state, config, sealing_key.as_deref()).await {
-        rollback_state_roles(&state).await;
-        return Err(error);
-    }
-    if let Err(error) =
-        rewrap_sealed_secrets(state.postgres.operator_pool(), sealing_key.clone()).await
-    {
-        rollback_state_roles(&state).await;
-        return Err(error);
-    }
-
-    let state = apply_overrides(state, overrides);
-
-    if let Err(error) = state.production_validate() {
-        rollback_state_roles(&state).await;
-        return Err(ServerBootError::ProductionValidation(error));
-    }
-    if let Err(error) = verify_operator_keys(&state, config).await {
-        rollback_state_roles(&state).await;
-        return Err(error);
-    }
-    Ok(BootedServer {
-        state,
-        coordination_runtime,
-        compaction_runtime,
-        data_root,
-    })
+    pub bifrost_test_controls: Option<crate::state::BifrostTestControls>,
+    /// Test-tier controls of a test server; defaults to production behavior.
+    #[cfg(feature = "test-support")]
+    pub test_hooks: crate::state::TestHooks,
 }
 
-/// Tear down role-owned state after server-only boot stages fail.
+impl StartInputs {
+    /// The production inputs for `config`: dependencies from the
+    /// environment's DSNs and storage settings, the configured key material,
+    /// default auth settings and RBAC, and this executable as the sandbox
+    /// worker.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError`] when the database URLs, storage, catalog,
+    /// resource detection, data root, sealing or signing key, or peer TLS
+    /// bundle is invalid or unavailable, or this executable's path is not
+    /// available.
+    pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
+        let dsns = ResolvedDsns::from_env()?;
+        let dependencies =
+            build_bifrost_external_dependencies(&dsns, &config.bifrost, config.role).await?;
+        Ok(Self {
+            dependencies,
+            signing_key: resolve_signing_key(config)?,
+            sealing_key: build_sealing_keyring(config)?,
+            verify_settings: WyrdAuthVerifySettings::default(),
+            token_exchange: TokenExchangeSettings::default(),
+            permission_check: Arc::new(RbacCheck),
+            peer_tls: build_bifrost_peer_tls(&config.bifrost.peer)?,
+            worker: std::env::current_exe().map_err(|error| {
+                ServerBootError::VerificationBlocks(format!(
+                    "cannot locate this executable: {error}"
+                ))
+            })?,
+            #[cfg(feature = "test-support")]
+            bifrost_test_controls: None,
+            #[cfg(feature = "test-support")]
+            test_hooks: crate::state::TestHooks::default(),
+        })
+    }
+}
+
+impl AppState {
+    /// Compose and validate the process state from `config` and `inputs`,
+    /// the one startup path production and the test harness share.
+    ///
+    /// Builds auth, composes Bifrost (activating its roles), then the login,
+    /// gateway, verification, MCP, and health owners; seeds configured
+    /// federation, rewraps sealed secrets, validates the production posture,
+    /// and verifies Operator tenant keys. The returned
+    /// [`BootedServer::workers`] are the engine-owned refresh listeners and
+    /// verification runtime the caller's supervisor must run until shutdown.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError`] when auth handles, Bifrost composition,
+    /// the gateway, hosted Verifier blocks, Operator keys, federation
+    /// seeding, the sealed-secret check, production validation, or Operator
+    /// key verification fails. Every failure after Bifrost composition
+    /// releases the roles it activated before returning.
+    pub async fn start(
+        config: &WyrdServerConfig,
+        inputs: StartInputs,
+    ) -> Result<BootedServer, ServerBootError> {
+        let StartInputs {
+            dependencies,
+            signing_key,
+            sealing_key,
+            verify_settings,
+            token_exchange,
+            permission_check,
+            peer_tls,
+            worker,
+            #[cfg(feature = "test-support")]
+            bifrost_test_controls,
+            #[cfg(feature = "test-support")]
+            test_hooks,
+        } = inputs;
+        let shutdown = CancellationToken::new();
+        let mut auth = install_auth(
+            dependencies.postgres.as_ref(),
+            config,
+            &signing_key,
+            sealing_key.clone(),
+            verify_settings,
+        )?;
+        auth.token_exchange_settings = token_exchange;
+        auth.permission_check = permission_check;
+        let verifier = auth
+            .token_verifier
+            .clone()
+            .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
+        #[cfg(feature = "test-support")]
+        if test_hooks.omit_token_verifier {
+            auth.token_verifier = None;
+        }
+        let crate::state::ComposedBifrost {
+            bifrost,
+            coordination_runtime,
+            compaction_runtime,
+            data_root,
+        } = compose_bifrost(crate::state::BifrostBuildInputs {
+            target: config.role,
+            deployment_profile: config.deployment_profile,
+            postgres: dependencies.postgres.as_ref().clone(),
+            bifrost_storage: dependencies.bifrost_storage,
+            catalog: dependencies.catalog,
+            resources: dependencies.resources,
+            cluster: dependencies.cluster,
+            token_verifier: verifier,
+            peer_tls,
+            config: config.bifrost.clone(),
+            forge_config: config.forge,
+            node_id: dependencies.node_id,
+            advertise_addr: dependencies.advertise_addr,
+            data_root: dependencies.data_root,
+            shutdown: shutdown.clone(),
+            #[cfg(feature = "test-support")]
+            test_controls: bifrost_test_controls,
+        })
+        .await?;
+        attach_human_logins(
+            &mut auth,
+            &dependencies.postgres,
+            &bifrost,
+            config,
+            sealing_key.clone(),
+        );
+        let owners = async {
+            let gateway = Gateway::from_config(
+                config.gateway.clone(),
+                config.deployment_profile,
+                sealing_key.clone(),
+            )?;
+            let blocks = if config.verification.enabled && config.role.serves_api() {
+                Some(
+                    HostedBlocks::start(worker, config.verification.limits)
+                        .await
+                        .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let verification = Verification::new(
+                dependencies.postgres.wyrd().clone(),
+                blocks,
+                OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
+            );
+            Ok::<_, ServerBootError>((gateway, verification))
+        };
+        let (gateway, verification) = match owners.await {
+            Ok(owners) => owners,
+            Err(error) => {
+                rollback_roles(&bifrost).await;
+                return Err(error);
+            }
+        };
+        let state = Self::assembled(crate::state::AppStateInner {
+            settings: ServerSettings {
+                deployment_profile: config.deployment_profile,
+                role: config.role,
+                limits: config.limits.into_state(),
+            },
+            postgres: dependencies.postgres,
+            storage: dependencies.storage,
+            bifrost,
+            auth,
+            gateway,
+            verification,
+            mcp: Mcp::default(),
+            health: Health::default(),
+            shutdown_token: shutdown,
+            #[cfg(feature = "test-support")]
+            test_hooks,
+        });
+        if let Err(error) = state.validate_startup(config, sealing_key).await {
+            rollback_roles(&state.bifrost).await;
+            return Err(error);
+        }
+        let workers = state.engine_workers(config);
+        Ok(BootedServer {
+            state,
+            coordination_runtime,
+            compaction_runtime,
+            data_root,
+            workers,
+        })
+    }
+
+    /// The startup steps that need the assembled state: seed configured
+    /// federation, rewrap or prove absent sealed secrets, validate the
+    /// production posture, and verify Operator tenant keys.
+    ///
+    /// # Errors
+    /// Returns the first failing step's [`ServerBootError`].
+    async fn validate_startup(
+        &self,
+        config: &WyrdServerConfig,
+        sealing_key: Option<Arc<SealingKeyring>>,
+    ) -> Result<(), ServerBootError> {
+        seed_federation(&self.postgres, config, sealing_key.as_deref()).await?;
+        rewrap_sealed_secrets(self.postgres.operator_pool(), sealing_key).await?;
+        self.production_validate()
+            .map_err(ServerBootError::ProductionValidation)?;
+        verify_operator_keys(self.verification.operator_keys(), &self.postgres, config).await
+    }
+
+    /// The engine-owned background work this process runs until shutdown:
+    /// each owner's cache invalidation listener where its cache serves, and
+    /// the verification runtime of an API-serving process with verification
+    /// enabled, its drain grace clipped inside the server's shutdown budget.
+    fn engine_workers(&self, config: &WyrdServerConfig) -> Vec<EngineWorker> {
+        let postgres = self.postgres.wyrd();
+        let shutdown = &self.shutdown_token;
+        let mut workers: Vec<EngineWorker> = self
+            .bifrost
+            .refresh_worker(shutdown.clone())
+            .into_iter()
+            .collect();
+        if !config.role.serves_api() {
+            return workers;
+        }
+        workers.push(self.gateway.refresh_worker(postgres, shutdown.clone()));
+        workers.extend(self.verification.refresh_worker(postgres, shutdown.clone()));
+        #[cfg(feature = "test-support")]
+        let held = self.test_hooks.hold_verification_runner;
+        #[cfg(not(feature = "test-support"))]
+        let held = false;
+        if config.verification.enabled
+            && !held
+            && let Some(runtime) = VerificationRuntime::builder(self)
+                .limits(
+                    RuntimeLimits::default()
+                        .within_server_drain(Duration::from_millis(config.shutdown.drain_ms)),
+                )
+                .build()
+        {
+            let shutdown = shutdown.clone();
+            workers.push((
+                "verification_runtime",
+                Box::pin(async move { runtime.run(shutdown).await }),
+            ));
+        }
+        workers
+    }
+}
+
+/// Tear down Bifrost roles after a startup stage past composition fails.
 ///
-/// Oracle and Scribe fences are activated before federation and production
-/// validation. This helper reuses their normal owner/registry shutdown phases
-/// with an already-expired deadline, ensuring cancellation and retained-task
-/// abort happen without granting a second cleanup budget.
-async fn rollback_state_roles(state: &AppState) {
+/// Oracle and Scribe fences are activated during composition. This reuses
+/// their normal owner/registry shutdown phases with an already-expired
+/// deadline, ensuring cancellation and retained-task abort happen without
+/// granting a second cleanup budget.
+async fn rollback_roles(bifrost: &crate::state::Bifrost) {
     let deadline = std::time::Instant::now();
-    state.bifrost.begin_shutdown();
-    if state.bifrost.shutdown(deadline).await.is_err() {
-        state.bifrost.abort();
+    bifrost.begin_shutdown();
+    if bifrost.shutdown(deadline).await.is_err() {
+        bifrost.abort();
     }
 }
 
@@ -1318,7 +1452,8 @@ fn resolve_signing_key(config: &WyrdServerConfig) -> Result<SecretString, Server
 /// unavailable or any tenant's active key is unavailable, missing, malformed,
 /// or not 32 bytes.
 pub async fn verify_operator_keys(
-    state: &AppState,
+    keys: &OperatorKeys,
+    postgres: &ServerPostgres,
     config: &WyrdServerConfig,
 ) -> Result<(), ServerBootError> {
     if !(config.role.serves_api()
@@ -1327,9 +1462,7 @@ pub async fn verify_operator_keys(
     {
         return Ok(());
     }
-    let keys = &state.operator_keys;
-    let directory = state
-        .postgres
+    let directory = postgres
         .operator_pool()
         .ok_or_else(|| keys.unavailable(keys.active_version(), KeyFailure::Database))?;
     let tenants = keys.verify_active(&directory).await?;
@@ -1339,62 +1472,6 @@ pub async fn verify_operator_keys(
         "active Operator tenant keys verified"
     );
     Ok(())
-}
-
-/// Apply caller overrides to a built state. Factored out for unit testing
-/// without a live DB boot.
-fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
-    let mut state = state;
-    if let Some(authz) = overrides.authz {
-        state = state.with_authz(authz);
-    }
-    state
-}
-
-/// Attach config-derived fields to core state: shutdown token, telemetry,
-/// limits, gateway configuration, and the gateway engine whose HTTP provider
-/// dispatch screens endpoints under the deployment profile. The engine opens
-/// managed secrets with the deployment sealing keyring already attached by
-/// [`AppState::with_auth`]. Synchronous, but not IO-free: building the
-/// credential resolver reads each configured secret backend's CA bundle from
-/// its file or environment variable once.
-///
-/// # Errors
-/// Returns [`ServerBootError::OperatorKeys`] when an API-bearing role's
-/// Operator key owner cannot be built (see [`OperatorKeys::for_role`]), and
-/// [`ServerBootError::GatewayTransport`] when a secret backend's CA bundle is
-/// unreadable or does not parse, a backend client cannot be built, or the
-/// HTTP provider dispatch transport cannot be built. Boot aborts before
-/// readiness on any of these.
-fn attach_config_fields(
-    state: AppState,
-    config: &WyrdServerConfig,
-    telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
-) -> Result<AppState, ServerBootError> {
-    let sealing_key = state.auth.sealing_key.clone();
-    Ok(state
-        .with_deployment_profile(config.deployment_profile)
-        .with_operator_keys(OperatorKeys::for_role(
-            config.role,
-            &config.verification.operator_keys,
-        )?)
-        .with_telemetry(telemetry)
-        .with_limits(config.limits.into_state())
-        .with_gateway(config.gateway.clone())
-        .with_gateway_engine(wyrd_gateway::GatewayEngine::new(
-            config
-                .gateway
-                .credential_resolver(sealing_key)
-                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
-            wyrd_gateway::DeploymentHealth::default(),
-            Arc::new(
-                wyrd_gateway::HttpProviderDispatch::new(
-                    skald_providers::EndpointPolicy::new(config.deployment_profile.is_production()),
-                    config.gateway.endpoints.clone(),
-                )
-                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
-            ),
-        )))
 }
 
 /// Reseal every stored provider and workload-issuer client secret and gateway
@@ -1444,9 +1521,9 @@ pub async fn rewrap_sealed_secrets(
     }
 }
 
-/// Install Wyrd's own auth handles: build resolvers, construct issuing key +
-/// verifier (fails closed in production without a key), and attach via
-/// `with_auth`.
+/// Build Wyrd's own auth handles: resolvers, issuing key, and verifiers
+/// under `verify_settings` (fails closed in production without a key), with
+/// default exchange settings, RBAC, and no login owners yet.
 ///
 /// # Errors
 /// Returns [`ServerBootError::SigningKey`] when production profile lacks a
@@ -1456,6 +1533,7 @@ fn install_auth(
     config: &WyrdServerConfig,
     signing_key: &SecretString,
     sealing_key: Option<Arc<SealingKeyring>>,
+    verify_settings: WyrdAuthVerifySettings,
 ) -> Result<ServerAuth, ServerBootError> {
     // Postgres is the single source of issuer/binding resolution. Both resolvers
     // are always attached; an empty config simply means the tenant federates no
@@ -1472,9 +1550,8 @@ fn install_auth(
         signing_key,
         Arc::clone(&issuer_resolver),
         config.deployment_profile.screened_http(),
+        verify_settings,
     )?;
-
-    let token_exchange_settings = wyrd_auth::issuance::TokenExchangeSettings::default();
 
     Ok(ServerAuth {
         issuing_key: Some(handles.issuing_key),
@@ -1484,47 +1561,47 @@ fn install_auth(
         workload_binding_resolver: Some(binding_resolver),
         human_connections: None,
         platform_login: None,
-        sealing_key: sealing_key.clone(),
-        token_exchange_settings,
+        sealing_key,
+        ..ServerAuth::default()
     })
 }
 
-/// Attach the human and platform login owners to `state`'s auth handles.
+/// Attach the human and platform login owners to `auth`.
 ///
 /// Both owners stage their decisions on the process Scribe outbox, which
-/// exists only once [`AppState::new`] has adopted the one `compose_bifrost`
-/// built, so they are attached here rather than in [`install_auth`]. One
-/// owner of each serves every login, so its provider cache outlives a
-/// request. Platform login needs the cross-tenant boundary and an issuing
-/// key; without either it stays unset.
+/// exists only once [`compose_bifrost`] built `bifrost`, so they are attached
+/// here rather than in [`install_auth`]. One owner of each serves every
+/// login, so its provider cache outlives a request. Platform login needs the
+/// cross-tenant boundary and an issuing key; without either it stays unset.
 fn attach_human_logins(
-    mut state: AppState,
+    auth: &mut ServerAuth,
+    postgres: &ServerPostgres,
+    bifrost: &crate::state::Bifrost,
     config: &WyrdServerConfig,
     sealing_key: Option<Arc<SealingKeyring>>,
-) -> AppState {
-    state.auth.human_connections = Some(HumanConnections::new(
-        state.postgres.wyrd().clone(),
+) {
+    auth.human_connections = Some(HumanConnections::new(
+        postgres.wyrd().clone(),
         sealing_key.clone(),
         config.deployment_profile.screened_http(),
-        Arc::clone(&state.scribe_outbox) as _,
+        Arc::clone(bifrost.scribe_outbox()) as _,
     ));
-    state.auth.platform_login = state
-        .postgres
-        .operator_pool()
-        .zip(state.auth.issuing_key.clone())
-        .map(|(pool, issuing_key)| {
-            PlatformLogin::new(
-                pool.clone(),
-                sealing_key,
-                Arc::new(PlatformSessions::new(
-                    pool,
-                    issuing_key,
-                    Arc::clone(&state.scribe_outbox) as _,
-                )),
-                config.deployment_profile.screened_http(),
-            )
-        });
-    state
+    auth.platform_login =
+        postgres
+            .operator_pool()
+            .zip(auth.issuing_key.clone())
+            .map(|(pool, issuing_key)| {
+                PlatformLogin::new(
+                    pool.clone(),
+                    sealing_key,
+                    Arc::new(PlatformSessions::new(
+                        pool,
+                        issuing_key,
+                        Arc::clone(bifrost.scribe_outbox()) as _,
+                    )),
+                    config.deployment_profile.screened_http(),
+                )
+            });
 }
 
 /// Builds and registers the local Oracle role after security dependencies verify.
@@ -1950,7 +2027,7 @@ async fn release_failed_oracle_role(
 /// the implicit tenant. Issuers are seeded first because workload bindings
 /// reference them by FK.
 async fn seed_federation(
-    state: &AppState,
+    postgres: &ServerPostgres,
     config: &WyrdServerConfig,
     sealing_key: Option<&SealingKeyring>,
 ) -> Result<(), ServerBootError> {
@@ -1966,11 +2043,10 @@ async fn seed_federation(
                 slug: "(unset)".to_owned(),
             }
         })?;
-        let tenant_id =
-            crate::boot::issuer::resolve_implicit_tenant(state.postgres.wyrd(), slug).await?;
+        let tenant_id = crate::boot::issuer::resolve_implicit_tenant(postgres.wyrd(), slug).await?;
 
         crate::boot::issuer::seed_trusted_issuers(
-            state.postgres.wyrd(),
+            postgres.wyrd(),
             tenant_id,
             &config.trusted_issuers,
             sealing_key,
@@ -1978,8 +2054,7 @@ async fn seed_federation(
         .await?;
 
         let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
-        crate::boot::issuer::seed_workload_bindings(state.postgres.wyrd(), tenant_id, &bindings)
-            .await?;
+        crate::boot::issuer::seed_workload_bindings(postgres.wyrd(), tenant_id, &bindings).await?;
     }
     Ok(())
 }
@@ -2196,7 +2271,7 @@ fn build_bifrost_peer_tls(
 pub fn check_card_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
     check_card_recovery_pool_inner(
         state.postgres.operator_pool().is_some(),
-        state.deployment_profile,
+        state.settings.deployment_profile,
     )
 }
 
@@ -2471,7 +2546,6 @@ mod tests {
 #[cfg(test)]
 /// Postgres-backed boot fixtures and regressions shared by crate tests.
 pub(crate) mod pg_tests {
-    use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -2510,51 +2584,9 @@ pub(crate) mod pg_tests {
         }
     }
 
-    /// Builds the shared non-Bifrost application shell for focused boot tests.
-    async fn make_test_state() -> AppState {
-        crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres(),
-            crate::test_support::test_storage(),
-            crate::test_support::test_catalog().await,
-        )
-    }
-
     use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
-
-    /// An authz override replaces the permission evaluator wholesale.
-    ///
-    /// # Panics
-    /// Panics when the patched state does not carry the override's evaluator.
-    #[tokio::test(flavor = "current_thread")]
-    async fn state_overrides_authz_applied() {
-        let state = make_test_state().await;
-        let replacement = ServerAuthz::default();
-        let expected = Arc::clone(&replacement.permission_check);
-        let overrides = StateOverrides {
-            authz: Some(replacement),
-            ..StateOverrides::default()
-        };
-
-        let patched = apply_overrides(state, overrides);
-
-        assert!(Arc::ptr_eq(&patched.authz.permission_check, &expected));
-    }
-
-    /// Default overrides leave the assembled permission evaluator in place.
-    ///
-    /// # Panics
-    /// Panics when an empty override changes the evaluator.
-    #[tokio::test(flavor = "current_thread")]
-    async fn state_overrides_default_is_noop() {
-        let state = make_test_state().await;
-        let original = Arc::clone(&state.authz.permission_check);
-
-        let patched = apply_overrides(state, StateOverrides::default());
-
-        assert!(Arc::ptr_eq(&patched.authz.permission_check, &original));
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn app_state_retains_only_runtime_pools() {

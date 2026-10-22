@@ -93,6 +93,13 @@ impl HostedBlocks {
         })
     }
 
+    /// Settle the Python sandbox's admitted operations, refuse new ones,
+    /// and reap its workers by `deadline`; see [`Sandbox::shutdown`].
+    /// Returns whether everything settled.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> bool {
+        self.sandbox.shutdown(deadline).await
+    }
+
     /// The Deployment limits in force.
     #[must_use]
     pub const fn limits(&self) -> &HostedLimits {

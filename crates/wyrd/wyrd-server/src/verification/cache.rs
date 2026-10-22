@@ -26,11 +26,9 @@
 //! that delivery latency.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use lru::LruCache;
 use sqlx::PgConnection;
-use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::principal::PrincipalId;
@@ -49,9 +47,6 @@ pub(crate) const TARGET_CHANNEL: &str = "wyrd_verification_target";
 
 /// Total bytes of cached targets one process keeps.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Pause before reconnecting after the listener fails to connect or listen.
-const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Cache key: tenant, Verifier Card UID, and subject Card UID.
 type TargetKey = (DataTenantId, Uuid, Uuid);
@@ -340,53 +335,20 @@ impl VerifierCardCache {
         entries.live = live;
     }
 
-    /// Listens for target invalidations on `pool` until `shutdown`.
+    /// Listens for target invalidations from `postgres` until `shutdown`.
     ///
-    /// Holds one pool connection for the listener. Targets serve only
-    /// between a successful `LISTEN` and the next lost connection; each loss
-    /// forgets them, and sqlx reconnects and re-listens before reporting the
-    /// loss, so serving resumes from fresh reads. A failed connect or
-    /// `LISTEN` leaves serving off and retries after [`RECONNECT_DELAY`].
-    pub async fn watch(&self, pool: &sqlx::PgPool, shutdown: CancellationToken) {
-        while !shutdown.is_cancelled() {
-            let listener = async {
-                let mut listener = PgListener::connect_with(pool).await?;
-                listener.listen(TARGET_CHANNEL).await?;
-                Ok::<_, sqlx::Error>(listener)
-            };
-            let mut listener = match listener.await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    tracing::warn!(%error, "verification target cache listener could not start; targets read Postgres");
-                    tokio::select! {
-                        () = shutdown.cancelled() => break,
-                        () = tokio::time::sleep(RECONNECT_DELAY) => continue,
-                    }
-                }
-            };
-            self.reset(true);
-            loop {
-                let received = tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    received = listener.try_recv() => received,
-                };
-                match received {
-                    Ok(Some(notification)) => self.invalidate(notification.payload()),
-                    Ok(None) => {
-                        tracing::warn!(
-                            "verification target cache listener reconnected; targets forgotten"
-                        );
-                        self.reset(true);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "verification target cache listener failed; targets read Postgres");
-                        break;
-                    }
-                }
-            }
-            self.reset(false);
-        }
-        self.reset(false);
+    /// Targets serve only while the listener is subscribed and its heartbeat
+    /// answers, so a lost or silently stalled listener stops serving within
+    /// the heartbeat bound; see [`wyrd_sql::NotificationListener::watch`].
+    pub async fn watch(&self, postgres: &wyrd_sql::WyrdPostgres, shutdown: CancellationToken) {
+        postgres
+            .listener(TARGET_CHANNEL)
+            .watch(
+                shutdown,
+                |live| self.reset(live),
+                |payload| self.invalidate(payload),
+            )
+            .await;
     }
 }
 

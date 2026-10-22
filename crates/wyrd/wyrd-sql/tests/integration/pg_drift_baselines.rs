@@ -83,6 +83,7 @@ async fn insert_card(
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await

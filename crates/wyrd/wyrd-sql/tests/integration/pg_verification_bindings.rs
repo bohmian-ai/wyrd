@@ -118,6 +118,7 @@ async fn declare_service(
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await

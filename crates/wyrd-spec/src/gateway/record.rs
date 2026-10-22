@@ -533,7 +533,10 @@ fn validate_payload_object_refs(
 /// Exact version-1 payload of one `vala.gateway.calls` row.
 ///
 /// Bifrost appends its canonical managed envelope; the payload never
-/// duplicates managed identity and never substitutes zero for unknowns.
+/// duplicates managed identity and never substitutes zero for unknowns. The
+/// envelope's `wyrd_request_id` names the Scribe write that carried the row,
+/// so the admitting HTTP request is the payload's own `request_id`, the join
+/// key to that request's `vala.system.audit_log` decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -542,6 +545,8 @@ pub struct GatewayCallPayloadV1 {
     pub schema_version: u8,
     /// Logical call.
     pub call_id: GatewayCallId,
+    /// HTTP request that admitted the call.
+    pub request_id: crate::request_id::RequestId,
     /// Requested operation.
     pub operation: GatewayOperation,
     /// Ingress dialect, such as `openai_chat_completions`.
@@ -701,6 +706,7 @@ mod tests {
         json!({
             "schema_version": 1,
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
+            "request_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
             "requested_model": {"deployment": "openai", "model": "gpt-4o"},
@@ -839,6 +845,7 @@ mod tests {
         json!({
             "schema_version": 1,
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
+            "request_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
             "requested_model": {"deployment": "openai", "model": "gpt-4o"},

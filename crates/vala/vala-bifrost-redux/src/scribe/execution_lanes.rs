@@ -14,7 +14,7 @@ use iceberg::spec::Schema as IcebergSchema;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
-use crate::contracts::{IngressPayload, ScribeError};
+use crate::contracts::{IngressPayload, ScribeError, StampedAttribution};
 use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::memtable::FrozenMemtable;
@@ -25,7 +25,7 @@ use crate::scribe::wal::{
     PreparedWalAppend, WalAppendResult, WalHandle, WalSegment, WalSegmentRef,
 };
 use std::str::FromStr;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -460,8 +460,8 @@ pub(crate) fn decode_native_batch(
 /// The lane moves these into its worker, so they are owned rather than the
 /// borrowed [`DecodeContext`] the decode itself assembles from them.
 pub(crate) struct IngressDecodeInputs {
-    /// Trusted subject/actor pair stamped on every row.
-    pub(crate) attribution: Attribution,
+    /// Source of the trusted subject/actor pair stamped on every row.
+    pub(crate) attribution: StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
@@ -486,8 +486,8 @@ pub(crate) struct IngressDecodeInputs {
 /// request; every batch of one request stamps the same request identity and
 /// admission instant.
 pub(crate) struct DecodeContext<'a> {
-    /// Trusted subject/actor pair stamped on every row.
-    pub(crate) attribution: Attribution,
+    /// Source of the trusted subject/actor pair stamped on every row.
+    pub(crate) attribution: StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
@@ -556,11 +556,18 @@ fn decode_rows(
         }
         // `run_id` and `card_uid` are caller correlation that this function
         // relinquishes and restamps exactly once in their slots, `card_uid`
-        // only after authorizing it. Every other reserved column is
-        // unconditionally server-owned, so supplying one is a refusal rather
-        // than an override.
+        // only after authorizing it, and a row-attributed frame's
+        // subject/actor pair is validated and restamped the same way. Every
+        // other reserved column is unconditionally server-owned, so
+        // supplying one is a refusal rather than an override.
         let name = field.name().as_str();
-        if correlation_policy(context).reserves(name) && name != RUN_ID && name != CARD_UID {
+        let carried = context.attribution == StampedAttribution::Rows
+            && (name == SUB_PRINCIPAL_ID || name == ACT_PRINCIPAL_ID);
+        if correlation_policy(context).reserves(name)
+            && name != RUN_ID
+            && name != CARD_UID
+            && !carried
+        {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -1079,8 +1086,10 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 ///
 /// # Errors
 /// Returns [`ScribeError::CardScopeDenied`] when a row's `card_uid` is not
-/// authorized, and a typed Scribe error when timestamp construction,
-/// managed-array construction, or final batch validation fails.
+/// authorized, [`ScribeError::InvalidFrame`] when a row-attributed frame's
+/// subject or actor column is missing or malformed, and a typed Scribe error
+/// when timestamp construction, managed-array construction, or final batch
+/// validation fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -1202,8 +1211,9 @@ fn correlation_policy(context: &DecodeContext<'_>) -> CorrelationPolicy {
 
 /// The per-batch values the managed columns are stamped from.
 struct ManagedValues<'a> {
-    /// Trusted pair stamped as `sub_principal_id` and `act_principal_id`.
-    attribution: Attribution,
+    /// Source of the trusted pair stamped as `sub_principal_id` and
+    /// `act_principal_id`.
+    attribution: StampedAttribution,
     /// Authorized `card_uid` of each row, in row order.
     card_uid: ArrayRef,
     /// Request identity stamped as `wyrd_request_id`.
@@ -1212,6 +1222,48 @@ struct ManagedValues<'a> {
     receipt_micros: i64,
     /// Caller `run_id` column lifted out of the user projection, if supplied.
     caller_run_id: Option<ArrayRef>,
+}
+
+/// Builds the stamped `name` principal column of `rows` from `attribution`.
+///
+/// A frame pair fills every row with the principal `pick` selects. A
+/// row-attributed frame keeps the rows' own `name` column, after checking that
+/// it is `Utf8` and every value is a principal id, so the stamped column holds
+/// only well-formed principals whichever source named them.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when a row-attributed frame has no
+/// `name` column, or it is not `Utf8`, holds a null, or holds a value that is
+/// not a principal id.
+fn principal_column(
+    rows: &RecordBatch,
+    attribution: StampedAttribution,
+    name: &str,
+    pick: fn(Attribution) -> PrincipalId,
+) -> Result<ArrayRef, ScribeError> {
+    match attribution {
+        StampedAttribution::Frame(pair) => Ok(Arc::new(StringArray::from(vec![
+            pick(pair)
+                .to_string();
+            rows.num_rows()
+        ]))),
+        StampedAttribution::Rows => {
+            let column = rows.column_by_name(name).ok_or(ScribeError::InvalidFrame)?;
+            let values = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(ScribeError::InvalidFrame)?;
+            let valid = values.null_count() == 0
+                && values
+                    .iter()
+                    .flatten()
+                    .all(|value| PrincipalId::from_str(value).is_ok());
+            valid
+                .then(|| Arc::clone(column))
+                .ok_or(ScribeError::InvalidFrame)
+        }
+    }
 }
 
 /// Builds one array per managed column `policy` appends, in declared order.
@@ -1224,7 +1276,8 @@ struct ManagedValues<'a> {
 /// # Errors
 ///
 /// Returns [`ScribeError::Internal`] when a declared managed column has no
-/// stamping rule here.
+/// stamping rule here, and [`ScribeError::InvalidFrame`] when a
+/// row-attributed frame's subject or actor column is missing or malformed.
 fn managed_arrays(
     rows: &RecordBatch,
     values: &ManagedValues<'_>,
@@ -1244,20 +1297,16 @@ fn managed_arrays(
                     Arc::clone,
                 ),
                 CARD_UID => Arc::clone(&values.card_uid),
-                SUB_PRINCIPAL_ID => Arc::new(StringArray::from(vec![
-                    values
-                        .attribution
-                        .sub_principal_id
-                        .to_string();
-                    row_count
-                ])),
-                ACT_PRINCIPAL_ID => Arc::new(StringArray::from(vec![
-                    values
-                        .attribution
-                        .act_principal_id
-                        .to_string();
-                    row_count
-                ])),
+                SUB_PRINCIPAL_ID => {
+                    principal_column(rows, values.attribution, SUB_PRINCIPAL_ID, |pair| {
+                        pair.sub_principal_id
+                    })?
+                }
+                ACT_PRINCIPAL_ID => {
+                    principal_column(rows, values.attribution, ACT_PRINCIPAL_ID, |pair| {
+                        pair.act_principal_id
+                    })?
+                }
                 WYRD_REQUEST_ID => Arc::new(StringArray::from(vec![
                     values.request_id.as_str();
                     row_count
@@ -2195,11 +2244,11 @@ mod tests {
 
     use super::{
         DecodeContext, ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
-        ScribePersistenceCpuPool, ScribeWalIoPool, conform_to_registered, decode,
+        ScribePersistenceCpuPool, ScribeWalIoPool, conform_to_registered, decode, decode_rows,
         record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
         wait_lane_drained,
     };
-    use crate::contracts::{IngressPayload, ScribeError};
+    use crate::contracts::{IngressPayload, ScribeError, StampedAttribution};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
     use crate::schema::SchemaFingerprint;
     use crate::scribe::replay::ReplayedSealKey;
@@ -2231,7 +2280,7 @@ mod tests {
     ) -> super::DecodeContext<'a> {
         super::DecodeContext {
             definition: None,
-            attribution: Attribution::direct(principal.id),
+            attribution: Attribution::direct(principal.id).into(),
             card_scope,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
@@ -2341,7 +2390,7 @@ mod tests {
         decode(
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -2559,7 +2608,7 @@ mod tests {
         let refusal = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -2621,7 +2670,7 @@ mod tests {
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: None,
                 expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
                 request_id: &RequestId::now_v7(),
@@ -2686,6 +2735,66 @@ mod tests {
             ingested.iter().all(|value| value == Some(ADMITTED_AT)),
             "every row carries the admission instant"
         );
+    }
+
+    /// A row-attributed frame stamps each row's own subject and actor and
+    /// refuses a value that is not a principal id, while a frame pair still
+    /// refuses caller-supplied principal columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decode outcome or a stamped principal differs.
+    #[test]
+    fn row_attributed_frames_stamp_each_rows_own_pair() {
+        let (first, second) = (
+            PrincipalId::new(Uuid::now_v7()).to_string(),
+            PrincipalId::new(Uuid::now_v7()).to_string(),
+        );
+        let rows = |sub: &str| {
+            batch(
+                vec![
+                    Field::new("value", DataType::Int64, false),
+                    Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, false),
+                    Field::new(ACT_PRINCIPAL_ID, DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+                    Arc::new(StringArray::from(vec![sub, second.as_str()])),
+                    Arc::new(StringArray::from(vec![second.as_str(), first.as_str()])),
+                ],
+            )
+        };
+        let attributed = rows(&first);
+        let principal = principal();
+        let request_id = RequestId::now_v7();
+        let mut context = stamping_context(&principal, None, &request_id);
+        context.expected_schema_fingerprint =
+            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref());
+        assert!(
+            matches!(
+                decode_rows(&attributed, &context, false),
+                Err(ScribeError::InvalidFrame)
+            ),
+            "a frame pair refuses caller-supplied principals"
+        );
+
+        context.attribution = StampedAttribution::Rows;
+        let stamped = decode_rows(&attributed, &context, false).expect("row pairs decode");
+        let text = |name: &str| {
+            stamped
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .expect("a principal column is stamped")
+                .iter()
+                .map(|value| value.expect("stamped principals are non-null").to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(SUB_PRINCIPAL_ID), [first.clone(), second.clone()]);
+        assert_eq!(text(ACT_PRINCIPAL_ID), [second.clone(), first.clone()]);
+        assert!(matches!(
+            decode_rows(&rows("not-a-principal"), &context, false),
+            Err(ScribeError::InvalidFrame)
+        ));
     }
 
     #[test]
@@ -3059,7 +3168,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3111,7 +3220,7 @@ mod tests {
         decode(
             payload,
             &DecodeContext {
-                attribution: Attribution::direct(principal.id),
+                attribution: Attribution::direct(principal.id).into(),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3246,7 +3355,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                attribution: Attribution::direct(principal.id),
+                attribution: Attribution::direct(principal.id).into(),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3299,7 +3408,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3344,7 +3453,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3403,7 +3512,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id),
+                attribution: Attribution::direct(principal().id).into(),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3515,7 +3624,7 @@ mod tests {
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                attribution: Attribution::direct(principal.id),
+                attribution: Attribution::direct(principal.id).into(),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3570,7 +3679,7 @@ mod tests {
             let error = decode(
                 ipc_payload(&rows),
                 &DecodeContext {
-                    attribution: Attribution::direct(principal.id),
+                    attribution: Attribution::direct(principal.id).into(),
                     card_scope: principal
                         .card_ref_scope()
                         .map(CardRefScope::uids)

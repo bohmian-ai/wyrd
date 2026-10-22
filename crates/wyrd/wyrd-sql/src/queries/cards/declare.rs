@@ -75,6 +75,11 @@ pub struct NewCardRow<'a> {
     pub spec_hash: &'a str,
     /// Canonical artifact-manifest hash.
     pub artifact_hash: Option<&'a str>,
+    /// How long a `pending` Card waits before reconciliation may claim it:
+    /// zero for a Card the declaration completes itself, and the client's
+    /// upload window for one awaiting client uploads, so the reconciler
+    /// takes over abandoned uploads instead of racing a live upload saga.
+    pub reconcile_delay: std::time::Duration,
 }
 
 /// A manifest row eligible for post-commit upload initialization.
@@ -255,7 +260,8 @@ pub async fn insert_declaration_operation(
 ///
 /// Writes the Card with its resolved space and pinned version, its creation
 /// pair, and the operation that owns it; a `pending` Card is stamped with its
-/// pending time and immediately due for reconciliation. The row joins the
+/// pending time and becomes due for reconciliation once its
+/// `reconcile_delay` has passed on `PostgreSQL`'s clock. The row joins the
 /// caller's transaction, so nothing is durable until the declaration
 /// commits, and the creation pair is never rewritten afterwards.
 ///
@@ -292,7 +298,9 @@ pub async fn insert_card_row(
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
                    $9, $10, $11, $12, $13, $14, $15,
                    CASE WHEN $11 = 'pending' THEN 'pending' ELSE 'idle' END,
-                   CASE WHEN $11 = 'pending' THEN statement_timestamp() ELSE NULL END)
+                   CASE WHEN $11 = 'pending'
+                        THEN statement_timestamp() + ($16 * interval '1 second')
+                        ELSE NULL END)
            RETURNING created_at",
     )
     .bind(input.card_uid.as_uuid())
@@ -316,6 +324,7 @@ pub async fn insert_card_row(
     .bind(input.attribution.act_principal_id.as_uuid())
     .bind(input.operation_id.as_uuid())
     .bind(pending_since)
+    .bind(input.reconcile_delay.as_secs_f64())
     .fetch_one(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;

@@ -473,11 +473,47 @@ struct AttributedRow {
     act_principal_id: String,
 }
 
+/// One Arrow IPC frame of [`ATTRIBUTED_ROWS`] holding row `id`, plus a
+/// `sub_principal_id` and/or `act_principal_id` column carrying `sub` and
+/// `act` when given, exactly as an otherwise-valid producer frame would.
+///
+/// # Panics
+/// Panics when the batch or its IPC encoding cannot be built.
+fn attributed_frame(id: i64, sub: Option<&str>, act: Option<&str>) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let mut fields = vec![Field::new("id", DataType::Int64, false)];
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![id]))];
+    for (name, value) in [("sub_principal_id", sub), ("act_principal_id", act)] {
+        if let Some(value) = value {
+            fields.push(Field::new(name, DataType::Utf8, false));
+            columns.push(Arc::new(StringArray::from(vec![value])));
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), columns).expect("frame");
+    let mut ipc = Vec::new();
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref()).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC terminal");
+    drop(writer);
+    ipc
+}
+
 /// Rows carry the verified subject and actor Wyrd stamps, and neither name
-/// can be declared or written by a client (AC-005/016).
+/// can be declared or written by a client (AC-005/016, AC-013/014).
 ///
 /// Service A writes row 1 directly and Service B, acting for A, writes row
-/// 2; after shutdown and publication they read back as A/A and A/B. Declaring
+/// 2; after shutdown and publication they read back as A/A and A/B. Over the
+/// public ingest transport, A's otherwise-valid frames naming B as subject,
+/// B as actor, or B as both are refused by Scribe's server-owned column check
+/// and land nothing, while A's otherwise identical control frame of row 4
+/// lands as A/A, so the refusal is the managed column's. Declaring
 /// `sub_principal_id` or `act_principal_id` as a table column, inserting
 /// either as a row key, and registering either over the raw route are each
 /// refused with the reserved-column error. Another tenant's administrator
@@ -555,6 +591,38 @@ async fn subject_actor_rows_and_reserved_columns() {
         .insert(br#"{"id": 2}"#.to_vec(), Correlation::default())
         .expect("B's row for A inserts");
     writer.shutdown().await.expect("B's writer drains");
+
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&direct)
+        .await
+        .expect("A's public ingest transport connects");
+    let forger = b.id().to_string();
+    for (id, sub, act) in [
+        (10, Some(forger.as_str()), None),
+        (11, None, Some(forger.as_str())),
+        (12, Some(forger.as_str()), Some(forger.as_str())),
+    ] {
+        let forged = ingest
+            .insert(
+                ATTRIBUTED_ROWS,
+                wyrd_spec::ids::uuid7().parse().expect("batch id"),
+                attributed_frame(id, sub, act),
+            )
+            .await
+            .expect_err("the server refuses a forged managed column");
+        assert_eq!(
+            forged.code(),
+            "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+            "row {id}: {forged}"
+        );
+    }
+    ingest
+        .insert(
+            ATTRIBUTED_ROWS,
+            wyrd_spec::ids::uuid7().parse().expect("batch id"),
+            attributed_frame(4, None, None),
+        )
+        .await
+        .expect("A's control frame lands");
     server.flush_bifrost().await.expect("rows publish");
 
     let rows: Vec<AttributedRow> = Bifrost::connect_with(
@@ -582,8 +650,13 @@ async fn subject_actor_rows_and_reserved_columns() {
             },
             AttributedRow {
                 id: 2,
-                sub_principal_id: a,
+                sub_principal_id: a.clone(),
                 act_principal_id: b,
+            },
+            AttributedRow {
+                id: 4,
+                sub_principal_id: a.clone(),
+                act_principal_id: a,
             },
         ]
     );

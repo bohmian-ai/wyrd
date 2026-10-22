@@ -311,11 +311,14 @@ async fn create_trusted_issuer(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
-    let jwks_uri = discover_jwks_uri(&request.issuer, state.deployment_profile).await?;
+    let jwks_uri = discover_jwks_uri(&request.issuer, state.settings.deployment_profile).await?;
 
     let trusted = TrustedIssuer {
         tenant_id: caller.principal.tenant_id,
@@ -390,7 +393,10 @@ async fn list_trusted_issuers(
         "trusted_issuers",
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
     let rows = trusted_issuers_for_tenant(&mut conn)
@@ -458,7 +464,10 @@ async fn delete_trusted_issuer_route(
         &format!("trusted_issuer:{issuer}"),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
 
@@ -542,7 +551,10 @@ async fn create_workload_binding(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
@@ -607,7 +619,10 @@ async fn list_workload_bindings(
         "workload_bindings",
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     // Normalize the issuer filter to the stored form so a trailing slash does
     // not silently miss; the subject is matched verbatim.
@@ -673,7 +688,10 @@ async fn delete_workload_binding_route(
         &format!("workload_binding:{issuer}:{}", query.subject),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
@@ -994,7 +1012,7 @@ mod pg_tests {
 
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::components::auth::{Caller, ServerAuthz};
+    use crate::components::auth::Caller;
     use crate::components::gateway::recording::RecordingScribe;
     use wyrd_spec::request_id::RequestId;
 
@@ -1015,14 +1033,16 @@ mod pg_tests {
         let storage_root = dir.keep().join("admin-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        crate::test_support::test_app_state(
-            postgres,
-            Arc::new(StorageHandle::new(signer)),
-            crate::test_support::test_catalog().await,
-        )
-        .with_auth(crate::components::auth::ServerAuth {
-            sealing_key: Some(Arc::new(sealing_key())),
-            ..crate::components::auth::ServerAuth::default()
+        crate::state::AppState::from_owners_for_test(crate::state::AppStateInner {
+            auth: crate::components::auth::ServerAuth {
+                sealing_key: Some(Arc::new(sealing_key())),
+                ..crate::components::auth::ServerAuth::default()
+            },
+            ..crate::test_support::test_owners(
+                postgres,
+                Arc::new(StorageHandle::new(signer)),
+                crate::test_support::test_catalog().await,
+            )
         })
     }
 
@@ -1194,9 +1214,9 @@ mod pg_tests {
     async fn create_blocks_private_issuer_in_production() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture)
-            .await
-            .with_deployment_profile(DeploymentProfile::Production);
+        let state = test_state(&fixture).await.with_owners_for_test(|owners| {
+            owners.settings.deployment_profile = DeploymentProfile::Production;
+        });
         // The SSRF guard must reject a loopback issuer under the Production
         // profile before any network call — no discovery server is stood up.
         let issuer = IssuerUrl::new("http://127.0.0.1:9/").expect("loopback issuer parses");
@@ -1650,7 +1670,7 @@ mod pg_tests {
     async fn settle_audit(state: &AppState) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );
@@ -1733,7 +1753,7 @@ mod pg_tests {
     async fn a_binding_create_without_a_connection_stages_its_allowance() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let (mut state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
         let unreachable = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(2))
             .connect_lazy_with(
@@ -1741,10 +1761,12 @@ mod pg_tests {
                     .host("127.0.0.1")
                     .port(1),
             );
-        state.postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
-            wyrd_sql::WyrdPostgres::from_pools(unreachable, None),
-            fixture.vala_postgres().clone(),
-        ));
+        let state = state.with_owners_for_test(|owners| {
+            owners.postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+                wyrd_sql::WyrdPostgres::from_pools(unreachable, None),
+                fixture.vala_postgres().clone(),
+            ));
+        });
 
         let _ = create_workload_binding(
             State(state.clone()),
@@ -1853,8 +1875,8 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let (state, scribe) =
-            RecordingScribe::attach(test_state(&fixture).await.with_authz(ServerAuthz {
-                permission_check: Arc::new(DenyAllCheck),
+            RecordingScribe::attach(test_state(&fixture).await.with_owners_for_test(|owners| {
+                owners.auth.permission_check = Arc::new(DenyAllCheck);
             }));
         seed_issuer(&fixture, tenant).await;
 

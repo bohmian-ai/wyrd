@@ -89,7 +89,10 @@ fn refuse_after_decision<T>(
     decision: AuditEvent,
     refusal: WyrdError,
 ) -> Result<T, WyrdErrorResponse> {
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
     Err(WyrdErrorResponse::from(refusal))
 }
 
@@ -247,7 +250,10 @@ async fn test_candidate(
     Json(request): Json<ConnectionTestRequest>,
 ) -> Result<Json<ConnectionTestResponse>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.test")?;
-    state.scribe_outbox.stage(caller.data_tenant_id, decision);
+    state
+        .bifrost
+        .scribe_outbox()
+        .stage(caller.data_tenant_id, decision);
     let tester = ConnectionTester {
         principal_id: caller.principal.id,
         principal_kind: caller.principal.kind.tag(),
@@ -418,7 +424,7 @@ mod pg_tests {
     use wyrd_storage::{LocalSigner, StorageHandle};
 
     use super::*;
-    use crate::components::auth::{ServerAuth, ServerAuthz};
+    use crate::components::auth::ServerAuth;
     use crate::components::gateway::recording::RecordingScribe;
     use crate::postgres::ServerPostgres;
     use crate::test_support::{test_app_state, test_catalog};
@@ -520,22 +526,22 @@ mod pg_tests {
             Arc::new(StorageHandle::new(signer)),
             test_catalog().await,
         ));
-        let audit = Arc::clone(&state.scribe_outbox);
+        let audit = Arc::clone(state.bifrost.scribe_outbox());
         state
-            .with_auth(ServerAuth {
-                human_connections: Some(HumanConnections::new(
-                    fixture.wyrd_postgres().clone(),
-                    Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
-                        [7_u8; 32],
-                    )))),
-                    ScreenedHttp::allowing_internal(),
-                    audit,
-                )),
-                ..ServerAuth::default()
+            .with_owners_for_test(|owners| {
+                owners.auth = ServerAuth {
+                    human_connections: Some(HumanConnections::new(
+                        fixture.wyrd_postgres().clone(),
+                        Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
+                            [7_u8; 32],
+                        )))),
+                        ScreenedHttp::allowing_internal(),
+                        audit,
+                    )),
+                    ..ServerAuth::default()
+                }
             })
-            .with_authz(ServerAuthz {
-                permission_check: check,
-            })
+            .with_owners_for_test(|owners| owners.auth.permission_check = check)
     }
 
     /// A caller of `tenant`; the injected check, not its grants, decides.
@@ -602,7 +608,7 @@ mod pg_tests {
     ) -> Vec<(String, i64)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.scribe_outbox.settle(deadline).await,
+            state.bifrost.scribe_outbox().settle(deadline).await,
             0,
             "audit settles"
         );

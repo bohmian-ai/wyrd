@@ -1,11 +1,10 @@
 //! Shared axum application state.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
@@ -26,32 +25,32 @@ use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, Scrib
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ServerSpanSink};
+use crate::scribe_outbox::{ScribeOutbox, ServerSpanSink};
 use wyrd_auth_verify::TokenVerifier;
-use wyrd_gateway::GatewayEngine;
 use wyrd_storage::StorageHandle;
-use wyrd_telemetry::TelemetryGuard;
-use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
-use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::components::gateway::GatewayApiKeys;
-use crate::components::health::ReadinessSnapshot;
-use crate::components::operators::keys::OperatorKeys;
-use crate::config::{
-    BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig, GatewayConfig,
-};
+use crate::components::auth::ServerAuth;
+use crate::components::gateway::Gateway;
+use crate::components::health::Health;
+use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
+use crate::mcp::Mcp;
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
-use crate::verification::cache::VerifierCardCache;
-use crate::verification::health::VerificationHealth;
-use crate::verification::hosted::blocks::HostedBlocks;
-use crate::verification::submissions::SubmissionOutbox;
+use crate::verification::Verification;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
+
+/// One named long-lived task an engine registers with the process
+/// supervisor at startup, such as a cache listener or the verification
+/// runtime; it runs until the shutdown token it was built with is cancelled.
+pub type EngineWorker = (
+    &'static str,
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+);
 
 /// Redact database failures at the public registry boundary.
 ///
@@ -1577,9 +1576,6 @@ pub struct Bifrost {
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Lifecycle routing retained by every query ingress, regardless of local role.
     query_controls: Option<crate::oracle::RunningQueryControls>,
-    /// Queue writer of submissions whose inputs Scribe acknowledged; `None`
-    /// only for the ownerless unit-test shell.
-    submissions: Option<Arc<SubmissionOutbox>>,
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
@@ -1592,11 +1588,9 @@ pub struct Bifrost {
     /// when no role owns one.
     #[cfg(feature = "test-support")]
     test_catalog: Option<Arc<BifrostCatalog>>,
-    /// The process Scribe outbox every Scribe-bound write stages on.
-    ///
-    /// `None` only for the ownerless unit-test shell, whose `AppState` starts
-    /// its own outbox.
-    scribe_outbox: Option<Arc<ScribeOutbox>>,
+    /// The process Scribe outbox every Scribe-bound write stages on; the
+    /// ownerless unit-test shell's reaches no Scribe.
+    scribe_outbox: Arc<ScribeOutbox>,
     /// This server's one tenant span sink over [`Self::scribe_outbox`], whose
     /// permit pool caps the copies it holds unwritten; its request edges bind
     /// it to every request they open.
@@ -1608,6 +1602,20 @@ pub struct Bifrost {
     ///
     /// `None` only for the ownerless unit-test shell, which has no membership.
     membership_poller: Option<Arc<ClusterTask>>,
+}
+
+/// The outbox of an ownerless unit-test shell, which composes no Scribe for
+/// it to reach; every write it stages is counted lost.
+///
+/// # Panics
+/// Panics when called outside a Tokio runtime, because the outbox writer
+/// task is spawned immediately.
+#[cfg(feature = "test-support")]
+fn shell_outbox() -> Arc<ScribeOutbox> {
+    crate::scribe_outbox::ScribeSink::outbox(
+        None,
+        vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+    )
 }
 
 /// Complete immutable composition retained by one published [`Bifrost`].
@@ -1634,8 +1642,6 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Shared local controls or remote-only routing for a forwarding ingress.
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
-    /// Queue writer acknowledged submissions are staged on.
-    pub(crate) submissions: Arc<SubmissionOutbox>,
     /// The process Scribe outbox, routed to the local or a peer Scribe.
     pub(crate) scribe_outbox: Arc<ScribeOutbox>,
     /// The one process membership poller for the shared cluster registry.
@@ -1658,7 +1664,6 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
-            submissions,
             scribe_outbox,
             membership_poller,
             #[cfg(feature = "test-support")]
@@ -1674,13 +1679,12 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
-            submissions: Some(submissions),
             #[cfg(feature = "test-support")]
             test_resources: resources,
             #[cfg(feature = "test-support")]
             test_catalog: None,
             tenant_spans: Some(Arc::new(ServerSpanSink::new(Arc::clone(&scribe_outbox)))),
-            scribe_outbox: Some(scribe_outbox),
+            scribe_outbox,
             membership_poller: Some(Arc::new(membership_poller)),
         })
     }
@@ -1704,10 +1708,9 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
-            submissions: None,
             test_resources: None,
             test_catalog: None,
-            scribe_outbox: None,
+            scribe_outbox: shell_outbox(),
             tenant_spans: None,
             membership_poller: None,
         })
@@ -1741,10 +1744,9 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
-            submissions: None,
             test_resources: None,
             test_catalog: Some(catalog),
-            scribe_outbox: None,
+            scribe_outbox: shell_outbox(),
             tenant_spans: None,
             membership_poller: None,
         })
@@ -1793,10 +1795,17 @@ impl Bifrost {
                 .is_none_or(|oracle| oracle.heartbeat.is_finished())
     }
 
-    /// Borrows the process Scribe outbox, absent only for the unit-test shell.
+    /// Borrows the process Scribe outbox every audit decision, gateway
+    /// capture, span, and Verifier result stages on.
     #[must_use]
-    pub const fn scribe_outbox(&self) -> Option<&Arc<ScribeOutbox>> {
-        self.scribe_outbox.as_ref()
+    pub const fn scribe_outbox(&self) -> &Arc<ScribeOutbox> {
+        &self.scribe_outbox
+    }
+
+    /// Route this unit-test shell's staging to `outbox` instead.
+    #[cfg(feature = "test-support")]
+    pub fn replace_scribe_outbox_for_test(&mut self, outbox: Arc<ScribeOutbox>) {
+        self.scribe_outbox = outbox;
     }
 
     /// This server's tenant span sink, which its request edges bind to every
@@ -1827,16 +1836,6 @@ impl Bifrost {
     #[must_use]
     pub fn shared_token_verifier(&self) -> Arc<TokenVerifier> {
         Arc::clone(&self.token_verifier)
-    }
-
-    /// Borrows the submission queue writer, absent only in the ownerless
-    /// unit-test shell.
-    ///
-    /// Process shutdown drains it after the Scribe outbox so submissions
-    /// whose inputs were acknowledged last are queued.
-    #[must_use]
-    pub fn submissions(&self) -> Option<&Arc<SubmissionOutbox>> {
-        self.submissions.as_ref()
     }
 
     /// Borrows the retained ready-Oracle forwarder, when this process has one.
@@ -1905,6 +1904,20 @@ impl Bifrost {
         self.oracle
             .as_ref()
             .map(|runtime| Arc::clone(runtime.peer()))
+    }
+
+    /// The Oracle cut-cache listener, when this process plans queries.
+    ///
+    /// Oracle's cut cache serves only while this listener hears every
+    /// `vala.file_list` change; the future runs until `shutdown` and is
+    /// registered with the process supervisor at startup.
+    pub(crate) fn refresh_worker(&self, shutdown: CancellationToken) -> Option<EngineWorker> {
+        self.oracle.as_ref()?;
+        let catalog = Arc::clone(self.catalog()?);
+        Some((
+            "oracle_cut_cache",
+            Box::pin(async move { catalog.watch_cuts(shutdown).await }),
+        ))
     }
 
     /// Borrows the shared catalog retained by the selected data owners.
@@ -2181,14 +2194,73 @@ impl BifrostShutdownReport {
     }
 }
 
+/// Values the server runs under, fixed at startup.
+///
+/// These are plain values copied out of [`crate::config::WyrdServerConfig`]
+/// by [`AppState::start`], never handles; every request reads them through
+/// [`AppStateInner::settings`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerSettings {
+    /// Deployment posture (Development / Production) locked at boot.
+    pub deployment_profile: DeploymentProfile,
+    /// Closed process target derived from `WYRD_TARGET`.
+    pub role: BifrostTarget,
+    /// Request-shaping limits for the router middleware stack.
+    pub limits: LimitsConfig,
+}
+
+impl ServerSettings {
+    /// Reject production-profile boots where stubs survived assembly.
+    ///
+    /// Development-profile boots and processes that serve no public API pass
+    /// unchanged: a dedicated Forge worker constructs no Gate, Scribe, or
+    /// Oracle surface to authenticate. A production API process must carry
+    /// a token verifier.
+    ///
+    /// # Errors
+    /// Returns [`ProductionValidationError::MissingTokenVerifier`] when a
+    /// production process serving the API has no token verifier.
+    pub fn validate(
+        &self,
+        bifrost: &Bifrost,
+        auth: &ServerAuth,
+    ) -> Result<(), ProductionValidationError> {
+        if !self.deployment_profile.is_production() || !bifrost.serves_api() {
+            return Ok(());
+        }
+        if auth.token_verifier.is_none() {
+            return Err(ProductionValidationError::MissingTokenVerifier);
+        }
+        Ok(())
+    }
+}
+
+/// Test-tier controls carried by one test server's state.
+///
+/// Every field defaults to production behavior, and only a test server that
+/// explicitly opts in through the `wyrd-testing` builder changes one, so
+/// enabling the `test-support` feature never changes a production process.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Default)]
+pub struct TestHooks {
+    /// Register the test-support MCP context probe in the `/mcp` tool catalog.
+    pub mcp_context_probe: bool,
+    /// Deterministic one-shot query stream truncation controller.
+    pub query_stream_fault: Option<QueryStreamFaultController>,
+    /// Compose the auth owner without a token verifier, so a journey can
+    /// observe the refusal of a server that cannot authenticate.
+    pub omit_token_verifier: bool,
+    /// Leave the queued verification runtime unstarted while direct
+    /// verification still runs, so a journey can observe queued state.
+    pub hold_verification_runner: bool,
+}
+
 /// Process-wide handle registry. One instance is shared by all HTTP handlers.
 ///
 /// Tower clones the middleware stack, and the state each layer holds, on every
 /// request, so a clone is one reference-count increment on the shared
-/// [`AppStateInner`]. Fields read through [`Deref`]. A write through
-/// [`DerefMut`] copies the handles first when other clones share them, so a
-/// clone keeps the value semantics of a plain copy: mutating one never changes
-/// another.
+/// [`AppStateInner`]. Fields read through [`Deref`]. The state is immutable
+/// once [`AppState::start`] builds it: every field is a complete owner.
 #[derive(Clone)]
 pub struct AppState(Arc<AppStateInner>);
 
@@ -2201,272 +2273,92 @@ impl Deref for AppState {
     }
 }
 
-impl DerefMut for AppState {
-    /// Borrow the handles mutably, copying them out of the shared allocation
-    /// first when another clone still holds it.
-    fn deref_mut(&mut self) -> &mut AppStateInner {
-        Arc::make_mut(&mut self.0)
-    }
-}
-
-/// The handles [`AppState`] shares.
-///
-/// Foundation commits append their owned handles here, for example storage,
-/// auth verification, and policy evaluation.
-#[derive(Clone)]
+/// The complete owners [`AppState`] shares.
 pub struct AppStateInner {
+    /// Values the server runs under: profile, role, and HTTP limits.
+    pub settings: ServerSettings,
     /// Composed production Postgres handle. Single DB access path for all routes.
     pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
-    /// One composite owner for the complete Bifrost runtime graph.
+    /// One composite owner for the complete Bifrost runtime graph, including
+    /// the process Scribe outbox.
     pub bifrost: Arc<Bifrost>,
-    /// Authentication handles: token issuance + verification + issuer/binding resolution.
+    /// Authentication and authorization: issuance, verification, resolvers,
+    /// human and platform logins, and the permission check.
     pub auth: ServerAuth,
-    /// Authorization handles: policy decision + RBAC evaluation + decision audit.
-    pub authz: ServerAuthz,
-    /// Deployment posture (Development / Production) locked at boot.
-    pub deployment_profile: DeploymentProfile,
+    /// The governed gateway: configuration, engine, caches, and call tasks.
+    pub gateway: Gateway,
+    /// The verification runtime's process capabilities.
+    pub verification: Verification,
+    /// The `/mcp` surface's in-flight work.
+    pub mcp: Mcp,
+    /// Readiness and peer-plane status.
+    pub health: Health,
     /// Shared cancellation token for cooperative shutdown.
     pub shutdown_token: CancellationToken,
-    /// In-flight MCP tool work for this process.
-    ///
-    /// Every `/mcp` tool invocation holds an RAII token for the life of its
-    /// work, including cancellation cleanup. After the supervised transport
-    /// drain stops admission, `BoundServer::run` closes this tracker and waits
-    /// for it inside the existing shutdown deadline, so a pod cannot report a
-    /// clean drain while an MCP handler is still settling.
-    pub mcp_tasks: tokio_util::task::TaskTracker,
-    /// In-flight governed gateway call work for this process.
-    ///
-    /// Every call's execution and accounting task runs on this tracker,
-    /// including accounting that settles after a stream reached its caller.
-    /// After transport admission stops, `BoundServer::run` closes it and waits
-    /// inside the shutdown deadline, so accepted calls keep their accounting
-    /// evidence.
-    pub gateway_tasks: tokio_util::task::TaskTracker,
-    /// Register the test-support MCP context probe in the `/mcp` tool catalog.
-    ///
-    /// Default `false`: only a test server that explicitly opted in through
-    /// `WyrdTestServerBuilder::with_mcp_context_probe_for_test` exposes it, so
-    /// merely compiling `test-support` never adds a capability to the catalog.
+    /// Test-tier controls; production behavior unless a test opted in.
     #[cfg(feature = "test-support")]
-    pub mcp_context_probe: bool,
-    /// Telemetry guard (holds the tracer provider).
-    pub telemetry: Arc<TelemetryGuard>,
-    /// Request-shaping limits for the router middleware stack.
-    pub limits: LimitsConfig,
-    /// Operator-declared gateway credential bindings and secret backends.
-    pub gateway: Arc<GatewayConfig>,
-    /// Shared gateway execution engine behind every governed invocation entry.
-    pub gateway_engine: Arc<GatewayEngine>,
-    /// Tokens exchanged for Wyrd API keys presented to public gateway
-    /// ingress, reused per key for at most 60 seconds.
-    pub(crate) gateway_api_keys: Arc<GatewayApiKeys>,
-    /// The process's one non-blocking outbox for audit decisions, gateway
-    /// capture, and Verifier results; every audited surface stages on it
-    /// without waiting for the write. Drained by `BoundServer::run` before
-    /// Bifrost shutdown.
-    pub scribe_outbox: Arc<ScribeOutbox>,
-    /// gRPC health reporter shared between HTTP readiness and gRPC health service.
-    pub grpc_health: HealthReporter,
-    /// Cached readiness snapshot from the background readiness_loop task.
-    pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
-    /// Retained status of this process's private Bifrost peer listener.
-    pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
-    /// Liveness of this process's verification runtime capabilities.
-    ///
-    /// The runtime marks each capability it composes required and up or down;
-    /// the readiness loop reports the server unready while one is absent.
-    pub verification: Arc<VerificationHealth>,
-    /// Key-encryption keys that seal and open Operator connection credentials.
-    pub operator_keys: Arc<OperatorKeys>,
-    /// The process's hosted Verifier block capacity, which direct
-    /// verification and the queued runner build every engine over; `None`
-    /// until boot starts it, and then neither verification surface runs.
-    pub verification_blocks: Option<Arc<HostedBlocks>>,
-    /// The one resolution of verification targets, shared by direct verify,
-    /// submission acceptance, and the queued runner; it is the submission
-    /// writer's own cache when this process has one. Targets serve only
-    /// while the server's listener hears every change that could alter them.
-    pub verifier_cards: Arc<VerifierCardCache>,
-    /// Optional deterministic stream truncation controller for test servers.
-    #[cfg(feature = "test-support")]
-    pub query_stream_fault: Option<QueryStreamFaultController>,
+    pub test_hooks: TestHooks,
 }
 
 impl AppState {
-    /// Build runtime state from production-ready Postgres handles.
+    /// Share `inner`, the complete owner graph [`AppState::start`] or a
+    /// test-tier fixture assembled.
+    #[must_use]
+    pub(crate) fn assembled(inner: AppStateInner) -> Self {
+        Self(Arc::new(inner))
+    }
+
+    /// Share a complete owner graph a unit test assembled itself.
     ///
-    /// Shares the process Scribe outbox `bifrost` was composed with, and starts
-    /// one reaching no Scribe only for the ownerless unit-test shell, which
-    /// has none.
+    /// Only the in-crate unit tier and the test harness's ownerless shells
+    /// call this; every server, production or test, starts through
+    /// [`AppState::start`].
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn from_owners_for_test(inner: AppStateInner) -> Self {
+        Self::assembled(inner)
+    }
+
+    /// This unit-test state with `change` applied to its owners.
     ///
     /// # Panics
-    /// Panics when called outside a Tokio runtime with the unit-test shell,
-    /// because the outbox writer task is spawned immediately.
+    /// Panics when a clone of this state is still alive; see
+    /// [`Self::into_owners_for_test`].
+    #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn new(
-        postgres: Arc<ServerPostgres>,
-        storage: Arc<StorageHandle>,
-        bifrost: Arc<Bifrost>,
-        shutdown_token: CancellationToken,
-    ) -> Self {
-        let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
-        let scribe_outbox = bifrost.scribe_outbox().map_or_else(
-            || {
-                ScribeSink::outbox(
-                    None,
-                    vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-                )
-            },
-            Arc::clone,
-        );
-        let verifier_cards = bifrost
-            .submissions()
-            .map_or_else(Arc::default, |submissions| {
-                submissions.sink().verifier_cards()
-            });
-        Self(Arc::new(AppStateInner {
-            postgres,
-            storage,
-            bifrost,
-            auth: ServerAuth::default(),
-            authz: ServerAuthz::default(),
-            deployment_profile: DeploymentProfile::Development,
-            shutdown_token: shutdown_token.clone(),
-            mcp_tasks: tokio_util::task::TaskTracker::new(),
-            gateway_tasks: tokio_util::task::TaskTracker::new(),
-            #[cfg(feature = "test-support")]
-            mcp_context_probe: false,
-            telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
-                wyrd_telemetry::TelemetryConfig::default(),
-            )),
-            limits: LimitsConfig::default(),
-            gateway: Arc::default(),
-            gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
-            gateway_api_keys: Arc::default(),
-            scribe_outbox,
-            grpc_health: reporter,
-            readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
-            peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
-            verification: Arc::default(),
-            operator_keys: Arc::new(OperatorKeys::default()),
-            verification_blocks: None,
-            verifier_cards,
-            #[cfg(feature = "test-support")]
-            query_stream_fault: None,
-        }))
+    pub fn with_owners_for_test(self, change: impl FnOnce(&mut AppStateInner)) -> Self {
+        let mut owners = self.into_owners_for_test();
+        change(&mut owners);
+        Self::from_owners_for_test(owners)
     }
 
-    /// Run every Verifier execution over `blocks`.
-    #[must_use]
-    pub fn with_verification_blocks(mut self, blocks: Arc<HostedBlocks>) -> Self {
-        self.verification_blocks = Some(blocks);
-        self
-    }
-
-    /// Register the test-support MCP context probe on this state.
+    /// Take back the owner graph of a unit-test state nothing else shares.
     ///
-    /// Connectivity journeys call this through
-    /// `WyrdTestServerBuilder::with_mcp_context_probe_for_test`; ordinary test
-    /// servers leave the catalog empty.
+    /// # Panics
+    /// Panics when a clone of this state is still alive.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn with_mcp_context_probe(mut self, enabled: bool) -> Self {
-        self.mcp_context_probe = enabled;
-        self
+    pub fn into_owners_for_test(self) -> AppStateInner {
+        Arc::into_inner(self.0)
+            .expect("a unit-test state is unshared when its owners are taken back")
     }
 
-    /// Attach a test-tier one-shot query stream fault controller.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn with_query_stream_fault(mut self, controller: QueryStreamFaultController) -> Self {
-        self.query_stream_fault = Some(controller);
-        self
-    }
-
-    /// Attach authentication handles (issuance, verification, resolvers).
-    #[must_use]
-    pub fn with_auth(mut self, auth: ServerAuth) -> Self {
-        self.auth = auth;
-        self
-    }
-
-    /// Attach authorization handles (policy, RBAC, audit).
-    #[must_use]
-    pub fn with_authz(mut self, authz: ServerAuthz) -> Self {
-        self.authz = authz;
-        self
-    }
-
-    /// Use `keys` for Operator connection credentials.
-    #[must_use]
-    pub fn with_operator_keys(mut self, keys: OperatorKeys) -> Self {
-        self.operator_keys = Arc::new(keys);
-        self
-    }
-
-    /// Set the deployment posture.
-    #[must_use]
-    pub fn with_deployment_profile(mut self, profile: DeploymentProfile) -> Self {
-        self.deployment_profile = profile;
-        self
+    /// Reject production-profile boots where stubs survived assembly; see
+    /// [`ServerSettings::validate`].
+    ///
+    /// # Errors
+    /// Returns [`ProductionValidationError::MissingTokenVerifier`] when a
+    /// production process serving the API has no token verifier.
+    pub fn production_validate(&self) -> Result<(), ProductionValidationError> {
+        self.settings.validate(&self.bifrost, &self.auth)
     }
 
     /// Borrows the selected Scribe runtime.
     #[must_use]
     pub fn bifrost_ingest(&self) -> Option<&Arc<Scribe>> {
         self.bifrost.scribe()
-    }
-
-    /// Attach the live telemetry guard.
-    #[must_use]
-    pub fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
-        self.telemetry = telemetry;
-        self
-    }
-
-    /// Attach request-shaping limits from WyrdServerConfig.
-    #[must_use]
-    pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    /// Attach the operator gateway configuration tenants' credentials may name.
-    #[must_use]
-    pub fn with_gateway(mut self, gateway: GatewayConfig) -> Self {
-        self.gateway = Arc::new(gateway);
-        self
-    }
-
-    /// Attach the gateway execution engine every invocation entry shares.
-    #[must_use]
-    pub fn with_gateway_engine(mut self, engine: GatewayEngine) -> Self {
-        self.gateway_engine = Arc::new(engine);
-        self
-    }
-
-    /// Attach the gRPC health reporter.
-    #[must_use]
-    pub fn with_grpc_health(mut self, reporter: HealthReporter) -> Self {
-        self.grpc_health = reporter;
-        self
-    }
-
-    /// Attach the cached readiness publisher.
-    #[must_use]
-    pub fn with_readiness(mut self, readiness: Arc<ArcSwap<ReadinessSnapshot>>) -> Self {
-        self.readiness = readiness;
-        self
-    }
-
-    /// Replace the storage handle.
-    #[must_use]
-    pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
-        self.storage = storage;
-        self
     }
 
     /// Get a tenant-scoped Postgres connection for registry operations.
@@ -2650,36 +2542,13 @@ pub enum ProductionValidationError {
     MissingOraclePeer,
 }
 
-impl AppState {
-    /// Reject production-profile boots where stubs survived assembly.
-    ///
-    /// Development-profile boots short-circuit to `Ok(())` so unit tests work.
-    pub fn production_validate(&self) -> Result<(), ProductionValidationError> {
-        if !self.deployment_profile.is_production() {
-            return Ok(());
-        }
-        // Dedicated Forge workers do not expose the public serving surface and
-        // therefore do not construct Gate/authentication or Oracle peers. The
-        // closed role topology still records Forge ownership in
-        // `bifrost_roles`; only the server roles carry Scribe/Oracle markers.
-        let serves_api = self.bifrost.serves_api();
-        if !serves_api {
-            return Ok(());
-        }
-        if self.auth.token_verifier.is_none() {
-            return Err(ProductionValidationError::MissingTokenVerifier);
-        }
-        Ok(())
-    }
-}
-
 /// PostgreSQL-backed application-state ownership proofs.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{AppState, LimitsConfig};
+    use super::AppState;
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_storage::{LocalSigner, StorageHandle};
@@ -2820,9 +2689,9 @@ mod tests {
     /// owner and is proven where such a state exists, not in this unit tier.
     #[tokio::test]
     async fn production_validate_applies_the_stub_rule_only_to_serving_processes() {
-        let state = test_state()
-            .await
-            .with_deployment_profile(crate::config::DeploymentProfile::Production);
+        let state = test_state().await.with_owners_for_test(|owners| {
+            owners.settings.deployment_profile = crate::config::DeploymentProfile::Production;
+        });
         assert!(
             state.auth.token_verifier.is_none(),
             "the shell fixture lacks the verifier the production rule requires"
@@ -2835,27 +2704,6 @@ mod tests {
             state.production_validate().is_ok(),
             "a process that serves no public surface is not refused for a missing verifier"
         );
-    }
-
-    /// `with_limits` replaces every request limit on the state it returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the test state cannot be built or a supplied limit is not
-    /// reflected on the returned state.
-    #[tokio::test]
-    async fn with_limits_updates_all_fields() {
-        let state = test_state().await;
-        let limits = LimitsConfig {
-            body_bytes: 2048,
-            audio_upload_bytes: 4096,
-            timeout: std::time::Duration::from_secs(1),
-            concurrency: 10,
-        };
-        let state = state.with_limits(limits);
-        assert_eq!(state.limits.body_bytes, 2048);
-        assert_eq!(state.limits.audio_upload_bytes, 4096);
-        assert_eq!(state.limits.concurrency, 10);
     }
 
     async fn test_state() -> AppState {

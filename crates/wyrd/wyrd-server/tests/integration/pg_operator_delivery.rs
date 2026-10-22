@@ -353,6 +353,7 @@ impl Delivery {
             limits,
             script,
             crash,
+            None,
             ProviderEndpoints {
                 slack: base.join("/slack").expect("slack URL"),
                 pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
@@ -360,7 +361,34 @@ impl Delivery {
         )
     }
 
-    /// Spawn a runtime over `state` delivering fixed providers to `endpoints`.
+    /// Spawn a runtime over this server's state as a replica holding `keys`
+    /// would run it, delivering to the mock provider.
+    ///
+    /// # Panics
+    /// Panics when the runtime cannot compose.
+    fn spawn_replica(
+        &self,
+        keys: Arc<OperatorKeys>,
+        limits: &RuntimeLimits,
+        script: &EngineScript,
+        crash: &CapabilityCrash,
+    ) -> Running {
+        let base = Url::parse(&self.mock.uri()).expect("mock URI");
+        self.spawn_to(
+            self.server.state(),
+            limits,
+            script,
+            crash,
+            Some(keys),
+            ProviderEndpoints {
+                slack: base.join("/slack").expect("slack URL"),
+                pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
+            },
+        )
+    }
+
+    /// Spawn a runtime over `state` delivering fixed providers to `endpoints`,
+    /// with `keys` standing in for the process's Operator keys when given.
     ///
     /// # Panics
     /// Panics when the runtime cannot compose.
@@ -370,15 +398,19 @@ impl Delivery {
         limits: &RuntimeLimits,
         script: &EngineScript,
         crash: &CapabilityCrash,
+        keys: Option<Arc<OperatorKeys>>,
         endpoints: ProviderEndpoints,
     ) -> Running {
-        let runtime = VerificationRuntime::builder(state)
+        let builder = VerificationRuntime::builder(state)
             .limits(*limits)
             .engine_script(script.clone())
             .crash_switch(crash.clone())
-            .provider_endpoints(endpoints)
-            .build()
-            .expect("the runtime composes");
+            .provider_endpoints(endpoints);
+        let builder = match keys {
+            Some(keys) => builder.operator_keys(keys),
+            None => builder,
+        };
+        let runtime = builder.build().expect("the runtime composes");
         let stop = CancellationToken::new();
         let task = tokio::spawn(runtime.run(stop.clone()));
         Running { stop, task }
@@ -841,8 +873,7 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .operator_keys_dir_for_test()
         .expect("generated key directory");
     std::fs::copy(dir.join("v1"), dir.join("v2")).expect("key v2 publishes");
-    let mut replica = delivery.server.state().clone();
-    replica.operator_keys = Arc::new(
+    let replica = Arc::new(
         OperatorKeys::new(OperatorKeysConfig {
             source: OperatorKeySource::File,
             dir: Some(dir.to_path_buf()),
@@ -852,8 +883,8 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .expect("file keys build"),
     );
     delivery.make_retries_due(run).await;
-    let second = delivery.spawn(
-        &replica,
+    let second = delivery.spawn_replica(
+        Arc::clone(&replica),
         &Delivery::limits(),
         &EngineScript::default(),
         &CapabilityCrash::default(),
@@ -931,7 +962,7 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
         ..Delivery::limits()
     };
     let crash = CapabilityCrash::default();
-    let health = Arc::clone(&delivery.server.state().verification);
+    let health = Arc::clone(&delivery.server.state().verification.health);
     let running = delivery.spawn(delivery.server.state(), &limits, &failing_script(1), &crash);
     wait_until("runtime health", || {
         health.is_composed() && !health.is_degraded()
@@ -1082,8 +1113,7 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
     delivery.fail_binding("owner", &[&revoked, &hooked]).await;
 
     let empty = tempfile::tempdir().expect("empty key directory");
-    let mut outage = delivery.server.state().clone();
-    outage.operator_keys = Arc::new(
+    let outage = Arc::new(
         OperatorKeys::new(OperatorKeysConfig {
             source: OperatorKeySource::File,
             dir: Some(empty.path().to_path_buf()),
@@ -1091,8 +1121,8 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
         })
         .expect("file keys build"),
     );
-    let running = delivery.spawn(
-        &outage,
+    let running = delivery.spawn_replica(
+        Arc::clone(&outage),
         &Delivery::limits(),
         &failing_script(1),
         &CapabilityCrash::default(),
@@ -1515,6 +1545,7 @@ async fn live_smoke(connection: Value, spec: Value) {
         &Delivery::limits(),
         &failing_script(1),
         &CapabilityCrash::default(),
+        None,
         ProviderEndpoints::default(),
     );
     let run = delivery.new_run(&[]).await;
@@ -1840,8 +1871,7 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_mins(1)))
         .mount(&vault)
         .await;
-    let mut replica = delivery.server.state().clone();
-    replica.operator_keys = Arc::new(
+    let replica = Arc::new(
         OperatorKeys::new(OperatorKeysConfig {
             source: OperatorKeySource::Vault,
             active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
@@ -1861,8 +1891,8 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         rewrap_tenant_budget: Duration::from_millis(300),
         ..Delivery::limits()
     };
-    let running = delivery.spawn(
-        &replica,
+    let running = delivery.spawn_replica(
+        Arc::clone(&replica),
         &limits,
         &failing_script(1),
         &CapabilityCrash::default(),
@@ -1929,8 +1959,8 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
             .mount(&vault)
             .await;
     }
-    let running = delivery.spawn(
-        &replica,
+    let running = delivery.spawn_replica(
+        Arc::clone(&replica),
         &limits,
         &EngineScript::default(),
         &CapabilityCrash::default(),

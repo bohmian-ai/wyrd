@@ -19,6 +19,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -37,6 +38,7 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
 
 use skald_providers::MediaAnswer;
+use skald_providers::exchange::{self, Exchange};
 
 use crate::adapter::{BatchAction, IngressDialect, MediaRequest};
 use crate::credential::{CredentialResolver, ProviderSecret};
@@ -134,6 +136,15 @@ pub struct EventStream {
     /// without a value only when the relay task itself was dropped, which the
     /// owner treats as cancellation. Taken by the owner that accounts the call.
     pub end: Option<oneshot::Receiver<StreamEnd>>,
+    /// When [`Self::recv`] last handed a frame to the response-body consumer.
+    handed: Option<std::time::Instant>,
+    /// Reports `handed` once the consumer drops this stream.
+    handoff: Option<oneshot::Sender<Option<std::time::Instant>>>,
+    /// The instant the consumer took the stream's final frame, sent when it
+    /// drops the stream: `None` when no frame was taken. Taken by the owner
+    /// that reports the call's end; a closed channel means the stream was
+    /// dropped before any report could be sent.
+    pub handed_off: Option<oneshot::Receiver<Option<std::time::Instant>>>,
 }
 
 /// Terminal result of one relayed stream, which settles the provisional
@@ -154,6 +165,13 @@ pub struct StreamEnd {
     /// the capture ceiling, had no JSON form, or held the credential, or when
     /// a media stream did not end cleanly.
     pub capture: Option<ResponseCapture>,
+    /// When the relay received the last upstream body byte; `None` when no
+    /// body byte arrived. Transient, for telemetry only.
+    pub last_byte: Option<std::time::Instant>,
+    /// Time the relay spent decoding, translating, and framing upstream
+    /// chunks, excluding waits on the provider and on the caller.
+    /// Transient, for telemetry only.
+    pub relay: Duration,
 }
 
 /// Abnormal end of a stream that could not carry an in-band terminal error;
@@ -169,11 +187,15 @@ impl EventStream {
         terminated: Arc<AtomicBool>,
         end: oneshot::Receiver<StreamEnd>,
     ) -> Self {
+        let (handoff, handed_off) = oneshot::channel();
         Self {
             frames,
             terminated,
             aborted: false,
             end: Some(end),
+            handed: None,
+            handoff: Some(handoff),
+            handed_off: Some(handed_off),
         }
     }
 
@@ -186,8 +208,12 @@ impl EventStream {
     /// Yields [`StreamAborted`] once, after the last frame, when the relay
     /// closed without terminating the stream; the caller must abort its
     /// transport rather than end the response cleanly.
+    ///
+    /// Each frame's handoff instant is kept, so the stream's drop reports
+    /// when the consumer took the final one.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>, StreamAborted>> {
         if let Some(frame) = self.frames.recv().await {
+            self.handed = Some(std::time::Instant::now());
             return Some(Ok(frame));
         }
         if self.aborted || self.terminated.load(Ordering::Acquire) {
@@ -195,6 +221,16 @@ impl EventStream {
         }
         self.aborted = true;
         Some(Err(StreamAborted))
+    }
+}
+
+impl Drop for EventStream {
+    /// Reports when the consumer took the final frame to whoever holds
+    /// [`EventStream::handed_off`]; nobody listening is not an error.
+    fn drop(&mut self) {
+        if let Some(handoff) = self.handoff.take() {
+            handoff.send(self.handed).ok();
+        }
     }
 }
 
@@ -376,6 +412,78 @@ pub struct CallExecution {
     /// provisional until its [`StreamEnd`], so the span stays open and
     /// unrecorded for the owner to record; otherwise it is already recorded.
     pub attempt_span: tracing::Span,
+    /// Monotonic credential, adapter, and provider-wait time of every
+    /// attempt, for telemetry only.
+    pub timing: ExecutionTiming,
+}
+
+/// Transient monotonic timing of one call's execution, read by telemetry and
+/// never accounted, persisted, or sent on the wire.
+///
+/// Provider wait comes from the HTTP exchanges Skald logs inside
+/// [`GatewayEngine::execute`]'s [`exchange::scope`]: everything else an
+/// attempt spends inside its dispatch is adapter work (request preparation,
+/// translation, client setup, and response decode), so neither is mistaken
+/// for the other however slow the provider is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionTiming {
+    /// Credential resolution, summed across attempts.
+    pub credential: Duration,
+    /// Dispatch time outside every provider exchange, summed across attempts.
+    pub translate: Duration,
+    /// Send to fully-read body, or to failure, of every ended exchange,
+    /// summed across attempts and retries.
+    pub upstream: Duration,
+    /// Send and header instants of the opened stream's exchange, whose body
+    /// the relay reads; `None` for a buffered call.
+    pub open: Option<(std::time::Instant, std::time::Instant)>,
+}
+
+impl ExecutionTiming {
+    /// Folds one attempt whose dispatch took `dispatch` and sent `exchanges`.
+    ///
+    /// An ended exchange adds its send-to-end time to [`Self::upstream`]; an
+    /// open one becomes [`Self::open`] and counts as waited only until its
+    /// headers. Dispatch time not waited on any exchange is adapter work.
+    fn attempt(&mut self, dispatch: Duration, exchanges: &[Exchange]) {
+        let mut waited = Duration::ZERO;
+        for exchange in exchanges {
+            match (exchange.ended, exchange.headers) {
+                (Some(ended), _) => {
+                    let elapsed = ended.saturating_duration_since(exchange.sent);
+                    self.upstream += elapsed;
+                    waited += elapsed;
+                }
+                (None, Some(headers)) => {
+                    self.open = Some((exchange.sent, headers));
+                    waited += headers.saturating_duration_since(exchange.sent);
+                }
+                (None, None) => {}
+            }
+        }
+        self.translate += dispatch.saturating_sub(waited);
+    }
+
+    /// Provider wait until the call's answer head: every ended exchange plus
+    /// the open stream's send to headers.
+    #[must_use]
+    pub fn until_headers(&self) -> Duration {
+        self.upstream
+            + self.open.map_or(Duration::ZERO, |(sent, headers)| {
+                headers.saturating_duration_since(sent)
+            })
+    }
+
+    /// Provider wait until an open stream's `last_byte`: every ended exchange
+    /// plus the stream's send to its last byte, or to its headers when no
+    /// body byte arrived.
+    #[must_use]
+    pub fn until_last_byte(&self, last_byte: Option<std::time::Instant>) -> Duration {
+        self.upstream
+            + self.open.map_or(Duration::ZERO, |(sent, headers)| {
+                last_byte.unwrap_or(headers).saturating_duration_since(sent)
+            })
+    }
 }
 
 /// Inputs of one admitted call.
@@ -461,7 +569,19 @@ impl GatewayEngine {
     /// or was cancelled in flight, its stable `error.code`. A stream that
     /// opened is recorded `Succeeded` provisionally and its span is left for
     /// the owner to record from the stream's [`StreamEnd`].
+    ///
+    /// Attempts run inside one [`exchange::scope`], so the returned
+    /// [`ExecutionTiming`] separates credential, adapter, and provider time.
     pub async fn execute(&self, input: CallInput<'_>) -> CallExecution {
+        let mut timing = ExecutionTiming::default();
+        let mut execution = exchange::scope(self.walk(&input, &mut timing)).await;
+        execution.timing = timing;
+        execution
+    }
+
+    /// Walks the plan's candidates as [`Self::execute`] describes, folding
+    /// each attempt's timing into `timing`.
+    async fn walk(&self, input: &CallInput<'_>, timing: &mut ExecutionTiming) -> CallExecution {
         let mut attempts: Vec<AttemptRecord> = Vec::new();
         let mut refusal = None;
         let retry_safe = matches!(
@@ -491,7 +611,7 @@ impl GatewayEngine {
                 () = input.cancel.cancelled() => Err(GatewayCallOutcome::Cancelled),
                 () = tokio::time::sleep_until(input.deadline) => Err(GatewayCallOutcome::TimedOut),
                 result = self
-                    .attempt(&input, candidate, ordinal, &dispatched)
+                    .attempt(input, candidate, ordinal, &dispatched, &mut *timing)
                     .instrument(span.clone()) => Ok(result),
             };
             let record = |outcome, billable, usage| AttemptRecord {
@@ -567,20 +687,25 @@ impl GatewayEngine {
     /// failure is reported as a before-dispatch failure with unknown usage.
     /// [`Self::execute`] runs it inside the attempt's `gateway.attempt` span
     /// carrying the ordinal, deployment, and `gen_ai` provider and
-    /// request-model attributes.
+    /// request-model attributes. Credential and dispatch time fold into
+    /// `timing` once each finishes; an attempt interrupted mid-dispatch adds
+    /// no dispatch time.
     async fn attempt(
         &self,
         input: &CallInput<'_>,
         candidate: &PlannedCandidate,
         ordinal: NonZeroU32,
         dispatched: &AtomicBool,
+        timing: &mut ExecutionTiming,
     ) -> AttemptResult {
         let deployment = &candidate.deployment;
-        let credential = match self
+        let resolving = std::time::Instant::now();
+        let resolved = self
             .resolver
             .resolve(input.tenant, input.snapshot, deployment)
-            .await
-        {
+            .await;
+        timing.credential += resolving.elapsed();
+        let credential = match resolved {
             Ok(credential) => credential,
             Err(error) => {
                 metrics::counter!("wyrd_gateway_secret_resolution_failures_total").increment(1);
@@ -596,7 +721,10 @@ impl GatewayEngine {
             }
         };
         dispatched.store(true, Ordering::Relaxed);
-        self.dispatch
+        drop(exchange::take());
+        let dispatching = std::time::Instant::now();
+        let result = self
+            .dispatch
             .dispatch(ProviderAttempt {
                 call_id: input.plan.call_id,
                 ordinal,
@@ -613,7 +741,9 @@ impl GatewayEngine {
                 deadline: input.deadline,
                 cancel: input.cancel,
             })
-            .await
+            .await;
+        timing.attempt(dispatching.elapsed(), &exchange::take());
+        result
     }
 
     /// Applies health and retry rules to one failed attempt.
@@ -665,6 +795,7 @@ fn finish(
         refusal,
         capture,
         attempt_span: attempt_span.unwrap_or_else(tracing::Span::none),
+        timing: ExecutionTiming::default(),
     }
 }
 
@@ -1132,5 +1263,59 @@ mod tests {
         );
         assert_eq!(execution.outcome, GatewayCallOutcome::Cancelled);
         assert_eq!(execution.attempts.len(), 1);
+    }
+
+    /// Provider wait is subtracted exchange by exchange: a prior attempt's
+    /// whole exchange and an opened stream's send-to-headers, while dispatch
+    /// time outside every exchange stays adapter work, and the stream's end
+    /// adds its send-to-last-byte.
+    ///
+    /// # Panics
+    ///
+    /// Panics when time is attributed to the wrong owner.
+    #[test]
+    fn execution_timing_separates_provider_wait_from_adapter_work() {
+        let base = std::time::Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        let mut timing = ExecutionTiming::default();
+        timing.attempt(
+            Duration::from_millis(40),
+            &[Exchange {
+                sent: at(5),
+                headers: Some(at(25)),
+                ended: Some(at(35)),
+            }],
+        );
+        timing.attempt(
+            Duration::from_millis(120),
+            &[Exchange {
+                sent: at(60),
+                headers: Some(at(160)),
+                ended: None,
+            }],
+        );
+        assert_eq!(timing.upstream, Duration::from_millis(30));
+        assert_eq!(timing.translate, Duration::from_millis(10 + 20));
+        assert_eq!(timing.until_headers(), Duration::from_millis(30 + 100));
+        assert_eq!(
+            timing.until_last_byte(Some(at(900))),
+            Duration::from_millis(30 + 840)
+        );
+        assert_eq!(timing.until_last_byte(None), timing.until_headers());
+
+        let mut failed = ExecutionTiming::default();
+        failed.attempt(
+            Duration::from_millis(3),
+            &[Exchange {
+                sent: at(1),
+                headers: None,
+                ended: Some(at(3)),
+            }],
+        );
+        assert_eq!(
+            (failed.upstream, failed.translate),
+            (Duration::from_millis(2), Duration::from_millis(1))
+        );
+        assert_eq!(failed.open, None);
     }
 }

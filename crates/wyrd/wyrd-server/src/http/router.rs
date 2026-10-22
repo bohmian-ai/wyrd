@@ -246,12 +246,16 @@ where
         ))
         .layer(
             crate::http::middleware::edge_capacity::EdgeCapacityLayer::new(
-                state.limits.concurrency,
+                state.settings.limits.concurrency,
             ),
         )
-        .layer(crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(state.limits.timeout))
+        .layer(
+            crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(
+                state.settings.limits.timeout,
+            ),
+        )
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
-            state.limits.body_bytes,
+            state.settings.limits.body_bytes,
             state
                 .bifrost
                 .serves_api()

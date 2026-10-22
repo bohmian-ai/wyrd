@@ -4,14 +4,15 @@
 //! release `wyrd-server` through the local-development guide (`migrate`,
 //! serve, `setup`) on the whole host, Linux or macOS; the report title carries
 //! the host fingerprint, so compare only reports from matching hosts. One
-//! tenant registers an assertion Verifier, a Model, and a Service, and the
-//! application loads the pulled Service bundle under a Card-bound key, so
-//! every call is the public Rust client's `observe().verify` or
+//! tenant registers an assertion Verifier, a Model, and one Service per
+//! closed-loop client, and each client is its own application loading its
+//! pulled Service bundle under that Service's own Card-bound key, so every
+//! call is the public Rust client's `observe().verify` or
 //! `observe().submit` exactly as production makes it. All evidence comes from
 //! client timings, `/metrics`, and the OS's readings of the server process.
 //!
 //! The two AC-009 cases, each selectable with `--case 1,2`, run at each of
-//! [`CLIENTS`] closed-loop clients:
+//! [`CLIENTS`] closed-loop clients, or those `--clients 1,4,16,64` selects:
 //!
 //! 1. Direct `verify`: judged on the server's verification overhead (the
 //!    request's arrival until its result is staged, less the Verifier's own
@@ -50,13 +51,13 @@ const CLIENTS: [usize; 4] = [1, 4, 16, 64];
 /// Where the report, samples, profiles, and server log land.
 const OUTPUT: &str = "target/verification-capacity";
 
-/// Runs the selected `cases` against one fresh server and returns whether
-/// every row passed.
+/// Runs the selected `cases` at each of `clients` against one fresh server
+/// and returns whether every row passed.
 ///
 /// # Errors
 ///
 /// Returns a server, client, capture, or evidence failure that stopped it.
-async fn benchmark(cases: &[u8]) -> Result<bool> {
+async fn benchmark(cases: &[u8], clients: &[usize]) -> Result<bool> {
     let output = PathBuf::from(OUTPUT);
     if output.exists() {
         std::fs::remove_dir_all(&output)?;
@@ -66,23 +67,24 @@ async fn benchmark(cases: &[u8]) -> Result<bool> {
     let [setup] = server.tenants() else {
         return Err("setup provisioned one tenant".into());
     };
-    let tenant = Tenant::provision(setup, &output.join("tenants")).await?;
+    let applications = clients.iter().copied().max().unwrap_or(0);
+    let tenant = Tenant::provision(setup, &output.join("tenants"), applications).await?;
     let bench = Bench::new(&server, tenant, output.join("profiles"));
     let label = format!(
-        "{}, {}s windows, 2 KiB contexts",
+        "{}, {}s windows, 2 KiB contexts, one Service key per client",
         server.describe(),
         WINDOW.as_secs()
     );
     let mut report = Report::new(label, server.memory_limit_bytes());
     if cases.contains(&1) {
-        for clients in CLIENTS {
+        for &clients in clients {
             let step = format!("1 direct verify {clients}");
             let measured = bench.run(&step, Op::Verify, clients).await?;
             report.direct(&step, &measured);
         }
     }
     if cases.contains(&2) {
-        for clients in CLIENTS {
+        for &clients in clients {
             let step = format!("2 background submit {clients}");
             let measured = bench.run(&step, Op::Submit, clients).await?;
             report.queued(&step, &measured);
@@ -118,8 +120,12 @@ fn parse_cases(arguments: &[String]) -> Result<Vec<u8>> {
 /// `verification-capacity` subcommand removed.
 pub(crate) async fn main(arguments: Vec<String>) -> ExitCode {
     install_tracing();
-    let outcome = match parse_cases(&arguments) {
-        Ok(cases) => benchmark(&cases).await,
+    let selected = parse_cases(&arguments).and_then(|cases| {
+        let clients = crate::flags::clients(&arguments, &CLIENTS)?;
+        Ok((cases, clients))
+    });
+    let outcome = match selected {
+        Ok((cases, clients)) => benchmark(&cases, &clients).await,
         Err(error) => Err(error),
     };
     match outcome {

@@ -30,8 +30,11 @@ At minimum, deployments measure:
 - HTTP/gRPC/MCP availability and latency by bounded route family and outcome;
 - authentication, permission, and policy availability, and Scribe outbox
   health for audit, gateway capture, and Verifier result writes:
-  `outbox_pending`, `outbox_write_failures_total`, and
-  `outbox_events_lost_total`, each labelled `outbox="scribe"`;
+  `outbox_pending`, `outbox_write_failures_total`,
+  `outbox_items_written_total`, `outbox_bytes_written_total`, and
+  `outbox_events_lost_total`, each labelled `outbox="scribe"`, the last also
+  by `reason` (`shed` at the staging limits, `rejected`, `unreachable`, or
+  `shutdown`);
 - Scribe admission latency, queue age, fairness, WAL fsync latency, staged-run
   age, persistence lag, object publication, replay, and rejection;
 - Oracle interactive and analytical queue age, execution latency, result
@@ -182,8 +185,10 @@ table. Audit decisions, gateway captures, and Verifier results are held only in
 memory on the process Scribe outbox until Scribe acknowledges them, so there is
 no audit staging state to restore or reconcile. A retryable failure resubmits
 the identical slice, which Scribe's durable batch-id fence absorbs; a terminal
-rejection is logged, counted in `outbox_events_lost_total{outbox="scribe"}`, and
-consumed. Writes Scribe has not acknowledged are lost on abrupt process death
+rejection is logged, counted in
+`outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and consumed.
+Writes past the outbox's write or byte limit are shed with `reason="shed"`.
+Writes Scribe has not acknowledged are lost on abrupt process death
 or an expired shutdown deadline. Loss never changes the originating permission
 decision, gateway call, run settlement, or realtime verdict. A legacy
 direct-Iceberg relay is not a recovery mechanism.

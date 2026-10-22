@@ -15,7 +15,7 @@
 //! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
 //! columns to built-ins and proves each is refused before any ACK.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,16 +46,18 @@ use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
+use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
+use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::card::verifier::Check;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, VerificationResultId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -68,13 +70,14 @@ use wyrd_spec::vala::managed_columns::{
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    InputDeclaration, RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::gateway_capture::GatewayCapture;
+use wyrd_testing::listener_stall::ListenerStallProxy;
 use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 use wyrd_types::variant::{variant_field, variant_storage_type};
 
 use super::query::{ServerJourneyError, audit_rows, scheduled_context};
@@ -225,7 +228,8 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     // it reaches the peer Scribe only once that outbox drains.
     let unwritten = oracle
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -504,7 +508,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     // the results reach the peer Scribe only once that outbox drains.
     let unwritten = oracle
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -1184,9 +1189,9 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Gateway capture: the resolved call carries both model Structs whole,
     // and the refused call's absent resolved model reads both children null.
     let models_sql = format!(
-        "SELECT wyrd_request_id, requested_model['deployment'], requested_model['model'], \
+        "SELECT request_id, requested_model['deployment'], requested_model['model'], \
          resolved_model['deployment'], resolved_model['model'] FROM vala.gateway.calls \
-         WHERE wyrd_request_id IN ('{}', '{}') ORDER BY wyrd_request_id",
+         WHERE request_id IN ('{}', '{}') ORDER BY request_id",
         call.request_id, call.unresolved_request_id
     );
     let mut expected_models = vec![
@@ -1232,7 +1237,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let payloads = journey
         .rows(format!(
             "SELECT request_payload, response_payload FROM vala.gateway.calls \
-             WHERE wyrd_request_id = '{}'",
+             WHERE request_id = '{}'",
             call.request_id
         ))
         .await?;
@@ -2477,7 +2482,7 @@ impl TypedPayloadJourney {
             )
             .build(&outcome)?;
             let result = payload.result_id();
-            self.gateway.server.state().scribe_outbox.stage(
+            self.gateway.server.state().bifrost.scribe_outbox().stage(
                 self.gateway.tenant,
                 ScribeWrite::Result {
                     payload,
@@ -2524,7 +2529,8 @@ impl TypedPayloadJourney {
         self.gateway
             .server
             .state()
-            .scribe_outbox
+            .bifrost
+            .scribe_outbox()
             .stage(self.gateway.tenant, event);
         self.gateway.server.await_audit_retained().await?;
         Ok(StagedDecision {
@@ -2819,7 +2825,8 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
 
     let unwritten = server
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -3058,7 +3065,8 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
 
     let unwritten = server
         .state()
-        .scribe_outbox
+        .bifrost
+        .scribe_outbox()
         .settle(std::time::Instant::now() + WAIT)
         .await;
     if unwritten != 0 {
@@ -3305,5 +3313,1131 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
         return Err(format!("expected A/SYSTEM with chain [{b_id}], read {row:?}").into());
     }
     server.shutdown().await?;
+    Ok(())
+}
+
+/// Request body ceiling the shared-startup journey injects, well under the
+/// production default so an ordinary body proves the injected value governs.
+const STARTUP_BODY_BYTES: usize = 16 * 1024;
+
+/// Poll `execution` until the runtime settles it as completed or errored.
+///
+/// # Errors
+/// Returns a fixture error, or a description when the execution is not
+/// settled within [`WAIT`].
+async fn settled_execution(
+    seed: &VerificationFixture,
+    execution: ExecutionId,
+) -> Result<ExecutionRow, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let row = seed.execution(execution).await?;
+        if matches!(row.status.as_str(), "completed" | "errored") {
+            return Ok(row);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the execution was never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Production and harness servers start the same complete graph from the
+/// same configuration and injected inputs (AC-010/011, INV-001/003).
+///
+/// A server whose hosted blocks must prewarm a worker that does not exist
+/// fails startup after its Bifrost roles were acquired; the next server
+/// opens the same durable data root, so the failed start released it. That server is composed with
+/// an injected body ceiling and the queued runtime: its state carries the
+/// injected limit and development profile, a body over the ceiling is
+/// refused at a buffered public route, and an execution submitted to the queue is
+/// completed by the runtime startup returned. A last server over the missing
+/// worker with no prewarm starts lazily, and without the queued runtime its
+/// runner never comes up.
+///
+/// # Errors
+/// Returns server, seeding, or request errors, or a description of the
+/// first startup, limit, or runtime expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn shared_startup_uses_complete_injected_engines() -> Result<(), ServerJourneyError> {
+    let scratch = tempfile::tempdir()?;
+    let volume = scratch.path().join("volume");
+    std::fs::create_dir_all(&volume)?;
+    let missing = scratch.path().join("no-such-worker");
+    let builder = || WyrdTestServer::builder().with_durable_bifrost_data_root(volume.clone());
+
+    let refused = Box::pin(
+        builder()
+            .with_verification_worker_for_test(missing.clone())
+            .with_verification_limits_for_test(HostedLimits {
+                monty_min_workers: 1,
+                ..HostedLimits::default()
+            })
+            .start_bound(),
+    )
+    .await;
+    match refused {
+        Ok(server) => {
+            server.shutdown().await?;
+            return Err("a prewarmed missing worker must fail startup".into());
+        }
+        Err(error)
+            if error
+                .to_string()
+                .contains("hosted Verifier blocks could not start") => {}
+        Err(error) => return Err(format!("startup failed for another reason: {error}").into()),
+    }
+
+    let server = Box::pin(
+        builder()
+            .with_limits_for_test(LimitsConfig {
+                body_bytes: STARTUP_BODY_BYTES,
+                ..LimitsConfig::default()
+            })
+            .with_verification_runtime_for_test()
+            .start_bound(),
+    )
+    .await?;
+    let state = server.state();
+    if state.settings.limits.body_bytes != STARTUP_BODY_BYTES
+        || state.settings.deployment_profile.is_production()
+    {
+        return Err(format!("the injected settings were not kept: {:?}", state.settings).into());
+    }
+    let caller = server.bootstrap_service("startup-caller", &[]).await?;
+    let token = server
+        .exchange_api_key(caller.api_key().ok_or("the caller carries an API key")?)
+        .await?;
+    let oversized = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/cards/upload/init",
+            server.base_url().ok_or("the server is bound")?
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(vec![b' '; 2 * STARTUP_BODY_BYTES])
+        .send()
+        .await?;
+    if oversized.status() != reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        return Err(format!("an oversized body answered {}", oversized.status()).into());
+    }
+
+    let seed =
+        VerificationFixture::provision(state.postgres.wyrd(), server.data_tenant_id()).await?;
+    let (subject, _) = seed.service("startup-subject").await?;
+    let verifier = assert_verifier(&seed, "startup-assert").await?;
+    let execution = seed
+        .submit(
+            &verifier,
+            &subject,
+            BTreeMap::from([(
+                SlotName::new("x")?,
+                InputDeclaration::Json { value: json!(true) },
+            )]),
+        )
+        .await?;
+    let row = settled_execution(&seed, execution).await?;
+    if row.status != "completed" || !state.verification.health.is_up(RuntimeCapability::Runner) {
+        return Err(format!("the started runtime did not complete the run: {row:?}").into());
+    }
+    server.shutdown().await?;
+
+    // A fresh fixture database cannot replay the previous server's WAL, so
+    // the lazy server mounts no shared data root.
+    let lazy = Box::pin(
+        WyrdTestServer::builder()
+            .with_verification_worker_for_test(missing)
+            .start_bound(),
+    )
+    .await?;
+    let runner_up = lazy
+        .state()
+        .verification
+        .health
+        .is_up(RuntimeCapability::Runner);
+    lazy.shutdown().await?;
+    if runner_up {
+        return Err("a server without the queued runtime reports its runner up".into());
+    }
+    Ok(())
+}
+
+/// One bound server whose gateway reaches a recording mock upstream, and
+/// the administration and invocation requests the refresh journey sends.
+struct RefreshJourney {
+    /// The bound server under test.
+    server: WyrdTestServer,
+    /// Mock upstream answering every request with one completion.
+    upstream: wiremock::MockServer,
+    /// Plain HTTP client standing in for the SDK transport.
+    http: reqwest::Client,
+    /// The server's base URL.
+    base: String,
+}
+
+impl RefreshJourney {
+    /// Start a bound server whose built-in adapters target a fresh mock
+    /// upstream answering every request with one completion.
+    ///
+    /// # Errors
+    /// Returns a mock, URL, or server startup error.
+    async fn start() -> Result<Self, ServerJourneyError> {
+        Self::start_with(WyrdTestServer::builder()).await
+    }
+
+    /// Start `builder` bound, with its built-in adapters targeting a fresh
+    /// mock upstream answering every request with one completion.
+    ///
+    /// # Errors
+    /// Returns a mock, URL, or server startup error.
+    async fn start_with(builder: WyrdTestServerBuilder) -> Result<Self, ServerJourneyError> {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()),
+            )
+            .mount(&upstream)
+            .await;
+        let root = url::Url::parse(&upstream.uri())?;
+        let server = Box::pin(
+            builder
+                .with_gateway_provider_root_for_test(root)
+                .start_bound(),
+        )
+        .await?;
+        let base = server.base_url().ok_or("the server is bound")?.to_owned();
+        Ok(Self {
+            server,
+            upstream,
+            http: reqwest::Client::new(),
+            base,
+        })
+    }
+
+    /// Access token of a new administrator named `name` in `tenant`, or in
+    /// the fixture tenant when `tenant` is `None`.
+    ///
+    /// # Errors
+    /// Returns a bootstrap or exchange error.
+    async fn admin(
+        &self,
+        tenant: Option<DataTenantId>,
+        name: &str,
+    ) -> Result<String, ServerJourneyError> {
+        let admin = match tenant {
+            Some(tenant) => {
+                self.server
+                    .bootstrap_service_in_tenant(tenant, name, &["admin"])
+                    .await?
+            }
+            None => self.server.bootstrap_service(name, &["admin"]).await?,
+        };
+        Ok(self
+            .server
+            .exchange_api_key(admin.api_key().ok_or("the admin carries an API key")?)
+            .await?)
+    }
+
+    /// Store `admin`'s tenant deployment `acme`, serving any model from the
+    /// mock upstream under `prefix`, through the public administration route.
+    ///
+    /// # Errors
+    /// Returns a request error or a description of a refused write.
+    async fn deploy(&self, admin: &str, prefix: &str) -> Result<(), ServerJourneyError> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/v1/admin/gateway/provider-deployments/acme",
+                self.base
+            ))
+            .header("x-wyrd-access-token", format!("Bearer {admin}"))
+            .json(&json!({
+                "name": "acme",
+                "adapter": {"openai_compatible": {
+                    "base_url": format!("{}/{prefix}/v1", self.upstream.uri())
+                }},
+                "auth": "none",
+                "capabilities": ["chat_completions"],
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "deploying {prefix}: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Call `acme/m` as `caller` and return the upstream path the call
+    /// reached, or `None` when the gateway refused it before dispatch.
+    ///
+    /// # Errors
+    /// Returns a request or recording error.
+    async fn call(&self, caller: &str) -> Result<Option<String>, ServerJourneyError> {
+        let before = self.upstream_paths().await?.len();
+        let response = self
+            .http
+            .post(format!("{}/v1/chat/completions", self.base))
+            .bearer_auth(caller)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await?;
+        let answered = response.status().is_success();
+        response.bytes().await?;
+        let mut paths = self.upstream_paths().await?;
+        if !answered {
+            return if paths.len() == before {
+                Ok(None)
+            } else {
+                Err("a refused call reached the upstream".into())
+            };
+        }
+        Ok(paths.pop().filter(|_| paths.len() == before))
+    }
+
+    /// Call as `caller` until the call reaches `expected` or [`WAIT`]
+    /// passes, and return the last route reached.
+    ///
+    /// An administrative write reaches the snapshot cache only through its
+    /// committed notification, or through the listener noticing a lost
+    /// session and forgetting every snapshot, so a call right after the write
+    /// may still route on the previous snapshot for that latency. A snapshot
+    /// that is never forgotten keeps the old route past the deadline.
+    ///
+    /// # Errors
+    /// Returns a request or recording error from any call.
+    async fn route_after_write(
+        &self,
+        caller: &str,
+        expected: Option<&str>,
+    ) -> Result<Option<String>, ServerJourneyError> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let route = self.call(caller).await?;
+            if route.as_deref() == expected || tokio::time::Instant::now() >= deadline {
+                return Ok(route);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Every path the mock upstream received, oldest first.
+    ///
+    /// # Errors
+    /// Returns a description when request recording is off.
+    async fn upstream_paths(&self) -> Result<Vec<String>, ServerJourneyError> {
+        Ok(self
+            .upstream
+            .received_requests()
+            .await
+            .ok_or("request recording is on")?
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect())
+    }
+
+    /// Number of this server's Postgres sessions waiting on `LISTEN`; when
+    /// `terminate` is set, each is terminated as a lost listener connection.
+    ///
+    /// The sessions are selected before any is terminated: in one statement
+    /// the planner may evaluate the termination before the database filter,
+    /// ending concurrent tests' listeners in other databases on the same
+    /// instance.
+    ///
+    /// # Errors
+    /// Returns a pool or statement error.
+    async fn listeners(&self, terminate: bool) -> Result<i64, ServerJourneyError> {
+        let superuser = self.server.pg_fixture().superuser_pool()?;
+        let pids: Vec<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
+             AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid()",
+        )
+        .fetch_all(&superuser)
+        .await?;
+        if terminate {
+            sqlx::query("SELECT pg_terminate_backend(pid) FROM unnest($1::int[]) AS pid")
+                .bind(&pids)
+                .execute(&superuser)
+                .await?;
+        }
+        Ok(i64::try_from(pids.len())?)
+    }
+}
+
+/// Engine-owned refresh keeps every tenant's gateway changes current
+/// through listener loss, without one tenant seeing another's snapshot
+/// (REQ-005/013, INV-001/003, AC-010/011).
+///
+/// Tenant A's administrator stores deployment `acme` and calls it, then
+/// moves it twice: once while the server's change listeners are connected,
+/// and once right after every listener session is terminated. Calls after
+/// each move reach the newest upstream once the write's notification or the
+/// listener's loss is handled, so a lost listener leaves no stale snapshot.
+/// Once the listeners reconnect a further move is still seen. Tenant B
+/// cannot call A's deployment, and B's own `acme` reaches only B's upstream
+/// while A keeps its own.
+///
+/// # Errors
+/// Returns server, request, or Postgres errors, or a description of the
+/// first stale, leaked, or missing route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn engine_owned_refresh_preserves_tenant_changes() -> Result<(), ServerJourneyError> {
+    let journey = RefreshJourney::start().await?;
+    let a = journey.admin(None, "refresh-a").await?;
+    let other = journey.server.seed_tenant("refresh-other").await?;
+    let b = journey.admin(Some(other), "refresh-b").await?;
+    let reaches = |prefix: &str| Some(format!("/{prefix}/v1/chat/completions"));
+
+    journey.deploy(&a, "one").await?;
+    expect_eq("A's first route", &journey.call(&a).await?, &reaches("one"))?;
+    expect_eq(
+        "B before its own route",
+        &journey.call(&b).await?,
+        &None::<String>,
+    )?;
+    journey.deploy(&a, "two").await?;
+    let two = reaches("two");
+    expect_eq(
+        "A's moved route",
+        &journey.route_after_write(&a, two.as_deref()).await?,
+        &two,
+    )?;
+
+    if journey.listeners(true).await? == 0 {
+        return Err("startup composed no engine-owned change listener".into());
+    }
+    journey.deploy(&a, "three").await?;
+    let three = reaches("three");
+    expect_eq(
+        "A's route after listener loss",
+        &journey.route_after_write(&a, three.as_deref()).await?,
+        &three,
+    )?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.listeners(false).await? == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the change listeners never reconnected".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    journey.deploy(&a, "four").await?;
+    let four = reaches("four");
+    expect_eq(
+        "A's route after reconnect",
+        &journey.route_after_write(&a, four.as_deref()).await?,
+        &four,
+    )?;
+
+    journey.deploy(&b, "bee").await?;
+    let bee = reaches("bee");
+    expect_eq(
+        "B's own route",
+        &journey.route_after_write(&b, bee.as_deref()).await?,
+        &bee,
+    )?;
+    expect_eq(
+        "A beside B's route",
+        &journey.call(&a).await?,
+        &reaches("four"),
+    )?;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// The gateway snapshot cache's notification channel.
+const SNAPSHOT_CHANNEL: &str = "wyrd_gateway_snapshot";
+
+/// Production bound on noticing a silently stalled listener: one 30 s
+/// heartbeat interval plus its 5 s probe timeout.
+const STALL_DETECTION: Duration = Duration::from_secs(35);
+
+/// Scheduling allowance this journey grants beyond [`STALL_DETECTION`].
+const STALL_TOLERANCE: Duration = Duration::from_secs(10);
+
+/// Wait until `proxy` relays at least one live subscription to `channel`.
+///
+/// # Errors
+/// Returns a description when no subscription arrives within [`WAIT`].
+async fn subscribed(proxy: &ListenerStallProxy, channel: &str) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while proxy.listening(channel) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("no listener subscribed to {channel}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// A silently stalled snapshot listener stops serving cached routes within
+/// the heartbeat bound and recovers once its path returns (REQ-013,
+/// AC-011).
+///
+/// The server's runtime pools dial Postgres through a proxy. Once tenant A's
+/// route is cached, the proxy stops relaying the snapshot listener's
+/// connection without closing either socket, so no notification and no loss
+/// report reach the server; request connections keep flowing. A's next
+/// move commits normally, and calls reach the new route within
+/// [`STALL_DETECTION`] plus [`STALL_TOLERANCE`] while every subscription
+/// is still stalled, so they read Postgres. Tenant B keeps its own route
+/// throughout. After the path is restored and a listener subscribes again, a
+/// further move is still seen.
+///
+/// # Errors
+/// Returns server, proxy, request, or Postgres errors, or a description of
+/// the first stale, leaked, or late route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn silent_listener_stall_falls_back_and_recovers() -> Result<(), ServerJourneyError> {
+    expect_eq(
+        "production stall detection bound",
+        &(wyrd_sql::listener::HEARTBEAT + wyrd_sql::listener::PROBE_TIMEOUT),
+        &STALL_DETECTION,
+    )?;
+    let dsns = wyrd_sql::dsn::ResolvedDsns::from_env()?;
+    let proxy = Arc::new(ListenerStallProxy::start(&dsns).await?);
+    let journey = RefreshJourney::start_with(
+        WyrdTestServer::builder().with_postgres_proxy_for_test(Arc::clone(&proxy)),
+    )
+    .await?;
+    let a = journey.admin(None, "stall-a").await?;
+    let other = journey.server.seed_tenant("stall-other").await?;
+    let b = journey.admin(Some(other), "stall-b").await?;
+    let reaches = |prefix: &str| Some(format!("/{prefix}/v1/chat/completions"));
+
+    subscribed(&proxy, SNAPSHOT_CHANNEL).await?;
+    journey.deploy(&a, "one").await?;
+    journey.deploy(&b, "bee").await?;
+    let (one, bee) = (reaches("one"), reaches("bee"));
+    expect_eq(
+        "A's cached route",
+        &journey.route_after_write(&a, one.as_deref()).await?,
+        &one,
+    )?;
+    expect_eq(
+        "B's cached route",
+        &journey.route_after_write(&b, bee.as_deref()).await?,
+        &bee,
+    )?;
+
+    if proxy.stall(SNAPSHOT_CHANNEL) == 0 {
+        return Err("no subscribed snapshot listener was stalled".into());
+    }
+    let stalled_at = tokio::time::Instant::now();
+    journey.deploy(&a, "two").await?;
+    let two = reaches("two");
+    expect_eq(
+        "A's route during a silent stall",
+        &journey.route_after_write(&a, two.as_deref()).await?,
+        &two,
+    )?;
+    let detected = stalled_at.elapsed();
+    tracing::info!(?detected, "stalled snapshot listener detected");
+    if detected > STALL_DETECTION + STALL_TOLERANCE {
+        return Err(format!("the stalled listener served a stale route for {detected:?}").into());
+    }
+    if proxy.listening(SNAPSHOT_CHANNEL) != 0 {
+        return Err("a snapshot listener subscribed through a stalled path".into());
+    }
+    expect_eq("B during A's stall", &journey.call(&b).await?, &bee)?;
+
+    proxy.restore(SNAPSHOT_CHANNEL);
+    subscribed(&proxy, SNAPSHOT_CHANNEL).await?;
+    expect_eq("A after recovery", &journey.call(&a).await?, &two)?;
+    journey.deploy(&a, "three").await?;
+    let three = reaches("three");
+    expect_eq(
+        "A's route after recovery",
+        &journey.route_after_write(&a, three.as_deref()).await?,
+        &three,
+    )?;
+    expect_eq("B after recovery", &journey.call(&b).await?, &bee)?;
+    journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// What a shared cache listener told its cache, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Heard {
+    /// `reset(live)`: the cache was cleared and now serves only when `live`.
+    Reset(bool),
+    /// `notify(payload)`.
+    Notified(String),
+}
+
+/// One shared cache listener running under test, recording each callback
+/// in place of a cache.
+struct Watched {
+    /// Every callback so far.
+    heard: Arc<std::sync::Mutex<Vec<Heard>>>,
+    /// Cancels the listener.
+    shutdown: CancellationToken,
+    /// The listener's worker.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Watched {
+    /// Spawn `listener`'s watch, recording its callbacks.
+    fn start(listener: wyrd_sql::NotificationListener) -> Self {
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let (resets, notes, token) = (Arc::clone(&heard), Arc::clone(&heard), shutdown.clone());
+        let task = tokio::spawn(async move {
+            listener
+                .watch(
+                    token,
+                    |live| Self::push(&resets, Heard::Reset(live)),
+                    |payload| Self::push(&notes, Heard::Notified(payload.to_owned())),
+                )
+                .await;
+        });
+        Self {
+            heard,
+            shutdown,
+            task,
+        }
+    }
+
+    /// Append one callback to `heard`.
+    fn push(heard: &std::sync::Mutex<Vec<Heard>>, event: Heard) {
+        heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    /// Every callback so far.
+    fn heard(&self) -> Vec<Heard> {
+        self.heard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the last reset switched the cache on.
+    fn live(&self) -> bool {
+        self.heard()
+            .iter()
+            .rev()
+            .find_map(|heard| match heard {
+                Heard::Reset(live) => Some(*live),
+                Heard::Notified(_) => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// The resets heard since the first `skip` callbacks, in order.
+    fn resets_since(&self, skip: usize) -> Vec<bool> {
+        self.heard()
+            .into_iter()
+            .skip(skip)
+            .filter_map(|heard| match heard {
+                Heard::Reset(live) => Some(live),
+                Heard::Notified(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether `payload` was delivered.
+    fn notified(&self, payload: &str) -> bool {
+        self.heard().contains(&Heard::Notified(payload.to_owned()))
+    }
+
+    /// Cancel the listener and return how long it took to finish, failing
+    /// unless it ends within the production shutdown drain with its cache
+    /// switched off.
+    ///
+    /// # Errors
+    /// Returns a join error, or a description of a late or live finish.
+    async fn stop(self) -> Result<Duration, ServerJourneyError> {
+        let started = tokio::time::Instant::now();
+        self.shutdown.cancel();
+        tokio::time::timeout(SHUTDOWN_DRAIN, self.task)
+            .await
+            .map_err(|_| "the cancelled listener outlived the shutdown drain")??;
+        let elapsed = started.elapsed();
+        if self
+            .heard
+            .lock()
+            .map(|heard| heard.last().cloned())
+            .ok()
+            .flatten()
+            != Some(Heard::Reset(false))
+        {
+            return Err("the cancelled listener left its cache serving".into());
+        }
+        Ok(elapsed)
+    }
+}
+
+/// The production shutdown drain every engine worker must finish within.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(35);
+
+/// Wait until `ready` holds, polling, or fail naming `what` after [`WAIT`].
+///
+/// # Errors
+/// Returns a description naming `what` when it never holds.
+async fn until(what: &str, ready: impl Fn() -> bool) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !ready() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Send `payload` on `channel` over a connection that bypasses the proxy.
+///
+/// # Errors
+/// Returns the statement error.
+async fn notify_channel(
+    pool: &sqlx::PgPool,
+    channel: &str,
+    payload: &str,
+) -> Result<(), ServerJourneyError> {
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(channel)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A fixture database, a stall proxy in front of it, and a Wyrd handle
+/// whose pools dial the proxy, with the process telemetry installed so
+/// `WYRD_LOG` traces the listener.
+///
+/// # Errors
+/// Returns a telemetry, fixture, proxy, or connection error.
+async fn proxied_postgres() -> Result<
+    (
+        wyrd_dev_fixtures::pg::PgFixture,
+        ListenerStallProxy,
+        wyrd_sql::WyrdPostgres,
+    ),
+    ServerJourneyError,
+> {
+    wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
+    let fixture = wyrd_dev_fixtures::pg::PgFixture::start().await?;
+    let dsns = fixture.runtime_dsns()?;
+    let proxy = ListenerStallProxy::start(&dsns).await?;
+    let postgres = wyrd_sql::WyrdPostgres::connect_from_dsns(&proxy.route(&dsns)?).await?;
+    Ok((fixture, proxy, postgres))
+}
+
+/// A detected listener loss switches the cache off before any replacement
+/// subscribes, and a failed start keeps it off (REQ-013, AC-011).
+///
+/// The shared listener's pool dials Postgres through a stall proxy. Started
+/// while its channel is stalled, it never reports a live cache and retries
+/// at most once per reconnect delay, releasing each stalled attempt. Once
+/// the channel is restored it subscribes and delivers a notification. Its
+/// backend is then terminated while every new subscription is held
+/// pending: the cache is switched off before the replacement can subscribe
+/// and stays off while it waits. After the path is restored the replacement
+/// switches the cache on, from empty, and delivers the next notification.
+///
+/// # Errors
+/// Returns fixture, proxy, or statement errors, or a description of the
+/// first live cache during recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn listener_loss_disables_cache_before_reconnect() -> Result<(), ServerJourneyError> {
+    const CHANNEL: &str = "wyrd_listener_loss";
+    let (fixture, proxy, postgres) = proxied_postgres().await?;
+
+    proxy.stall(CHANNEL);
+    let started = tokio::time::Instant::now();
+    let watched = Watched::start(postgres.listener(CHANNEL));
+    until("two stalled subscription attempts", || {
+        proxy.subscriptions(CHANNEL) >= 2
+    })
+    .await?;
+    let attempts = proxy.subscriptions(CHANNEL);
+    let allowed = started.elapsed().as_secs() / wyrd_sql::listener::RECONNECT_DELAY.as_secs() + 1;
+    if u64::try_from(attempts)? > allowed {
+        return Err(format!("{attempts} subscription attempts spun past {allowed}").into());
+    }
+    if watched.resets_since(0).contains(&true) {
+        return Err("a stalled start switched the cache on".into());
+    }
+    if proxy.stalled_open(CHANNEL) > 1 {
+        return Err("stalled subscription attempts were retained".into());
+    }
+
+    proxy.restore(CHANNEL);
+    until("a live subscription", || {
+        watched.live() && proxy.listening(CHANNEL) == 1
+    })
+    .await?;
+    notify_channel(fixture.app_pool(), CHANNEL, "one").await?;
+    until("the first notification", || watched.notified("one")).await?;
+
+    let before = watched.heard().len();
+    let subscribed = proxy.subscriptions(CHANNEL);
+    expect_eq("stalled live subscriptions", &proxy.stall(CHANNEL), &1)?;
+    let superuser = fixture.superuser_pool()?;
+    // Selected first: the planner may evaluate a termination in the same
+    // WHERE clause before its filters, ending unrelated sessions.
+    let listeners: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND query = $1",
+    )
+    .bind(format!("LISTEN \"{CHANNEL}\""))
+    .fetch_all(&superuser)
+    .await?;
+    expect_eq("listener backends", &listeners.len(), &1)?;
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM unnest($1::int[]) AS pid")
+        .bind(&listeners)
+        .execute(&superuser)
+        .await?;
+    until("a pending replacement subscription", || {
+        proxy.subscriptions(CHANNEL) > subscribed && proxy.stalled_open(CHANNEL) >= 1
+    })
+    .await?;
+    let pending = watched.resets_since(before);
+    if pending.first() != Some(&false) || pending.contains(&true) {
+        return Err(format!("the cache while its replacement is pending: {pending:?}").into());
+    }
+
+    proxy.restore(CHANNEL);
+    until("a recovered subscription", || watched.live()).await?;
+    let recovered = watched.resets_since(before);
+    if recovered.first() != Some(&false) || recovered.iter().filter(|live| **live).count() != 1 {
+        return Err(format!("recovery after loss: {recovered:?}").into());
+    }
+    notify_channel(fixture.app_pool(), CHANNEL, "two").await?;
+    until("the recovered notification", || watched.notified("two")).await?;
+    let stopped = watched.stop().await?;
+    tracing::info!(?stopped, "loss-ordering listener stopped");
+    Ok(())
+}
+
+/// Stalled listeners release their connections while still stalled, every
+/// pending stage ends within the shutdown drain, and one stalled listener
+/// never stops another (REQ-013, AC-011).
+///
+/// Two shared listeners on different channels share one proxied pool, with
+/// the heartbeat shortened. Three times the first channel stalls: its
+/// listener switches its cache off, closes its stalled connection while the
+/// stall persists, and resubscribes once restored, while the second keeps
+/// delivering notifications and the pool grows no retained connections.
+/// Listeners are then cancelled while receiving on a stalled path, while a
+/// liveness probe is unanswered, while a subscription is unanswered, and
+/// while waiting to retry; each finishes within the production drain with
+/// its cache off and no stalled connection left open.
+///
+/// # Errors
+/// Returns fixture, proxy, or statement errors, or a description of the
+/// first retained connection, late cancellation, or coupled failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn listener_shutdown_releases_stalled_connections() -> Result<(), ServerJourneyError> {
+    const STALLED: &str = "wyrd_listener_stalled";
+    const HEALTHY: &str = "wyrd_listener_healthy";
+    let (fixture, proxy, postgres) = proxied_postgres().await?;
+    let quick = |channel: &str, timeout: Duration| {
+        postgres
+            .listener(channel)
+            .with_heartbeat_for_test(Duration::from_secs(1), timeout)
+    };
+    let mut stalled = Watched::start(quick(STALLED, Duration::from_secs(1)));
+    let healthy = Watched::start(quick(HEALTHY, Duration::from_secs(1)));
+    until("both listeners live", || stalled.live() && healthy.live()).await?;
+    let baseline = postgres.app_pool().size();
+
+    for round in 0..3 {
+        if proxy.stall(STALLED) == 0 {
+            return Err("no live subscription was stalled".into());
+        }
+        until("stall detection", || !stalled.live()).await?;
+        until("the stalled connection's release", || {
+            proxy.stalled_open(STALLED) == 0
+        })
+        .await?;
+        let payload = format!("round-{round}");
+        notify_channel(fixture.app_pool(), HEALTHY, &payload).await?;
+        until("the healthy listener's notification", || {
+            healthy.notified(&payload)
+        })
+        .await?;
+        proxy.restore(STALLED);
+        until("resubscription", || {
+            stalled.live() && proxy.listening(STALLED) == 1
+        })
+        .await?;
+    }
+    let size = postgres.app_pool().size();
+    if size > baseline {
+        return Err(format!("the pool grew from {baseline} to {size} connections").into());
+    }
+
+    proxy.stall(STALLED);
+    let receive = stalled.stop().await?;
+    until("release after receive", || proxy.stalled_open(STALLED) == 0).await?;
+
+    proxy.restore(STALLED);
+    stalled = Watched::start(quick(STALLED, wyrd_sql::listener::PROBE_TIMEOUT));
+    until("a live listener", || {
+        stalled.live() && proxy.listening(STALLED) == 1
+    })
+    .await?;
+    let discarded = proxy.discarded(STALLED);
+    proxy.stall(STALLED);
+    until("an unanswered probe", || {
+        proxy.discarded(STALLED) > discarded
+    })
+    .await?;
+    let probe = stalled.stop().await?;
+    until("release after a probe", || proxy.stalled_open(STALLED) == 0).await?;
+
+    let attempts = proxy.subscriptions(STALLED);
+    stalled = Watched::start(quick(STALLED, wyrd_sql::listener::PROBE_TIMEOUT));
+    until("an unanswered subscription", || {
+        proxy.subscriptions(STALLED) > attempts && proxy.stalled_open(STALLED) == 1
+    })
+    .await?;
+    let subscription = stalled.stop().await?;
+    until("release after a subscription", || {
+        proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+
+    let attempts = proxy.subscriptions(STALLED);
+    stalled = Watched::start(quick(STALLED, Duration::from_millis(200)));
+    until("a released attempt awaiting retry", || {
+        proxy.subscriptions(STALLED) > attempts && proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+    let retry = stalled.stop().await?;
+    tracing::info!(
+        ?receive,
+        ?probe,
+        ?subscription,
+        ?retry,
+        "stalled listeners cancelled"
+    );
+
+    notify_channel(fixture.app_pool(), HEALTHY, "after").await?;
+    until("the healthy listener after every stall", || {
+        healthy.notified("after")
+    })
+    .await?;
+    healthy.stop().await?;
+    until("no stalled connection left open", || {
+        proxy.stalled_open(STALLED) == 0
+    })
+    .await?;
+    Ok(())
+}
+
+/// Shared shutdown settles accepted producer work, reaps its workers, and
+/// commits acknowledgements that arrive while it drains (AC-003/011/012).
+///
+/// A bound server with the queued runtime holds one gateway call at its slow
+/// upstream and accepts one public enqueue whose Scribe acknowledgement is
+/// still outstanding, then shuts down through the production supervisor.
+/// Drain cancels the held call, which answers its caller as unavailable and
+/// is still settled: a server restarted over the same Postgres, storage, and
+/// Bifrost data root reads exactly one cancelled capture and the accepted
+/// execution. A second
+/// server whose drain budget is already spent, shut down with a call still
+/// held, reports the expired drain instead of a clean one.
+///
+/// # Errors
+/// Returns server, seeding, request, or query errors, or a description of
+/// the first lost, duplicated, or falsely settled item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
+-> Result<(), ServerJourneyError> {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&upstream)
+        .await;
+    let root = url::Url::parse(&upstream.uri())?;
+    let scratch = tempfile::tempdir()?;
+    let builder = || {
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root.clone())
+            .with_durable_bifrost_data_root(scratch.path().to_path_buf())
+    };
+    let server = Box::pin(builder().with_verification_runtime_for_test().start_bound()).await?;
+    let journey = RefreshJourney {
+        base: server.base_url().ok_or("the server is bound")?.to_owned(),
+        server,
+        upstream,
+        http: reqwest::Client::new(),
+    };
+    let admin = journey
+        .server
+        .bootstrap_service("drain-admin", &["admin"])
+        .await?;
+    let admin_key = admin.api_key().ok_or("the admin carries an API key")?;
+    let token = journey.server.exchange_api_key(admin_key).await?;
+    journey.deploy(&token, "held").await?;
+    let metadata = json!({"mode": "metadata", "payload_fields": []});
+    let policy = journey
+        .http
+        .put(format!("{}/v1/admin/gateway/capture-policy", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .json(&metadata)
+        .send()
+        .await?;
+    if !policy.status().is_success() {
+        return Err(format!("the capture policy was refused: {}", policy.status()).into());
+    }
+    journey
+        .server
+        .seed_role(
+            "drain_runner",
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    // A service is bound to its own Card scope; a user is decided by RBAC.
+    let Bootstrap::User { jwt: enqueuer, .. } = journey
+        .server
+        .bootstrap_user("drain-enqueuer", &["drain_runner"])
+        .await?
+    else {
+        return Err("the enqueuer bootstraps a user".into());
+    };
+    let seed = VerificationFixture::provision(
+        journey.server.state().postgres.wyrd(),
+        journey.server.data_tenant_id(),
+    )
+    .await?;
+    let (subject, _) = seed.service("drain-subject").await?;
+    let verifier = assert_verifier(&seed, "drain-assert").await?;
+
+    let (http, base, caller) = (journey.http.clone(), journey.base.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(caller)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.upstream_paths().await?.is_empty() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the held call never dispatched".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let accepted: Value = journey
+        .http
+        .post(format!("{}/v1/verification/enqueue", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {enqueuer}"))
+        .json(&enqueue_body(
+            &verifier,
+            &subject,
+            json!({ "x": { "kind": "json", "value": true } }),
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let execution = accepted["execution_id"]
+        .as_str()
+        .ok_or("the enqueue answers an execution ID")?
+        .parse::<uuid::Uuid>()?;
+
+    let RefreshJourney {
+        mut server,
+        upstream,
+        ..
+    } = journey;
+    server.cancel_and_join_for_test().await?;
+    let answered = held.await??;
+    if answered.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(format!("the drained call answered {}", answered.status()).into());
+    }
+
+    let server = Box::pin(server.restart_bound(builder())).await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_executions WHERE execution_id = $1")
+            .bind(execution)
+            .fetch_one(&superuser)
+            .await?;
+    server.flush_bifrost().await?;
+    let captured = query_rows(
+        &server,
+        server.data_tenant_id(),
+        "SELECT call_id FROM vala.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
+    )
+    .await?;
+    server.shutdown().await?;
+    if (queued, captured) != (1, 1) {
+        return Err(format!(
+            "expected the accepted execution and one cancelled capture, read {queued} and {captured}"
+        )
+        .into());
+    }
+
+    let mut expired = Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root)
+            .with_shutdown_drain_for_test(Duration::ZERO)
+            .start_bound(),
+    )
+    .await?;
+    let journey = RefreshJourney {
+        base: expired.base_url().ok_or("the server is bound")?.to_owned(),
+        server: expired,
+        upstream,
+        http: reqwest::Client::new(),
+    };
+    let token = journey.admin(None, "expired-admin").await?;
+    journey.deploy(&token, "held").await?;
+    let dispatched = journey.upstream_paths().await?.len();
+    let (http, base) = (journey.http.clone(), journey.base.clone());
+    let held = tokio::spawn(async move {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(token)
+            .json(&json!({
+                "model": "acme/m",
+                "max_completion_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while journey.upstream_paths().await?.len() == dispatched {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the expired server's held call never dispatched".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    expired = journey.server;
+    let drained = expired.cancel_and_join_for_test().await;
+    let _ = held.await;
+    expired.shutdown().await?;
+    if drained.is_ok() {
+        return Err("an expired drain with a held call reported a clean shutdown".into());
+    }
     Ok(())
 }

@@ -821,6 +821,8 @@ struct ShardOwner {
     pending: Arc<AtomicUsize>,
     /// Notification used by runtime drains to await accepted work.
     drained: Arc<Notify>,
+    /// Pod-wide index of fenced, visible batches this owner records into.
+    committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// One-shot retirement release fault used only by deterministic owner tests.
     #[cfg(test)]
     fail_next_retirement_release: bool,
@@ -861,6 +863,9 @@ pub(crate) struct ScribeShardRuntime {
     drained: Arc<Notify>,
     /// Whether external shard admission has closed.
     closed: AtomicBool,
+    /// Batches every owner fenced and made visible, consulted by the ingress
+    /// to answer an honest retry without re-entering a shard.
+    committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// Owner acknowledgements received through the graceful flush path.
     #[cfg(any(test, feature = "test-support"))]
     shutdown_flush_completions: AtomicUsize,
@@ -1002,6 +1007,7 @@ impl ScribeShardRuntime {
             (0..shard_count).map(|id| set.shard(id)).collect();
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
+        let committed = Arc::new(crate::scribe::committed_batches::CommittedBatches::default());
         let mut tasks = Vec::with_capacity(shard_count);
         let mut memtables = Vec::with_capacity(shard_count);
         let abort_handles = Mutex::new(Vec::with_capacity(shard_count));
@@ -1056,6 +1062,7 @@ impl ScribeShardRuntime {
                 snapshot: Arc::clone(&snapshots[id]),
                 pending: Arc::clone(&pending),
                 drained: Arc::clone(&drained),
+                committed: Arc::clone(&committed),
                 #[cfg(test)]
                 fail_next_retirement_release: false,
             };
@@ -1076,6 +1083,7 @@ impl ScribeShardRuntime {
             pending,
             drained,
             closed: AtomicBool::new(false),
+            committed,
             #[cfg(any(test, feature = "test-support"))]
             shutdown_flush_completions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1107,6 +1115,29 @@ impl ScribeShardRuntime {
     #[must_use]
     pub(crate) fn shard_count(&self) -> usize {
         self.senders.len()
+    }
+
+    /// Rows of `append` when it is an honest retry of a batch some owner
+    /// already fenced and made visible, so the ingress can acknowledge it with
+    /// no first commit instead of queueing it behind fresh writes.
+    ///
+    /// The batch must match the recorded tenant, batch id, table, logical
+    /// slice-set digest, and slice count. Anything else returns `None` and the
+    /// append takes the shard path, whose durable fence decides it; a fresh
+    /// batch costs one map probe and no digest.
+    pub(crate) fn committed_duplicate_rows(&self, append: &PreparedAppend) -> Option<u64> {
+        if !self.committed.knows(append.tenant, append.batch_id) {
+            return None;
+        }
+        let (logical_digest, slice_count, rows) = append.logical_identity()?;
+        let batch = crate::scribe::committed_batches::CommittedBatch {
+            table_fqn: append.table.fqn(),
+            logical_digest,
+            slice_count,
+        };
+        self.committed
+            .contains(append.tenant, append.batch_id, &batch)
+            .then_some(rows)
     }
 
     /// Enqueue a prepared request onto its deterministic shard.
@@ -2997,6 +3028,10 @@ struct GroupWalState {
     /// A batch absent here was a replay: the fence spent it or the memtable
     /// already retained every slice, so its ACK reports no first commit.
     inserted_batch_ids: HashSet<[u8; 16]>,
+    /// Logical identity and slice count of each batch whose fence this group
+    /// committed or found spent, by index into `prepared`; recorded into the
+    /// pod-wide index once the group's rows are visible.
+    fenced: Vec<(usize, [u8; 32], u32)>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3104,8 +3139,29 @@ impl ShardOwner {
         };
         let state = post_commit.into_state();
         let _ = touched_keys;
+        self.record_committed(&state);
         Self::acknowledge_visible(state, &stages);
         Ok(())
+    }
+
+    /// Records every batch this group fenced into the pod-wide index, once its
+    /// rows are query-visible, so a later honest retry is answered at ingress.
+    ///
+    /// Only the successful path records: a group that failed after its sync
+    /// stays retained for serial retry and records nothing until it settles.
+    fn record_committed(&self, state: &GroupWalState) {
+        for &(index, logical_digest, slice_count) in &state.fenced {
+            let append = &state.prepared[index];
+            self.committed.record(
+                append.tenant,
+                append.batch_id,
+                crate::scribe::committed_batches::CommittedBatch {
+                    table_fqn: append.table.fqn(),
+                    logical_digest,
+                    slice_count,
+                },
+            );
+        }
     }
 
     /// Completes every waiter of a group whose rows are now query-visible.
@@ -3580,6 +3636,9 @@ impl ShardOwner {
         let mut fences =
             Vec::<(DataTenantId, Vec<(usize, ScribeBatchCommit, DateTime<Utc>)>)>::new();
         for (index, identity, header, commit_lsn) in commits {
+            state
+                .fenced
+                .push((index, identity.logical_digest, identity.slice_count));
             let append = &state.prepared[index];
             let (commit, ingested_at) = Self::batch_commit_fence(
                 append,
@@ -3827,6 +3886,7 @@ impl ShardOwner {
             rows_by_append,
             spent_batch_ids: HashSet::new(),
             inserted_batch_ids: HashSet::new(),
+            fenced: Vec::new(),
         })
     }
 
@@ -6282,6 +6342,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(ShardMemtableSnapshot::default())),
             pending: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
+            committed: Arc::default(),
             fail_next_retirement_release: false,
         };
         (owner, budget, command_tx, completion_tx, pressure_tx)

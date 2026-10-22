@@ -956,7 +956,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
-                attribution: auth.attribution(),
+                attribution: auth.attribution().into(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
                 table,
@@ -1033,7 +1033,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
-            attribution: auth.attribution(),
+            attribution: auth.attribution().into(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
             table,
@@ -1271,7 +1271,7 @@ mod tests {
     use wyrd_runtime::{
         Action, Permission, PermissionScope, PermissionSet, Principal, PrincipalKind, Resource,
     };
-    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1990,17 +1990,16 @@ mod tests {
 
     /// No public principal can write the gateway call table through Gate.
     ///
-    /// Capture is a server-internal write that never passes Gate, so a
-    /// wildcard holder and a principal claiming the capture identity are both
-    /// refused before Scribe resolves anything, and each refusal is recorded
-    /// against the table it targeted.
+    /// Capture is a server-internal write that never passes Gate, so even a
+    /// wildcard holder is refused before Scribe resolves anything, and the
+    /// refusal is recorded against the table it targeted.
     ///
     /// # Panics
     ///
-    /// Panics when either write is admitted, reaches Scribe, or is not
-    /// recorded as denied.
+    /// Panics when the write is admitted, reaches Scribe, or is not recorded
+    /// as denied.
     #[tokio::test]
-    async fn gate_reserves_the_gateway_call_table_to_the_capture_principal() {
+    async fn gate_reserves_the_gateway_call_table_to_server_capture() {
         let scribe = ResolvingScribe::new(random_uid());
         let audit = RecordingAudit::new();
         let gate = Gate::<RecordingAudit>::with_test_scribe(
@@ -2016,28 +2015,24 @@ mod tests {
             scope: PermissionScope::All,
         }];
 
-        for principal in [
+        let context = context_with(
             PrincipalId::new(uuid::Uuid::now_v7()),
-            GATEWAY_CAPTURE_PRINCIPAL,
-        ] {
-            let context = context_with(principal, PrincipalKind::User, wildcard.clone());
-            let error = gate
-                .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))
-                .await
-                .expect_err("no public principal writes the reserved call table");
-            assert!(matches!(
-                error,
-                IngestError::ReservedBuiltinWriteDenied { .. }
-            ));
-        }
+            PrincipalKind::User,
+            wildcard,
+        );
+        let error = gate
+            .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))
+            .await
+            .expect_err("no public principal writes the reserved call table");
+        assert!(matches!(
+            error,
+            IngestError::ReservedBuiltinWriteDenied { .. }
+        ));
         assert_eq!(scribe.resolved.load(Ordering::Relaxed), 0);
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
         assert_eq!(
             audit.decisions(),
-            vec![
-                ("vala.gateway.calls".to_owned(), AuditOutcome::Denied),
-                ("vala.gateway.calls".to_owned(), AuditOutcome::Denied),
-            ]
+            vec![("vala.gateway.calls".to_owned(), AuditOutcome::Denied)]
         );
     }
 

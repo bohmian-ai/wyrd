@@ -60,4 +60,3 @@ DATA-1's supplied migrated-CHECK-clone experiment corroborates these exact expre
 Read the follow-up role, subject and claims comparison, relevant discovery reports, original task, R1 owner amendments, revision 18 requirements, applicable architecture and agent rules. CodeGraph was used before code search; its broad result did not contain this test, so direct source inspection followed. Both latest-fix and cumulative changed-surface evidence were inspected for these two boundaries only. Reports are evidence, not votes.
 
 No source edits, tests, managed Postgres sessions, builds, broad audit, benchmark or accepted-limit repairs were performed. Root owns the sequential traced journey rerun. Independent Ponytail validation must assess SEC-001 and the narrowed DATA-1 proposal before assigning final findings/verdict.
-

@@ -238,10 +238,7 @@ impl VerifierRunner {
                 postgres.clone(),
                 None,
                 capacity,
-                state
-                    .bifrost
-                    .submissions()
-                    .map(|submissions| submissions.sink().accepted()),
+                Some(state.verification.submissions().sink().accepted()),
                 &limits,
             ),
             renewal: Arc::new(LeaseRenewal::new(postgres.clone(), queue, limits.lease)),
@@ -319,7 +316,8 @@ impl VerifierRunner {
         let tenant = conn.data_tenant_id();
         let resolved = self
             .state
-            .verifier_cards
+            .verification
+            .verifier_cards()
             .resolve(
                 Db::Conn(conn.transaction()),
                 tenant,

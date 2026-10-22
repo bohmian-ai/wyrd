@@ -83,7 +83,7 @@ async fn retained_history_carries_both_credential_shapes() -> Result<(), ServerJ
         uuid::Uuid::now_v7().simple()
     );
     let credential = uuid::Uuid::now_v7();
-    let audit: &dyn AuditStage = &*server.state().scribe_outbox;
+    let audit: &dyn AuditStage = &**server.state().bifrost.scribe_outbox();
     let without = decision(&operation);
     let mut with = decision(&operation);
     with.credential_id = Some(credential);
@@ -153,7 +153,7 @@ async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJour
 
     PostgresPeerSecurityAudit::try_new(
         &server.state().postgres,
-        Arc::clone(&server.state().scribe_outbox),
+        Arc::clone(server.state().bifrost.scribe_outbox()),
     )
     .await
     .map_err(|_| "the booted server carries the exact system sentinel")?

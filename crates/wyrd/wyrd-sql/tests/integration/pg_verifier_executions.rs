@@ -154,6 +154,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -2649,6 +2650,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
                 verifier_card_uid: source.clone(),
             },
         )]),
+        order_by: None,
     };
     let operator = FrozenTarget::Digest("sha256:operator".to_owned());
     let lasting = |verifier: &CardUid, after: &str| NewBinding {

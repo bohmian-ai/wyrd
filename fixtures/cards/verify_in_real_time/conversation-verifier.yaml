@@ -9,6 +9,7 @@ spec:
   inputs:
     turns: verifiers.turn-check.inputs.turn
     answered: verifiers.turn-check.requirements.answered.outcome
+  order_by: inputs.turns.turn
   requirements:
     - id: every-turn-answered
       statement: Every turn of the conversation was answered

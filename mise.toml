@@ -80,6 +80,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:wyrd:inner"]
 hide = true
 description = "Run wyrd family tests with the lifecycle already provisioned; packages are the crates under the family directory"
+depends = ["build:server"]
 run = "bash scripts/run-family-tests.sh wyrd"
 
 [tasks."test:cards:unit"]
@@ -319,6 +320,7 @@ hide = true
 description = """The gate's share of Bifrost: only the ignored Rust tests. Every non-ignored Rust test belongs to a family lane, and py:test:integration,
 ts:test:integration, and ts:test:unit own the SDK Bifrost files. One `nextest` invocation schedules
 every selected binary together. Run `test:bifrost` for the complete, standalone lane."""
+depends = ["build:server"]
 run = """
 scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -e
@@ -484,7 +486,8 @@ description = "Tier-1 journeys: Verifiers judge in real time, and a failed sched
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
 [tasks."test:bifrost:journey:drift:inner"]
 hide = true
-description = "wyrd-ai verify_in_real_time, verifier_building_blocks, and scheduled_drift_alerts_operator stories"
+description = "wyrd-ai verify_in_real_time, verifier_building_blocks, and scheduled_drift_alerts_operator stories; grouped support launches the public Python and Node SDKs"
+depends = ["build:server", "py:setup", "ts:build", "ts:build:testing"]
 run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|verifier_building_blocks|scheduled_drift_alerts_operator)::/)'"
 
 [tasks."test:bifrost:journey:forge"]
@@ -558,7 +561,7 @@ scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" query-capac
 '''
 
 [tasks."bench:verification:capacity"]
-description = "Opt-in benchmark (REQ-015/AC-009, the capacity binary's verification-capacity workload) of the verification runtime and engine overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), with one tenant loading a hydrated Service bundle under a Card-bound key and driven through the public Rust client at 1, 4, 16 and 64 closed-loop clients. Case 1: direct observe().verify of an assertion Verifier, judged on server wyrd_verification_overhead_seconds{mode=direct} p99 <= 500 µs from >=1,000 samples with zero refusals and correct verdicts; reports Verifier time, phases, and client-added time. Case 2: background observe().submit, reported only (submit time, queue wait, queued overhead and Verifier time, trigger to terminal, throughput, drain); fails only on refusals or a backlog not drained within 60 s. `-- --case 1` selects a case. Always builds with frame pointers into target/profiling and records each window with perf under target/verification-capacity/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Fails on any FAIL row. Part of no gate or verify lane."
+description = "Opt-in benchmark (REQ-015/AC-009, the capacity binary's verification-capacity workload) of the verification runtime and engine overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), with one tenant declaring one Service per closed-loop client, each client loading its own hydrated Service bundle under that Service's own Card-bound key, driven through the public Rust client at 1, 4, 16 and 64 closed-loop clients. Case 1: direct observe().verify of an assertion Verifier, judged on server wyrd_verification_overhead_seconds{mode=direct} p99 <= 500 µs from >=1,000 samples with zero refusals and correct verdicts; reports Verifier time, phases, and client-added time. Case 2: background observe().submit, reported only (submit time, queue wait, queued overhead and Verifier time, trigger to terminal, throughput, drain); fails only on refusals or a backlog not drained within 60 s. `-- --case 1` selects a case. Always builds with frame pointers into target/profiling and records each window with perf under target/verification-capacity/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Fails on any FAIL row. Part of no gate or verify lane."
 run = '''
 bash -lc '
 set -uo pipefail
@@ -566,6 +569,28 @@ target=target/profiling
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
 cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
 scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" verification-capacity "$@"' _
+'''
+
+[tasks."bench:gateway:overhead"]
+description = "Opt-in benchmark (the capacity binary's gateway-overhead workload) of the AI gateway's server overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint and binary identity; compare only matching hosts), with one tenant's openai_compatible deployments against an instant local upstream and one wyrd_sk_ key per closed-loop client, driving raw HTTP/1.1 keep-alive POST /v1/chat/completions. Case 1 chat (about 1 KiB buffered) and case 2 chat-stream (32 data events then [DONE]) at 1, 4, 16 and 64 clients with metadata capture; case 3 chat-capture (64 KiB in and out, payload capture) at 16 and 64. 2 s warmup and 10 s windows. Each row is judged on server wyrd_gateway_overhead_seconds p99 < 1 ms from >=1,000 samples at every handoff point (TARGET at <=500 us), zero refusals or invalid answers, one staged capture per arrival with no drop or outbox loss, and memory headroom; each step's drain (within 60 s) and the shutdown have their own loss-free rows. Client roundtrip percentiles (completion; stream headers and first event) and client-added means are reported. `-- --case 1,2,3`, `--clients 1,4,16,64` (intersected with each case's matrix) and `--no-profile` select steps and skip profiling. Always builds with frame pointers into target/profiling and, unless --no-profile, records each window with perf under target/gateway-overhead/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Writes target/gateway-overhead/. Fails on any FAIL row. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
+scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" gateway-overhead "$@"' _
+'''
+
+[tasks."bench:gateway:capacity"]
+description = "Opt-in benchmark (the capacity binary's gateway-capacity workload) of the AI gateway's sustainable open-loop rate: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint, binary identity, SLOs and pacing; compare only matching hosts), with four tenants of eight wyrd_sk_ keys each and metadata capture against a paced local upstream (100 ms buffered answers; streams with 250 ms headers then 32 chunks 20 ms apart). Case 1 buffered, case 2 paced-stream and case 3 tenant-contention (70/10/10/10 tenant split, half streams) each sweep --rates (default 50,100,250,500,1000 calls/s) with 2 s warmup and 15 s windows, stopping at the first unsustainable rate. A rate is SUSTAINABLE when every tenant and mode meets the SLOs from >=30 samples, the driver missed, capped and delayed no arrival, backlog did not grow, nothing was refused or invalid, captures equal admitted calls with no loss or misattribution, and memory has headroom. The highest sustainable rate then runs a 10 s overload at twice that rate, judged on configured admission refusals rather than timeouts or bad answers, followed by 20 s of recovery whose last 15 s are judged on the original SLOs. Requires `-- --max-answer-ms`, `--max-first-token-ms`, `--max-chunk-lag-ms` and `--max-stream-ms` for the selected cases; `--case 1,2,3`, `--rates` and `--no-profile` select steps and skip profiling. Always builds with frame pointers into target/profiling and, unless --no-profile, records each window with perf under target/gateway-capacity/profiles/. Writes target/gateway-capacity/. Fails on any FAIL or INVALID row. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
+scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" gateway-capacity "$@"' _
 '''
 
 [tasks."bench:bifrost:client-queue"]
@@ -606,6 +631,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:server:inner"]
 hide = true
 description = "wyrd-testing `server` binary, whole"
+depends = ["build:server"]
 run = "cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all"
 
 [tasks."test:bifrost:journey:mcp"]
@@ -752,13 +778,12 @@ run = "scripts/identity/with-identity-providers.sh -- bash scripts/server/test-s
 
 [tasks."build:server"]
 hide = true
-description = "Build the wyrd-server release binary, which also runs as the Monty worker it spawns"
-run = "cargo build --release --locked -p wyrd-server --features wyrd-server/cloud"
+description = "Build the dev wyrd-server binary that in-process test servers (Rust journeys, Python, TypeScript) spawn as their Monty worker"
+run = "cargo build --locked -p wyrd-server --bin wyrd-server"
 
 [tasks."test:verification:sandbox"]
 description = "Run the Verifier Python sandbox and registered-Artifact code tests against the real Monty worker and test Postgres"
-depends = ["build:server"]
-run = "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=only -E 'test(/^(sandbox_worker|pg_hosted_artifacts)::/)'"
+run = "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^(sandbox_worker|pg_hosted_artifacts)::/)'"
 
 [tasks."test:server:startup"]
 description = "Official image journeys: the development setup, then the team deployment"

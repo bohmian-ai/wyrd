@@ -58,6 +58,28 @@ pub(crate) fn projected_source_schema_fingerprint(
     SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(fields))
 }
 
+/// Source of the subject/actor pair Scribe stamps on a frame's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampedAttribution {
+    /// One trusted pair for every row, from the verified token or the one
+    /// operation that produced the frame.
+    Frame(Attribution),
+    /// Each row carries its own pair as `sub_principal_id` and
+    /// `act_principal_id` values, so one server-internal frame can hold rows
+    /// of many callers of one tenant. Only server-owned writers construct it:
+    /// public Gate ingestion always derives [`Self::Frame`] from the verified
+    /// token. Scribe still stamps the managed columns itself after validating
+    /// every value is a principal id.
+    Rows,
+}
+
+impl From<Attribution> for StampedAttribution {
+    /// One pair for every row.
+    fn from(attribution: Attribution) -> Self {
+        Self::Frame(attribution)
+    }
+}
+
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {
@@ -65,13 +87,14 @@ pub struct ScribeIngressFrame {
     /// client ingest, or a server-internal transport identity. It is checked
     /// for tenant and Card scope and never stamped onto rows.
     pub principal: Principal,
-    /// The trusted subject/actor pair Scribe stamps as `sub_principal_id` and
-    /// `act_principal_id`.
+    /// Where the trusted subject/actor pair Scribe stamps as
+    /// `sub_principal_id` and `act_principal_id` comes from.
     ///
-    /// Gate derives it from the verified token; a server-internal writer from
-    /// the operation that produced the rows, never from its transport
-    /// identity. No row or header value can set it.
-    pub attribution: Attribution,
+    /// Gate derives one pair from the verified token. A server-internal
+    /// writer names each row's pair from the operation that produced it,
+    /// never from its transport identity. No client row or header value can
+    /// set it.
+    pub attribution: StampedAttribution,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Card UIDs the frame's rows may correlate to, when the principal's

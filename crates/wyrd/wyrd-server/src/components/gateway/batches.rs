@@ -451,7 +451,8 @@ impl<'a> GatewayBatches<'a> {
         let task_caller = caller.clone();
         let creation = self
             .state
-            .gateway_tasks
+            .gateway
+            .tasks()
             .spawn(async move {
                 GatewayBatches::new(&state)
                     .claim_and_settle(&task_caller, claim, &digest, request, &cancel)

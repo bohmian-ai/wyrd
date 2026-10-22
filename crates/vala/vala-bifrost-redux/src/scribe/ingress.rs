@@ -1,7 +1,9 @@
 //! Bounded pre-ACK preparation for Scribe requests.
 
 use super::ScribeImpl;
-use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame};
+use crate::contracts::{
+    FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame, StampedAttribution,
+};
 use crate::scribe::material_plan::{MaterialPlan, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{
@@ -52,12 +54,14 @@ fn validate_decoded_request_size(
 ///
 /// The system owner is admitted only for the server's internal audit
 /// publication: the platform audit principal writing the retained audit log.
+/// Row-carried attribution is admitted only from the server-internal writer's
+/// reserved transport principal, which no token can name, so a client frame
+/// always stamps the one pair its token verified.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or any other
-/// system-owner frame, and [`ScribeError::PayloadTooLarge`] above the fixed
-/// request ceiling.
+/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch, any other
+/// system-owner frame, and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
 fn validate_logical_transport_frame(
     frame: &ScribeIngressFrame,
     request_limit_bytes: usize,
@@ -96,8 +100,9 @@ fn take_transport_decode_owner(
 
 /// Move-only context required to form one admitted row source.
 struct AdmittedRowContext {
-    /// Trusted subject/actor pair moved into the retained source.
-    attribution: wyrd_spec::auth::Attribution,
+    /// Source of the trusted subject/actor pair moved into the retained
+    /// source.
+    attribution: StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Catalog fingerprint required of the projected source schema.
@@ -577,8 +582,24 @@ impl ScribeImpl {
         };
         let preprocess = profile.preprocess.timer();
         let mut prepared = self.preprocess(admitted).await?;
-        self.charge_prepared(&mut prepared)?;
+        let duplicate_rows = self.shards.committed_duplicate_rows(&prepared);
+        if duplicate_rows.is_none() {
+            self.charge_prepared(&mut prepared)?;
+        }
         preprocess.done();
+        if let Some(rows) = duplicate_rows {
+            // An honest retry of a fenced, visible batch: answer it now. The
+            // append and its reservations drop here, and nothing is rewritten.
+            drop(prepared);
+            metrics::histogram!("bifrost_scribe_ack_seconds")
+                .record(append_started.elapsed().as_secs_f64());
+            return Ok(FrameAdmission {
+                batch_id: frame.batch_id,
+                rows_accepted: rows,
+                receipt_micros,
+                first_commit: false,
+            });
+        }
         self.shards
             .try_send(prepared)
             .inspect_err(|_| super::record_scribe_rejection("queue"))?;
@@ -764,7 +785,11 @@ const ADMISSION_CLOCK_REANCHOR: std::time::Duration = std::time::Duration::from_
 /// `statement_timestamp()` per batch costs a pool acquire and a round trip on
 /// every request. The clock instead reads it once, pairs it with a local
 /// [`Instant`], and answers each later admission with the anchor plus the
-/// monotonic time elapsed since. The node's wall clock is never consulted, so
+/// monotonic time elapsed since. The local instant is taken before the read
+/// is sent, so it never trails the `PostgreSQL` instant it pairs with: a
+/// stamp may run ahead of `PostgreSQL` time by one read's round trip, but is
+/// never behind it, and a row admitted after `PostgreSQL` time `F` is stamped
+/// at or after `F`. The node's wall clock is never consulted, so
 /// replicas still agree to within one anchor's drift, and the anchor is
 /// re-read after [`ADMISSION_CLOCK_REANCHOR`] so that drift stays bounded. An
 /// engine without control `PostgreSQL` has no durable state to agree with and
@@ -817,10 +842,11 @@ impl AdmissionClock {
             Some(anchor) if anchor.1.elapsed() < ADMISSION_CLOCK_REANCHOR => anchor,
             _ => {
                 let mut conn = postgres.tenant_conn(tenant).await?;
+                let sent = Instant::now();
                 let instant =
                     vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn).await?;
                 conn.commit().await?;
-                let anchor = (instant.timestamp_micros(), Instant::now());
+                let anchor = (instant.timestamp_micros(), sent);
                 *self
                     .anchor
                     .lock()
@@ -857,18 +883,18 @@ mod tests {
     use std::time::{Duration, Instant};
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
-    use wyrd_spec::auth::{Attribution, PrincipalId};
+    use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
     use wyrd_spec::request_id::RequestId;
 
     /// After its first `PostgreSQL` read the admission clock answers from its
-    /// anchor: a later admission needs no database trip and never runs
-    /// backwards.
+    /// anchor: a later admission needs no database trip, never runs
+    /// backwards, and is never behind `PostgreSQL` time read before it.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot start, the first read fails, or the
-    /// clock reaches `PostgreSQL` again after its pool is closed.
+    /// Panics when the fixture cannot start, the first read fails, a stamp
+    /// precedes an earlier `PostgreSQL` instant, or the clock reaches
+    /// `PostgreSQL` again after its pool is closed.
     #[tokio::test]
     async fn admission_clock_answers_from_its_anchor() {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -882,6 +908,10 @@ mod tests {
             .now_micros(tenant)
             .await
             .expect("anchors on PostgreSQL");
+        let floor: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(postgres.pool())
+            .await
+            .expect("reads PostgreSQL time");
         postgres.pool().close().await;
         let second = clock
             .now_micros(tenant)
@@ -889,6 +919,10 @@ mod tests {
             .expect("answers from the anchor");
 
         assert!(second >= first, "{second} precedes {first}");
+        assert!(
+            second >= floor.timestamp_micros(),
+            "{second} precedes PostgreSQL time {floor} read before it"
+        );
     }
 
     /// The Scribe ingress boundary carries no OTLP signal payload (S4).
@@ -1009,7 +1043,7 @@ mod tests {
         ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
-            attribution: Attribution::direct(principal.id),
+            attribution: Attribution::direct(principal.id).into(),
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),

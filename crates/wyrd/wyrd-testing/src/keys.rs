@@ -2,14 +2,13 @@
 
 use std::sync::OnceLock;
 
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use secrecy::SecretString;
 
 static KEYPAIR: OnceLock<(SigningKey, VerifyingKey)> = OnceLock::new();
 static PRIVATE_KEY_PEM: OnceLock<String> = OnceLock::new();
-static PUBLIC_KEY_PEM: OnceLock<String> = OnceLock::new();
 
 /// Return the deterministic process-local keypair.
 #[must_use]
@@ -52,19 +51,11 @@ pub fn oracle_peer_signing_key_pem() -> SecretString {
     private_key_pem()
 }
 
-pub(crate) fn public_key_pem() -> &'static str {
-    PUBLIC_KEY_PEM.get_or_init(|| {
-        verifying_key()
-            .to_public_key_pem(LineEnding::LF)
-            .expect("deterministic Ed25519 verifying key encodes as public-key PEM")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use secrecy::ExposeSecret;
 
-    use super::{keypair, private_key_pem, public_key_pem};
+    use super::{keypair, private_key_pem};
 
     #[test]
     fn keypair_is_deterministic() {
@@ -78,6 +69,5 @@ mod tests {
     #[test]
     fn keypair_exports_pem() {
         assert!(private_key_pem().expose_secret().contains("PRIVATE KEY"));
-        assert!(public_key_pem().contains("PUBLIC KEY"));
     }
 }

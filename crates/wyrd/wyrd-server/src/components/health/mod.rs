@@ -17,6 +17,28 @@ use crate::state::AppState;
 use axum::Router;
 use axum::routing::get;
 
+/// This process's readiness and private peer-plane status.
+///
+/// The readiness loop publishes into [`Self::readiness`] and `/readyz` and
+/// the gRPC health service read it back; the serving owner records whether
+/// the peer listener it requires is up in [`Self::peer_plane`].
+pub struct Health {
+    /// Cached readiness snapshot from the background readiness loop.
+    pub readiness: Arc<arc_swap::ArcSwap<ReadinessSnapshot>>,
+    /// Retained status of this process's private Bifrost peer listener.
+    pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
+}
+
+impl Default for Health {
+    /// The pre-boot warmup snapshot and a peer plane nobody requires yet.
+    fn default() -> Self {
+        Self {
+            readiness: Arc::new(arc_swap::ArcSwap::from_pointee(ReadinessSnapshot::initial())),
+            peer_plane: Arc::default(),
+        }
+    }
+}
+
 /// Build unprotected health routes.
 pub fn health_router() -> Router<AppState> {
     Router::new()
@@ -171,7 +193,7 @@ pub async fn readiness_loop(
 ) {
     loop {
         let snapshot = compute_snapshot(&state, probe_timeout).await;
-        state.readiness.store(Arc::new(snapshot));
+        state.health.readiness.store(Arc::new(snapshot));
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(tick) => {}
@@ -203,9 +225,9 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
 /// Returns `None` when this process composed no verification capability, so
 /// a process that intentionally runs none never grows an unsatisfiable check.
 fn probe_verification(state: &AppState) -> Option<ProbeOutcome> {
-    state.verification.is_composed().then(|| {
+    state.verification.health.is_composed().then(|| {
         role_outcome(
-            !state.verification.is_degraded(),
+            !state.verification.health.is_degraded(),
             ProbeReason::VerificationRuntimeDegraded,
         )
     })
@@ -261,8 +283,8 @@ fn role_outcome(ready: bool, unavailable: ProbeReason) -> ProbeOutcome {
 /// being plainly unready: tail discovery and Analytical stage delivery both
 /// fail against it while a load balancer keeps sending it work.
 fn probe_peer(state: &AppState) -> ProbeOutcome {
-    let required = state.peer_plane.is_required();
-    let outcome = if state.peer_plane.is_satisfied() {
+    let required = state.health.peer_plane.is_required();
+    let outcome = if state.health.peer_plane.is_satisfied() {
         ProbeOutcome {
             ok: true,
             reason: ProbeReason::Ok,
@@ -541,7 +563,7 @@ impl PublicReadinessReport {
 /// Readiness handler — reads the cached snapshot only. Never touches live dependencies.
 #[tracing::instrument(skip(state))]
 pub async fn readyz(State(state): State<AppState>) -> Response {
-    let snapshot = state.readiness.load_full();
+    let snapshot = state.health.readiness.load_full();
     if snapshot.all_ok() {
         let report = PublicReadinessReport::from_snapshot(&snapshot, "ok");
         return (StatusCode::OK, Json(report)).into_response();
@@ -747,7 +769,10 @@ mod pg_tests {
             crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         );
-        state.verification.require(RuntimeCapability::Scheduler);
+        state
+            .verification
+            .health
+            .require(RuntimeCapability::Scheduler);
 
         let mut snapshot = compute_snapshot(&state, Duration::from_millis(100)).await;
         assert!(!snapshot.scribe_fault_is_role_local);

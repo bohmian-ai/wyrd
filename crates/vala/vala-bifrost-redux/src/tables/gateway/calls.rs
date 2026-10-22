@@ -98,6 +98,7 @@ impl DomainTable for CallsTable {
         vec![
             int32("schema_version", false),
             utf8("call_id", false),
+            utf8("request_id", false),
             utf8("operation", false),
             utf8("ingress_dialect", false),
             // A `ModelRef`: its deployment name and model identifier.
@@ -183,6 +184,7 @@ mod tests {
             vec![
                 ("schema_version", false),
                 ("call_id", false),
+                ("request_id", false),
                 ("operation", false),
                 ("ingress_dialect", false),
                 ("requested_model", false),

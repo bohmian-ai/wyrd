@@ -12,9 +12,7 @@ use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{
     TaskExit, TaskId, fallible_task, restarting_worker, supervise, worker_task,
 };
-use crate::boot::{
-    BootedServer, StateOverrides, build_state, production_guards, spawn_forge_worker,
-};
+use crate::boot::{BootedServer, StartInputs, production_guards, spawn_forge_worker};
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::state::AppState;
 
@@ -70,12 +68,16 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     // `BoundServer::run` performs and the supervised Forge worker, and are
     // released only once serving has returned. Their drops are non-blocking,
     // which is required because this frame is inside `#[tokio::main]`.
+    let inputs = StartInputs::production(&config)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
     let BootedServer {
         state,
         coordination_runtime,
         data_root: _data_root,
+        workers,
         compaction_runtime,
-    } = build_state(&config, telemetry.clone(), StateOverrides::default())
+    } = AppState::start(&config, inputs)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
@@ -83,8 +85,13 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
         state.bifrost.node_id().ok_or_else(|| {
             BootExit::Other("configured Bifrost node identity is unavailable".into())
         })?;
-        WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
-            .map_err(|e| BootExit::Other(Box::new(e)))?
+        workers
+            .into_iter()
+            .fold(
+                WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
+                    .map_err(|e| BootExit::Other(Box::new(e)))?,
+                |server, (name, worker)| server.spawn_worker(name, worker),
+            )
             .serve(mode)
             .await
     } else {
@@ -227,7 +234,7 @@ mod tests {
             .expect("application module has production source before tests");
 
         let bind = production
-            .find("compaction_runtime,\n    } = build_state(")
+            .find("compaction_runtime,\n    } = AppState::start(")
             .expect("run binds the compaction runtime out of BootedServer");
         let serve = production
             .find("let result = if config.role.serves_api()")

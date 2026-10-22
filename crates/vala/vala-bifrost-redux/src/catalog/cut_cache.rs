@@ -11,8 +11,8 @@
 //! and manifest rewrites send nothing; they change neither rows nor files.
 //!
 //! A cached cut is served only while this node is listening: before the first
-//! `LISTEN` and after any lost connection the cache is cleared and every query
-//! reads Postgres. A notification is delivered after its commit, so a query
+//! `LISTEN` and after any lost or silently stalled connection the cache is
+//! cleared and every query reads Postgres. A notification is delivered after its commit, so a query
 //! racing a publication can see the pre-publication cut for that delivery
 //! latency. Notifications only keep the cache fresh; they never validate a
 //! read. Oracle validates each served cut against the publication revision
@@ -26,9 +26,8 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::oracle_reader_authority::{CutTableRef, TableCut};
@@ -36,9 +35,6 @@ use wyrd_spec::DataTenantId;
 
 /// Postgres channel the `vala.file_list` trigger notifies on.
 pub(crate) const CUT_CHANNEL: &str = "bifrost_cut";
-
-/// Pause before reconnecting after the listener fails to connect or listen.
-const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Cache key: tenant, logical namespace, table name.
 type CutKey = (Uuid, String, String);
@@ -179,51 +175,24 @@ impl CutCache {
         }
     }
 
-    /// Listens for cut invalidations on `pool` until `shutdown`.
+    /// Listens for cut invalidations through `listener` until `shutdown`.
     ///
-    /// Holds one pool connection for the listener. The cache serves only
-    /// between a successful `LISTEN` and the next lost connection; each loss
-    /// clears it, and sqlx reconnects and re-listens before reporting the
-    /// loss, so serving resumes from an empty cache. A failed connect or
-    /// `LISTEN` leaves the cache off and retries after [`RECONNECT_DELAY`].
-    pub(crate) async fn watch(&self, pool: &sqlx::PgPool, shutdown: CancellationToken) {
-        while !shutdown.is_cancelled() {
-            let listener = async {
-                let mut listener = PgListener::connect_with(pool).await?;
-                listener.listen(CUT_CHANNEL).await?;
-                Ok::<_, sqlx::Error>(listener)
-            };
-            let mut listener = match listener.await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    tracing::warn!(%error, "Oracle cut cache listener could not start; cuts read Postgres");
-                    tokio::select! {
-                        () = shutdown.cancelled() => break,
-                        () = tokio::time::sleep(RECONNECT_DELAY) => continue,
-                    }
-                }
-            };
-            self.reset(true);
-            loop {
-                let received = tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    received = listener.try_recv() => received,
-                };
-                match received {
-                    Ok(Some(notification)) => self.invalidate(notification.payload()),
-                    Ok(None) => {
-                        tracing::warn!("Oracle cut cache listener reconnected; cache cleared");
-                        self.reset(true);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Oracle cut cache listener failed; cuts read Postgres");
-                        break;
-                    }
-                }
-            }
-            self.reset(false);
-        }
-        self.reset(false);
+    /// The cache serves only while the listener is subscribed and its
+    /// heartbeat answers: each loss or silent stall clears it and switches it
+    /// off before a replacement subscribes, and serving resumes from an
+    /// empty cache; see [`vala_sql::NotificationListener::watch`].
+    pub(crate) async fn watch(
+        &self,
+        listener: &vala_sql::NotificationListener,
+        shutdown: CancellationToken,
+    ) {
+        listener
+            .watch(
+                shutdown,
+                |live| self.reset(live),
+                |payload| self.invalidate(payload),
+            )
+            .await;
     }
 }
 
@@ -238,6 +207,8 @@ fn key(tenant: DataTenantId, table: &CutTableRef<'_>) -> CutKey {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 

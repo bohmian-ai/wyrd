@@ -32,9 +32,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::SecretRef;
-use wyrd_sql::queries::gateway::{
-    GatewayAccountingEntryWrite, append_gateway_accounting_entry, revoke_gateway_credential,
-};
+use wyrd_sql::queries::gateway::revoke_gateway_credential;
 use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::recording::RecordingScribe;
@@ -65,7 +63,14 @@ pub(super) async fn test_state(fixture: &PgFixture) -> AppState {
         Arc::new(StorageHandle::new(signer)),
         crate::test_support::test_catalog().await,
     )
-    .with_gateway(gateway_config(fixture.data_tenant_id()))
+    .with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::from_config(
+            gateway_config(fixture.data_tenant_id()),
+            crate::config::DeploymentProfile::Development,
+            owners.auth.sealing_key.clone(),
+        )
+        .expect("the gateway builds");
+    })
 }
 
 /// Assigns a credential source to `tenant` and `provider` without a host.
@@ -135,7 +140,7 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
 pub(super) async fn settle_audit(state: &AppState) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     assert_eq!(
-        state.scribe_outbox.settle(deadline).await,
+        state.bifrost.scribe_outbox().settle(deadline).await,
         0,
         "audit settles"
     );
@@ -426,8 +431,9 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     const SUBMITTED: &str = "sk-live-managed-submission";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let mut state = test_state(&fixture).await;
-    state.auth.sealing_key = Some(sealing_keyring(1));
+    let state = test_state(&fixture).await;
+    let state =
+        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(1)));
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let managed = |name: &str, secret: &str| {
@@ -577,7 +583,14 @@ async fn gateway_credential_sources_stay_within_operator_assignments() {
         .expect("vault backend")
         .paths
         .insert("other".to_owned(), assigned(other, "openai"));
-    let state = test_state(&fixture).await.with_gateway(config);
+    let state = test_state(&fixture).await.with_owners_for_test(|owners| {
+        owners.gateway = crate::components::gateway::Gateway::from_config(
+            config,
+            crate::config::DeploymentProfile::Development,
+            owners.auth.sealing_key.clone(),
+        )
+        .expect("the gateway builds");
+    });
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let put = |name: &str, provider: &str, source: Value| {
@@ -864,8 +877,11 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     );
 
     settle_audit(&state).await;
-    let decisions = audit_decisions(&scribe, tenant);
-    let expected: Vec<(String, String)> = [
+    // Distinct callers' decisions use different Scribe lanes, so only the
+    // multiset of decisions is promised, not their cross-call commit order.
+    let mut decisions = audit_decisions(&scribe, tenant);
+    decisions.sort();
+    let mut expected: Vec<(String, String)> = [
         ("gateway.provider_credential.list", "denied"),
         ("gateway.provider_deployment.list", "denied"),
         ("gateway.provider_credential.put", "denied"),
@@ -876,6 +892,7 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     .into_iter()
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
+    expected.sort();
     assert_eq!(decisions, expected);
     settle_audit(&state).await;
 }
@@ -914,7 +931,7 @@ async fn gateway_fallback_policy_replaces_and_resets() {
 }
 
 /// Proves governance validation, pricing immutability, and retention of
-/// pricing referenced by accounting history across replace and delete.
+/// omitted pricing versions, inactive, across replace and delete.
 ///
 /// # Panics
 /// Panics when the Postgres fixture, a seed or call, or an assertion fails.
@@ -981,23 +998,6 @@ async fn gateway_governance_retains_referenced_pricing() {
         .expect_err("pricing version is immutable");
     assert_invalid(&changed, "pricing[0]");
 
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    append_gateway_accounting_entry(
-        &mut conn,
-        GatewayAccountingEntryWrite {
-            entry_id: Uuid::now_v7(),
-            call_id: Uuid::now_v7(),
-            kind: "attempt_accounted",
-            deployment: Some("openai"),
-            model: Some("gpt-4o"),
-            pricing_version: Some("v1"),
-            entry: &json!({}),
-        },
-    )
-    .await
-    .expect("ledger entry");
-    conn.commit().await.expect("ledger commits");
-
     let replaced = gateway
         .put_governance(
             &admin,
@@ -1015,23 +1015,6 @@ async fn gateway_governance_retains_referenced_pricing() {
         vec![("v1", false), ("v2", false), ("v3", true)],
         "omitted versions are retained inactive"
     );
-    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    append_gateway_accounting_entry(
-        &mut conn,
-        GatewayAccountingEntryWrite {
-            entry_id: Uuid::now_v7(),
-            call_id: Uuid::now_v7(),
-            kind: "attempt_accounted",
-            deployment: Some("openai"),
-            model: Some("gpt-4o"),
-            pricing_version: Some("v2"),
-            entry: &json!({}),
-        },
-    )
-    .await
-    .expect("a call admitted under unreferenced v2 still accounts after replacement");
-    conn.commit().await.expect("late ledger commits");
-
     gateway.delete_governance(&admin).await.expect("delete");
     gateway.delete_governance(&admin).await.expect("idempotent");
     let reset = gateway.governance(&admin).await.expect("reset");
@@ -1510,8 +1493,9 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
         .await
         .expect("tenant b");
     let keyless = test_state(&fixture).await;
-    let (mut state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
-    state.auth.sealing_key = Some(sealing_keyring(2));
+    let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
+    let state =
+        state.with_owners_for_test(|owners| owners.auth.sealing_key = Some(sealing_keyring(2)));
     let admin_of = admin;
     let admin = admin_of(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -1756,13 +1740,16 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
 
     settle_audit(&state).await;
     settle_audit(&keyless).await;
-    let applies = audit_decisions(&scribe, tenant)
+    // The reader's denial travels on its own call's lane, so compare outcomes
+    // without assuming cross-call commit order.
+    let mut applies = audit_decisions(&scribe, tenant)
         .into_iter()
         .filter(|(operation, _)| operation == "gateway.provider_deployments.apply")
         .map(|(_, outcome)| outcome)
         .collect::<Vec<_>>();
+    applies.sort();
     assert_eq!(
         applies,
-        ["allowed", "denied", "allowed", "allowed", "allowed"]
+        ["allowed", "allowed", "allowed", "allowed", "denied"]
     );
 }

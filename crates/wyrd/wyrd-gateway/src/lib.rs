@@ -29,8 +29,9 @@ pub use adapter::{
 pub use credential::{CredentialError, CredentialResolver, ProviderSecret};
 pub use engine::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallInput, EventStream,
-    FailureClass, GatewayEngine, ProviderAttempt, ProviderDispatch, ProviderRefusal, ResponseBody,
-    ResponseCapture, StreamAborted, StreamEnd, outcome_error_code, outcome_name,
+    ExecutionTiming, FailureClass, GatewayEngine, ProviderAttempt, ProviderDispatch,
+    ProviderRefusal, ResponseBody, ResponseCapture, StreamAborted, StreamEnd, outcome_error_code,
+    outcome_name,
 };
 pub use health::DeploymentHealth;
 pub use managed::ManagedSecretBinding;

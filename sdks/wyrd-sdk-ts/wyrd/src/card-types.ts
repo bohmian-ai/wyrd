@@ -2019,7 +2019,7 @@ export interface GroupSnapshot {
  */
 export interface GroupSourceSnapshot {
   /**
-   * The source executions the slot's list holds one value for, in list order: earliest input ingest time (earliest result ingest time for a result-only execution), then execution ID.
+   * The source executions the slot's list holds one value for, in list order: the binding's `order_by` input key when declared, then the server-recorded input time, then execution ID.
    */
   readonly execution_ids: readonly string[];
   /**
@@ -3175,6 +3175,11 @@ export interface OperatorSpecNotify {
   readonly description?: string | null;
   readonly kind: "notify";
 }
+
+/**
+ * Group source-list order: recorded_at (server-recorded input time, the default) or inputs.<slot> with .field and [n] selectors naming a sortable key of a source slot that reads a source input. Ties order by recorded_at, then execution ID.
+ */
+export type OrderBy = string;
 
 /**
  * Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.
@@ -5838,6 +5843,10 @@ export interface VerifierSpec {
    * Named evidence slots, addressed as `inputs.<slot>`.
    */
   readonly inputs?: Readonly<Record<string, InputSlot>>;
+  /**
+   * Order of a group Verifier's source lists: `recorded_at`, or an input key that orders every slot reading the same source binding. Absent means `recorded_at`.
+   */
+  readonly order_by?: OrderBy | null;
   /**
    * Whole-Verifier requirements, judged after every step finishes.
    */

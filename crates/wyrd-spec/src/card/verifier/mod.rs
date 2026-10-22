@@ -38,7 +38,7 @@ mod schema_path;
 mod validate;
 
 pub use reference::{
-    PathSegment, Reference, ReferenceError, ReferenceRoot, SourceField, SourceReference,
+    OrderBy, PathSegment, Reference, ReferenceError, ReferenceRoot, SourceField, SourceReference,
     SourceText, VerdictField,
 };
 pub use validate::ResolvedAgent;
@@ -72,6 +72,11 @@ pub struct VerifierSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
     pub context_capture: Option<ContextCapture>,
+    /// Order of a group Verifier's source lists: `recorded_at`, or an input
+    /// key that orders every slot reading the same source binding. Absent
+    /// means `recorded_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<OrderBy>,
 }
 
 impl VerifierSpec {

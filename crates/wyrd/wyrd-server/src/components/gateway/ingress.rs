@@ -12,12 +12,12 @@
 //! governed [`GatewayInvocation`], which never forwards caller headers to a
 //! provider.
 
-use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use skald_spec::ProviderName;
@@ -45,12 +45,14 @@ use super::invocation::{
     invalid_request,
 };
 use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body};
+use super::telemetry::IngressClock;
 use crate::components::auth::Caller;
 use crate::components::auth::token_extract::{
     ANTHROPIC_API_KEY_HEADER, GOOGLE_API_KEY_HEADER, extract_gateway_access_token,
     verify_access_token,
 };
 use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::metrics::RequestArrival;
 use crate::state::AppState;
 
 /// Protocol of one group of public gateway inference routes.
@@ -120,8 +122,11 @@ impl GatewayIngress {
     /// and the principal is inserted for the handler's [`Caller`]. A missing,
     /// ambiguous, URL-borne, or invalid credential, or a key the exchange
     /// refuses, is refused in the protocol's envelope without reading the
-    /// body; a refused key never falls back to token verification.
+    /// body; a refused key never falls back to token verification. An
+    /// authenticated request also carries the [`IngressClock`] its handler
+    /// uses to time the call from the request's arrival.
     async fn authenticate(self, state: AppState, mut request: Request, next: Next) -> Response {
+        let authenticating = std::time::Instant::now();
         let native = self.native_header();
         let credential = extract_gateway_access_token(
             request.headers(),
@@ -144,7 +149,8 @@ impl GatewayIngress {
                     .cloned()
                     .unwrap_or_else(RequestId::now_v7);
                 state
-                    .gateway_api_keys
+                    .gateway
+                    .api_keys()
                     .authenticate(&state, &api_key, request_id.as_str())
                     .await
             }
@@ -152,7 +158,10 @@ impl GatewayIngress {
         };
         match verified {
             Ok(principal) => {
-                request.extensions_mut().insert(principal);
+                let arrival = request.extensions().get::<RequestArrival>().copied();
+                let extensions = request.extensions_mut();
+                extensions.insert(principal);
+                extensions.insert(IngressClock::authenticated(arrival, authenticating));
                 next.run(request).await
             }
             Err(error) => self.error(&error),
@@ -429,6 +438,7 @@ pub(super) fn requested_subject(
 pub(crate) async fn anthropic_messages(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -460,7 +470,12 @@ pub(crate) async fn anthropic_messages(
                 })
             });
             match call {
-                Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
+                Ok(call) => {
+                    GatewayInvocation::new(&state)
+                        .parsed(clock.map(|Extension(clock)| clock), call.operation)
+                        .invoke(&caller, call)
+                        .await
+                }
                 Err(error) => Err(error),
             }
         }
@@ -514,13 +529,19 @@ pub(crate) async fn anthropic_messages(
 pub(crate) async fn jev_systemone(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
         Ok(caller) => match jev_call(&headers, request) {
-            Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
+            Ok(call) => {
+                GatewayInvocation::new(&state)
+                    .parsed(clock.map(|Extension(clock)| clock), call.operation)
+                    .invoke(&caller, call)
+                    .await
+            }
             Err(error) => Err(error),
         },
     };
@@ -614,6 +635,7 @@ fn jev_call(
 pub(crate) async fn gemini_generate_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    clock: Option<Extension<IngressClock>>,
     Path((deployment, target)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
@@ -627,7 +649,12 @@ pub(crate) async fn gemini_generate_content(
             &headers,
             request,
         ) {
-            Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
+            Ok(call) => {
+                GatewayInvocation::new(&state)
+                    .parsed(clock.map(|Extension(clock)| clock), call.operation)
+                    .invoke(&caller, call)
+                    .await
+            }
             Err(error) => Err(error),
         },
     };

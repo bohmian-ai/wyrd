@@ -1,7 +1,7 @@
 //! The shared Python sandbox behind `code` blocks and the `code.run` tool.
 //!
 //! [`Sandbox`] owns one process-wide Monty pool of `wyrd-server
-//! subprocess` worker processes (see the binary's `monty_worker` module for
+//! subprocess` worker processes (see [`super::worker`] for
 //! the in-worker isolation). Each [`Sandbox::run`] admits at most `max_workers +
 //! max_waiters` operations, checks out a fresh worker within the operation's
 //! deadline, feeds the source plus one
@@ -56,6 +56,9 @@ pub struct Sandbox {
     pool: Arc<Pool>,
     /// Admission: one permit per running or waiting operation.
     admission: Semaphore,
+    /// Every admission permit, which [`Self::shutdown`] holds once no
+    /// operation is running or waiting.
+    capacity: u32,
     /// Limits in force.
     limits: HostedLimits,
 }
@@ -86,11 +89,44 @@ impl Sandbox {
         config.max_checkouts_per_worker = Some(1);
         // ponytail: replacements spawn on demand, so the warm set shrinks to
         // zero under load; prewarm replacements if spawn latency matters.
+        let capacity = workers + limits.monty_max_waiters;
         Ok(Self {
             pool: Arc::new(Pool::new(config).await?),
-            admission: Semaphore::new(workers + limits.monty_max_waiters),
+            admission: Semaphore::new(capacity),
+            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
             limits,
         })
+    }
+
+    /// Settle every admitted operation, refuse new ones, and reap the idle
+    /// workers, all by `deadline`; returns whether everything settled.
+    ///
+    /// Waits until it holds every admission permit, which means no operation
+    /// is running or waiting and therefore no worker is checked out, because
+    /// [`Pool::close`] reaps only idle workers. Admission is then closed, so
+    /// a later [`Self::run`] answers busy, and the pool asks each idle
+    /// worker to exit, killing one that does not within its grace. When the
+    /// deadline passes first, admission still closes and idle workers are
+    /// still reaped (a reap cut short kills its workers on drop), but `false`
+    /// reports that operations were still running; their workers die with
+    /// their checkouts. Repeating the call is safe and finds nothing to do.
+    pub async fn shutdown(&self, deadline: Instant) -> bool {
+        let settled =
+            match tokio::time::timeout_at(deadline, self.admission.acquire_many(self.capacity))
+                .await
+            {
+                Ok(Ok(permits)) => {
+                    permits.forget();
+                    true
+                }
+                Ok(Err(_closed)) => true,
+                Err(_elapsed) => false,
+            };
+        self.admission.close();
+        let reaped = tokio::time::timeout_at(deadline, self.pool.close())
+            .await
+            .is_ok();
+        settled && reaped
     }
 
     /// Run `source`, then return `entrypoint(**inputs)` as JSON, through

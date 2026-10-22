@@ -742,9 +742,9 @@ collisions stay reversible implementation choices within the declared owners.
 ## Authority Links
 
 - [Approved specification, revision 17](../spec.md).
-- [AGENTS.md](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md).
-- [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+- [AGENTS.md](../../../../AGENTS.md) and [agent rules](../../../../AGENTS.md).
+- [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-design.md), [Bifrost design](../../../../architecture/bifrost-design.md).
+- [Spec workflow](../../../../changes/spec-driven-development.md), [implementation execution](../../../../changes/implementation-execution.md), [testing workflows](../../../../TESTING.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md).
 
 ## Implementation Evidence

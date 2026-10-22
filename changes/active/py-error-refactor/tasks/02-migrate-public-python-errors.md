@@ -50,13 +50,13 @@ Required execution skill: `$wyrd-implement`.
 
 ## Relevant Surface
 
-- Approved Python owner crates listed in `AGENTS.md` §7, especially
+- Approved Python owner crates listed in `AGENTS.md`, especially
   `wyrd-cli`, `skald-agent`, `skald-tool`, `skald-workflow`, `skald-prompt`,
   `wyrd-interfaces`, `wyrd-cards`, `wyrd-config`, and `wyrd-testing`
 - Public package projections and exception construction under
   `sdks/wyrd-sdk-python/python/wyrd`, including Bifrost and schema helpers
 - Python-boundary guidance in
-  `architecture/references/languages/pyo3-boundaries.md`
+  `sdks/wyrd-sdk-python/AGENTS.md`
 - Native registration under `sdks/wyrd-sdk-python/src`
 - Generated Python stubs and the focused negative tests for each touched owner
   family
@@ -236,7 +236,7 @@ Do not run `mise run gate`, `mise run test:rust`, `mise run test:shared`,
 
 ### Broad post-change source audit
 
-Owner set searched (AGENTS.md §7 plus the Python package root):
+Owner set searched (AGENTS.md plus the Python package root):
 
 ```
 crates/wyrd/wyrd-interfaces crates/wyrd/wyrd-cards crates/wyrd/wyrd-config

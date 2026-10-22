@@ -47,9 +47,15 @@ def test_every_listed_export_resolves(module_name: str) -> None:
         ("wyrd.prompt", "Prompt"),
         ("wyrd.prompt", "PromptCard"),
         ("wyrd.state", "CardEnvelope"),
-        ("wyrd.state", "HydratedArtifact"),
         ("wyrd.state", "WyrdState"),
     ],
 )
 def test_root_reexport_is_the_module_export(module_name: str, name: str) -> None:
     assert getattr(wyrd, name) is getattr(importlib.import_module(module_name), name)
+
+
+def test_state_declares_and_lists_no_artifact_files() -> None:
+    assert callable(wyrd.WyrdState.declare)
+    assert not hasattr(wyrd.WyrdState, "artifacts")
+    assert not hasattr(importlib.import_module("wyrd.state"), "HydratedArtifact")
+    assert not hasattr(wyrd, "HydratedArtifact")

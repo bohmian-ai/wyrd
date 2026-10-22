@@ -33,5 +33,5 @@ Commit `4ae6a1992` changed `crates/wyrd/wyrd-sql/bootstrap/roles.sql` to use `\g
 
 ## Authority and revision
 
-- `AGENTS.md` §11; `scripts/postgres/with-test-postgres.sh`; `crates/wyrd/wyrd-sql/bootstrap/roles.sql`; `docker-compose.yml`.
+- `AGENTS.md`; `scripts/postgres/with-test-postgres.sh`; `crates/wyrd/wyrd-sql/bootstrap/roles.sql`; `docker-compose.yml`.
 - Revision 1 — draft, 2026-10-09: record the host psql 14 bootstrap failure and container-client fix.

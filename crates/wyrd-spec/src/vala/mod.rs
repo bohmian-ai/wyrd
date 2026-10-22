@@ -7,9 +7,8 @@
 //! SDK, MCP, and Postgres control-plane / Iceberg object-store storage.
 //! Runtime behavior lives in the `vala-*` crates.
 //!
-//! Per PR4.0 §0.1 framing 1, `wyrd-spec` ships only declarative artifacts —
-//! no IO, no async, no PyO3. See
-//! `architecture/v1/06-crates/wyrd-spec.md` and AGENTS.md §9.
+//! `wyrd-spec` ships only declarative artifacts — no IO, no async, no PyO3.
+//! See AGENTS.md.
 
 /// Public Bifrost wire contracts — table management, query, and ingest types.
 pub mod api;

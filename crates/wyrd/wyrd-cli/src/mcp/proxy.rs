@@ -3,8 +3,8 @@
 //! Hosts launch local MCP servers over stdio and speak whichever protocol
 //! revision they ship; Wyrd serves one session-free revision over Streamable
 //! HTTP behind its authenticated edge. The proxy is the protocol bridge
-//! between the two and nothing more: it forwards tool discovery and tool
-//! calls verbatim to the server, which owns the catalog, permissions, tenancy,
+//! between the two and nothing more: it forwards tool discovery, tool calls,
+//! and prompt reads verbatim to the server, which owns the catalog, permissions, tenancy,
 //! errors, and audit. Credentials never pass through here — the upstream
 //! transport is [`WyrdMcpHttpClient`], which takes its bearer, renewal, and
 //! refusal replay from the shared [`wyrd_client::WyrdClient`].
@@ -12,8 +12,9 @@
 use std::process::ExitCode;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorData, InitializeResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, ErrorData, GetPromptRequestParams, GetPromptResponse,
+    InitializeResult, ListPromptsResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -29,18 +30,23 @@ use crate::error::{CliBoundaryError, WyrdCliError};
 /// The host-facing MCP server: every request is answered by the upstream
 /// Wyrd session.
 struct McpProxy {
-    /// The established `/mcp` client session tool requests are forwarded on.
+    /// The established `/mcp` client session requests are forwarded on.
     upstream: Peer<RoleClient>,
 }
 
 impl ServerHandler for McpProxy {
-    /// Advertise tools, the only capability Wyrd's `/mcp` serves.
+    /// Advertise tools and prompts, the capabilities Wyrd's `/mcp` serves.
     ///
     /// The protocol revision is negotiated with the host independently of the
     /// upstream session, so a host pinned to an earlier revision still reaches
     /// Wyrd's session-free one.
     fn get_info(&self) -> ServerInfo {
-        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        );
         info.instructions = self
             .upstream
             .peer_info()
@@ -79,6 +85,38 @@ impl ServerHandler for McpProxy {
     ) -> Result<CallToolResponse, ErrorData> {
         self.upstream
             .call_tool_once(request)
+            .await
+            .map_err(upstream_error)
+    }
+
+    /// Return the server's prompts for the authenticated caller.
+    ///
+    /// # Errors
+    /// Returns the server's protocol error, or an internal error describing
+    /// an upstream transport failure.
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        self.upstream
+            .list_prompts(request)
+            .await
+            .map_err(upstream_error)
+    }
+
+    /// Forward one prompt read and return the server's response unchanged.
+    ///
+    /// # Errors
+    /// Returns the server's protocol error, or an internal error describing
+    /// an upstream transport failure.
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        self.upstream
+            .get_prompt_once(request)
             .await
             .map_err(upstream_error)
     }

@@ -15,13 +15,13 @@ spec:
       statement: The ticket has an answer and an order id
       check:
         kind: code
-        entrypoint: check
-        inputs: {ticket: inputs.ticket}
+        entrypoint: check  # the function Wyrd calls
+        inputs: {ticket: inputs.ticket}  # its arguments, read from the evidence
         source:
           inline: |
             def check(ticket):
                 missing = [field for field in ("answer", "order_id") if not ticket.get(field)]
-                return {
+                return {  # the requirement's verdict
                     "outcome": "failed" if missing else "passed",
                     "reason": "missing " + ", ".join(missing) if missing else "all fields present",
                     "citations": [{"slot": "ticket", "locator": {"json_pointer": ""}}],

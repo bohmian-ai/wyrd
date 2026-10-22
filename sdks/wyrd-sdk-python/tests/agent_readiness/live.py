@@ -6,7 +6,7 @@ up. It is opt-in and outside ``gate`` and CI: it calls paid agents.
 
 The harness builds this checkout's Python wheel and serves this checkout's
 docs. Each agent then gets its own deployment: an empty database, an isolated
-Wyrd configuration, a foreground ``wyrd server dev`` the harness owns and
+Wyrd configuration, a foreground ``wyrd init`` the harness owns and
 waits on, its host connected through ``wyrd mcp install``, and a fresh
 application directory and home. Both agents receive the same objective and
 run concurrently. ``observe`` then judges each agent from its own server;
@@ -367,7 +367,7 @@ def docs_served(artifacts: Path, redact: Redactor, cancel: threading.Event) -> I
 def wyrd_served(
     cli: Path, tenant: str, home: Path, env: dict[str, str], log: Path, cancel: threading.Event
 ) -> Iterator[dict[str, Any]]:
-    """Run ``wyrd server dev --format json`` in the foreground; yield its readiness document.
+    """Run ``wyrd init --format json`` in the foreground; yield its readiness document.
 
     The harness owns the child: it waits for the one readiness line and stops
     it with an interrupt when the block ends, exactly as a person would.
@@ -378,7 +378,7 @@ def wyrd_served(
     """
     with log.open("w") as diagnostics:
         child = subprocess.Popen(
-            [str(cli), "server", "dev", "--tenant", tenant, "--non-interactive"]
+            [str(cli), "init", "--tenant", tenant, "--non-interactive"]
             + ["--skip-gateway", "--format", "json"],
             cwd=home,
             env=env,

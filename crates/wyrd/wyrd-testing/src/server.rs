@@ -7,8 +7,8 @@ use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
 
@@ -5301,7 +5301,7 @@ const RESERVATION_ATTEMPTS: u32 = 512;
 
 /// The loopback port band reservations are drawn from, below the kernel's own.
 ///
-/// A `:0` bind reports a port from `ip_local_port_range` and releases it the
+/// A `:0` bind reports a port from the OS ephemeral range and releases it the
 /// moment the probe listener drops, so the kernel may hand that exact port to
 /// anyone before the server that asked for it binds. With several journey
 /// processes reserving several ports each, that race is routine: a test fails
@@ -5310,27 +5310,18 @@ const RESERVATION_ATTEMPTS: u32 = 512;
 /// it never auto-assigns there — leaving only sibling test processes, which
 /// start at different offsets in the band and are fenced by [`claim_port`].
 ///
-/// Returns `None` where the range cannot be read, which is every non-Linux
-/// host; the caller then falls back to `:0` and keeps the old behavior rather
-/// than guessing at a band it cannot verify is safe.
-fn reservation_band() -> Option<Range<u16>> {
-    /// The band read once per process; the kernel range does not change under a test run.
-    static BAND: OnceLock<Option<Range<u16>>> = OnceLock::new();
-    BAND.get_or_init(|| {
-        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()?;
-        let low: u16 = range.split_whitespace().next()?.parse().ok()?;
-        let start = low / 2;
-        (start >= 1024).then_some(start..low)
-    })
-    .clone()
-}
+/// The band is fixed below the default ephemeral ranges of every supported
+/// OS: Linux starts at 32768 and macOS at 49152.
+// ponytail: assumes the OS default ephemeral range; a host that lowers it
+// below 32768 reopens the race.
+const RESERVATION_BAND: Range<u16> = 16384..32768;
 
 /// Ask the OS for one currently free loopback address used by a bound harness
 /// or by a test that hands the address to a server process it spawns.
 ///
 /// Reserving before server composition gives membership a concrete nonzero
 /// private endpoint. The production binder later claims this exact address, so
-/// the port has to stay free across the gap — see [`reservation_band`] for why
+/// the port has to stay free across the gap — see [`RESERVATION_BAND`] for why
 /// a `:0` bind does not keep it free and what is drawn from instead. The first
 /// candidate is seeded from the process id so two test processes walking the
 /// band concurrently do not walk it in step, and each candidate is first
@@ -5346,9 +5337,7 @@ fn reservation_band() -> Option<Range<u16>> {
 pub fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
     /// Process-wide offset into the band so successive reservations probe fresh ports.
     static CURSOR: AtomicU32 = AtomicU32::new(0);
-    let Some(band) = reservation_band() else {
-        return bound_loopback_addr(0);
-    };
+    let band = RESERVATION_BAND;
     let span = u32::from(band.end - band.start);
     let seed = std::process::id().wrapping_mul(2_654_435_761);
     let mut last = None;

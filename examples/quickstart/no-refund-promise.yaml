@@ -1,0 +1,18 @@
+# The Verifier: a support answer never promises a guaranteed refund.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: default
+spec:
+  inputs:
+    answer: { type: json }
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund

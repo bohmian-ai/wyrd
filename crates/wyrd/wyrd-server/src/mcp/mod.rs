@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool,
+    GetPromptRequestParams, GetPromptResponse, InitializeResult, ListPromptsResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -201,11 +201,17 @@ impl WyrdMcpHandler {
 }
 
 impl ServerHandler for WyrdMcpHandler {
-    /// Advertise Wyrd's tools capability and sole supported protocol revision.
+    /// Advertise Wyrd's tools and prompts capabilities and sole supported
+    /// protocol revision.
     fn get_info(&self) -> ServerInfo {
-        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        );
         info.protocol_version = WYRD_MCP_PROTOCOL_VERSION;
-        info.instructions = Some(r#"New to Wyrd? Call wyrd.guide {"topic":"start"} for the Declare -> Observe -> Verify workflow on an application you own, then use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries."#.to_owned());
+        info.instructions = Some(r#"New to Wyrd? The setup prompt adds Wyrd to the current project and confirms a first verification. Call wyrd.guide {"topic":"start"} for the Declare -> Observe -> Verify workflow on an application you own, then use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries."#.to_owned());
         info
     }
 
@@ -260,6 +266,36 @@ impl ServerHandler for WyrdMcpHandler {
         std::future::ready(Ok(ListToolsResult::with_all_items(catalog)
             .with_ttl_ms(0)
             .with_cache_scope(CacheScope::Private)))
+    }
+
+    /// Advertise the one static `setup` prompt to every authenticated caller.
+    ///
+    /// # Errors
+    /// This hook is infallible; authentication failures are handled by the edge.
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
+        // Release text, identical for every caller but served only to
+        // authenticated ones, so it is never cached as public.
+        std::future::ready(Ok(ListPromptsResult::with_all_items(vec![
+            guide::prompt_descriptor(),
+        ])
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)))
+    }
+
+    /// Return the `setup` prompt's release text without executing any step.
+    ///
+    /// # Errors
+    /// Returns invalid parameters for an unknown prompt or any argument.
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
+        std::future::ready(guide::prompt(&request).map(Into::into))
     }
 
     /// Dispatch tools inside the HTTP request's span.

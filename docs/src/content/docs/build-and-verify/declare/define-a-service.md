@@ -1,6 +1,6 @@
 ---
-title: Define a Service
-description: Declare a Service as a folder of Card files, with exact component versions and a table for the rows it records, then validate it locally.
+title: Services
+description: Declare a Service from YAML files, with each component at an exact version and a table for the rows it records, then read back what the server stored.
 pillar: wyrd
 section: Build and verify
 topic: Declare
@@ -8,13 +8,13 @@ order: 1
 status: runnable
 ---
 
-A Service Card is the root of your declaration. It names the components your service is built from, each pinned to an exact Card version, and the tables it records rows into. You write it in YAML whatever language the service is written in, and `wyrd declare --check` checks it without a server.
+Declare the Service your app runs: the components it is built from, each at an exact version, and the tables it records rows into. Every verdict then names exactly what it checked.
 
-This page builds the `support-desk` Service from the [quickstart](/get-started/quickstart/). The finished files are in `examples/support-desk-app/service/`.
+You need a running server from [Set up Wyrd](/get-started/setup/). This page builds the `support-desk` Service; the finished files are in `examples/support-desk-app/service/`.
 
 ## 1. Write the components
 
-Each component is its own Card file with an exact `metadata.version`. The support desk has an Agent and the Prompt it runs. The Agent points at the Prompt by relative path:
+Each component is its own YAML file with an exact `metadata.version`. The support desk has an Agent and the Prompt it runs, and the Agent points at the Prompt by relative path:
 
 <Tabs>
 <Tab label="support-agent.yaml">
@@ -29,13 +29,13 @@ Each component is its own Card file with an exact `metadata.version`. The suppor
 </Tab>
 </Tabs>
 
-`execution_route` says how the Agent reaches its model: `wyrd_gateway` sends it through the gateway deployment named `openai`, which [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) creates. Use `{kind: native}` when your own code calls the model.
+`execution_route` says how the Agent reaches its model: `wyrd_gateway` sends it through the [LLM gateway](/connect/set-up-the-llm-gateway/) deployment named `openai`. Use `{kind: native}` when your own code calls the model.
 
-The Prompt's `provider` and `model` name a hosted model, such as `openai` and `gpt-4o`, and the gateway resolves `openai/gpt-4o` at call time. That string is not a Model Card and needs none. Declare a `Model` Card only for a model artifact you own and version, such as a trained classifier or a fine-tune, so verdicts and drift attach to its exact version.
+A hosted model such as `gpt-4o` needs no file of its own. Declare a `Model` only for a model you own and version, such as a trained classifier, so verdicts attach to its exact version.
 
 ## 2. Write the Service
 
-The Service gives each component an `alias`, the name your code uses at runtime, such as `state.run("agent")`:
+The Service gives each component an `alias`, the name your code uses at runtime, such as `run.for_card("agent")`:
 
 ```yaml title="support-desk.yaml"
 apiVersion: wyrd/v1
@@ -47,60 +47,112 @@ metadata:
 spec:
   service_type: agent
   tables:
-    - name: tickets
+    - name: tickets  # becomes vala.datasets.tickets
       schema:
         type: object
-        properties:
+        properties:  # in column order
           question: {type: string}
           answer: {type: string}
         required: [question, answer]
   components:
     - alias: agent
-      ref: ./support-agent.yaml
+      ref: ./support-agent.yaml  # relative to this file
     - alias: prompt
       ref: ./support-prompt.yaml
 ```
 
-| Field | Holds |
-| --- | --- |
-| `components[].alias` | The runtime name of the component, unique within the Service |
-| `components[].ref` | A path to the component's Card file, or a declared Card such as `{kind: Model, name: churn-classifier, version: 1.4.2}` |
-| `tables[].name` | A table to create as `vala.datasets.<name>` when the Service registers |
-| `tables[].schema` | A JSON Schema object; the order of `properties` is the column order |
-| `service_type` | A free-form label, such as `agent` or `api` |
+A `ref` can also name a component that is already declared, such as `{kind: Model, name: churn-classifier, version: 1.4.2}`. Every reference names one exact version, never a range.
 
-A path is relative to the file that contains it. Every reference names one exact version: Wyrd has no version ranges, so a declared Service always records exactly what it was built from.
-
-Verifiers attach through `verified_by`, which [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/) adds next.
-
-## 3. Check it locally
+## 3. Check it
 
 ```bash
 wyrd declare --check support-desk.yaml
 ```
 
-`wyrd declare --check` loads the Service and every Card it references, validates them, and contacts no server. It prints `check valid: 3 card(s)`, then one line per Card, such as `Service default/support-desk@1.0.0`. Fix anything it reports before you declare.
+It loads the Service and every file it references, validates them without contacting the server, and lists each one. Fix anything it reports before you declare.
 
-## Set the space once
+## 4. Declare it
 
-`space` groups related Cards, such as a team's. Instead of writing it in every file, put a `wyrd.toml` next to your Cards or in any parent directory:
+```bash
+wyrd declare support-desk.yaml
+```
+
+It declares every file the Service references, dependencies first, creates the `tickets` table, and prints one line per file with its outcome. Run it again: unchanged files come back `idempotent_noop`, so declaring is safe to repeat.
+
+<Aside type="note" title="From code">
+
+`WyrdState.declare("support-desk.yaml")` declares the same files and returns the Service ready to use, as in [Write a Verifier](/build-and-verify/verify/author-a-verifier/#3-call-it-and-read-the-verdict).
+
+</Aside>
+
+## 5. Read it back
+
+The server records which component references which, in both directions. Fetch the Service and list its components:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from wyrd.cards import CardRef, Cards
+
+card = Cards().get(CardRef("Service", "support-desk", "1.0.0", space="default"))
+for edge in card.relationships["outbound_refs"]:
+    print(edge.get("alias"), edge["ref"])
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use wyrd_ai::cards::{CardRef, CardSelector, Cards};
+
+let service: CardRef = "default/Service/support-desk@1.0.0".parse()?;
+let card = Cards::connect().await?.get(CardSelector::exact(service)).await?;
+for edge in &card.relationships.outbound_refs {
+    println!("{edge:?}");
+}
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { Cards } from "wyrd-ai";
+
+const card = await (await Cards.connect()).get("default/Service/support-desk@1.0.0");
+for (const edge of card.relationships.outbound_refs) console.log(edge.alias, edge.ref);
+```
+
+</LangTab>
+</LangTabs>
+
+It prints one line per component, with its alias and exact version. Fetching `support-prompt` instead shows, under `inbound_refs`, both the Agent and the Service that use it.
+
+## 6. Change a component
+
+A declared version never changes. To change the Prompt, set a new `version` in `support-prompt.yaml`, then bump the Agent and the Service that reference it, since they now point at different content. Declare again: the new Service version records the new Prompt, and verdicts from the old version still name the old one.
+
+<Aside type="note" title="Set the space once">
+
+`space` groups related files, such as a team's. Instead of writing it in every file, put a `wyrd.toml` next to them or in a parent directory:
 
 ```toml
 [defaults]
 space = "support"
-
-[kind.Verifier]
-space = "support-verifiers"
 ```
 
-A Card's own `metadata.space` wins, then the `[kind.<Kind>]` value, then `[defaults]`, then `default`. `wyrd.toml` can also set `labels` and `annotations`, but never `name` or `version`.
+A file's own `metadata.space` still wins.
+
+</Aside>
 
 ## If it fails
 
-| You see | Cause | Fix |
-| --- | --- | --- |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | A file is missing `apiVersion` or `kind`, a path points at no Card, a referenced Card has no exact `version`, or two Cards reference each other. `details.diagnostics` names each file | Fix the file it names |
-| `WYRD_LOADER_400_PATH_ESCAPE` | A `ref` path leaves the declaration's directory tree | Move the Card inside it, or reference the declared Card instead |
+| You see | Fix |
+| --- | --- |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Fix the file `details.diagnostics` names: a missing `apiVersion` or `kind`, a path to no file, or a missing exact `version` |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | That version is already declared with different content: bump its `version` |
+| `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | Declare the referenced component first, or fix the `ref` |
+| `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
 
 ## Next
 

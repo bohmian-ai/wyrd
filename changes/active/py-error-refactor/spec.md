@@ -249,12 +249,10 @@ None.
 
 ## Authorities
 
-- `AGENTS.md` §§4, 7, 8, 11, and 14
-- `architecture/agent-rules.md`
+- `AGENTS.md`, and 14
+- `AGENTS.md`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
-- `architecture/references/languages/errors.md`
-- `architecture/references/languages/pyo3-boundaries.md`
-- `architecture/references/languages/python-api-and-stubs.md`
-- `architecture/references/languages/testing-workflows.md`
+- `agent_docs/errors.md`
+- `sdks/wyrd-sdk-python/AGENTS.md`
+- `TESTING.md`

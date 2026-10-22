@@ -1,6 +1,7 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { expect, vi } from "vitest";
 
@@ -12,6 +13,7 @@ import { fixture, declared, serverTest } from "../support/server.js";
 vi.setConfig({ testTimeout: 60_000 });
 
 const DESK = fixture("cards/declare_and_pull/support-desk.yaml");
+const QUICKSTART = resolve(import.meta.dirname, "../../../../../examples/quickstart");
 
 /** The support desk graph, declared after the artifact-bearing Model it references. */
 const test = serverTest().extend<{
@@ -45,9 +47,60 @@ test("service graph declares and pulls", async ({ cards, desk }) => {
   expect(state.agent("agent").metadata.name).toBe("support-agent");
   expect(() => state.data("model")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
   expect(() => state.prompt("model")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
-  const [artifact] = state.artifacts("model");
-  expect(artifact.relative_path).toBe("support-model.bin");
-  expect(readFileSync(artifact.local_path)).toEqual(readFileSync(fixture("cards/declare_and_pull/support-model.bin")));
+  expect(readFileSync(join(bundle, "cards/model/artifacts/support-model.bin"))).toEqual(
+    readFileSync(fixture("cards/declare_and_pull/support-model.bin")),
+  );
+  expect("artifacts" in state).toBe(false);
+});
+
+test("runs the Quickstart script from a directory holding only its Cards", async ({ server: _ }) => {
+  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
+  for (const file of ["no-refund-promise.yaml", "support-reply.yaml"]) cpSync(join(QUICKSTART, file), join(reader, file));
+  const ref = (kind: string, name: string) => `default/${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
+  const printed = () =>
+    execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
+
+  const first = printed();
+  expect(first).toMatch(
+    new RegExp(
+      `^passed: the comparison held\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "no-refund-promise")}\\n` +
+        `failed: operator NotContains returned false\\n  subject:  ${ref("Service", "support-reply")}\\n  verifier: ${ref("Verifier", "no-refund-promise")}\\n$`,
+    ),
+  );
+  expect(printed()).toBe(first);
+  expect(readdirSync(reader).sort()).toEqual(["no-refund-promise.yaml", "support-reply.yaml"]);
+});
+
+test("declares a ready verification state", async ({ server, model: _ }) => {
+  const quickstart = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-"));
+  cpSync(QUICKSTART, quickstart, { recursive: true });
+  const service = join(quickstart, "support-reply.yaml");
+
+  const state = await WyrdState.declare(service);
+  const run = state.run();
+  const passed = await run.observe.verify("no-refund-promise", { answer: "Your refund request is approved." });
+  const failed = await run.observe.verify("no-refund-promise", { answer: "You have a guaranteed refund." });
+  expect([passed.outcome.verdict, failed.outcome.verdict]).toEqual(["passed", "failed"]);
+  expect((await WyrdState.declare(service)).rootRef).toEqual(state.rootRef);
+
+  const reader = WyrdClient.connect({ credential: server.scopedApiKey("quickstart_reader", ["cards:read"]) });
+  await expect(WyrdState.declare(service, { client: reader })).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
+  const verifier = join(quickstart, "no-refund-promise.yaml");
+  writeFileSync(verifier, readFileSync(verifier, "utf8").replace("expected: guaranteed refund", "expected: guaranteed"));
+  await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_REGISTRY_409_SPEC_DRIFT" });
+  rmSync(verifier);
+  await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_LOADER_400_INVALID_ENVELOPE" });
+
+  // A caller-owned bundle stays after the state and loads offline.
+  const bundle = bundleDir();
+  const desk = await WyrdState.declare(DESK, { bundleDir: bundle });
+  expect(desk.model("model").metadata.name).toBe("support-model");
+  expect(WyrdState.fromPath(bundle).rootRef).toEqual(desk.rootRef);
+  expect(readFileSync(join(bundle, "cards/model/artifacts/support-model.bin"))).toEqual(
+    readFileSync(fixture("cards/declare_and_pull/support-model.bin")),
+  );
 });
 
 test("latest version resolves to the declared card", async ({ cards, desk }) => {

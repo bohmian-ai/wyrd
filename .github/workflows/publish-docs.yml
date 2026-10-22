@@ -13,6 +13,12 @@ on:
     branches: [main]
     paths:
       - docs/**
+      # Pages embed tested examples and generate reference from these sources;
+      # the same inputs select the docs check in .github/scripts/select-ci.py.
+      - examples/**
+      - openapi.yaml
+      - crates/**/src/**/*.rs
+      - sdks/**/src/**/*.rs
       # The header shows the workspace version; a release bump redeploys it.
       - Cargo.toml
       - .github/workflows/publish-docs.yml

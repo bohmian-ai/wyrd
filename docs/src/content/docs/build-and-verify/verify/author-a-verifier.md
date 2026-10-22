@@ -1,6 +1,6 @@
 ---
-title: Author a Verifier
-description: Write a Verifier Card from its inputs and requirements, starting with a one-line assertion and working up to a model judge that cites a document.
+title: Write a Verifier
+description: Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 pillar: wyrd
 section: Build and verify
 topic: Verify
@@ -8,58 +8,103 @@ order: 0
 status: runnable
 ---
 
-A Verifier is a YAML Card that says what evidence it takes and what must be true of it. This page builds the three Verifiers from the support-desk example, from cheapest to most expensive: an assertion, a Python check, then a model judge that reads a document. Start with the cheapest check that can catch the failure. Only reach for a model when nothing else can decide.
+Build the Verifiers for a support desk: one assertion, one Python check, and one model judge. Each step adds a check, binds it, and shows the verdict your code gets back.
 
-Every Verifier has the same skeleton:
+You need a running server from [Set up Wyrd](/get-started/setup/). The files live in a `service/` directory next to your program.
 
-```yaml
-apiVersion: wyrd/v1
-kind: Verifier
-metadata: {name: my-check, version: 1.0.0, space: support}
-spec:
-  description: One sentence a reviewer reads in a report.
-  inputs: {}        # the named evidence your app sends
-  steps: []         # optional work before checking, such as extracting a file
-  requirements: []  # what must be true; each has one check
-```
+## 1. Write an assertion
 
-Every field is listed in the [Verifier Card reference](/reference/verifier-card/).
-
-## 1. Assert on a value
-
-The cheapest Verifier is one assertion. `no-refund-promise` takes the agent's answer as JSON and fails if it contains a phrase:
+A Verifier names the evidence it takes and what must be true of it. This one fails any answer that promises a guaranteed refund:
 
 <CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
 
-What each part does:
+An assertion runs no model, so its verdict is deterministic and returns in milliseconds. Every field is listed in the [Verifier Card reference](/reference/verifier-card/).
 
-- `inputs.answer` names a slot. Your app fills it when it calls `verify("no-refund-promise", answer)`. `type: json` accepts any JSON value; add `schema` to constrain it.
-- `requirements` is a list. Each requirement has an `id`, a `statement` a human reads in the result, and one `check`.
-- `kind: assert` compares the value at `path` with `operator` and `expected`. No model runs, so the result is deterministic and returns in milliseconds.
+## 2. Bind it and check it
 
-`path` can reach inside a value, such as `inputs.ticket.order_id`. To check every item of a list, use `each: inputs.items[*].price` in place of `path`; the requirement passes only if every item does.
+A Verifier runs only on what it is bound to. Add it under `verified_by` in your Service:
 
-## 2. Check with Python
+```yaml title="service/support-desk.yaml"
+spec:
+  verified_by:
+    - verifier: ./no-refund-promise.yaml  # runs on the Service itself
+```
 
-When one operator cannot express the rule, write it in Python. `ticket-complete` names every field the help desk needs that is missing:
+Check every file without declaring anything:
+
+```bash
+wyrd declare --check service/support-desk.yaml
+```
+
+A misspelled field or a reference to a slot that does not exist fails here, naming the field.
+
+## 3. Call it and read the verdict
+
+Open a Run for each request your app handles, and verify the answer inside it:
+
+```python title="app.py"
+from wyrd import WyrdState
+
+state = WyrdState.declare("service/support-desk.yaml")  # declares only what changed
+
+with state.run() as run:  # one Run per request; everything inside is tied to it
+    answer = support_agent("Can I get my money back?")  # your agent's own code
+    # answer= fills the Verifier's answer slot; verify waits for the verdict
+    result = run.observe.verify("no-refund-promise", answer=answer)
+
+print(result.verdict)
+for requirement in result.requirements:  # one outcome and reason per requirement
+    print(requirement["id"], requirement["outcome"], requirement["reason"])
+```
+
+```bash
+uv run python app.py
+```
+
+```text
+passed
+no-refund-promise passed ...
+```
+
+A `failed` verdict is an ordinary return, not an exception: the check ran and the answer broke the rule.
+
+## 4. Add a Python check
+
+When one operator cannot express the rule, write it in Python. This Verifier names every field a ticket is missing:
 
 <CodeFromFile file="examples/support-desk-app/service/ticket-complete.yaml" lang="yaml" title="service/ticket-complete.yaml" />
 
-The function named by `entrypoint` receives the `inputs` you map to it and returns a verdict:
+The function must return the requirement's [verdict](/reference/verifier-card/#verdicts-and-citations), with exactly these fields:
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `passed`, `failed`, `inconclusive`, or `not_applicable` |
-| `reason` | One sentence that ends up in the result |
+| `outcome` | `passed`, `failed`, or `inconclusive` |
+| `reason` | One sentence shown in the result |
 | `citations` | Where in the evidence the decision rests, as `{slot, locator}` |
 
-The code runs in Wyrd's sandbox, not in your app. Keep it to the decision; anything with side effects belongs in your app.
+Any other shape, or an exception, makes the requirement `inconclusive`, and so does a `passed` outcome without a citation. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
 
-A `passed` verdict must cite the evidence it read. Here `{"json_pointer": ""}` cites the whole ticket. A `passed` verdict with no valid citation is recorded as `inconclusive`, so a check cannot pass without showing its work.
+Tickets come from the agent, so bind this Verifier to the agent component rather than the whole Service:
 
-## 3. Judge a document with a model
+```yaml title="service/support-desk.yaml"
+spec:
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./ticket-complete.yaml
+```
 
-Some rules need judgment. The support agent writes a refund decision letter, and `follows-policy` asks a model whether the letter follows the refund policy. This takes three Cards: the Verifier, the judge Agent, and the Service that binds the Verifier to the support agent.
+Verify on the Run's view of that component, inside the same `with` block:
+
+```python
+result = run.for_card("agent").observe.verify("ticket-complete", ticket={"answer": answer, "order_id": "A-1001"})
+print(result.verdict)  # passed
+```
+
+## 5. Add a model judge
+
+Some rules need judgment. `follows-policy` asks a model whether a refund decision letter follows the refund policy, which lives in the judge Agent's prompt:
 
 <Tabs>
 <Tab label="follows-policy.yaml">
@@ -72,45 +117,30 @@ Some rules need judgment. The support agent writes a refund decision letter, and
 <CodeFromFile file="examples/support-desk-app/service/policy-judge.yaml" lang="yaml" title="service/policy-judge.yaml" />
 
 </Tab>
-<Tab label="support-desk.yaml">
-
-<CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
-
-</Tab>
 </Tabs>
 
-Read it top to bottom:
+The judge calls its model through your server's [LLM gateway](/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its `response_format` must be the same verdict schema, or declaring the Verifier fails. Bind `follows-policy` beside `ticket-complete` on the agent.
 
-1. `inputs.letter` is a `media` slot. It accepts only Markdown files up to 1 MiB, so a PDF or a 50 MB upload is refused before any model runs.
-2. The `read-letter` step extracts the file into `{format, text}`. A `{{letter}}` placeholder takes text, not a file, so the letter goes through `extract` first. Steps run before requirements, and a requirement reads a step's result as `steps.read-letter.output`.
-3. The `agent` check sends the requirement's statement and the extracted letter to `policy-judge`. Those names fill `{{claim}}` and `{{letter}}` in the judge's prompt.
-4. `policy-judge` has the policy in its system message and a closed `response_format`, so the model can only answer with an outcome, a reason, and citations at lines of the letter.
+A model call takes seconds, so submit the letter and collect the verdict later instead of waiting in the request:
 
-The policy lives in the judge, not in the request. Your app sends only the letter, and every verdict is tied to the exact judge version, and so the exact policy, that produced it. A new policy is a new `policy-judge` version.
+```python
+from wyrd import verify
 
-A model call takes seconds, so the app [submits this Verifier](/build-and-verify/observe/record-a-run-and-observations/) in the background instead of waiting on it in the request.
-
-## 4. Check it before you declare
-
-`wyrd declare --check` loads every Card a Service references, follows the `./` paths, and validates each one without writing anything:
-
-```bash
-wyrd declare --check service/support-desk.yaml
+# inside the same with block
+execution = run.for_card("agent").observe.submit("follows-policy", letter=verify.File("letter.md"))
+result = execution.wait(timeout=60)  # or later, from any process: verify.Execution.connect(id)
+print(result.verdict)  # passed
 ```
 
-```text
-plan valid: 7 card(s)
-```
+## If it fails
 
-The CLI then lists each Card it would declare. A broken Verifier fails here with the field that is wrong:
+| You see | Fix |
+| --- | --- |
+| `WYRD_REGISTRY_400_INVALID_CARD_SPEC` naming an unknown field | Fix the spelling against the [Verifier Card reference](/reference/verifier-card/) |
+| `WYRD_SPEC_400_VALIDATION` with rule `unknown_reference` | Match the slot or step `id` the reference names |
+| `WYRD_SDK_404_UNKNOWN_VERIFIER` | Verify on the view the Verifier is bound to: `run` for the Service, `run.for_card("agent")` for the agent |
+| `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` from the judge | Create the deployment the judge's `execution_route` names, as in [LLM gateway](/connect/set-up-the-llm-gateway/) |
 
-| You see | Cause | Fix |
-| --- | --- | --- |
-| `WYRD_REGISTRY_400_INVALID_CARD_SPEC` naming an unknown field | A misspelled key; Verifier specs reject fields they do not define | Fix the spelling against the [reference](/reference/verifier-card/) |
-| `WYRD_SPEC_400_VALIDATION` with rule `unknown_reference` | A reference to an input, step, or requirement that does not exist, such as `steps.read-leter.output` | Match the slot or step `id` |
-| `WYRD_SPEC_400_VALIDATION` with rule `duplicate_id` | A step and a requirement share an `id` | IDs are unique across the whole Verifier |
-| `WYRD_SPEC_400_VALIDATION` with rule `media_as_text` | A `media` slot is passed straight to an Agent text placeholder | Add an `extract` step and pass `steps.<id>.output`, as in step 3 |
-| `WYRD_SPEC_400_VALIDATION` with rule `extract_format` | An `extract` step reads a slot that accepts a format extraction cannot read, such as `png` | Accept only PDF, text, Markdown, CSV, JSON, HTML, DOCX, XLSX, or PPTX in that slot |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | `apiVersion`, `kind`, or `metadata` is missing or misspelled | Copy the skeleton above |
+## Next
 
-Then [bind the Verifier](/build-and-verify/declare/bind-a-verifier/) to a component and [call it from your app](/build-and-verify/verify/verify-a-request-in-real-time/).
+Copy a check for your own case from [Recipes](/build-and-verify/verify/verifier-recipes/).

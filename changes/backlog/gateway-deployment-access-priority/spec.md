@@ -49,7 +49,7 @@ None. The queue storage/wake mechanism and exact administrative configuration sh
 
 ## Authority and revision
 
-- `AGENTS.md` §§2, 9, 11; `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`; `architecture/operations/reliability-and-recovery.md`; `changes/active/wyrd-gateway-port/spec.md`.
+- `AGENTS.md`; `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`; `architecture/operations/reliability-and-recovery.md`; `changes/active/wyrd-gateway-port/spec.md`.
 - Provider quota grounding: [Gemini API rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) and [Vertex Provisioned Throughput](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/provisioned-throughput/measure-provisioned-throughput).
 - Example fallback provider grounding: [Z.AI GLM Chat Completions](https://docs.z.ai/guides/capabilities/mcp-call). A supported request must still qualify through Wyrd's actual adapter and operation checks.
 - Revision 1 — draft, 2026-09-25: team-isolated RBAC, optional authorized selection, and production admission.

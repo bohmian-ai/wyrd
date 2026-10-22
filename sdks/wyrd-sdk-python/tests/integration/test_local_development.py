@@ -9,6 +9,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import http.client
 import json
@@ -35,6 +36,10 @@ import httpx
 import openai
 import pytest
 import tomllib
+import yaml
+from mcp import Client, StdioServerParameters
+from mcp.shared.exceptions import MCPError
+from mcp.types import TextContent
 from opentelemetry import trace
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost
@@ -451,7 +456,7 @@ PROVIDER_KEY_VARIABLES = (
     "GEMINI_API_KEY",
     "TYPESAFE_API_KEY",
 )
-"""Provider keys ``wyrd server dev`` offers; removed so only a test opts in to the offer."""
+"""Provider keys ``wyrd init`` offers; removed so only a test opts in to the offer."""
 
 
 @contextmanager
@@ -523,7 +528,7 @@ def installed_local_cli(
 ) -> Iterator[None]:
     """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends.
 
-    ``extra`` appends further ``server dev`` arguments, such as a gateway file.
+    ``extra`` appends further ``wyrd init`` arguments, such as a gateway file.
     """
     command_env = dict(env)
     master, slave = pty.openpty() if terminal else (-1, -1)
@@ -532,7 +537,7 @@ def installed_local_cli(
         command_env["CODEX_HOME"] = str(home / "codex")
     with tempfile.TemporaryFile(mode="w+") as errors:
         child = subprocess.Popen(
-            [cli_path, "server", "dev", "--tenant", tenant, *extra],
+            [cli_path, "init", "--tenant", tenant, *extra],
             cwd=home,
             env=command_env,
             stdin=slave if terminal else subprocess.DEVNULL,
@@ -892,7 +897,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
             via = f"http://127.0.0.1:{proxy.server_address[1]}"
             try:
                 failed = subprocess.run(
-                    [cli_path, "server", "dev", "--tenant", "acme", "--gateway-file", str(lost)],
+                    [cli_path, "init", "--tenant", "acme", "--gateway-file", str(lost)],
                     cwd=home,
                     env={
                         **env,
@@ -977,7 +982,7 @@ def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], se
     master, slave = pty.openpty()
     try:
         child = subprocess.Popen(
-            [cli_path, "server", "dev"],
+            [cli_path, "init"],
             cwd=home,
             env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
             stdin=slave,
@@ -1043,7 +1048,7 @@ def restart_on_another_listener(
     key = tomllib.loads(protected.read_text())["default"]["api_key"]
     master, slave = pty.openpty()
     child = subprocess.Popen(
-        [cli_path, "server", "dev", "--bind", rebound],
+        [cli_path, "init", "--bind", rebound],
         cwd=home,
         env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
         stdin=slave,
@@ -1095,7 +1100,7 @@ def test_installed_cli_guided_setup() -> None:
         database = env.pop("WYRD_DATABASE_URL")
         env.update(secrets)
         unattended = subprocess.run(
-            [cli_path, "server", "dev", "--non-interactive"],
+            [cli_path, "init", "--non-interactive"],
             cwd=home,
             env=env,
             capture_output=True,
@@ -1110,7 +1115,7 @@ def test_installed_cli_guided_setup() -> None:
         master, slave = pty.openpty()
         stderr = tempfile.TemporaryFile()  # noqa: SIM115 - read after the child exits
         child = subprocess.Popen(
-            [cli_path, "server", "dev"],
+            [cli_path, "init"],
             cwd=home,
             env={**env, "HOME": str(home), "CODEX_HOME": str(home / "codex")},
             stdin=slave,
@@ -1168,6 +1173,149 @@ def test_installed_cli_guided_setup() -> None:
         assert not any(value.encode() in protected for value in secrets.values())
         restart_on_another_listener(cli_path, home, env, listed)
     unattended_terminal_offers_no_hosts(cli_path)
+
+
+def read_setup_prompt(cli_path: str, home: Path, env: dict[str, str]) -> str:
+    """Read the MCP ``setup`` prompt as a host does: the official client over the installed proxy.
+
+    Only the ``setup`` prompt is listed, it takes no arguments, and other names
+    or any argument are refused.
+    """
+    proxy = StdioServerParameters(command=cli_path, args=["mcp", "proxy"], env=env, cwd=home)
+
+    async def read() -> str:
+        async with Client(proxy) as host:
+            listed = (await host.list_prompts()).prompts
+            assert [prompt.name for prompt in listed] == ["setup"]
+            assert not listed[0].arguments
+            for name, arguments in (("start", None), ("setup", {"language": "rust"})):
+                with pytest.raises(MCPError):
+                    await host.get_prompt(name, arguments)
+            [message] = (await host.get_prompt("setup")).messages
+            assert message.role == "user"
+            assert isinstance(message.content, TextContent)
+            return message.content.text
+
+    return asyncio.run(read())
+
+
+@pytest.mark.local_dev
+def test_guided_setup_prompt_surfaces() -> None:
+    """The installed Python CLI and an authenticated MCP host agree on the setup prompt.
+
+    ``wyrd init --print-prompt`` prints the release-labelled prompt with no
+    deployment, configuration, or server, and refuses setup options. Once
+    ``wyrd init`` is ready, a host connected through ``wyrd mcp proxy`` with
+    the saved local credential reads the same bytes from the ``setup`` prompt.
+    """
+    cli_path = os.environ.get("WYRD_TEST_INSTALLED_CLI", str(Path(sys.executable).parent / "wyrd"))
+    with local_deployment() as (home, env):
+        printed = subprocess.run(
+            [cli_path, "init", "--print-prompt"], cwd=home, env=env, capture_output=True, text=True
+        )
+        assert printed.returncode == 0 and printed.stderr == "", printed.stderr
+        release = subprocess.check_output([cli_path, "--version"], text=True).split()[1]
+        assert printed.stdout.startswith(f"# Wyrd {release} setup\n\n")
+        assert not (home / "wyrd/config.toml").exists(), "printing saved nothing"
+        refused = subprocess.run(
+            [cli_path, "init", "--print-prompt", "--format", "json"],
+            cwd=home,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert refused.returncode == os.EX_USAGE and refused.stdout == ""
+        with installed_local_cli(cli_path, home, env, ""):
+            assert read_setup_prompt(cli_path, home, env) == printed.stdout
+
+
+QUICKSTART_RUNNERS = {
+    "python": lambda root: [sys.executable, "quickstart.py"],
+    "rust": lambda root: [
+        *("mise", "exec", "--", "cargo", "run", "--locked", "-q"),
+        *("--manifest-path", str(root / "Cargo.toml"), "-p", "wyrd-rust-examples"),
+        *("--bin", "quickstart"),
+    ],
+    "typescript": lambda root: ["node", str(root / "examples/quickstart/quickstart.ts")],
+}
+"""Language → the command a reader runs in a directory holding the Quickstart files."""
+
+
+GET_SERVICE = "wyrd get --space default --kind Service --name support-reply --version 1.0.0"
+"""The Quickstart's published command that reads the Service, whose ``metadata.uid`` the query needs."""
+
+QUERY_VERDICTS = "wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql"
+"""The Quickstart's published query command, naming the default address ``wyrd init`` prints."""
+
+
+def stored_verdicts(cli_path: str, reader: Path, env: dict[str, str], sql: str) -> dict[str, set]:
+    """Read the stored verdicts as the Quickstart publishes it: ``wyrd get``, then ``wyrd query``.
+
+    ``sql`` is the published query; ``<uid>`` becomes the Service UID that
+    ``wyrd get`` prints, and the query names this deployment's address. Rows are polled for up to a minute, as the page says,
+    and grouped by Run.
+    """
+    shown = subprocess.run(
+        [cli_path, *GET_SERVICE.split()[1:]], cwd=reader, env=env, capture_output=True, text=True
+    )
+    assert shown.returncode == 0, shown.stderr
+    (reader / "stored-verdicts.sql").write_text(
+        sql.replace("<uid>", yaml.safe_load(shown.stdout)["metadata"]["uid"])
+    )
+    endpoint = f"http://{env['WYRD_SERVER_BIND']}"
+    query = [cli_path, *QUERY_VERDICTS.replace("http://127.0.0.1:8080", endpoint).split()[1:]]
+    deadline = time.monotonic() + 60
+    while True:
+        answered = subprocess.run(query, cwd=reader, env=env, capture_output=True, text=True)
+        assert answered.returncode == 0, answered.stderr
+        runs: dict[str, set] = {}
+        for line in answered.stdout.splitlines():
+            row = json.loads(line)
+            runs.setdefault(row["run_id"], set()).add(row["verdict"])
+        if {"passed", "failed"} in runs.values() or time.monotonic() > deadline:
+            return runs
+        time.sleep(0.5)
+
+
+@pytest.mark.local_dev
+@pytest.mark.parametrize("language", QUICKSTART_RUNNERS)
+def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
+    """The manual path the setup prompt also follows stores one Run's two verdicts.
+
+    After ``wyrd init``, the Quickstart program runs from a directory holding
+    only its Card files with the saved local setup and no model key, prints a
+    passed and a failed verdict for the Service, and the prompt's ``cards.get``
+    and the published ``wyrd get`` and ``wyrd query`` readback finds both
+    verdicts under one stored Run. The Quickstart page publishes that readback,
+    Setup's Manual tab links to it, and its query is the setup prompt's.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    example = root / "examples/quickstart"
+    reader = tmp_path / "project"
+    reader.mkdir()
+    for name in ("no-refund-promise.yaml", "support-reply.yaml", "quickstart.py"):
+        shutil.copy(example / name, reader)
+    prompt = subprocess.check_output([cli_path, "init", "--print-prompt"], text=True)
+    sql = (example / "stored-verdicts.sql").read_text()
+    assert sql.splitlines()[-1] == prompt.split("```sql\n", 1)[1].split("```", 1)[0].strip()
+    docs = root / "docs/src/content/docs/get-started"
+    quickstart = (docs / "quickstart.md").read_text()
+    assert GET_SERVICE in quickstart and QUERY_VERDICTS in quickstart
+    assert 'file="examples/quickstart/stored-verdicts.sql"' in quickstart
+    assert (
+        "/get-started/quickstart/#3-confirm-the-stored-verdicts" in (docs / "setup.md").read_text()
+    )
+    with local_deployment() as (home, env), installed_local_cli(cli_path, home, env, ""):
+        ran = subprocess.run(
+            QUICKSTART_RUNNERS[language](root), cwd=reader, env=env, capture_output=True, text=True
+        )
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+        verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]
+        assert verdicts == ["passed", "failed"], ran.stdout
+        assert "  subject:  default/Service/support-reply@1.0.0#" in ran.stdout
+        runs = stored_verdicts(cli_path, reader, env, sql)
+        assert {"passed", "failed"} in runs.values(), runs
 
 
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")

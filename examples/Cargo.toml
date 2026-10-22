@@ -1,0 +1,55 @@
+[package]
+name = "wyrd-rust-examples"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Runnable Wyrd Rust examples, and the journeys that run each docs example binary."
+
+# The quickstart's Rust reference app, compiled here against the public SDK.
+[lib]
+name = "support_desk_app"
+path = "support-desk-app/rust/lib.rs"
+
+[[bin]]
+name = "transport_grpc"
+path = "rust/transport_grpc.rs"
+
+[[bin]]
+name = "transport_http"
+path = "rust/transport_http.rs"
+
+[[bin]]
+name = "client_request"
+path = "rust/client_request.rs"
+
+[[bin]]
+name = "quickstart"
+path = "quickstart/quickstart.rs"
+
+[[bin]]
+name = "support_desk"
+path = "support-desk/rust/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+wyrd-ai = { path = "../sdks/wyrd-sdk-rust", features = ["otel"] }
+
+[dev-dependencies]
+workspace-hack.workspace = true
+# The journeys run each docs example binary against a real server.
+secrecy = { workspace = true }
+wyrd-testing = { workspace = true }
+
+[lints]
+workspace = true

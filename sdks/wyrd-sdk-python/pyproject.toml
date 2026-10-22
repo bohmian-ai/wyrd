@@ -63,6 +63,8 @@ dev = [
     "mcp>=2.3.0",
     "openai-agents>=0.23.1",
     "pydantic-ai-slim[mcp]>=2.56.0",
+    "gunicorn>=23.0.0",
+    "opentelemetry-instrumentation-asgi>=0.48b0",
 ]
 
 [tool.maturin]

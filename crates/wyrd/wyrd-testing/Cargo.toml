@@ -117,9 +117,7 @@ wyrd-tls = { workspace = true }
 
 wiremock = { workspace = true }
 
-# The release-server launcher reads host and process usage on macOS.
-[target.'cfg(target_os = "macos")'.dependencies]
-libproc = { workspace = true }
+# The release-server launcher reads host and process usage.
 sysinfo = { workspace = true }
 
 [dev-dependencies]

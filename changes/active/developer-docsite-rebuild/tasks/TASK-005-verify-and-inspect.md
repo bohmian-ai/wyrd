@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: proposed
+status: superseded
 spec: SPEC-developer-docsite-rebuild
 spec_revision: 2
 requirements: [REQ-003, REQ-005, REQ-006, REQ-007, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, AC-001, AC-003, AC-004, AC-005, AC-006]
@@ -9,6 +9,14 @@ depends_on: [TASK-003, TASK-004]
 parent_task:
 remediates: []
 ---
+
+## Supersession — 2026-10-20
+
+Remaining documentation work is owned by
+[SPEC-docsite-incremental-reset revision 2](../../docsite-incremental-reset/spec.md)
+and its four tasks. Preserve this task's historical implementation evidence;
+this status does not assert completion or revoke the retained brand, platform,
+navigation, or accessibility commitments.
 
 ## Outcome and Value
 
@@ -79,8 +87,8 @@ produce the approved attributable result without new Wyrd behavior.
 - [Approved specification](../spec.md)
 - [Repository instructions](../../../../AGENTS.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)
-- [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
-- [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+- [Wyrd doctrine](../../../../architecture/wyrd-design.md)
+- [Testing workflow](../../../../TESTING.md)
 
 ## MCP investigation slice evidence
 

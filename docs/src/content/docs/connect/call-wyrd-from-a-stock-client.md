@@ -1,9 +1,10 @@
 ---
-title: Make gateway requests from a framework
+title: Gateway from any client
 description: Run inference through a named Wyrd gateway deployment from the OpenAI, Anthropic, and Google GenAI SDKs, the OpenAI Agents SDK, and Pydantic AI.
 pillar: wyrd
 section: Connect
 order: 2
+draft: true
 status: runnable
 ---
 
@@ -15,7 +16,7 @@ The transport is `wyrd.http_auth` in Python, an `httpx.Auth` that also works as 
 
 - A deployment for each model you call. The examples use `openai-prod`, `claude-prod`, and `gemini-team` from [Set up the LLM gateway](/connect/set-up-the-llm-gateway/). Swap in your own deployment names.
 - The capture policy from [step 5 of the setup](/connect/set-up-the-llm-gateway/#set-up-one-provider). Calls run without it, but none are recorded, so [Check that the call was recorded](#check-that-the-call-was-recorded) finds nothing.
-- A Wyrd credential the client can find: the config `wyrd server dev` saves, `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or a saved `wyrd auth login`.
+- A Wyrd credential the client can find: the config `wyrd init` saves, `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or a saved `wyrd auth login`.
 - Python: `pip install 'wyrd-ai[gateway]'`, plus the SDK or framework you use. These examples were checked with `openai` 3.14, `anthropic` 1.6, `google-genai` 2.30, `openai-agents` 0.23, and `pydantic-ai-slim` 2.56.
 - TypeScript: `npm install wyrd-ai`, plus `openai` or `@anthropic-ai/sdk`.
 
@@ -217,7 +218,7 @@ This prints `404 WYRD_GATEWAY_404_MODEL_UNAVAILABLE` and the request ID. The com
 | `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | No deployment by that name serves the operation | Check the part before `/` against `wyrd gateway deployment list`. |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | Your principal isn't allowed that model | Ask a tenant admin for access, or call a deployment you're granted. |
 | `WYRD_AUTH_400_BAD_TOKEN_FORMAT` | The request carried a provider key instead of a Wyrd credential | Pass `http_client` with `wyrd.http_auth` (or `fetch: wyrd.httpAuth`). Without it the SDK sends `"wyrd"` as a key. |
-| `WYRD_CLIENT_401_NO_CREDENTIALS` | The transport found no Wyrd credential | Start `wyrd server dev`, or set `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`. |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` | The transport found no Wyrd credential | Start `wyrd init`, or set `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`. |
 
 [Set up the LLM gateway](/connect/set-up-the-llm-gateway/#when-a-call-is-refused) covers credential and deployment failures.
 

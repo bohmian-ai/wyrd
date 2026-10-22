@@ -2,7 +2,7 @@
 
 Wyrd keeps a complete tracked packet while a change is active and one compact
 record after it is complete. The normative workflow is
-[`spec-driven-development.md`](../architecture/references/languages/spec-driven-development.md).
+[`spec-driven-development.md`](spec-driven-development.md).
 
 ```text
 changes/

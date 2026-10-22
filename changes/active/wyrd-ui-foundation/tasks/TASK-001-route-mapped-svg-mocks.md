@@ -56,8 +56,8 @@ Wyrd-owned surfaces. A Verifier result identifies its actual provider. Use the
 produced by Fathom; Fathom does not relabel or visually own the whole Changes
 workspace, and a generic or external Verifier is not styled as Fathom.
 
-Also read `AGENTS.md`, `architecture/agent-rules.md`,
-`architecture/wyrd-design.md`, and `architecture/wyrd-doctrine.mdx`.
+Also read `AGENTS.md`,
+`architecture/wyrd-design.md`, and `architecture/wyrd-design.md`.
 
 Research-only references:
 

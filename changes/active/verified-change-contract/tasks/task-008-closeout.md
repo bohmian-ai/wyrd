@@ -812,15 +812,15 @@ security; needing a verification/network-policy bypass is a material blocker.
 - [TASK-008 recovery](task-008-recovery.md)
 - [TASK-012 integration closure](../integration/TASK-012-replay-operator-connections-and-delivery.md)
 - [Repository standards](../../../../AGENTS.md)
-- [Agent rules](../../../../architecture/agent-rules.md)
+- [Agent rules](../../../../AGENTS.md)
 - [Wyrd protocol](../../../../architecture/wyrd-design.md)
-- [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
+- [Wyrd doctrine](../../../../architecture/wyrd-design.md)
 - [Bifrost architecture and telemetry](../../../../architecture/bifrost-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
-- [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
-- [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
-- [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
-- [Telemetry observations](../../../../architecture/references/domain/telemetry-observations.md)
+- [Spec-driven development](../../../../changes/spec-driven-development.md)
+- [Implementation execution](../../../../changes/implementation-execution.md)
+- [Testing workflows](../../../../TESTING.md)
+- [Telemetry observations](../../../../.agents/skills/wyrd-advise/references/telemetry-observations.md)
 
 Primary profiling references for the documented commands:
 

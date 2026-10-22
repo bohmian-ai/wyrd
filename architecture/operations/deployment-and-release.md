@@ -14,6 +14,10 @@ contain multiple replicas and role-targeted pods behind one gateway.
 | Cloud SaaS | Multi-tenant | Shared serving fleet with full tenant separation in identity, RLS, object paths, encryption, resource admission, audit, telemetry, and generated artifacts |
 | Enterprise cloud | One tenant per deployment | The same server and protocol contracts, isolated storage and keys, and no in-tree commercial feature or compatibility fork |
 
+Every topology keeps the platform login and pool. Self-hosted deployments
+provision and recover tenants through it, Cloud SaaS keeps it a small audited
+pool, and enterprise cloud holds it as a break-glass credential.
+
 Replicas may enable a subset of server roles through the canonical target
 configuration. Targeting changes activated subsystems and resource ownership;
 it does not create another public service, protocol, or durable contract.
@@ -179,7 +183,8 @@ The release pipeline must:
    contract.
 2. Acquire one deployment-scoped migration lease.
 3. Verify the source schema and application compatibility range.
-4. Apply Wyrd and Vala migrations in their declared order.
+4. Apply `wyrd_sql::migrate`, then `vala_sql::migrate`, so tenant-aware
+   `vala.*` rows can reference Wyrd control-plane state. Skald has no step.
 5. Verify schema invariants, RLS policies, role grants, required sentinels, and
    migration checksums.
 6. Exit the migrate process. Application replicas re-verify migration
@@ -290,15 +295,22 @@ release, refuses one outside the CLI's caret-compatible version line, and
 verifies the signature and bundle digest before extracting into a staging
 directory that becomes runnable only by an atomic rename and link swap; a
 bundle without the server or the UI payload never replaces the current
-installation. `wyrd server dev` runs the UI on the system Node.js (26 or
+installation. `wyrd init` runs the UI on the system Node.js (26 or
 newer) at `WYRD_UI_BIND` (default `127.0.0.1:3000`), whose address is the
 browser's public origin; the BFF forwards the browser's `/auth` requests to
 the server.
 Rotating the signing key requires a CLI release that embeds the new key.
-`wyrd server dev` runs the installed bundle with inputs resolved as argument,
+`wyrd init` runs the installed bundle with inputs resolved as argument,
 environment, saved `[dev]` setting, then prompt, saves them before any tenant
 key is issued, and pins storage and Bifrost data to absolute paths so a restart
-from any directory reuses the same tenant, key, and data.
+from any directory reuses the same tenant, key, and data. Ordinary `wyrd init`
+starts no coding agent. Only the explicit `wyrd init guided` starts one
+user-selected agent, after readiness and its MCP connection, on the terminal,
+with the agent's own permissions and approvals. Wyrd owns that one child: it
+reports the agent's exit and keeps serving, and on interruption or an
+unexpected server or UI exit it stops and reaps the agent before the bounded
+server and UI shutdown, then restores the terminal. It never stops other
+editor or agent processes. Wyrd is not an agent runtime.
 
 ## Release evidence
 

@@ -120,10 +120,10 @@ out of other tenants' rows without a Wyrd-provisioned role or grant.
 ## Authority Links
 
 `changes/active/local-server-bootstrap/spec.md` revision 3;
-`AGENTS.md` §§2, 9, 11; `architecture/agent-rules.md`;
+`AGENTS.md`; `AGENTS.md`;
 `architecture/operations/deployment-and-release.md`;
 `architecture/wyrd-security-posture.md`;
-`architecture/v1/00-foundations/tenancy.md`.
+`crates/wyrd/wyrd-sql/AGENTS.md`.
 
 ## Implementation Evidence
 

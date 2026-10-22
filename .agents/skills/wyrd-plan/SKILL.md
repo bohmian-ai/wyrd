@@ -17,11 +17,10 @@ to `$wyrd-spec`.
 
 ## Establish authority
 
-Require an explicitly approved `changes/active/<slug>/spec.md`. Read `AGENTS.md`,
-[agent rules](../../../architecture/agent-rules.md),
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-[implementation execution](../../../architecture/references/languages/implementation-execution.md),
-and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
+Require an explicitly approved `changes/active/<slug>/spec.md`. Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touches,
+[spec-driven development](../../../changes/spec-driven-development.md),
+[implementation execution](../../../changes/implementation-execution.md),
+and [testing](../../../TESTING.md).
 Follow the shared maintainer-approval and independent-comprehension guidance in
 spec-driven development.
 Load only applicable architecture references. Follow CodeGraph instructions and

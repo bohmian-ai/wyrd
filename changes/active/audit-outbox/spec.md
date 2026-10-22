@@ -235,7 +235,7 @@ None for revision 4.
 
 ## Authority links
 
-- `AGENTS.md` §2 (audit is non-blocking, one write path, one publisher)
+- `AGENTS.md` (audit is non-blocking, one write path, one publisher)
 - `architecture/wyrd-design.md` (principal model, audit path)
 - `architecture/bifrost-design.md` (Gate, Oracle audit)
 

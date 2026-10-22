@@ -69,3 +69,4 @@ openapi.yaml.tmp
 changes/**/review/**/*.diff
 changes/**/review/**/*.patch
 changes/**/review/**/*.tar.gz
+/.wyrd

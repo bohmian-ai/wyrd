@@ -831,16 +831,13 @@ None.
 ## Material authority links
 
 - `AGENTS.md`
-- `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/wyrd-security-posture.md`
 - `architecture/operations/README.md`
 - `architecture/operations/deployment-and-release.md`
-- `architecture/references/doctrine/architecture-constraints.md`
-- `architecture/references/languages/spec-driven-development.md`
-- `architecture/references/domain/evaluation.md`
-- `architecture/references/domain/drift-monitoring.md`
+- `changes/spec-driven-development.md`
+- `.agents/skills/wyrd-advise/references/evaluation.md`
+- `.agents/skills/wyrd-advise/references/drift-monitoring.md`
 - `architecture/bifrost-design.md`
 - `changes/active/verified-change-contract/spec.md`
 - `crates/wyrd/wyrd-cli/tests/fixtures/card_lifecycle`

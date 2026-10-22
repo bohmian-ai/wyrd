@@ -1,0 +1,12 @@
+{
+  "name": "@wyrd/examples",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "wyrd-ai": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3"
+  }
+}

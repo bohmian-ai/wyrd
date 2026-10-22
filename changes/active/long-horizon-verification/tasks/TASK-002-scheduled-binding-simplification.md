@@ -163,9 +163,9 @@ Do not add tasks to the owner-approved four-task split.
 
 
 - [Approved specification, revision 13](../spec.md).
-- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md).
-- [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), [Bifrost design](../../../../architecture/bifrost-design.md).
-- [Spec workflow](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../AGENTS.md).
+- [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-design.md), [Bifrost design](../../../../architecture/bifrost-design.md).
+- [Spec workflow](../../../../changes/spec-driven-development.md), [implementation execution](../../../../changes/implementation-execution.md), [testing workflows](../../../../TESTING.md).
 - Execute with [$wyrd-implement](../../../../.agents/skills/wyrd-implement/SKILL.md); implementation returns evidence, not independent task approval.
 
 ## Implementation Evidence

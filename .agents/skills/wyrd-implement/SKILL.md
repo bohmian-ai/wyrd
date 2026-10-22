@@ -15,11 +15,11 @@ For remediation, also read the review verdict and the remediation task under
 `changes/active/<slug>/review/<review-name>/`. Treat the original task plus the
 validated findings as the contract; preserve portions already satisfying it.
 
-Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-[implementation execution](../../../architecture/references/languages/implementation-execution.md),
-[maintainer style](../../../architecture/references/languages/maintainer-style.md),
-and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
+Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touches,
+[spec-driven development](../../../changes/spec-driven-development.md),
+[implementation execution](../../../changes/implementation-execution.md),
+[maintainer style](../../../agent_docs/maintainer-style.md),
+and [testing](../../../TESTING.md).
 Load only references applicable to the changed surface. Follow CodeGraph
 instructions and inspect the nearest owner, callers, consumers, tests,
 manifests, generated projections, and `mise.toml`.

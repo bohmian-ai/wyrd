@@ -258,10 +258,10 @@ or public API, report that precise seam rather than duplicating the renderer.
 ## Authority Links
 
 `changes/active/local-server-bootstrap/spec.md` revision 7;
-`AGENTS.md` §§3, 5, 9, 11–12;
-`architecture/agent-rules.md`; `architecture/wyrd-design.md`;
-`architecture/wyrd-doctrine.mdx`;
-`architecture/references/languages/spec-driven-development.md`;
-`architecture/references/languages/implementation-execution.md`;
-`architecture/references/languages/testing-workflows.md`;
+`AGENTS.md`;
+`AGENTS.md`; `architecture/wyrd-design.md`;
+`architecture/wyrd-design.md`;
+`changes/spec-driven-development.md`;
+`changes/implementation-execution.md`;
+`TESTING.md`;
 `crates/wyrd/wyrd-server/wyrd-ui/brand/{DESIGN.md,palette.json}`.

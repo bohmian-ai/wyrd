@@ -1,5 +1,6 @@
 //! Interruptible line input from the invoking terminal, shared by local
-//! startup questions and the MCP host offer.
+//! startup questions and the MCP host offer, and the terminal handed to the
+//! coding agent guided setup starts.
 
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -97,5 +98,31 @@ impl Terminal {
         let answer = self.ask(question).await.map(SecretString::from);
         println!();
         answer
+    }
+}
+
+/// The invoking terminal's attributes saved before a child takes it over,
+/// restored once that child has been reaped so the terminal stays usable
+/// even if the child left it in raw mode.
+pub(crate) struct SavedTerminal(
+    /// Standard input's attributes as read by [`SavedTerminal::save`] before
+    /// the child started; [`SavedTerminal::restore`] writes them back.
+    Termios,
+);
+
+impl SavedTerminal {
+    /// Save standard input's terminal attributes.
+    ///
+    /// # Errors
+    /// Propagates the attribute read failure, such as standard input not
+    /// being a terminal.
+    pub(crate) fn save() -> io::Result<Self> {
+        Ok(Self(tcgetattr(io::stdin())?))
+    }
+
+    /// Restore the saved attributes; a failure leaves nothing further to
+    /// restore.
+    pub(crate) fn restore(&self) {
+        let _ = tcsetattr(io::stdin(), OptionalActions::Now, &self.0);
     }
 }

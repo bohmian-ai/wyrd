@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: superseded
 spec: SPEC-developer-docsite-rebuild
 spec_revision: 2
 requirements: [REQ-002, REQ-006, REQ-008, REQ-009, REQ-010, REQ-011, REQ-014, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006]
@@ -9,6 +9,14 @@ depends_on: [TASK-001]
 parent_task:
 remediates: []
 ---
+
+## Supersession — 2026-10-20
+
+Remaining documentation work is owned by
+[SPEC-docsite-incremental-reset revision 2](../../docsite-incremental-reset/spec.md)
+and its four tasks. Preserve this task's historical implementation evidence;
+this status does not assert completion or revoke the retained brand, platform,
+navigation, or accessibility commitments.
 
 ## Outcome and Value
 
@@ -29,7 +37,7 @@ and their landing and shell links. Also own the four Understand explanations
 those pages link to: Cards, versions, and relationships; How verification
 works; Runs, observations, and retained evidence; and Identity and
 authorization. They publish with the Get started journey. Derive every step from
-`architecture/wyrd-design.md`, `architecture/wyrd-doctrine.mdx`, and current
+`architecture/wyrd-design.md`, and current
 Wyrd contracts (`wyrd-spec` schemas, SDK declarations, CLI). Do not implement
 product behavior, simulate a verdict, invent output or timing, restore old
 articles, or alter the approved visual system.

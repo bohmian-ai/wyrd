@@ -251,7 +251,7 @@ support and equivalent focused selectors remain implementation decisions.
 - [Parent task](TASK-002-complete-startup-and-gateway-closeout.md)
 - [AGENTS.md](../../../../AGENTS.md) and [agent rules](../../../../architecture/agent-rules.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-doctrine.mdx), and [Bifrost design](../../../../architecture/bifrost-design.md)
-- [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md), [implementation execution](../../../../architecture/references/languages/implementation-execution.md), and [testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+- [Spec-driven development](../../../../changes/spec-driven-development.md), [implementation execution](../../../../changes/implementation-execution.md), and [testing workflows](../../../../TESTING.md)
 
 ## Implementation Evidence
 

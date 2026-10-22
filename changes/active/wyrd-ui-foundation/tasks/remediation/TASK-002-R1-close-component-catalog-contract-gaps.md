@@ -68,8 +68,8 @@ for `Button`, `Select`, `ChartPanel`, `Line`, and `Spark` in
   submission, chart tooltip keyboard behavior, trusted chrome exclusion, and
   all unaffected component contracts.
 
-Authority: `AGENTS.md` §§11–12; `architecture/agent-rules.md` gate-integrity
-rules; `architecture/references/languages/spec-driven-development.md` TDD and
+Authority: `AGENTS.md`; `AGENTS.md` gate-integrity
+rules; `changes/spec-driven-development.md` TDD and
 remediation rules; approved spec revision 6 REQ-128, REQ-130, REQ-131,
 INV-008, INV-021, and AC-010; original TASK-002 locked prop and catalog
 decisions.

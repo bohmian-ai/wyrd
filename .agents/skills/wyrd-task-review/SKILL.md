@@ -40,9 +40,9 @@ Require the repository root, unambiguous base and candidate commits, approved
 spec, original task, actual diff, repository rules, and available verification
 results. If the candidate changes during review, return `BLOCKED`.
 
-Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-[maintainer style](../../../architecture/references/languages/maintainer-style.md),
+Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touches,
+[spec-driven development](../../../changes/spec-driven-development.md),
+[maintainer style](../../../agent_docs/maintainer-style.md),
 and only the architecture and testing references applicable to the task. Follow
 CodeGraph instructions. Build a compact navigation map of changed symbols,
 owners, likely callers and consumers, and relevant tests, and select the
@@ -191,9 +191,9 @@ Give the repository-standards specialist the immutable subject, complete diff,
 repository root, and available verification results. Do not provide either task
 reviewer's conclusions or an intended verdict.
 
-The specialist reads `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
-and the complete applicable authority selected through the
-[reference router](../../../architecture/references/README.md). It maps every
+The specialist reads `AGENTS.md`, every nested `AGENTS.md` the diff touches,
+the applicable `agent_docs/` topic guides, and the owning sections of the
+[architecture authorities](../../../architecture/README.md). It maps every
 changed surface to its governing rules and inspects enough surrounding source,
 tests, manifests, generated artifacts, and consumers to determine compliance.
 It audits all touched languages and layers; one surface cannot stand in for
@@ -222,7 +222,7 @@ the review. Preserve its report as `standards-review.md`.
 ## Independent maintainer review (`maintainer-rev`)
 
 Give the specialist the immutable subject, complete diff, repository root,
-[maintainer style](../../../architecture/references/languages/maintainer-style.md),
+[maintainer style](../../../agent_docs/maintainer-style.md),
 applicable Wyrd authority, and available verification results. Do not provide
 other reviewers' conclusions or an intended verdict.
 

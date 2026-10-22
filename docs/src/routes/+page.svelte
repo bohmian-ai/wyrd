@@ -20,14 +20,15 @@
     'Get started': { blurb: 'Learn what Wyrd verifies and set up a local server.', kicker: 'Start' },
     'Build and verify': { blurb: 'Declare an AI system, observe its behavior, and verify it.', kicker: 'How-to' },
     Connect: { blurb: 'Use the SDKs, CLI, MCP, and the AI Gateway.', kicker: 'How-to' },
-    Operate: { blurb: 'Deploy Wyrd for a team and manage sign-in and access.', kicker: 'Operate' },
+    Operate: { blurb: 'Configure how a Wyrd server runs verification.', kicker: 'Operate' },
     Understand: { blurb: 'How Cards, verification, Bifrost, and identity fit together.', kicker: 'Explain' },
-    Reference: { blurb: 'Card schemas, APIs, CLI commands, errors, and configuration.', kicker: 'Look up' }
+    Reference: { blurb: 'The Verifier Card, MCP tools, the HTTP API, errors, and runtime limits.', kicker: 'Look up' }
   };
   const doors = navGroups().map((group) => ({ label: group.label, path: group.items[0].path, ...DOORS[group.label] }));
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];
   // The CTA opens the quickstart once it is published, else the first Get started page.
   const start = startPages.find((item) => item.path === '/get-started/quickstart/') ?? firstPage('Get started');
+  const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
 </script>
 
 <svelte:head>
@@ -48,6 +49,7 @@
     <div class="cta">
       {#if start}
         <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
+        {#if agent}<a class="button" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
         <a class="button" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
       {:else}
         <a class="button primary" href={GITHUB_URL} rel="noreferrer" target="_blank">Wyrd on GitHub →</a>
@@ -72,7 +74,7 @@
       <div>
         <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">One support agent and one Verifier, one step per tab: declare what a ticket must contain, hand the ticket to the verification engine, and read the verdict.</p>
+        <p class="sub">One support agent and one Verifier, one step per tab: declare what an answer must never say, verify two answers, and read the verdict.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
@@ -82,14 +84,14 @@
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks.</p>
+            <p class="step">The Service binds one Verifier. The Verifier declares the evidence it takes and the requirement it checks. Declare both with <code>wyrd declare support-reply.yaml</code>, or from your code with <code>WyrdState.declare</code>.</p>
             <Tabs>
               <Tab label="Service"><CodeBlock lang="yaml" {...data.declare.service} /></Tab>
               <Tab label="Verifier"><CodeBlock lang="yaml" {...data.declare.verifier} /></Tab>
             </Tabs>
           </Tab>
           <Tab label="02 Observe">
-            <p class="step">Inside a Run, hand the agent's ticket to the verification engine. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <p class="step">Declare, start a Run, and verify two answers. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
               {#each data.observe as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
@@ -97,11 +99,8 @@
             </LangTabs>
           </Tab>
           <Tab label="03 Verify">
-            <p class="step">The verdict cites the evidence it judged. A failed check is a result, not an exception.</p>
-            <Tabs>
-              <Tab label="Real time"><CodeBlock lang="json" {...data.verify.realtime} /></Tab>
-              <Tab label="Background"><CodeBlock lang="json" {...data.verify.background} /></Tab>
-            </Tabs>
+            <p class="step">The failing answer's verdict names the requirement, the reason, and the value it judged. A failed check is a result, not an exception.</p>
+            <CodeBlock lang="json" {...data.verify} />
           </Tab>
         </Tabs>
       </div>

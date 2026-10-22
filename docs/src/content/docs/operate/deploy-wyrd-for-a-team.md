@@ -1,9 +1,10 @@
 ---
-title: Deploy Wyrd for a team
+title: Deploy for a team
 description: Prepare PostgreSQL with a platform login and a tenant login, migrate it, start the server, and create the first tenant.
 pillar: wyrd
 section: Operate
 order: 1
+draft: true
 status: partial
 ---
 
@@ -99,4 +100,4 @@ This is the only time the tenant credential is shown. Store it now.
 
 Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
 
-Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/connect/connect-an-agent-through-mcp/), and grant roles to others; [Identity and authorization](/understand/identity-and-authorization/) explains the model.
+Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/get-started/use-with-your-coding-agent/), and grant roles to others; [Identity and authorization](/understand/identity-and-authorization/) explains the model.

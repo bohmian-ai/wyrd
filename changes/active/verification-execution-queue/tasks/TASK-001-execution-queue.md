@@ -582,13 +582,13 @@ repeat the repository-wide gate or every language journey suite.
 ## Authority Links
 
 [Specification revision 2 — draft, awaiting explicit approval](../spec.md).
-Repository authorities: `AGENTS.md`, `architecture/agent-rules.md`,
-`architecture/wyrd-design.md`, `architecture/wyrd-doctrine.mdx`,
-`architecture/bifrost-design.md`, `architecture/references/README.md`, and the
+Repository authorities: `AGENTS.md`,
+`architecture/wyrd-design.md`,
+`architecture/bifrost-design.md`, `architecture/wyrd-design.md`, and the
 focused references in the spec, particularly
-`architecture/references/languages/spec-driven-development.md`,
-`architecture/references/languages/implementation-execution.md` and
-`architecture/references/languages/testing-workflows.md`.
+`changes/spec-driven-development.md`,
+`changes/implementation-execution.md` and
+`TESTING.md`.
 Measured diagnostic context:
 `changes/active/long-horizon-verification/tasks/TASK-004-capacity-qualification.md`,
 “Settlement group commit and runner throughput”. Source evidence is not proof

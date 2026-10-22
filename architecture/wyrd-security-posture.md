@@ -158,8 +158,10 @@ credential.
 
 - API keys are bootstrap credentials for token exchange, not request-session
   credentials.
-- Plaintext is returned once. The server stores only a memory-hard password
-  hash and non-secret lookup metadata.
+- The server generates a 256-bit secret and returns the plaintext once, in the
+  response that created it. It stores only the secret's SHA-256 verifier and
+  non-secret lookup and lifecycle metadata. API keys default to a 365-day
+  lifetime.
 - A credential's non-secret prefix resolves its owning principal before
   verification — `wyrd_global_...` at platform scope, `wyrd_sk_<tenant>_...`
   within a tenant, the latter entering a tenant-scoped transaction first. Every
@@ -195,8 +197,8 @@ credential.
   operations may require a shorter configured lifetime, but never a longer
   one.
 - Only a tenant human login receives a refresh token; platform sessions are
-  access-only. Refresh tokens are stored by
-  one-way digest and rotated on every use for public clients (`wyrd-cli`):
+  access-only. Refresh tokens live 30 days, are stored by
+  one-way digest, and are rotated on every use for public clients (`wyrd-cli`):
   reuse of a rotated refresh token revokes its rotation chain and emits a
   security audit event (RFC 9700 §4.14.2). The first-party web app uses
   Rust-owned browser sessions, not an OAuth client or refresh-token grant.
@@ -271,7 +273,7 @@ credential.
   inside the authenticated payload, so an envelope copied into another
   tenant's or credential's row does not open. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
-- `wyrd server dev` keeps local database URLs and the tenant key only in the
+- `wyrd init` keeps local database URLs and the tenant key only in the
   protected `credentials.toml`; `config.toml` `[dev]` holds non-secret
   settings. Gateway documents name provider keys as `local_env` sources the
   CLI resolves at apply time, and the server applies a composite document
@@ -358,6 +360,11 @@ credential.
   accepted, `act` confers no authority, and exchange consults no policy.
 - A delegated token is bound to the `wyrd` or `bifrost` audience; a `bifrost`
   token is refused outside the Bifrost ingest and query surfaces.
+- Token exchange adds no permission check of its own. `MAX_DELEGATION_DEPTH`
+  is five: issuance refuses a deeper chain and verification rejects one, so a
+  non-conforming token never enters request context. Every later request runs
+  the ordinary permission check against the delegated principal and its
+  intersected set; the `act` chain is attribution for audit only.
 - Delegation depth is bounded, every hop is authorized, and the effective
   permission set is the exact intersection of the actor's current permissions
   and the subject's, so it can only narrow. If the complete intersection cannot
@@ -446,6 +453,115 @@ There is no runtime cross-service invoke policy decision point. Wyrd
 authorizes every protected API request with its own RBAC permission check on the
 verified principal, recorded to canonical audit; there is no separate
 policy engine, policy cache, or stale-allow mode to reason about.
+
+### Request principal
+
+HTTP handlers receive identity through two extractors. `AuthenticatedPrincipal`
+verifies the signed Wyrd access token from `X-Wyrd-Access-Token`; `Caller`
+projects that verified principal with the request ID. `Caller.data_tenant_id`
+is copied from `principal.tenant_id`; no request header is tenant authority.
+
+### Permission model
+
+`Permission { resource: Resource, action: Action, scope: PermissionScope }` is
+the one authorization vocabulary. `resource` and `action` name the operation;
+`scope` names the objects it may reach. A static role-derived grant over a
+named object is RBAC, not ABAC, and never enters the Policy plane. Handlers
+require a typed `Permission`, never a flat string; `resource:action` names an
+operation only and the object axis has no string spelling.
+
+`Resource` and `Action` are closed enums in `wyrd_runtime::permission`, each
+with `AnyOf(..)` and `Wildcard`. Adding a variant is a reviewed Rust contract
+change; there are no custom runtime permission strings and no
+`Other(String)` escape hatch.
+
+`PermissionScope` is a closed, domain-tagged union:
+
+- `All` covers every object of the permission's own resource and action. It
+  never widens the resource or the action.
+- `Bifrost(BifrostPermissionScope)` is valid only on `bifrost_query` `read`.
+  `Schema { catalog, schema }` covers every table currently or later resolved
+  beneath that logical catalog and schema. `Table { catalog, schema,
+  table_uid }` covers exactly that registered table UID and does not follow a
+  dropped-and-recreated table; catalog and schema ride with the UID so the
+  synchronous check needs no catalog lookup. Catalog and schema are the logical
+  SQL names (catalog `vala`, schema `logs`), validated as identifier segments.
+
+A future domain that needs object scope adds its own typed variant rather than
+reusing another domain's identity spelling.
+
+Coverage is per axis, and a `Permission` covers a requirement only when all
+three cover. `Wildcard` covers every resource or action and `AnyOf` covers its
+members; otherwise only the identical variant covers. `All` covers every scope;
+a schema scope covers itself and every table scope in that exact
+catalog/schema; a table scope covers only its UID; no Bifrost scope covers
+`All`. A wildcard or multi-resource grant cannot carry a Bifrost scope: decode
+rejects it. Grants are additive and absence is denial; there is no explicit
+deny, ownership, or grant option.
+
+`PermissionSet` keeps itself minimal on insert: an insert already covered is a
+no-op, and entries the insert covers are removed. Every authorization decision
+is `PermissionSet::contains`. `PermissionSet::covers_operation` ignores scope
+and answers only whether the principal holds the operation under some scope; it
+is route admission for requests whose objects are unknown until planning, never
+authorization. Built-in administrative authority is ordinary wildcard
+permissions, never a role-name bypass.
+
+Roles persist permissions as a JSONB array in `wyrd.auth_roles.permissions`,
+the direct serde projection of `Permission`:
+
+```json
+[
+  {"resource": "cards", "action": "write", "scope": "all"},
+  {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
+  {"resource": "bifrost_query", "action": "read",
+   "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}},
+  {"resource": "bifrost_query", "action": "read",
+   "scope": {"bifrost": {"table": {"catalog": "vala", "schema": "traces",
+                                   "table_uid": "0199f0c1-2f7e-7c2a-9a6f-1c9b2f4d5e60"}}}}
+]
+```
+
+`scope` is required; a two-field object is rejected, not promoted to `all`.
+Malformed identities, Bifrost scope on another resource, and Bifrost scope on
+any action other than `read` are rejected at decode, so a corrupt role row
+surfaces by name instead of resolving into authority. Role permissions are the
+only static grant model: there is no second grant table, policy lookup, or SQL
+`GRANT` language. The shape may add closed variants or optional fields; existing
+field names and variant meanings do not change.
+
+### Permission check
+
+`PermissionCheck` is the one runtime authorization chokepoint:
+
+```rust
+fn check(&self, principal: &Principal, permission: &Permission) -> PermissionVerdict;
+```
+
+It is synchronous and infallible. Denial is `PermissionVerdict::Deny`, not a
+Rust error, and the handler boundary maps it into the public catalog
+(`WYRD_PERMISSION_403_DENIED_RBAC`). The signature takes no target parameter:
+the object is inside `Permission` as its scope. `RbacCheck`, the implementation,
+is stateless and allows exactly when
+`principal.effective_permissions.contains(permission)`, with no query-path
+database or network lookup. Handlers call
+`state.permission_check.check(&principal, &permission).into_result()?` and add
+no shortcut helpers, so audit, tracing, and policy stay at one call site. CEL
+and ABAC never sit behind this trait, and `PermissionDenyReason` has no ABAC
+variant.
+
+### Auth crate boundaries
+
+```text
+wyrd-runtime      Principal, Permission, PermissionSet, PermissionCheck, builtin roles
+wyrd-auth-issue   issuing keys, JWT claims, API-key hashing, delegation depth
+wyrd-auth-verify  synchronous JWT verifier, key map, principal from the permissions claim
+wyrd-sql          tenant-bound role, principal, and credential rows
+wyrd-server       HTTP handlers, TenantConn acquisition, credential writes, audit staging, error mapping
+```
+
+Shared auth crates do not depend on SQL. `wyrd-auth`'s `TenantTokenIssuer`
+resolves tenant permissions once, at issuance, over `TenantConn`.
 
 ### Production composition
 
@@ -537,6 +653,66 @@ is not an SSRF control.
 - Tenant identity is repeated in durable metadata and checked at each storage
   transition. Oracle's row tripwire fails the entire query on mismatch; it
   never filters mismatched rows and returns a partial result.
+
+### Postgres tenant binding
+
+Wyrd uses one PostgreSQL control-plane database. `wyrd-sql` owns the
+`platform` and `wyrd` schemas, `vala-sql` owns `vala`, and Skald owns none.
+Analytical payload bytes stay in Bifrost object storage.
+
+Every tenant-scoped row leads with
+`data_tenant_id UUID NOT NULL REFERENCES platform.tenants(data_tenant_id)`,
+typed in Rust as `wyrd_spec::ids::DataTenantId`. Human-facing `TenantSlug`
+values resolve to a `DataTenantId` at the authenticated boundary and never
+enter tenant rows. `space` is a registry namespace inside a tenant, never a
+tenancy boundary. Tenant-scoped parents expose composite foreign-key targets
+such as `(data_tenant_id, id)`, and children, including cross-schema
+references, carry the tenant key in their foreign keys. `platform.*` is the
+privileged plane above tenant scope.
+
+Row-level security is the authoritative tenant boundary, and the pool decides
+scope. Every table enables and forces RLS. Tenant tables carry a
+`tenant_isolation` policy with both predicates:
+
+```sql
+CREATE POLICY tenant_isolation ON wyrd.example
+    USING (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+```
+
+Every table also carries an `operator_access` policy that targets only the
+login that ran the migrations and admits sessions with `app.operator=on`.
+Platform and catalog pools set that flag; tenant pools never do, and a separate
+tenant login gains nothing by setting it because the policy does not apply to
+it.
+
+`TenantConn` binds the verified tenant and opens the transaction in one round
+trip, and is the only code that builds this statement or issues raw
+transaction control:
+
+```sql
+SELECT set_config('app.current_tenant', '<tenant uuid>', true); BEGIN
+```
+
+The binding precedes `BEGIN` deliberately. Postgres runs both statements as one
+implicit transaction that `BEGIN` makes explicit, so the binding survives into
+it; if the binding fails, `BEGIN` never runs and Postgres rolls back, leaving
+the pooled connection idle. `BEGIN` first would leave a failed binding inside
+an aborted transaction that SQLx does not roll back, poisoning the next
+borrower. The simple-query form takes no parameters, so the tenant is inlined
+from the typed `DataTenantId`, whose UUID rendering cannot contain a quote.
+Elsewhere tenant identity is parameter-bound. A missing binding fails
+(`wyrd.current_tenant()` is strict) rather than returning an empty or
+cross-tenant result; dropping the wrapper rolls back and clears the binding.
+
+Postgres enforces only tenant isolation and table-local invariants that hold
+for every login. Wyrd's RBAC is the single permission model: migrations add no
+per-command, per-column, or per-login permissions, and Wyrd creates no role and
+grants nothing to a named role. `SECURITY DEFINER` functions are narrow,
+reviewed bridges with a pinned `search_path` that raise the operator flag only
+for their own body, such as slug resolution, and never become a general RLS
+bypass. Logins, boot validation, and migration order are in
+[deployment and release](operations/deployment-and-release.md#database-logins-and-connection-budget).
 
 ## Audit integrity and privacy
 

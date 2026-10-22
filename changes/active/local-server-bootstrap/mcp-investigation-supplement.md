@@ -239,7 +239,7 @@ case file belongs to a separately specified Audit capability if needed.
 
 - `changes/active/local-server-bootstrap/spec.md` revision 5 and
   `tasks/TASK-003-mcp-host-connection.md` (completed connection boundary).
-- `AGENTS.md`; `architecture/agent-rules.md`;
+- `AGENTS.md`; `AGENTS.md`;
   `architecture/wyrd-design.md` (Card relationships, observation identity,
   verification history); `architecture/bifrost-design.md` (query owner);
   `architecture/wyrd-security-posture.md` (tenant and permission boundary).

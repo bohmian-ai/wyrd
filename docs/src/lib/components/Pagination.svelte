@@ -4,7 +4,7 @@
   import { page } from '$app/state';
   import { siblings } from '$lib/derived-nav';
 
-  const pair = $derived(siblings(page.url.pathname, base || '/wyrd'));
+  const pair = $derived(siblings(page.url.pathname));
 </script>
 
 {#if pair.prev || pair.next}

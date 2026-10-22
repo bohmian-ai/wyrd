@@ -90,6 +90,19 @@ importers:
         specifier: ^4.5.4
         version: 4.5.4
 
+  ../../examples:
+    dependencies:
+      wyrd-ai:
+        specifier: workspace:*
+        version: link:../sdks/wyrd-sdk-ts/wyrd
+    devDependencies:
+      '@types/node':
+        specifier: 24.10.0
+        version: 24.10.0
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   ../../examples/support-desk-app/typescript:
     dependencies:
       '@openai/agents':

@@ -17,6 +17,13 @@ pnpm test
 pnpm check
 ```
 
+## Publishing a page
+
+- One guide covers one outcome. Publish guides one at a time; finish and prove one before starting the next.
+- A guide's code comes from a local example under `examples/` that a journey test runs on a real server. Changing that example selects the docs check and its journeys in CI and republishes the site.
+- Prove the page before publishing it: a guide by running its steps at the documented release, a concept against its owning section in `architecture/`, a reference against its schema, API, configuration, or runtime catalog.
+- A page whose accuracy is unproven is set to `draft: true`, not published with a warning. Drafts are absent from production routes, navigation, search, and `llms.txt`.
+
 ## Page frontmatter
 
 Navigation, search, the landing page's section links, and `llms.txt` are all derived from frontmatter. A page appears in them once its file exists.

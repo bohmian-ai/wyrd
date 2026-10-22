@@ -1,9 +1,10 @@
 ---
-title: Troubleshoot a deployment
+title: Troubleshooting
 description: Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
 pillar: wyrd
 section: Operate
 order: 5
+draft: true
 status: partial
 ---
 
@@ -34,18 +35,17 @@ Match the code or message you see below. This page covers server installation, l
 | Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant on its own. If the one-time key was lost, rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set and confirm rotation, or follow the steps below. |
 | Gateway | Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the changes may have committed. Inspect with `wyrd gateway deployment list`, then rerun; reapplying the same named document is safe. Or pass `--skip-gateway`. |
 
-If the platform root exists but tenant creation failed, rerun `wyrd server dev` with the stored `WYRD_PLATFORM_CREDENTIAL` set. Retries never recover or reissue a credential on their own.
+If the platform root exists but tenant creation failed, rerun `wyrd init` with the stored `WYRD_PLATFORM_CREDENTIAL` set. Retries never recover or reissue a credential on their own.
 
 ### Recover a lost tenant credential
 
-On a terminal, `wyrd server dev` does this for you: with `WYRD_PLATFORM_CREDENTIAL` set, it asks before rotating the tenant administrator's key through the platform and saves the new one. Unattended runs never rotate a key; they stop with this guidance.
+On a terminal, `wyrd init` does this for you: with `WYRD_PLATFORM_CREDENTIAL` set, it asks before rotating the tenant administrator's key through the platform and saves the new one. Unattended runs never rotate a key; they stop with this guidance.
 
-To recover by hand: a failed `server dev` stops its server, so recovery starts the installed server directly.
+To recover by hand: a failed `wyrd init` stops its server, so recovery starts the installed server directly.
 
 1. Start the installed server with the same database URL.
 
    ```bash
-   export WYRD_SERVER_BIND=127.0.0.1:8080
    ~/.config/wyrd/server/current/wyrd-server
    ```
 
@@ -60,7 +60,7 @@ To recover by hand: a failed `server dev` stops its server, so recovery starts t
 
    The new credential prints once.
 4. Under `umask 077`, write it to `[default].api_key` in `credentials.toml`, and delete any old `access_token` and `access_expires_at` values. Confirm the file mode is `0600`.
-5. Stop the directly started server, then rerun `wyrd server dev`.
+5. Stop the directly started server, then rerun `wyrd init`.
 
 ## Database
 
@@ -80,6 +80,6 @@ When the server refuses its database, it exits and its last log line says why.
 
 | Message contains | Cause | Fix |
 | --- | --- | --- |
-| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#4-start-the-server-and-check-readiness) and restart. `wyrd server dev` creates one for you |
+| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#4-start-the-server-and-check-readiness) and restart. `wyrd init` creates one for you |
 | `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
 | A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |

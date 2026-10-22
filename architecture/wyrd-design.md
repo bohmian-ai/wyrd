@@ -49,6 +49,41 @@ attributable, reproducible, governable, and auditable. Cards, observations,
 lineage, policy, audit, and analytical storage are the verification substrate,
 not a passive integration or inventory product.
 
+Wyrd does not become the user's application runtime, training framework,
+workflow engine, arbitrary code executor, or cloud platform. User code owns
+inference loops, training loops, app servers, agent processes, and deployment
+mechanics; runtime results that persist become runs, observations, artifact
+Cards, relationships, audit records, or status updates through service-owned
+paths.
+
+The verification loop:
+
+```text
+Cards and Specs declare the system
+  -> verification bindings attach Verifiers
+  -> Runs and Observations record measured behavior
+  -> Verifiers produce judgments
+  -> Bifrost, lineage, and audit preserve the evidence
+  -> Policy governs decisions and Operators react
+```
+
+| Term | Meaning |
+|---|---|
+| Verification | Evaluating observed behavior against declared criteria and producing a judgment. |
+| Assurance | Confidence supported by durable verification evidence, provenance, policy decisions, and audit history. |
+| Observation | A measured fact. An observation is evidence, not a judgment. |
+| Verifier | A reusable, subject-less declaration that interprets observations and produces judgments. |
+
+The core nouns are `Card` (a declared thing with identity, kind, version,
+spec, relationships, and status), `Spec` (the kind-specific declared payload),
+`Run` (one execution of declared behavior), and `Observation` (a measured
+fact). A new concept first tries to fit as a Card kind, spec field,
+relationship, run, or observation; add a noun only when those shapes cannot
+express it honestly. Layers are not skipped: a Card kind specializes `Card`
+and changes only its spec, services operate on the foundations (envelope,
+metadata, `CardRef`, relationships, status, version), and surfaces expose
+services.
+
 1. **Cards are independent.** No card "owns" another. The
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
@@ -148,7 +183,7 @@ not a passive integration or inventory product.
       RBAC and never enters the Policy plane. The rejected legacy vocabulary was
       a free-form OAuth-style `Scope` *string*; a typed closed object scope
       inside `Permission` is the sanctioned model — see
-      `v1/00-foundations/permission-model.md`.
+      [Permission model](wyrd-security-posture.md#permission-model).
     - **Policy** gates card states (`classify` at declare-time, `gate` at
       deploy-time). There is no runtime cross-service invoke gate: the
       `PolicyAction::Invoke` enum member and the `POST /v1/authz/check`
@@ -304,6 +339,12 @@ foreign-runtime boundary, such as Python async integration, Node loading,
 generated declarations, or idiomatic local authoring helpers. It does not
 duplicate transport or durable behavior.
 
+Framework adapters follow the same rule. The Python ASGI middleware
+(`wyrd.integrations.asgi`) starts and drains an already loaded `WyrdState`
+with the application's lifespan and enters one Run per HTTP request or
+WebSocket connection. It registers nothing, owns no writer, provider, or
+credential, and creates no HTTP spans.
+
 Existing Rust owner crates may retain their optional `python` features during
 this integration. Only `wyrd-sdk-python` enables and aggregates those features;
 the Rust and TypeScript SDKs do not. New or materially relocated Python logic
@@ -321,7 +362,9 @@ exchange that client requires before returning, while a supplied bearer or a
 fresh cached token makes no request and no health probe is added. A handle
 retains that one client, with its renewable token cache, for its lifetime.
 Local loaders (`from_path` / `from_path_with`) are not connected handles and
-stay lazy. Bifrost lists the caller's tables with `list_tables` /
+stay lazy and offline. `WyrdState.declare` is the online constructor: with one
+client it declares a Card file, pulls the declared graph, and returns a ready
+state that keeps no files unless the caller names a bundle directory. Bifrost lists the caller's tables with `list_tables` /
 `listTables`, which returns compact entries, and describes one table's schema
 on demand.
 
@@ -356,6 +399,35 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Governance    | Policy, Audit |
 | Observability | Verifier, Source |
 | Reaction      | Trigger, Operator |
+
+`Tool` (a Skald runtime registry name), `SubAgent` (an Agent-to-Agent
+relationship), `Skill`, and `Bifrost` (server state) are not Card kinds.
+
+Every Card uses one envelope: `apiVersion: wyrd/v1`, `metadata`, `kind`,
+`spec`, server-derived `relationships`, and server-managed `status`. There is
+no outer `kind: Card` wrapper and no `spec.type` discriminator.
+`metadata.labels` are short indexed classification fields that humans,
+agents, policy, and inventory views filter on; `metadata.annotations` carry
+longer descriptive context that travels with the Card but is not indexed.
+`tags` are not part of the public metadata contract.
+
+### Rejected shapes
+
+- Compatibility aliases, legacy names, or route prefixes from predecessor
+  projects, including governance tokens (`WYRD_GOV_TOKEN`,
+  `wyrd.auth_governance_tokens`) and Delta transaction-log logic in Vala.
+- One-off artifact reference wrappers or a second public shape for one
+  concept.
+- Authored lineage graphs that bypass `CardRef`s and derived relationships.
+- Per-kind registration methods on Card objects, or per-kind shadow tables
+  beside the single `wyrd.cards` table.
+- Server-only fields in client contracts, or surface vocabulary that diverges
+  from the spec.
+- Live runtime objects in specs, untyped strings where Wyrd has a domain type,
+  or runtime plugins where a closed enum is the real contract.
+- Public event-shaped payloads where `card`, `run`, `observation`,
+  `relationship`, `status`, `policy`, or `audit` names the concept.
+- Hidden side effects during local Card construction.
 
 ---
 

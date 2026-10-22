@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- wyrd-cli: `wyrd init` replaces `wyrd server dev`, with no alias; scripts
+  must use the new name. Startup, saved settings, and failures are unchanged.
+  `wyrd init --print-prompt` prints the release's agent setup prompt without
+  a server, `--format json` readiness carries it as `setup_prompt`, and a
+  ready run prints the command that starts each connected coding agent on it.
+  The server serves the same prompt as the MCP prompt `setup`.
+- wyrd-ai (Python): `wyrd.integrations.asgi.WyrdMiddleware` runs a loaded
+  `WyrdState` with an ASGI app's lifespan and opens one Run per HTTP request
+  or WebSocket connection.
+- wyrd-spec: the `Spec` JSON Schema now lists Card spec variants under
+  `anyOf`, so strict MCP clients accept `cards.get` results.
+- wyrd-server: the HTTP listener now defaults to `127.0.0.1:8080` instead of
+  `0.0.0.0:8080`, matching the gRPC default. A server reached directly rather
+  than through a same-host proxy must set `WYRD_SERVER_BIND`, for example
+  `0.0.0.0:8080`. Listener collision checks now also reject a wildcard bind
+  that overlaps another listener's port.
 - skald-agentic: `skald-agent` (live agent, bounded tool loop, and `SKALD_AGENT_*` catalog) and `skald-workflow` (explicit-binding
   Agent DAG with native, Wyrd gateway, and bound external gateway routes,
   bounded execution with retries, deadlines, and cancellation, and the

@@ -321,11 +321,20 @@ impl utoipa::ToSchema for Spec {
     }
 }
 
+/// The JSON Schema of [`Spec`], which MCP clients validate `cards.get`
+/// against: `anyOf` the typed variants, because the sibling `kind` selects the
+/// variant and several variants accept the same object, so `oneOf` would
+/// refuse valid Cards.
 impl schemars::JsonSchema for Spec {
     fn schema_name() -> String {
         "Spec".to_owned()
     }
 
+    /// `anyOf` the fourteen typed Card spec schemas, each registered in
+    /// `generator`'s definitions. Exactly one variant matches the Card's
+    /// `kind`, but an object may also match others, so schema consumers such
+    /// as MCP clients validating `cards.get` must accept any match; `kind`,
+    /// not this schema, selects the variant.
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let variants = vec![
             generator.subschema_for::<DataSpec>(),
@@ -350,7 +359,7 @@ impl schemars::JsonSchema for Spec {
                 ..SchemaMetadata::default()
             })),
             subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(variants),
+                any_of: Some(variants),
                 ..SubschemaValidation::default()
             })),
             ..SchemaObject::default()

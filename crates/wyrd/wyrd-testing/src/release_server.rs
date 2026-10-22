@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod os;
 
+pub use os::PeakSampler;
+
 use secrecy::SecretString;
 use tempfile::TempDir;
 
@@ -581,9 +583,8 @@ impl LocalServer {
     /// Starts a fresh memory-peak measurement window.
     ///
     /// Scoped, writing to the cgroup's `memory.peak` resets the peak seen
-    /// through that descriptor. On a Linux host, the process's peak resident
-    /// set is reset instead. macOS keeps only a process's lifetime peak, so
-    /// there a window's peak is the peak since the server started.
+    /// through that descriptor. On the host, a [`PeakSampler`] samples
+    /// the process's resident memory until the window is read.
     ///
     /// # Errors
     ///
@@ -598,11 +599,7 @@ impl LocalServer {
                 file.write_all(b"reset\n")?;
                 Ok(MemoryPeak::Cgroup(file))
             }
-            Meter::Process(pid) => {
-                #[cfg(target_os = "linux")]
-                os::reset_peak_memory(*pid)?;
-                Ok(MemoryPeak::Process(*pid))
-            }
+            Meter::Process(pid) => Ok(MemoryPeak::Process(os::PeakSampler::start(*pid))),
         }
     }
 
@@ -766,14 +763,13 @@ impl Drop for LocalServer {
 pub enum MemoryPeak {
     /// An open cgroup `memory.peak` descriptor.
     Cgroup(File),
-    /// The server process, read from the OS by PID.
-    Process(u32),
+    /// The server process's resident memory, sampled since the window opened.
+    Process(PeakSampler),
 }
 
 impl MemoryPeak {
     /// Peak memory in bytes since the window opened: the scope's peak when
-    /// scoped, else the process's peak resident set (lifetime peak on
-    /// macOS).
+    /// scoped, else the process's sampled peak resident set.
     ///
     /// # Errors
     ///
@@ -786,7 +782,7 @@ impl MemoryPeak {
                 file.read_to_string(&mut contents)?;
                 Ok(contents.trim().parse()?)
             }
-            Self::Process(pid) => Ok(os::peak_memory_bytes(pid)?),
+            Self::Process(sampler) => Ok(sampler.finish()?),
         }
     }
 }

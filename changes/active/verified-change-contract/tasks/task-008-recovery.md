@@ -310,9 +310,8 @@ hide startup time or replace production paths with mocks.
 - `changes/active/bifrost-scribe-live-reads/tasks/TASK-005-simplify-bifrost-telemetry.md` (proposed design precedent, not completed behavior)
 - all documents under `changes/active/verified-change-contract/architecture/`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
 - `architecture/wyrd-security-posture.md`
-- `architecture/references/domain/telemetry-observations.md`
-- `architecture/references/languages/testing-workflows.md`
+- `.agents/skills/wyrd-advise/references/telemetry-observations.md`
+- `TESTING.md`
 - `AGENTS.md`

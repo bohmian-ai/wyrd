@@ -123,8 +123,8 @@ migration without a new public compatibility rule.
 ## Authority Links
 
 `changes/active/local-server-bootstrap/spec.md` revision 2;
-`AGENTS.md` §§2, 9, 11; `architecture/operations/deployment-and-release.md`;
-`architecture/references/languages/testing-workflows.md`.
+`AGENTS.md`; `architecture/operations/deployment-and-release.md`;
+`TESTING.md`.
 
 ## Implementation Evidence
 

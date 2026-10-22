@@ -6,7 +6,7 @@
 //! on the same Keycloak issuer, one on Dex, a different provider), and a
 //! provider-replacement tenant (Active first realm, replaced by the second
 //! Keycloak realm through the settings page), starts two production
-//! BFF processes (`node build`) configured as `wyrd server dev` configures
+//! BFF processes (`node build`) configured as `wyrd init` configures
 //! them, with the public origin set and `/auth/*` forwarded to their server —
 //! the first in front of replica A over loopback HTTP, the second in front of
 //! replica B only through a Node TLS terminator whose certificate the
@@ -111,7 +111,7 @@ fn ui_dir() -> PathBuf {
 }
 
 /// Start one production BFF replica against `server_url` at public `origin`,
-/// configured as `wyrd server dev` configures it (the public origin is set,
+/// configured as `wyrd init` configures it (the public origin is set,
 /// never read from request headers), and wait until it answers. `extra_ca` is the
 /// PEM file Node adds to its trust store, so a replica given the TLS
 /// terminator's `https:` origin verifies it through the ordinary native

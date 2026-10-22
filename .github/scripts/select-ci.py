@@ -38,10 +38,15 @@ GLOBAL = re.compile(
     r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|\.github/)"
 )
 # Paths that select no verification of their own.
-UNVERIFIED = re.compile(r"^(changes/|architecture/|[^/]+\.md$)")
-# The docs diagram test reads the wyrd-spec contract bundle, so contract
-# sources are docs inputs as well as Rust packages.
-DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/(src|examples)/|examples/)")
+UNVERIFIED = re.compile(r"^(changes/|architecture/|\.agents/skills/wyrd-advise/references/|[^/]+\.md$)")
+# The docs diagram test reads the wyrd-spec contract bundle, and the error
+# reference is generated from every `#[wyrd_error]` under crate and SDK `src/`
+# trees (docs/scripts/generate_api_docs.py), so those sources are docs inputs
+# as well as Rust packages.
+DOCS = re.compile(
+    r"^(docs/|openapi\.yaml|crates/wyrd-spec/(src|examples)/|examples/"
+    r"|(crates|sdks)/.+/src/.+\.rs$)"
+)
 # UI also covers the generated token targets so the token drift check fires on a
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.
@@ -49,8 +54,12 @@ UI = re.compile(
     r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css"
     r"|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
 )
-PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/python/)")
-TYPESCRIPT = re.compile(r"^sdks/wyrd-sdk-ts/")
+# A docs example (examples/<guide>/) is run by every SDK's journeys, so its
+# Card files select both language lanes as well as its program.
+PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/(python/|[^/]+/[^/]+\.(py|ya?ml)$))")
+TYPESCRIPT = re.compile(
+    r"^(sdks/wyrd-sdk-ts/|examples/(package\.json|tsconfig\.json|[^/]+/[^/]+\.(ts|ya?ml)$))"
+)
 # Non-package inputs of the environment-owning journeys; package changes reach
 # them through the closure.
 STORAGE = re.compile(r"^crates/wyrd/wyrd-storage/docker/")
@@ -59,7 +68,7 @@ IDENTITY = re.compile(r"^(docker-compose\.yml|tests/fixtures/identity/)")
 # verify:bifrost; Bifrost plus other Rust takes the complete gate.
 BIFROST_ONLY = re.compile(
     r"^(architecture/bifrost-design\.md"
-    r"|architecture/references/domain/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md"
+    r"|\.agents/skills/wyrd-advise/references/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md"
     r"|crates/vala/vala-bifrost-redux/"
     r"|crates/shared/wyrd-client/(src/bifrost/|tests/integration/pg_bifrost_e2e\.rs)"
     r"|crates/vala/vala-sql/(src/(queries|row_types)/(forge|oracle|file_list|maintenance|scribe)"
@@ -74,7 +83,7 @@ BIFROST_ONLY = re.compile(
 )
 # Trees whose every file must be owned by a workspace package.
 PACKAGE_TREES = re.compile(
-    r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)"
+    r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/)"
 )
 
 # Packages outside the four Rust families; each has a dedicated owning lane.
@@ -373,6 +382,8 @@ def select(paths, root):
         sel.lane("test:gateway:gate", f"gateway journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & EXAMPLE_PACKAGES):
         sel.lane("check:examples", f"examples build {hits[0]}")
+    if "wyrd-rust-examples" in affected:
+        sel.lane("test:examples", "the docs examples' Rust journeys run wyrd-rust-examples")
     if hits := sorted(affected.keys() & RUST_CLIENT_PACKAGES):
         sel.flag("rust_client", f"{hits[0]} is affected")
     if hits := sorted(affected.keys() & STORAGE_PACKAGES):

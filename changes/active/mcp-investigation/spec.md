@@ -96,7 +96,7 @@ server-derived from the caller.
 ### REQ-007 Surface parity
 
 Every investigation capability is a server-owned contract available over HTTP
-and MCP. MCP is not the only path (`AGENTS.md` §2: headless, agent-first,
+and MCP. MCP is not the only path (`AGENTS.md`: headless, agent-first,
 not UI- or MCP-only).
 
 ## Constraints and invariants
@@ -165,5 +165,5 @@ not UI- or MCP-only).
 - `architecture/wyrd-design.md`: Observation identity, Audit,
   `ProvenanceQuery`, `ObservationCriteria`
 - `architecture/bifrost-design.md`: correlation columns, query limits
-- `architecture/wyrd-doctrine.mdx`
-- `AGENTS.md` §2, §9, §11
+- `architecture/wyrd-design.md`
+- `AGENTS.md`, §9, §11

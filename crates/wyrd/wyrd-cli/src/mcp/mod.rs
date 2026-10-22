@@ -17,6 +17,8 @@ use serde::Serialize;
 use wyrd_client::transport::HttpConfig;
 use wyrd_spec::error::WyrdError;
 
+#[cfg(unix)]
+pub(crate) use hosts::prompt_agent;
 pub(crate) use hosts::selected;
 pub use hosts::{McpHost, McpHostReport, McpHostStatus};
 
@@ -229,6 +231,22 @@ impl McpInstallReport {
                 (None, Some(path)) => println!("{name}: {} {}", outcome.status, path.display()),
                 (None, None) => println!("{name}: {}", outcome.status),
             }
+        }
+    }
+
+    /// Tell the person the exact command that starts each connected host on
+    /// `prompt` in the current directory. Nothing is launched.
+    pub(crate) fn print_handoff(&self, prompt: &str) {
+        for outcome in self
+            .hosts
+            .iter()
+            .filter(|outcome| outcome.status.connected())
+        {
+            println!(
+                "Start {} on the setup prompt in this directory:\n{}",
+                outcome.host.label(),
+                outcome.host.launch(prompt)
+            );
         }
     }
 

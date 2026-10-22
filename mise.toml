@@ -164,10 +164,10 @@ run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
   # share the test builds' third-party artifacts instead of rebuilding them.
   "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
-  # `wyrd server dev` launches the installed production UI build.
+  # `wyrd init` launches the installed production UI build.
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile",
   "pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build",
-  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads) | test(=pg_tests::server_dev_keeps_the_gateway_managed_secret_key) | test(=pg_tests::server_dev_saved_settings_survive_working_directory_change)'",
+  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=pg_tests::init_first_run_is_client_ready) | test(=pg_tests::init_repeat_and_partial_failure_preserve_state) | test(=pg_tests::init_selected_mcp_host_reads) | test(=pg_tests::init_keeps_the_gateway_managed_secret_key) | test(=pg_tests::init_saved_settings_survive_working_directory_change) | test(=pg_tests::guided_init_lifecycle_and_prompt)'",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_guided_setup",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_standalone_examples_use_saved_local_setup",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
@@ -176,6 +176,7 @@ run = [
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
   "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
   "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_gateway_setup",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_guided_setup_prompt_surfaces tests/integration/test_local_development.py::test_guided_manual_setup",
 ]
 
 [tasks."test:wyrdstate:journey"]
@@ -395,7 +396,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 
 [tasks."test:agent-readiness:smoke:live"]
 description = """Opt-in live coding-agent readiness: Claude Code and Codex each build and run a Wyrd-verified Python
-application from this checkout's locally served docs and connected MCP, against a foreground `wyrd server dev` the
+application from this checkout's locally served docs and connected MCP, against a foreground `wyrd init` the
 harness owns for that agent alone. Only authorized server evidence decides each outcome. Calls paid agents. Claude
 Code reads ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`), normally from an untracked
 mise.local.toml; Codex uses the owner's existing `codex login` through a linked auth.json. A missing one blocks that
@@ -651,7 +652,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_verifier_building_blocks.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks"
+run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_verifier_building_blocks.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks tests/integration/test_asgi_integration.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -1137,6 +1138,11 @@ run = "pnpm start"
 description = "Show Card registration terminal progress rendering"
 run = "cargo run --locked -p wyrd-cli --example declaration_progress"
 
+[tasks."test:examples"]
+description = "Run every docs example's Rust program against a real server, on one Postgres lifecycle"
+depends = ["build:server"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-rust-examples -P journey --run-ignored=all\""
+
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
@@ -1147,20 +1153,7 @@ run = [
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
-# Bifrost detects the node memory limit from cgroups or /proc/meminfo, both of
-# which are Linux-only. On macOS that probe has no source and the server refuses
-# to start rather than guess, so supply the limit here from `hw.memsize`. Linux
-# leaves the variable unset and keeps the real detection path.
-run = [
-  "cargo build -p wyrd-server",
-  """
-  if [ -z "${WYRD_BIFROST_MEMORY_LIMIT_BYTES:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
-    WYRD_BIFROST_MEMORY_LIMIT_BYTES="$(sysctl -n hw.memsize)"
-    export WYRD_BIFROST_MEMORY_LIMIT_BYTES
-  fi
-  scripts/postgres/dev-server.sh
-  """,
-]
+run = ["cargo build -p wyrd-server", "scripts/postgres/dev-server.sh"]
 
 [tasks."cli:init"]
 description = "Establish this deployment's platform administrative root and print its credential once"
@@ -1399,10 +1392,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
-description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), and the quickstart's TypeScript reference app"
+description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a), the support-desk TypeScript reference app, and the docs examples"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit"]
+run = ["pnpm exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/example-support-desk-app exec tsc --noEmit", "pnpm --dir .. --filter @wyrd/examples exec tsc --noEmit"]
 
 [tasks."ts:test:unit"]
 description = "wyrd-ai unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
@@ -1474,8 +1467,8 @@ depends = ["test:bifrost:gate"]
 
 [tasks."gate:rust:journeys"]
 hide = true
-description = "Gate shard: the identity, Rust SDK, and installed-CLI local development journeys"
-depends = ["test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
+description = "Gate shard: the identity, Rust SDK, installed-CLI local development, and docs example journeys"
+depends = ["test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey", "test:examples"]
 
 [tasks."gate:storage"]
 hide = true

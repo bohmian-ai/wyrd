@@ -57,7 +57,7 @@ None for this backlog draft. Exact prompt bytes, token-count method, capacity ob
 
 ## Authority and revision
 
-- `AGENTS.md` §10–11; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`; `architecture/operations/reliability-and-recovery.md`; `architecture/references/languages/testing-workflows.md`.
+- `AGENTS.md`; `AGENTS.md`; `architecture/wyrd-design.md`; `architecture/wyrd-design.md`; `architecture/operations/reliability-and-recovery.md`; `TESTING.md`.
 - External context: [LiteLLM proxy benchmarks](https://docs.litellm.ai/docs/benchmarks), [LiteLLM virtual keys](https://docs.litellm.ai/docs/proxy/virtual_keys), [LiteLLM Rust gateway](https://docs.litellm.ai/docs/proxy/rust_gateway), [AIGatewayBench](https://github.com/BerriAI/ai-gateway-bench), and [mock-openai-api](https://github.com/zerob13/mock-openai-api).
 - Revision 1 — draft, 2026-09-25: initial backlog specification.
 - Revision 2 — draft, 2026-09-25: expanded comparison and evidence scope.

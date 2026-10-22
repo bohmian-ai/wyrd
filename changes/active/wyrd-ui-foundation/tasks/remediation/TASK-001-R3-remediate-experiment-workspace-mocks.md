@@ -69,7 +69,7 @@ Read before editing:
 5. `changes/active/wyrd-ui-foundation/reviews/TASK-001-visual-acceptance.md`.
 6. `architecture/wyrd-design.md`, especially Card independence, Experiment,
    Run, relationships, observations, and Vala correlation.
-7. `architecture/wyrd-doctrine.mdx`.
+7. `architecture/wyrd-design.md`.
 8. `architecture/bifrost-design.md`, especially observation/query projection.
 9. `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md`.
 10. `crates/wyrd/wyrd-server/wyrd-ui/brand/renders/workbench.html`.

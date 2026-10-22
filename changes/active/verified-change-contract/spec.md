@@ -152,7 +152,7 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   or historical-card migration path. The v1 catalog therefore contains 15
   registrable native kinds, with `Verifier` replacing both `Drift` and `Eval`.
   `AGENTS.md`, `architecture/wyrd-design.md`, and
-  `architecture/wyrd-doctrine.mdx` MUST publish that same catalog and
+  `architecture/wyrd-design.md` MUST publish that same catalog and
   `verified_by` binding model; `publishes_to` MUST NOT remain as a verification
   subscription contract.
 - **REQ-046**: `VerifierSpec` MUST contain exactly one adjacently tagged
@@ -1885,7 +1885,7 @@ table on `(data_tenant_id, result_id)`.
   describe the new Verifier-only verification model. In particular, the
   current 16-kind catalog, `publishes_to` monitor routing, and standalone
   Drift/Eval/Trigger firing prose in `architecture/wyrd-design.md` and
-  `architecture/wyrd-doctrine.mdx` MUST be replaced by the approved
+  `architecture/wyrd-design.md` MUST be replaced by the approved
   `verified_by` binding and locked generic runtime semantics. No stale
   architecture may remain as an apparent alternative to the control-flow
   diagram. `architecture/bifrost-design.md` MUST also recognize the five
@@ -2983,9 +2983,7 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 ## Material authority links
 
 - `AGENTS.md`
-- `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`
-- `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
 - `changes/active/verified-change-contract/architecture/verification-control-flow.html`
 - `changes/active/verified-change-contract/architecture/logic/run_api.md`
@@ -2994,10 +2992,9 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - `architecture/wyrd-security-posture.md`
 - `architecture/operations/deployment-and-release.md`
 - `changes/active/verified-change-contract/review/TASK-006-r2/TASK-006-R2-continuous-eval-closure.md`
-- `architecture/references/doctrine/positioning-and-vocabulary.md`
-- `architecture/references/domain/evaluation.md`
-- `architecture/references/languages/agent-harness.md`
-- `architecture/references/languages/spec-driven-development.md`
+- `.agents/skills/wyrd-advise/references/evaluation.md`
+- `agent_docs/agent-surfaces.md`
+- `changes/spec-driven-development.md`
 - `crates/wyrd-spec/src/vala/eval/task.rs`
 - `crates/wyrd-spec/src/card/workflow.rs`
 - `crates/skald/skald-workflow/src/run.rs`
@@ -3138,7 +3135,7 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - **Revision 60 Eval run-request outbox (2026-10-03, approved):** Revision
   59 had Scribe insert `verifier_runs` in its batch-fence transaction. That
   breaks the repository rule that no crate's transaction writes another
-  crate's tables (`architecture/v1/00-foundations/sql-foundation.md:75`,
+  crate's tables (`crates/wyrd/wyrd-sql/AGENTS.md:75`,
   enforced by two `vala-sql` checks). The alternative of writing runs before
   acknowledging would make clients wait. The user chose a batched run-request
   outbox like audit's instead. The acknowledgement covers receipt only, a

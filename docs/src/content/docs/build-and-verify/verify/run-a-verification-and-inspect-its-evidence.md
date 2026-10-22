@@ -1,10 +1,11 @@
 ---
-title: Run a verification and inspect its evidence
+title: Background checks
 description: Queue a Verifier with submit, follow its execution from any process, tell a failed verdict from a check that never ran, and read the stored evidence.
 pillar: wyrd
 section: Build and verify
 topic: Verify
-order: 4
+order: 3
+draft: true
 status: runnable
 ---
 

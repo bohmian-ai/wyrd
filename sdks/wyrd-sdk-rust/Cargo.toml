@@ -22,7 +22,6 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
     "dep:reqwest",
-    "dep:serde_json",
     "dep:tokio",
     "dep:tracing",
     "dep:tracing-opentelemetry",
@@ -36,7 +35,8 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-http = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true, features = ["http-proto", "logs"] }
 reqwest = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+# Re-exported: `verify` and `submit` take its `Value`.
+serde_json = { workspace = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }

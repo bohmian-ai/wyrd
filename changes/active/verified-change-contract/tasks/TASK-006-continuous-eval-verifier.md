@@ -196,7 +196,7 @@ or any path that treats an execution error as subject failure.
 - `changes/active/verified-change-contract/spec.md`
 - `changes/active/verified-change-contract/architecture/verifier/eval.md`
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
-- `architecture/references/domain/evaluation.md`
+- `.agents/skills/wyrd-advise/references/evaluation.md`
 - `AGENTS.md`
 
 ## Implementation Evidence

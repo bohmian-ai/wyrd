@@ -16,8 +16,8 @@ including reviewed base and target commits, the complete
 `changes/active/<slug>` packet, task-review closure, acceptance matrix,
 completion payload, and delivery context when available.
 
-Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md), and
-[spec-driven development](../../../architecture/references/languages/spec-driven-development.md).
+Read `AGENTS.md` and
+[spec-driven development](../../../changes/spec-driven-development.md).
 Read the active spec's materially relevant architecture links and confirm the
 completion worktree's `HEAD` equals the reviewed target. Require the exact
 active packet to match that target before writing. Do not reinterpret the spec

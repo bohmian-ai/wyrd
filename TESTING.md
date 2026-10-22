@@ -1,7 +1,7 @@
 # Testing Wyrd
 
 How the test suite is organized, which lane to run, and where a new test goes.
-The rules live in `AGENTS.md` §11; this file is the map.
+The rules live in the `AGENTS.md` testing section; this file is the map.
 
 ## The three tiers
 
@@ -72,6 +72,47 @@ When using `gate` for final verification, do not also run its component lanes
 as a checklist. Use focused tests while iterating; add a separate final lane
 only if `mise.toml` shows that required proof is outside `gate`.
 
+Scope verification to the work:
+
+1. **Bounded task:** focused commands for the affected behavior and its exact
+   optional features.
+2. **Milestone integration:** the combined lanes for the integrated dependency
+   closure.
+3. **Whole-change closeout:** the aggregate the approved plan requires.
+
+The complete non-credentialed suite runs nightly on `main`. Credentialed S3,
+GCS, and Azure tests run locally through the ignored `mise.local.toml` tasks as
+pre-merge proof; their GitHub Actions workflow runs on pushes to `main` after
+merge. Performance qualification keeps its own schedule.
+
+Run Cargo-backed commands sequentially across agents sharing a checkout or
+`target/` directory: no overlapping Cargo builds, tests, lints, docs, or codegen.
+
+### Named tests
+
+A specifically named test runs through its exact command, never only through a
+package-wide lane:
+
+```bash
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
+mise exec -- cargo nextest run --locked -p <crate> --test <target> \
+  -E 'test(=test_name)'
+```
+
+Confirm target and test names from source or `mise exec -- cargo nextest list`.
+A new test may be marked planned: confirm its existing package, target, runner,
+and setup during planning, then confirm the actual selector after adding the
+test, before RED. Never present a planned test as already existing. Include the repository-managed setup wrapper, or use the narrowest
+environment-owning `mise` task, when the test needs Postgres, storage
+emulators, or a live server. Never use a positional filter that can pass after
+selecting no test. Named Python and TypeScript tests likewise carry the exact
+pytest or package-runner command, path, and selector.
+
+Use default features or the exact feature set the behavior needs.
+`--all-features` in a test command forces the heavy feature union to recompile
+and defeats artifact reuse; lint and type-check tasks own their feature policy.
+
 ### Bifrost
 
 ```bash
@@ -101,6 +142,15 @@ mise run test:identity:journey           # every identity journey against Keyclo
 The identity journeys need Keycloak and Dex, so they run only in
 `test:identity:journey`, not in the `verify:*-sdk` tasks; `gate` runs it once in
 its `gate:rust:journeys` shard.
+
+```bash
+mise run py:setup                        # sync deps + maturin develop
+mise run py:test:integration             # wyrd.testing journeys against live Postgres
+mise run py:test:testing                 # wyrd.testing harness suite
+mise run ts:build                        # napi addon build
+mise run ts:test:integration             # in-process WyrdTestServer journey
+mise run ts:napi:check                   # committed napi index.d.ts matches
+```
 
 ### Everything else
 
@@ -137,9 +187,29 @@ For scoped verification (`gate` already includes its checks):
 
 ```bash
 mise run fmt lints                       # relevant Rust format and lint checks
+mise run check                           # format check + workspace Clippy together
+mise run py:format py:lints              # when Python changed
+mise run py:typecheck                    # when Python stubs, exports, or typing changed
+mise run ts:typecheck                    # when TypeScript changed
 mise run codegen:check                   # TS wire types, error codes, UI examples, theme tokens
-mise run check:deps                      # crate boundaries on the dependency graph
+mise run codegen:regen                   # regenerate every consumed output from source
 ```
+
+| Gate | What it enforces |
+|---|---|
+| `lints` | Workspace Clippy policy from `Cargo.toml` `[lints]`, including `unwrap_used` and reasoned suppressions |
+| `check:deps` | Crate boundaries on the resolved graph: client tier, PyO3 scope, test tooling out of production, Skald foundation edges, one Arrow/DataFusion stack, AWS-LC-only Rustls, no test seams in the shipped server |
+| `check:tenant-isolation` | Query and server code reach tenant tables only through `TenantConn`; RLS itself is proven by Postgres readiness |
+| `check:storage:drift` | Storage credential and tenancy guardrails |
+| `check:py-wheel-no-testing` | The production `wyrd-sdk-python` wheel does not expose `wyrd.testing` |
+| `codegen:check` | Generated outputs match their sources |
+
+Python `.pyi` stubs are authored, not generated; `py:lints` and `py:typecheck`
+prove them. The OpenAPI document is served at runtime from `GET /openapi.json`
+and is not a checked-in artifact; prove an OpenAPI change with
+`mise run test:principals:integration`
+(`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`). Runtime
+MCP catalogs are proven by their owning MCP tests, not by codegen.
 
 ## Family lanes vs. gated journeys
 
@@ -157,6 +227,25 @@ service journeys keep explicit lanes.
 Bifrost's own lanes pass `--include-ignored`, so an ignored test still runs
 there. Marking a test `#[ignore]` excludes it from the default family lane, not
 from Bifrost.
+
+## Fixtures and harnesses
+
+`wyrd-dev-fixtures::PgFixture` owns one isolated ephemeral database per test.
+The Compose superuser `wyrd_test_admin` plays the DBA: it alone creates and
+drops databases, hands each one to the ordinary `wyrd_platform` login, and runs
+the per-database setup in `scripts/postgres/test-database-setup.sql` for the
+separate `wyrd_tenant` login. `wyrd_platform` migrates each fixture database,
+as `wyrd-server migrate` does; neither serving login can create databases.
+`PgFixture::attach` lets child processes reuse the parent's database without
+remigration, reseeding, or cleanup authority.
+
+`wyrd-testing` owns `WyrdTestCluster`, production-shaped server and
+multi-process fixtures, Forge fixtures, Bifrost telemetry capture, and the
+capability-target Bifrost journeys. Do not replace them with globally
+serialized shared-container fixtures or in-process engine substitutes.
+
+Storage tests use local emulators (RustFS, fake-gcs, Azurite); providers are
+mocked. Unit tests never need credentials.
 
 ## When a test fails
 
@@ -193,7 +282,7 @@ state inspection, or a test-only workaround is evidence of a product or
 harness gap, not a successful user journey. Fix that gap or move the assertion
 to the internal tier that owns it.
 
-Follow `AGENTS.md` §16 for style, and these rules specifically:
+Follow the `AGENTS.md` code rules, and these rules specifically:
 
 - **A test must assert.** A test that calls another test and prints a marker
   proves nothing, silently pays that test's full runtime a second time, and
@@ -269,5 +358,5 @@ against this checklist:
   and how to add a journey.
 - `crates/vala/vala-bifrost-redux/tests/README.md` — the tier-2 rule and its
   subsystem groups.
-- `AGENTS.md` §11 — the normative taxonomy and verification scope.
+- `AGENTS.md` — the normative taxonomy and verification scope.
 - `mise.toml` — every lane, with a description on each.

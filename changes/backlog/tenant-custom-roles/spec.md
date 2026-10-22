@@ -90,7 +90,7 @@ surface creates one.
 
 ## Authority and revision
 
-- `AGENTS.md` §§2, 9, 11; `architecture/wyrd-design.md`;
+- `AGENTS.md`; `architecture/wyrd-design.md`;
   `architecture/wyrd-security-posture.md`.
 - Docs: `docs/src/content/docs/understand/identity-and-authorization.md`
   currently states that the four built-in roles are the only roles.

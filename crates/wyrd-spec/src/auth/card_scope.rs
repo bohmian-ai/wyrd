@@ -72,7 +72,7 @@ impl CardScope {
 mod tests {
     use super::CardScope;
     use crate::envelope::CardKind;
-    use crate::ids::{CardName};
+    use crate::ids::CardName;
     use crate::reference::CardRef;
     use wyrd_semver::VersionBlock;
 

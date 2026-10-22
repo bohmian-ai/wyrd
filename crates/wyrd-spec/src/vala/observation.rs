@@ -66,7 +66,7 @@ mod observation_tests {
     //! descriptor.
 
     use crate::envelope::CardKind;
-    use crate::ids::{CardName};
+    use crate::ids::CardName;
     use crate::reference::CardRef;
     use crate::vala::api::BifrostTableName;
     use crate::vala::ids::RunId;

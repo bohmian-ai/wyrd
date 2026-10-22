@@ -124,7 +124,7 @@ mod e2e {
 
     use tempfile::NamedTempFile;
     use wyrd_spec::envelope::{CardKind, Metadata};
-    use wyrd_spec::ids::{CardName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
     use crate::{WyrdConfig, apply_defaults};

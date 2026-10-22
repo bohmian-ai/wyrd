@@ -154,7 +154,7 @@ mod tests {
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::envelope::{CardKind, Metadata, Spec};
-    use wyrd_spec::ids::{CardName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::Ref;
 
     fn metadata(name: &str) -> Metadata {

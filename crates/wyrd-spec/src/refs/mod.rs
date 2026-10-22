@@ -483,8 +483,7 @@ mod blocks_tests {
     /// Panics when a slot is missing or yielded at the wrong path.
     #[test]
     fn blocks_verifier_yields_every_reference_slot() {
-        let agent =
-            json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
+        let agent = json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
         let inline = json!({
             "prompt": {"kind": "Prompt", "name": "judge-prompt", "version": "1.0.0"},
             "execution_route": {"kind": "wyrd_gateway", "deployment": "openai-primary"}

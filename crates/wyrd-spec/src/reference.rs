@@ -313,9 +313,7 @@ impl CardRef {
     /// `(kind, name, version)` only.
     #[must_use]
     pub fn same_identity(&self, other: &CardRef) -> bool {
-        self.kind == other.kind
-            && self.name == other.name
-            && self.version == other.version
+        self.kind == other.kind && self.name == other.name && self.version == other.version
     }
 }
 
@@ -895,19 +893,28 @@ mod tests {
             r#"{"kind":"Service","name":"checkout","version":"1.0.0","space":"prod"}"#,
         )
         .expect_err("space field is refused");
-        assert!(error.to_string().contains("unknown field `space`"), "{error}");
+        assert!(
+            error.to_string().contains("unknown field `space`"),
+            "{error}"
+        );
 
         let error = serde_json::from_str::<Ref>(
             r#"{"kind":"Service","name":"checkout","version":"1.0.0","space":"prod"}"#,
         )
         .expect_err("space field is refused in a reference slot");
-        assert!(error.to_string().contains("unknown field `space`"), "{error}");
+        assert!(
+            error.to_string().contains("unknown field `space`"),
+            "{error}"
+        );
 
         let error = serde_json::from_str::<InlineableRef<skald_spec::Prompt>>(
             r#"{"kind":"Prompt","name":"answer","version":"1.0.0","space":"prod"}"#,
         )
         .expect_err("space field is refused in an inlineable slot");
-        assert!(error.to_string().contains("unknown field `space`"), "{error}");
+        assert!(
+            error.to_string().contains("unknown field `space`"),
+            "{error}"
+        );
     }
 
     #[test]

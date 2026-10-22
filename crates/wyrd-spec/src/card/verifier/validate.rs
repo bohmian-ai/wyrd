@@ -1704,8 +1704,7 @@ mod tests {
             agent(&[], json!("{{findings}}"), Some(incompatible[0].clone()));
         assert_eq!(rule(&stepped), "check_agent_schema");
 
-        let card =
-            json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
+        let card = json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
         let registered = with(review(), "/requirements/2/check/agent", card);
         for (declared, valid) in [(verdict_schema(), true), (incompatible[0].clone(), false)] {
             let resolved: crate::card::agent::AgentSpec =
@@ -1842,8 +1841,7 @@ mod tests {
         ))
         .expect("Agent");
         let prompt = resolved.prompt.as_inline().expect("inline Prompt");
-        let card =
-            json!({"kind": "Agent", "name": "reviewer", "version": "1.0.0"});
+        let card = json!({"kind": "Agent", "name": "reviewer", "version": "1.0.0"});
         for (selector, valid) in [
             ("steps.findings.output.score.value", true),
             ("steps.findings.output.points", false),

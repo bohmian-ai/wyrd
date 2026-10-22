@@ -81,11 +81,7 @@ pub struct BundleArtifactManifest {
 /// Wire-compatibility fixtures for Card bundle projections.
 #[cfg(test)]
 mod tests {
-    use crate::{
-        envelope::CardKind,
-        ids::{CardName},
-        reference::CardRef,
-    };
+    use crate::{envelope::CardKind, ids::CardName, reference::CardRef};
     use wyrd_semver::VersionBlock;
 
     use super::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};

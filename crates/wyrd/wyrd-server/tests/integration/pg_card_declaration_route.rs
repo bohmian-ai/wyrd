@@ -4777,10 +4777,7 @@ async fn flat_card_http_contract() {
     )
     .expect("refusal body is UTF-8");
     assert!(status.is_client_error(), "{status}: {refusal}");
-    assert!(
-        refusal.to_string().contains("unknown field `space`"),
-        "{refusal}"
-    );
+    assert!(refusal.contains("unknown field `space`"), "{refusal}");
     let never = server
         .oneshot_authenticated(
             &jwt,

@@ -125,7 +125,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use wyrd_spec::ids::{CardName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::metadata::{LabelKey, LabelValue};
 
     fn label_pair(k: &str, v: &str) -> (LabelKey, LabelValue) {
@@ -181,7 +181,7 @@ mod merge_tests {
     use std::collections::BTreeMap;
 
     use wyrd_spec::envelope::{CardKind, Metadata};
-    use wyrd_spec::ids::{CardName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::metadata::{LabelKey, LabelValue};
 
     use crate::{WyrdConfig, apply_defaults};

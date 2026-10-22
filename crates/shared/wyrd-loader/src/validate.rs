@@ -156,7 +156,7 @@ mod tests {
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
     use wyrd_spec::card::verifier::VerificationBinding;
     use wyrd_spec::envelope::{CardKind, Metadata, Spec};
-    use wyrd_spec::ids::{CardName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 
     /// Reject two `verified_by` bindings to the same Verifier version on one

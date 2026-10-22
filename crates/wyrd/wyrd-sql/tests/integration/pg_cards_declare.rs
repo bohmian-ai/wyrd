@@ -1111,30 +1111,6 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
 /// Panics when fixture setup fails or any identity rule above does not hold.
 #[tokio::test]
 async fn flat_registry_identity_is_tenant_and_kind_scoped() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let other_tenant = fixture
-        .seed_additional_tenant("flat-identity-other")
-        .await
-        .expect("second tenant seeds");
-    let has_space: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-         WHERE table_schema = 'wyrd' AND table_name IN ('cards', 'card_relationships', 'auth_service_accounts') \
-           AND column_name IN ('space', 'target_space'))",
-    )
-    .fetch_one(fixture.operator_pool().pool())
-    .await
-    .expect("column catalog reads");
-    assert!(!has_space, "Card identity columns must not include space");
-
-    let prompt = prompt_card("flat-identity");
-    let mut service = prompt_card("flat-identity");
-    service.kind = wyrd_spec::envelope::CardKind::Service;
-    service.spec = wyrd_spec::envelope::Spec::from_kind_and_value(
-        &wyrd_spec::envelope::CardKind::Service,
-        serde_json::json!({}),
-    )
-    .expect("service spec decodes");
-
     async fn register(
         fixture: &PgFixture,
         tenant: wyrd_spec::ids::DataTenantId,
@@ -1174,6 +1150,30 @@ async fn flat_registry_identity_is_tenant_and_kind_scoped() {
         conn.commit().await.expect("registration commits");
         Ok(row.card_uid)
     }
+
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let other_tenant = fixture
+        .seed_additional_tenant("flat-identity-other")
+        .await
+        .expect("second tenant seeds");
+    let has_space: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'wyrd' AND table_name IN ('cards', 'card_relationships', 'auth_service_accounts') \
+           AND column_name IN ('space', 'target_space'))",
+    )
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("column catalog reads");
+    assert!(!has_space, "Card identity columns must not include space");
+
+    let prompt = prompt_card("flat-identity");
+    let mut service = prompt_card("flat-identity");
+    service.kind = wyrd_spec::envelope::CardKind::Service;
+    service.spec = wyrd_spec::envelope::Spec::from_kind_and_value(
+        &wyrd_spec::envelope::CardKind::Service,
+        serde_json::json!({}),
+    )
+    .expect("service spec decodes");
 
     let tenant = fixture.data_tenant_id();
     let prompt_uid = register(&fixture, tenant, &prompt)

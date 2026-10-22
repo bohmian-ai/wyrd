@@ -369,6 +369,16 @@ pub struct TableCut {
     pub identity: TableAuthorityIdentity,
     /// Current Iceberg metadata document location for the table.
     pub metadata_location: String,
+    /// Publication revision per Scribe node, read in the same statement
+    /// snapshot as `metadata_location` and `hot_files`; a node absent here has
+    /// revision 0.
+    ///
+    /// One node's publications into a table commit in revision order, so the
+    /// cut holds every publication of a node up to its revision. Oracle
+    /// compares this with the revision each Scribe reports with its live
+    /// capture: a higher reported revision means the cut predates rows that
+    /// Scribe no longer serves live.
+    pub publication_revisions: std::collections::HashMap<Uuid, i64>,
     /// Unresolved `file_list` rows in durable file-list order. These are
     /// candidates; reconciliation against the selected snapshot happens after
     /// the metadata document is read.
@@ -468,6 +478,9 @@ struct CutDbRow {
     table_name: String,
     /// Catalog pointer of the table's current metadata.
     metadata_location: String,
+    /// The table's per-node publication revisions as a JSON object from node
+    /// id to revision, repeated on every row of the table.
+    publication_revisions: sqlx::types::Json<std::collections::HashMap<Uuid, i64>>,
     /// Hot row identity; `None` exactly when the hot side is empty.
     id: Option<Uuid>,
     /// Hot row tenant.
@@ -607,6 +620,7 @@ fn group_table_cut(
                 || cut.identity.namespace_name != row.namespace_name
                 || cut.identity.table_name != row.table_name
                 || cut.metadata_location != row.metadata_location
+                || cut.publication_revisions != row.publication_revisions.0
             {
                 return Err(invariant("table cut returned conflicting table identity"));
             }
@@ -638,6 +652,7 @@ fn group_table_cut(
             TableCut {
                 identity,
                 metadata_location: row.metadata_location,
+                publication_revisions: std::mem::take(&mut row.publication_revisions.0),
                 hot_files: hot.into_iter().collect(),
             },
         ));

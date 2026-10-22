@@ -127,7 +127,8 @@ pub(super) fn signed_closure_schema(
 /// Async boundary that constructs one authenticated role-local scan provider.
 #[async_trait]
 pub trait FollowerSourceResolver: Send + Sync {
-    /// Resolves exactly one validated assignment for the signed target role.
+    /// Resolves exactly one validated assignment for the signed target role
+    /// and the authenticated query it belongs to.
     ///
     /// The returned plan must expose exactly the signed closure, and the
     /// returned `full_schema` must be the authenticated schema that closure was
@@ -142,6 +143,7 @@ pub trait FollowerSourceResolver: Send + Sync {
     async fn resolve(
         &self,
         target_role: ClusterRole,
+        query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError>;
@@ -153,14 +155,21 @@ where
     T: FollowerSourceResolver + ?Sized,
 {
     /// Delegates to the one injected process resolver allocation.
+    ///
+    /// Adds no state, retry, or cancellation behavior of its own: dropping
+    /// this future drops the inner resolution under that resolver's contract.
+    ///
+    /// # Errors
+    /// Returns the inner resolver's [`FollowerResolutionError`] unchanged.
     async fn resolve(
         &self,
         target_role: ClusterRole,
+        query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         self.as_ref()
-            .resolve(target_role, assignment, session)
+            .resolve(target_role, query_id, assignment, session)
             .await
     }
 }
@@ -221,6 +230,9 @@ pub struct AuthenticatedFollowerContext<'a> {
     pub leader_fence: OracleRoleFence,
     /// Role incarnation owned by this receiving process.
     pub local_fence: OracleRoleFence,
+    /// Query recovered from checked context claims; a Scribe follower reads
+    /// only captures retained for it.
+    pub query_id: uuid::Uuid,
 }
 
 /// Builds the leaf for an assignment that names no files at all.
@@ -254,10 +266,10 @@ trait LiveTailSource: Send + Sync + std::fmt::Debug {
     /// Returns the exact stream incarnation served by this source.
     fn stream(&self) -> StreamIdentity;
 
-    /// Opens one lazily produced live read over the bounded memtable cut and
-    /// the staged members it did not serve.
-    /// Cancellation before the open returns exposes no producer; a retry opens
-    /// a new cut.
+    /// Opens one partition range of the retained capture the request names.
+    ///
+    /// It never takes a fresh capture: a capture that is gone fails the read.
+    /// Cancellation before the open returns exposes no producer.
     ///
     /// # Errors
     /// Returns a redacted [`FollowerResolutionError`] when Scribe rejects or
@@ -275,7 +287,7 @@ impl LiveTailSource for FetchLiveTailService {
         FetchLiveTailService::stream(self)
     }
 
-    /// Delegates exactly once to the Scribe live-read open.
+    /// Delegates exactly once to the Scribe retained-capture open.
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::SourceLoss`] when the request names
@@ -285,7 +297,7 @@ impl LiveTailSource for FetchLiveTailService {
         &self,
         request: FetchLiveTailRequest,
     ) -> Result<LiveTailBatches, FollowerResolutionError> {
-        self.open_live_batches(&request)
+        self.open_capture(&request)
             .map_err(|error| live_open_error(&error))
     }
 }
@@ -413,7 +425,7 @@ impl<T> ScribeTailResolver<T> {
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
         let fault = |detail: &str| FollowerResolutionError::Fault(detail.to_owned());
-        let (rows, runs, lease) = read.into_parts();
+        let (rows, charges, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if !rows.is_empty() || runs.is_empty() {
             let projected = rows
@@ -430,6 +442,7 @@ impl<T> ScribeTailResolver<T> {
             // re-deals whatever the query's predicate keeps.
             let source = super::memtable_source::MemtableSource::try_new(
                 projected,
+                charges.into(),
                 self.partitioning,
                 session.config().target_partitions(),
                 Arc::clone(required_schema),
@@ -562,6 +575,7 @@ where
     async fn resolve(
         &self,
         target_role: ClusterRole,
+        query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
@@ -644,6 +658,8 @@ where
             .open(FetchLiveTailRequest {
                 binding,
                 target_stream: stream,
+                query_id,
+                capture_id: cut.capture_id,
                 start_partition,
                 end_partition,
                 // The signed closure, byte for byte. Scribe projects the
@@ -762,7 +778,12 @@ where
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
                 .resolver
-                .resolve(request.target_fence.role, &assignment, session)
+                .resolve(
+                    request.target_fence.role,
+                    authenticated.query_id,
+                    &assignment,
+                    session,
+                )
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
             // Two distinct schemas, checked in order. The fingerprint identifies
@@ -1089,6 +1110,7 @@ pub fn authenticated_preflight(
         async fn resolve(
             &self,
             _target_role: ClusterRole,
+            _query_id: uuid::Uuid,
             _assignment: &FollowerScanAssignment,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
@@ -1155,7 +1177,46 @@ pub(crate) mod tests {
             writer_epoch: 2,
             start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
+            capture_id: uuid::Uuid::nil(),
         }
+    }
+
+    /// Query identity the focused resolver tests resolve under.
+    fn test_query_id() -> uuid::Uuid {
+        uuid::Uuid::from_u128(1)
+    }
+
+    /// Retains a live capture of the assignment's table on `tail` for
+    /// [`test_query_id`] and returns the assignment reading that capture.
+    ///
+    /// # Panics
+    /// Panics when the capture cannot be taken.
+    async fn reading_capture(
+        tail: &FetchLiveTailService,
+        mut assignment: FollowerScanAssignment,
+    ) -> FollowerScanAssignment {
+        // Listing takes the discovery wire spelling, without the `vala.` root.
+        let listed = TenantTableBinding {
+            namespace: assignment
+                .binding
+                .namespace
+                .trim_start_matches("vala.")
+                .to_owned(),
+            ..assignment.binding.clone()
+        };
+        let capture = tail
+            .capture_active_streams(
+                &listed,
+                &crate::scan_sizing::ScanScope::default(),
+                test_query_id(),
+                std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("the live capture is taken");
+        if let Some(cut) = assignment.scribe_provider_cut.as_mut() {
+            cut.capture_id = capture.capture_id.unwrap_or_default();
+        }
+        assignment
     }
 
     /// Derives the production identity-bound scan ID for one local test stream.
@@ -1219,6 +1280,7 @@ pub(crate) mod tests {
         async fn resolve(
             &self,
             _target_role: ClusterRole,
+            _query_id: uuid::Uuid,
             assignment: &FollowerScanAssignment,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
@@ -1304,6 +1366,7 @@ pub(crate) mod tests {
             reservation_id: &request.reservation_id,
             leader_fence: request.leader_fence.clone(),
             local_fence: request.target_fence.clone(),
+            query_id: test_query_id(),
         }
     }
 
@@ -1353,6 +1416,7 @@ pub(crate) mod tests {
         resolver
             .resolve(
                 ClusterRole::Scribe,
+                test_query_id(),
                 &assignment(local_scribe_scan_id(&binding, stream)),
                 &session,
             )
@@ -1371,7 +1435,12 @@ pub(crate) mod tests {
             3,
         );
         resolver
-            .resolve(ClusterRole::Scribe, &assignment(sibling), &session)
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment(sibling),
+                &session,
+            )
             .await
             .expect("a sibling placeholder resolves as an explicit empty provider");
         assert_eq!(
@@ -1440,7 +1509,7 @@ pub(crate) mod tests {
         );
         for (refused, expected) in [(other_epoch, "source loss"), (other_schema, "fault")] {
             let class = match resolver
-                .resolve(ClusterRole::Scribe, &refused, &session)
+                .resolve(ClusterRole::Scribe, test_query_id(), &refused, &session)
                 .await
             {
                 Err(FollowerResolutionError::SourceLoss(_)) => "source loss",
@@ -1753,18 +1822,23 @@ pub(crate) mod tests {
         let provider = resolver
             .resolve(
                 ClusterRole::Scribe,
-                &FollowerScanAssignment {
-                    scan_id: local_scribe_scan_id(&binding, stream),
-                    binding,
-                    scribe_provider_cut: Some(cut()),
-                    schema_fingerprint: super::super::assignment_schema_fingerprint(
-                        schema.as_ref(),
-                    ),
-                    // The resolver now projects the assignment's own closure,
-                    // so this fixture names the single column its memtable
-                    // schema actually carries.
-                    required_columns: vec!["event_time".to_owned()],
-                },
+                test_query_id(),
+                &reading_capture(
+                    &resolver.tail,
+                    FollowerScanAssignment {
+                        scan_id: local_scribe_scan_id(&binding, stream),
+                        binding,
+                        scribe_provider_cut: Some(cut()),
+                        schema_fingerprint: super::super::assignment_schema_fingerprint(
+                            schema.as_ref(),
+                        ),
+                        // The resolver now projects the assignment's own
+                        // closure, so this fixture names the single column its
+                        // memtable schema actually carries.
+                        required_columns: vec!["event_time".to_owned()],
+                    },
+                )
+                .await,
                 &session,
             )
             .await
@@ -1968,13 +2042,18 @@ pub(crate) mod tests {
         let owned = resolver
             .resolve(
                 ClusterRole::Scribe,
-                &closure_assignment(
-                    local_scribe_scan_id(&binding, stream),
-                    binding.clone(),
-                    schema.as_ref(),
-                    closure.clone(),
-                    fingerprint.clone(),
-                ),
+                test_query_id(),
+                &reading_capture(
+                    &resolver.tail,
+                    closure_assignment(
+                        local_scribe_scan_id(&binding, stream),
+                        binding.clone(),
+                        schema.as_ref(),
+                        closure.clone(),
+                        fingerprint.clone(),
+                    ),
+                )
+                .await,
                 &session,
             )
             .await
@@ -2011,6 +2090,7 @@ pub(crate) mod tests {
         let unowned = resolver
             .resolve(
                 ClusterRole::Scribe,
+                test_query_id(),
                 &closure_assignment(
                     "vala.traces.spans:scribe:someone-else".to_owned(),
                     binding.clone(),
@@ -2048,7 +2128,7 @@ pub(crate) mod tests {
             fingerprint,
         );
         recording
-            .resolve(ClusterRole::Scribe, &assignment, &session)
+            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
             .await
             .expect("the recording source resolves the same signed closure");
         let recorded = requests
@@ -2098,6 +2178,7 @@ pub(crate) mod tests {
             counting
                 .resolve(
                     ClusterRole::Scribe,
+                    test_query_id(),
                     &closure_assignment(
                         local_scribe_scan_id(&binding, stream),
                         binding,
@@ -2121,7 +2202,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Resolves the staged-generation fixture's own Scribe assignment.
+    /// Captures and resolves the staged-generation fixture's own Scribe
+    /// assignment, returning the plan and the capture it reads.
     ///
     /// The fixture's generation is marked durable first, so its rows are
     /// served only by its staged runs and the resolved leaf must read them.
@@ -2132,7 +2214,7 @@ pub(crate) mod tests {
         fixture: &StagedGenerationFixture,
         service: Arc<FetchLiveTailService>,
         session: &SessionState,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> (Arc<dyn ExecutionPlan>, uuid::Uuid) {
         fixture
             .memtable
             .complete_staged(fixture.generation.get(), fixture.member)
@@ -2148,6 +2230,14 @@ pub(crate) mod tests {
             namespace: "vala.bifrost".to_owned(),
             table: "events".to_owned(),
         };
+        let request = crate::scribe::tail_rpc::tests::captured(
+            &service,
+            &FetchLiveTailRequest {
+                query_id: test_query_id(),
+                ..fixture.request.clone()
+            },
+        )
+        .await;
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         let assignment = FollowerScanAssignment {
             scan_id: local_scribe_scan_id(&binding, stream),
@@ -2157,15 +2247,17 @@ pub(crate) mod tests {
                     .expect("positive fixture epoch"),
                 start_partition: fixture.request.start_partition.to_wire(),
                 end_partition: fixture.request.end_partition.to_wire(),
+                capture_id: request.capture_id,
             }),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
             required_columns: vec!["value".to_owned()],
         };
-        resolver
-            .resolve(ClusterRole::Scribe, &assignment, session)
+        let plan = resolver
+            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, session)
             .await
             .expect("the staged assignment resolves")
-            .plan
+            .plan;
+        (plan, request.capture_id)
     }
 
     /// A selective filter skips the staged row groups that cannot match.
@@ -2189,7 +2281,7 @@ pub(crate) mod tests {
             crate::resources::OracleSessionShape::for_test().session_config(),
         )
         .state();
-        let leaf = resolve_staged_fixture(&fixture, service, &session).await;
+        let (leaf, _) = resolve_staged_fixture(&fixture, service, &session).await;
         let predicate = datafusion::physical_expr::expressions::binary(
             Arc::new(datafusion::physical_expr::expressions::Column::new(
                 "value", 0,
@@ -2240,11 +2332,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// The staged lease lives exactly as long as the Scribe leaf reading it.
+    /// The staged lease lives exactly as long as the Scribe leaf reading it
+    /// or the query's retained capture.
     ///
     /// The generation is staged as two runs. A stream that yielded its first
-    /// batch keeps the lease; dropping the stream and the plan releases it at
-    /// once, so nothing keeps reading on a dropped read's behalf.
+    /// batch keeps the lease; dropping the stream and the plan leaves only the
+    /// retained capture's, and releasing the capture frees it at once.
     ///
     /// # Panics
     /// Panics when the stream fails or the lease outlives the dropped read.
@@ -2258,7 +2351,8 @@ pub(crate) mod tests {
             crate::resources::OracleSessionShape::new(1).session_config(),
         )
         .state();
-        let plan = resolve_staged_fixture(&fixture, service, &session).await;
+        let (plan, capture_id) =
+            resolve_staged_fixture(&fixture, Arc::clone(&service), &session).await;
         let leases = || {
             fixture
                 .registry
@@ -2276,7 +2370,16 @@ pub(crate) mod tests {
         assert_eq!(leases(), 1, "an open stream keeps the lease");
         drop(stream);
         drop(plan);
-        assert_eq!(leases(), 0, "dropping the read releases the lease");
+        assert_eq!(leases(), 1, "the retained capture keeps the lease");
+        let wire = TenantTableBinding {
+            tenant_id: fixture.key.tenant,
+            namespace: "bifrost".to_owned(),
+            table: "events".to_owned(),
+        };
+        service
+            .release_capture(&wire, test_query_id(), capture_id)
+            .expect("the capture is released");
+        assert_eq!(leases(), 0, "releasing the capture releases the lease");
     }
 
     /// Returns the partition count each live source under `plan` advertises.
@@ -2334,15 +2437,19 @@ pub(crate) mod tests {
         let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
         let binding = closure_fixture_binding(tenant_id);
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
-        let assignment = closure_assignment(
-            local_scribe_scan_id(&binding, stream),
-            binding.clone(),
-            schema.as_ref(),
-            signed_closure(),
-            fingerprint.clone(),
-        );
+        let assignment = reading_capture(
+            &resolver.tail,
+            closure_assignment(
+                local_scribe_scan_id(&binding, stream),
+                binding.clone(),
+                schema.as_ref(),
+                signed_closure(),
+                fingerprint.clone(),
+            ),
+        )
+        .await;
         let plan = resolver
-            .resolve(ClusterRole::Scribe, &assignment, &session)
+            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
             .await
             .expect("the one-batch cut resolves")
             .plan;
@@ -2368,7 +2475,7 @@ pub(crate) mod tests {
             Arc::clone(&schema),
         );
         let plan = empty
-            .resolve(ClusterRole::Scribe, &assignment, &session)
+            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
             .await
             .expect("the empty cut resolves")
             .plan;
@@ -2411,7 +2518,7 @@ pub(crate) mod tests {
             )
             .expect("the newer batch inserts");
         let service = Arc::clone(&fixture.service);
-        let plan = resolve_staged_fixture(&fixture, service, &session).await;
+        let (plan, _) = resolve_staged_fixture(&fixture, service, &session).await;
         assert_eq!(live_source_partitions(&plan), vec![1, 1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await

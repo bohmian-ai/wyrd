@@ -14,8 +14,10 @@
 //! `LISTEN` and after any lost connection the cache is cleared and every query
 //! reads Postgres. A notification is delivered after its commit, so a query
 //! racing a publication can see the pre-publication cut for that delivery
-//! latency; this is the same best-effort freshness a cut already has between
-//! its read and the live scan opening.
+//! latency. Notifications only keep the cache fresh; they never validate a
+//! read. Oracle validates each served cut against the publication revision
+//! every captured Scribe reports, and [`CutCache::evict`]s a cut a Scribe
+//! proves stale before reading it again.
 //!
 //! Snapshot safety comes from the caller's `not_before` bound, not from age:
 //! the cached pointer was current when read, and Forge keeps a replaced
@@ -133,6 +135,19 @@ impl CutCache {
         }
     }
 
+    /// Drops one table's cut, which Oracle found older than a Scribe's
+    /// reported publication revision.
+    ///
+    /// Bumps the generation exactly as a notification does, so a fill that
+    /// began before the eviction cannot reinsert the stale cut.
+    pub(crate) fn evict(&self, tenant: DataTenantId, table: &CutTableRef<'_>) {
+        let Ok(mut entries) = self.entries.write() else {
+            return;
+        };
+        entries.generation = entries.generation.wrapping_add(1);
+        entries.cuts.remove(&key(tenant, table));
+    }
+
     /// Drops the cut a notification names, or every cut when the payload is
     /// not `tenant|namespace|table`.
     fn invalidate(&self, payload: &str) {
@@ -237,13 +252,14 @@ mod tests {
                 table_name: table.to_owned(),
             },
             metadata_location: format!("s3://w/{table}/v1.metadata.json"),
+            publication_revisions: std::collections::HashMap::new(),
             hot_files: Vec::new(),
         }
     }
 
     /// Proves the cache serves only while listening, only cuts read at or
-    /// after the bound, drops a fill that raced an invalidation, and drops
-    /// exactly the table a notification names.
+    /// after the bound, drops a fill that raced an invalidation or eviction,
+    /// and drops exactly the table a notification or eviction names.
     ///
     /// # Panics
     /// Panics when any serve, miss, or invalidation assertion fails.
@@ -306,6 +322,20 @@ mod tests {
         assert!(
             cache.get(tenant, &[other], None).is_none(),
             "malformed clears all"
+        );
+
+        let generation = cache.fill_generation().expect("listening");
+        cache.insert(generation, start, &[cut(tenant, "events")]);
+        let raced = cache.fill_generation().expect("listening");
+        cache.evict(tenant, &events);
+        assert!(
+            cache.get(tenant, &[events], None).is_none(),
+            "evicted table dropped"
+        );
+        cache.insert(raced, start, &[cut(tenant, "events")]);
+        assert!(
+            cache.get(tenant, &[events], None).is_none(),
+            "a fill that raced an eviction is dropped"
         );
 
         let generation = cache.fill_generation().expect("listening");

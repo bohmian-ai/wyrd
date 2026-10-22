@@ -1,4 +1,4 @@
-//! Private tonic adapter for Scribe active-stream discovery.
+//! Private tonic adapter for Scribe live capture and release.
 //!
 //! Mounted only on the mutually authenticated peer listener, so every caller
 //! already presented the cluster `wyrd-peer` certificate. That admits a
@@ -16,7 +16,10 @@ use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_server::{
     ScribeTailService, ScribeTailServiceServer,
 };
-use wyrd_tonic::wyrd::v1::{self as proto, ListActiveStreamsRequest, ListActiveStreamsResponse};
+use wyrd_tonic::wyrd::v1::{
+    self as proto, ListActiveStreamsRequest, ListActiveStreamsResponse, ReleaseTailCaptureRequest,
+    ReleaseTailCaptureResponse,
+};
 
 /// Private gRPC adapter listing this process's live Scribe streams.
 pub struct ScribeTailGrpc {
@@ -40,25 +43,41 @@ impl ScribeTailGrpc {
 
 #[wyrd_tonic::tonic::async_trait]
 impl ScribeTailService for ScribeTailGrpc {
-    /// Lists active tenant/table event-day scopes with the bytes the request's
-    /// scope reads in each; returns metadata, never rows.
+    /// Captures one tenant table's live sources for the request's query and
+    /// lists the captured event-day scopes with the bytes the request's scope
+    /// reads in each; returns metadata and the capture id, never rows.
+    ///
+    /// The capture is retained until it is released or `expires_at_unix_ms`
+    /// passes. Cancelling the RPC before the capture is retained retains
+    /// nothing; cancelling after leaves it to its release or that expiry.
+    ///
+    /// # Errors
+    /// Returns invalid-argument for an absent or malformed binding or query
+    /// id or an invalid tail binding, deadline-exceeded when the expiry
+    /// passes before the capture is taken, and internal when Scribe state
+    /// cannot be captured.
     async fn list_active_streams(
         &self,
         request: Request<ListActiveStreamsRequest>,
     ) -> Result<Response<ListActiveStreamsResponse>, Status> {
         let request = request.into_inner();
-        let binding = request
-            .binding
-            .ok_or_else(|| Status::invalid_argument("tail binding is required"))?;
-        let binding = wyrd_spec::vala::api::TenantTableBinding::try_from(binding)
-            .map_err(conversion_status)?;
+        let binding = wire_binding(request.binding)?;
+        let query_id = uuid_field(&request.query_id, "query_id")?;
+        let expires_at =
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(request.expires_at_unix_ms);
         let scope = ScanScope::from_wire(request.columns, &request.filters);
-        let streams = self
+        let capture = self
             .source
-            .list_active_streams(&binding, &scope)
+            .capture_active_streams(&binding, &scope, query_id, expires_at)
+            .await
             .map_err(tail_status)?;
         Ok(Response::new(ListActiveStreamsResponse {
-            streams: streams
+            capture_id: capture
+                .capture_id
+                .map(|capture_id| capture_id.as_bytes().to_vec())
+                .unwrap_or_default(),
+            streams: capture
+                .streams
                 .into_iter()
                 .map(|stream| proto::ActiveTailStream {
                     time_partition: Some(stream.time_partition.into()),
@@ -66,8 +85,55 @@ impl ScribeTailService for ScribeTailGrpc {
                     bytes: stream.bytes,
                 })
                 .collect(),
+            publication_revision: capture.publication_revision,
         }))
     }
+
+    /// Releases one query's retained capture; an unknown capture is a no-op.
+    ///
+    /// A capture owned by another query or table is left unchanged, and the
+    /// release completes without awaiting once decoded, so a cancelled RPC
+    /// either released the capture or leaves it to its expiry.
+    ///
+    /// # Errors
+    /// Returns invalid-argument for an absent or malformed binding, query id,
+    /// or capture id or an invalid tail binding, and internal when the
+    /// capture table is poisoned.
+    async fn release_capture(
+        &self,
+        request: Request<ReleaseTailCaptureRequest>,
+    ) -> Result<Response<ReleaseTailCaptureResponse>, Status> {
+        let request = request.into_inner();
+        let binding = wire_binding(request.binding)?;
+        self.source
+            .release_capture(
+                &binding,
+                uuid_field(&request.query_id, "query_id")?,
+                uuid_field(&request.capture_id, "capture_id")?,
+            )
+            .map_err(tail_status)?;
+        Ok(Response::new(ReleaseTailCaptureResponse {}))
+    }
+}
+
+/// Decodes the required private tenant/table binding.
+///
+/// # Errors
+/// Returns an invalid-argument status when it is absent or malformed.
+fn wire_binding(
+    binding: Option<proto::TenantTableBinding>,
+) -> Result<wyrd_spec::vala::api::TenantTableBinding, Status> {
+    let binding = binding.ok_or_else(|| Status::invalid_argument("tail binding is required"))?;
+    wyrd_spec::vala::api::TenantTableBinding::try_from(binding).map_err(conversion_status)
+}
+
+/// Decodes one required 16-byte UUID field.
+///
+/// # Errors
+/// Returns an invalid-argument status naming `field` when it is not a UUID.
+fn uuid_field(value: &[u8], field: &str) -> Result<uuid::Uuid, Status> {
+    uuid::Uuid::from_slice(value)
+        .map_err(|_| Status::invalid_argument(format!("tail {field} is not a UUID")))
 }
 
 /// Maps malformed private wire fields to an unauthenticated-safe invalid argument status.

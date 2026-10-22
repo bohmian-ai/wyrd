@@ -1,15 +1,15 @@
 //! Typed, pod-local live-tail reads over writable and immutable memtable data.
 //!
-//! The Scribe live source owns no WAL or SQL access. Oracle discovers the
-//! partitions a Scribe serves through the mTLS private `ListActiveStreams`
-//! RPC and reads them as lazily produced live batches.
+//! The Scribe live source owns no WAL or SQL access. Oracle captures the
+//! sources a Scribe serves for one query through the mTLS private
+//! `ListActiveStreams` RPC, reads every fragment of that query from the
+//! retained capture, and releases it through `ReleaseCapture`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "test-support")]
 use datafusion::physical_plan::SendableRecordBatchStream;
-use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
 use wyrd_tonic::tonic::{Code, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
@@ -51,30 +51,49 @@ pub struct TonicTailReadTransport {
 }
 
 impl TonicTailReadTransport {
-    /// Discovers active event-day scopes through the private Scribe RPC.
+    /// Captures one table's live sources for `query_id` through the private
+    /// Scribe RPC and lists the captured partitions.
     ///
     /// # Errors
     /// Returns the [`TailReadError`] class of the server status (see
     /// [`tonic_error`]), [`TailReadError::Binding`] for an unreadable returned
     /// partition, and [`TailReadError::State`] for a malformed returned stream
-    /// identity.
+    /// identity or capture id.
     pub async fn list_active_streams(
         &self,
         binding: tail::TenantTableBinding,
         scope: &ScanScope,
-    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        query_id: uuid::Uuid,
+        expires_at: std::time::SystemTime,
+    ) -> Result<TailCapture, TailReadError> {
         let mut client = self.client.clone();
         let (columns, filters) = scope.to_wire();
+        let expires_at_unix_ms = expires_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .ok_or(TailReadError::DeadlineElapsed)?;
         let response = client
             .list_active_streams(wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
                 binding: Some(binding.into()),
                 columns,
                 filters,
+                query_id: query_id.as_bytes().to_vec(),
+                expires_at_unix_ms,
             })
             .await
-            .map_err(|status| tonic_error(&status))?;
-        response
-            .into_inner()
+            .map_err(|status| tonic_error(&status))?
+            .into_inner();
+        let capture_id = if response.capture_id.is_empty() {
+            None
+        } else {
+            Some(uuid::Uuid::from_slice(&response.capture_id).map_err(|_| {
+                TailReadError::State {
+                    detail: "tail capture id is invalid".to_owned(),
+                }
+            })?)
+        };
+        let streams = response
             .streams
             .into_iter()
             .map(|stream| {
@@ -100,7 +119,40 @@ impl TonicTailReadTransport {
                     bytes,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, TailReadError>>()?;
+        if capture_id.is_none() != streams.is_empty() {
+            return Err(TailReadError::State {
+                detail: "tail listing and capture id disagree".to_owned(),
+            });
+        }
+        Ok(TailCapture {
+            capture_id,
+            streams,
+            publication_revision: response.publication_revision,
+        })
+    }
+
+    /// Releases one query's capture through the private Scribe RPC.
+    ///
+    /// # Errors
+    /// Returns the [`TailReadError`] class of the server status (see
+    /// [`tonic_error`]).
+    pub async fn release_capture(
+        &self,
+        binding: tail::TenantTableBinding,
+        query_id: uuid::Uuid,
+        capture_id: uuid::Uuid,
+    ) -> Result<(), TailReadError> {
+        let mut client = self.client.clone();
+        client
+            .release_capture(wyrd_tonic::wyrd::v1::ReleaseTailCaptureRequest {
+                binding: Some(binding.into()),
+                query_id: query_id.as_bytes().to_vec(),
+                capture_id: capture_id.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|status| tonic_error(&status))?;
+        Ok(())
     }
 
     /// Creates a remote transport over the mTLS private Scribe channel.
@@ -304,13 +356,17 @@ impl Drop for OpenLiveProducer {
     }
 }
 
-/// Exact, bounded hot-read request handed from Oracle to Scribe.
+/// Exact, bounded read of one retained capture, handed from Oracle to Scribe.
 #[derive(Debug, Clone)]
 pub struct FetchLiveTailRequest {
     /// Authenticated tenant/table binding resolved by Oracle.
     pub binding: TenantTableBinding,
     /// The writer stream the caller believes it is talking to.
     pub target_stream: StreamIdentity,
+    /// Query the capture was taken for, from the authenticated peer context.
+    pub query_id: uuid::Uuid,
+    /// Retained capture named by the signed assignment.
+    pub capture_id: uuid::Uuid,
     /// Inclusive first partition day governed by the query.
     pub start_partition: TimePartition,
     /// Inclusive last partition day governed by the query.
@@ -326,9 +382,6 @@ pub struct HotBatch {
     pub partition_day: TimePartition,
     /// Immutable generation holding the rows, or `None` while they are still
     /// in a writable bucket.
-    ///
-    /// A live read skips the staged runs of every generation its memtable
-    /// snapshot already served, so each generation reaches a reader once.
     pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     /// Arrow rows projected to the request's required columns.
     pub rows: arrow::record_batch::RecordBatch,
@@ -337,24 +390,36 @@ pub struct HotBatch {
     pub statistics: std::sync::Arc<datafusion::common::Statistics>,
 }
 
-/// One opened Scribe live read: its bounded memtable cut and the staged runs
-/// that cut did not already serve.
+/// One partition range read from a retained Scribe live capture.
 ///
-/// Opening takes the bounded shallow memtable snapshot and leases the staged
-/// members not already served by it; nothing is filtered, decoded, or copied
-/// here. The Scribe follower turns it into one `DataFusion` plan: the memtable
-/// rows become an in-memory source, the unserved runs are read by Oracle's
-/// hot-Parquet scan, and the lease moves into that scan so an already-leased
-/// run stays readable even if publication retires its authority meanwhile.
+/// Opening filters and projects the capture's memory batches and names its
+/// staged runs in range; nothing is decoded or copied here. The Scribe
+/// follower turns it into one `DataFusion` plan: the memory rows become an
+/// in-memory source, the runs are read by Oracle's hot-Parquet scan, and the
+/// shared lease moves into that scan so a run stays readable even if
+/// publication retires its authority meanwhile.
 #[derive(Debug)]
 pub struct LiveTailBatches {
-    /// Shallow memtable batches in acknowledgement order, not yet filtered.
+    /// Memory batches in capture order, not yet filtered.
     memtable: Vec<HotBatch>,
-    /// Lease keeping every staged run below readable until release.
-    staged: Option<crate::scribe::hot_source::StagedSourceLease>,
-    /// Leased staged members the memtable cut did not already serve.
-    unserved: Vec<crate::scribe::hot_source::StagedSource>,
+    /// Accounting owners of `memtable`'s Arrow buffers, shared with the
+    /// retained capture so retirement cannot uncharge them while this read
+    /// holds them.
+    charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    /// Staged run paths in merge order.
+    runs: Vec<PathBuf>,
+    /// Lease keeping `runs` on disk, shared with the retained capture.
+    staged: Option<Arc<StagedSourceLease>>,
 }
+
+/// The parts of one [`LiveTailBatches`]: memory batches, their accounting
+/// owners, staged run paths, and the lease keeping those runs on disk.
+pub(crate) type LiveTailParts = (
+    Vec<HotBatch>,
+    Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    Vec<PathBuf>,
+    Option<Arc<StagedSourceLease>>,
+);
 
 impl LiveTailBatches {
     /// Wraps an already captured memtable snapshot with no staged members.
@@ -364,24 +429,22 @@ impl LiveTailBatches {
     pub fn from_snapshot(memtable: Vec<HotBatch>) -> Self {
         Self {
             memtable,
+            charges: Vec::new(),
+            runs: Vec::new(),
             staged: None,
-            unserved: Vec::new(),
         }
     }
 
-    /// Splits the read into its memtable batches, the unserved staged run
-    /// paths in merge order, and the lease keeping those runs on disk.
+    /// Splits the read into its memory batches, their accounting owners, its
+    /// staged run paths in merge order, and the lease keeping those runs on
+    /// disk.
     ///
-    /// The caller must hold the lease for as long as it reads any run path.
+    /// The caller must hold the charges for as long as any memory batch or a
+    /// projection of one lives, and the lease for as long as it reads any run
+    /// path.
     #[must_use]
-    pub(crate) fn into_parts(self) -> (Vec<HotBatch>, Vec<PathBuf>, Option<StagedSourceLease>) {
-        let rows = self.memtable;
-        let runs = self
-            .unserved
-            .into_iter()
-            .flat_map(|source| source.runs)
-            .collect();
-        (rows, runs, self.staged)
+    pub(crate) fn into_parts(self) -> LiveTailParts {
+        (self.memtable, self.charges, self.runs, self.staged)
     }
 }
 
@@ -415,7 +478,152 @@ pub(crate) fn observe_live_production_for_test(
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, observed))
 }
 
+/// One retained live capture and the query it belongs to.
+#[derive(Debug)]
+pub(crate) struct RetainedCapture {
+    /// Query the capture was taken for.
+    query_id: uuid::Uuid,
+    /// Tenant table the capture covers.
+    binding: TenantTableBinding,
+    /// The captured sources.
+    capture: crate::scribe::memtable::LiveCapture,
+    /// The query's monotonic deadline, the end of the capture's authority: no
+    /// read opens it at or after this instant, whether or not its expiry timer
+    /// has run yet.
+    deadline: tokio::time::Instant,
+    /// Expiry timer, armed only after the capture is in the table and aborted
+    /// when the capture is released first; empty while it is being armed.
+    expiry: std::sync::OnceLock<tokio::task::AbortHandle>,
+}
+
+impl RetainedCapture {
+    /// Reports whether the capture's authority has ended at `now`.
+    fn elapsed_at(&self, now: tokio::time::Instant) -> bool {
+        now >= self.deadline
+    }
+}
+
+/// Captures retained by one Scribe, shared by every tail service it builds.
+pub(crate) type RetainedCaptures = Arc<CaptureTable>;
+
+/// Lock shards of the capture table; each query touches one shard per
+/// listing, open, and release.
+const CAPTURE_SHARDS: usize = 16;
+
+/// Retained captures keyed by capture id, split across independently locked
+/// shards so concurrent queries do not serialize on one lock.
+///
+/// A removed capture is dropped after its shard lock is released: dropping
+/// one frees its batches and staged lease, which must not stall other
+/// queries on the same shard.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureTable {
+    /// Capture shards selected by the capture id's low bits.
+    shards: [std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<RetainedCapture>>>;
+        CAPTURE_SHARDS],
+}
+
+impl CaptureTable {
+    /// Locks the shard holding `capture_id`.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn shard(
+        &self,
+        capture_id: uuid::Uuid,
+    ) -> Result<
+        std::sync::MutexGuard<'_, std::collections::HashMap<uuid::Uuid, Arc<RetainedCapture>>>,
+        TailReadError,
+    > {
+        let index = (capture_id.as_u128() % CAPTURE_SHARDS as u128) as usize;
+        self.shards[index].lock().map_err(|_| TailReadError::State {
+            detail: "live capture table is poisoned".to_owned(),
+        })
+    }
+
+    /// Retains `capture` under `capture_id`.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn insert(
+        &self,
+        capture_id: uuid::Uuid,
+        capture: Arc<RetainedCapture>,
+    ) -> Result<(), TailReadError> {
+        self.shard(capture_id)?.insert(capture_id, capture);
+        Ok(())
+    }
+
+    /// Returns the retained capture `capture_id` when `owns` accepts it.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn get(
+        &self,
+        capture_id: uuid::Uuid,
+        owns: impl FnOnce(&RetainedCapture) -> bool,
+    ) -> Result<Option<Arc<RetainedCapture>>, TailReadError> {
+        Ok(self
+            .shard(capture_id)?
+            .get(&capture_id)
+            .filter(|retained| owns(retained))
+            .cloned())
+    }
+
+    /// Removes the capture `capture_id` when `owns` accepts it, returning it
+    /// so the caller drops it outside the shard lock.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the shard is poisoned.
+    fn remove(
+        &self,
+        capture_id: uuid::Uuid,
+        owns: impl FnOnce(&RetainedCapture) -> bool,
+    ) -> Result<Option<Arc<RetainedCapture>>, TailReadError> {
+        let mut shard = self.shard(capture_id)?;
+        if shard
+            .get(&capture_id)
+            .is_some_and(|retained| owns(retained))
+        {
+            Ok(shard.remove(&capture_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Counts every retained capture.
+    #[cfg(any(test, feature = "test-support"))]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().map_or(0, |captures| captures.len()))
+            .sum()
+    }
+}
+
+/// One listing's partitions and the capture they are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailCapture {
+    /// Retained capture every listed stream is read from, or `None` when
+    /// nothing was listed and nothing is retained.
+    pub capture_id: Option<uuid::Uuid>,
+    /// Listed partitions, sorted, each once.
+    pub streams: Vec<ActiveTailStream>,
+    /// The table revision this Scribe node's last locally completed
+    /// publication committed at, read in the capture's critical section.
+    ///
+    /// Reported for an empty capture too: Oracle keeps a cut only when its
+    /// revision for this node is at least this one.
+    pub publication_revision: i64,
+}
+
 /// Pod-local live-tail service over the Scribe memtable.
+///
+/// A listing takes one coherent whole-table capture (see
+/// [`crate::scribe::memtable::LiveCapture`]) and retains it for its query
+/// until the query releases it or its deadline passes; every read of that
+/// query's fragments is served from the retained capture, never from live
+/// state again.
 #[derive(Debug)]
 pub struct FetchLiveTailService {
     /// Exact pod-local WAL stream incarnation served by this source.
@@ -429,13 +637,15 @@ pub struct FetchLiveTailService {
     hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
     /// Production shard runtime that owns live generation state.
     shards: Option<Arc<ScribeShardRuntime>>,
+    /// Captures retained for in-flight queries.
+    captures: RetainedCaptures,
 }
 
 impl FetchLiveTailService {
     /// Construct a reader over a direct in-process memtable.
     ///
     /// The direct-memtable branch backs the narrow in-process adapter used by
-    /// unit tests; production readers submit shard snapshots through
+    /// unit tests; production readers capture shard memtables through
     /// `FetchLiveTailService::with_runtime`.
     #[must_use]
     pub fn new(stream: StreamIdentity, memtable: Arc<crate::scribe::memtable::Memtable>) -> Self {
@@ -444,22 +654,25 @@ impl FetchLiveTailService {
             hot_sources: None,
             memtable: Some(memtable),
             shards: None,
+            captures: RetainedCaptures::default(),
         }
     }
 
-    /// Construct a production reader that submits snapshots to the owning
-    /// shard command queue instead of traversing Scribe state directly.
+    /// Construct a production reader over the shard runtime's memtables and
+    /// the Scribe's shared capture table.
     #[must_use]
     pub(crate) fn with_runtime(
         stream: StreamIdentity,
         shards: Arc<ScribeShardRuntime>,
         hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+        captures: RetainedCaptures,
     ) -> Self {
         Self {
             stream,
             hot_sources: Some(hot_sources),
             memtable: None,
             shards: Some(shards),
+            captures,
         }
     }
 
@@ -483,39 +696,59 @@ impl FetchLiveTailService {
         self.stream
     }
 
-    /// Lists active event-day scopes for one authenticated tenant/table.
+    /// Captures one authenticated tenant table for `query_id` and lists the
+    /// captured partitions, each with the bytes `scope` reads there.
     ///
-    /// This is intentionally metadata-only: it returns the partitions this
-    /// stream still serves live, each with the bytes `scope` reads there,
-    /// never rows. Oracle plans a live leaf per returned partition, sizes its
-    /// plan from the bytes, and reads it through [`Self::open_live_batches`].
+    /// The capture is coherent across rollover and local publication: while
+    /// a publication outcome for the table is unsettled the attempt waits for
+    /// it to settle and captures again, bounded by `expires_at`. A non-empty
+    /// capture is retained under a fresh random id until
+    /// [`Self::release_capture`] or `expires_at`; an empty one retains
+    /// nothing and returns no id.
     ///
     /// # Errors
-    /// Returns [`TailReadError::Binding`] for an invalid wire binding and
-    /// [`TailReadError::State`] when the Scribe snapshot cannot be read.
-    pub fn list_active_streams(
+    /// Returns [`TailReadError::Binding`] for an invalid wire binding,
+    /// [`TailReadError::DeadlineElapsed`] when `expires_at` passes first, and
+    /// [`TailReadError::State`] when Scribe state cannot be captured.
+    ///
+    /// # Cancellation
+    /// Cancelling while waiting retains nothing; cancelling after the
+    /// capture is retained leaves it to its release or expiry.
+    pub async fn capture_active_streams(
         &self,
         binding: &tail::TenantTableBinding,
         scope: &ScanScope,
-    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        query_id: uuid::Uuid,
+        expires_at: std::time::SystemTime,
+    ) -> Result<TailCapture, TailReadError> {
         let binding = binding_from_wire(binding)?;
-        let partitions = self
-            .active_partitions_for_table(binding.tenant, &binding.table_ref, scope)
-            .map_err(|error| TailReadError::State {
-                detail: error.to_string(),
-            })?;
+        let deadline = tokio::time::Instant::now()
+            + expires_at
+                .duration_since(std::time::SystemTime::now())
+                .map_err(|_| TailReadError::DeadlineElapsed)?;
+        let capture = self.capture(&binding, deadline).await?;
+        let partitions = capture.partition_bytes(scope);
         tracing::debug!(
             tenant = %binding.tenant,
             table = %binding.table_ref,
+            %query_id,
             active_partition_count = partitions.len(),
-            "listed active Scribe tail partitions"
+            "captured active Scribe tail partitions"
         );
+        let publication_revision = capture.publication_revision();
+        if capture.is_empty() {
+            return Ok(TailCapture {
+                capture_id: None,
+                streams: Vec::new(),
+                publication_revision,
+            });
+        }
         let stream = self.stream;
         let writer_epoch =
             u64::try_from(stream.writer_epoch.as_i64()).map_err(|_| TailReadError::State {
                 detail: "Scribe writer epoch is negative".to_owned(),
             })?;
-        Ok(partitions
+        let streams = partitions
             .into_iter()
             .map(|(partition, bytes)| ActiveTailStream {
                 time_partition: partition.to_wire(),
@@ -525,101 +758,176 @@ impl FetchLiveTailService {
                 },
                 bytes,
             })
-            .collect())
-    }
-
-    /// Lists the partitions of one tenant table that still have live Scribe
-    /// state, sorted, each once with the bytes `scope` reads there.
-    ///
-    /// Writable, pending immutable, and staged keys are all scanned for `table`
-    /// alone. The list is a point-in-time discovery cut; retirement is driven
-    /// by the durable file-list commit and therefore naturally removes a
-    /// partition from subsequent cuts.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] when a shard inspection snapshot, memtable lock,
-    /// or staged registry lock cannot be read.
-    pub fn active_partitions_for_table(
-        &self,
-        tenant: DataTenantId,
-        table: &crate::catalog::TableRef,
-        scope: &ScanScope,
-    ) -> Result<Vec<(TimePartition, u64)>, ScribeError> {
-        let mut sources = if let Some(memtable) = &self.memtable {
-            memtable.live_bytes_for_table(tenant, table, scope)?
-        } else {
-            self.shards
-                .as_ref()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "tail source has no shard runtime".to_owned(),
-                })?
-                .active_live_bytes_for_table(tenant, table, scope)?
-        };
-        if let Some(hot_sources) = &self.hot_sources {
-            sources.extend(
-                hot_sources
-                    .staged_bytes_for_table(tenant, table, scope)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!("discover staged live-tail keys: {error}"),
-                    })?
-                    .into_iter()
-                    .map(|(key, bytes)| (key.partition, bytes)),
-            );
-        }
-        let mut partitions = std::collections::BTreeMap::<TimePartition, u64>::new();
-        for (partition, bytes) in sources {
-            let total = partitions.entry(partition).or_default();
-            *total = total.saturating_add(bytes);
-        }
-        Ok(partitions.into_iter().collect())
-    }
-
-    /// Opens one lazily produced live read over this Scribe's stream.
-    ///
-    /// Validation, the bounded memtable snapshot, and the staged lease happen
-    /// here; filtering and staged decoding happen only in the plan the Scribe
-    /// follower builds from the returned read.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when stream/range validation fails, the owning
-    /// memtable cannot produce the projection, or the staged registry is
-    /// unavailable.
-    pub fn open_live_batches(
-        &self,
-        request: &FetchLiveTailRequest,
-    ) -> Result<LiveTailBatches, ScribeError> {
-        let memtable = self.memtable_batches(request)?;
-        let served = Self::served_generations(&memtable);
-        let staged = self.staged_lease(request)?;
-        let unserved = staged
-            .as_ref()
-            .map(|lease| {
-                lease
-                    .sources()
-                    .iter()
-                    .filter(|source| !served.contains(&(source.key.partition, source.generation)))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(LiveTailBatches {
-            memtable,
-            staged,
-            unserved,
+            .collect();
+        let capture_id = self.retain(query_id, binding, capture, deadline)?;
+        Ok(TailCapture {
+            capture_id: Some(capture_id),
+            streams,
+            publication_revision,
         })
     }
 
-    /// Validates one request and takes its bounded shallow memtable snapshot.
+    /// Takes one coherent capture, waiting out unsettled publications until
+    /// `deadline`.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::DeadlineElapsed`] when `deadline` passes while
+    /// a publication is unsettled and [`TailReadError::State`] when Scribe
+    /// state cannot be captured.
+    async fn capture(
+        &self,
+        binding: &TenantTableBinding,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::scribe::memtable::LiveCapture, TailReadError> {
+        let state = |error: ScribeError| TailReadError::State {
+            detail: error.to_string(),
+        };
+        loop {
+            let settled = self
+                .hot_sources
+                .as_ref()
+                .map(|registry| registry.publication_settled());
+            let memtables: Vec<&Memtable> = if let Some(memtable) = &self.memtable {
+                vec![memtable.as_ref()]
+            } else {
+                self.shards
+                    .as_ref()
+                    .ok_or_else(|| TailReadError::State {
+                        detail: "tail source has no shard runtime".to_owned(),
+                    })?
+                    .memtables()
+                    .map_err(state)?
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect()
+            };
+            if let Some(capture) = crate::scribe::memtable::LiveCapture::take(
+                memtables,
+                binding.tenant,
+                &binding.table_ref,
+                self.hot_sources.as_ref(),
+            )
+            .map_err(state)?
+            {
+                return Ok(capture);
+            }
+            tracing::debug!(
+                tenant = %binding.tenant,
+                table = %binding.table_ref,
+                "live capture waits for an unsettled publication"
+            );
+            let Some(settled) = settled else {
+                continue;
+            };
+            tokio::time::timeout_at(deadline, settled)
+                .await
+                .map_err(|_| TailReadError::DeadlineElapsed)?;
+        }
+    }
+
+    /// Retains `capture` for `query_id` until release or `deadline`.
+    ///
+    /// Registration and expiry are one ordered lifecycle: the capture is
+    /// installed first, then refused and removed if `deadline` has already
+    /// passed, and only then is its expiry timer armed. The timer therefore
+    /// always finds the entry unless a release removed it first, so no capture
+    /// can outlive its deadline because its only remover ran before it was
+    /// installed. Its identity is returned only for a capture whose authority
+    /// is still live.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::DeadlineElapsed`] when `deadline` has passed,
+    /// retaining nothing, and [`TailReadError::State`] when the capture table
+    /// is poisoned. The capture is dropped on either error.
+    fn retain(
+        &self,
+        query_id: uuid::Uuid,
+        binding: TenantTableBinding,
+        capture: crate::scribe::memtable::LiveCapture,
+        deadline: tokio::time::Instant,
+    ) -> Result<uuid::Uuid, TailReadError> {
+        let capture_id = uuid::Uuid::new_v4();
+        let retained = Arc::new(RetainedCapture {
+            query_id,
+            binding,
+            capture,
+            deadline,
+            expiry: std::sync::OnceLock::new(),
+        });
+        self.captures.insert(capture_id, Arc::clone(&retained))?;
+        if retained.elapsed_at(tokio::time::Instant::now()) {
+            let elapsed = self.captures.remove(capture_id, |_| true)?;
+            drop(elapsed);
+            return Err(TailReadError::DeadlineElapsed);
+        }
+        let captures = Arc::clone(&self.captures);
+        let expiry = tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let expired = captures.remove(capture_id, |_| true);
+            drop(expired);
+            tracing::debug!(%capture_id, "live capture expired");
+        })
+        .abort_handle();
+        // A release that removed the capture before this point finds no
+        // handle to abort; the timer then wakes at the deadline, finds
+        // nothing, and exits.
+        let _ = retained.expiry.set(expiry);
+        Ok(capture_id)
+    }
+
+    /// Releases one query's retained capture.
+    ///
+    /// Reads already opened from it keep their batches and lease until they
+    /// drop. Releasing an unknown, expired, or already released capture, or
+    /// one that belongs to another query or table, changes nothing.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::Binding`] for an invalid wire binding and
+    /// [`TailReadError::State`] when the capture table is poisoned.
+    pub fn release_capture(
+        &self,
+        binding: &tail::TenantTableBinding,
+        query_id: uuid::Uuid,
+        capture_id: uuid::Uuid,
+    ) -> Result<(), TailReadError> {
+        let binding = binding_from_wire(binding)?;
+        if let Some(retained) = self.captures.remove(capture_id, |retained| {
+            retained.query_id == query_id && retained.binding == binding
+        })? && let Some(expiry) = retained.expiry.get()
+        {
+            expiry.abort();
+        }
+        Ok(())
+    }
+
+    /// Returns how many captures this Scribe currently retains.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn retained_captures_for_test(&self) -> usize {
+        self.captures.len()
+    }
+
+    /// Opens one partition range of a retained capture.
+    ///
+    /// The capture must exist, belong to the request's stream, query, tenant,
+    /// and table, and be within its deadline; nothing is read from live state.
+    /// The deadline is checked here, before any source is projected, because
+    /// the expiry timer that removes the capture may not have run yet.
+    /// Filtering and staged decoding happen only in the plan the Scribe
+    /// follower builds from the returned read, which keeps its batches,
+    /// their charges, and the staged lease after the capture is released or
+    /// expires.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when the request names another stream or an
-    /// inverted range, or the owning memtable cannot produce the projection.
-    fn memtable_batches(
+    /// Returns [`ScribeError::StreamMismatch`] when the request names another
+    /// stream, and [`ScribeError::Internal`] for an inverted range, a capture
+    /// that is not retained for this query and table or whose deadline has
+    /// passed, or a projection that cannot be read.
+    pub fn open_capture(
         &self,
         request: &FetchLiveTailRequest,
-    ) -> Result<Vec<HotBatch>, ScribeError> {
+    ) -> Result<LiveTailBatches, ScribeError> {
         if request.target_stream != self.stream {
             return Err(ScribeError::StreamMismatch {
                 requested: request.target_stream,
@@ -631,79 +939,41 @@ impl FetchLiveTailService {
                 detail: "live-tail start day is after end day".to_owned(),
             });
         }
-        if let Some(shards) = &self.shards {
-            return shards.snapshot(request);
-        }
-        Ok(self
-            .memtable
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "direct tail memtable is not configured".to_owned(),
-            })?
-            .readable_batches_for_range(
-                request.binding.tenant,
-                &request.binding.table_ref,
-                request.start_partition,
-                request.end_partition,
-                &request.required_columns,
-            )?
-            .into_iter()
-            .map(|readable| HotBatch {
-                partition_day: readable.partition_day,
-                generation: readable.generation,
-                rows: readable.batch,
-                statistics: readable.statistics,
+        let retained = self
+            .captures
+            .get(request.capture_id, |retained| {
+                retained.query_id == request.query_id && retained.binding == request.binding
             })
-            .collect())
-    }
-
-    /// Names the immutable generations a memtable snapshot already served.
-    ///
-    /// Their staged runs must be skipped so each generation reaches a reader
-    /// once.
-    fn served_generations(
-        batches: &[HotBatch],
-    ) -> std::collections::HashSet<(TimePartition, crate::scribe::hot_source::GenerationOrdinal)>
-    {
-        batches
-            .iter()
-            .filter_map(|batch| {
-                batch
-                    .generation
-                    .map(|generation| (batch.partition_day, generation))
-            })
-            .collect()
-    }
-
-    /// Leases the staged members that serve this request's range.
-    ///
-    /// A generation whose Arrow was released after staging is invisible to the
-    /// shard snapshot, so without this a live-tail reader would see a gap
-    /// between staging and publication. The registry hands back only the
-    /// generations it still holds staged authority for, so a generation a
-    /// published object already serves is absent rather than filtered out.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the registry is unavailable.
-    fn staged_lease(
-        &self,
-        request: &FetchLiveTailRequest,
-    ) -> Result<Option<crate::scribe::hot_source::StagedSourceLease>, ScribeError> {
-        let Some(hot_sources) = &self.hot_sources else {
-            return Ok(None);
-        };
-        hot_sources
-            .staged_sources(
-                request.binding.tenant,
-                &request.binding.table_ref,
-                request.start_partition,
-                request.end_partition,
-            )
-            .map(Some)
             .map_err(|error| ScribeError::Internal {
-                detail: format!("resolve the staged members serving a live-tail read: {error}"),
-            })
+                detail: error.to_string(),
+            })?
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "live capture is not retained for this query".to_owned(),
+            })?;
+        if retained.elapsed_at(tokio::time::Instant::now()) {
+            return Err(ScribeError::Internal {
+                detail: "live capture has expired".to_owned(),
+            });
+        }
+        let read = retained.capture.read(
+            &(request.start_partition..=request.end_partition),
+            &request.required_columns,
+        )?;
+        Ok(LiveTailBatches {
+            memtable: read
+                .batches
+                .into_iter()
+                .map(|readable| HotBatch {
+                    partition_day: readable.partition_day,
+                    generation: readable.generation,
+                    rows: readable.batch,
+                    statistics: readable.statistics,
+                })
+                .collect(),
+            charges: read.charges,
+            runs: read.runs,
+            staged: read.lease,
+        })
     }
 }
 
@@ -795,8 +1065,8 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when a fixture insert fails or the listing names another table's
     /// or tenant's partition.
-    #[test]
-    fn listing_collects_only_the_named_table() {
+    #[tokio::test]
+    async fn listing_collects_only_the_named_table() {
         use crate::catalog::TableRef;
         use crate::scribe::seal_key::SealKey;
 
@@ -846,9 +1116,9 @@ pub(crate) mod tests {
                 .expect("unlisted fixture batch inserts");
         }
 
-        let partitions = service
-            .active_partitions_for_table(tenant, &binding.table_ref, &ScanScope::default())
-            .expect("listing reads the memtable");
+        let partitions = capture_of(&service, &binding)
+            .await
+            .partition_bytes(&ScanScope::default());
 
         assert_eq!(
             partitions
@@ -869,8 +1139,8 @@ pub(crate) mod tests {
     ///
     /// # Panics
     /// Panics when the listing fails or reports other bytes.
-    #[test]
-    fn scoped_listing_counts_only_unpruned_batches() {
+    #[tokio::test]
+    async fn scoped_listing_counts_only_unpruned_batches() {
         use datafusion::prelude::{col, lit};
 
         let tenant = DataTenantId::new_v7();
@@ -888,12 +1158,9 @@ pub(crate) mod tests {
         let kept = 2 * 8;
         let pruned = 3 * 8;
 
-        let scoped = service
-            .active_partitions_for_table(tenant, &binding.table_ref, &scope)
-            .expect("scoped listing reads the memtable");
-        let unscoped = service
-            .active_partitions_for_table(tenant, &binding.table_ref, &ScanScope::default())
-            .expect("unscoped listing reads the memtable");
+        let capture = capture_of(&service, &binding).await;
+        let scoped = capture.partition_bytes(&scope);
+        let unscoped = capture.partition_bytes(&ScanScope::default());
 
         assert_eq!(scoped, vec![(day, kept)]);
         assert_eq!(unscoped, vec![(day, kept + pruned)]);
@@ -989,7 +1256,7 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when a staged run cannot be decoded.
     fn served_values(read: super::LiveTailBatches) -> Vec<i64> {
-        let (rows, runs, _lease) = read.into_parts();
+        let (rows, _charges, runs, _lease) = read.into_parts();
         let mut values = rows
             .iter()
             .flat_map(|batch| first_column_values(&batch.rows))
@@ -1009,15 +1276,57 @@ pub(crate) mod tests {
         values
     }
 
-    /// Opens one live read and returns every `value` it serves, sorted.
+    /// Takes one coherent capture of `binding` with a one-minute deadline.
+    ///
+    /// # Panics
+    /// Panics when the capture cannot be taken.
+    async fn capture_of(
+        service: &FetchLiveTailService,
+        binding: &super::TenantTableBinding,
+    ) -> crate::scribe::memtable::LiveCapture {
+        service
+            .capture(
+                binding,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("the live capture is taken")
+    }
+
+    /// Captures `request`'s table, retains the capture for its query, and
+    /// returns the request naming that capture.
+    ///
+    /// # Panics
+    /// Panics when the capture cannot be taken or retained.
+    pub(crate) async fn captured(
+        service: &FetchLiveTailService,
+        request: &super::FetchLiveTailRequest,
+    ) -> super::FetchLiveTailRequest {
+        let capture = capture_of(service, &request.binding).await;
+        let capture_id = service
+            .retain(
+                request.query_id,
+                request.binding.clone(),
+                capture,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .expect("the capture is retained");
+        super::FetchLiveTailRequest {
+            capture_id,
+            ..request.clone()
+        }
+    }
+
+    /// Captures one live read and returns every `value` it serves, sorted.
     ///
     /// # Panics
     /// Panics when the read cannot open or a staged run cannot be decoded.
-    fn hot_values(
+    async fn hot_values(
         service: &FetchLiveTailService,
         request: &super::FetchLiveTailRequest,
     ) -> Vec<i64> {
-        served_values(service.open_live_batches(request).expect("live read opens"))
+        let request = captured(service, request).await;
+        served_values(service.open_capture(&request).expect("live read opens"))
     }
 
     /// One frozen generation whose rows are both in the memtable and in a
@@ -1140,6 +1449,8 @@ pub(crate) mod tests {
         let request = super::FetchLiveTailRequest {
             binding,
             target_stream: stream,
+            query_id: uuid::Uuid::new_v4(),
+            capture_id: uuid::Uuid::nil(),
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
@@ -1167,8 +1478,8 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when the fixture cannot be built or a read returns any row other
     /// than exactly once.
-    #[test]
-    fn a_generation_staged_before_the_shard_settles_is_read_once() {
+    #[tokio::test]
+    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1178,24 +1489,153 @@ pub(crate) mod tests {
             directory: _directory,
             ..
         } = staged_generation_fixture();
-        let read = || hot_values(&service, &request);
 
-        assert_eq!(read(), vec![1, 2, 3], "staged but not yet durable");
+        assert_eq!(
+            hot_values(&service, &request).await,
+            vec![1, 2, 3],
+            "staged but not yet durable"
+        );
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
-        assert_eq!(read(), vec![1, 2, 3], "durable and served by its runs");
+        assert_eq!(
+            hot_values(&service, &request).await,
+            vec![1, 2, 3],
+            "durable and served by its runs"
+        );
     }
 
-    /// A live read opened over durable staged runs keeps them readable after
-    /// publication retires their authority, and holds its lease until it
-    /// drops.
+    /// Writable rows that freeze into staging while a capture is selecting
+    /// its sources are read exactly once.
+    ///
+    /// The capture holds every memtable read guard from memory selection
+    /// until the staged lease is taken, so the freeze, which needs the
+    /// writable write lock, cannot detach the rows in between. The test
+    /// starts that freeze and its staging from another thread at exactly that
+    /// point, then proves the capture serves the rows once, from memory, and
+    /// a capture taken after staging serves them once, from the runs.
+    ///
+    /// # Panics
+    /// Panics when a fixture step fails, the freeze completes inside the
+    /// capture, or either capture serves a row other than exactly once.
+    #[tokio::test]
+    async fn active_rollover_during_capture_is_read_once() {
+        use crate::scribe::hot_source::{GenerationOrdinal, RunFooters};
+        use crate::scribe::seal_key::SealKey;
+
+        let tenant = DataTenantId::new_v7();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let table =
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
+        let key = SealKey::new(tenant, table.clone(), day);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("fixture batch");
+        let registry = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let memtable = Arc::new(Memtable::new().with_hot_sources(0, Arc::clone(&registry)));
+        memtable
+            .insert(
+                &key,
+                crate::scribe::wal::ScribeAppendMeta {
+                    batch_id: *uuid::Uuid::now_v7().as_bytes(),
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
+                    rows_accepted: 3,
+                    wal_lsn_min: WalLsn::new(1),
+                    wal_lsn_max: WalLsn::new(1),
+                    seal_key: key.to_string(),
+                },
+                rows.clone(),
+            )
+            .expect("fixture batch inserts");
+        let directory = tempfile::tempdir().expect("staged run directory");
+        let run = write_staged_run(directory.path(), Arc::clone(&schema), &rows, tenant);
+        let service = Arc::new(
+            FetchLiveTailService::new(stream, Arc::clone(&memtable))
+                .with_hot_sources(Arc::clone(&registry)),
+        );
+        let binding =
+            super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
+        let request = super::FetchLiveTailRequest {
+            binding,
+            target_stream: stream,
+            query_id: uuid::Uuid::new_v4(),
+            capture_id: uuid::Uuid::nil(),
+            start_partition: day,
+            end_partition: day,
+            required_columns: vec!["value".to_owned()],
+        };
+
+        let rollover = Arc::new(std::sync::Mutex::new(None));
+        let started = Arc::clone(&rollover);
+        let (freezing, stage_registry, stage_key) =
+            (Arc::clone(&memtable), Arc::clone(&registry), key.clone());
+        crate::scribe::memtable::on_capture_selected_for_test(Box::new(move || {
+            assert!(
+                freezing.writable.try_write().is_err(),
+                "the capture holds the writable map while it selects"
+            );
+            *started.lock().expect("rollover slot") = Some(std::thread::spawn(move || {
+                let frozen = freezing.freeze(&stage_key).expect("the rows freeze");
+                stage_registry
+                    .advance(
+                        &stage_key,
+                        GenerationOrdinal::new(0, frozen.seal_id),
+                        HotAuthority::StagedRun {
+                            member: crate::scribe::assembly::StagedMemberId::new(0, frozen.seal_id),
+                            runs: vec![run],
+                            bytes: 4_096,
+                            footers: RunFooters::default(),
+                            wal: (WalLsn::new(1), WalLsn::new(1)),
+                        },
+                    )
+                    .expect("the frozen generation stages");
+            }));
+        }));
+        let during = captured(&service, &request).await;
+        rollover
+            .lock()
+            .expect("rollover slot")
+            .take()
+            .expect("the rollover started inside the capture")
+            .join()
+            .expect("the rollover completes once the capture is taken");
+
+        assert_eq!(
+            served_values(service.open_capture(&during).expect("the capture opens")),
+            vec![1, 2, 3],
+            "the capture taken across the rollover serves each row once"
+        );
+        assert_eq!(
+            hot_values(&service, &request).await,
+            vec![1, 2, 3],
+            "a capture after staging serves each row once"
+        );
+    }
+
+    /// A retained capture keeps its staged runs readable after publication
+    /// retires their authority, and its lease is held until both the read and
+    /// the capture are released; a released capture can no longer be opened.
     ///
     /// # Panics
     /// Panics when the fixture cannot be built, the leased run cannot be read
-    /// after publication, or the lease does not follow the read.
-    #[test]
-    fn an_open_live_read_keeps_staged_runs_across_publication() {
+    /// after publication, the lease does not follow the read and capture, or
+    /// a released capture still opens.
+    #[tokio::test]
+    async fn an_open_live_read_keeps_staged_runs_across_publication() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1209,9 +1649,8 @@ pub(crate) mod tests {
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
-        let open = service
-            .open_live_batches(&request)
-            .expect("the live read opens");
+        let request = captured(&service, &request).await;
+        let open = service.open_capture(&request).expect("the live read opens");
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
         registry
             .advance(
@@ -1222,23 +1661,184 @@ pub(crate) mod tests {
                 },
             )
             .expect("the generation publishes");
-        let (rows, runs, lease) = open.into_parts();
+        let (rows, _charges, runs, lease) = open.into_parts();
         assert!(rows.is_empty(), "a durable staged generation leaves memory");
         assert_eq!(runs.len(), 1, "the leased run is still named");
         assert!(
             runs[0].exists(),
             "a leased staged run stays on disk after publication"
         );
-        assert_eq!(
-            registry.leases(&key, generation).expect("locked"),
-            1,
-            "an open read keeps its lease"
-        );
         drop(lease);
         assert_eq!(
             registry.leases(&key, generation).expect("locked"),
-            0,
-            "dropping the read releases the lease"
+            1,
+            "the retained capture keeps its lease"
         );
+        let wire = wyrd_spec::vala::api::TenantTableBinding {
+            tenant_id: key.tenant,
+            namespace: "bifrost".to_owned(),
+            table: "events".to_owned(),
+        };
+        service
+            .release_capture(&wire, uuid::Uuid::new_v4(), request.capture_id)
+            .expect("a foreign release is accepted");
+        assert_eq!(
+            service.retained_captures_for_test(),
+            1,
+            "a foreign query cannot release it"
+        );
+        service
+            .release_capture(&wire, request.query_id, request.capture_id)
+            .expect("the release is accepted");
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "releasing the capture releases the lease"
+        );
+        assert!(
+            service.open_capture(&request).is_err(),
+            "a released capture is never reopened"
+        );
+    }
+
+    /// A capture is opened only by its own query and table.
+    ///
+    /// # Panics
+    /// Panics when a foreign query or substituted capture id opens it.
+    #[tokio::test]
+    async fn a_capture_is_opened_only_by_its_query() {
+        let StagedGenerationFixture {
+            service,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        let request = captured(&service, &request).await;
+        assert!(service.open_capture(&request).is_ok());
+        for foreign in [
+            super::FetchLiveTailRequest {
+                query_id: uuid::Uuid::new_v4(),
+                ..request.clone()
+            },
+            super::FetchLiveTailRequest {
+                capture_id: uuid::Uuid::new_v4(),
+                ..request.clone()
+            },
+        ] {
+            assert!(service.open_capture(&foreign).is_err());
+        }
+    }
+
+    /// A capture whose deadline passed before it was installed is refused
+    /// with no identity, and neither it nor its staged lease is left behind
+    /// for a timer that already ran or never runs.
+    ///
+    /// The deadline has already elapsed when `retain` is called, as when
+    /// selection and sizing outlast the query's remaining time; the table and
+    /// the lease are checked before the runtime polls anything else.
+    ///
+    /// # Panics
+    /// Panics when the elapsed capture is retained, returns an identity, or
+    /// keeps its staged runs leased.
+    #[tokio::test]
+    async fn a_capture_elapsed_before_installation_is_refused_and_retains_nothing() {
+        let StagedGenerationFixture {
+            service,
+            memtable,
+            registry,
+            key,
+            generation,
+            member,
+            request,
+            directory: _directory,
+        } = staged_generation_fixture();
+        memtable
+            .complete_staged(generation.get(), member)
+            .expect("the shard marks the generation durable");
+        let capture = capture_of(&service, &request.binding).await;
+        assert_eq!(registry.leases(&key, generation).expect("leases"), 1);
+        let refused = service.retain(
+            request.query_id,
+            request.binding.clone(),
+            capture,
+            tokio::time::Instant::now(),
+        );
+        assert!(matches!(refused, Err(TailReadError::DeadlineElapsed)));
+        assert_eq!(service.retained_captures_for_test(), 0);
+        assert_eq!(registry.leases(&key, generation).expect("leases"), 0);
+    }
+
+    /// An installed capture refuses a new open once its deadline passes, even
+    /// while its expiry timer has not run, and a read opened before the
+    /// deadline keeps serving.
+    ///
+    /// The test blocks its only runtime thread across the deadline, so the
+    /// timer cannot be polled and the capture is still in the table when the
+    /// late open arrives.
+    ///
+    /// # Panics
+    /// Panics when the late open succeeds or the capture leaves the table
+    /// without its timer running.
+    #[tokio::test]
+    async fn an_elapsed_capture_refuses_a_new_open_before_its_expiry_runs() {
+        let StagedGenerationFixture {
+            service,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        let capture = capture_of(&service, &request.binding).await;
+        let authority = std::time::Duration::from_millis(20);
+        let capture_id = service
+            .retain(
+                request.query_id,
+                request.binding.clone(),
+                capture,
+                tokio::time::Instant::now() + authority,
+            )
+            .expect("the capture is retained");
+        let request = super::FetchLiveTailRequest {
+            capture_id,
+            ..request
+        };
+        let opened = service.open_capture(&request).expect("an open in time");
+        std::thread::sleep(authority * 2);
+        assert_eq!(service.retained_captures_for_test(), 1);
+        assert!(service.open_capture(&request).is_err());
+        let (_rows, _charges, runs, lease) = opened.into_parts();
+        assert!(lease.is_some() && runs.iter().all(|run| run.exists()));
+    }
+
+    /// An unreleased capture expires at its query deadline and is never
+    /// reopened, so a lost release leaks nothing past the query.
+    ///
+    /// # Panics
+    /// Panics when the capture outlives its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreleased_capture_expires_at_its_deadline() {
+        let StagedGenerationFixture {
+            service,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        let capture = capture_of(&service, &request.binding).await;
+        let deadline = std::time::Duration::from_secs(1);
+        let capture_id = service
+            .retain(
+                request.query_id,
+                request.binding.clone(),
+                capture,
+                tokio::time::Instant::now() + deadline,
+            )
+            .expect("the capture is retained");
+        let request = super::FetchLiveTailRequest {
+            capture_id,
+            ..request
+        };
+        assert!(service.open_capture(&request).is_ok());
+        tokio::time::sleep(deadline * 2).await;
+        assert_eq!(service.retained_captures_for_test(), 0);
+        assert!(service.open_capture(&request).is_err());
     }
 }

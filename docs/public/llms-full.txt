@@ -5001,7 +5001,7 @@ Event time lives in each table's own time column: `created_at` for drift samples
 
 `observe.*` calls return as soon as the row is queued, so they add almost no time to a request. The trade-off is that a queued row is not yet stored. `shutdown` sends everything still queued and returns when the server has it; a process that exits without it can lose its last rows. If the queue fills because the server is slow or unreachable, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking your request.
 
-Stored is not the same as queryable. Bifrost acknowledges a write before the rows are published for queries, and a query reads the published data plus recent rows on a best-effort basis. A row that is missing seconds after `flush` returned is usually not lost. [Bifrost](/wyrd/understand/bifrost/) explains the gap.
+Stored is not the same as queryable. Bifrost acknowledges a write before the rows are published for queries, and a query reads the published data plus the recent rows each Scribe still holds. If the Scribe holding a recent row cannot be reached when the query lists live sources, the query ends `degraded` and that row may be missing; it is not lost. If that Scribe is lost after the query captured its rows, the query fails instead. [Bifrost](/wyrd/understand/bifrost/) explains the gap.
 
 ## Two ways to write your own data
 
@@ -5111,7 +5111,7 @@ _Diagram `bifrost-write-read`: see the web page._
 
 A write is stored when a Scribe acknowledges it. That is what `flush`, `shutdown`, and `write_batch` wait for. From then on the row survives a server restart.
 
-A row is queryable once it is published into the table, which happens shortly after. An Oracle query reads the published data plus the live tail: recent rows still held by the Scribe that received them. The live tail is best effort, so a row written seconds ago may not appear yet. In rare cases a row being published during the query can be missed or counted twice. Re-run the query; the next one sees a settled table.
+A row is queryable once it is published into the table, which happens shortly after. An Oracle query reads the published data plus the live tail: recent rows still held by the Scribe that received them. A row moving from the live tail into the table while the query runs is returned exactly once. Only a Scribe that cannot be reached when the query lists live sources can leave its recent rows out, and then the query ends `degraded`. Once the query has captured a Scribe's recent rows, losing that Scribe fails the query, even before the first row arrives.
 
 This applies to everything that reads Bifrost, including Verifiers. A scheduled drift window that closes the instant a row is written may score without it.
 

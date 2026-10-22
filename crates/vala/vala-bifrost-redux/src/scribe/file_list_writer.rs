@@ -99,6 +99,12 @@ pub struct FileListArtifactSetOutcome {
     pub artifact_set_digest: String,
     /// Whether every row already existed and matched exactly.
     pub replayed: bool,
+    /// The producer node's table publication revision as of this commit.
+    ///
+    /// Read inside the publishing transaction, so for a fresh set it is the
+    /// revision the set committed at; for a replay it is the node's latest
+    /// committed revision, which is never lower.
+    pub publication_revision: i64,
 }
 
 /// Database projection used to validate one ordered writer-v2 artifact row.
@@ -180,6 +186,7 @@ fn artifact_set_outcome(
     first: &FileListArtifactInsert,
     rows: &[FileListArtifactInsert],
     inserted: u64,
+    publication_revision: i64,
 ) -> Result<FileListArtifactSetOutcome, SqlError> {
     let mut digest = Sha256::new();
     for row in rows {
@@ -204,6 +211,7 @@ fn artifact_set_outcome(
         })?,
         artifact_set_digest: hex::encode(digest.finalize()),
         replayed: inserted == 0,
+        publication_revision,
     })
 }
 
@@ -452,13 +460,19 @@ fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError
 /// Atomically publishes a complete writer-v2 artifact set under one actor fence.
 ///
 /// Either every contiguous row commits, or none do. Replays succeed only when
-/// every ordered identity matches exactly. Publication is an engine-internal
-/// generation transition that evaluates no principal permission, so `vala.file_list`
-/// is its whole lineage record and no audit event is appended.
+/// every ordered identity matches exactly. The outcome carries the producer
+/// node's table revision; an exact replay of a set committed before revision
+/// tracking existed finds no revision row and reports revision 0, while a
+/// fresh insert must find the row its trigger advanced.
+///
+/// Publication is an engine-internal generation transition that evaluates no
+/// principal permission, so `vala.file_list` is its whole lineage record and no
+/// audit event is appended.
 ///
 /// # Errors
 /// Returns a SQL invariant error for an empty/noncontiguous/mixed replay set,
-/// a stale actor fence, identity mismatch, or commit failure.
+/// a stale actor fence, identity mismatch, or a fresh insert without a
+/// publication revision, and the SQL error for a failed read or commit.
 pub async fn insert_artifact_set_fenced(
     operator_pool: &OperatorPool,
     actor: StreamIdentity,
@@ -542,8 +556,72 @@ pub async fn insert_artifact_set_fenced(
             detail: "writer-v2 replay identity does not match the complete artifact set".to_owned(),
         });
     }
+    let publication_revision: Option<i64> = sqlx::query_scalar(
+        "SELECT publication_revision FROM vala.bifrost_table_publication_revisions \
+         WHERE data_tenant_id=$1 AND namespace_name=$2 AND table_name=$3 AND node_id=$4",
+    )
+    .bind(first.data_tenant_id.as_uuid())
+    .bind(&first.namespace)
+    .bind(&first.table_name)
+    .bind(first.node_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(SqlError::from)?;
+    // A fresh insert's trigger always creates the row. Only an exact replay of
+    // a set committed before revision tracking finds none, which is revision 0.
+    let publication_revision = match (publication_revision, inserted) {
+        (Some(revision), _) => revision,
+        (None, 0) => 0,
+        (None, _) => {
+            return Err(SqlError::InvariantViolation {
+                detail: "writer-v2 publication committed without a publication revision".to_owned(),
+            });
+        }
+    };
     transaction.commit().await.map_err(SqlError::from)?;
-    artifact_set_outcome(first, rows, inserted)
+    artifact_set_outcome(first, rows, inserted, publication_revision)
+}
+
+/// Reads every table publication revision `node_id` has committed.
+///
+/// A restarted Scribe, or one that recovers a commit it never advanced,
+/// raises its reported revisions to these before serving a capture that
+/// omits the rows they cover. Rows whose namespace is not a known Bifrost
+/// namespace cannot be served by any capture and are skipped.
+///
+/// # Errors
+///
+/// Returns the SQL error when the read fails, and an invariant violation for
+/// a row whose tenant is not a valid tenant id.
+pub async fn node_publication_revisions(
+    operator_pool: &OperatorPool,
+    node_id: Uuid,
+) -> Result<Vec<((DataTenantId, crate::catalog::TableRef), i64)>, SqlError> {
+    let rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
+        "SELECT data_tenant_id,namespace_name,table_name,publication_revision \
+         FROM vala.scribe_node_publication_revisions($1)",
+    )
+    .bind(node_id)
+    .fetch_all(operator_pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    rows.into_iter()
+        .filter_map(|(tenant, namespace, table, revision)| {
+            let namespace = crate::namespaces::BifrostNamespace::from_wire(&namespace)?;
+            Some(
+                DataTenantId::new(tenant)
+                    .map(|tenant| {
+                        (
+                            (tenant, crate::catalog::TableRef::new(namespace, table)),
+                            revision,
+                        )
+                    })
+                    .map_err(|error| SqlError::InvariantViolation {
+                        detail: format!("publication revision tenant {tenant} is invalid: {error}"),
+                    }),
+            )
+        })
+        .collect()
 }
 
 /// What `vala.file_list` already records for one writer-v2 artifact set.

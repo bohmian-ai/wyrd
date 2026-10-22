@@ -49,13 +49,12 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v9 assignment-authority digest.
+/// Domain separator for the v10 assignment-authority digest.
 ///
-/// v9 drops the persisted-file descriptors and the scan predicates: persisted
-/// reads are planned and distributed by `DataFusion`, so an assignment names
-/// only a Scribe provider cut and its projection. The domain differs so v8
-/// bytes never validate as v9.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v9\0";
+/// v10 binds the Scribe cut's retained live capture, so a peer cannot
+/// substitute another capture under a signed context. The domain differs so
+/// v9 bytes never validate as v10.
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v10\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -127,10 +126,10 @@ fn push_time_partition(buffer: &mut Vec<u8>, partition: crate::vala::api::TimePa
 }
 
 /// Appends one Scribe provider cut as `writer_epoch:u64` big-endian followed
-/// by its start and end partitions.
+/// by its start and end partitions and its 16 capture-id bytes.
 ///
-/// The cut names which memory partitions a follower may read on which writer
-/// incarnation, so it is digested whole; it carries no size limit.
+/// The cut names which captured partitions a follower may read on which
+/// writer incarnation, so it is digested whole; it carries no size limit.
 ///
 /// # Errors
 ///
@@ -146,6 +145,7 @@ fn push_scribe_cut(
     buffer.extend_from_slice(&cut.writer_epoch.to_be_bytes());
     push_time_partition(buffer, cut.start_partition);
     push_time_partition(buffer, cut.end_partition);
+    buffer.extend_from_slice(cut.capture_id.as_bytes());
     Ok(())
 }
 
@@ -259,12 +259,14 @@ mod tests {
     use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
     /// Builds the normative Scribe cut: writer epoch 7 over the two hourly
-    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`.
+    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, read from
+    /// one fixed capture.
     fn normative_scribe_cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
+            capture_id: uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
         }
     }
 
@@ -325,6 +327,8 @@ mod tests {
         other_epoch.writer_epoch = 2;
         let mut other_start = cut.clone();
         other_start.start_partition = hour_partition(1_787_490_000_000_000);
+        let mut other_capture = cut.clone();
+        other_capture.capture_id = uuid::Uuid::from_u128(2);
         let reordered = vec![
             "wyrd_ingested_at".to_string(),
             "service_name".to_string(),
@@ -362,6 +366,10 @@ mod tests {
             }),
             digest_of(&AssignmentDigestInput {
                 scribe_cut: Some(&other_start),
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                scribe_cut: Some(&other_capture),
                 ..baseline.clone()
             }),
             digest_of(&AssignmentDigestInput {

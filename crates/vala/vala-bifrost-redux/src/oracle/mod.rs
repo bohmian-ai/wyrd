@@ -132,7 +132,7 @@ pub use query_stream::{
 use query_stream::{QueryStreamInput, RunningQueryTerminalOwner};
 pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
-pub use tail_discovery::{DiscoveredTailRoute, TailStreamDiscovery};
+pub use tail_discovery::{DiscoveredTail, DiscoveredTailRoute, TailStreamDiscovery};
 
 /// Default maximum SQL request size accepted by the synchronous query floor.
 pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
@@ -993,6 +993,9 @@ struct LiveDiscovery {
     tables: std::collections::HashMap<String, live::LiveTableRoutes>,
     /// Whether listing failed for any pinned table.
     listing_lost: bool,
+    /// Pinned tables whose cut a captured Scribe proved stale: it reported a
+    /// publication revision above the cut's for its node.
+    stale: Vec<TableRef>,
 }
 
 /// Everything the one retained root needs to execute exactly once.
@@ -1770,7 +1773,13 @@ impl Oracle {
         let snapshot = self.cluster.snapshot();
         let planned = self
             .planner
-            .pin_cut(context, &tables, deadline, &self.catalog)
+            .pin_cut(
+                context,
+                &tables,
+                deadline,
+                &self.catalog,
+                Arc::new(profile::QueryProfile::new()),
+            )
             .await?;
         #[cfg(feature = "test-support")]
         let held = self
@@ -2021,7 +2030,11 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns the stable catalog, planning, or roster error. Every one of them
-    /// is terminal; nothing here repins or rebuilds.
+    /// is terminal. A selection whose cut a captured Scribe proved stale is
+    /// not an error: its captures are released, the cut is repinned from
+    /// Postgres, and the root rebuilt under the same deadline, all before
+    /// admission, so no row of a discarded selection is ever produced. Each
+    /// retry is counted on the query's one profile as `selection_retries`.
     async fn classify_one_build(
         &self,
         input: ClassifyInput<'_>,
@@ -2031,12 +2044,33 @@ impl Oracle {
             request,
             deadline,
             mut roster,
-            prepared: planned,
+            prepared: mut planned,
             query_telemetry,
         } = input;
-        let retained = self
-            .build_physical_root(context, request, &planned, &mut roster, deadline)
-            .await?;
+        let retained = loop {
+            if let Some(retained) = self
+                .build_physical_root(context, request, &planned, &mut roster, deadline)
+                .await?
+            {
+                break retained;
+            }
+            let tables = planned
+                .cuts
+                .iter()
+                .map(|cut| cut.binding.table_ref.clone())
+                .collect::<Vec<_>>();
+            planned.profile.selection_retries.add(1);
+            planned = self
+                .planner
+                .pin_cut(
+                    context,
+                    &tables,
+                    deadline,
+                    &self.catalog,
+                    Arc::clone(&planned.profile),
+                )
+                .await?;
+        };
         let query_class = exec::query_class_for_root(retained.root.as_ref());
         tracing::Span::current().record("query_class", query_class_label(query_class));
         let participant_cut = roster
@@ -2784,8 +2818,10 @@ impl Oracle {
     /// shape cannot be read, [`BifrostError::QueryTimeout`] when the deadline
     /// passes during planning, the stable listing errors of
     /// [`Self::discover_live_routes`], or the mapped planning failure, which
-    /// is terminal for this query: there is no second build and no fallback
-    /// path.
+    /// is terminal for this query. `Ok(None)` reports a selection whose cut a
+    /// captured Scribe proved stale by reporting a higher publication revision
+    /// for its node: the stale cuts are evicted from the node's cut cache, the
+    /// captures are released, and the caller repins from Postgres.
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
@@ -2793,7 +2829,7 @@ impl Oracle {
         planned: &PlannedSqlCut,
         roster: &mut OracleQueryAttemptRoster,
         deadline: Instant,
-    ) -> Result<RetainedPhysicalPlan, BifrostError> {
+    ) -> Result<Option<RetainedPhysicalPlan>, BifrostError> {
         let cuts = planned.cuts.as_slice();
         let cap = self.admission.session_partitions(planned.local_ratio)?;
         let shape = crate::resources::OracleSessionShape::new(cap);
@@ -2825,6 +2861,16 @@ impl Oracle {
             .discover_live_routes(roster, cuts, &scans, deadline)
             .await?;
         listing.done();
+        if !live.stale.is_empty() {
+            for table in &live.stale {
+                self.catalog.evict_cut(context.data_tenant_id, table);
+            }
+            tracing::debug!(
+                tables = live.stale.len(),
+                "Oracle discards a selection whose cut predates a Scribe's publication"
+            );
+            return Ok(None);
+        }
         for provider in &registered {
             if let Some(routes) = live.tables.get(provider.table()) {
                 provider.set_live(routes.clone());
@@ -2875,11 +2921,11 @@ impl Oracle {
             .await?
             .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
-        Ok(RetainedPhysicalPlan {
+        Ok(Some(RetainedPhysicalPlan {
             config: planning.copied_config(),
             root,
             live_listing_lost: live.listing_lost,
-        })
+        }))
     }
 
     /// Runs one planning step under the query deadline.
@@ -2934,7 +2980,7 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<LiveDiscovery, BifrostError> {
         let (Some(discovery), Some(_)) = (
-            self.tail_discovery.as_deref(),
+            self.tail_discovery.as_ref(),
             self.fragment_dispatcher.as_ref(),
         ) else {
             return Ok(LiveDiscovery::default());
@@ -2965,7 +3011,7 @@ impl Oracle {
     /// roster refreeze failure.
     async fn list_live_routes(
         &self,
-        discovery: &dyn TailStreamDiscovery,
+        discovery: &Arc<dyn TailStreamDiscovery>,
         roster: &OracleQueryAttemptRoster,
         (cuts, scans): (&[PinnedSealedTable], &sizing::OracleScans),
         deadline: Instant,
@@ -2975,11 +3021,17 @@ impl Oracle {
         for cut in cuts {
             let binding = tail_discovery::wire_binding(cut)?;
             let scope = scans.listing_scope(&cut.binding.table_ref.fqn());
-            let routes = match discovery
-                .discover(&binding, &scope, roster.scribes(), deadline)
+            let discovered_tail = match discovery
+                .discover(
+                    &binding,
+                    &scope,
+                    roster.scribes(),
+                    roster.attempt_id().as_uuid(),
+                    deadline,
+                )
                 .await
             {
-                Ok(routes) => routes,
+                Ok(discovered_tail) => discovered_tail,
                 Err(_) if Instant::now() >= deadline => {
                     return Err(BifrostError::QueryTimeout);
                 }
@@ -3008,9 +3060,34 @@ impl Oracle {
                     });
                 }
             };
+            if discovered_tail.revisions.iter().any(|(node_id, revision)| {
+                *revision > cut.publication_revisions.get(node_id).copied().unwrap_or(0)
+            }) {
+                discovered.stale.push(cut.binding.table_ref.clone());
+            }
+            let routes = discovered_tail.routes;
             if routes.is_empty() {
                 continue;
             }
+            let mut captures = Vec::<(OracleQueryParticipant, uuid::Uuid)>::new();
+            for route in &routes {
+                if !captures.iter().any(|(_, id)| *id == route.capture_id)
+                    && let Some(scribe) = roster
+                        .scribes()
+                        .iter()
+                        .find(|scribe| scribe.node_id == route.stream.node_id)
+                {
+                    captures.push((scribe.clone(), route.capture_id));
+                }
+            }
+            // Owned before any fallible step, so an error below releases them.
+            let captures = Arc::new(live::LiveCaptures::new(
+                Arc::clone(discovery),
+                binding.clone(),
+                roster.attempt_id().as_uuid(),
+                captures,
+                deadline,
+            ));
             let routes = routes
                 .into_iter()
                 .map(|route| {
@@ -3026,12 +3103,17 @@ impl Oracle {
                         endpoint,
                         time_partition: route.time_partition,
                         bytes: route.bytes,
+                        capture_id: route.capture_id,
                     })
                 })
                 .collect::<Result<Vec<_>, BifrostError>>()?;
             discovered.tables.insert(
                 cut.binding.table_ref.fqn(),
-                live::LiveTableRoutes { binding, routes },
+                live::LiveTableRoutes {
+                    binding,
+                    routes,
+                    captures,
+                },
             );
         }
         Ok(Some(discovered))

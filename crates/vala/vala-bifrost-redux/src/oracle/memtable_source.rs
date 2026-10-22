@@ -24,6 +24,7 @@ use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 
 use crate::scan_sizing::{BatchPruning, ScanScope, ScanSizer};
@@ -35,6 +36,11 @@ use crate::scan_sizing::{BatchPruning, ScanScope, ScanSizer};
 /// only the batches the predicate cannot exclude and reports the predicate as
 /// not pushed down, so the `FilterExec` above still evaluates it on every
 /// surviving row and the answer stays exact.
+///
+/// The batches share the Scribe capture's Arrow buffers, so the source, every
+/// clone or pushed-down rewrite of it, and every stream it opens hold the
+/// capture's accounting owners: retirement of the batches' generation cannot
+/// return their charge to the Scribe root while any of them still reads.
 #[derive(Debug, Clone)]
 pub(super) struct MemtableSource {
     /// The batches, already dealt to partitions, that this source reads.
@@ -44,6 +50,8 @@ pub(super) struct MemtableSource {
     statistics: Vec<Vec<Arc<Statistics>>>,
     /// The sizing that deals batches over partitions by their recorded column bytes.
     partitioning: crate::scan_sizing::OraclePartitioning,
+    /// Accounting owners of the batches' Arrow buffers.
+    charges: Arc<[Arc<crate::scribe::memory::RetainedArrowCharge>]>,
 }
 
 impl MemtableSource {
@@ -52,7 +60,8 @@ impl MemtableSource {
     /// one and at most `cap`.
     ///
     /// The batches are already projected to the query's columns, so they are
-    /// sized by [`ScanSizer`] with every column covered.
+    /// sized by [`ScanSizer`] with every column covered. `charges` are the
+    /// accounting owners of the batches' buffers, held for the source's life.
     ///
     /// # Errors
     ///
@@ -60,6 +69,7 @@ impl MemtableSource {
     /// `schema`.
     pub(super) fn try_new(
         batches: Vec<(RecordBatch, Arc<Statistics>)>,
+        charges: Arc<[Arc<crate::scribe::memory::RetainedArrowCharge>]>,
         partitioning: crate::scan_sizing::OraclePartitioning,
         cap: usize,
         schema: SchemaRef,
@@ -78,7 +88,25 @@ impl MemtableSource {
             inner: MemorySourceConfig::try_new(&batches, schema, None)?,
             statistics,
             partitioning,
+            charges,
         })
+    }
+
+    /// Rewraps a fetch- or projection-rewritten copy of `inner`, keeping this
+    /// source's accounting owners, or `None` when `rewritten` is not an
+    /// in-memory source.
+    ///
+    /// The rewritten source no longer prunes (see [`Self::pruned`]).
+    fn rewrapped(&self, rewritten: &Arc<dyn DataSource>) -> Option<Self> {
+        let rewritten: &dyn std::any::Any = rewritten.as_ref();
+        rewritten
+            .downcast_ref::<MemorySourceConfig>()
+            .map(|inner| Self {
+                inner: inner.clone(),
+                statistics: self.statistics.clone(),
+                partitioning: self.partitioning,
+                charges: Arc::clone(&self.charges),
+            })
     }
 
     /// Returns this source without the batches `predicate` excludes, dealt
@@ -90,13 +118,17 @@ impl MemtableSource {
     /// recorded column bytes, never more than this source had, so a point lookup that keeps one
     /// batch runs as one partition rather than one per core. A predicate that
     /// does not plan as a pruning predicate, or a partition whose bounds
-    /// cannot be evaluated, keeps every batch it covers.
+    /// cannot be evaluated, keeps every batch it covers. A source carrying a
+    /// fetch or projection is never pruned, since rebuilding would drop it.
     ///
     /// # Errors
     ///
     /// Returns the `DataFusion` error raised when the kept batches cannot be
     /// rebuilt into a source.
     fn pruned(&self, predicate: Arc<dyn PhysicalExpr>) -> DataFusionResult<Option<Self>> {
+        if self.inner.fetch().is_some() || self.inner.projection().is_some() {
+            return Ok(None);
+        }
         let schema = self.inner.original_schema();
         let Some(pruning) = BatchPruning::try_new(&schema, predicate) else {
             return Ok(None);
@@ -118,12 +150,20 @@ impl MemtableSource {
         if !excluded {
             return Ok(None);
         }
-        Self::try_new(kept, self.partitioning, self.statistics.len(), schema).map(Some)
+        Self::try_new(
+            kept,
+            Arc::clone(&self.charges),
+            self.partitioning,
+            self.statistics.len(),
+            schema,
+        )
+        .map(Some)
     }
 }
 
 impl DataSource for MemtableSource {
-    /// Streams one partition's kept batches.
+    /// Streams one partition's kept batches, holding the source's accounting
+    /// owners until the stream drops, since a stream can outlive its plan.
     ///
     /// # Errors
     ///
@@ -133,7 +173,14 @@ impl DataSource for MemtableSource {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        self.inner.open(partition, context)
+        let stream = self.inner.open(partition, context)?;
+        let schema = stream.schema();
+        let charges = Arc::clone(&self.charges);
+        let held = futures_util::StreamExt::map(stream, move |batch| {
+            let _charges = &charges;
+            batch
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, held)))
     }
 
     /// Displays as the wrapped in-memory source.
@@ -160,10 +207,12 @@ impl DataSource for MemtableSource {
         self.inner.partition_statistics(partition)
     }
 
-    /// Applies a limit through the wrapped source; the limited source no
-    /// longer prunes.
+    /// Applies a limit through the wrapped source, keeping the accounting
+    /// owners; the limited source no longer prunes.
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
-        self.inner.with_fetch(limit)
+        let limited = self.inner.with_fetch(limit)?;
+        self.rewrapped(&limited)
+            .map(|source| Arc::new(source) as Arc<dyn DataSource>)
     }
 
     /// Reports the wrapped source's limit.
@@ -171,8 +220,8 @@ impl DataSource for MemtableSource {
         self.inner.fetch()
     }
 
-    /// Absorbs a projection through the wrapped source; the projected source
-    /// no longer prunes.
+    /// Absorbs a projection through the wrapped source, keeping the
+    /// accounting owners; the projected source no longer prunes.
     ///
     /// # Errors
     ///
@@ -181,7 +230,11 @@ impl DataSource for MemtableSource {
         &self,
         projection: &ProjectionExprs,
     ) -> DataFusionResult<Option<Arc<dyn DataSource>>> {
-        self.inner.try_swapping_with_projection(projection)
+        Ok(self
+            .inner
+            .try_swapping_with_projection(projection)?
+            .and_then(|projected| self.rewrapped(&projected))
+            .map(|source| Arc::new(source) as Arc<dyn DataSource>))
     }
 
     /// Prunes the batches `filters` exclude and leaves every filter to the
@@ -274,6 +327,7 @@ mod tests {
                 bounded(&[10, 11, 12]),
                 bounded(&[20, 21, 22]),
             ],
+            Arc::from(Vec::new()),
             crate::scan_sizing::OraclePartitioning::new(
                 2,
                 crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,

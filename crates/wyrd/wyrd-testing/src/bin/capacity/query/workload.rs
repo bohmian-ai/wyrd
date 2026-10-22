@@ -200,6 +200,8 @@ pub struct Target {
     pub p95_ms: Option<f64>,
     /// Client p99 ceiling, milliseconds.
     pub p99_ms: Option<f64>,
+    /// Client p99 limit, milliseconds, that equality meets.
+    pub p99_at_most_ms: Option<f64>,
     /// Successful queries-per-second floor at the same concurrency as the
     /// latency ceilings.
     pub min_qps: Option<f64>,
@@ -346,9 +348,7 @@ impl Case {
     pub fn target(self, fixture: Fixture) -> Target {
         match self {
             Self::Selective => Target {
-                p50_ms: Some(7.0),
-                p95_ms: Some(10.0),
-                p99_ms: Some(10.0),
+                p99_at_most_ms: Some(1.0),
                 peak_qps: Some(1_200.0),
                 ..Target::default()
             },

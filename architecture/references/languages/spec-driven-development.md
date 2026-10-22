@@ -23,6 +23,79 @@ invariant, public behavior, material constraint, or required system boundary,
 stop and route the conflict through a specification revision and renewed human
 approval.
 
+## Write for maintainer approval
+
+Specs and tasks serve two readers: the maintainer deciding what to approve and
+the agent executing the approved work. A maintainer must understand the change,
+its limits and its proof without reading the conversation or implementation.
+Execution completeness and maintainer comprehension are both required.
+
+Lead with the problem and proposed behavior. Use one concrete before/after
+example when it makes the change easier to understand. Explain the approach,
+why it was chosen, and its material costs before introducing detailed contracts,
+source symbols or commands. For an internal change, explain the effect on the
+system or its contributors; do not invent a user story for mechanical work.
+
+- Name the actor and action: who reads, writes, refuses, retries or releases
+  something. Define specialist terms when first needed, keeping the precise
+  domain name once explained.
+- Give each requirement or invariant one principal promise. State the failure
+  it prevents. Separate independent promises rather than packing migration,
+  concurrency, tenancy and cleanup into one long obligation.
+- Explain verification as an observation: what situation is exercised, what
+  must happen, and what result would show a violation. A command or test name
+  alone does not explain the proof.
+- Use one scenario per distinct behavior. Group timing variations or equivalent
+  cases in a small table with an expected result for each. Do not duplicate
+  scenarios or hide unrelated guarantees inside a catch-all scenario.
+- Keep IDs in metadata and one requirement-to-proof mapping. Use descriptive
+  names in prose; an acceptance criterion must explain success without making
+  the reader chase IDs through several sections.
+- Put inspected symbols, reuse evidence, affected files and exact commands
+  after the behavioral explanation. Combine overlapping inventories and record
+  each command once, with a descriptive link from its scenario. Keep all
+  required execution detail in the same authoritative packet.
+
+A compact proof table can connect the decision to its evidence:
+
+| Rule | Failure prevented | Verification and expected result |
+|---|---|---|
+| Replaying an acknowledged batch does not insert its rows again. | A transport retry duplicates evidence. | Submit the same batch twice through the real client; the second acknowledgement succeeds and the query returns the original row count. |
+
+This is an illustrative row, not a new product requirement. Technical detail
+is welcome when it explains a decision, boundary or failure; readability does
+not justify removing constraints, weakening proof or prescribing private code.
+
+## Independent comprehension pass
+
+Before handing a new or materially revised spec/task packet to the maintainer,
+obtain one bounded, read-only comprehension pass. Review the current spec and
+all proposed tasks together when tasks exist; a spec-only handoff reviews only
+the spec. Reuse a reader in an already-running document/readiness review when
+it can perform this pass independently. Otherwise use one independent reader;
+do not create a reviewer per task or another approval workflow. Recheck changed
+explanations and their dependencies without rereviewing unchanged material.
+
+Give the reader the packet without the author conversation, code or intended
+interpretation. Ask it to explain, citing the relevant sections:
+
+1. What problem is fixed, and what behavior changes?
+2. Why this approach, and what costs or limits remain?
+3. What must never happen, and why does each important invariant matter?
+4. What does each important proof exercise and assert? What would fail?
+5. What exactly is the maintainer being asked to approve or decide?
+
+The reader reports missing explanations, ambiguous interpretations and
+contradictions. It does not redesign the system, run verification or reject
+wording for subjective style preferences. The author repairs the documents
+before handoff and checks that the repair preserves their technical meaning.
+Meaning-changing discoveries follow the existing spec approval rules.
+
+This pass adds no readiness status, durable review artifact or human approval
+round. Report any remaining comprehension gap in the existing handoff. If an
+independent reader is unavailable, disclose that limitation and perform the
+same author check; never claim independence for a self-review.
+
 ## Change artifact lifecycle
 
 Use one tracked, repository-local change packet while work is active. Keep the
@@ -120,6 +193,11 @@ status: draft
 11. open material decisions; and
 12. revision history.
 
+Present these obligations in reading order: an explanation of the proposed
+change and its rationale first, precise behavior and constraints next, then
+acceptance evidence and supporting references. Use the maintainer-approval
+guidance above rather than turning the list into mandatory boilerplate headings.
+
 Do not prescribe private function signatures, module boundaries, data
 structures, algorithms, internal APIs, persistence mechanics, or concurrency
 mechanisms unless the user explicitly makes one a material constraint or an
@@ -131,9 +209,10 @@ the spec to draft. An approved spec has no unresolved material decision.
 
 ## Task contract
 
-`wyrd-plan` derives implementation tasks only from an approved spec revision or
-from validated task-review findings under that same spec. Use as many tasks as
-cohesive ownership and real dependencies require; task count is not a target.
+`wyrd-plan` derives implementation tasks from an approved spec revision.
+`wyrd-task-review` packages validated review findings into remediation tasks
+under that same spec. Use as many tasks as cohesive ownership and real
+dependencies require; task count is not a target.
 
 Each task identifies:
 
@@ -166,6 +245,11 @@ remediates: []
 - broader crate, module, family, integration, codegen, and journey verification;
 - completion evidence and material stop conditions; and
 - for remediation, the parent task and validated finding IDs.
+
+Start with the outcome, one before/after example where useful, the important
+invariants and implementation sequence. Explain scenarios and their expected
+observations before the source-backed implementation reference and exact
+command inventory. Map obligations once without repeating the whole spec.
 
 Task planning fixes outcomes, required boundaries, and source-backed reuse
 decisions. Reversible private mechanics remain implementation-owned. It may not
@@ -219,10 +303,12 @@ mise exec -- cargo nextest run --locked -p <crate> --test <target> \
 
 When the test requires repository-managed Postgres or another environment, the
 exact command must include the owning setup wrapper or use the narrowest
-environment-owning `mise` task. Do not invent a selector. Confirm target and
-test names from source and, when needed,
-`mise exec -- cargo nextest list`. Avoid positional filters that can
-accidentally select no test.
+environment-owning `mise` task. Confirm existing test names from source and,
+when needed, `mise exec -- cargo nextest list`. A new test name may be explicitly
+marked planned: confirm its existing package, target, runner and setup during
+planning, then confirm the actual selector after adding the test, before RED.
+Do not invent targets or present a planned test as already existing. Avoid
+positional filters that can accidentally select no test.
 
 Named Python and TypeScript tests likewise carry the exact repository-native
 pytest or package-runner command, path, and selector plus any required setup.
@@ -290,6 +376,14 @@ or grant product authorization.
 
 These sources inform the workflow but do not override Wyrd authority:
 
+- [Rust RFC template](https://github.com/rust-lang/rfcs/blob/main/0000-template.md)
+  — summary, motivation and guide-level examples before reference-level detail;
+- [Kubernetes KEP template](https://github.com/kubernetes/enhancements/blob/master/keps/NNNN-kep-template/README.md)
+  — reader-facing proposal and goals, separate design details, test plan and
+  production-readiness questions;
+- [GitHub Spec Kit specification template](https://github.com/github/spec-kit/blob/main/templates/spec-template.md)
+  — plain-language scenarios, independently testable outcomes and measurable
+  success criteria; Wyrd retains its own mandatory TDD and journey rules;
 - [Kent Beck, Canon TDD](https://newsletter.kentbeck.com/p/canon-tdd) — one
   scenario and one Red-Green-Refactor cycle at a time;
 - [Martin Fowler, Test-Driven Development](https://martinfowler.com/bliki/TestDrivenDevelopment.html)

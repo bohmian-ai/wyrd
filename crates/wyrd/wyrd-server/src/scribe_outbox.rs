@@ -1744,6 +1744,26 @@ mod tests {
         )
     }
 
+    /// Waits for every one of `spans`' permits to be free again.
+    ///
+    /// A written copy's permit is released when the outbox frees the copy on
+    /// the blocking pool, and a cancelled write's when its task is dropped;
+    /// both can land after `settle` or `shutdown` returns, so this acquires
+    /// the whole pool rather than reading its count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a permit is still held after ten seconds.
+    async fn every_permit_returns(spans: &ServerSpanSink) {
+        let all = u32::try_from(TENANT_SPAN_PERMITS).expect("the permit pool fits a u32");
+        let permits =
+            tokio::time::timeout(Duration::from_secs(10), spans.permits.acquire_many(all))
+                .await
+                .expect("every permit returns")
+                .expect("the permit pool stays open");
+        drop(permits);
+    }
+
     /// Proves tenant span staging is capped through a sustained Scribe
     /// outage without starving sibling writes: copies beyond the permit pool
     /// are dropped at once, audit and capture writes still stage, and
@@ -1776,7 +1796,7 @@ mod tests {
             outbox.shutdown(Instant::now()).await,
             TENANT_SPAN_PERMITS + 2
         );
-        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
+        every_permit_returns(&spans).await;
 
         let scribe = Arc::new(RecordingScribe::default());
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
@@ -1788,7 +1808,7 @@ mod tests {
         assert_eq!(received.len(), 1, "{received:?}");
         assert_eq!(received[0].table, "vala.traces.spans");
         assert_eq!(received[0].attribution, route.attribution);
-        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
+        every_permit_returns(&spans).await;
     }
 
     /// A Scribe request ceiling well below the default, so a modest drift

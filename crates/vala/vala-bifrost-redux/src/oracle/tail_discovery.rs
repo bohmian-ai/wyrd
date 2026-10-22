@@ -1,8 +1,9 @@
 //! Authenticated query-scoped discovery of active Scribe live streams.
 //!
 //! Oracle lists each pinned table's reported streams on its frozen Scribe
-//! roster before planning; the routes name exact Scribe incarnations and
-//! writer epochs and retain no rows.
+//! roster before planning; the routes name exact Scribe incarnations, writer
+//! epochs, and the capture each Scribe retains for the query until released
+//! or expired.
 
 use wyrd_spec::vala::api::{TailStreamIdentity, TenantTableBinding, TimePartitionWire};
 
@@ -16,16 +17,38 @@ pub struct DiscoveredTailRoute {
     pub stream: TailStreamIdentity,
     /// Live bytes the listing's scope reads in this partition.
     pub bytes: u64,
+    /// Capture the reporting Scribe retains for this query; fragments read
+    /// only this capture.
+    pub capture_id: uuid::Uuid,
+}
+
+/// One table's query-scoped discovery: every reported route plus the
+/// publication revision each answering Scribe reported in the same capture.
+#[derive(Default)]
+pub struct DiscoveredTail {
+    /// Routes of every retained capture.
+    pub routes: Vec<DiscoveredTailRoute>,
+    /// Each answering Scribe's node and the table revision its last locally
+    /// completed publication committed at, an empty capture included.
+    ///
+    /// Oracle compares each with the cut's revision for that node: a higher
+    /// reported revision means the cut lacks rows that Scribe no longer
+    /// serves live.
+    pub revisions: Vec<(uuid::Uuid, i64)>,
 }
 
 /// Query-scoped resolver for live Scribe streams.
 #[async_trait::async_trait]
 pub trait TailStreamDiscovery: Send + Sync {
     /// Lists active streams for one binding on exactly the frozen Scribes,
-    /// each with the bytes `scope` reads there.
+    /// each with the bytes `scope` reads there, and every answering Scribe's
+    /// publication revision.
     ///
     /// `scribes` is the query attempt's frozen roster; discovery never rereads
-    /// membership, so every route names a participant of that one cut.
+    /// membership, so every route names a participant of that one cut. Each
+    /// listing retains a capture bound to `query_id` that expires at
+    /// `deadline`. When any listing fails, the captures the others retained
+    /// are released before the error returns.
     ///
     /// # Errors
     /// Returns the listing's [`TailReadError`] class:
@@ -41,8 +64,24 @@ pub trait TailStreamDiscovery: Send + Sync {
         binding: &TenantTableBinding,
         scope: &crate::scan_sizing::ScanScope,
         scribes: &[OracleQueryParticipant],
+        query_id: uuid::Uuid,
         deadline: Instant,
-    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;
+    ) -> Result<DiscoveredTail, TailReadError>;
+
+    /// Releases captures this discovery retained for `query_id`, waiting no
+    /// later than the query's `deadline`.
+    ///
+    /// Best effort: a capture that cannot be released, or whose Scribe has not
+    /// answered by `deadline`, expires there on its Scribe, so a failure is
+    /// logged and never returned and a stalled peer cannot keep the caller
+    /// waiting past the query.
+    async fn release(
+        &self,
+        binding: &TenantTableBinding,
+        query_id: uuid::Uuid,
+        captures: &[(OracleQueryParticipant, uuid::Uuid)],
+        deadline: Instant,
+    );
 
     /// Toggles a test-tier discovery outage without changing production behavior.
     #[cfg(feature = "test-support")]

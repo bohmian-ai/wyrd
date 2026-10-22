@@ -293,11 +293,11 @@ export const bifrostWriteRead: TimelineSpec = {
       ghostLane: 2,
       readouts: [
         { v: 'Held by Scribe', s: 'In its write-ahead log, not yet published' },
-        { v: '<span class="wd-badge warn">! usually 1 row</span>', s: 'Oracle reads the live tail best effort' },
+        { v: '<span class="wd-badge ok">✓ 1 row</span>', s: 'Oracle reads the live tail from the holding Scribe' },
         { v: '<span class="wd-badge ok">✓ Yes</span>', s: 'Durable once acknowledged' }
       ],
       caption:
-        '<code>flush()</code> has returned, so the row is durable. Oracle reads it from the holding Scribe as live tail, on a best-effort basis. An empty result now is not proof the row is missing. The dashed box marks where it will appear in the table.'
+        '<code>flush()</code> has returned, so the row is durable. Oracle reads it from the holding Scribe as live tail. Only if that Scribe cannot be reached when the query lists live sources does the query end degraded without it; losing it after capture fails the query. The dashed box marks where it will appear in the table.'
     },
     {
       from: 58,

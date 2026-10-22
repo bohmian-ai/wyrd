@@ -6,6 +6,11 @@ status: approved
 
 # Long-horizon and heavy verification
 
+> **Superseded in part.** [bifrost-source-consistency revision 2](../../completed/2026/bifrost-source-consistency.md)
+> replaces this revision's accepted publication-overlap tradeoff for Bifrost
+> reads and REQ-015/AC-009's direct-overhead target (now p99 at or under
+> 500 µs). Everything else here is unchanged and remains authority.
+
 ## Objective and authority
 
 Verify accumulated behavior by grouping ordinary Verifier executions under a

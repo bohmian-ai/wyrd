@@ -11,9 +11,11 @@
 //! `DataFusion` as it arrives, so no live fragment is ever materialized on the
 //! leader.
 //!
-//! A route that is unavailable before it yields a row is recorded as a
-//! `LiveTail` loss and ends empty; any later loss, and any integrity, tenant,
-//! security, resource, cancellation, or deadline fault, fails the query.
+//! Every route reads the capture its Scribe retained for the query at
+//! discovery; the captures are released when the last plan holding the
+//! table's routes drops. A capture lost during execution, and any integrity,
+//! tenant, security, resource, cancellation, or deadline fault, fails the
+//! query: no live source is ever reopened underneath it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,6 +88,137 @@ pub(crate) struct LiveScribeRoute {
     /// Live bytes the listing reported this query reads in the partition;
     /// sizes the query's partitions and nothing else.
     pub(crate) bytes: u64,
+    /// Capture the reporting Scribe retains for this query.
+    pub(crate) capture_id: uuid::Uuid,
+}
+
+/// The captures one table's discovery retained, released on drop.
+///
+/// Shared by every clone of the table's routes, so the captures stay retained
+/// while any plan can still read them and are released once, by the last
+/// drop, on completion, cancellation, failure, or a discarded selection. The
+/// detached release waits no later than the query deadline. A drop outside a
+/// Tokio runtime releases nothing; each capture then expires at that
+/// deadline on its Scribe.
+pub(crate) struct LiveCaptures {
+    /// Discovery that retained the captures and releases them.
+    discovery: Arc<dyn super::TailStreamDiscovery>,
+    /// Binding every capture was retained for.
+    binding: TenantTableBinding,
+    /// Query attempt every capture is bound to.
+    query_id: uuid::Uuid,
+    /// Each retaining Scribe with its capture.
+    captures: Vec<(super::OracleQueryParticipant, uuid::Uuid)>,
+    /// The query's absolute deadline, which is every capture's expiry and the
+    /// latest instant the release waits for a Scribe.
+    deadline: std::time::Instant,
+}
+
+impl LiveCaptures {
+    /// Takes ownership of the captures `discovery` retained for one table
+    /// until the query's `deadline`.
+    pub(crate) fn new(
+        discovery: Arc<dyn super::TailStreamDiscovery>,
+        binding: TenantTableBinding,
+        query_id: uuid::Uuid,
+        captures: Vec<(super::OracleQueryParticipant, uuid::Uuid)>,
+        deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            discovery,
+            binding,
+            query_id,
+            captures,
+            deadline,
+        }
+    }
+}
+
+/// Discovery for fixtures whose routes are planned but never dialed.
+#[cfg(test)]
+struct NoCaptureDiscovery;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl super::TailStreamDiscovery for NoCaptureDiscovery {
+    /// Discovers nothing; fixtures construct their routes directly.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: the fixture always returns an empty discovery.
+    async fn discover(
+        &self,
+        _binding: &TenantTableBinding,
+        _scope: &crate::scan_sizing::ScanScope,
+        _scribes: &[super::OracleQueryParticipant],
+        _query_id: uuid::Uuid,
+        _deadline: std::time::Instant,
+    ) -> Result<super::DiscoveredTail, crate::scribe::tail_rpc::TailReadError> {
+        Ok(super::DiscoveredTail::default())
+    }
+
+    /// Holds no capture, so there is nothing to release.
+    async fn release(
+        &self,
+        _binding: &TenantTableBinding,
+        _query_id: uuid::Uuid,
+        _captures: &[(super::OracleQueryParticipant, uuid::Uuid)],
+        _deadline: std::time::Instant,
+    ) {
+    }
+}
+
+#[cfg(test)]
+impl LiveCaptures {
+    /// Returns an empty capture set for fixture routes that are never dialed.
+    pub(crate) fn none_for_test(binding: TenantTableBinding) -> Arc<Self> {
+        Arc::new(Self::new(
+            Arc::new(NoCaptureDiscovery),
+            binding,
+            uuid::Uuid::nil(),
+            Vec::new(),
+            std::time::Instant::now(),
+        ))
+    }
+}
+
+impl Drop for LiveCaptures {
+    /// Spawns the release of every capture on the current runtime, bounded
+    /// by the query deadline so a stalled Scribe cannot keep the detached task
+    /// alive past it; a capture left unreleased expires there.
+    fn drop(&mut self) {
+        let captures = std::mem::take(&mut self.captures);
+        if captures.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let discovery = Arc::clone(&self.discovery);
+        let binding = self.binding.clone();
+        let query_id = self.query_id;
+        let deadline = self.deadline;
+        runtime.spawn(async move {
+            discovery
+                .release(&binding, query_id, &captures, deadline)
+                .await;
+        });
+    }
+}
+
+impl std::fmt::Debug for LiveCaptures {
+    /// Renders the query and capture count; the discovery holds peer channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error unchanged.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveCaptures")
+            .field("query_id", &self.query_id)
+            .field("captures", &self.captures.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Every live route discovered for one pinned table, with its signing identity.
@@ -98,6 +231,8 @@ pub(crate) struct LiveTableRoutes {
     pub(crate) binding: TenantTableBinding,
     /// Reported routes, in discovery order.
     pub(crate) routes: Vec<LiveScribeRoute>,
+    /// Captures the routes read, released when the last clone drops.
+    pub(crate) captures: Arc<LiveCaptures>,
 }
 
 impl LiveTableRoutes {
@@ -147,6 +282,7 @@ impl LiveTableRoutes {
                 .filter(|(_, keep)| *keep)
                 .map(|(route, _)| route.clone())
                 .collect(),
+            captures: Arc::clone(&self.captures),
         }
     }
 }
@@ -182,7 +318,11 @@ impl std::fmt::Debug for LiveDispatch {
     }
 }
 
-/// Records one known live source lost before it yielded a row.
+/// Records that a table's live streams could not be listed.
+///
+/// Only listing loss degrades: a query that never captured a table's live
+/// sources reads it from published files alone. A capture lost after it was
+/// accepted fails the query instead.
 ///
 /// The loss uses the non-partition ordinal, so it sits beside the
 /// participant losses on the same accumulator the terminal reads. A poisoned
@@ -306,6 +446,7 @@ impl LiveScribeExec {
                 .step_by(self.properties.partitioning.partition_count())
                 .cloned()
                 .collect(),
+            captures: Arc::clone(&self.routes.captures),
         };
         let mut leaf = self.clone();
         let Some(predicate) = &self.predicate else {
@@ -362,6 +503,7 @@ impl LiveScribeExec {
                 writer_epoch: route.writer_epoch,
                 start_partition: route.time_partition,
                 end_partition: route.time_partition,
+                capture_id: route.capture_id,
             }),
             schema_fingerprint: self.schema_fingerprint.clone(),
             required_columns: self.required_columns.clone(),
@@ -655,13 +797,10 @@ impl LiveFragmentRead {
     /// Turns the read into a batch stream `DataFusion` polls incrementally,
     /// reading this partition's routes one after another.
     ///
-    /// Outcomes per route, in order of precedence:
-    /// - cancellation or an elapsed deadline fails the partition;
-    /// - an availability loss (`Unavailable`, `EligibleSourceLoss`,
-    ///   `StaleObject`) before that route yielded a row records one
-    ///   `LiveTail` loss and moves on to the next route;
-    /// - every other dispatch failure, any loss after a row, a malformed or
-    ///   out-of-order frame, and end of stream without a valid footer fail it.
+    /// Cancellation, an elapsed deadline, any dispatch failure — including a
+    /// lost capture, before or after a row — a malformed or out-of-order
+    /// frame, and end of stream without a valid footer fail the partition.
+    /// A route's capture is never reopened or replaced.
     ///
     /// A partition dropped before its end — because the plan no longer needs
     /// it — owes no footer; the drop alone cancels the Scribe fragment.
@@ -692,16 +831,7 @@ impl LiveFragmentRead {
                     Ok(frames) => frames,
                     Err(error) => {
                         grant.ensure_live()?;
-                        if !is_availability_loss(&error) {
-                            Err(live_error("open", &error))?;
-                        }
-                        tracing::warn!(
-                            scribe = %route.node_id.as_uuid(),
-                            ?error,
-                            "Oracle omits a live Scribe route unavailable before its first row"
-                        );
-                        record_live_tail_unavailable(bindings.degraded());
-                        continue 'routes;
+                        Err(live_error("open", &error))?
                     }
                 };
                 loop {
@@ -731,16 +861,7 @@ impl LiveFragmentRead {
                         }
                         Some(Err(error)) => {
                             grant.ensure_live()?;
-                            if decoder.rows() > 0 || !is_availability_loss(&error) {
-                                Err(live_error("stream", &error))?;
-                            }
-                            tracing::warn!(
-                                scribe = %route.node_id.as_uuid(),
-                                ?error,
-                                "Oracle omits a live Scribe route lost before its first row"
-                            );
-                            record_live_tail_unavailable(bindings.degraded());
-                            continue 'routes;
+                            Err(live_error("stream", &error))?;
                         }
                         Some(Ok(frame)) => {
                             if let Some(batch) = decoder.accept(frame).map_err(|error| {
@@ -780,20 +901,6 @@ fn remaining(deadline: DateTime<Utc>) -> Duration {
         .signed_duration_since(Utc::now())
         .to_std()
         .unwrap_or_default()
-}
-
-/// Reports whether a dispatch failure is a known live source's availability loss.
-///
-/// Only these may become a `Degraded` omission, and only before the source
-/// yielded a row. Security, tenant, protocol, and resource failures are never
-/// availability: they fail the query wherever they occur.
-const fn is_availability_loss(error: &DispatchError) -> bool {
-    matches!(
-        error,
-        DispatchError::Unavailable
-            | DispatchError::EligibleSourceLoss { .. }
-            | DispatchError::StaleObject
-    )
 }
 
 /// Maps a fatal live-source failure to the `DataFusion` error the terminal maps.
@@ -877,6 +984,7 @@ impl LiveFrameDecoder {
     }
 
     /// Rows already released to `DataFusion`.
+    #[cfg(test)]
     const fn rows(&self) -> u64 {
         self.rows
     }
@@ -1498,14 +1606,16 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .expect("fixture batch");
+        let binding = TenantTableBinding {
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            namespace: "bifrost".to_owned(),
+            table: "events".to_owned(),
+        };
         let leaf = || {
             LiveScribeExec::new(
                 LiveTableRoutes {
-                    binding: TenantTableBinding {
-                        tenant_id: wyrd_spec::DataTenantId::new_v7(),
-                        namespace: "bifrost".to_owned(),
-                        table: "events".to_owned(),
-                    },
+                    captures: LiveCaptures::none_for_test(binding.clone()),
+                    binding: binding.clone(),
                     routes: Vec::new(),
                 },
                 crate::catalog::TimeAxis::new(

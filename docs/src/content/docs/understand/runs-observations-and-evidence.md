@@ -104,7 +104,7 @@ Event time lives in each table's own time column: `created_at` for drift samples
 
 `observe.*` calls return as soon as the row is queued, so they add almost no time to a request. The trade-off is that a queued row is not yet stored. `shutdown` sends everything still queued and returns when the server has it; a process that exits without it can lose its last rows. If the queue fills because the server is slow or unreachable, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking your request.
 
-Stored is not the same as queryable. Bifrost acknowledges a write before the rows are published for queries, and a query reads the published data plus recent rows on a best-effort basis. A row that is missing seconds after `flush` returned is usually not lost. [Bifrost](/understand/bifrost/) explains the gap.
+Stored is not the same as queryable. Bifrost acknowledges a write before the rows are published for queries, and a query reads the published data plus the recent rows each Scribe still holds. If the Scribe holding a recent row cannot be reached when the query lists live sources, the query ends `degraded` and that row may be missing; it is not lost. If that Scribe is lost after the query captured its rows, the query fails instead. [Bifrost](/understand/bifrost/) explains the gap.
 
 ## Two ways to write your own data
 

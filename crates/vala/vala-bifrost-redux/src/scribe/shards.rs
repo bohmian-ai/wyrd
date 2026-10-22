@@ -31,7 +31,6 @@ use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, Pr
 use crate::scribe::profile::GroupStages;
 use crate::scribe::routing::shard_for;
 use crate::scribe::stream_identity::StreamIdentity;
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
 use crate::scribe::wal::{WalHandle, WalWriter};
 
 type WalSegmentsByKey = HashMap<
@@ -903,28 +902,20 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
-    /// Returns every live partition of one tenant table, per memtable source,
-    /// with the bytes `scope` reads from it.
+    /// Returns every shard's memtable for one coherent live capture.
     ///
-    /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
-    /// rows. An owner inserts rows before it acknowledges them but republishes
-    /// its inspection snapshot only afterwards, so discovery from published
-    /// snapshots could omit the partition of an already acknowledged write.
-    /// Only `table`'s sources are collected; the caller sums per partition.
+    /// A capture reads the memtables directly instead of asking the shard
+    /// owners, so a query never waits behind an owner's queued writes. An
+    /// owner inserts rows before it acknowledges them, so every acknowledged
+    /// row is visible to a capture taken after the acknowledgement.
     ///
     /// # Errors
-    /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
-    pub(crate) fn active_live_bytes_for_table(
-        &self,
-        tenant: DataTenantId,
-        table: &crate::catalog::TableRef,
-        scope: &crate::scan_sizing::ScanScope,
-    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
-        let mut partitions = Vec::new();
-        for memtable in &self.memtables {
-            partitions.extend(memtable.live_bytes_for_table(tenant, table, scope)?);
+    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down.
+    pub(crate) fn memtables(&self) -> Result<&[Arc<Memtable>], ScribeError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ScribeError::IngressClosed);
         }
-        Ok(partitions)
+        Ok(&self.memtables)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.
@@ -1151,47 +1142,6 @@ impl ScribeShardRuntime {
             });
         }
         Ok(())
-    }
-
-    /// Reads every shard's readable memtable rows for one live-tail request.
-    ///
-    /// Reads the memtables directly instead of asking the shard owners, so a
-    /// query never waits behind an owner's queued writes. Each memtable read
-    /// holds both of its maps for one consistent cut, and an owner inserts rows
-    /// before it acknowledges them, so every acknowledged row is visible. The
-    /// result is one flat list of per-partition-day batches in shard order.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down,
-    /// or the memtable error when a projection cannot be read.
-    pub(crate) fn snapshot(
-        &self,
-        request: &FetchLiveTailRequest,
-    ) -> Result<Vec<HotBatch>, ScribeError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(ScribeError::IngressClosed);
-        }
-        let mut merged = Vec::new();
-        for memtable in &self.memtables {
-            merged.extend(
-                memtable
-                    .readable_batches_for_range(
-                        request.binding.tenant,
-                        &request.binding.table_ref,
-                        request.start_partition,
-                        request.end_partition,
-                        &request.required_columns,
-                    )?
-                    .into_iter()
-                    .map(|readable| HotBatch {
-                        partition_day: readable.partition_day,
-                        generation: readable.generation,
-                        rows: readable.batch,
-                        statistics: readable.statistics,
-                    }),
-            );
-        }
-        Ok(merged)
     }
 
     /// Queue one age/pressure flush request per fixed shard owner.
@@ -2378,7 +2328,7 @@ impl ShardOwner {
     /// A generation is eligible the moment its state is
     /// `ImmutableState::Committed`, which is only reached after the fenced
     /// `vala.file_list` transaction commits. Retirement ordering is
-    /// preserved: `memory_ownership.release_immutable` is called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
+    /// preserved: the generation's memory ownership is settled before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
     ///
     /// A failed WAL retirement is logged and remains recoverable on the next
@@ -2413,6 +2363,12 @@ impl ShardOwner {
     }
 
     /// Releases one committed generation's governed immutable and memtable ownership once.
+    ///
+    /// The generation's exact bytes leave the shard ledger and move into its
+    /// shared [`crate::scribe::memory::RetainedArrowCharge`] rather than back
+    /// to the root, so a live capture or opened read still holding its Arrow
+    /// keeps them charged until it drops; with no such holder they return when
+    /// the memtable drops the generation.
     ///
     /// Replay uses this transition as soon as a published member is terminal,
     /// while leaving the retained generation and its cohort vote in place for
@@ -2452,8 +2408,8 @@ impl ShardOwner {
                 detail: "injected immutable retirement release failure".to_owned(),
             });
         }
-        self.memory_ownership.release_immutable(token.arrow_bytes)?;
-        if let Err(error) = self.memtable.commit_retirement(token) {
+        let retained = self.memory_ownership.detach_immutable(token.arrow_bytes)?;
+        if let Err(error) = self.memtable.commit_retirement(token, retained) {
             self.memory_ownership.poison();
             return Err(error);
         }
@@ -5421,17 +5377,21 @@ mod tests {
     /// poisoned lock is observed on the production settlement path rather than
     /// by calling the failure directly. The chunk response must surface the
     /// poisoned-lock error, and the owner must be left with no replay chunk, no
-    /// pending generations, and every immutable byte returned to the baseline.
+    /// pending generations, and an empty immutable ledger. The completed
+    /// `current` generation retires, so its bytes stay charged while this
+    /// helper still holds its payload and return exactly when that last
+    /// holder drops, settling the root at the baseline.
     ///
     /// # Panics
     ///
     /// Panics if the response does not settle within one second, does not name
-    /// the poisoned identity owner lock, or if any ownership survives.
+    /// the poisoned identity owner lock, or if any ownership survives the last
+    /// payload holder.
     async fn settle_poisoned_advance(
         owner: &mut ShardOwner,
         budget: &crate::resources::ScribeResources,
         baseline: &crate::resources::ResourceSnapshot,
-        current: &Arc<ImmutableGeneration>,
+        current: Arc<ImmutableGeneration>,
         current_key: &SealKey,
         next: Arc<ImmutableGeneration>,
         next_key: &SealKey,
@@ -5440,7 +5400,7 @@ mod tests {
         owner.pending_generations.insert(
             current_key.clone(),
             VecDeque::from([PendingGeneration {
-                generation: Arc::clone(current),
+                generation: Arc::clone(&current),
                 binding: crate::catalog::TenantTableBinding::resolve((
                     current_key.tenant,
                     current_key.table.clone(),
@@ -5508,6 +5468,15 @@ mod tests {
         assert!(owner.replay_chunk.is_none());
         assert!(owner.pending_generations.is_empty());
         assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("retired payload still held")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes + current.arrow_bytes,
+            "the held payload keeps its retired generation charged"
+        );
+        drop((current, next_for_poison));
         assert_eq!(
             budget
                 .snapshot()
@@ -5702,6 +5671,10 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("advance-failure WAL handle");
         let current = owner_generation(&current_key, &current_frozen, stream, wal_handle.clone());
         let next = owner_generation(&next_key, &next_frozen, stream, wal_handle.clone());
+        // Freeze returns a clone sharing each generation's retained charge, as
+        // production hands persistence one; keeping it would hold a retired
+        // generation's bytes past settlement.
+        drop((current_frozen, next_frozen));
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
         let baseline = budget.snapshot().expect("advance-failure baseline");
@@ -5717,7 +5690,7 @@ mod tests {
             &mut owner,
             &budget,
             &baseline,
-            &current,
+            current,
             &current_key,
             next,
             &next_key,
@@ -6831,6 +6804,7 @@ mod tests {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            charge: Arc::clone(&frozen.charge),
             replay_identity: std::sync::Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
@@ -8058,6 +8032,223 @@ mod tests {
         assert_eq!(token_after.seal_id, token_before.seal_id);
         assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
         assert_eq!(token_after.wal_range, token_before.wal_range);
+    }
+
+    /// A retired generation's Arrow stays charged to the Scribe root while a
+    /// live capture or an opened read still holds it, and the last holder
+    /// returns exactly its bytes once.
+    ///
+    /// One capture is taken while the rows are in the writable bucket and one
+    /// after they freeze, and a projected read is opened from the first, as a
+    /// query holding them before admission would. Retirement then removes the
+    /// generation from the shard ledger and the memtable and submits its WAL,
+    /// yet the root keeps the bytes charged, so a reservation that fits only
+    /// if they had been returned is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if retirement returns the charge while a holder remains, a
+    /// non-final holder's drop returns it, or the final drop returns anything
+    /// other than the generation's exact bytes.
+    #[tokio::test]
+    async fn a_retired_generation_stays_charged_until_its_last_holder_drops() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let active =
+            crate::scribe::memtable::LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("active capture")
+                .expect("unregistered capture");
+        // Freeze hands persistence a clone of the generation, which holds the
+        // charge too; this test keeps only its identity and size.
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let (seal_id, arrow_bytes) = (frozen.seal_id, frozen.arrow_bytes);
+        drop(frozen);
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
+        let pending = crate::scribe::memtable::LiveCapture::take(
+            [owner.memtable.as_ref()],
+            key.tenant,
+            &key.table,
+            None,
+        )
+        .expect("pending capture")
+        .expect("unregistered capture");
+        let read = active
+            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .expect("projected read");
+        drop(active);
+        owner
+            .memtable
+            .complete_staged(seal_id, owner_staged_member(seal_id))
+            .expect("owner completion");
+        owner
+            .memory_ownership
+            .reserve_immutable(arrow_bytes)
+            .expect("immutable ledger ownership");
+        owner.retained_generations.insert(
+            seal_id,
+            RetainedGeneration {
+                arrow_bytes,
+                memory_released: false,
+                wal_segments: Vec::new(),
+                wal: wal_handle,
+                replay_identity: Arc::new(Mutex::new(None)),
+            },
+        );
+        let charged = budget.memory_snapshot();
+        owner.retire_committed().await.expect("retirement");
+        assert!(!owner.retained_generations.contains_key(&seal_id));
+        assert_eq!(
+            owner.memtable.immutable_generation_count().expect("count"),
+            0
+        );
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        let retained = budget.memory_snapshot();
+        assert_eq!(retained.scribe_total_bytes, charged.scribe_total_bytes);
+        let refreed = retained.scribe_limit_bytes - retained.scribe_total_bytes + arrow_bytes;
+        assert!(
+            budget
+                .try_reserve_maintenance(MemoryCategory::Active, refreed)
+                .is_err(),
+            "growth into the retained bytes is refused"
+        );
+        drop(pending);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes,
+            "a non-final holder keeps the charge"
+        );
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].batch.num_rows(), 1);
+        drop(read);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes - arrow_bytes,
+            "the last holder returns the exact bytes"
+        );
+    }
+
+    /// A retired generation's Arrow stays charged while persistence still
+    /// holds its production-converted payload or the frozen snapshot staging
+    /// rebuilt from it, after every memtable, capture, and read holder is gone.
+    ///
+    /// The payload comes from [`ImmutableGeneration::from_frozen`], as replay,
+    /// selective sealing, and rotation build it, and the snapshot from the
+    /// payload, as staging builds it. Two payload `Arc`s model a pending front
+    /// and the persistence worker. Each physical holder can be the last one,
+    /// so the root keeps the bytes and refuses growth into them until the
+    /// snapshot, dropped last, returns them exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if retirement or any non-final drop returns the charge while a
+    /// persistence holder remains, the snapshot's rows are unreadable, or the
+    /// final drop returns anything other than the generation's exact bytes.
+    #[tokio::test]
+    async fn a_retired_generation_stays_charged_while_persistence_holds_it() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let capture =
+            crate::scribe::memtable::LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("capture")
+                .expect("unregistered capture");
+        let read = capture
+            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .expect("projected read");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let (seal_id, arrow_bytes) = (frozen.seal_id, frozen.arrow_bytes);
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let payload = Arc::new(ImmutableGeneration::from_frozen(
+            &frozen,
+            (key.tenant, key.table.clone()),
+            stream,
+            Vec::new(),
+            wal_handle.clone(),
+        ));
+        let worker = Arc::clone(&payload);
+        let snapshot = payload.frozen_snapshot();
+        drop((frozen, capture, read));
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
+        owner
+            .memtable
+            .complete_staged(seal_id, owner_staged_member(seal_id))
+            .expect("owner completion");
+        owner
+            .memory_ownership
+            .reserve_immutable(arrow_bytes)
+            .expect("immutable ledger ownership");
+        owner.retained_generations.insert(
+            seal_id,
+            RetainedGeneration {
+                arrow_bytes,
+                memory_released: false,
+                wal_segments: Vec::new(),
+                wal: wal_handle,
+                replay_identity: Arc::new(Mutex::new(None)),
+            },
+        );
+        let charged = budget.memory_snapshot();
+        owner.retire_committed().await.expect("retirement");
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        let retained = budget.memory_snapshot();
+        assert_eq!(
+            retained.scribe_total_bytes, charged.scribe_total_bytes,
+            "persistence holders keep the charge through retirement"
+        );
+        let refreed = retained.scribe_limit_bytes - retained.scribe_total_bytes + arrow_bytes;
+        assert!(
+            budget
+                .try_reserve_maintenance(MemoryCategory::Active, refreed)
+                .is_err(),
+            "growth into the retained bytes is refused"
+        );
+        drop(payload);
+        drop(worker);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes,
+            "the snapshot keeps the charge after the last payload drops"
+        );
+        assert_eq!(snapshot.batches.len(), 1);
+        assert_eq!(snapshot.batches[0].num_rows(), 1);
+        drop(snapshot);
+        assert_eq!(
+            budget.memory_snapshot().scribe_total_bytes,
+            charged.scribe_total_bytes - arrow_bytes,
+            "the last persistence holder returns the exact bytes"
+        );
     }
 
     /// Retirement does not remove a retained generation when immutable release cannot proceed.

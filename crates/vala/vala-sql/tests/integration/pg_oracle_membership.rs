@@ -919,4 +919,95 @@ mod pg_tests {
             "a rolled-back change is never heard"
         );
     }
+
+    /// Proves each committed `vala.file_list` publication advances its
+    /// node's table revision once, and the cut returns every node's revision.
+    ///
+    /// A second publication by the same node advances that node only; an
+    /// identical replay and a rolled-back publication advance nothing; a table
+    /// with no publication and another tenant read no revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a read fails or a revision differs from the expected count.
+    #[tokio::test]
+    async fn file_list_publications_advance_their_node_revision() {
+        let reads = CutReads::start().await;
+        let tenant = reads.tenant().await;
+        let other = reads.tenant().await;
+        for owner in [tenant, other] {
+            reads
+                .register(owner, "events", Some("s3://a/events/v1.metadata.json"))
+                .await;
+        }
+        reads
+            .register(tenant, "quiet", Some("s3://a/quiet/v1.metadata.json"))
+            .await;
+        reads
+            .hot_row(tenant, "events", "a/hot-1.parquet", false, None)
+            .await;
+        reads
+            .hot_row(tenant, "events", "a/hot-2.parquet", false, None)
+            .await;
+        let node = |path: &str| {
+            sqlx::query_scalar::<_, Uuid>("SELECT node_id FROM vala.file_list WHERE file_path = $1")
+                .bind(path.to_owned())
+                .fetch_one(&reads.superuser)
+        };
+        let (first, second) = (
+            node("a/hot-1.parquet").await.expect("first node"),
+            node("a/hot-2.parquet").await.expect("second node"),
+        );
+        let republish = "INSERT INTO vala.file_list ( \
+                id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, \
+                min_event_time, max_event_time, partition_granularity, partition_start, \
+                node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record, compacted) \
+             SELECT gen_random_uuid(), data_tenant_id, namespace, table_name, \
+                    file_path || $1, file_size, row_count, min_event_time, \
+                    max_event_time, partition_granularity, partition_start, node_id, \
+                    writer_epoch, wal_lsn_max + $2, wal_lsn_max + $2, promotion_record, compacted \
+               FROM vala.file_list WHERE file_path = 'a/hot-1.parquet'";
+        sqlx::query(republish)
+            .bind(".next")
+            .bind(1_i64)
+            .execute(&reads.superuser)
+            .await
+            .expect("the same node publishes again");
+        let replayed = sqlx::query(
+            "INSERT INTO vala.file_list SELECT * FROM vala.file_list \
+              WHERE data_tenant_id = $1 ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&reads.superuser)
+        .await
+        .expect("the replay runs");
+        assert_eq!(replayed.rows_affected(), 0, "a replay inserts nothing");
+        let mut rolled_back = reads.superuser.begin().await.expect("begin");
+        sqlx::query(republish)
+            .bind(".uncommitted")
+            .bind(2_i64)
+            .execute(&mut *rolled_back)
+            .await
+            .expect("the uncommitted publication inserts");
+        rolled_back.rollback().await.expect("rollback");
+
+        let cuts = reads
+            .read(tenant, &["events", "quiet"])
+            .await
+            .expect("the cut reads");
+        assert_eq!(
+            cuts[0].publication_revisions,
+            std::collections::HashMap::from([(first, 2), (second, 1)]),
+            "each node's publications advance only that node, once each"
+        );
+        assert!(
+            cuts[1].publication_revisions.is_empty(),
+            "an unpublished table has no revision"
+        );
+        let foreign = reads.read(other, &["events"]).await.expect("other cut");
+        assert!(
+            foreign[0].publication_revisions.is_empty(),
+            "another tenant is independent"
+        );
+    }
 }

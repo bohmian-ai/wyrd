@@ -58,7 +58,7 @@ These are two different moments, and the gap between them explains most "where i
 
 A write is stored when a Scribe acknowledges it. That is what `flush`, `shutdown`, and `write_batch` wait for. From then on the row survives a server restart.
 
-A row is queryable once it is published into the table, which happens shortly after. An Oracle query reads the published data plus the live tail: recent rows still held by the Scribe that received them. The live tail is best effort, so a row written seconds ago may not appear yet. In rare cases a row being published during the query can be missed or counted twice. Re-run the query; the next one sees a settled table.
+A row is queryable once it is published into the table, which happens shortly after. An Oracle query reads the published data plus the live tail: recent rows still held by the Scribe that received them. A row moving from the live tail into the table while the query runs is returned exactly once. Only a Scribe that cannot be reached when the query lists live sources can leave its recent rows out, and then the query ends `degraded`. Once the query has captured a Scribe's recent rows, losing that Scribe fails the query, even before the first row arrives.
 
 This applies to everything that reads Bifrost, including Verifiers. A scheduled drift window that closes the instant a row is written may score without it.
 

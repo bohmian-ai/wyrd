@@ -614,6 +614,8 @@ struct ScribeFragment {
     leader: OracleRoleFence,
     /// Scribe incarnation serving the live stream.
     target: OracleRoleFence,
+    /// Query the Scribe retained the fragment's capture for.
+    query_id: uuid::Uuid,
 }
 
 impl ScribeFragment {
@@ -669,12 +671,19 @@ impl ScribeFragment {
             namespace: "bifrost".to_owned(),
             table: table.to_owned(),
         };
-        let listed = scribe
+        let query_id = uuid::Uuid::new_v4();
+        let capture = scribe
             .tail_service()
-            .list_active_streams(
+            .capture_active_streams(
                 &binding,
                 &vala_bifrost_redux::scan_sizing::ScanScope::default(),
-            )?
+                query_id,
+                std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            )
+            .await?;
+        let capture_id = capture.capture_id.unwrap_or_default();
+        let listed = capture
+            .streams
             .into_iter()
             .next()
             .ok_or("the Scribe reports no live partition")?;
@@ -718,6 +727,7 @@ impl ScribeFragment {
                     writer_epoch: stream.writer_epoch,
                     start_partition: partition,
                     end_partition: partition,
+                    capture_id,
                 }),
                 schema_fingerprint,
                 required_columns: columns.iter().map(|column| (*column).to_owned()).collect(),
@@ -732,6 +742,7 @@ impl ScribeFragment {
                 role: ClusterRole::Scribe,
                 fencing_token: stream.writer_epoch,
             },
+            query_id,
         })
     }
 
@@ -769,7 +780,7 @@ impl ScribeFragment {
             worker_fence: self.target.fencing_token,
             leader_node_id: self.leader.node_id.as_uuid().as_bytes().to_vec(),
             leader_fence: self.leader.fencing_token,
-            query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            query_id: self.query_id.as_bytes().to_vec(),
             tenant_id: context_tenant.as_bytes().to_vec(),
             expires_at_ms: deadline,
             execution_deadline_unix_ms: deadline,

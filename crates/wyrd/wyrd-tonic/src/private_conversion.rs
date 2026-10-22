@@ -561,13 +561,15 @@ impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
     /// memory and a wire-carried interval would be a weaker second one.
     ///
     /// # Errors
-    /// Returns a conversion error when either partition endpoint is absent or
-    /// the complete cut violates its canonical ordering.
+    /// Returns a conversion error when either partition endpoint is absent,
+    /// the capture id is not a UUID, or the complete cut violates its
+    /// canonical ordering.
     fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
         let cut = Self {
             writer_epoch: value.writer_epoch,
             start_partition: time_partition(value.start_partition, "start_partition")?,
             end_partition: time_partition(value.end_partition, "end_partition")?,
+            capture_id: uuid_bytes(&value.capture_id, "capture_id")?,
         };
         if !cut.is_valid() {
             return Err(PrivateConversionError::Invalid {
@@ -585,6 +587,7 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: Some(time_partition_proto(value.start_partition)),
             end_partition: Some(time_partition_proto(value.end_partition)),
+            capture_id: value.capture_id.as_bytes().to_vec(),
         }
     }
 }
@@ -992,6 +995,7 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
+            capture_id: uuid::Uuid::from_u128(9),
         };
         assert_eq!(
             domain::ScribeProviderCut::try_from(proto::ScribeProviderCut::from(cut.clone()))

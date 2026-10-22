@@ -288,7 +288,8 @@ impl ScribeFragmentExecutor {
             .ok()
             .and_then(|tenant| wyrd_spec::DataTenantId::new(tenant).ok())
             .ok_or(DispatchError::Terminal)?;
-        uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
+        let query_id =
+            uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
         if claims.protocol_version != PEER_PROTOCOL_VERSION
             || claims.leader_node_id.as_slice() != request.leader_fence.node_id.as_uuid().as_bytes()
             || claims.leader_fence != request.leader_fence.fencing_token
@@ -332,6 +333,7 @@ impl ScribeFragmentExecutor {
             reservation_id: &request.reservation_id,
             leader_fence: request.leader_fence.clone(),
             local_fence: request.target_fence.clone(),
+            query_id,
         };
         authenticated_preflight(&request, &authenticated).map_err(|error| {
             tracing::error!(?error, "Scribe physical follower rejected the request");

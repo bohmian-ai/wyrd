@@ -140,7 +140,7 @@ metric labels.
 
 Production qualification exercises crash recovery at every authority switch,
 duplicate batches, schema conflicts, partial uploads, lease loss, ambiguous
-catalog commits, live-tail publication races, peer loss, exchange/spill
+catalog commits, publication during live-source selection, peer loss, exchange/spill
 exhaustion, cancellation, delete-file application, retained-reader safety,
 backup restoration, and tenant tripwire failures. Performance claims require a
 fixed workload, environment, concurrency, dataset, query mix, and promoted

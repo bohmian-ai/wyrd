@@ -30,9 +30,10 @@ pub(crate) fn run_cli_with_credential(
 
 /// Run the shipped CLI with only the named environment sources set.
 ///
-/// Every `WYRD_*` secret source is cleared first, so a journey proves the
-/// command works from the sources it was given and cannot pass by picking up a
-/// developer's ambient login.
+/// Every `WYRD_*` secret source and an ambient `RUST_LOG` are cleared first,
+/// so a journey proves the command works from the sources it was given and
+/// cannot pass by picking up a developer's ambient login, nor have a CI log
+/// filter write a JSON-mode diagnostic log into its config directory.
 ///
 /// # Panics
 /// Panics when the `wyrd` binary cannot be built or located, or the process
@@ -51,6 +52,7 @@ pub(crate) fn run_cli_with_env(arguments: &[&str], sources: &[(&str, &str)]) -> 
         .env_remove("WYRD_PLATFORM_CREDENTIAL")
         .env_remove("WYRD_REFRESH_TOKEN")
         .env_remove("WYRD_ISSUER_CLIENT_SECRET")
+        .env_remove("RUST_LOG")
         .envs(sources.iter().copied());
     command.args(arguments).output().expect("wyrd command runs")
 }

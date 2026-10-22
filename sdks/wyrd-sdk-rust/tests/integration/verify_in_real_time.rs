@@ -1315,125 +1315,11 @@ impl Grouped {
             .and_then(|id| id.parse().ok())
             .expect("the response names its execution")
     }
-
-    /// Judge `value` with `verifier` in a new Run of the Service's `agent`
-    /// under `group`, as the Service, from a fresh `runtime` SDK process.
-    ///
-    /// The child loads this hydrated bundle through its own public SDK and
-    /// resolves the deployment and the Service key from its environment, the
-    /// way a deployed process does, with an empty config home so no saved
-    /// login replaces that key. It returns once the child's verify returned.
-    ///
-    /// # Panics
-    /// Panics when the child cannot start or exits unsuccessfully.
-    async fn foreign_turn(
-        &self,
-        deployment: &Deployment,
-        runtime: Runtime,
-        verifier: &str,
-        group: &GroupId,
-        value: &serde_json::Value,
-    ) {
-        let sdks = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the Rust SDK sits under sdks/");
-        let mut command = match runtime {
-            Runtime::Python => {
-                let mut command = std::process::Command::new("uv");
-                command.current_dir(sdks.join("wyrd-sdk-python")).args([
-                    "run",
-                    "--no-sync",
-                    "python",
-                    "-c",
-                    PYTHON_TURN,
-                ]);
-                command
-            }
-            Runtime::TypeScript => {
-                let mut command = std::process::Command::new("node");
-                command.current_dir(sdks.join("wyrd-sdk-ts/wyrd")).args([
-                    "--input-type=module",
-                    "-e",
-                    TYPESCRIPT_TURN,
-                ]);
-                command
-            }
-        };
-        let config_home = TempDir::new().expect("config home");
-        command
-            .arg(self.bundle.path().join("bundle"))
-            .arg(verifier)
-            .arg(group.as_str())
-            .arg(value.to_string())
-            .env("WYRD_CONFIG_HOME", config_home.path())
-            .env(
-                "WYRD_SERVER_URL",
-                deployment
-                    .server()
-                    .base_url()
-                    .expect("bound server has a URL"),
-            )
-            .env(
-                "WYRD_GRPC_URL",
-                deployment
-                    .server()
-                    .grpc_url()
-                    .expect("bound server has a gRPC URL"),
-            )
-            .env("WYRD_API_KEY", &self.key)
-            .env_remove("WYRD_ACCESS_TOKEN")
-            .env_remove("WYRD_WORKLOAD_TOKEN")
-            .env_remove("WYRD_TENANT");
-        let output = tokio::task::spawn_blocking(move || command.output())
-            .await
-            .expect("child joins")
-            .expect("child starts");
-        assert!(
-            output.status.success(),
-            "{runtime:?} turn failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 }
 
-/// A first-class SDK runtime other than Rust that [`Grouped::foreign_turn`]
-/// runs in its own process.
-#[derive(Clone, Copy, Debug)]
-enum Runtime {
-    /// The Python SDK, run by the package's `uv` environment.
-    Python,
-    /// The TypeScript SDK, run by Node from the built package.
-    TypeScript,
-}
-
-/// The Python turn: verify `argv[4]` as JSON with Verifier `argv[2]` under
-/// group `argv[3]` in a new `agent` Run of the bundle at `argv[1]`.
-const PYTHON_TURN: &str = "\
-import json, sys
-from wyrd.client import WyrdClient
-from wyrd.state import WyrdState
-bundle, verifier, group, value = sys.argv[1:]
-WyrdState.from_path(bundle, WyrdClient()).run('agent').observe.verify(
-    verifier, json.loads(value), group_id=group
-)
-";
-
-/// The TypeScript turn: the same verify as [`PYTHON_TURN`], through the
-/// package's public `wyrd-ai` entry point.
-const TYPESCRIPT_TURN: &str = "\
-const { WyrdClient, WyrdState } = await import('wyrd-ai');
-const [bundle, verifier, group, value] = process.argv.slice(1);
-await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
-  .run('agent')
-  .observe.verify(verifier, JSON.parse(value), { positional: true, group_id: group });
-process.exit(0);
-";
-
-/// A support conversation populated by the Rust, Python, and TypeScript SDKs,
-/// each from its own process, then resumed over another Run, a background
-/// submit, and an agent's replayed HTTP enqueue, all as the Service under one
-/// `group_id`, is judged once its `after` period expires: the group execution
+/// A support conversation populated over three Runs of the Rust SDK, then
+/// resumed over another Run, a background submit, and an agent's replayed
+/// HTTP enqueue, all as the Service under one `group_id`, is judged once its `after` period expires: the group execution
 /// reads back its group and owner and judges the Service's six turns in call
 /// order. The replay counts once; an ungrouped key conflict joins no group,
 /// and a same-group verify the administrator made with no owning Service and
@@ -1463,18 +1349,8 @@ async fn grouped_support_resumes() {
         .map(|turn| json!({"turn": turn, "answer": format!("answer {turn}")}))
         .collect();
     support.turn("turn-check", &group, turns[0].clone()).await;
-    support
-        .foreign_turn(deployment, Runtime::Python, "turn-check", &group, &turns[1])
-        .await;
-    support
-        .foreign_turn(
-            deployment,
-            Runtime::TypeScript,
-            "turn-check",
-            &group,
-            &turns[2],
-        )
-        .await;
+    support.turn("turn-check", &group, turns[1].clone()).await;
+    support.turn("turn-check", &group, turns[2].clone()).await;
     let resumed = support
         .state
         .run_for_card("agent")

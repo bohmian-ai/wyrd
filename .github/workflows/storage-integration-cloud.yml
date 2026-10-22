@@ -117,4 +117,5 @@ jobs:
           WYRD_STORAGE_URL: az://${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}/${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
           # object_store reads this and takes its token from the azure/login session.
           AZURE_USE_AZURE_CLI: "true"
+          WYRD_LOG: info,wyrd_storage=debug,object_store=debug
         run: mise run test:storage:azure:cloud

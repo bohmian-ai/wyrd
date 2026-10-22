@@ -121,12 +121,15 @@ async fn run_handle_crud(handle: &StorageHandle) {
         .expect("delete c");
 }
 
-/// Boot the handle described by the process storage environment.
+/// Boot the handle described by the process storage environment, logging
+/// to stderr when `WYRD_LOG` or `RUST_LOG` is set so a refused credential
+/// probe shows the backend's own error.
 ///
 /// # Panics
 /// Panics when the environment is incomplete, selects a backend other than
 /// `kind`, or the handle cannot be built.
 async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
+    wyrd_testing::capacity::install_tracing();
     let settings = settings::from_env().expect("WYRD_STORAGE_URL configures storage");
     assert_eq!(
         settings.backend.kind(),

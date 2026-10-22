@@ -183,7 +183,6 @@ mod pg_tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
         CompactionTypeWire, DataTypeSpec, FieldSpec, PhysicalLayoutWire, RegisterOutcome,
-        TimeGranularityWire,
     };
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
@@ -522,7 +521,7 @@ mod pg_tests {
             let name = unique_name();
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             req.physical_layout = Some(PhysicalLayoutWire {
-                partition_granularity: TimeGranularityWire::Day,
+                partition_by: Vec::new(),
                 time_column: None,
                 sort_keys: Vec::new(),
                 bloom_columns: vec!["absent_column".to_owned()],

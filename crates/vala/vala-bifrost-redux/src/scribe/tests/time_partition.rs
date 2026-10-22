@@ -31,7 +31,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         ),
         Field::new("value", DataType::Int64, false),
@@ -39,7 +39,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     arrow::record_batch::RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(TimestampMicrosecondArray::from(micros)),
+            Arc::new(TimestampMicrosecondArray::from(micros).with_timezone("+00:00")),
             Arc::new(Int64Array::from(
                 (0..i64::try_from(rows).expect("fixture row count fits i64")).collect::<Vec<_>>(),
             )),

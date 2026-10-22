@@ -425,7 +425,7 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new(
                 "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
             Field::new("value", DataType::Int32, false),
@@ -444,7 +444,8 @@ mod tests {
     /// Parquet file cannot be created, written, or closed.
     fn write_run(directory: &Path, name: &str, rows: &[(i64, i32)]) -> PathBuf {
         let schema = merge_schema();
-        let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.0));
+        let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.0))
+            .with_timezone("+00:00");
         let values = Int32Array::from_iter_values(rows.iter().map(|row| row.1));
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times), Arc::new(values)])

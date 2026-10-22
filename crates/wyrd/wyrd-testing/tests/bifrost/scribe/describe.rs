@@ -222,3 +222,244 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     );
     server.shutdown().await.expect("server shutdown");
 }
+
+/// A composite layout registers, describes canonically, and re-registers
+/// idempotently; a changed declaration and every out-of-bounds declaration are
+/// refused, and a refusal leaves no registration behind.
+///
+/// The accepted table partitions hourly on a zoned `event_time` plus an
+/// identity dimension over a nullable string and a bucket dimension over a
+/// nullable integer, sorts on the string, and Blooms a third column; describe
+/// returns exactly that declaration, with the complete Bloom set and no hidden
+/// floor. A table registered without a layout resolves to
+/// `hour(wyrd_ingested_at)` and no Bloom columns. Each refused declaration
+/// — including a timezone-naive or nullable time axis — returns the
+/// invalid-layout code naming its field and violation, and the
+/// same name then registers as `Created` under a valid layout.
+///
+/// # Panics
+///
+/// Panics when an accepted layout is refused or describes differently, a
+/// refusal carries another code, field, or violation, or a refused name is
+/// already registered.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composite_layout_creation_and_refusal() {
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use wyrd_spec::vala::api::{
+        NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
+        RegisterOutcome, SortDirectionWire, SortKeyWire,
+    };
+
+    let server = start_scribe_server().await;
+    let bootstrap = server
+        .bootstrap_service(&unique_table("layout_writer"), &["admin"])
+        .await
+        .expect("bootstrap the registering writer");
+    let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+        grpc: wyrd_client::transport::GrpcConfig {
+            endpoint: server.grpc_url().expect("gRPC URL"),
+            connect_retries: 0,
+            ..wyrd_client::transport::GrpcConfig::default()
+        },
+        http: wyrd_client::transport::HttpConfig {
+            base_url: server.base_url().expect("HTTP URL").to_owned(),
+            ..wyrd_client::transport::HttpConfig::default()
+        },
+        credential: Some(bootstrap.api_key().expect("machine API key").clone()),
+        ..wyrd_client::config::ClientConfig::default()
+    })
+    .expect("writer client");
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new(
+            "local_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            "maybe_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("customer", DataType::Utf8, true),
+        Field::new("shard", DataType::Int64, true),
+        Field::new("score", DataType::Float64, true),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let register = |table: String, layout: Option<PhysicalLayoutWire>| {
+        let client = &client;
+        let schema = std::sync::Arc::clone(&schema);
+        async move {
+            let mut config = wyrd_client::bifrost::TableConfig::from_arrow(
+                &format!("vala.datasets.{table}"),
+                schema,
+            )
+            .expect("declared table");
+            if let Some(layout) = layout {
+                config = config.with_layout(layout);
+            }
+            Bifrost::connect_with(
+                client,
+                BifrostOptions {
+                    table: Some(config),
+                    ..BifrostOptions::default()
+                },
+            )
+            .await
+            .expect("the writer connects")
+            .register()
+            .await
+        }
+    };
+    let query = Bifrost::query_only(&client);
+    let part = |column: &str, transform, buckets, width| PartitionFieldWire {
+        buckets,
+        width,
+        ..PartitionFieldWire::new(column, transform)
+    };
+    let composite = PhysicalLayoutWire {
+        time_column: Some("event_time".to_owned()),
+        partition_by: vec![
+            part("event_time", PartitionTransformWire::Hour, None, None),
+            part("customer", PartitionTransformWire::Identity, None, None),
+            part("shard", PartitionTransformWire::Bucket, Some(16), None),
+        ],
+        sort_keys: vec![SortKeyWire {
+            column: "customer".to_owned(),
+            direction: SortDirectionWire::Asc,
+            null_order: NullOrderWire::First,
+        }],
+        bloom_columns: vec!["name".to_owned()],
+    };
+
+    let table = unique_table("composite");
+    assert_eq!(
+        register(table.clone(), Some(composite.clone()))
+            .await
+            .expect("a composite layout registers"),
+        RegisterOutcome::Created
+    );
+    let described = query
+        .describe_table("vala.datasets", &table)
+        .await
+        .expect("describe the composite table")
+        .physical_layout;
+    assert_eq!(
+        described, composite,
+        "describe returns exactly the declared composite layout"
+    );
+    assert_eq!(
+        register(table.clone(), Some(composite.clone()))
+            .await
+            .expect("the same declaration re-registers"),
+        RegisterOutcome::AlreadyExists
+    );
+    let mut changed = composite.clone();
+    changed.partition_by[2] = part("shard", PartitionTransformWire::Truncate, None, Some(10));
+    let mismatch = register(table.clone(), Some(changed))
+        .await
+        .expect_err("a changed declaration never alters the table");
+    assert_eq!(
+        wyrd_spec::error::WyrdError::from(&mismatch).code(),
+        "WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH"
+    );
+    assert_eq!(
+        query
+            .describe_table("vala.datasets", &table)
+            .await
+            .expect("describe after the refused change")
+            .physical_layout,
+        composite,
+        "the refused change left the registered layout unchanged"
+    );
+
+    let defaults = unique_table("default_layout");
+    register(defaults.clone(), None)
+        .await
+        .expect("an omitted layout registers");
+    let default_layout = query
+        .describe_table("vala.datasets", &defaults)
+        .await
+        .expect("describe the default table")
+        .physical_layout;
+    assert_eq!(
+        default_layout.partition_by,
+        vec![PartitionFieldWire::new(
+            "wyrd_ingested_at",
+            PartitionTransformWire::Hour
+        )]
+    );
+    assert!(
+        default_layout.bloom_columns.is_empty(),
+        "the default layout carries no hidden Bloom floor"
+    );
+
+    let with = |edit: &dyn Fn(&mut PhysicalLayoutWire)| {
+        let mut layout = composite.clone();
+        edit(&mut layout);
+        layout
+    };
+    let refusals = [
+        (
+            with(&|layout| layout.time_column = Some("local_time".to_owned())),
+            "TimeColumn/UnsupportedColumn",
+        ),
+        (
+            with(&|layout| {
+                layout.partition_by.push(part(
+                    "name",
+                    PartitionTransformWire::Identity,
+                    None,
+                    None,
+                ));
+            }),
+            "Partition/TooManyKeys",
+        ),
+        (
+            with(&|layout| layout.partition_by[2].buckets = Some(1025)),
+            "PartitionTransform/OutOfRange",
+        ),
+        (
+            with(&|layout| {
+                layout.partition_by[1] =
+                    part("score", PartitionTransformWire::Identity, None, None);
+            }),
+            "Partition/UnsupportedColumn",
+        ),
+        (
+            with(&|layout| layout.time_column = Some("maybe_time".to_owned())),
+            "TimeColumn/UnsupportedColumn",
+        ),
+        (
+            with(&|layout| layout.bloom_columns = vec!["event_time".to_owned()]),
+            "BloomColumn/UnsupportedColumn",
+        ),
+    ];
+    for (layout, expected) in refusals {
+        let refused_table = unique_table("refused_layout");
+        let refused = register(refused_table.clone(), Some(layout))
+            .await
+            .expect_err("an out-of-bounds declaration is refused");
+        assert_eq!(
+            wyrd_spec::error::WyrdError::from(&refused).code(),
+            "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT"
+        );
+        assert!(
+            refused.to_string().contains(expected),
+            "the refusal names {expected}: {refused}"
+        );
+        assert_eq!(
+            register(refused_table, Some(composite.clone()))
+                .await
+                .expect("the refused name registers under a valid layout"),
+            RegisterOutcome::Created,
+            "a refusal leaves no registration behind"
+        );
+    }
+    server.shutdown().await.expect("server shutdown");
+}

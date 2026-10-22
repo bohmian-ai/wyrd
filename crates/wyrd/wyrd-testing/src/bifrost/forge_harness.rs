@@ -1621,7 +1621,10 @@ fn fixture_time_field() -> Field {
 /// the hourly `wyrd_ingested_at` default place rows by arrival.
 fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
     wyrd_spec::vala::api::PhysicalLayoutWire {
-        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+        partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+            FIXTURE_TIME_COLUMN,
+            wyrd_spec::vala::api::PartitionTransformWire::Day,
+        )],
         time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),

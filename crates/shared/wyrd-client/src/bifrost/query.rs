@@ -1967,7 +1967,7 @@ mod tests {
                   "metadata": { "PARQUET:field_id": "1000" } }
             ],
             "canonical_physical_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "physical_layout": { "partition_granularity": "hour" }
+            "physical_layout": { "partition_by": [{ "column": "start_time", "transform": "hour" }] }
         }"#;
         let (base_url, seen) = recording_server(body);
         let described = client_for(&base_url)

@@ -45,9 +45,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuthMethod, NodeId, NullOrderWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-};
+use wyrd_spec::vala::api::{AuthMethod, NodeId, NullOrderWire, SortDirectionWire, SortKeyWire};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass, QueryTerminalOutcome, QueryWarning};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -2736,7 +2734,11 @@ impl FilteringFixture {
             .describe_table("vala.datasets", &self.custom)
             .await?
             .physical_layout;
-        if resolved.partition_granularity != TimeGranularityWire::Hour
+        if resolved.partition_by
+            != [wyrd_spec::vala::api::PartitionFieldWire::new(
+                EVENT_TIME,
+                wyrd_spec::vala::api::PartitionTransformWire::Hour,
+            )]
             || resolved.time_column.as_deref() != Some(EVENT_TIME)
             || resolved.sort_keys != declared_sort
             || !resolved

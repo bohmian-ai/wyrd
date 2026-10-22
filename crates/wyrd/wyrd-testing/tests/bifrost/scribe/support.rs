@@ -10,7 +10,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::geometry::ScribeGeometry;
 use vala_bifrost_redux::scribe::telemetry::{ScribeBucketMemorySnapshot, ScribeInspectionSnapshot};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
+use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
 use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
@@ -106,7 +106,10 @@ pub(super) async fn register_timed_table(
 /// this layout, so a case controls placement only through the value it writes.
 pub(super) fn timed_layout() -> PhysicalLayoutWire {
     PhysicalLayoutWire {
-        partition_granularity: TimeGranularityWire::Hour,
+        partition_by: vec![PartitionFieldWire::new(
+            EVENT_TIME,
+            PartitionTransformWire::Hour,
+        )],
         time_column: Some(EVENT_TIME.to_owned()),
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),

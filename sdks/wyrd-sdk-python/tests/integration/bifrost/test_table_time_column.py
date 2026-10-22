@@ -53,7 +53,10 @@ def _table(name: str, time_column: str | None) -> Bifrost:
 
     return Bifrost(
         TableConfig.from_arrow(
-            f"{NAMESPACE}.{name}", SCHEMA, partition_granularity="hour", time_column=time_column
+            f"{NAMESPACE}.{name}",
+            SCHEMA,
+            partition_by=[{"column": time_column or "wyrd_ingested_at", "transform": "hour"}],
+            time_column=time_column,
         )
     )
 

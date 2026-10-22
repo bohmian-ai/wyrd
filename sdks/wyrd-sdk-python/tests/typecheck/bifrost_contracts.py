@@ -45,7 +45,7 @@ def described_field_types_are_recursive_without_any() -> None:
         "compaction_target_file_size_bytes": 1_073_741_824,
         "compaction_type": "small-files",
         "physical_layout": {
-            "partition_granularity": "Hour",
+            "partition_by": [{"column": "start_time_unix_nano", "transform": "hour"}],
             "time_column": "start_time_unix_nano",
             "sort_keys": [{"column": "trace_id", "direction": "Ascending", "null_order": "Last"}],
             "bloom_columns": ["trace_id"],

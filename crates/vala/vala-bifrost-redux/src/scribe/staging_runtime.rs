@@ -1110,7 +1110,7 @@ mod tests {
     pub(super) fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]))
     }
@@ -1125,9 +1125,12 @@ mod tests {
         let schema = runtime_schema();
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
-                (0..rows).map(|row| row * 2 + i64::from(shard)),
-            ))],
+            vec![Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    (0..rows).map(|row| row * 2 + i64::from(shard)),
+                )
+                .with_timezone("+00:00"),
+            )],
         )
         .expect("fixture member batch");
         let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);

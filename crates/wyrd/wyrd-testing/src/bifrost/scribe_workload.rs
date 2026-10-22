@@ -1131,7 +1131,10 @@ impl crate::WyrdTestServer {
                         tenant,
                         attribution: wyrd_spec::auth::Attribution::unresolved(),
                         physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
-                            partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                            partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+                                WORKLOAD_TIME_COLUMN,
+                                wyrd_spec::vala::api::PartitionTransformWire::Hour,
+                            )],
                             time_column: Some(WORKLOAD_TIME_COLUMN.to_owned()),
                             sort_keys: Vec::new(),
                             bloom_columns: Vec::new(),

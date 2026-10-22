@@ -228,7 +228,7 @@ impl TableConfig {
     /// Declare the physical layout the register call should request.
     ///
     /// Omitted, the server resolves `hour(wyrd_ingested_at)`,
-    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
+    /// `wyrd_ingested_at` descending nulls-last, and no Bloom columns.
     /// A layout's `time_column` names the non-null timestamp column that
     /// partitions the table and leads its default sort order.
     ///

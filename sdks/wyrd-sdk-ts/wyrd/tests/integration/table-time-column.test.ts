@@ -49,7 +49,7 @@ function readings(): RecordBatch {
 function table(name: string, timeColumn?: string): Promise<Bifrost> {
   return Bifrost.connect({
     table: TableConfig.fromArrow(`${NAMESPACE}.${name}`, SCHEMA, {
-      layout: { partitionGranularity: "hour", timeColumn },
+      layout: { partitionBy: [{ column: timeColumn ?? "wyrd_ingested_at", transform: "hour" }], timeColumn },
     }),
   });
 }

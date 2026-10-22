@@ -342,10 +342,10 @@ pub const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
 /// on ingest without changing the instant.
 pub const UTC_TIME_ZONE: &str = "+00:00";
 
-/// Time-partition granularity on the wire.
+/// Time-partition granularity of a private partition identity.
 ///
-/// Bifrost partitions every table on its one time column and admits exactly
-/// these two Iceberg-native transforms; nothing else is representable.
+/// The time component of every partition is exactly one of these two
+/// Iceberg-native transforms of the table's time column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -390,41 +390,101 @@ pub struct SortKeyWire {
     pub null_order: NullOrderWire,
 }
 
+/// Transform one declared partition field applies to its source column.
+///
+/// `hour` and `day` partition the table's required UTC time column; the
+/// `identity`, `bucket`, and `truncate` transforms form at most two additional
+/// dimensions over `Utf8`, `Int32`, or `Int64` columns. Each follows Iceberg's
+/// transform semantics, including null preservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionTransformWire {
+    /// One partition per UTC hour of the time column.
+    Hour,
+    /// One partition per UTC day of the time column.
+    Day,
+    /// One partition per distinct source value, null included.
+    Identity,
+    /// Iceberg's Murmur3 hash bucket of the source value; requires `buckets`.
+    Bucket,
+    /// Iceberg truncation of the source value; requires `width`.
+    Truncate,
+}
+
+/// One declared partition field.
+///
+/// `buckets` is required for and only accepted on a `bucket` transform (2
+/// through 1024); `width` is required for and only accepted on a `truncate`
+/// transform (a positive integer counting Unicode code points for strings).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PartitionFieldWire {
+    /// Top-level source column of the complete physical schema.
+    pub column: String,
+    /// Transform applied to `column`.
+    pub transform: PartitionTransformWire,
+    /// Bucket count of a `bucket` transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    pub buckets: Option<u32>,
+    /// Truncation width of a `truncate` transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    pub width: Option<u32>,
+}
+
+impl PartitionFieldWire {
+    /// Builds one parameterless partition field.
+    #[must_use]
+    pub fn new(column: impl Into<String>, transform: PartitionTransformWire) -> Self {
+        Self {
+            column: column.into(),
+            transform,
+            buckets: None,
+            width: None,
+        }
+    }
+}
+
 /// The authoritative physical layout of one Bifrost table.
 ///
 /// The same shape is used three ways: as the optional declaration on
 /// [`RegisterTableRequest`], as the canonical server-resolved layout returned by
 /// [`BifrostTableDescription`], and as the exact JSON persisted in the control
-/// row. In the latter two it is always fully populated: the sort order carries
-/// at least one key and the Bloom list begins with the schema-present managed
-/// floor.
+/// row. In the latter two it is always fully populated: `time_column` and
+/// `partition_by` are named, the sort order carries at least one key, and the
+/// Bloom list is the complete resolved set, which may be empty.
 ///
-/// Every table is partitioned on exactly one time column: a non-null
-/// microsecond or nanosecond timestamp column of the table's own content,
-/// named by `time_column`, or the managed `wyrd_ingested_at` when the
-/// declaration names none. The column is the source of the table's one
-/// Iceberg `hour` or `day` partition field.
+/// `partition_by` holds at most three fields: exactly one `hour` or `day`
+/// transform of `time_column`, a required UTC microsecond or nanosecond
+/// timestamp, plus at most two `identity`, `bucket`, or `truncate` dimensions.
+/// An omitted or empty list resolves to `hour(time_column)`, and an omitted
+/// `time_column` to `wyrd_ingested_at`.
 ///
 /// On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
 /// resolve identically, because the server injects nothing ahead of a declared
 /// key and defaults an empty order to the time column descending.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct PhysicalLayoutWire {
-    /// Required partition granularity on the time column.
-    pub partition_granularity: TimeGranularityWire,
-    /// The table's time column: a non-null `TIMESTAMP_LTZ` or `TIMESTAMP_NTZ`
-    /// column at microsecond or nanosecond precision.
+    /// The table's time column: a required `TIMESTAMP_LTZ` column at
+    /// microsecond or nanosecond precision.
     ///
     /// Omitted on a request, the time column is `wyrd_ingested_at`. The
     /// canonical form in a description and the control row always names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub time_column: Option<String>,
+    /// Ordered partition fields; at most three may be declared.
+    #[serde(default)]
+    pub partition_by: Vec<PartitionFieldWire>,
     /// Ordered sort keys; at most four may be declared.
     #[serde(default)]
     pub sort_keys: Vec<SortKeyWire>,
-    /// Ordered Bloom-filtered columns.
+    /// Bloom-filtered columns; at most sixteen may be declared.
     #[serde(default)]
     pub bloom_columns: Vec<String>,
 }
@@ -443,10 +503,10 @@ pub struct RegisterTableRequest {
     /// Optional physical layout declaration.
     ///
     /// Omitting the field entirely resolves to `hour(wyrd_ingested_at)`,
-    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
-    /// Supplying the object requires `partition_granularity`; within it, an
-    /// explicit empty `sort_keys` resolves exactly as an omitted one does, and
-    /// an explicit empty `bloom_columns` means "managed floor only".
+    /// `wyrd_ingested_at` descending nulls-last, and no Bloom columns. Within
+    /// a supplied object an empty `partition_by` resolves to
+    /// `hour(time_column)`, and an explicit empty `sort_keys` resolves exactly
+    /// as an omitted one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_layout: Option<PhysicalLayoutWire>,
     /// Optional soft file target Forge compacts this table toward, in bytes.
@@ -2454,9 +2514,9 @@ mod bifrost_wire_tests {
 
     use crate::vala::api::{
         BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
-        NullOrderWire, PARQUET_FIELD_ID_KEY, PhysicalLayoutWire, RegisterOutcome,
-        RegisterTableRequest, RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus,
-        TimeGranularityWire, TimeUnit,
+        NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire, PartitionTransformWire,
+        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+        SortDirectionWire, SortKeyWire, TableStatus, TimeUnit,
     };
     use schemars::schema_for;
 
@@ -2544,8 +2604,8 @@ mod bifrost_wire_tests {
         assert!(!json.contains("physical_layout"), "{json}");
     }
 
-    /// An explicit object carrying only `partition_granularity` decodes with
-    /// empty lists and keeps them through a round trip.
+    /// An explicit object with empty lists decodes and keeps them through a
+    /// round trip.
     ///
     /// The wire distinction between `None` and an explicit object survives; what
     /// the server no longer distinguishes is an empty `sort_keys` from an
@@ -2554,12 +2614,12 @@ mod bifrost_wire_tests {
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(
             r#"{"namespace":"vala.bifrost","name":"events","fields":[],
-                "physical_layout":{"partition_granularity":"hour",
+                "physical_layout":{"partition_by":[],
                 "sort_keys":[],"bloom_columns":[]}}"#,
         )
         .expect("deserialize");
         let layout = req.physical_layout.as_ref().expect("explicit layout");
-        assert_eq!(layout.partition_granularity, TimeGranularityWire::Hour);
+        assert!(layout.partition_by.is_empty());
         assert!(layout.sort_keys.is_empty());
         assert!(layout.bloom_columns.is_empty());
         bifrost_wire_round_trip(&req);
@@ -2638,13 +2698,24 @@ mod bifrost_wire_tests {
         }
     }
 
-    /// No wire field names a partition column any more, so a declaration that
-    /// carries one is rejected rather than silently ignored.
+    /// The layout carries exactly its four canonical keys, and the replaced
+    /// `partition_granularity` spelling or an unknown partition-field key is
+    /// refused rather than silently ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the serialized keys drift or a removed spelling decodes.
     #[test]
-    fn bifrost_wire_physical_layout_has_no_partition_column_field() {
+    fn bifrost_wire_physical_layout_has_one_partition_spelling() {
         let layout = PhysicalLayoutWire {
-            partition_granularity: TimeGranularityWire::Hour,
-            time_column: None,
+            time_column: Some("event_time".to_owned()),
+            partition_by: vec![
+                PartitionFieldWire::new("event_time", PartitionTransformWire::Day),
+                PartitionFieldWire {
+                    buckets: Some(32),
+                    ..PartitionFieldWire::new("customer_id", PartitionTransformWire::Bucket)
+                },
+            ],
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
@@ -2654,8 +2725,26 @@ mod bifrost_wire_tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["bloom_columns", "partition_granularity", "sort_keys"]
+            vec!["bloom_columns", "partition_by", "sort_keys", "time_column"]
         );
+        assert_eq!(
+            json["partition_by"],
+            serde_json::json!([
+                {"column": "event_time", "transform": "day"},
+                {"column": "customer_id", "transform": "bucket", "buckets": 32}
+            ])
+        );
+        bifrost_wire_round_trip(&layout);
+        for refused in [
+            r#"{"partition_granularity":"hour"}"#,
+            r#"{"partition_by":[{"column":"a","transform":"hour","granularity":"hour"}]}"#,
+            r#"{"partition_by":[{"column":"a","transform":"month"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PhysicalLayoutWire>(refused).is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -2742,8 +2831,11 @@ mod bifrost_wire_tests {
             ],
             canonical_physical_fingerprint: None,
             physical_layout: PhysicalLayoutWire {
-                partition_granularity: TimeGranularityWire::Hour,
                 time_column: Some("wyrd_ingested_at".to_string()),
+                partition_by: vec![PartitionFieldWire::new(
+                    "wyrd_ingested_at",
+                    PartitionTransformWire::Hour,
+                )],
                 sort_keys: vec![SortKeyWire {
                     column: "wyrd_ingested_at".to_string(),
                     direction: SortDirectionWire::Desc,
@@ -2766,8 +2858,14 @@ mod bifrost_wire_tests {
             fingerprint: "01".repeat(32),
         });
         bifrost_wire_round_trip(&PhysicalLayoutWire {
-            partition_granularity: TimeGranularityWire::Day,
             time_column: Some("created_at".to_string()),
+            partition_by: vec![
+                PartitionFieldWire::new("created_at", PartitionTransformWire::Day),
+                PartitionFieldWire {
+                    width: Some(4),
+                    ..PartitionFieldWire::new("region", PartitionTransformWire::Truncate)
+                },
+            ],
             sort_keys: vec![SortKeyWire {
                 column: "created_at".to_string(),
                 direction: SortDirectionWire::Desc,

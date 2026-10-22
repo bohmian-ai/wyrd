@@ -446,14 +446,14 @@ mod tests {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
-                0..row_count,
-            ))],
+            vec![Arc::new(
+                TimestampMicrosecondArray::from_iter_values(0..row_count).with_timezone("+00:00"),
+            )],
         )
         .expect("frozen member fixture");
         let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&batch);

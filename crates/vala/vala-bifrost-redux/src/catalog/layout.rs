@@ -25,24 +25,29 @@ use iceberg::spec::{
     SortField, SortOrder, Transform, UnboundPartitionSpec,
 };
 use wyrd_spec::vala::api::{
-    NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-    TimePartitionWire,
+    NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
+    SortDirectionWire, SortKeyWire, TimeGranularityWire, TimePartitionWire,
 };
-use wyrd_spec::vala::managed_columns::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
-};
+use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
-/// Managed Bloom floor, in the stable order every writer must emit it.
+/// Largest number of partition fields one declaration may carry: the one
+/// required time field plus at most two additional dimensions.
 ///
-/// A name is included only when the table's physical schema actually has the
-/// column, so a table without a correlation policy does not claim Blooms it
-/// cannot write.
+/// Every additional dimension multiplies the partitions one hour of data can
+/// occupy, and files never cross a partition boundary, so the contract caps
+/// the declaration instead of letting fanout grow with the field count.
+pub const MAX_PARTITION_FIELDS: usize = 3;
+
+/// Smallest and largest bucket counts a `bucket` partition field may declare.
+pub const BUCKET_COUNT_RANGE: std::ops::RangeInclusive<u32> = 2..=1024;
+
+/// Largest number of Bloom columns one declaration may carry.
 ///
-/// No tenant column exists to Bloom: every tenant owns its own Iceberg
-/// namespace and object prefix, and each file proves its tenant in footer
-/// metadata.
-pub const MANAGED_BLOOM_FLOOR: [&str; 4] = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
+/// Each enabled column initializes its own filter per row group, so the cap
+/// bounds writer memory rather than letting a declaration grow it without
+/// limit.
+pub const MAX_BLOOM_COLUMNS: usize = 16;
 
 /// Largest number of sort keys one declaration may carry.
 ///
@@ -203,47 +208,60 @@ impl TimeAxis {
     /// Derives the time axis a stored or built-in layout declaration names.
     ///
     /// A declaration without `time_column` partitions on `wyrd_ingested_at`,
-    /// the same default [`PhysicalLayout::resolve`] applies, so ingest and
-    /// publication agree on the axis without re-resolving the whole layout.
+    /// and one without a time field partitions hourly — the same defaults
+    /// [`PhysicalLayout::resolve`] applies — so ingest and publication agree on
+    /// the axis without re-resolving the whole layout.
     #[must_use]
     pub fn of_wire(layout: &PhysicalLayoutWire) -> Self {
+        let granularity = layout
+            .partition_by
+            .iter()
+            .find_map(|field| PartitionTransform::from_wire(field).ok()?.granularity())
+            .unwrap_or(TimeGranularity::Hour);
         Self::new(
             layout.time_column.as_deref().unwrap_or(WYRD_INGESTED_AT),
-            TimeGranularity::from_wire(layout.partition_granularity),
+            granularity,
         )
     }
 
-    /// Derives the time axis a published Iceberg table was partitioned on.
+    /// Derives the time axis a published Iceberg table's default partition
+    /// spec partitions on.
     ///
-    /// The table's default partition spec has exactly one field, an `hour` or
-    /// `day` transform of the time column, so the column and granularity are
-    /// read from the table's own metadata rather than restated by a reader.
-    /// Returns `None` when the spec has no such field or its source column is
-    /// absent from the current schema, which a registered table never has.
+    /// Returns `None` when the default spec has no `hour` or `day` field or its
+    /// source column is absent from the current schema, which a registered
+    /// table never has.
     #[must_use]
     pub fn of_iceberg(metadata: &iceberg::spec::TableMetadata) -> Option<Self> {
-        let field = metadata.default_partition_spec().fields().first()?;
-        let granularity = match field.transform {
-            Transform::Hour => TimeGranularity::Hour,
-            Transform::Day => TimeGranularity::Day,
-            _ => return None,
-        };
-        let column = metadata
-            .current_schema()
-            .field_by_id(Self::iceberg_field_id(metadata.default_partition_spec())?)?;
-        Some(Self::new(&column.name, granularity))
+        Self::of_iceberg_spec(metadata.default_partition_spec(), metadata.current_schema())
+    }
+
+    /// Derives the time axis one retained Iceberg partition spec partitions on,
+    /// resolving its source column through `schema` by stable field id.
+    ///
+    /// Returns `None` when the spec has no `hour` or `day` field or `schema`
+    /// has no field with its source id.
+    #[must_use]
+    pub fn of_iceberg_spec(
+        spec: &iceberg::spec::PartitionSpec,
+        schema: &IcebergSchema,
+    ) -> Option<Self> {
+        let (_, field, granularity) = time_partition_field(spec)?;
+        Some(Self::new(
+            &schema.field_by_id(field.source_id)?.name,
+            granularity,
+        ))
     }
 
     /// Returns the field id of the time column a partition spec partitions on.
     ///
-    /// Every Bifrost spec has exactly one field, the time transform, so its
-    /// source is the time column. Reading the id from the spec a file was
-    /// written under, rather than resolving a name against the current schema,
-    /// keeps a file's bounds attached to the column it was partitioned on.
-    /// Returns `None` for a spec with no field.
+    /// Every Bifrost spec has exactly one `hour` or `day` field, the time
+    /// transform, so its source is the time column. Reading the id from the
+    /// spec a file was written under, rather than resolving a name against the
+    /// current schema, keeps a file's bounds attached to the column it was
+    /// partitioned on. Returns `None` for a spec with no time field.
     #[must_use]
     pub fn iceberg_field_id(spec: &iceberg::spec::PartitionSpec) -> Option<i32> {
-        spec.fields().first().map(|field| field.source_id)
+        time_partition_field(spec).map(|(_, field, _)| field.source_id)
     }
 
     /// Borrows the time column name.
@@ -568,23 +586,192 @@ impl LayoutSortKey {
     }
 }
 
+/// Returns the position, field, and granularity of the `hour` or `day` field
+/// of one Iceberg partition spec — the one place a spec's time field is found.
+fn time_partition_field(
+    spec: &iceberg::spec::PartitionSpec,
+) -> Option<(usize, &iceberg::spec::PartitionField, TimeGranularity)> {
+    spec.fields().iter().enumerate().find_map(|(index, field)| {
+        PartitionTransform::from_iceberg(field.transform)?
+            .granularity()
+            .map(|granularity| (index, field, granularity))
+    })
+}
+
+/// Transform one canonical partition field applies to its source column.
+///
+/// `Hour` and `Day` partition the table's required time column; `Identity`,
+/// `Bucket`, and `Truncate` are the additional dimensions, applied with
+/// Iceberg's own transform semantics so a null source stays a null partition
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PartitionTransform {
+    /// One partition per UTC hour of the time column.
+    Hour,
+    /// One partition per UTC day of the time column.
+    Day,
+    /// One partition per distinct source value.
+    Identity,
+    /// Iceberg Murmur3 bucket over this many buckets.
+    Bucket(u32),
+    /// Iceberg truncation at this width.
+    Truncate(u32),
+}
+
+impl PartitionTransform {
+    /// Adopts one declared wire field's transform and parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violation of [`PhysicalLayoutField::PartitionTransform`]
+    /// when a required parameter is absent (`Missing`), a parameter is out of
+    /// range (`OutOfRange`), or a parameter the transform does not take is
+    /// supplied (`UnsupportedValue`).
+    pub fn from_wire(field: &PartitionFieldWire) -> Result<Self, PhysicalLayoutViolation> {
+        let parameterless = |transform| {
+            if field.buckets.is_some() || field.width.is_some() {
+                return Err(PhysicalLayoutViolation::UnsupportedValue);
+            }
+            Ok(transform)
+        };
+        match field.transform {
+            PartitionTransformWire::Hour => parameterless(Self::Hour),
+            PartitionTransformWire::Day => parameterless(Self::Day),
+            PartitionTransformWire::Identity => parameterless(Self::Identity),
+            PartitionTransformWire::Bucket => {
+                if field.width.is_some() {
+                    return Err(PhysicalLayoutViolation::UnsupportedValue);
+                }
+                let buckets = field.buckets.ok_or(PhysicalLayoutViolation::Missing)?;
+                if !BUCKET_COUNT_RANGE.contains(&buckets) {
+                    return Err(PhysicalLayoutViolation::OutOfRange);
+                }
+                Ok(Self::Bucket(buckets))
+            }
+            PartitionTransformWire::Truncate => {
+                if field.buckets.is_some() {
+                    return Err(PhysicalLayoutViolation::UnsupportedValue);
+                }
+                let width = field.width.ok_or(PhysicalLayoutViolation::Missing)?;
+                if width == 0 || i32::try_from(width).is_err() {
+                    return Err(PhysicalLayoutViolation::OutOfRange);
+                }
+                Ok(Self::Truncate(width))
+            }
+        }
+    }
+
+    /// Projects onto one wire field over `column`.
+    #[must_use]
+    pub fn to_wire(self, column: &str) -> PartitionFieldWire {
+        let (transform, buckets, width) = match self {
+            Self::Hour => (PartitionTransformWire::Hour, None, None),
+            Self::Day => (PartitionTransformWire::Day, None, None),
+            Self::Identity => (PartitionTransformWire::Identity, None, None),
+            Self::Bucket(count) => (PartitionTransformWire::Bucket, Some(count), None),
+            Self::Truncate(width) => (PartitionTransformWire::Truncate, None, Some(width)),
+        };
+        PartitionFieldWire {
+            column: column.to_owned(),
+            transform,
+            buckets,
+            width,
+        }
+    }
+
+    /// Returns the time granularity of an `Hour` or `Day` transform, and
+    /// `None` for an additional dimension.
+    #[must_use]
+    pub const fn granularity(self) -> Option<TimeGranularity> {
+        match self {
+            Self::Hour => Some(TimeGranularity::Hour),
+            Self::Day => Some(TimeGranularity::Day),
+            Self::Identity | Self::Bucket(_) | Self::Truncate(_) => None,
+        }
+    }
+
+    /// Maps to the Iceberg transform written into the partition spec.
+    #[must_use]
+    pub const fn to_iceberg(self) -> Transform {
+        match self {
+            Self::Hour => Transform::Hour,
+            Self::Day => Transform::Day,
+            Self::Identity => Transform::Identity,
+            Self::Bucket(count) => Transform::Bucket(count),
+            Self::Truncate(width) => Transform::Truncate(width),
+        }
+    }
+
+    /// Adopts one Iceberg transform this contract can represent, or `None`.
+    #[must_use]
+    pub const fn from_iceberg(transform: Transform) -> Option<Self> {
+        match transform {
+            Transform::Hour => Some(Self::Hour),
+            Transform::Day => Some(Self::Day),
+            Transform::Identity => Some(Self::Identity),
+            Transform::Bucket(count) => Some(Self::Bucket(count)),
+            Transform::Truncate(width) => Some(Self::Truncate(width)),
+            _ => None,
+        }
+    }
+
+    /// Returns the Iceberg partition-field name this transform gives
+    /// `column`, following Iceberg's own naming: the column for `identity`,
+    /// and `{column}_{hour|day|bucket|trunc}` otherwise.
+    #[must_use]
+    pub fn iceberg_field_name(self, column: &str) -> String {
+        match self {
+            Self::Identity => column.to_owned(),
+            Self::Hour => format!("{column}_hour"),
+            Self::Day => format!("{column}_day"),
+            Self::Bucket(_) => format!("{column}_bucket"),
+            Self::Truncate(_) => format!("{column}_trunc"),
+        }
+    }
+}
+
+/// One canonical partition field: a source column and its transform.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LayoutPartitionField {
+    /// Top-level source column; always present in the physical schema.
+    column: String,
+    /// Transform applied to the column.
+    transform: PartitionTransform,
+}
+
+impl LayoutPartitionField {
+    /// Borrows the source column name.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// Returns the transform.
+    #[must_use]
+    pub const fn transform(&self) -> PartitionTransform {
+        self.transform
+    }
+}
+
 /// The canonical, fully resolved physical layout of one table.
 ///
 /// Construct it only through [`PhysicalLayout::resolve`] or
-/// [`PhysicalLayout::from_stored_wire`]; both guarantee a valid time column, a
-/// non-empty sort order, the managed Bloom floor, and schema-validated columns.
+/// [`PhysicalLayout::from_stored_wire`]; both guarantee a valid UTC time
+/// column, a bounded partition list holding exactly one time field, a
+/// non-empty bounded sort order, and a bounded, typed Bloom set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalLayout {
-    /// Granularity of the one time partition.
+    /// Granularity of the one time partition field.
     granularity: TimeGranularity,
-    /// The table's one time column: the source of its partition field, its
-    /// default first sort key, and every tier's time bounds. A non-null
-    /// microsecond or nanosecond timestamp column of the physical schema.
+    /// The table's one time column: the source of its time partition field,
+    /// its default first sort key, and every tier's time bounds. A required
+    /// UTC microsecond or nanosecond timestamp column of the physical schema.
     time_column: String,
+    /// Partition fields in declared order, holding exactly one time field.
+    partition_by: Vec<LayoutPartitionField>,
     /// Canonical sort order, carrying at least one key.
     sort_keys: Vec<LayoutSortKey>,
-    /// Canonical Bloom columns, always beginning with the schema-present managed
-    /// floor.
+    /// The complete resolved Bloom set; empty disables Bloom filters.
     bloom_columns: Vec<String>,
 }
 
@@ -600,16 +787,18 @@ impl PhysicalLayout {
     /// as public error context. `schema` is the complete physical schema,
     /// including managed and correlation columns.
     ///
-    /// An omitted declaration resolves to hourly partitioning on
-    /// `wyrd_ingested_at`, that column descending nulls-last as the sole sort
-    /// key, and the schema-present managed Bloom floor. An omitted
-    /// `time_column` resolves to `wyrd_ingested_at`, and an empty `sort_keys`
-    /// resolves to the time column descending nulls-last, because the system
-    /// injects nothing else of its own.
+    /// An omitted declaration resolves exactly as an empty one: hourly
+    /// partitioning on `wyrd_ingested_at`, that column descending nulls-last as
+    /// the sole sort key, and no Bloom column. Within a declaration an omitted
+    /// `time_column` resolves to `wyrd_ingested_at`, an empty `partition_by` to
+    /// `hour(time_column)`, and an empty `sort_keys` to the time column
+    /// descending nulls-last. The Bloom set is exactly the declared one; the
+    /// system adds no column of its own.
     ///
-    /// Validation precedence matches the public contract: the time column,
-    /// then the sort-key count, then sort keys in request order, then Bloom
-    /// columns in request order. The first fault wins and nothing is mutated.
+    /// Validation precedence: the time column, then partition fields, then
+    /// sort keys, then Bloom columns, each list checked for its count before
+    /// its entries in request order. The first fault wins and nothing is
+    /// mutated.
     ///
     /// # Errors
     /// Returns [`BifrostError::InvalidPhysicalLayout`] naming the exact field,
@@ -619,22 +808,23 @@ impl PhysicalLayout {
         schema: &Schema,
         declared: Option<&PhysicalLayoutWire>,
     ) -> Result<Self, BifrostError> {
-        let Some(declared) = declared else {
-            return Ok(Self {
-                granularity: TimeGranularity::Hour,
-                time_column: WYRD_INGESTED_AT.to_owned(),
-                sort_keys: vec![LayoutSortKey::default_for_time_column(WYRD_INGESTED_AT)],
-                bloom_columns: managed_bloom_floor(schema),
-            });
+        let omitted = PhysicalLayoutWire {
+            time_column: None,
+            partition_by: Vec::new(),
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
         };
-
+        let declared = declared.unwrap_or(&omitted);
         let time_column = canonical_time_column(table, schema, declared.time_column.as_deref())?;
+        let (granularity, partition_by) =
+            canonical_partition_by(table, schema, &time_column, &declared.partition_by)?;
         let sort_keys = canonical_sort_keys(table, schema, &time_column, &declared.sort_keys)?;
         let bloom_columns = canonical_bloom_columns(table, schema, &declared.bloom_columns)?;
 
         Ok(Self {
-            granularity: TimeGranularity::from_wire(declared.partition_granularity),
+            granularity,
             time_column,
+            partition_by,
             sort_keys,
             bloom_columns,
         })
@@ -714,6 +904,20 @@ impl PhysicalLayout {
         TimeAxis::new(&self.time_column, self.granularity)
     }
 
+    /// Borrows the partition fields in declared order, time field included.
+    #[must_use]
+    pub fn partition_by(&self) -> &[LayoutPartitionField] {
+        &self.partition_by
+    }
+
+    /// Iterates the additional partition dimensions in declared order, every
+    /// field except the one time field.
+    pub fn dimensions(&self) -> impl Iterator<Item = &LayoutPartitionField> {
+        self.partition_by
+            .iter()
+            .filter(|field| field.transform.granularity().is_none())
+    }
+
     /// Borrows the canonical sort order.
     #[must_use]
     pub fn sort_keys(&self) -> &[LayoutSortKey] {
@@ -777,8 +981,12 @@ impl PhysicalLayout {
     #[must_use]
     pub fn to_wire(&self) -> PhysicalLayoutWire {
         PhysicalLayoutWire {
-            partition_granularity: self.granularity().to_wire(),
             time_column: Some(self.time_column.clone()),
+            partition_by: self
+                .partition_by
+                .iter()
+                .map(|field| field.transform.to_wire(&field.column))
+                .collect(),
             sort_keys: self
                 .sort_keys
                 .iter()
@@ -798,43 +1006,30 @@ impl PhysicalLayout {
         }
     }
 
-    /// Builds the Iceberg partition spec for this layout.
+    /// Builds the Iceberg partition spec for this layout: one field per
+    /// declared partition field, in declared order, bound by source field id.
     ///
     /// # Errors
-    /// Returns a message when the time column is absent from the Iceberg
-    /// schema or when Iceberg rejects the partition field.
+    /// Returns a message when a source column is absent from the Iceberg
+    /// schema or when Iceberg rejects a partition field.
     pub fn iceberg_partition_spec(
         &self,
         iceberg_schema: &IcebergSchema,
     ) -> Result<UnboundPartitionSpec, String> {
-        let field = iceberg_schema
-            .field_by_name(&self.time_column)
-            .ok_or_else(|| format!("partition column not found: {}", self.time_column))?;
-        Ok(UnboundPartitionSpec::builder()
-            .add_partition_field(
-                field.id,
-                self.iceberg_partition_field_name(),
-                self.iceberg_transform(),
-            )
-            .map_err(|error| error.to_string())?
-            .build())
-    }
-
-    /// Returns the Iceberg partition-field name this layout produces,
-    /// `{time_column}_{hour|day}`, so validation can compare the recorded name
-    /// exactly.
-    #[must_use]
-    pub fn iceberg_partition_field_name(&self) -> String {
-        format!("{}_{}", self.time_column, self.granularity.as_str())
-    }
-
-    /// Returns the Iceberg transform this layout's granularity uses.
-    #[must_use]
-    pub const fn iceberg_transform(&self) -> Transform {
-        match self.granularity() {
-            TimeGranularity::Hour => Transform::Hour,
-            TimeGranularity::Day => Transform::Day,
+        let mut builder = UnboundPartitionSpec::builder();
+        for field in &self.partition_by {
+            let source = iceberg_schema
+                .field_by_name(&field.column)
+                .ok_or_else(|| format!("partition column not found: {}", field.column))?;
+            builder = builder
+                .add_partition_field(
+                    source.id,
+                    field.transform.iceberg_field_name(&field.column),
+                    field.transform.to_iceberg(),
+                )
+                .map_err(|error| error.to_string())?;
         }
+        Ok(builder.build())
     }
 
     /// Builds the Forge sort order for this layout, bound to the physical
@@ -867,15 +1062,6 @@ impl PhysicalLayout {
     }
 }
 
-/// Returns the schema-present managed Bloom floor in its stable order.
-fn managed_bloom_floor(schema: &Schema) -> Vec<String> {
-    MANAGED_BLOOM_FLOOR
-        .iter()
-        .filter(|column| schema.field_with_name(column).is_ok())
-        .map(|column| (*column).to_owned())
-        .collect()
-}
-
 /// Builds one public layout error.
 fn invalid(
     table: &str,
@@ -893,23 +1079,21 @@ fn invalid(
 
 /// Resolves the declared time column, or `wyrd_ingested_at` when none is named.
 ///
-/// A time column must be a non-null column of the physical schema typed as a
-/// microsecond or nanosecond Arrow timestamp, naive (`TIMESTAMP_NTZ`) or zoned
-/// (`TIMESTAMP_LTZ`). `TIMESTAMP_TZ` is a struct and is therefore refused with
-/// every other non-timestamp type.
+/// A time column must be a required column of the physical schema typed as a
+/// zoned (`TIMESTAMP_LTZ`, one UTC instant) microsecond or nanosecond Arrow
+/// timestamp. A naive `TIMESTAMP_NTZ` column names no UTC instant and is
+/// refused, as is `TIMESTAMP_TZ`, a struct, with every other type.
 ///
 /// # Errors
 /// Returns [`BifrostError::InvalidPhysicalLayout`] on
 /// [`PhysicalLayoutField::TimeColumn`] with `UnknownColumn` for an absent
-/// column and `UnsupportedColumn` for a nullable or wrongly typed one.
+/// column and `UnsupportedColumn` for a nullable, naive, or wrongly typed one.
 fn canonical_time_column(
     table: &str,
     schema: &Schema,
     declared: Option<&str>,
 ) -> Result<String, BifrostError> {
-    let Some(column) = declared else {
-        return Ok(WYRD_INGESTED_AT.to_owned());
-    };
+    let column = declared.unwrap_or(WYRD_INGESTED_AT);
     let refuse = |violation| {
         invalid(
             table,
@@ -921,10 +1105,103 @@ fn canonical_time_column(
     let field = schema
         .field_with_name(column)
         .map_err(|_| refuse(PhysicalLayoutViolation::UnknownColumn))?;
-    if TimePrecision::of(field.data_type()).is_none() || field.is_nullable() {
+    let zoned = matches!(field.data_type(), DataType::Timestamp(_, Some(_)));
+    if TimePrecision::of(field.data_type()).is_none() || !zoned || field.is_nullable() {
         return Err(refuse(PhysicalLayoutViolation::UnsupportedColumn));
     }
     Ok(column.to_owned())
+}
+
+/// Canonicalizes declared partition fields in request order.
+///
+/// An empty declaration resolves to `hour(time_column)`. Otherwise the list
+/// holds at most [`MAX_PARTITION_FIELDS`] fields naming each source column
+/// once: exactly one `hour` or `day` field over `time_column`, plus
+/// `identity`, `bucket`, or `truncate` dimensions over top-level `Utf8`,
+/// `Int32`, or `Int64` columns, nullable or not.
+///
+/// # Errors
+/// Returns [`BifrostError::InvalidPhysicalLayout`] on
+/// [`PhysicalLayoutField::Partition`] with `TooManyKeys`, `UnknownColumn`,
+/// `Duplicate`, `UnsupportedColumn` (a time transform off the time column or
+/// a dimension over an ineligible type), or `Missing` (no time field); and on
+/// [`PhysicalLayoutField::PartitionTransform`] for a missing, out-of-range, or
+/// unexpected transform parameter.
+fn canonical_partition_by(
+    table: &str,
+    schema: &Schema,
+    time_column: &str,
+    declared: &[PartitionFieldWire],
+) -> Result<(TimeGranularity, Vec<LayoutPartitionField>), BifrostError> {
+    if declared.is_empty() {
+        let field = LayoutPartitionField {
+            column: time_column.to_owned(),
+            transform: PartitionTransform::Hour,
+        };
+        return Ok((TimeGranularity::Hour, vec![field]));
+    }
+    let refuse =
+        |field, violation, column: &str| invalid(table, field, violation, Some(column.to_owned()));
+    if declared.len() > MAX_PARTITION_FIELDS {
+        return Err(invalid(
+            table,
+            PhysicalLayoutField::Partition,
+            PhysicalLayoutViolation::TooManyKeys,
+            None,
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut granularity = None;
+    let mut fields = Vec::with_capacity(declared.len());
+    for declared_field in declared {
+        let column = declared_field.column.as_str();
+        let source = schema.field_with_name(column).map_err(|_| {
+            refuse(
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::UnknownColumn,
+                column,
+            )
+        })?;
+        if !seen.insert(column) {
+            return Err(refuse(
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::Duplicate,
+                column,
+            ));
+        }
+        let transform = PartitionTransform::from_wire(declared_field).map_err(|violation| {
+            refuse(PhysicalLayoutField::PartitionTransform, violation, column)
+        })?;
+        let eligible = match transform.granularity() {
+            Some(time) => {
+                granularity = Some(time);
+                column == time_column
+            }
+            None => matches!(
+                source.data_type(),
+                DataType::Utf8 | DataType::Int32 | DataType::Int64
+            ),
+        };
+        if !eligible {
+            return Err(refuse(
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::UnsupportedColumn,
+                column,
+            ));
+        }
+        fields.push(LayoutPartitionField {
+            column: column.to_owned(),
+            transform,
+        });
+    }
+    let granularity = granularity.ok_or_else(|| {
+        refuse(
+            PhysicalLayoutField::Partition,
+            PhysicalLayoutViolation::Missing,
+            time_column,
+        )
+    })?;
+    Ok((granularity, fields))
 }
 
 /// Canonicalizes declared sort keys in request order.
@@ -936,14 +1213,16 @@ fn canonical_time_column(
 ///
 /// The count cap is checked before per-key validation so a caller that declared
 /// too many keys learns the shape fault first rather than a fault in the fifth
-/// key. An unknown column is rejected and a repeated column is rejected. An
+/// key. An unknown column, a nested (Variant, list, map, or struct) column,
+/// and a repeated column are rejected. An
 /// empty declaration resolves to `time_column` descending nulls-last, which is
 /// what makes an explicit empty `sort_keys` mean exactly what an omitted one
 /// means.
 ///
 /// # Errors
 /// Returns [`BifrostError::InvalidPhysicalLayout`] with
-/// [`PhysicalLayoutViolation::TooManyKeys`], `UnknownColumn`, or `Duplicate`.
+/// [`PhysicalLayoutViolation::TooManyKeys`], `UnknownColumn`,
+/// `UnsupportedColumn`, or `Duplicate`.
 fn canonical_sort_keys(
     table: &str,
     schema: &Schema,
@@ -961,11 +1240,19 @@ fn canonical_sort_keys(
     let mut seen = BTreeSet::new();
     let mut keys = Vec::with_capacity(declared.len().max(1));
     for key in declared {
-        if schema.field_with_name(&key.column).is_err() {
-            return Err(invalid(
+        let field = schema.field_with_name(&key.column).map_err(|_| {
+            invalid(
                 table,
                 PhysicalLayoutField::SortKey,
                 PhysicalLayoutViolation::UnknownColumn,
+                Some(key.column.clone()),
+            )
+        })?;
+        if field.data_type().is_nested() {
+            return Err(invalid(
+                table,
+                PhysicalLayoutField::SortKey,
+                PhysicalLayoutViolation::UnsupportedColumn,
                 Some(key.column.clone()),
             ));
         }
@@ -997,45 +1284,54 @@ fn canonical_sort_keys(
 
 /// Canonicalizes declared Bloom columns in request order.
 ///
-/// The schema-present managed floor always comes first; a caller naming a floor
-/// column is deduplicated by union rather than rejected. Any other
-/// schema-present column may be added, including a managed column outside the
-/// floor. An unknown column is rejected and a repeated non-floor column is
-/// rejected.
+/// The declared list is the complete set: nothing is added to it, and an empty
+/// list disables Bloom filters. At most [`MAX_BLOOM_COLUMNS`] columns may be
+/// declared, each a schema-present `Utf8`, `Int32`, `Int64`, `Binary`, or
+/// `FixedSizeBinary` column named once. List order carries no meaning beyond
+/// the stored description: each column has its own independent filter.
 ///
 /// # Errors
-/// Returns [`BifrostError::InvalidPhysicalLayout`] with `UnknownColumn` or
-/// `Duplicate`.
+/// Returns [`BifrostError::InvalidPhysicalLayout`] with `TooManyKeys`,
+/// `UnknownColumn`, `UnsupportedColumn`, or `Duplicate`.
 fn canonical_bloom_columns(
     table: &str,
     schema: &Schema,
     declared: &[String],
 ) -> Result<Vec<String>, BifrostError> {
-    let mut columns = managed_bloom_floor(schema);
-    let mut seen: BTreeSet<String> = columns.iter().cloned().collect();
-    for column in declared {
-        if MANAGED_BLOOM_FLOOR.contains(&column.as_str()) {
-            continue;
-        }
-        if schema.field_with_name(column).is_err() {
-            return Err(invalid(
-                table,
-                PhysicalLayoutField::BloomColumn,
-                PhysicalLayoutViolation::UnknownColumn,
-                Some(column.clone()),
-            ));
-        }
-        if !seen.insert(column.clone()) {
-            return Err(invalid(
-                table,
-                PhysicalLayoutField::BloomColumn,
-                PhysicalLayoutViolation::Duplicate,
-                Some(column.clone()),
-            ));
-        }
-        columns.push(column.clone());
+    let refuse = |violation, column: Option<&String>| {
+        invalid(
+            table,
+            PhysicalLayoutField::BloomColumn,
+            violation,
+            column.cloned(),
+        )
+    };
+    if declared.len() > MAX_BLOOM_COLUMNS {
+        return Err(refuse(PhysicalLayoutViolation::TooManyKeys, None));
     }
-    Ok(columns)
+    let mut seen = BTreeSet::new();
+    for column in declared {
+        let field = schema
+            .field_with_name(column)
+            .map_err(|_| refuse(PhysicalLayoutViolation::UnknownColumn, Some(column)))?;
+        if !matches!(
+            field.data_type(),
+            DataType::Utf8
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Binary
+                | DataType::FixedSizeBinary(_)
+        ) {
+            return Err(refuse(
+                PhysicalLayoutViolation::UnsupportedColumn,
+                Some(column),
+            ));
+        }
+        if !seen.insert(column) {
+            return Err(refuse(PhysicalLayoutViolation::Duplicate, Some(column)));
+        }
+    }
+    Ok(declared.to_vec())
 }
 
 /// One exact physical partition: a granularity plus its UTC start boundary.
@@ -1225,6 +1521,28 @@ impl TimePartition {
         Self::new(granularity, start)
     }
 
+    /// Reads the time partition one data file's partition tuple holds under
+    /// the spec it was written with.
+    ///
+    /// The spec supplies the time transform and its position; the tuple
+    /// supplies the transformed value. Returns `None` when the spec has no
+    /// time field or the tuple holds no integer at its position — a file
+    /// Bifrost did not lay out.
+    #[must_use]
+    pub fn of_iceberg_partition(
+        spec: &iceberg::spec::PartitionSpec,
+        partition: &iceberg::spec::Struct,
+    ) -> Option<Self> {
+        let (index, _, granularity) = time_partition_field(spec)?;
+        let Some(Some(iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(
+            value,
+        )))) = partition.fields().get(index)
+        else {
+            return None;
+        };
+        Self::from_iceberg_transform_value(granularity, *value).ok()
+    }
+
     /// Renders the canonical object-path segment pair.
     #[must_use]
     pub fn as_path_components(&self) -> String {
@@ -1312,57 +1630,63 @@ pub enum TimePartitionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        LayoutSortKey, MANAGED_BLOOM_FLOOR, MAX_SORT_KEYS, NullOrder, PhysicalLayout,
-        SortDirection, TimeGranularity,
+        LayoutSortKey, MAX_BLOOM_COLUMNS, MAX_SORT_KEYS, NullOrder, PartitionTransform,
+        PhysicalLayout, SortDirection, TimeGranularity,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::vala::api::{
-        NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
+        NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
+        SortDirectionWire, SortKeyWire,
     };
-    use wyrd_spec::vala::managed_columns::{
-        ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
-    };
+    use wyrd_spec::vala::managed_columns::{RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT};
     use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
     /// Canonical fully-qualified name every case in this module resolves under.
-    const TABLE: &str = "vala.datasets.layout";
+    const TABLE: &str = "bifrost.datasets.layout";
 
-    /// Builds the fixture physical schema: the full managed floor, two user
-    /// columns to declare against, and one candidate time column per accepted
-    /// and refused shape.
+    /// A zoned UTC timestamp at `unit`.
+    fn utc(unit: TimeUnit) -> DataType {
+        DataType::Timestamp(unit, Some("+00:00".into()))
+    }
+
+    /// Builds the fixture physical schema: managed columns, one candidate time
+    /// column per accepted and refused shape, and one column per eligible and
+    /// ineligible partition, sort, and Bloom type.
     fn fixture_schema() -> Schema {
         Schema::new(vec![
-            Field::new(
-                WYRD_INGESTED_AT,
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-                false,
-            ),
-            Field::new(
-                "started_at",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
-                false,
-            ),
+            Field::new(WYRD_INGESTED_AT, utc(TimeUnit::Microsecond), false),
+            Field::new("started_at", utc(TimeUnit::Nanosecond), false),
             Field::new(
                 "local_at",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new(
-                "maybe_at",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                true,
-            ),
+            Field::new("maybe_at", utc(TimeUnit::Microsecond), true),
             Field::new(
                 "seconds_at",
                 DataType::Timestamp(TimeUnit::Second, None),
                 false,
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, true),
-            Field::new(ACT_PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, false),
             Field::new("customer", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
+            Field::new("shard", DataType::Int32, true),
+            Field::new("account", DataType::Int64, false),
+            Field::new("digest", DataType::Binary, true),
+            Field::new("hash", DataType::FixedSizeBinary(16), true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("day", DataType::Date32, true),
+            Field::new(
+                "tags",
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                true,
+            ),
         ])
     }
 
@@ -1375,11 +1699,30 @@ mod tests {
         }
     }
 
-    /// Builds one hourly declaration over the supplied sort and Bloom intent.
-    fn declaration(sort_keys: Vec<SortKeyWire>, bloom_columns: Vec<String>) -> PhysicalLayoutWire {
+    /// Builds one partition field with optional bucket and width parameters.
+    fn part(
+        column: &str,
+        transform: PartitionTransformWire,
+        buckets: Option<u32>,
+        width: Option<u32>,
+    ) -> PartitionFieldWire {
+        PartitionFieldWire {
+            buckets,
+            width,
+            ..PartitionFieldWire::new(column, transform)
+        }
+    }
+
+    /// Builds one declaration over the supplied partition, sort, and Bloom
+    /// intent, with the default time column.
+    fn declaration(
+        partition_by: Vec<PartitionFieldWire>,
+        sort_keys: Vec<SortKeyWire>,
+        bloom_columns: Vec<String>,
+    ) -> PhysicalLayoutWire {
         PhysicalLayoutWire {
-            partition_granularity: TimeGranularityWire::Hour,
             time_column: None,
+            partition_by,
             sort_keys,
             bloom_columns,
         }
@@ -1394,89 +1737,436 @@ mod tests {
             .collect()
     }
 
-    /// Asserts one declaration is refused with the exact public triple.
+    /// Asserts one declaration is refused with the exact public error.
     ///
     /// # Panics
     ///
-    /// Panics when the declaration resolves, or fails with a different field or
-    /// violation than the one named.
+    /// Panics when the declaration resolves, or fails with a different field,
+    /// violation, or column than the one named.
     fn assert_refused(
         schema: &Schema,
         declared: &PhysicalLayoutWire,
-        expected_field: PhysicalLayoutField,
-        expected_violation: PhysicalLayoutViolation,
+        field: PhysicalLayoutField,
+        violation: PhysicalLayoutViolation,
+        column: Option<&str>,
     ) {
         let error = PhysicalLayout::resolve(TABLE, schema, Some(declared))
             .expect_err("declaration must be refused");
-        let BifrostError::InvalidPhysicalLayout {
-            field, violation, ..
-        } = error
-        else {
-            panic!("expected an invalid physical layout, got {error:?}");
-        };
-        assert_eq!(field, expected_field);
-        assert_eq!(violation, expected_violation);
+        assert_eq!(
+            error,
+            BifrostError::InvalidPhysicalLayout {
+                table: TABLE.to_owned(),
+                field,
+                violation,
+                column: column.map(str::to_owned),
+            },
+            "{declared:?}"
+        );
     }
 
-    /// The declarations the single resolution entry point accepts.
+    /// The bounded composite layout matrix the single validator enforces.
     ///
-    /// Covers an omitted declaration, an explicit-empty declaration,
-    /// the time column declared explicitly, managed columns on both lists,
-    /// floor-union dedupe, and the canonical form's fixed point through the
-    /// stored wire.
+    /// Accepts the defaults and every eligible hour/day plus identity, bucket,
+    /// and truncate shape over `Utf8`, `Int32`, and `Int64` sources, nullable
+    /// or not, with the time field at any position; each canonical form is a
+    /// fixed point through the stored wire and builds a bound Iceberg spec.
+    /// Refuses every unsupported type, transform, parameter, count, and
+    /// duplicate with its exact public error, including a nullable, naive, or
+    /// coarse time axis.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an eligible declaration is refused, an ineligible one
+    /// resolves, or any refusal names the wrong field, violation, or column.
+    #[test]
+    fn bounded_composite_layout_validation() {
+        use PartitionTransformWire::{Bucket, Day, Hour, Identity, Truncate};
+        let schema = fixture_schema();
+        let convertible = Schema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "seconds_at")
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let iceberg_schema =
+            crate::tables::iceberg_schema_for(&convertible).expect("fixture has an Iceberg form");
+
+        // An omitted declaration and an explicit empty one resolve identically:
+        // hourly on ingestion time, one descending key, no Bloom column.
+        let omitted =
+            PhysicalLayout::resolve(TABLE, &schema, None).expect("an omitted declaration resolves");
+        let empty = PhysicalLayout::resolve(
+            TABLE,
+            &schema,
+            Some(&declaration(Vec::new(), Vec::new(), Vec::new())),
+        )
+        .expect("an empty declaration resolves");
+        assert_eq!(omitted, empty);
+        assert_eq!(omitted.granularity(), TimeGranularity::Hour);
+        assert_eq!(omitted.time_column(), WYRD_INGESTED_AT);
+        assert_eq!(
+            omitted.to_wire().partition_by,
+            vec![part(WYRD_INGESTED_AT, Hour, None, None)]
+        );
+        assert_eq!(omitted.dimensions().count(), 0);
+        assert_eq!(sort_columns(&omitted), vec![WYRD_INGESTED_AT.to_owned()]);
+        assert!(omitted.bloom_columns().is_empty(), "no hidden Bloom floor");
+
+        // Every eligible composite shape resolves, keeps its declared order, and
+        // is a canonical fixed point that builds an Iceberg spec.
+        let accepted: Vec<(Option<&str>, Vec<PartitionFieldWire>)> = vec![
+            (None, vec![part(WYRD_INGESTED_AT, Day, None, None)]),
+            (
+                Some("started_at"),
+                vec![part("started_at", Hour, None, None)],
+            ),
+            (
+                None,
+                vec![
+                    part(WYRD_INGESTED_AT, Hour, None, None),
+                    part("customer", Identity, None, None),
+                    part("shard", Bucket, Some(2), None),
+                ],
+            ),
+            (
+                None,
+                vec![
+                    part("account", Truncate, None, Some(1)),
+                    part(WYRD_INGESTED_AT, Day, None, None),
+                    part("region", Bucket, Some(1024), None),
+                ],
+            ),
+            (
+                None,
+                vec![
+                    part(WYRD_INGESTED_AT, Hour, None, None),
+                    part("customer", Truncate, None, Some(3)),
+                    part("account", Identity, None, None),
+                ],
+            ),
+            (
+                None,
+                vec![
+                    part(WYRD_INGESTED_AT, Hour, None, None),
+                    part("shard", Identity, None, None),
+                ],
+            ),
+        ];
+        for (time_column, partition_by) in accepted {
+            let declared = PhysicalLayoutWire {
+                time_column: time_column.map(str::to_owned),
+                ..declaration(partition_by.clone(), Vec::new(), Vec::new())
+            };
+            let layout = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
+                .unwrap_or_else(|error| panic!("{partition_by:?} must resolve: {error:?}"));
+            let stored = layout.to_wire();
+            assert_eq!(stored.partition_by, partition_by);
+            assert_eq!(layout.dimensions().count(), partition_by.len() - 1);
+            assert_eq!(
+                PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
+                    .expect("canonical layout re-resolves")
+                    .to_wire(),
+                stored
+            );
+            let spec = layout
+                .iceberg_partition_spec(&iceberg_schema)
+                .expect("the layout binds an Iceberg spec");
+            assert_eq!(spec.fields().len(), partition_by.len());
+            for (field, declared) in spec.fields().iter().zip(&partition_by) {
+                let transform = PartitionTransform::from_wire(declared).expect("valid");
+                assert_eq!(field.transform, transform.to_iceberg());
+                assert_eq!(field.name, transform.iceberg_field_name(&declared.column));
+            }
+        }
+
+        let time = |transform| part(WYRD_INGESTED_AT, transform, None, None);
+        let refused: Vec<(
+            Vec<PartitionFieldWire>,
+            PhysicalLayoutField,
+            PhysicalLayoutViolation,
+            Option<&str>,
+        )> = vec![
+            // Count: a fourth field is refused before any per-field fault.
+            (
+                vec![
+                    time(Hour),
+                    part("customer", Identity, None, None),
+                    part("region", Identity, None, None),
+                    part("absent", Identity, None, None),
+                ],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::TooManyKeys,
+                None,
+            ),
+            // No time field, or a second one.
+            (
+                vec![part("customer", Identity, None, None)],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::Missing,
+                Some(WYRD_INGESTED_AT),
+            ),
+            (
+                vec![time(Hour), time(Day)],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::Duplicate,
+                Some(WYRD_INGESTED_AT),
+            ),
+            // A source column named twice is redundant.
+            (
+                vec![
+                    time(Hour),
+                    part("customer", Identity, None, None),
+                    part("customer", Bucket, Some(8), None),
+                ],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::Duplicate,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("absent", Identity, None, None)],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::UnknownColumn,
+                Some("absent"),
+            ),
+            // A time transform off the time column.
+            (
+                vec![part("started_at", Hour, None, None)],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::UnsupportedColumn,
+                Some("started_at"),
+            ),
+            // A dimension transform over the time column.
+            (
+                vec![part(WYRD_INGESTED_AT, Identity, None, None)],
+                PhysicalLayoutField::Partition,
+                PhysicalLayoutViolation::UnsupportedColumn,
+                Some(WYRD_INGESTED_AT),
+            ),
+            // Bucket parameters.
+            (
+                vec![time(Hour), part("customer", Bucket, None, None)],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::Missing,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("customer", Bucket, Some(1), None)],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::OutOfRange,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("customer", Bucket, Some(1025), None)],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::OutOfRange,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("customer", Bucket, Some(8), Some(2))],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::UnsupportedValue,
+                Some("customer"),
+            ),
+            // Truncate parameters.
+            (
+                vec![time(Hour), part("customer", Truncate, None, None)],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::Missing,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("customer", Truncate, None, Some(0))],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::OutOfRange,
+                Some("customer"),
+            ),
+            (
+                vec![
+                    time(Hour),
+                    part(
+                        "customer",
+                        Truncate,
+                        None,
+                        Some(u32::try_from(i32::MAX).expect("fits") + 1),
+                    ),
+                ],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::OutOfRange,
+                Some("customer"),
+            ),
+            (
+                vec![time(Hour), part("customer", Identity, Some(4), None)],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::UnsupportedValue,
+                Some("customer"),
+            ),
+            (
+                vec![part(WYRD_INGESTED_AT, Day, None, Some(4))],
+                PhysicalLayoutField::PartitionTransform,
+                PhysicalLayoutViolation::UnsupportedValue,
+                Some(WYRD_INGESTED_AT),
+            ),
+        ];
+        let mut refused = refused;
+        // Every ineligible dimension type, under each dimension transform.
+        for column in ["digest", "hash", "score", "flag", "day", "tags", "local_at"] {
+            for (transform, buckets, width) in [
+                (Identity, None, None),
+                (Bucket, Some(4), None),
+                (Truncate, None, Some(4)),
+            ] {
+                refused.push((
+                    vec![time(Hour), part(column, transform, buckets, width)],
+                    PhysicalLayoutField::Partition,
+                    PhysicalLayoutViolation::UnsupportedColumn,
+                    Some(column),
+                ));
+            }
+        }
+        for (partition_by, field, violation, column) in refused {
+            assert_refused(
+                &schema,
+                &declaration(partition_by, Vec::new(), Vec::new()),
+                field,
+                violation,
+                column,
+            );
+        }
+
+        // The time axis must be a required, zoned microsecond or nanosecond
+        // timestamp.
+        for (column, violation) in [
+            ("absent", PhysicalLayoutViolation::UnknownColumn),
+            ("maybe_at", PhysicalLayoutViolation::UnsupportedColumn),
+            ("local_at", PhysicalLayoutViolation::UnsupportedColumn),
+            ("seconds_at", PhysicalLayoutViolation::UnsupportedColumn),
+            ("customer", PhysicalLayoutViolation::UnsupportedColumn),
+        ] {
+            assert_refused(
+                &schema,
+                &PhysicalLayoutWire {
+                    time_column: Some(column.to_owned()),
+                    ..declaration(Vec::new(), Vec::new(), Vec::new())
+                },
+                PhysicalLayoutField::TimeColumn,
+                violation,
+                Some(column),
+            );
+        }
+
+        // Bloom: exactly the eligible types, at most sixteen, each once, kept
+        // in request order with nothing added.
+        let blooms = ["customer", "shard", "account", "digest", "hash"]
+            .map(str::to_owned)
+            .to_vec();
+        let resolved = PhysicalLayout::resolve(
+            TABLE,
+            &schema,
+            Some(&declaration(Vec::new(), Vec::new(), blooms.clone())),
+        )
+        .expect("every eligible Bloom type resolves");
+        assert_eq!(resolved.bloom_columns(), blooms.as_slice());
+        let too_many = (0..=MAX_BLOOM_COLUMNS)
+            .map(|index| format!("c{index}"))
+            .collect();
+        assert_refused(
+            &schema,
+            &declaration(Vec::new(), Vec::new(), too_many),
+            PhysicalLayoutField::BloomColumn,
+            PhysicalLayoutViolation::TooManyKeys,
+            None,
+        );
+        for column in ["score", "flag", "day", "tags", WYRD_INGESTED_AT] {
+            assert_refused(
+                &schema,
+                &declaration(Vec::new(), Vec::new(), vec![column.to_owned()]),
+                PhysicalLayoutField::BloomColumn,
+                PhysicalLayoutViolation::UnsupportedColumn,
+                Some(column),
+            );
+        }
+        for (blooms, violation, column) in [
+            (
+                vec!["absent"],
+                PhysicalLayoutViolation::UnknownColumn,
+                "absent",
+            ),
+            (
+                vec!["customer", "customer"],
+                PhysicalLayoutViolation::Duplicate,
+                "customer",
+            ),
+        ] {
+            assert_refused(
+                &schema,
+                &declaration(
+                    Vec::new(),
+                    Vec::new(),
+                    blooms.into_iter().map(str::to_owned).collect(),
+                ),
+                PhysicalLayoutField::BloomColumn,
+                violation,
+                Some(column),
+            );
+        }
+
+        // Sort: scalar sources only, at most four, each once.
+        assert_refused(
+            &schema,
+            &declaration(Vec::new(), vec![asc("tags")], Vec::new()),
+            PhysicalLayoutField::SortKey,
+            PhysicalLayoutViolation::UnsupportedColumn,
+            Some("tags"),
+        );
+        assert!(
+            PhysicalLayout::resolve(
+                TABLE,
+                &schema,
+                Some(&declaration(
+                    Vec::new(),
+                    vec![asc("score"), asc("flag"), asc("day"), asc("digest")],
+                    Vec::new()
+                )),
+            )
+            .is_ok(),
+            "every scalar type is an eligible sort source"
+        );
+    }
+
+    /// The declarations the single resolution entry point accepts for the sort
+    /// order: the time column declared explicitly replaces the default, managed
+    /// columns are legal, and nothing is prepended.
     #[test]
     fn canonical_layout_accepts_declared_shapes() {
         let schema = fixture_schema();
-
-        // An omitted declaration resolves to hourly, one ingestion-time key,
-        // and the schema-present managed floor.
-        let omitted =
-            PhysicalLayout::resolve(TABLE, &schema, None).expect("an omitted declaration resolves");
-        assert_eq!(omitted.granularity(), TimeGranularity::Hour);
-        assert_eq!(omitted.time_column(), WYRD_INGESTED_AT);
-        assert_eq!(sort_columns(&omitted), vec![WYRD_INGESTED_AT.to_owned()]);
-        assert!(omitted.sort_keys()[0].is_descending());
-        assert!(!omitted.sort_keys()[0].nulls_first());
-        assert_eq!(
-            omitted.bloom_columns(),
-            MANAGED_BLOOM_FLOOR
-                .iter()
-                .map(|column| (*column).to_owned())
-                .collect::<Vec<_>>()
-                .as_slice()
-        );
-
-        // An explicit empty declaration means exactly what omission means,
-        // because the system injects nothing of its own.
-        let explicit_empty =
-            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(Vec::new(), Vec::new())))
-                .expect("an explicit empty declaration resolves");
-        assert_eq!(explicit_empty.sort_keys(), omitted.sort_keys());
-        assert_eq!(explicit_empty.bloom_columns(), omitted.bloom_columns());
-
-        // Naming the time column is legal and replaces the default rather than
-        // duplicating or erroring.
         let named = PhysicalLayout::resolve(
             TABLE,
             &schema,
-            Some(&declaration(vec![asc(WYRD_INGESTED_AT)], Vec::new())),
+            Some(&declaration(
+                Vec::new(),
+                vec![asc(WYRD_INGESTED_AT)],
+                Vec::new(),
+            )),
         )
         .expect("the time column is a legal declared sort key");
-        assert_eq!(sort_columns(&named), vec![WYRD_INGESTED_AT.to_owned()]);
         assert_eq!(
-            named.sort_keys()[0],
-            LayoutSortKey::new(WYRD_INGESTED_AT, SortDirection::Asc, NullOrder::Last),
+            named.sort_keys(),
+            [LayoutSortKey::new(
+                WYRD_INGESTED_AT,
+                SortDirection::Asc,
+                NullOrder::Last
+            )],
             "the declaration replaces the descending default"
         );
-
-        // Every other managed column is legal too: nothing is stripped, and
-        // nothing is prepended.
         let managed = PhysicalLayout::resolve(
             TABLE,
             &schema,
             Some(&declaration(
+                Vec::new(),
                 vec![asc(RUN_ID), asc("customer")],
-                vec![CARD_UID.to_owned(), "region".to_owned()],
+                vec![RUN_ID.to_owned(), "region".to_owned()],
             )),
         )
         .expect("managed columns are legal sort and Bloom columns");
@@ -1484,191 +2174,89 @@ mod tests {
             sort_columns(&managed),
             vec![RUN_ID.to_owned(), "customer".to_owned()]
         );
-
-        // Floor columns dedupe by union rather than erroring, and the declared
-        // additions keep their request order behind the floor.
-        assert_eq!(
-            managed.bloom_columns(),
-            [
-                RUN_ID,
-                CARD_UID,
-                SUB_PRINCIPAL_ID,
-                ACT_PRINCIPAL_ID,
-                "region"
-            ]
-            .iter()
-            .map(|column| (*column).to_owned())
-            .collect::<Vec<_>>()
-            .as_slice()
-        );
-
-        // The canonical form is a fixed point, and the wire it projects carries
-        // the granularity directly.
-        let stored = managed.to_wire();
-        assert_eq!(stored.partition_granularity, TimeGranularityWire::Hour);
-        assert_eq!(
-            PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
-                .expect("a canonical layout re-resolves to itself")
-                .to_wire(),
-            stored
-        );
+        assert_eq!(managed.bloom_columns(), [RUN_ID, "region"]);
     }
 
-    /// The shape and column faults the resolution entry point refuses.
-    ///
-    /// Covers the sort-key cap winning over a per-key column fault, and unknown
-    /// and duplicate columns on both the sort-key and Bloom lists.
+    /// The sort-key cap admits exactly `MAX_SORT_KEYS` and refuses the next
+    /// one before any per-key validation; unknown and duplicate keys stay
+    /// refused.
     #[test]
     fn canonical_layout_refuses_shape_and_column_faults() {
         let schema = fixture_schema();
-
-        // The cap admits exactly MAX_SORT_KEYS and refuses the next one before
-        // any per-key validation, so the shape fault wins over a column fault.
         let four = vec![
             asc(WYRD_INGESTED_AT),
             asc(RUN_ID),
-            asc(CARD_UID),
+            asc("region"),
             asc("customer"),
         ];
         assert_eq!(four.len(), MAX_SORT_KEYS);
         assert!(
-            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(four.clone(), Vec::new())))
-                .is_ok(),
+            PhysicalLayout::resolve(
+                TABLE,
+                &schema,
+                Some(&declaration(Vec::new(), four.clone(), Vec::new()))
+            )
+            .is_ok(),
             "four declared keys are admitted"
         );
         let mut five = four;
         five.push(asc("absent"));
         assert_refused(
             &schema,
-            &declaration(five, Vec::new()),
+            &declaration(Vec::new(), five, Vec::new()),
             PhysicalLayoutField::SortKey,
             PhysicalLayoutViolation::TooManyKeys,
+            None,
         );
-
-        // Unknown and duplicate columns stay refused on both lists.
         assert_refused(
             &schema,
-            &declaration(vec![asc("absent")], Vec::new()),
+            &declaration(Vec::new(), vec![asc("absent")], Vec::new()),
             PhysicalLayoutField::SortKey,
             PhysicalLayoutViolation::UnknownColumn,
-        );
-        assert_refused(
-            &schema,
-            &declaration(vec![asc("customer"), asc("customer")], Vec::new()),
-            PhysicalLayoutField::SortKey,
-            PhysicalLayoutViolation::Duplicate,
-        );
-        assert_refused(
-            &schema,
-            &declaration(Vec::new(), vec!["absent".to_owned()]),
-            PhysicalLayoutField::BloomColumn,
-            PhysicalLayoutViolation::UnknownColumn,
+            Some("absent"),
         );
         assert_refused(
             &schema,
             &declaration(
                 Vec::new(),
-                vec!["customer".to_owned(), "customer".to_owned()],
+                vec![asc("customer"), asc("customer")],
+                Vec::new(),
             ),
-            PhysicalLayoutField::BloomColumn,
+            PhysicalLayoutField::SortKey,
             PhysicalLayoutViolation::Duplicate,
+            Some("customer"),
         );
     }
 
-    /// A schema missing a floor column claims no Bloom it cannot write, and the
-    /// floor's stable order survives the filter.
-    #[test]
-    fn managed_bloom_floor_is_filtered_to_schema_present_columns() {
-        let schema = Schema::new(vec![
-            Field::new(
-                WYRD_INGESTED_AT,
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, true),
-        ]);
-        let resolved = PhysicalLayout::resolve(TABLE, &schema, None)
-            .expect("a narrow schema resolves under the default");
-        assert_eq!(resolved.bloom_columns(), [SUB_PRINCIPAL_ID.to_owned()]);
-    }
-
-    /// A declared time column is the source of the one Iceberg partition field
-    /// and the default first sort key, at either timestamp precision and zone,
-    /// and the canonical wire names it so a repeat registration compares it.
+    /// A declared time column is the source of the time partition field and
+    /// the default first sort key, at either precision, and the canonical wire
+    /// names it so a repeat registration compares it.
     #[test]
     fn time_column_drives_partition_and_sort() {
         let schema = fixture_schema();
-        for (column, granularity) in [
-            ("started_at", TimeGranularityWire::Hour),
-            ("local_at", TimeGranularityWire::Day),
-        ] {
-            let declared = PhysicalLayoutWire {
-                partition_granularity: granularity,
-                time_column: Some(column.to_owned()),
-                sort_keys: Vec::new(),
-                bloom_columns: Vec::new(),
-            };
-            let layout = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
-                .expect("a non-null timestamp column is a legal time column");
-            assert_eq!(layout.time_column(), column);
-            assert_eq!(
-                layout.sort_keys(),
-                [LayoutSortKey::new(
-                    column,
-                    SortDirection::Desc,
-                    NullOrder::Last
-                )]
-            );
-            assert_eq!(
-                layout.iceberg_partition_field_name(),
-                format!("{column}_{}", layout.granularity().as_str())
-            );
-            let stored = layout.to_wire();
-            assert_eq!(stored.time_column.as_deref(), Some(column));
-            assert_eq!(
-                PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
-                    .expect("a canonical layout re-resolves to itself"),
-                layout
-            );
-        }
-        let ingested =
-            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(Vec::new(), Vec::new())))
-                .expect("an omitted time column resolves");
-        assert_eq!(ingested.time_column(), WYRD_INGESTED_AT);
+        let declared = PhysicalLayoutWire {
+            time_column: Some("started_at".to_owned()),
+            ..declaration(Vec::new(), Vec::new(), Vec::new())
+        };
+        let layout = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
+            .expect("a required zoned timestamp column is a legal time column");
+        assert_eq!(layout.time_column(), "started_at");
+        assert_eq!(layout.time_axis().column(), "started_at");
         assert_eq!(
-            ingested.iceberg_partition_field_name(),
-            "wyrd_ingested_at_hour"
+            layout.sort_keys(),
+            [LayoutSortKey::new(
+                "started_at",
+                SortDirection::Desc,
+                NullOrder::Last
+            )]
         );
-    }
-
-    /// An absent, nullable, coarse, or non-timestamp time column is refused
-    /// naming the `time_column` field and the offending column.
-    #[test]
-    fn invalid_time_column_is_refused_naming_the_field() {
-        let schema = fixture_schema();
-        for (column, expected) in [
-            ("absent", PhysicalLayoutViolation::UnknownColumn),
-            ("maybe_at", PhysicalLayoutViolation::UnsupportedColumn),
-            ("seconds_at", PhysicalLayoutViolation::UnsupportedColumn),
-            ("customer", PhysicalLayoutViolation::UnsupportedColumn),
-        ] {
-            let declared = PhysicalLayoutWire {
-                time_column: Some(column.to_owned()),
-                ..declaration(Vec::new(), Vec::new())
-            };
-            let error = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
-                .expect_err("an invalid time column is refused");
-            assert_eq!(
-                error,
-                BifrostError::InvalidPhysicalLayout {
-                    table: TABLE.to_owned(),
-                    field: PhysicalLayoutField::TimeColumn,
-                    violation: expected,
-                    column: Some(column.to_owned()),
-                },
-                "{column}"
-            );
-        }
+        let stored = layout.to_wire();
+        assert_eq!(stored.time_column.as_deref(), Some("started_at"));
+        assert_eq!(
+            stored.partition_by,
+            vec![part("started_at", PartitionTransformWire::Hour, None, None)]
+        );
+        assert_eq!(super::TimeAxis::of_wire(&stored), layout.time_axis());
     }
 
     /// Nanosecond instants narrow to a microsecond interval that contains

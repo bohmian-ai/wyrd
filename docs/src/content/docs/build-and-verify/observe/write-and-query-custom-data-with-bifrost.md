@@ -87,7 +87,7 @@ console.log(await bifrost.register()); // "created" or "already_exists"
 
 Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, and names starting with `wyrd_` are reserved.
 
-By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null timestamp:
+By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null UTC timestamp:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -101,12 +101,12 @@ TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes", time_column="closed_
 
 ```rust
 // The layout type is not re-exported from wyrd_ai yet; add wyrd-spec as a dependency.
-use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 
 let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?
     .with_layout(PhysicalLayoutWire {
-        partition_granularity: TimeGranularityWire::Day,
         time_column: Some("closed_at".into()),
+        partition_by: vec![],
         sort_keys: vec![],
         bloom_columns: vec![],
     });

@@ -1168,6 +1168,7 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::tables::DomainTable as _;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use wyrd_spec::vala::api::PhysicalLayoutWire;
 
     /// Builds one assembly key for the staged-namespace fixtures.
     ///
@@ -1178,10 +1179,16 @@ mod tests {
     fn fixture_key() -> ScribeAssemblyKey {
         let schema = Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]);
-        let layout = PhysicalLayout::resolve("vala.bifrost.events", &schema, None)
+        let declared = PhysicalLayoutWire {
+            time_column: Some("event_time".to_owned()),
+            partition_by: Vec::new(),
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        };
+        let layout = PhysicalLayout::resolve("vala.bifrost.events", &schema, Some(&declared))
             .expect("fixture layout resolves");
         ScribeAssemblyKey::new(
             DataTenantId::new_v7(),

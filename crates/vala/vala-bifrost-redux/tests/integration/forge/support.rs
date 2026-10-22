@@ -3008,8 +3008,11 @@ async fn create_table(
             tenant,
             attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
-                partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
                 time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
+                partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+                    FIXTURE_TIME_COLUMN,
+                    wyrd_spec::vala::api::PartitionTransformWire::Day,
+                )],
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),

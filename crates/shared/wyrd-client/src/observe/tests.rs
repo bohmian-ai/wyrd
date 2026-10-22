@@ -193,7 +193,10 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
         ],
         canonical_physical_fingerprint: None,
         physical_layout: wyrd_spec::vala::api::PhysicalLayoutWire {
-            partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+            partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+                "wyrd_ingested_at",
+                wyrd_spec::vala::api::PartitionTransformWire::Day,
+            )],
             time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),

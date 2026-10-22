@@ -17,9 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iceberg::spec::{
-    DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
-};
+use iceberg::spec::{DataContentType, DataFile, PartitionSpec};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +29,7 @@ use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::managed::RewriteHandoff;
 use super::managed::fingerprint::ForgeRewriteEvidence;
-use crate::catalog::layout::{TimeGranularity, TimePartition};
+use crate::catalog::layout::TimePartition;
 
 /// Value of `forge.workflow` every rewrite snapshot carries.
 ///
@@ -1129,44 +1127,6 @@ pub(super) enum RewriteSubmission {
     AcceptanceUnknown(ForgeError),
 }
 
-/// Derives the exact time partition one live file belongs to.
-///
-/// The partition value is read off the file itself rather than out of
-/// `vala.file_list`, and that difference is load-bearing: the outputs of a
-/// previous rewrite have no `file_list` row, so a `file_list`-derived partition
-/// would make every already-rewritten file permanently unselectable. The table
-/// spec supplies the transform and the data file supplies the transformed
-/// value, both of which travel with every file forever.
-///
-/// Returns `None` when the spec carries no day or hour transform, or when the
-/// file's partition tuple does not hold an integer at that position — a table
-/// Bifrost did not lay out, which Forge declines to rewrite rather than guess
-/// a partition for.
-pub(super) fn rewrite_time_partition(
-    spec: &PartitionSpec,
-    partition: &Struct,
-) -> Option<TimePartition> {
-    let (index, granularity) = spec
-        .fields()
-        .iter()
-        .enumerate()
-        .find_map(|(index, field)| match field.transform {
-            Transform::Day => Some((index, TimeGranularity::Day)),
-            Transform::Hour => Some((index, TimeGranularity::Hour)),
-            _ => None,
-        })?;
-    let Some(Some(Literal::Primitive(PrimitiveLiteral::Int(value)))) =
-        partition.fields().get(index)
-    else {
-        return None;
-    };
-    let seconds = i64::from(*value).checked_mul(match granularity {
-        TimeGranularity::Day => 86_400,
-        TimeGranularity::Hour => 3_600,
-    })?;
-    TimePartition::new(granularity, chrono::DateTime::from_timestamp(seconds, 0)?).ok()
-}
-
 /// Derives the single time partition one publication belongs to.
 ///
 /// The audit row for a rewrite names one partition, and so does the group fence
@@ -1187,14 +1147,15 @@ pub(super) fn rewrite_group_partition<'file>(
 ) -> Result<TimePartition, ForgeError> {
     let mut partitions = BTreeMap::new();
     for file in files {
-        let partition = rewrite_time_partition(spec, file.partition()).ok_or_else(|| {
-            ForgeError::Reconciliation {
-                detail: format!(
-                    "rewrite file {} carries no derivable Bifrost time partition",
-                    file.file_path()
-                ),
-            }
-        })?;
+        let partition =
+            TimePartition::of_iceberg_partition(spec, file.partition()).ok_or_else(|| {
+                ForgeError::Reconciliation {
+                    detail: format!(
+                        "rewrite file {} carries no derivable Bifrost time partition",
+                        file.file_path()
+                    ),
+                }
+            })?;
         partitions.insert(
             (partition.granularity_str(), partition.start_utc()),
             partition,

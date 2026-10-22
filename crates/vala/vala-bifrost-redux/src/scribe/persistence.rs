@@ -3195,7 +3195,7 @@ mod tests {
                     "event_time",
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
-                        None,
+                        Some("+00:00".into()),
                     ),
                     false,
                 ),
@@ -3262,9 +3262,12 @@ mod tests {
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
-                        Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                            1_767_225_600_000_000_i64,
-                        ])),
+                        Arc::new(
+                            arrow::array::TimestampMicrosecondArray::from(vec![
+                                1_767_225_600_000_000_i64,
+                            ])
+                            .with_timezone("+00:00"),
+                        ),
                         Arc::new(arrow::array::Int64Array::from(vec![1_i64])),
                     ],
                 )

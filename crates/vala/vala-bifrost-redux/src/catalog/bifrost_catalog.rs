@@ -1214,25 +1214,37 @@ impl BifrostCatalog {
             )));
         }
         let schema = table.metadata().current_schema();
-        let partition_source_id = schema
-            .field_by_name(layout.time_column())
-            .map(|field| field.id)
+        let expected_partition_fields = layout
+            .partition_by()
+            .iter()
+            .map(|field| {
+                schema.field_by_name(field.column()).map(|source| {
+                    (
+                        source.id,
+                        field.transform().iceberg_field_name(field.column()),
+                        field.transform().to_iceberg(),
+                    )
+                })
+            })
+            .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
-                BifrostCatalogError::MetadataMismatch(format!(
-                    "physical schema lacks partition column {}",
-                    layout.time_column()
-                ))
+                BifrostCatalogError::MetadataMismatch(
+                    "physical schema lacks a partition source column".to_owned(),
+                )
             })?;
-        let expected_partition_name = layout.iceberg_partition_field_name();
         let fields = table.metadata().default_partition_spec().fields();
-        if fields.len() != 1
-            || fields[0].source_id != partition_source_id
-            || fields[0].name != expected_partition_name
-            || fields[0].transform != layout.iceberg_transform()
+        if fields.len() != expected_partition_fields.len()
+            || fields.iter().zip(&expected_partition_fields).any(
+                |(field, (source_id, name, transform))| {
+                    field.source_id != *source_id
+                        || &field.name != name
+                        || field.transform != *transform
+                },
+            )
         {
-            return Err(BifrostCatalogError::MetadataMismatch(format!(
-                "physical table partition spec mismatch: expected one {expected_partition_name} field"
-            )));
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "physical table partition spec mismatch".to_owned(),
+            ));
         }
         let expected_sort_fields = layout
             .sort_keys()

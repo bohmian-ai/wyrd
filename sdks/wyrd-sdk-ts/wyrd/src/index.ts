@@ -42,6 +42,7 @@ import type {
   ModelRef,
   OperatorConnectionStatus,
   OperatorConnectionView,
+  PartitionFieldWire as PartitionField,
   PhysicalLayoutWire as PhysicalLayout,
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
@@ -172,6 +173,7 @@ export type {
   ModelRef,
   OperatorConnectionStatus,
   OperatorConnectionView,
+  PartitionField,
   PhysicalLayout,
   PrincipalKind,
   PrincipalPage,
@@ -526,14 +528,18 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
 /**
  * The physical layout a table asks the server to create.
  *
- * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
- * so a layout read back from the server can be declared again unchanged.
- * `timeColumn` names the non-null timestamp column that partitions the table
- * and leads its default sort order; omitted, it is `wyrd_ingested_at`. Any
- * instant is accepted.
+ * Partition fields and sort keys reuse {@link PartitionField} and
+ * {@link SortKey} — the shapes the describe route returns — so a layout read
+ * back from the server can be declared again unchanged. `partitionBy` holds
+ * one `hour` or `day` field on the time column plus at most two `identity`,
+ * `bucket`, or `truncate` dimensions; omitted or empty, the table partitions
+ * hourly on the time column. `timeColumn` names the non-null UTC timestamp
+ * column that partitions the table and leads its default sort order; omitted,
+ * it is `wyrd_ingested_at`. Any instant is accepted. `bloomColumns` is the
+ * complete Bloom-filtered set; omitted or empty, no column is filtered.
  */
 export interface TableLayout {
-  partitionGranularity?: PhysicalLayout["partition_granularity"];
+  partitionBy?: readonly PartitionField[];
   timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
@@ -564,7 +570,7 @@ function layoutJson(layout?: TableLayout): string | undefined {
     return undefined;
   }
   return JSON.stringify({
-    partition_granularity: layout.partitionGranularity ?? "hour",
+    partition_by: layout.partitionBy ?? [],
     time_column: layout.timeColumn,
     sort_keys: layout.sortKeys ?? [],
     bloom_columns: layout.bloomColumns ?? [],

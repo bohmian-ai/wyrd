@@ -48,7 +48,7 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
 
 use crate::catalog::TableRef;
-use crate::catalog::layout::{PhysicalLayout, TimePartition};
+use crate::catalog::layout::{PartitionTransform, PhysicalLayout, TimePartition};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
 
@@ -219,6 +219,20 @@ fn layout_fingerprint(layout: &PhysicalLayout) -> [u8; 32] {
     let wire = layout.to_wire();
     let mut hasher = Sha256::new();
     hasher.update([layout.granularity().tag()]);
+    hasher.update((layout.partition_by().len() as u64).to_be_bytes());
+    for field in layout.partition_by() {
+        hasher.update((field.column().len() as u64).to_be_bytes());
+        hasher.update(field.column().as_bytes());
+        let (tag, parameter) = match field.transform() {
+            PartitionTransform::Hour => (1, 0),
+            PartitionTransform::Day => (2, 0),
+            PartitionTransform::Identity => (3, 0),
+            PartitionTransform::Bucket(count) => (4, count),
+            PartitionTransform::Truncate(width) => (5, width),
+        };
+        hasher.update([tag]);
+        hasher.update(parameter.to_be_bytes());
+    }
     hasher.update((wire.sort_keys.len() as u64).to_be_bytes());
     for key in &wire.sort_keys {
         hasher.update((key.column.len() as u64).to_be_bytes());
@@ -1205,13 +1219,15 @@ mod tests {
     use crate::catalog::layout::TimeGranularity;
     use crate::namespaces::BifrostNamespace;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
+    use wyrd_spec::vala::api::{
+        PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire, TimeGranularityWire,
+    };
 
     /// Builds the physical schema every fixture layout resolves against.
     fn fixture_schema() -> Schema {
         Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )])
     }
@@ -1224,13 +1240,24 @@ mod tests {
     /// fixture bug rather than assembler behavior.
     fn layout(granularity: Option<TimeGranularityWire>) -> PhysicalLayout {
         let schema = fixture_schema();
-        let declared = granularity.map(|partition_granularity| PhysicalLayoutWire {
-            partition_granularity,
+        let declared = PhysicalLayoutWire {
             time_column: Some("event_time".to_owned()),
+            partition_by: granularity
+                .map(|granularity| {
+                    PartitionFieldWire::new(
+                        "event_time",
+                        match granularity {
+                            TimeGranularityWire::Hour => PartitionTransformWire::Hour,
+                            TimeGranularityWire::Day => PartitionTransformWire::Day,
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
-        });
-        PhysicalLayout::resolve("vala.bifrost.events", &schema, declared.as_ref())
+        };
+        PhysicalLayout::resolve("vala.bifrost.events", &schema, Some(&declared))
             .expect("fixture layout resolves")
     }
 

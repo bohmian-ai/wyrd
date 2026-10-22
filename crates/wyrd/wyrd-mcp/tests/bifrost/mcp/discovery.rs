@@ -479,8 +479,12 @@ mod pg_tests {
         );
         let layout = &described["physical_layout"];
         assert!(
-            layout["partition_granularity"].is_string(),
-            "the event-time partition granularity is described: {layout}"
+            layout["partition_by"]
+                .as_array()
+                .is_some_and(|fields| fields
+                    .iter()
+                    .any(|field| matches!(field["transform"].as_str(), Some("hour" | "day")))),
+            "the event-time partition transform is described: {layout}"
         );
         assert!(
             layout["sort_keys"].as_array().is_some_and(

@@ -187,7 +187,14 @@ impl DomainTable for PointsTable {
         hourly_layout(
             "time_unix_nano",
             vec![sort_desc("time_unix_nano"), sort_asc("metric_name")],
-            &["metric_name", "metric_type"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "metric_name",
+                "metric_type",
+            ],
         )
     }
 }

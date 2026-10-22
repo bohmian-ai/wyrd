@@ -1373,40 +1373,266 @@ async fn init_selected_mcp_host_reads() {
     local.stop("-INT").await;
 }
 
+/// The stand-in coding agent `wyrd init guided` starts: it records its
+/// program, arguments, directory, terminal, the Codex configuration it found,
+/// and its pid under `WYRD_FAKE_AGENT_DIR`, then announces itself and exits 3
+/// (`WYRD_FAKE_AGENT_MODE=exit`), or puts the terminal in raw mode, announces
+/// itself once it is raw, and waits as the recorded process.
+const FAKE_AGENT: &str = r#"#!/bin/sh
+out="$WYRD_FAKE_AGENT_DIR"
+basename "$0" > "$out/program"
+: > "$out/argv"
+for argument in "$@"; do printf '%s\0' "$argument" >> "$out/argv"; done
+pwd -P > "$out/cwd"
+if [ -t 0 ] && [ -t 1 ]; then echo yes > "$out/tty"; fi
+cat "$HOME/.codex/config.toml" > "$out/config" 2>/dev/null
+echo $$ > "$out/pid"
+if [ "$WYRD_FAKE_AGENT_MODE" = exit ]; then echo "fake agent started"; exit 3; fi
+stty raw -echo
+echo "fake agent started"
+exec sleep 600
+"#;
+
+/// A directory holding stand-in agents for `programs`, a `copilot` whose
+/// interpreter is missing so it cannot start, and the system `node` the UI
+/// needs, so a `PATH` of it plus the system directories sees no real agent.
+///
+/// # Panics
+/// Panics when the directory cannot be written or `node` is not on `PATH`.
+fn fake_agents(root: &Path, programs: &[&str]) -> PathBuf {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("fake agent directory");
+    let write = |name: &str, body: &str| {
+        let path = bin.join(name);
+        fs::write(&path, body).expect("fake agent");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
+    };
+    for program in programs {
+        write(program, FAKE_AGENT);
+    }
+    write("copilot", "#!/nonexistent/interpreter\n");
+    let node = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("node"))
+        .find(|node| node.is_file())
+        .expect("node on PATH");
+    symlink(
+        fs::canonicalize(node).expect("node resolves"),
+        bin.join("node"),
+    )
+    .expect("node");
+    bin
+}
+
+/// `wyrd init guided` attached to a pseudo-terminal, as a person runs it:
+/// stdin, stdout, and stderr all share the terminal.
+struct Guided {
+    /// The CLI process.
+    child: Child,
+    /// The controlling side, where answers are typed.
+    controller: fs::File,
+    /// The terminal device, kept open to inspect its attributes.
+    terminal: fs::File,
+    /// Terminal output read off the controlling side.
+    output: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Everything printed so far, with `\r\n` folded to `\n`.
+    printed: String,
+}
+
+impl Guided {
+    /// Start `command` on a fresh pseudo-terminal.
+    ///
+    /// # Panics
+    /// Panics when the pseudo-terminal cannot be opened or the CLI cannot start.
+    fn spawn(mut command: Command) -> Self {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("pty opens");
+        grantpt(&controller).expect("pty granted");
+        unlockpt(&controller).expect("pty unlocked");
+        let name = ptsname(&controller, Vec::new()).expect("pty name");
+        let terminal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(std::ffi::OsStr::from_bytes(name.as_bytes()))
+            .expect("pty device opens");
+        let stdio = || Stdio::from(terminal.try_clone().expect("pty device shares"));
+        let child = command
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("installed CLI starts");
+        let controller = fs::File::from(controller);
+        let mut reader = controller.try_clone().expect("controller shares");
+        let (sender, output) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read @ 1..) = reader.read(&mut buffer) {
+                if sender.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            controller,
+            terminal,
+            output,
+            printed: String::new(),
+        }
+    }
+
+    /// Wait until the terminal shows `text`.
+    ///
+    /// # Panics
+    /// Panics when `text` does not appear within the readiness budget.
+    async fn expect(&mut self, text: &str) {
+        let shown = tokio::time::timeout(Duration::from_secs(150), async {
+            while !self.printed.contains(text) {
+                let Some(bytes) = self.output.recv().await else {
+                    return false;
+                };
+                self.printed
+                    .push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            shown,
+            "the terminal never showed {text:?}: {}",
+            self.printed
+        );
+    }
+
+    /// Type `line` and Enter.
+    ///
+    /// # Panics
+    /// Panics when the terminal cannot be written.
+    fn answer(&mut self, line: &str) {
+        use std::io::Write as _;
+        writeln!(self.controller, "{line}").expect("answer typed");
+    }
+
+    /// Whether the terminal echoes and edits lines, as a shell needs.
+    ///
+    /// # Panics
+    /// Panics when the attributes cannot be read.
+    fn usable(&self) -> bool {
+        use rustix::termios::LocalModes;
+        let modes = rustix::termios::tcgetattr(&self.terminal)
+            .expect("terminal attributes")
+            .local_modes;
+        modes.contains(LocalModes::ECHO | LocalModes::ICANON)
+    }
+
+    /// Wait for the CLI to exit and return its exit code.
+    ///
+    /// # Panics
+    /// Panics when the CLI cannot be awaited or runs past its drain budget.
+    async fn exit(&mut self) -> Option<i32> {
+        tokio::time::timeout(Duration::from_secs(90), self.child.wait())
+            .await
+            .expect("CLI exits")
+            .expect("CLI reaped")
+            .code()
+    }
+
+    /// Interrupt the CLI as Ctrl-C does and return its exit code.
+    ///
+    /// # Panics
+    /// Panics when the CLI cannot be signalled or awaited.
+    async fn interrupt(&mut self) -> Option<i32> {
+        let pid = self.child.id().expect("live CLI");
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &pid.to_string()])
+                .status()
+                .await
+                .expect("kill runs")
+                .success()
+        );
+        self.exit().await
+    }
+}
+
+/// Whether process `pid` still exists.
+///
+/// # Panics
+/// Panics when `kill` cannot run.
+async fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("kill runs")
+        .success()
+}
+
+/// Whether `endpoint` answers readiness.
+async fn serving(endpoint: &str) -> bool {
+    reqwest::get(format!("{endpoint}/readyz"))
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
 /// Guided handoff around the unchanged bootstrap: a text run with explicit
-/// hosts prints a literal launch command for each connected host that takes
-/// an initial prompt and paste guidance for the rest, then serves until
-/// interrupted. A JSON restart carries the same release prompt as
+/// hosts prints a literal launch command for each connected host, then
+/// serves until interrupted without starting any agent, even one installed. A JSON restart carries the same release prompt as
 /// `setup_prompt`, and an authenticated host reads byte-identical text from
 /// the MCP `setup` prompt through the installed proxy, which refuses other
 /// names and arguments.
 ///
+/// `wyrd init guided` on a terminal starts only the chosen installed agent,
+/// after readiness and its MCP connection, in the project directory with
+/// the literal prompt and the terminal. More than one `--host`, a missing
+/// program, or a failed connection refuses without starting any agent. An
+/// agent that exits or cannot start leaves Wyrd serving; interruption and an
+/// unexpected server exit stop the agent Wyrd started, settle the server and
+/// UI, and leave the terminal usable.
+///
 /// # Panics
 /// Panics when bootstrap fails, any surface's prompt differs, a launch
-/// command does not preserve the prompt, or a refused prompt read succeeds.
+/// command does not preserve the prompt, a refused prompt read succeeds, or
+/// guided setup starts, keeps, or substitutes an agent other than described.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
 async fn guided_init_lifecycle_and_prompt() {
     let prompt = wyrd_spec::mcp::setup_prompt(env!("CARGO_PKG_VERSION"));
     let mut local = LocalDev::new().await;
-    for host in [".codex", ".claude", ".cursor"] {
+    for host in [".codex", ".claude", ".cursor", ".copilot"] {
         fs::create_dir_all(local.home.path().join(host)).expect("detected host");
     }
-    local.start(&["codex", "claude-code", "cursor"]).await;
+    let bin = fake_agents(local.home.path(), &["codex", "claude", "pi"]);
+    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .expect("PATH");
+    let marks = local.home.path().join("agent");
+    let project = local.home.path().join("project");
+    fs::create_dir_all(&marks).expect("agent records");
+    fs::create_dir_all(&project).expect("project directory");
+    let mut ordinary = local.command();
+    ordinary
+        .env("PATH", &path)
+        .env("WYRD_FAKE_AGENT_DIR", &marks)
+        .args(["init", "--tenant", "local"]);
+    for host in ["codex", "claude-code", "cursor"] {
+        ordinary.args(["--host", host]);
+    }
+    local.start_with(ordinary).await;
     let printed = local.stop("-INT").await;
+    assert!(!marks.join("pid").exists(), "ordinary init starts no agent");
     let literal = prompt.replace('\'', r"'\''");
-    for program in ["codex", "claude"] {
+    for program in ["codex", "claude", "agent"] {
         assert!(
             printed.contains(&format!("{program} '{literal}'")),
             "{program} launches on the literal prompt: {printed}"
         );
     }
-    assert!(
-        printed.contains(
-            "Start Cursor in this directory and paste the output of `wyrd init --print-prompt`"
-        ),
-        "{printed}"
-    );
 
     local.start_json().await;
     let ready = local.ready.clone().expect("readiness result");
@@ -1451,6 +1677,129 @@ async fn guided_init_lifecycle_and_prompt() {
     assert!(host.get_prompt(with_arguments).await.is_err());
     host.cancel().await.expect("host disconnects");
     local.stop("-INT").await;
+
+    let guided = |mode: &str, arguments: &[&str]| {
+        for entry in fs::read_dir(&marks).expect("agent records") {
+            fs::remove_file(entry.expect("record").path()).expect("record cleared");
+        }
+        let mut command = local.command();
+        command
+            .current_dir(&project)
+            .env("PATH", &path)
+            .env("WYRD_FAKE_AGENT_DIR", &marks)
+            .env("WYRD_FAKE_AGENT_MODE", mode)
+            .args(["init", "guided", "--tenant", "local"])
+            .args(arguments);
+        Guided::spawn(command)
+    };
+    let record = |name: &str| fs::read_to_string(marks.join(name)).expect("agent record");
+
+    // Refusals before any side effect start nothing.
+    for (arguments, refusal) in [
+        (
+            &["--host", "codex", "--host", "claude-code"][..],
+            "name at most one --host",
+        ),
+        (&["--host", "hermes"][..], "program is not on PATH"),
+    ] {
+        let mut refused = guided("exit", arguments);
+        assert_ne!(refused.exit().await, Some(0));
+        refused.expect(refusal).await;
+        assert!(!marks.join("pid").exists(), "{arguments:?} starts no agent");
+    }
+
+    // The named agent starts after readiness and its connection, with the
+    // literal prompt, the project directory, and the terminal. Its nonzero
+    // exit is reported and Wyrd keeps serving.
+    let mut run = guided("exit", &["--host", "codex"]);
+    run.expect("fake agent started").await;
+    run.expect("exited unsuccessfully").await;
+    let ready = run
+        .printed
+        .find("Local Wyrd ready at")
+        .expect("ready first");
+    assert!(
+        ready
+            < run
+                .printed
+                .find("fake agent started")
+                .expect("agent output")
+    );
+    assert_eq!(record("program").trim(), "codex");
+    assert_eq!(record("argv"), format!("{prompt}\0"));
+    assert_eq!(
+        Path::new(record("cwd").trim()),
+        fs::canonicalize(&project).expect("project")
+    );
+    assert_eq!(record("tty").trim(), "yes");
+    assert!(
+        record("config").contains(&endpoint),
+        "connected before launch"
+    );
+    assert!(!run.printed.contains("wyrd_sk_") && !run.printed.contains(local.dsn.expose_secret()));
+    assert!(
+        serving(&endpoint).await,
+        "Wyrd keeps serving after the agent exits"
+    );
+    assert_eq!(run.interrupt().await, Some(130));
+    assert!(TcpListener::bind(&local.bind).is_ok() && TcpListener::bind(&local.ui).is_ok());
+
+    // Without --host the user picks one installed agent. Interruption stops
+    // it and restores the terminal it left in raw mode.
+    let mut run = guided("wait", &[]);
+    run.expect("Start which agent on the setup prompt?").await;
+    assert!(
+        !run.printed.contains("(hermes)"),
+        "only installed agents are offered"
+    );
+    run.answer("1 2");
+    run.expect("Enter one number").await;
+    run.answer("2");
+    run.expect("fake agent started").await;
+    assert_eq!(record("program").trim(), "claude");
+    let agent = record("pid");
+    assert_eq!(run.interrupt().await, Some(130));
+    assert!(!alive(&agent).await, "the agent Wyrd started is stopped");
+    assert!(run.usable(), "the terminal is usable again");
+    assert!(TcpListener::bind(&local.bind).is_ok() && TcpListener::bind(&local.ui).is_ok());
+
+    // A failed connection refuses before starting the agent.
+    let mut refused = guided("exit", &["--host", "pi"]);
+    assert_ne!(refused.exit().await, Some(0));
+    assert!(
+        !marks.join("pid").exists(),
+        "a failed connection starts no agent"
+    );
+
+    // An agent that cannot start is reported, and Wyrd keeps serving.
+    let mut run = guided("exit", &["--host", "copilot-cli"]);
+    run.expect("could not be started").await;
+    assert!(serving(&endpoint).await);
+    assert_eq!(run.interrupt().await, Some(130));
+
+    // An unexpected server exit stops the agent and settles the UI.
+    let mut run = guided("wait", &["--host", "codex"]);
+    run.expect("fake agent started").await;
+    let agent = record("pid");
+    let cli = run.child.id().expect("live CLI").to_string();
+    let server = Command::new("pgrep")
+        .args(["-P", &cli, "-x", "wyrd-server"])
+        .output()
+        .await
+        .expect("pgrep runs");
+    let server = String::from_utf8(server.stdout).expect("pid");
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", server.trim()])
+            .status()
+            .await
+            .expect("kill")
+            .success()
+    );
+    assert_ne!(run.exit().await, Some(0));
+    assert!(!alive(&agent).await, "the agent Wyrd started is stopped");
+    assert!(run.usable(), "the terminal is usable again");
+    assert!(TcpListener::bind(&local.ui).is_ok(), "the UI is settled");
 }
 
 /// Provider key the quickstart form stores and the mock provider demands.

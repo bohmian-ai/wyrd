@@ -35,13 +35,19 @@ use crate::mcp::{self, McpHost, McpInstallReport};
 use crate::platform::credential::PlatformEndpoint;
 use crate::server::{InstalledServer, ServerInstaller, compatible};
 #[cfg(unix)]
-use crate::terminal::Terminal;
+use crate::terminal::{SavedTerminal, Terminal};
 
 /// Local inputs accepted by both installed CLI projections. Each resolves as
 /// argument, canonical environment variable, saved `[dev]` setting, then a
 /// terminal prompt; secrets are never accepted as arguments.
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// `guided` also starts one coding agent on the setup prompt in this
+    /// directory once Wyrd and that agent's MCP connection are ready, then
+    /// keeps serving after the agent exits. Name the agent with `--host`, or
+    /// choose one installed agent when asked. Needs an interactive terminal.
+    #[arg(value_enum, conflicts_with_all = ["format", "non_interactive"])]
+    mode: Option<InitMode>,
     /// Tenant to provision on first use; an active tenant is never reissued.
     /// Defaults to the saved tenant, else is asked on a terminal.
     #[arg(long)]
@@ -81,6 +87,13 @@ pub struct InitArgs {
     /// contacts no server, changes nothing, and accepts no setup option.
     #[arg(long, exclusive = true)]
     print_prompt: bool,
+}
+
+/// The optional `wyrd init` mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum InitMode {
+    /// Start the selected coding agent on the setup prompt after readiness.
+    Guided,
 }
 
 /// Effective local deployment inputs, resolved once before any side effect,
@@ -143,8 +156,27 @@ struct DevServer {
     child: Option<Child>,
     /// UI child started after the server is ready and settled with it.
     ui: Option<Child>,
+    /// Coding agent guided setup started, settled before the server and UI.
+    agent: Option<Agent>,
     /// Destination of progress notices and both children's output.
     diagnostics: Diagnostics,
+}
+
+/// The coding agent `wyrd init guided` started on the terminal it shares.
+struct Agent {
+    /// The agent process; only this process is ever stopped.
+    child: Child,
+    /// Terminal attributes from before the agent took the terminal over.
+    #[cfg(unix)]
+    terminal: SavedTerminal,
+}
+
+impl Agent {
+    /// Give the terminal back as it was before the agent started.
+    fn restore(&self) {
+        #[cfg(unix)]
+        self.terminal.restore();
+    }
 }
 
 /// Where `wyrd init` writes progress, notices, and the serving child's
@@ -163,12 +195,14 @@ enum Diagnostics {
 }
 
 impl Diagnostics {
-    /// Select the terminal for text, else open `<root>/logs/server-dev.log`.
+    /// Select the terminal, else open `<root>/logs/server-dev.log` when
+    /// `log` is set: in JSON mode, and in guided mode, whose agent owns the
+    /// terminal.
     ///
     /// # Errors
     /// Returns a local-persistence stage error when the log cannot be opened.
-    fn open(root: &Path, format: OutputFormat) -> Result<Self, WyrdCliError> {
-        if format == OutputFormat::Text {
+    fn open(root: &Path, log: bool) -> Result<Self, WyrdCliError> {
+        if !log {
             return Ok(Self::Terminal);
         }
         let path = root.join("logs").join("server-dev.log");
@@ -182,7 +216,7 @@ impl Diagnostics {
             })
     }
 
-    /// The diagnostic log, when JSON mode writes one.
+    /// The diagnostic log, when JSON or guided mode writes one.
     fn path(&self) -> Option<&Path> {
         match self {
             Self::Terminal => None,
@@ -265,7 +299,7 @@ struct DevReady {
     gateway: String,
     /// Selected MCP hosts' outcomes; `None` when host setup was skipped.
     mcp: Option<McpInstallReport>,
-    /// JSON mode's diagnostic log.
+    /// The diagnostic log of JSON and guided mode.
     log: Option<PathBuf>,
     /// This release's setup prompt, as `wyrd init --print-prompt` prints it.
     setup_prompt: String,
@@ -288,6 +322,9 @@ impl DevReady {
             self.bifrost_data_dir.display(),
             self.gateway,
         );
+        if let Some(log) = &self.log {
+            println!("  Server output: {}", log.display());
+        }
     }
 }
 
@@ -315,6 +352,8 @@ impl InitArgs {
     /// Compose local setup and remain attached until interruption or exit.
     ///
     /// `--print-prompt` prints [`setup_prompt`] before any of that and exits.
+    /// `guided` chooses its agent before any side effect and starts it once
+    /// setup is ready.
     ///
     /// # Errors
     /// Refuses invalid local inputs, an incomplete active installation (with
@@ -336,7 +375,7 @@ impl InitArgs {
         let interrupted = interruption();
         tokio::pin!(interrupted);
         // Biased: the signal listeners register before any question is asked.
-        let inputs = tokio::select! {
+        let (agent, inputs) = tokio::select! {
             biased;
             signal = &mut interrupted => {
                 if self.format == OutputFormat::Text {
@@ -344,9 +383,15 @@ impl InitArgs {
                 }
                 return signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source });
             }
-            inputs = self.resolve(installer.root()) => inputs?,
+            resolved = async {
+                let agent = self.agent().await?;
+                Ok::<_, WyrdCliError>((agent, self.resolve(installer.root()).await?))
+            } => resolved?,
         };
-        let diagnostics = Diagnostics::open(installer.root(), self.format)?;
+        let diagnostics = Diagnostics::open(
+            installer.root(),
+            self.format == OutputFormat::Json || agent.is_some(),
+        )?;
         let installed = tokio::select! {
             biased;
             signal = &mut interrupted => {
@@ -369,7 +414,7 @@ impl InitArgs {
                 server.diagnostics.notice("Local startup stopped. Committed setup steps remain; rerun the same command. An active tenant's key is never reissued.");
                 signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source })
             }
-            result = server.run(&self.hosts, self.format) => result,
+            result = server.run(&self.hosts, self.format, agent) => result,
         };
         let settled = server.stop().await;
         let located = |error| server.diagnostics.locate(error);
@@ -380,6 +425,64 @@ impl InitArgs {
                 Err(located(error))
             }
         }
+    }
+
+    /// The coding agent guided setup starts, chosen before any side effect:
+    /// the one `--host`, else the user's choice among installed agents.
+    ///
+    /// # Errors
+    /// Refuses guided setup without an interactive terminal, with more than
+    /// one `--host`, with no installed agent, or when the selected agent's
+    /// program is not on `PATH`; no agent is substituted.
+    async fn agent(&self) -> Result<Option<McpHost>, WyrdCliError> {
+        if self.mode != Some(InitMode::Guided) {
+            return Ok(None);
+        }
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            return Err(dev_error(
+                "guided setup",
+                "wyrd init guided needs an interactive terminal; nothing has run. Run wyrd init and start the agent with the command it prints",
+            ));
+        }
+        let host = match self.hosts.as_slice() {
+            [host] => *host,
+            [] => {
+                let installed: Vec<McpHost> = McpHost::ALL
+                    .into_iter()
+                    .filter(|host| host.installed())
+                    .collect();
+                if installed.is_empty() {
+                    return Err(dev_error(
+                        "guided setup",
+                        "no supported coding agent's program is on PATH; nothing has run. Install one, or run wyrd init and paste the output of wyrd init --print-prompt",
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    mcp::prompt_agent(&installed, &mut std::io::stdout())
+                        .await
+                        .map_err(|source| WyrdCliError::Io { source })?
+                }
+                #[cfg(not(unix))]
+                return Err(dev_error(
+                    "guided setup",
+                    "name the coding agent with --host; nothing has run",
+                ));
+            }
+            _ => {
+                return Err(dev_error(
+                    "guided setup",
+                    "wyrd init guided starts one coding agent; name at most one --host. Nothing has run",
+                ));
+            }
+        };
+        if !host.installed() {
+            return Err(dev_error(
+                "guided setup",
+                "the selected coding agent's program is not on PATH; nothing has run. Install it, or choose another agent with --host",
+            ));
+        }
+        Ok(Some(host))
     }
 
     /// Resolve every input before any side effect, asking for a missing
@@ -710,6 +813,7 @@ impl DevServer {
             sealing_key,
             child: None,
             ui: None,
+            agent: None,
             diagnostics,
         })
     }
@@ -809,6 +913,7 @@ impl DevServer {
         &mut self,
         hosts: &[McpHost],
         format: OutputFormat,
+        agent: Option<McpHost>,
     ) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
         let grpc = format!("http://{}", self.inputs.grpc);
@@ -830,6 +935,7 @@ impl DevServer {
         let Self {
             child,
             ui,
+            agent: started,
             endpoint,
             inputs,
             diagnostics,
@@ -843,6 +949,8 @@ impl DevServer {
             configured = inputs.configure_gateway(client, diagnostics) => configured?,
             exited = Self::exited(child, ui) => return exited,
         };
+        // Guided setup connects exactly its agent.
+        let hosts = agent.as_ref().map_or(hosts, std::slice::from_ref);
         let offer = !inputs.configured || !hosts.is_empty();
         let mcp = if offer {
             tokio::select! {
@@ -856,7 +964,9 @@ impl DevServer {
             match &mcp {
                 Some(report) => {
                     report.print_text();
-                    report.print_handoff(&setup_prompt());
+                    if agent.is_none() {
+                        report.print_handoff(&setup_prompt());
+                    }
                 }
                 None if offer => {
                     println!("MCP setup skipped; connect a host later with wyrd mcp install.");
@@ -890,7 +1000,60 @@ impl DevServer {
             ),
         }
         drop(ready);
+        if let Some(host) = agent {
+            Self::guide(host, started, child, ui).await?;
+        }
         Self::exited(child, ui).await
+    }
+
+    /// Start `host` on the setup prompt with the terminal and report how it
+    /// ended, while the server and UI stay observed. The agent's exit alone
+    /// never claims setup succeeded; the server keeps serving afterwards.
+    ///
+    /// # Errors
+    /// Returns the server-exit failure of [`DevServer::exited`] when the
+    /// server or UI exits first; `stop` then settles the agent before them.
+    async fn guide(
+        host: McpHost,
+        started: &mut Option<Agent>,
+        server: &mut Child,
+        ui: &mut Child,
+    ) -> Result<(), WyrdCliError> {
+        let label = host.label();
+        println!(
+            "Starting {label} on the setup prompt in this directory. Wyrd keeps serving after it exits."
+        );
+        #[cfg(unix)]
+        let terminal = SavedTerminal::save().map_err(|source| WyrdCliError::Io { source })?;
+        let child = match host.command(&setup_prompt()).kill_on_drop(true).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "{label} could not be started ({}). Wyrd keeps serving; start the agent yourself with wyrd init's printed command, or press Ctrl-C to stop.",
+                    error.kind()
+                );
+                return Ok(());
+            }
+        };
+        let agent = started.insert(Agent {
+            child,
+            #[cfg(unix)]
+            terminal,
+        });
+        let status = tokio::select! {
+            status = agent.child.wait() => status,
+            exited = Self::exited(server, ui) => return exited.map(drop),
+        };
+        agent.restore();
+        let ended = match status {
+            Ok(status) if status.success() => "exited".to_owned(),
+            Ok(status) => format!("exited unsuccessfully ({status})"),
+            Err(error) => format!("could not be observed ({})", error.kind()),
+        };
+        println!(
+            "{label} {ended}. Setup is confirmed only by the stored verification evidence the prompt asks the agent to check. Wyrd keeps serving; press Ctrl-C to stop."
+        );
+        Ok(())
     }
 
     /// Save the resolved settings and database URLs through the protected
@@ -1132,8 +1295,18 @@ impl DevServer {
     /// # Errors
     /// Returns the first shutdown failure; both children are still settled.
     async fn stop(&mut self) -> Result<(), WyrdCliError> {
+        let agent = match self.agent.take() {
+            Some(agent) => {
+                let settled = settle(Some(agent.child)).await;
+                // `settle` consumed the child; its saved terminal remains.
+                #[cfg(unix)]
+                agent.terminal.restore();
+                settled
+            }
+            None => Ok(()),
+        };
         let (ui, server) = tokio::join!(settle(self.ui.take()), settle(self.child.take()));
-        ui.and(server)
+        agent.and(ui).and(server)
     }
 }
 

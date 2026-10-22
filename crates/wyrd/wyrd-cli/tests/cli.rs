@@ -28,7 +28,9 @@ mod server_install;
 /// touches nothing: an unreadable saved configuration is never read, the
 /// selected server and database listener see no connection, and neither the
 /// configuration nor home directory changes. Setup options conflict with it,
-/// help names it, and the removed `server dev` spelling is unknown.
+/// help names it, and the removed `server dev` spelling is unknown. `guided`
+/// refuses the prompt-only, JSON, and unattended modes and, without a
+/// terminal, refuses before reading anything.
 ///
 /// # Panics
 /// Panics when printing differs from the shared prompt, has side effects, or
@@ -74,6 +76,9 @@ fn guided_init_print_prompt_is_offline() {
         &["init", "--print-prompt", "--tenant", "local"][..],
         &["init", "--print-prompt", "--non-interactive"][..],
         &["init", "--print-prompt", "--host", "codex"][..],
+        &["init", "guided", "--print-prompt"][..],
+        &["init", "guided", "--format", "json"][..],
+        &["init", "guided", "--non-interactive"][..],
         &["server", "dev", "--tenant", "local"][..],
         &["server", "dev", "--print-prompt"][..],
     ] {
@@ -81,6 +86,14 @@ fn guided_init_print_prompt_is_offline() {
         assert_eq!(refused.status.code(), Some(64), "{conflict:?}: {refused:?}");
         assert!(refused.stdout.is_empty(), "{conflict:?}");
     }
+    // Guided setup without a terminal refuses before reading any setting.
+    let untyped =
+        principal_journey::run_cli_with_env(&["init", "guided", "--host", "codex"], &environment);
+    assert!(!untyped.status.success(), "{untyped:?}");
+    assert!(
+        String::from_utf8_lossy(&untyped.stderr).contains("needs an interactive terminal"),
+        "{untyped:?}"
+    );
     assert_eq!(listing(), before, "refusals write nothing");
     assert_eq!(
         listener.accept().map(|_| ()).map_err(|error| error.kind()),
@@ -90,7 +103,11 @@ fn guided_init_print_prompt_is_offline() {
 
     let help = principal_journey::run_cli_with_env(&["init", "--help"], &environment);
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("--print-prompt"));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("--print-prompt") && help.contains("guided"),
+        "{help}"
+    );
     let root = principal_journey::run_cli_with_env(&["--help"], &environment);
     let root = String::from_utf8(root.stdout).expect("UTF-8 help");
     assert!(
@@ -107,7 +124,12 @@ fn guided_init_print_prompt_is_offline() {
     );
 }
 
-/// Every path beneath `root`, relative to it, with its file contents.
+/// Every path beneath `root`, joined onto `root`, with its file contents;
+/// directories carry no contents.
+///
+/// # Panics
+/// Panics when a directory beneath `root` cannot be listed, an entry cannot
+/// be read, or a file's contents cannot be read.
 fn walk(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(root).expect("readable directory") {

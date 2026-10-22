@@ -61,7 +61,7 @@ pub enum McpHost {
 
 impl McpHost {
     /// Every supported host, in the order detection reports them.
-    const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Codex,
         Self::ClaudeCode,
         Self::CopilotCli,
@@ -85,20 +85,49 @@ impl McpHost {
         }
     }
 
+    /// The program and leading arguments that start this host in the
+    /// current directory with one further argument as its first message.
+    fn launcher(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Codex => ("codex", &[]),
+            Self::ClaudeCode => ("claude", &[]),
+            Self::CopilotCli => ("copilot", &["-i"]),
+            Self::Vscode => ("code", &["chat"]),
+            Self::Cursor => ("agent", &[]),
+            Self::Pi => ("pi", &[]),
+            Self::Hermes => ("hermes", &["chat", "-q"]),
+        }
+    }
+
     /// The POSIX shell command that starts this host in the current
-    /// directory with `prompt` as its first message, when its CLI takes one.
+    /// directory with `prompt` as its first message.
     ///
     /// The prompt is one single-quoted argument, so a shell passes it
     /// literally with no expansion.
-    pub(crate) fn launch(self, prompt: &str) -> Option<String> {
-        let program = match self {
-            Self::Codex => "codex",
-            Self::ClaudeCode => "claude",
-            Self::CopilotCli | Self::Vscode | Self::Cursor | Self::Pi | Self::Hermes => {
-                return None;
-            }
-        };
-        Some(format!("{program} '{}'", prompt.replace('\'', r"'\''")))
+    pub(crate) fn launch(self, prompt: &str) -> String {
+        let (program, arguments) = self.launcher();
+        let mut command = vec![program];
+        command.extend(arguments);
+        format!("{} '{}'", command.join(" "), prompt.replace('\'', r"'\''"))
+    }
+
+    /// Whether this host's launch program is a file on `PATH`. A detected
+    /// configuration directory alone does not prove the agent is installed.
+    pub(crate) fn installed(self) -> bool {
+        env::var_os("PATH").is_some_and(|path| {
+            env::split_paths(&path).any(|dir| dir.join(self.launcher().0).is_file())
+        })
+    }
+
+    /// The process that starts this host in the current directory with
+    /// `prompt` as its first message: the same program and arguments as
+    /// [`McpHost::launch`], with the prompt passed as one argument and no
+    /// shell.
+    pub(crate) fn command(self, prompt: &str) -> tokio::process::Command {
+        let (program, arguments) = self.launcher();
+        let mut command = tokio::process::Command::new(program);
+        command.args(arguments).arg(prompt);
+        command
     }
 
     /// The product name shown in the interactive prompt.
@@ -717,6 +746,43 @@ pub(super) async fn prompt_local_selection(
     }
 }
 
+/// Ask which one of the `installed` agents guided setup starts, re-asking
+/// until exactly one is chosen; nothing is selected silently.
+///
+/// # Errors
+/// Propagates terminal open, registration, input, UTF-8, and output failures.
+#[cfg(unix)]
+pub(crate) async fn prompt_agent(
+    installed: &[McpHost],
+    output: &mut impl Write,
+) -> io::Result<McpHost> {
+    let terminal = crate::terminal::Terminal::open()?;
+    writeln!(output, "Installed coding agents:")?;
+    for (index, host) in installed.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}) {} ({})",
+            index + 1,
+            host.label(),
+            host.name()
+        )?;
+    }
+    output.flush()?;
+    loop {
+        let answer = terminal
+            .ask("Start which agent on the setup prompt? [number]: ")
+            .await?;
+        if let Some([host]) = selected(installed, &answer).as_deref() {
+            return Ok(*host);
+        }
+        writeln!(
+            output,
+            "Enter one number between 1 and {}.",
+            installed.len()
+        )?;
+    }
+}
+
 /// Render the same detected-host menu for both terminal input paths.
 ///
 /// # Errors
@@ -771,33 +837,39 @@ pub(crate) fn selected<T: Copy>(detected: &[T], answer: &str) -> Option<Vec<T>> 
 mod tests {
     use super::*;
 
-    /// A launch command passes the real setup prompt to a POSIX shell as one
-    /// literal argument; hosts without an initial-prompt CLI get none.
+    /// Every host's launch command passes the real setup prompt to a POSIX
+    /// shell as one literal argument after its documented prefix.
     ///
     /// # Panics
-    /// Panics when the shell receives different bytes or a host's launch
-    /// support differs.
+    /// Panics when a host's prefix differs or the shell receives different
+    /// bytes.
     #[test]
     fn launch_preserves_the_setup_prompt_literally() {
         let prompt = format!(
-            "{}it's $HOME `id` \\ \"q\"",
+            "{}it's $HOME `id` \\ \"q\"\n$(id)",
             wyrd_spec::mcp::setup_prompt("1.2.3")
         );
-        let command = McpHost::ClaudeCode
-            .launch(&prompt)
-            .expect("Claude Code launches");
-        let quoted = command.strip_prefix("claude ").expect("program first");
-        let echoed = std::process::Command::new("sh")
-            .args(["-c", &format!("printf %s {quoted}")])
-            .output()
-            .expect("sh runs");
-        assert_eq!(String::from_utf8(echoed.stdout).expect("UTF-8"), prompt);
-        assert!(
-            McpHost::Codex
-                .launch(&prompt)
-                .is_some_and(|c| c.starts_with("codex '"))
-        );
-        assert!(McpHost::Cursor.launch(&prompt).is_none());
+        let prefixes = [
+            (McpHost::Codex, "codex"),
+            (McpHost::ClaudeCode, "claude"),
+            (McpHost::CopilotCli, "copilot -i"),
+            (McpHost::Vscode, "code chat"),
+            (McpHost::Cursor, "agent"),
+            (McpHost::Pi, "pi"),
+            (McpHost::Hermes, "hermes chat -q"),
+        ];
+        assert_eq!(prefixes.len(), McpHost::ALL.len());
+        for (host, prefix) in prefixes {
+            let command = host.launch(&prompt);
+            let quoted = command
+                .strip_prefix(&format!("{prefix} "))
+                .unwrap_or_else(|| panic!("{} starts with {prefix}", host.name()));
+            let echoed = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {quoted}")])
+                .output()
+                .expect("sh runs");
+            assert_eq!(String::from_utf8(echoed.stdout).expect("UTF-8"), prompt);
+        }
     }
 
     /// The prompt lists every detected host and maps numbers, `all`, and an

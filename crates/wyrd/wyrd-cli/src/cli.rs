@@ -101,7 +101,8 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// Migrate, start, and configure a local Wyrd server, then hand off the
     /// guided setup prompt; stays in the foreground until interrupted.
-    /// PostgreSQL is supplied externally. --print-prompt only prints the
+    /// PostgreSQL is supplied externally. `wyrd init guided` also starts the
+    /// selected coding agent on the prompt. --print-prompt only prints the
     /// setup prompt.
     Init(InitArgs),
     /// Install and manage the official Wyrd server for this host.

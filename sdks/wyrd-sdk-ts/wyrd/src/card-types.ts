@@ -549,6 +549,10 @@ export interface CheckCode {
   readonly inputs?: Readonly<Record<string, Reference>>;
   readonly kind: "code";
   /**
+   * `verdict`, or `{kind: verdict, data: <schema>}` to require custom data; omitted means the plain Verdict.
+   */
+  readonly response_format?: NamedResponseFormat | null;
+  /**
    * Execution runtime.
    */
   readonly runtime?: CodeRuntime;
@@ -2826,6 +2830,27 @@ export interface ModelSpec {
 }
 
 /**
+ * A named response format, such as Wyrd's `verdict`: the name alone, or `{kind, data}` with a schema for the format's custom data.
+ *
+ * Skald owns no names; the embedding host resolves them through [`AuthoredPrompt::compile_with`], and an unresolved Prompt cannot render.
+ */
+export type NamedResponseFormat = string | NamedResponseFormatVariant2;
+
+/**
+ * The expanded form, with an optional host-defined `data` schema.
+ */
+export interface NamedResponseFormatVariant2 {
+  /**
+   * Host-defined schema of the format's custom data.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>> | null;
+  /**
+   * The format name.
+   */
+  readonly kind: string;
+}
+
+/**
  * Non-secret JSON-like configuration value.
  */
 export type NonSecretValue = NonSecretValueStr | NonSecretValueNumber | NonSecretValueBool | NonSecretValueList | NonSecretValueObject;
@@ -3565,9 +3590,9 @@ export interface Prompt {
    */
   readonly provider: ProviderName;
   /**
-   * Portable structured output: one JSON Schema object.
+   * Structured output: one portable JSON Schema object, or a format its host names, which may also accompany a native `body`.
    */
-  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
+  readonly response_format?: ResponseFormat | null;
   /**
    * Portable generation settings.
    */
@@ -3610,9 +3635,9 @@ export interface PromptSpec {
    */
   readonly provider: ProviderName;
   /**
-   * Portable structured output: one JSON Schema object.
+   * Structured output: one portable JSON Schema object, or a format its host names, which may also accompany a native `body`.
    */
-  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
+  readonly response_format?: ResponseFormat | null;
   /**
    * Portable generation settings.
    */
@@ -4509,6 +4534,10 @@ export interface RequirementResult {
    */
   readonly citations?: readonly Citation[];
   /**
+   * Custom data an Agent or code check returned under its declared `verdict` format; absent when none was declared or the output was rejected.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>>;
+  /**
    * Check-specific detail.
    */
   readonly detail?: RequirementDetail | null;
@@ -4567,6 +4596,13 @@ export interface Resource {
    */
   readonly service_version?: string | null;
 }
+
+/**
+ * An authored `response_format`.
+ *
+ * A string or an object with `kind` is a [`NamedResponseFormat`]; any other object is a JSON Schema. Both serialize exactly as authored.
+ */
+export type ResponseFormat = NamedResponseFormat | Readonly<Record<string, JsonValue>>;
 
 /**
  * `POST /v1/principals/{id}/revoke` body.

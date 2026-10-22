@@ -87,10 +87,11 @@ pub enum ResponseFormat {
     Schema(Map<String, Value>),
 }
 
-/// A response format the embedding host names and resolves to a schema.
+/// A named response format, such as Wyrd's `verdict`: the name alone, or
+/// `{kind, data}` with a schema for the format's custom data.
 ///
-/// Skald owns no names: [`AuthoredPrompt::compile_with`] asks the host to
-/// resolve one, and a Prompt compiled without a resolver cannot render.
+/// Skald owns no names; the embedding host resolves them through
+/// [`AuthoredPrompt::compile_with`], and an unresolved Prompt cannot render.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]

@@ -82,7 +82,7 @@ Run the program again. Nothing changed, so you get the same verdicts and `uid` v
 The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
 
 ```bash
-wyrd get --space default --kind Service --name support-reply --version 1.0.0
+wyrd get --kind Service --name support-reply --version 1.0.0
 ```
 
 Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.sql`, with `<uid>` replaced by that value:

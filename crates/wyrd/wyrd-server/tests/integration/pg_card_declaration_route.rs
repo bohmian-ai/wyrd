@@ -4673,3 +4673,122 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
 
     server.shutdown().await.expect("test server shuts down");
 }
+
+#[tokio::test(flavor = "current_thread")]
+/// The HTTP contract names a Card by kind, name, and version alone.
+///
+/// A declared Prompt's receipt and stored metadata carry no space, the flat
+/// `by-ref` and `latest` reads find it, the removed space route segment is not
+/// served, and a submission naming `metadata.space` is refused before
+/// persisting.
+///
+/// # Panics
+/// Panics when the server, bootstrap, or a request fails, or a response
+/// carries a space, serves the removed route, or accepts a spaced submission.
+async fn flat_card_http_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("flat-http-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let get = |uri: &str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("read request builds")
+    };
+
+    let declared = server
+        .oneshot_authenticated(
+            &jwt,
+            prompt_declaration_request("flat-http", "flat-http-001"),
+        )
+        .await
+        .expect("declaration responds");
+    assert_eq!(declared.status(), StatusCode::CREATED);
+    let receipt = response_json(declared).await;
+    let card_ref = &receipt["outcomes"][0]["card_ref"];
+    assert_eq!(card_ref["kind"], "Prompt");
+    assert_eq!(card_ref["name"], "flat-http");
+    assert!(card_ref.get("space").is_none(), "{receipt}");
+
+    let by_ref = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("by-ref responds");
+    assert_eq!(by_ref.status(), StatusCode::OK);
+    let card = response_json(by_ref).await["card"].clone();
+    assert_eq!(card["metadata"]["uid"], card_ref["uid"]);
+    assert!(card["metadata"].get("space").is_none(), "{card}");
+
+    let latest = server
+        .oneshot_authenticated(&jwt, get("/v1/cards/Prompt/flat-http/latest"))
+        .await
+        .expect("latest responds");
+    assert_eq!(latest.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(latest).await["card"]["metadata"]["uid"],
+        card_ref["uid"]
+    );
+
+    let removed_route = server
+        .oneshot_authenticated(&jwt, get("/v1/cards/Prompt/default/flat-http/latest"))
+        .await
+        .expect("removed route responds");
+    assert_eq!(removed_route.status(), StatusCode::NOT_FOUND);
+
+    let spaced = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "flat-http-spaced",
+                json!({
+                    "submissions": [{
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Prompt",
+                        "metadata": {"name": "flat-spaced", "space": "default", "version": "1.0.0"},
+                        "spec": {
+                            "provider": "openai",
+                            "model": "gpt-4o",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        },
+                        "artifacts": []
+                    }]
+                }),
+            ),
+        )
+        .await
+        .expect("spaced declaration responds");
+    let status = spaced.status();
+    let refusal = String::from_utf8(
+        to_bytes(spaced.into_body(), usize::MAX)
+            .await
+            .expect("refusal body reads")
+            .to_vec(),
+    )
+    .expect("refusal body is UTF-8");
+    assert!(status.is_client_error(), "{status}: {refusal}");
+    assert!(
+        refusal.to_string().contains("unknown field `space`"),
+        "{refusal}"
+    );
+    let never = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/by-ref?kind=Prompt&name=flat-spaced&version=1.0.0"),
+        )
+        .await
+        .expect("refused card read responds");
+    assert_eq!(never.status(), StatusCode::NOT_FOUND);
+
+    server.shutdown().await.expect("test server shuts down");
+}

@@ -88,7 +88,7 @@ Declare it, then download the declared versions for your app:
 
 ```bash
 wyrd declare refund-letters/service.yaml
-wyrd pull --kind Service --space default --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
+wyrd pull --kind Service --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## Observe

@@ -414,7 +414,6 @@ fn prompt_card_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: name.parse().expect("valid prompt card name"),
         version: "1.0.0".parse().expect("valid prompt version"),
-        space: Some("default".parse().expect("valid space")),
         uid: None,
     }
 }

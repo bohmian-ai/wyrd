@@ -1452,12 +1452,12 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version).
+    /// `card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version).
     #[error("[WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
     #[wyrd_error(
         code = "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
         status = 400,
-        title = "`card_ref.uid` was populated for a registry lookup that resolves by (space, name, version)",
+        title = "`card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version)",
         remediation = "Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`."
     )]
     RegistryCardRefUidNotResolvableHere {
@@ -1486,7 +1486,7 @@ pub enum WyrdError {
         code = "WYRD_REGISTRY_404_CARD_NOT_FOUND",
         status = 404,
         title = "No card matches the supplied identity",
-        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant."
+        remediation = "Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant."
     )]
     RegistryCardNotFound {
         /// Human-readable error message.
@@ -1640,7 +1640,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_DUPLICATE_SUBMISSION",
         status = 400,
         title = "Duplicate card submission",
-        remediation = "Submit each (kind, space, name, version) identity at most once per request."
+        remediation = "Submit each (kind, name, version) identity at most once per request."
     )]
     SpecDuplicateSubmission {
         /// Human-readable error message.

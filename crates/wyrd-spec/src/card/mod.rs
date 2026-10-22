@@ -1880,7 +1880,7 @@ mod drift_validation_tests {
     use serde_json::json;
     use wyrd_semver::VersionBlock;
 
-    /// Build a durable reference in the `default` space.
+    /// Build an exact durable reference.
     fn card_ref(kind: CardKind, name: &str, version: &str) -> Ref {
         Ref::Ref(CardRef {
             kind,

@@ -100,7 +100,6 @@ fn prompt_card_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: name.parse().expect("valid prompt card name"),
         version: "0.3.0".parse().expect("valid prompt version"),
-        space: Some("research".parse().expect("valid space")),
         uid: None,
     }
 }
@@ -187,7 +186,6 @@ fn agent_with_chain_matches_locked_fixture() {
         .expect("registered prompt resolves")
         .name("planner-agent")
         .version("0.3.0")
-        .space("research")
         .with_run_config(RunConfig {
             max_iterations: 6,
             tool_concurrency_cap: Some(2),
@@ -213,7 +211,6 @@ fn agent_projects_locked_agent_envelope_shape() {
     let agent = Agent::new(Prompt::from_native(prompt()))
         .name("planner-agent")
         .version("0.3.0")
-        .space("research")
         .with_run_config(RunConfig {
             max_iterations: 6,
             tool_concurrency_cap: Some(2),
@@ -235,7 +232,6 @@ fn agent_projects_locked_agent_envelope_shape() {
     assert!(!yaml.contains(&format!("{}{}", "version: ", "^")));
     assert_eq!(card.name, "planner-agent");
     assert_eq!(card.version, "0.3.0");
-    assert_eq!(card.space, "research");
     assert_eq!(card.spec.run_config.max_iterations, Some(6));
     assert_eq!(card.spec.run_config.tool_concurrency_cap, Some(2));
     assert_eq!(card.spec.run_config.session_recent_limit, Some(4));
@@ -301,8 +297,7 @@ fn card_prompt_resolution_derives_cascade_and_missing_prompt_code() {
     )
     .expect("registered prompt resolves")
     .name("planner-agent")
-    .version("0.3.0")
-    .space("research");
+    .version("0.3.0");
     let card = agent.to_card().expect("agent projects");
 
     assert_eq!(card.cascade_children, vec![card_ref]);
@@ -316,7 +311,6 @@ fn card_prompt_resolution_derives_cascade_and_missing_prompt_code() {
 #[test]
 fn unknown_runtime_local_tool_uses_wyrd_code() {
     let card = AgentCard {
-        space: "default".to_owned(),
         name: "planner-agent".to_owned(),
         version: "0.3.0".to_owned(),
         uid: String::new(),

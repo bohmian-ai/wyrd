@@ -17,7 +17,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, Ref};
 
-use crate::identity::{card_name, optional_card_uid, space_name, version_block};
+use crate::identity::{card_name, optional_card_uid, version_block};
 
 #[cfg(feature = "python")]
 use {
@@ -100,8 +100,6 @@ impl Default for ModelCardMetadata {
 )]
 #[derive(Serialize, Deserialize)]
 pub struct ModelCard {
-    /// `ModelCard` space.
-    pub space: String,
     /// `ModelCard` name.
     pub name: String,
     /// `ModelCard` version.
@@ -175,7 +173,6 @@ impl ModelCard {
             kind: CardKind::Model,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -195,7 +192,6 @@ impl ModelCard {
                 name: card_name("name", &self.name)?,
                 version: Some(version_block(&self.version)?.into()),
                 bump: None,
-                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -308,15 +304,6 @@ impl ModelCard {
             })
             .collect::<Result<Vec<_>, WyrdError>>()?;
 
-        // resolve space, uid - error if not present
-        let space = metadata
-            .space
-            .as_ref()
-            .ok_or_else(|| WyrdError::ModelValidation {
-                message: "ModelCard envelope missing space in metadata".to_owned(),
-                details: serde_json::Value::Null,
-            })?;
-
         let uid = metadata
             .uid
             .as_ref()
@@ -326,7 +313,6 @@ impl ModelCard {
             })?;
 
         Ok(ModelCard {
-            space: space.to_string(),
             name: metadata.name.to_string(),
             version,
             uid: uid.to_string(),
@@ -411,14 +397,13 @@ impl ModelCard {
     /// Returns a Wyrd error when input classification, interface metadata
     /// conversion, or model spec validation fails.
     #[new]
-    #[pyo3(signature = (model_or_interface, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    #[pyo3(signature = (model_or_interface, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the ModelCard() Python constructor"
     )]
     pub fn __new__(
         model_or_interface: &Bound<'_, PyAny>,
-        space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
         uid: Option<&str>,
@@ -432,18 +417,15 @@ impl ModelCard {
             ModelCardInput::extract_bound(model_or_interface, false)?.into_handle(py, &metadata)?;
         metadata.interface = handle.to_spec_interface(py)?;
 
-        let mut resolved_space = space.map(str::to_owned);
         let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
         let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
         crate::identity::apply_repo_defaults(
             &CardKind::Model,
-            &mut resolved_space,
             &mut resolved_labels,
             &mut resolved_annotations,
         );
 
         let card = Self {
-            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("model").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
@@ -529,18 +511,6 @@ impl ModelCard {
         self.interface = Some(handle.into_py_any(py)?);
         self.to_model_spec_from_metadata().validate()?;
         Ok(())
-    }
-
-    /// Return the `ModelCard` space.
-    #[getter]
-    pub fn space(&self) -> &str {
-        &self.space
-    }
-
-    /// Set the `ModelCard` space.
-    #[setter]
-    pub fn set_space(&mut self, value: String) {
-        self.space = value;
     }
 
     /// Return the `ModelCard` name.
@@ -1179,7 +1149,6 @@ mod tests {
             annotation_value("training-run-1"),
         );
         ModelCard {
-            space: "default".to_string(),
             name: "model".to_string(),
             version: "0.1.0".to_string(),
             uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_string(),

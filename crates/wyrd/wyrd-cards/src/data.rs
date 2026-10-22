@@ -19,7 +19,7 @@ use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, Ref};
 
-use crate::identity::{card_name, optional_card_uid, space_name, version_block};
+use crate::identity::{card_name, optional_card_uid, version_block};
 
 #[cfg(feature = "python")]
 use {
@@ -107,8 +107,6 @@ impl Default for DataCardMetadata {
 )]
 #[derive(Serialize, Deserialize)]
 pub struct DataCard {
-    /// `DataCard` space.
-    pub space: String,
     /// `DataCard` name.
     pub name: String,
     /// `DataCard` version.
@@ -179,7 +177,6 @@ impl DataCard {
             kind: CardKind::Data,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -200,7 +197,6 @@ impl DataCard {
                 name: card_name("name", &self.name)?,
                 version: Some(version_block(&self.version)?.into()),
                 bump: None,
-                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -303,13 +299,6 @@ impl DataCard {
                 }),
             })
             .collect::<Result<Vec<_>, WyrdError>>()?;
-        let space = metadata
-            .space
-            .as_ref()
-            .ok_or_else(|| WyrdError::DataValidation {
-                message: "DataCard envelope missing space in metadata".to_owned(),
-                details: serde_json::Value::Null,
-            })?;
         let uid = metadata
             .uid
             .as_ref()
@@ -318,7 +307,6 @@ impl DataCard {
                 details: serde_json::Value::Null,
             })?;
         Ok(Self {
-            space: space.to_string(),
             name: metadata.name.to_string(),
             version,
             uid: uid.to_string(),
@@ -405,7 +393,6 @@ impl DataCard {
     /// # Arguments
     /// * `data` - Raw framework data, a `DataInterface`, a Python subclass of
     ///   `DataInterface`, or a `CardRef` with kind `Artifact`.
-    /// * `space` - Optional card space. Defaults to `default`.
     /// * `name` - Optional card name. Defaults to `data`.
     /// * `version` - Optional semantic version. Defaults to `0.1.0`.
     /// * `uid` - Optional `UUIDv7` card UID. Defaults to a generated UID.
@@ -420,14 +407,13 @@ impl DataCard {
     /// conversion, or schema inference fails, or when a split label, split
     /// column, or target column is invalid or missing from the schema.
     #[new]
-    #[pyo3(signature = (data, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, splits=None, target_columns=None))]
+    #[pyo3(signature = (data, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, splits=None, target_columns=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the DataCard() Python constructor"
     )]
     pub fn __new__(
         data: &Bound<'_, PyAny>,
-        space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
         uid: Option<&str>,
@@ -464,18 +450,15 @@ impl DataCard {
             metadata.declare_supervision(splits, target_columns)?;
         }
 
-        let mut resolved_space = space.map(str::to_owned);
         let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
         let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
         crate::identity::apply_repo_defaults(
             &CardKind::Data,
-            &mut resolved_space,
             &mut resolved_labels,
             &mut resolved_annotations,
         );
 
         Ok(Self {
-            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("data").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
@@ -545,18 +528,6 @@ impl DataCard {
         Err(WyrdPyError::validation(
             "DataCard has no live local data attached",
         ))
-    }
-
-    /// Return the `DataCard` space.
-    #[getter]
-    pub fn space(&self) -> &str {
-        &self.space
-    }
-
-    /// Set the `DataCard` space.
-    #[setter]
-    pub fn set_space(&mut self, value: String) {
-        self.space = value;
     }
 
     /// Return the `DataCard` name.
@@ -1112,7 +1083,6 @@ mod tests {
                 .expect("static annotation value is valid"),
         );
         let card = DataCard {
-            space: "default".to_string(),
             name: "data".to_string(),
             version: "0.1.0".to_string(),
             uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_string(),
@@ -1183,7 +1153,6 @@ mod tests {
 apiVersion: wyrd/v1
 kind: Data
 metadata:
-  space: prod
   name: churn-train
   version: "1.0.0"
   uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
@@ -1226,7 +1195,6 @@ spec:
     #[test]
     fn as_card_ref_returns_err_for_empty_name() {
         let card = DataCard {
-            space: "default".to_string(),
             name: String::new(),
             version: "0.1.0".to_string(),
             uid: String::new(),
@@ -1245,7 +1213,6 @@ spec:
     #[test]
     fn as_card_ref_returns_err_for_invalid_version() {
         let card = DataCard {
-            space: "default".to_string(),
             name: "my-dataset".to_string(),
             version: "not-semver".to_string(),
             uid: String::new(),
@@ -1269,7 +1236,6 @@ spec:
             LabelValue::new("churn").expect("static label value is valid"),
         );
         let card = DataCard {
-            space: "default".to_string(),
             name: "data".to_string(),
             version: "0.1.0".to_string(),
             uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_string(),

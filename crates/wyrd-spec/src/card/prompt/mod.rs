@@ -68,7 +68,7 @@ pub(crate) mod prompt_support {
         prompt
     }
 
-    /// The `support_prompt` version `1.0.0` Prompt Card in the `default` space
+    /// The `support_prompt` version `1.0.0` Prompt Card
     /// wrapping `spec`, as the boundary tests store it.
     ///
     /// # Panics

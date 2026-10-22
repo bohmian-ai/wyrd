@@ -288,7 +288,7 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
@@ -364,7 +364,6 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("test-service").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

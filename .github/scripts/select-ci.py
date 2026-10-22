@@ -20,7 +20,8 @@ WYRD_CARGO_METADATA names a prepared `cargo metadata` document for self-tests.
 `ci_jobs` is the JSON matrix of the Linux `ci` job: one entry per parallel job,
 each running its space-separated `lanes` and restoring the Rust cache named by
 `cache`. The complete gate runs one job per `gate:*` shard listed in mise.toml,
-so every lane runs exactly once. The `deps` job builds the workspace tests and
+so every lane runs exactly once; a partial run groups its selected lanes into
+the same shards, so its jobs run in parallel as the gate's do. The `deps` job builds the workspace tests and
 saves their dependencies as the shared `test` cache before any shard starts; `save` marks the one shard that refreshes
 each other cache from main.
 """
@@ -116,6 +117,8 @@ IDENTITY_PACKAGES = {
 }
 CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-ai"}
+# The Rust SDK package whose story journeys test:rust-sdk:journey runs.
+RUST_SDK_JOURNEY = {"wyrd-ai"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
 # Each Rust test family is a directory tree; scripts/run-family-tests.sh
 # uses the same prefixes.
@@ -144,10 +147,16 @@ def read_families(workspace):
 SHARD_CACHE = {"gate:checks": "clippy", "gate:typescript": "napi"}
 
 
+def gate_shards(root):
+    """Return each `gate:*` shard and its lanes, in mise.toml's gate order."""
+    with open(os.path.join(root, "mise.toml"), "rb") as manifest:
+        tasks = tomllib.load(manifest)["tasks"]
+    return {shard: tasks[shard]["depends"] for shard in tasks["gate"]["depends"]}
+
+
 def gate_jobs(root):
     """Return one ci job per `gate:*` shard, in mise.toml's gate order."""
-    with open(os.path.join(root, "mise.toml"), "rb") as manifest:
-        shards = tomllib.load(manifest)["tasks"]["gate"]["depends"]
+    shards = gate_shards(root)
     jobs = [
         {"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")}
         for shard in shards
@@ -157,27 +166,36 @@ def gate_jobs(root):
     return jobs
 
 
-def ci_jobs(sel, outputs):
-    """Return the ci matrix for a change that does not take the complete gate."""
+def ci_jobs(sel, outputs, root):
+    """Return the ci matrix for a change that does not take the complete gate.
+
+    Selected lanes run in parallel jobs grouped as the gate shards group them,
+    so a partial run never takes longer than the complete gate. A job is named
+    after its shard without the `gate:` prefix and runs only its selected
+    lanes; a lane no shard lists runs as its own job.
+    """
     if outputs.get("bifrost_only"):
         return [{"name": "bifrost", "lanes": "verify:bifrost", "cache": "test"}]
-    jobs = []
-    if sel.lanes:
-        jobs.append(
-            {
-                "name": "lanes",
-                "lanes": " ".join(["check", "check:deps", *sel.lanes]),
-                "cache": "test",
-            }
-        )
+    lanes = list(sel.lanes)
+    if lanes:
+        lanes = ["check", "check:deps", *lanes]
     if sel.flags.get("identity"):
-        jobs.append(
-            {"name": "identity", "lanes": "test:identity:journey", "cache": "test"}
-        )
+        lanes.append("test:identity:journey")
     if sel.flags.get("storage"):
-        jobs.append(
-            {"name": "storage", "lanes": "test:storage:matrix", "cache": "test"}
-        )
+        lanes.append("test:storage:matrix")
+    jobs = []
+    for shard, members in gate_shards(root).items():
+        chosen = [lane for lane in members if lane in lanes]
+        if chosen:
+            jobs.append(
+                {
+                    "name": shard.removeprefix("gate:"),
+                    "lanes": " ".join(chosen),
+                    "cache": SHARD_CACHE.get(shard, "test"),
+                }
+            )
+        lanes = [lane for lane in lanes if lane not in members]
+    jobs.extend({"name": lane, "lanes": lane, "cache": "test"} for lane in lanes)
     return jobs
 
 
@@ -380,6 +398,8 @@ def select(paths, root):
         sel.lane("test:bifrost:gate", f"Bifrost journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & GATEWAY_JOURNEY):
         sel.lane("test:gateway:gate", f"gateway journeys exercise {hits[0]}")
+    if hits := sorted(affected.keys() & RUST_SDK_JOURNEY):
+        sel.lane("test:rust-sdk:journey", f"story journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & EXAMPLE_PACKAGES):
         sel.lane("check:examples", f"examples build {hits[0]}")
     if "wyrd-rust-examples" in affected:
@@ -443,7 +463,7 @@ def main():
         "rust_packages": "" if full_gate else outputs["rust_packages"],
         "ci_lanes": "" if full_gate else " ".join(sel.lanes),
         "ci_jobs": json.dumps(
-            gate_jobs(root) if full_gate else ci_jobs(sel, outputs),
+            gate_jobs(root) if full_gate else ci_jobs(sel, outputs, root),
             separators=(",", ":"),
         ),
     }

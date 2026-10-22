@@ -174,6 +174,9 @@ check_selection "SDK error source regenerates the error reference" "full_gate=fa
   "sdks/wyrd-sdk-python/src/lib.rs"
 check_selection "Rust test source leaves the docs alone" "full_gate=false docs=false" \
   "crates/shared/wyrd-client/tests/integration/transport/http.rs"
+check_selection "Rust SDK change selects its story journeys" \
+  "full_gate=false ci_lanes~test:rust-sdk:journey ci_lanes~test:gateway:gate" \
+  "sdks/wyrd-sdk-rust/src/lib.rs"
 check_selection "identity fixture selects the identity journey" "full_gate=false identity=true" \
   "tests/fixtures/identity/dex-config.yaml"
 
@@ -194,15 +197,16 @@ check_jobs() {
 
 gate_shards="$(python3 -c 'import tomllib; print(" ".join(tomllib.load(open("'"$SCRIPT_DIR/../../../mise.toml"'","rb"))["tasks"]["gate"]["depends"]))')"
 check_jobs "full gate runs one job per gate shard" "$gate_shards" "Cargo.lock"
-check_jobs "server change runs its lanes, identity, and storage" "lanes identity storage" \
+check_jobs "server change runs its lanes in parallel shard jobs" \
+  "checks rust:families rust:gateway rust:bifrost rust:journeys storage python typescript" \
   "crates/wyrd/wyrd-server/src/state.rs"
-check_jobs "Rust-only leaf runs only its lanes" "lanes" "crates/wyrd/wyrd/src/lib.rs"
+check_jobs "Rust-only leaf runs only its lanes" "checks rust:families" "crates/wyrd/wyrd/src/lib.rs"
 check_jobs "Bifrost-only runs the Bifrost gate" "bifrost" \
   "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
 check_jobs "docs-only change runs no ci job" "" "docs/src/index.mdx"
-check_jobs "identity fixture runs only the identity journey" "identity" \
+check_jobs "identity fixture runs only the identity journey" "rust:journeys" \
   "tests/fixtures/identity/dex-config.yaml"
-check_jobs "TypeScript SDK change runs its lanes and identity" "lanes identity" \
+check_jobs "TypeScript SDK change runs its lanes and identity" "checks rust:journeys typescript" \
   "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
 if [[ "$(cd "$SCRIPT_DIR/../../.." && GITHUB_OUTPUT=/dev/stdout python3 .github/scripts/select-ci.py --gate \
   | cut -d= -f2- | python3 -c 'import json,sys; print(" ".join(j["name"] for j in json.load(sys.stdin)))')" == "$gate_shards" ]]; then

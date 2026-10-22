@@ -55,7 +55,8 @@ test("service graph declares and pulls", async ({ cards, desk }) => {
 
 test("runs the Quickstart script from a directory holding only its Cards", async ({ server: _ }) => {
   const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
-  for (const file of ["no-refund-promise.yaml", "support-reply.yaml"]) cpSync(join(QUICKSTART, file), join(reader, file));
+  for (const file of ["no-refund-promise.yaml", "support-reply.yaml"])
+    cpSync(join(QUICKSTART, file), join(reader, file));
   const ref = (kind: string, name: string) => `default/${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
   const printed = () =>
     execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
@@ -88,7 +89,10 @@ test("declares a ready verification state", async ({ server, model: _ }) => {
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
   const verifier = join(quickstart, "no-refund-promise.yaml");
-  writeFileSync(verifier, readFileSync(verifier, "utf8").replace("expected: guaranteed refund", "expected: guaranteed"));
+  writeFileSync(
+    verifier,
+    readFileSync(verifier, "utf8").replace("expected: guaranteed refund", "expected: guaranteed"),
+  );
   await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_REGISTRY_409_SPEC_DRIFT" });
   rmSync(verifier);
   await expect(WyrdState.declare(service)).rejects.toMatchObject({ code: "WYRD_LOADER_400_INVALID_ENVELOPE" });

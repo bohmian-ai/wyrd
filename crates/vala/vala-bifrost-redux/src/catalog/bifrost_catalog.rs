@@ -2690,6 +2690,74 @@ mod production_pin_tests {
         tasks.len()
     }
 
+    /// Registers `vala.datasets.<name>` with one nullable `value` column and
+    /// fast-appends one fixture data file, returning the table's binding.
+    ///
+    /// # Panics
+    /// Panics when registration, loading, or the append fails.
+    async fn register_with_one_file(
+        catalog: &BifrostCatalog,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> crate::catalog::TenantTableBinding {
+        catalog
+            .register_dataset(
+                tenant,
+                wyrd_spec::auth::Attribution::unresolved(),
+                table.clone(),
+                vec![arrow::datatypes::Field::new(
+                    "value",
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )],
+                None,
+                CompactionRegistration::default(),
+            )
+            .await
+            .expect("dataset registers");
+
+        let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+            .expect("binding resolves");
+        let physical = catalog
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("physical table loads");
+        let lower_micros = 1_787_493_600_000_000_i64;
+        let partition = crate::catalog::layout::TimeGranularity::Hour
+            .bucket(
+                chrono::DateTime::from_timestamp_micros(lower_micros)
+                    .expect("fixture instant is representable"),
+            )
+            .expect("fixture instant buckets");
+        let location = physical.metadata().location().to_owned();
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_path(format!("{location}/data/pinned.parquet"))
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .partition(iceberg::spec::Struct::from_iter([Some(
+                partition.iceberg_partition_literal(),
+            )]))
+            .record_count(1)
+            .file_size_in_bytes(1_024)
+            .partition_spec_id(physical.metadata().default_partition_spec_id())
+            .sort_order_id(
+                i32::try_from(physical.metadata().default_sort_order_id())
+                    .expect("fixture sort order id fits i32"),
+            )
+            .build()
+            .expect("fixture data file builds");
+        let transaction = Transaction::new(&physical);
+        let action = transaction.fast_append().add_data_files([data_file]);
+        let applied = ApplyTransactionAction::apply(action, transaction).expect("append applies");
+        applied
+            .commit(catalog.iceberg_catalog().as_ref())
+            .await
+            .expect("fast append commits");
+
+        binding
+    }
+
     /// A pinned provider resolves only against the snapshot it names.
     ///
     /// A follower resolves its own catalog handle, so without pinning its leaf
@@ -2726,61 +2794,7 @@ mod production_pin_tests {
 
             let tenant = fixture.data_tenant_id();
             let table = TableRef::new(BifrostNamespace::Datasets, "pinned_provider");
-            catalog
-                .register_dataset(
-                    tenant,
-                    wyrd_spec::auth::Attribution::unresolved(),
-                    table.clone(),
-                    vec![arrow::datatypes::Field::new(
-                        "value",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    )],
-                    None,
-                    CompactionRegistration::default(),
-                )
-                .await
-                .expect("dataset registers");
-
-            let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
-                .expect("binding resolves");
-            let physical = catalog
-                .iceberg_catalog()
-                .load_table(&binding.table_ident())
-                .await
-                .expect("physical table loads");
-            let lower_micros = 1_787_493_600_000_000_i64;
-            let partition = crate::catalog::layout::TimeGranularity::Hour
-                .bucket(
-                    chrono::DateTime::from_timestamp_micros(lower_micros)
-                        .expect("fixture instant is representable"),
-                )
-                .expect("fixture instant buckets");
-            let location = physical.metadata().location().to_owned();
-            let data_file = iceberg::spec::DataFileBuilder::default()
-                .content(iceberg::spec::DataContentType::Data)
-                .file_path(format!("{location}/data/pinned.parquet"))
-                .file_format(iceberg::spec::DataFileFormat::Parquet)
-                .partition(iceberg::spec::Struct::from_iter([Some(
-                    partition.iceberg_partition_literal(),
-                )]))
-                .record_count(1)
-                .file_size_in_bytes(1_024)
-                .partition_spec_id(physical.metadata().default_partition_spec_id())
-                .sort_order_id(
-                    i32::try_from(physical.metadata().default_sort_order_id())
-                        .expect("fixture sort order id fits i32"),
-                )
-                .build()
-                .expect("fixture data file builds");
-            let transaction = Transaction::new(&physical);
-            let action = transaction.fast_append().add_data_files([data_file]);
-            let applied =
-                ApplyTransactionAction::apply(action, transaction).expect("append applies");
-            applied
-                .commit(catalog.iceberg_catalog().as_ref())
-                .await
-                .expect("fast append commits");
+            let binding = register_with_one_file(&catalog, tenant, &table).await;
 
             let pinned = pin_current(&catalog, tenant, &table).await;
             let snapshot_id = pinned
@@ -2802,6 +2816,97 @@ mod production_pin_tests {
                     .await
                     .is_err(),
                 "an unpublished snapshot must fail to resolve rather than serve the current one"
+            );
+        });
+    }
+
+    /// A pin taken before a schema and partition-spec revision keeps reading
+    /// the snapshot it named: its schema is the one that snapshot was written
+    /// under, not the revised current schema, and its file still plans under
+    /// the retained spec.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, commit, or pin fails, when the
+    /// pinned schema shows the revised column, or when the file stops planning.
+    #[test]
+    fn pinned_snapshot_survives_schema_and_spec_revisions() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "pinned_revision");
+            let binding = register_with_one_file(&catalog, tenant, &table).await;
+            let snapshot_id = pin_current(&catalog, tenant, &table)
+                .await
+                .snapshot_id
+                .expect("a committed table has a snapshot");
+
+            let physical = catalog
+                .iceberg_catalog()
+                .load_table(&binding.table_ident())
+                .await
+                .expect("physical table loads");
+            let metadata = physical.metadata();
+            let current = metadata.current_schema();
+            let schema = iceberg::spec::Schema::builder()
+                .with_schema_id(current.schema_id() + 1)
+                .with_fields(
+                    current
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .cloned()
+                        .chain([Arc::new(iceberg::spec::NestedField::optional(
+                            metadata.last_column_id() + 1,
+                            "note",
+                            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                        ))]),
+                )
+                .build()
+                .expect("revised schema builds");
+            let spec = iceberg::spec::UnboundPartitionSpec::builder().build();
+            let transaction = Transaction::new(&physical);
+            let action = [
+                iceberg::TableUpdate::AddSchema { schema },
+                iceberg::TableUpdate::SetCurrentSchema { schema_id: -1 },
+                iceberg::TableUpdate::AddSpec { spec },
+                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ]
+            .into_iter()
+            .fold(
+                transaction.apply_updates(),
+                iceberg::transaction::ApplyUpdatesAction::update,
+            );
+            ApplyTransactionAction::apply(action, transaction)
+                .expect("revision applies")
+                .commit(catalog.iceberg_catalog().as_ref())
+                .await
+                .expect("revision commits");
+            catalog.evict_committed_revision(&table, tenant);
+
+            let pinned = catalog
+                .pinned_provider(&table, tenant, snapshot_id)
+                .await
+                .expect("the pinned snapshot still resolves after the revision");
+            let pinned_schema = datafusion::datasource::TableProvider::schema(&pinned);
+            assert!(
+                pinned_schema.field_with_name("value").is_ok()
+                    && pinned_schema.field_with_name("note").is_err(),
+                "the pin reads the schema its snapshot was written under: {pinned_schema:?}"
+            );
+            assert_eq!(
+                planned_file_count(&catalog, &binding.table_ident()).await,
+                1,
+                "the file written under the retained spec still plans"
             );
         });
     }

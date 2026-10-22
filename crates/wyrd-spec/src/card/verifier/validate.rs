@@ -405,7 +405,15 @@ where
                 validate_operator(&trace.operator, &path)
             }
             Check::Agent(call) => self.validate_agent(call, position, &path),
-            Check::Code(call) => self.validate_code(call, position, &path),
+            Check::Code(check) => {
+                self.validate_code(&check.call, position, &path)?;
+                match &check.response_format {
+                    Some(format) => Verdict::response_format(format)
+                        .map(drop)
+                        .map_err(|error| format_refusal(error, &path)),
+                    None => Ok(()),
+                }
+            }
             Check::Drift(drift) => self.validate_drift(drift, &path),
         }
     }
@@ -572,14 +580,16 @@ where
                 ));
             }
             let produces_verdict = match &resolved.prompt.response_type {
-                ResponseType::JsonSchema { schema, .. } => fits(schema, &verdict_schema()),
+                ResponseType::JsonSchema { schema, .. } => {
+                    fits(schema, &verdict_schema()) && declares_data_object(schema)
+                }
                 ResponseType::Text => false,
             };
             if !produces_verdict {
                 return Err(invalid(
                     "check_agent_schema",
                     path,
-                    "check Agent response schema must produce a Verdict: outcome passed, failed, or inconclusive; a string reason; and citations of slot and locator",
+                    "check Agent response schema must produce a Verdict: outcome passed, failed, or inconclusive; a string reason; citations of slot and locator; and, when it declares data, a required object. Declare `response_format: verdict` on the Prompt to generate it",
                 ));
             }
         }
@@ -771,6 +781,30 @@ where
             },
             Action::Code(_) => None,
         }
+    }
+}
+
+/// Returns whether a response schema that declares `data` also requires it
+/// as an object; one that does not declare it passes.
+fn declares_data_object(schema: &Value) -> bool {
+    let Some(data) = schema.pointer("/properties/data") else {
+        return true;
+    };
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|name| name == "data"));
+    required && data.get("type").and_then(Value::as_str) == Some("object")
+}
+
+/// Maps a `verdict` format refusal to the check's validation error, keeping
+/// the refused field under the check path.
+fn format_refusal(error: skald_spec::SkaldError, path: &str) -> WyrdError {
+    match error {
+        skald_spec::SkaldError::PromptInvalid { field, message } => {
+            invalid("check_response_format", &format!("{path}.{field}"), message)
+        }
+        other => invalid("check_response_format", path, other),
     }
 }
 
@@ -1619,7 +1653,12 @@ mod tests {
         let compatible = [
             verdict_schema(),
             variant,
-            super::verdict_schema(),
+            Value::Object(
+                crate::verification::execution::Verdict::response_format(
+                    &skald_spec::NamedResponseFormat::Name("verdict".to_owned()),
+                )
+                .expect("the plain format"),
+            ),
             schema(
                 "/properties/reason",
                 json!({"type": "string", "allOf": [{"maxLength": 500}]}),
@@ -1725,6 +1764,189 @@ mod tests {
             });
             assert_eq!(outcome.is_ok(), valid, "{outcome:?}");
         }
+    }
+
+    /// Named `verdict` formats: plain and expanded forms validate for check
+    /// Agents (inline portable and native Prompts, whole-Verifier and step
+    /// position) and code checks, generate the canonical response schema,
+    /// keep the authored form, and refuse unknown names, invalid data
+    /// schemas, handwritten `data` that is optional or not an object, and a
+    /// `response_format` on a code action.
+    ///
+    /// # Panics
+    /// Panics when a valid declaration is refused, an invalid one is
+    /// accepted, or the generated schema or authored form is wrong.
+    #[test]
+    fn named_verdict_formats_validate() {
+        let data = json!({"type": "object", "properties": {"score": {"type": "number"}, "category": {"type": "string"}}, "required": ["score", "category"], "additionalProperties": false});
+        let named = [
+            json!("verdict"),
+            json!({"kind": "verdict"}),
+            json!({"kind": "verdict", "data": data}),
+        ];
+        for format in &named {
+            let body = with(
+                review(),
+                "/requirements/2/check/agent",
+                judge(format.clone()),
+            );
+            let spec = parse(&body);
+            spec.validate()
+                .unwrap_or_else(|error| panic!("{format}: {error:?}"));
+            assert_eq!(
+                serde_json::to_value(&spec).expect("json")["requirements"][2]["check"]["agent"]["prompt"]
+                    ["response_format"],
+                *format,
+                "the authored format is kept"
+            );
+            let crate::card::verifier::Check::Agent(call) = &spec.requirements[2].check else {
+                panic!("agent check");
+            };
+            let prompt = call
+                .agent
+                .as_inline()
+                .expect("inline")
+                .prompt
+                .as_inline()
+                .expect("inline prompt");
+            let skald_spec::ResponseType::JsonSchema { schema, .. } = &prompt.response_type else {
+                panic!("{format}: a named format resolves to structured output");
+            };
+            assert_eq!(
+                schema["required"]
+                    .as_array()
+                    .expect("required")
+                    .iter()
+                    .any(|name| name == "data"),
+                format.get("data").is_some()
+            );
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "the Verdict envelope stays closed"
+            );
+            assert_eq!(schema.pointer("/properties/data"), format.get("data"));
+
+            let native = json!({"provider": "anthropic", "model": "claude", "format": "messages",
+                "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "${media:policy}"}}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]}]},
+                "response_format": format});
+            let mut native_judge = judge(format.clone());
+            native_judge["prompt"] = native;
+            let body = with(review(), "/requirements/2/check/agent", native_judge);
+            assert!(
+                serde_json::from_value::<super::super::VerifierSpec>(body).is_ok(),
+                "{format}: native named Prompt decodes"
+            );
+
+            let body = with(
+                review(),
+                "/requirements/3/check/response_format",
+                format.clone(),
+            );
+            let spec = parse(&body);
+            spec.validate()
+                .unwrap_or_else(|error| panic!("{format}: {error:?}"));
+            assert_eq!(
+                serde_json::to_value(&spec).expect("json")["requirements"][3]["check"]["response_format"],
+                *format
+            );
+
+            let mut stepped = review();
+            stepped["steps"][1]["requirements"].as_array_mut().expect("step requirements").push(json!({
+                "id": "grounded", "statement": "Findings are grounded",
+                "check": {"kind": "agent", "agent": agent(&[], json!("{{findings}}"), Some(format.clone())),
+                    "inputs": {"findings": "steps.findings.output"}}}));
+            stepped["steps"][1]["requirements"].as_array_mut().expect("step requirements").push(json!({
+                "id": "counted-step", "statement": "Counted",
+                "check": {"kind": "code", "entrypoint": "check", "source": {"inline": "def check(): pass"}, "response_format": format}}));
+            parse(&stepped)
+                .validate()
+                .unwrap_or_else(|error| panic!("{format}: {error:?}"));
+        }
+
+        for (format, field) in [
+            (json!("score"), "response_format"),
+            (json!({"kind": "judgment"}), "response_format"),
+            (
+                json!({"kind": "verdict", "data": {"type": "string"}}),
+                "response_format.data.type",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"type": "object", "properties": {"a": {"type": 5}}}}),
+                "response_format.data.properties.a.type",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"type": "object", "definitions": {"Citation": {"type": "string"}}}}),
+                "response_format.data.definitions.Citation",
+            ),
+        ] {
+            let body = with(
+                review(),
+                "/requirements/3/check/response_format",
+                format.clone(),
+            );
+            match parse(&body).validate() {
+                Err(WyrdError::Validation { details, .. }) => {
+                    assert_eq!(details["rule"], "check_response_format", "{format}");
+                    let path = details["path"].as_str().expect("path");
+                    assert!(
+                        path.ends_with(&format!(".check.{field}")),
+                        "{format}: {path}"
+                    );
+                }
+                other => panic!("{format}: expected a code-check refusal, got {other:?}"),
+            }
+            let body = with(
+                review(),
+                "/requirements/2/check/agent",
+                judge(format.clone()),
+            );
+            assert!(
+                serde_json::from_value::<super::super::VerifierSpec>(body).is_err(),
+                "{format}: an invalid Prompt format does not decode"
+            );
+        }
+        for malformed in [json!({"kind": "verdict", "extra": true}), json!(7)] {
+            let body = with(
+                review(),
+                "/requirements/3/check/response_format",
+                malformed.clone(),
+            );
+            assert!(
+                serde_json::from_value::<super::super::VerifierSpec>(body).is_err(),
+                "{malformed}"
+            );
+        }
+
+        let mut handwritten = verdict_schema();
+        handwritten["properties"]["data"] = data.clone();
+        handwritten["required"] = json!(["outcome", "reason", "citations", "data"]);
+        let body = with(
+            review(),
+            "/requirements/2/check/agent",
+            judge(handwritten.clone()),
+        );
+        parse(&body)
+            .validate()
+            .expect("a handwritten schema requiring object data");
+        for (pointer, value) in [
+            ("/required", json!(["outcome", "reason", "citations"])),
+            ("/properties/data", json!({"type": ["object", "null"]})),
+            ("/properties/data", json!({"type": "string"})),
+        ] {
+            let body = with(
+                review(),
+                "/requirements/2/check/agent",
+                judge(with(handwritten.clone(), pointer, value.clone())),
+            );
+            assert_eq!(rule(&body), "check_agent_schema", "{pointer} {value}");
+        }
+
+        let mut action = review();
+        action["steps"][2]["action"]["response_format"] = json!("verdict");
+        assert!(
+            serde_json::from_value::<super::super::VerifierSpec>(action).is_err(),
+            "code actions take no response_format"
+        );
     }
 
     /// Self- and mutually-referencing schemas finish validating through both

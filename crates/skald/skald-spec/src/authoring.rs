@@ -91,7 +91,7 @@ pub enum ResponseFormat {
 ///
 /// Skald owns no names: [`AuthoredPrompt::compile_with`] asks the host to
 /// resolve one, and a Prompt compiled without a resolver cannot render.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum NamedResponseFormat {
@@ -126,6 +126,39 @@ impl NamedResponseFormat {
     }
 }
 
+impl<'de> Deserialize<'de> for NamedResponseFormat {
+    /// Decodes a string as the scalar form and an object as the expanded
+    /// form.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for another JSON type, a missing
+    /// `kind`, or a member other than `kind` and `data`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The strict wire shape of the expanded form.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Expanded {
+            /// The format name.
+            kind: String,
+            /// The custom-data schema.
+            #[serde(default)]
+            data: Option<Map<String, Value>>,
+        }
+        match Value::deserialize(deserializer)? {
+            Value::String(name) => Ok(Self::Name(name)),
+            object @ Value::Object(_) => {
+                let Expanded { kind, data } =
+                    serde_json::from_value(object).map_err(serde::de::Error::custom)?;
+                Ok(Self::Expanded { kind, data })
+            }
+            _ => Err(serde::de::Error::custom(
+                "a named response format is a name or an object with `kind`",
+            )),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for ResponseFormat {
     /// Decodes a string or an object holding `kind` as a named format, and
     /// any other object as a JSON Schema.
@@ -133,23 +166,15 @@ impl<'de> Deserialize<'de> for ResponseFormat {
     /// # Errors
     ///
     /// Returns the deserializer's error for another JSON type and for a
-    /// `kind` object with members other than `kind` and `data`.
+    /// named format [`NamedResponseFormat`] refuses.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Expanded {
-            kind: String,
-            #[serde(default)]
-            data: Option<Map<String, Value>>,
-        }
         match Value::deserialize(deserializer)? {
-            Value::String(name) => Ok(Self::Named(NamedResponseFormat::Name(name))),
-            Value::Object(object) if object.contains_key("kind") => {
-                let Expanded { kind, data } = serde_json::from_value(Value::Object(object))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::Named(NamedResponseFormat::Expanded { kind, data }))
+            Value::Object(schema) if !schema.contains_key("kind") => Ok(Self::Schema(schema)),
+            named @ (Value::String(_) | Value::Object(_)) => {
+                NamedResponseFormat::deserialize(named)
+                    .map(Self::Named)
+                    .map_err(serde::de::Error::custom)
             }
-            Value::Object(schema) => Ok(Self::Schema(schema)),
             _ => Err(serde::de::Error::custom(
                 "response_format is a JSON Schema object or a named format",
             )),

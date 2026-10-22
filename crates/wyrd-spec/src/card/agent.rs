@@ -139,6 +139,7 @@ impl BuiltinTool {
 pub struct AgentSpec {
     /// Prompt reference preserved on disk and resolved by `skald-agent`.
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
+    #[serde(deserialize_with = "inline_prompt")]
     pub prompt: InlineableRef<skald_spec::Prompt>,
     /// Declared execution route; invocations may replace it whole.
     pub execution_route: ExecutionRoute,
@@ -151,6 +152,27 @@ pub struct AgentSpec {
     /// Continuous verification bindings owned by this standalone Agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_by: Vec<VerificationBinding>,
+}
+
+/// Decodes the Agent's Prompt reference, compiling an inline Prompt through
+/// [`compile_prompt`](crate::card::prompt::compile_prompt) so a named
+/// `response_format` resolves exactly as in a Prompt Card.
+///
+/// # Errors
+/// Returns the deserializer's error for an undecodable reference and the
+/// compiler's refusal for an inline Prompt.
+fn inline_prompt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<InlineableRef<skald_spec::Prompt>, D::Error> {
+    match InlineableRef::<skald_spec::Prompt>::deserialize(deserializer)? {
+        InlineableRef::Inline(prompt) => {
+            let authored = prompt.authored().map_err(serde::de::Error::custom)?;
+            crate::card::prompt::compile_prompt(&authored)
+                .map(|prompt| InlineableRef::Inline(Box::new(prompt)))
+                .map_err(serde::de::Error::custom)
+        }
+        other => Ok(other),
+    }
 }
 
 fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {

@@ -182,6 +182,35 @@ pub trait CheckExecutor: Send + Sync {
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
 }
 
+/// Decodes a check's raw `response` as the Verdict its declared `schema`
+/// describes.
+///
+/// The whole response must satisfy the exact declared schema, decode as a
+/// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
+/// and code checks share this rule; a refusal names the failing location
+/// or limit, never the response contents.
+///
+/// # Errors
+/// Returns [`BlockError::Terminal`], which makes the requirement
+/// inconclusive, for an invalid schema, a response the schema refuses, a
+/// response that is not a Verdict, or data beyond its bounds.
+pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockError> {
+    let terminal = |reason: String| BlockError::Terminal { reason };
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
+    if let Some(error) = validator.iter_errors(&response).next() {
+        return Err(terminal(format!(
+            "the check response violates its declared Verdict format at `{}` (schema `{}`)",
+            error.instance_path(),
+            error.schema_path()
+        )));
+    }
+    let verdict: Verdict = serde_json::from_value(response)
+        .map_err(|_| terminal("the check response is not a Verdict".to_owned()))?;
+    verdict.check_data_bounds().map_err(terminal)?;
+    Ok(verdict)
+}
+
 #[cfg(test)]
 mod tests {
     //! Executor seam calls and the tool-record handoff into step results.

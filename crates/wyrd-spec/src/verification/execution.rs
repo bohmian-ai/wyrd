@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use skald_spec::MediaFormat;
+use serde_json::{Map, Value};
+use skald_spec::{MediaFormat, NamedResponseFormat, SkaldError, check_output_schema};
 
 use super::{
     DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
@@ -234,6 +234,12 @@ pub struct RequirementResult {
     /// Validated original-evidence citations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<Citation>,
+    /// Custom data an Agent or code check returned under its declared
+    /// `verdict` format; absent when none was declared or the output was
+    /// rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<Map<String, Value>>")]
+    pub data: Option<Map<String, Value>>,
     /// Check-specific detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<RequirementDetail>,
@@ -372,7 +378,21 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
 }
 
+/// Most bytes of compact UTF-8 JSON one Verdict's custom `data` may take.
+pub const MAX_VERDICT_DATA_BYTES: usize = 65_536;
+
+/// Most nested containers one Verdict's custom `data` may hold; the root
+/// object counts as one.
+pub const MAX_VERDICT_DATA_DEPTH: usize = 16;
+
+/// The name of the generated Verdict response format.
+pub const VERDICT_FORMAT: &str = "verdict";
+
 /// The closed schema every Agent and code check returns.
+///
+/// `data` is present exactly when the check declares a custom-data schema
+/// through the `verdict` response format; the server validates the whole
+/// response against that declaration before decoding it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -384,6 +404,129 @@ pub struct Verdict {
     /// Original-evidence locations supporting it; a pass without a valid
     /// citation becomes inconclusive.
     pub citations: Vec<Citation>,
+    /// Custom data the check's declared format requires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<Map<String, Value>>")]
+    pub data: Option<Map<String, Value>>,
+}
+
+impl Verdict {
+    /// Resolves a `verdict` response format to the schema its responses
+    /// must satisfy.
+    ///
+    /// The plain form is the generated closed Verdict without `data`; an
+    /// expanded `data` schema becomes the required `data` member, its
+    /// `$defs` and `definitions` moved to the root so its local `$ref`s still
+    /// resolve. This is the resolver Prompt compilation and code-check
+    /// validation share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] at `response_format` for a name
+    /// other than `verdict`, and at `response_format.data...` for a data
+    /// schema that is not a valid object JSON Schema or whose definitions
+    /// collide with the Verdict's own.
+    pub fn response_format(format: &NamedResponseFormat) -> Result<Map<String, Value>, SkaldError> {
+        let invalid = |field: &str, message: &str| SkaldError::PromptInvalid {
+            field: field.to_owned(),
+            message: message.to_owned(),
+        };
+        if format.name() != VERDICT_FORMAT {
+            return Err(invalid(
+                "response_format",
+                &format!(
+                    "unknown response format `{}`; the named format is `verdict`",
+                    format.name()
+                ),
+            ));
+        }
+        let Ok(Value::Object(mut schema)) =
+            serde_json::to_value(crate::schema::schema_for::<Self>())
+        else {
+            unreachable!("a generated root schema serializes to a JSON object");
+        };
+        let required = |schema: &mut Map<String, Value>| {
+            schema
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+                .map(|required| required.retain(|name| name != "data"))
+        };
+        required(&mut schema);
+        let properties = schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .expect("the generated Verdict schema declares properties");
+        properties.remove("data");
+        let Some(data) = format.data() else {
+            return Ok(schema);
+        };
+        check_output_schema(&Value::Object(data.clone()), "response_format.data", true)?;
+        let mut data = data.clone();
+        data.remove("$schema");
+        for keyword in ["$defs", "definitions"] {
+            let Some(Value::Object(definitions)) = data.remove(keyword) else {
+                continue;
+            };
+            let root = schema
+                .entry(keyword)
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("schema definitions are an object");
+            for (name, definition) in definitions {
+                if root.contains_key(&name) {
+                    return Err(invalid(
+                        &format!("response_format.data.{keyword}.{name}"),
+                        "this definition name is reserved by the Verdict schema; rename it",
+                    ));
+                }
+                root.insert(name, definition);
+            }
+        }
+        schema["properties"]["data"] = Value::Object(data);
+        schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+            .expect("the generated Verdict schema requires fields")
+            .push(Value::from("data"));
+        Ok(schema)
+    }
+
+    /// Refuses custom `data` beyond the fixed size and depth bounds.
+    ///
+    /// Size is the compact UTF-8 JSON encoding of `data` alone, with only
+    /// the escapes JSON requires; depth counts every object and array, the
+    /// root included. The message names the violated limit, never the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violated bound as a message when `data` exceeds
+    /// [`MAX_VERDICT_DATA_BYTES`] or [`MAX_VERDICT_DATA_DEPTH`].
+    pub fn check_data_bounds(&self) -> Result<(), String> {
+        let Some(data) = &self.data else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(data).map_or(usize::MAX, |encoded| encoded.len());
+        if bytes > MAX_VERDICT_DATA_BYTES {
+            return Err(format!(
+                "verdict data is {bytes} bytes; the limit is {MAX_VERDICT_DATA_BYTES} bytes of compact JSON"
+            ));
+        }
+        /// Containers in the deepest path through `value`.
+        fn depth(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+                Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+                _ => 0,
+            }
+        }
+        let nested = 1 + data.values().map(depth).max().unwrap_or(0);
+        if nested > MAX_VERDICT_DATA_DEPTH {
+            return Err(format!(
+                "verdict data nests {nested} containers; the limit is {MAX_VERDICT_DATA_DEPTH}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A location in an original input slot, never in scratch space.
@@ -548,6 +691,87 @@ mod tests {
                 "{record}"
             );
         }
+    }
+
+    /// Custom Verdict data obeys the inclusive size and depth bounds: exact
+    /// boundaries pass and one more byte or container fails, counting UTF-8
+    /// bytes, required JSON escapes, and wide arrays, with messages naming
+    /// the limit and never the data.
+    ///
+    /// # Panics
+    /// Panics when a boundary value is judged on the wrong side.
+    #[test]
+    fn custom_verdict_data_obeys_limits() {
+        let verdict = |data: Value| Verdict {
+            outcome: VerificationVerdict::Passed,
+            reason: "ok".to_owned(),
+            citations: Vec::new(),
+            data: Some(data.as_object().expect("object data").clone()),
+        };
+        let text = |unit: &str, count: usize, tail: &str| json!({"s": format!("{}{tail}", unit.repeat(count))});
+        let wide = |last: u32| {
+            let mut items = vec![json!(0); 32_763];
+            items.push(json!(last));
+            json!({"a": items})
+        };
+        let nested = |containers: usize| {
+            let mut value = json!(1);
+            for level in 1..containers {
+                value = if level % 2 == 0 {
+                    json!({"o": value})
+                } else {
+                    json!([value])
+                };
+            }
+            json!({"r": value})
+        };
+        for (data, fits) in [
+            (text("x", 65_528, ""), true),
+            (text("x", 65_529, ""), false),
+            (text("é", 32_764, ""), true),
+            (text("é", 32_764, "x"), false),
+            (text("\n", 32_764, ""), true),
+            (text("\n", 32_764, "x"), false),
+            (text("\u{1}", 10_921, "xx"), true),
+            (text("\u{1}", 10_921, "xxx"), false),
+            (wide(9), true),
+            (wide(10), true),
+            (wide(100), false),
+            (nested(16), true),
+            (nested(17), false),
+        ] {
+            let bytes = serde_json::to_vec(&data).expect("json").len();
+            match verdict(data).check_data_bounds() {
+                Ok(()) => assert!(fits, "{bytes} bytes must fail"),
+                Err(message) => {
+                    assert!(!fits, "{bytes} bytes must pass: {message}");
+                    assert!(
+                        message.contains("65536") || message.contains("16"),
+                        "{message}"
+                    );
+                    assert!(
+                        !message.contains("xxx") && !message.contains('é'),
+                        "{message}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_vec(&wide(10)).expect("json").len(),
+            MAX_VERDICT_DATA_BYTES
+        );
+        let plain = Verdict {
+            data: None,
+            ..verdict(json!({}))
+        };
+        assert_eq!(plain.check_data_bounds(), Ok(()));
+        assert!(
+            serde_json::to_value(&plain)
+                .expect("json")
+                .get("data")
+                .is_none(),
+            "absent data is omitted"
+        );
     }
 
     /// A delayed idempotency conflict is reported with the existing stable

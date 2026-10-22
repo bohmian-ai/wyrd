@@ -243,11 +243,7 @@ pub fn check_model(model: &str) -> SkaldResult<()> {
 /// the dotted path to the first offending keyword: the schema itself when it
 /// is not a JSON object, `$schema` for an unsupported meta-schema, `type` for
 /// a strict OpenAI non-object root, or the meta-validation error location.
-pub(crate) fn check_output_schema(
-    schema: &Value,
-    field: &str,
-    object_root: bool,
-) -> SkaldResult<()> {
+pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
     let Some(object) = schema.as_object() else {
         return Err(invalid(field, "an output schema is a JSON object"));
     };

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use skald_spec::MediaFormat;
 
 use crate::card::agent::AgentSpec;
@@ -472,6 +472,65 @@ pub struct CodeCall {
     pub inputs: BTreeMap<ParameterName, Reference>,
 }
 
+/// Sandboxed code in check position: a [`CodeCall`] plus the Verdict
+/// format its return value must satisfy.
+///
+/// The wire form is the code call's fields beside an optional
+/// `response_format`; the code call keeps its own unknown-field refusal.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CodeCheck {
+    /// The code to run.
+    #[serde(flatten)]
+    pub call: CodeCall,
+    /// `verdict`, or `{kind: verdict, data: <schema>}` to require custom
+    /// data; omitted means the plain Verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<Value>))]
+    pub response_format: Option<skald_spec::NamedResponseFormat>,
+}
+
+impl CodeCheck {
+    /// The schema this check's return value must satisfy: its declared
+    /// `verdict` format, or the plain Verdict when none is declared.
+    ///
+    /// # Errors
+    /// Returns [`skald_spec::SkaldError::PromptInvalid`] for a format
+    /// [`Verdict::response_format`](crate::verification::execution::Verdict::response_format)
+    /// refuses; declaration validation refuses those first.
+    pub fn response_schema(&self) -> Result<Map<String, Value>, skald_spec::SkaldError> {
+        use crate::verification::execution::{VERDICT_FORMAT, Verdict};
+        match &self.response_format {
+            Some(format) => Verdict::response_format(format),
+            None => Verdict::response_format(&skald_spec::NamedResponseFormat::Name(
+                VERDICT_FORMAT.to_owned(),
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CodeCheck {
+    /// Takes `response_format` out, then decodes the rest as a [`CodeCall`].
+    ///
+    /// # Errors
+    /// Returns the deserializer's error for a non-object, a malformed
+    /// `response_format`, or anything the code call refuses.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut object = Map::<String, Value>::deserialize(deserializer)?;
+        let response_format = object
+            .remove("response_format")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let call =
+            CodeCall::deserialize(Value::Object(object)).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            call,
+            response_format,
+        })
+    }
+}
+
 /// A code execution runtime.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -545,7 +604,7 @@ pub enum Check {
     /// A tool-less Agent returning the Verdict schema.
     Agent(AgentCall),
     /// Sandboxed code returning the Verdict schema.
-    Code(CodeCall),
+    Code(CodeCheck),
     /// Statistical drift over a samples slot.
     Drift(DriftCheck),
 }

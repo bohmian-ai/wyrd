@@ -28,12 +28,12 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, EvidenceReader,
+    CheckOutput, EvidenceReader, verdict_from,
 };
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::execution::{CallProvenance, Verdict};
+use wyrd_spec::verification::execution::CallProvenance;
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
@@ -358,18 +358,20 @@ impl CheckExecutor for CodeExecutor {
     /// into evidence reachable through the call's bindings.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a non-code check or a result that
-    /// is not a Verdict, plus [`Self::run`] and citation-read failures.
+    /// Returns [`BlockError::Terminal`] for a non-code check or a result
+    /// [`verdict_from`] refuses against the check's declared `verdict`
+    /// format, plus [`Self::run`] and citation-read failures.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         let Check::Code(code) = call.block else {
             return Err(terminal(
                 "the code executor runs only code checks".to_owned(),
             ));
         };
-        let (value, provenance) = self.run(code, &call.inputs, call.deadline).await?;
-        let mut verdict: Verdict = serde_json::from_value(value).map_err(|error| {
-            terminal(format!("the code check result is not a Verdict: {error}"))
-        })?;
+        let schema = code
+            .response_schema()
+            .map_err(|error| terminal(format!("the code check format is invalid: {error}")))?;
+        let (value, provenance) = self.run(&code.call, &call.inputs, call.deadline).await?;
+        let mut verdict = verdict_from(&Value::Object(schema), value)?;
         let reachable: BTreeSet<SlotName> = call
             .inputs
             .values()

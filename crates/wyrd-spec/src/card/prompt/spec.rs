@@ -29,7 +29,7 @@ impl PromptSpec {
     /// that form does not compile, and the parameter-name error for a
     /// placeholder outside the grammar.
     pub fn new(prompt: skald_spec::Prompt) -> Result<Self, WyrdError> {
-        let prompt = prompt.authored()?.compile()?;
+        let prompt = compile_prompt(&*prompt.authored()?)?;
         let spec = Self { prompt };
         validate(&spec)?;
         Ok(spec)
@@ -55,6 +55,21 @@ impl PromptSpec {
     }
 }
 
+/// Compiles an authored Prompt, resolving a named `response_format` as the
+/// Wyrd-owned `verdict` format.
+///
+/// Every Card decode path compiles Prompts through here, so a stored Prompt
+/// never runs with an unresolved name.
+///
+/// # Errors
+/// Returns the compiler's refusal, including an unknown format name or an
+/// invalid custom-data schema.
+pub fn compile_prompt(
+    authored: &skald_spec::AuthoredPrompt,
+) -> Result<skald_spec::Prompt, skald_spec::SkaldError> {
+    authored.compile_with(crate::verification::execution::Verdict::response_format)
+}
+
 impl<'de> Deserialize<'de> for PromptSpec {
     /// Decodes the authored Prompt form, which compiles it, then applies the
     /// Prompt Card validation `PromptSpec::new` applies.
@@ -66,8 +81,9 @@ impl<'de> Deserialize<'de> for PromptSpec {
     where
         D: serde::Deserializer<'de>,
     {
+        let authored = skald_spec::AuthoredPrompt::deserialize(deserializer)?;
         let spec = Self {
-            prompt: skald_spec::Prompt::deserialize(deserializer)?,
+            prompt: compile_prompt(&authored).map_err(serde::de::Error::custom)?,
         };
         validate(&spec).map_err(serde::de::Error::custom)?;
         Ok(spec)

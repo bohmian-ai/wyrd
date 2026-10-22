@@ -54,7 +54,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{
-    Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource, VerifierSpec,
+    Action, AgentCall, Check, CodeCall, CodeCheck, CodeRuntime, CodeSource, VerifierSpec,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
@@ -863,7 +863,10 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         )
     };
     busy(act().await.map(drop), "a code action");
-    let check = Check::Code(call);
+    let check = Check::Code(CodeCheck {
+        call,
+        response_format: None,
+    });
     busy(
         CheckExecutor::execute(
             &code,

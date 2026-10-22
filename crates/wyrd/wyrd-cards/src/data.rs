@@ -261,7 +261,14 @@ impl DataCard {
     /// Build a native holder from a server-returned Data Card envelope.
     ///
     /// This path consumes the native envelope directly and does not re-enter
-    /// the Python package or deserialize through a Python model class.
+    /// the Python package or deserialize through a Python model class. The
+    /// holder takes the Card's flat name, exact version, and UID.
+    ///
+    /// # Errors
+    /// Returns `WyrdError::DataValidation` when the envelope is not `wyrd/v1` kind
+    /// `Data`, its spec is not a Data spec, it has no resolved version pin or no
+    /// `metadata.uid`, or a card reference is still an unresolved path, and
+    /// the spec's own validation errors.
     pub fn from_card(card: wyrd_spec::envelope::Card) -> Result<Self, WyrdError> {
         if card.api_version.as_str() != ApiVersion::V1 || card.kind != CardKind::Data {
             return Err(WyrdError::DataValidation {

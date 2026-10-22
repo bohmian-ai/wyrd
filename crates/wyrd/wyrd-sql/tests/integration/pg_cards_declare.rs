@@ -1111,6 +1111,19 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
 /// Panics when fixture setup fails or any identity rule above does not hold.
 #[tokio::test]
 async fn flat_registry_identity_is_tenant_and_kind_scoped() {
+    /// Register `card` Active in `tenant` through its own declaration operation.
+    ///
+    /// One tenant transaction inserts a fresh operation and the Card row, then
+    /// commits, returning the new Card UID.
+    ///
+    /// # Errors
+    /// Returns the [`insert_card_row`] error, such as the identity conflict of
+    /// a duplicate `(kind, name, version)` in the tenant; the transaction is
+    /// then dropped uncommitted.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection, the operation insert, or the commit
+    /// fails.
     async fn register(
         fixture: &PgFixture,
         tenant: wyrd_spec::ids::DataTenantId,

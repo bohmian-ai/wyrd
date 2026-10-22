@@ -25,6 +25,16 @@ pub fn read_card_file(path: &Path) -> Result<Card, WyrdError> {
 /// This helper is intentionally separate from `read_card_file`: server hydration
 /// and `model_validate_json` require a complete persisted envelope, while local
 /// declarative files may omit API version, name, version, or UID.
+///
+/// Omitted fields default to `wyrd/v1`, kind `Prompt`, name `prompt`,
+/// version `0.1.0`, and a fresh local UID; authored values always win.
+///
+/// # Errors
+/// Returns a prompt loader error when the extension is unsupported or the file
+/// cannot be read, and a validation error when the bytes are not JSON or
+/// YAML, the document or its `metadata` is not an object, or the filled
+/// document does not decode as a Prompt Card envelope, such as one naming the
+/// removed `metadata.space`.
 pub fn read_local_card_file(path: &Path) -> Result<Card, WyrdError> {
     let format = format_from_path(path)?;
     let bytes = std::fs::read(path).map_err(|error| loader_io(path, &error))?;

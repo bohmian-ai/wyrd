@@ -193,6 +193,18 @@ fn collect_yaml_files(
     Ok(())
 }
 
+/// Decode one authored YAML document into a typed Card with its source path.
+///
+/// This is the loader's diagnostic boundary for envelopes: decode failures
+/// become file-scoped [`Diagnostic`]s rather than raw serde errors. The
+/// envelope is strict, so a removed field such as `metadata.space` is reported
+/// verbatim as an unknown field instead of being misread as a missing one.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic for an unknown field, an invalid
+/// `apiVersion`, a missing `kind`, `metadata`, or `spec`, or a spec that does
+/// not decode for its kind, and a YAML-syntax diagnostic for any other
+/// envelope decode failure.
 fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<AuthoredCard, Diagnostic> {
     let envelope = serde_yaml::from_value::<RawCardEnvelope>(raw).map_err(|e| {
         // Check for missing required envelope fields
@@ -324,6 +336,13 @@ fn is_inlineable_body(key: &str, value: &serde_yaml::Value, agent_action: bool) 
 }
 
 /// Build the exact reference identity required by a resolved spec slot.
+///
+/// The reference is the Card's flat `kind`/`name` and its exact authored
+/// version, without a UID: the server assigns UIDs at declaration.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic when the Card's `metadata.version`
+/// is not an exact pin.
 pub(crate) fn card_ref_for(card: &AuthoredCard) -> Result<CardRef, Diagnostic> {
     let version = card.metadata.resolved_pin().cloned().ok_or_else(|| {
         Diagnostic::invalid_envelope(

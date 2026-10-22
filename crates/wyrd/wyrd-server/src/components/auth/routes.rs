@@ -788,6 +788,14 @@ mod pg_tests {
         user_id
     }
 
+    /// Insert an active Service principal bound to `card_ref` and return its id.
+    ///
+    /// The row stores the flat reference, its version, and a fresh Card UID,
+    /// created and acted by `creator`. It writes in the caller's tenant
+    /// transaction, which the caller commits.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
     async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,

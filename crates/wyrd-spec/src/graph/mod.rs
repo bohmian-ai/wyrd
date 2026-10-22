@@ -53,6 +53,12 @@ impl Hash for Edge {
     }
 }
 
+/// Feed one graph reference into a [`Node`] or [`Edge`] hash.
+///
+/// It hashes every field `CardRef` equality compares: flat `kind`, `name`,
+/// `version`, and the optional `uid`, keeping `Hash` consistent with `Eq`.
+/// UID-free sibling matching is a separate rule, owned by
+/// [`CardRef::same_identity`].
 fn hash_card_ref<H: Hasher>(card_ref: &CardRef, state: &mut H) {
     card_ref.kind.hash(state);
     card_ref.name.hash(state);
@@ -82,6 +88,11 @@ pub struct RootPick {
 /// requests therefore receive a
 /// graph-only placeholder. The authored submissions are cloned and never
 /// mutated; registration keeps their original version selection.
+///
+/// # Errors
+/// Returns [`GraphError::Empty`] when there are no submissions, and
+/// [`GraphError::InvalidSpec`] if the fixed `0.0.0` placeholder cannot be
+/// built.
 pub fn graph_ready_submissions(
     submissions: &[CardSubmission],
 ) -> Result<Vec<CardSubmission>, GraphError> {
@@ -181,6 +192,11 @@ pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
     card_ref.identity_key()
 }
 
+/// Build the graph reference of one submission with an exact version pin.
+///
+/// Returns `None` for an auto or range version, which has no exact identity
+/// until [`graph_ready_submissions`] gives it a placeholder. A caller-asserted
+/// `metadata.uid` is preserved so graph equality keeps it.
 pub(super) fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
     Some(CardRef {
         kind: submission.kind.clone(),

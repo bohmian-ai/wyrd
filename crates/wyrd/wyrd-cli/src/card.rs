@@ -620,6 +620,18 @@ async fn build_cards(server: Option<&str>) -> Result<Cards, WyrdCliError> {
     Ok(Cards::connect_with(&crate::client::from_global(server)?).await?)
 }
 
+/// Build the Card selector a `get`, `pull`, or `delete` invocation names.
+///
+/// `--uid` wins: it needs `--kind` and treats `--name` and `--version` as
+/// assertions about the UID's Card. Otherwise the selector is the flat
+/// `--kind`/`--name` line, narrowed to one Card by `--version`. A delete
+/// (`require_exact_for_delete`) must name one exact Card, never a line.
+///
+/// # Errors
+/// Returns an invalid-argument error for an unknown kind, an ill-formed
+/// version, name, or UID, or a missing `--kind` or `--name`, and
+/// [`WyrdCliError::DeleteSelectorRequiresExact`] for a delete naming neither a
+/// UID nor a version.
 fn selector_from_args(
     args: &SelectorArgs,
     require_exact_for_delete: bool,
@@ -727,6 +739,10 @@ pub(crate) fn invalid_argument(field: &str, value: &str, expected: &str) -> Wyrd
     }
 }
 
+/// Project loaded submissions onto the `check` report's flat Card identities.
+///
+/// The version is the authored selection, or `None` when the server will
+/// allocate one.
 fn check_cards(input: &DeclarationInput) -> Vec<CheckCard> {
     input
         .submissions
@@ -743,6 +759,8 @@ fn check_cards(input: &DeclarationInput) -> Vec<CheckCard> {
         .collect()
 }
 
+/// Print a passing `check` report for a person: one `Kind/name@version` line
+/// per Card, with `auto` for a server-allocated version, then any warnings.
 fn print_check_text(report: &CheckReport) {
     println!("check valid: {} card(s)", report.cards.len());
     for card in &report.cards {
@@ -802,6 +820,8 @@ fn print_pull_text(output: &PullSummary) {
     );
 }
 
+/// Print one list page for a person: one `Kind/name@version status=…` line
+/// per summary, then the continuation cursor when another page exists.
 fn print_list_text(response: &ListCardsResponse) {
     for item in &response.items {
         println!(

@@ -165,6 +165,17 @@ async fn soft_delete_card_with_expected_kind(
 }
 
 /// Soft-delete a card selected by its exact identity tuple.
+///
+/// The flat `kind`/`name`/`version` lookup locks the row in the caller's
+/// tenant transaction, then the existing UID delete runs. The caller owns the
+/// transaction and commits only after this succeeds; storage cleanup follows
+/// the commit.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no row has that identity,
+/// registry unavailability when a query fails, the Card UID error for an
+/// invalid stored UID, and the errors of [`soft_delete_card_with_state`],
+/// including the conflict raised while another Card still references it.
 pub async fn soft_delete_card_by_ref(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,

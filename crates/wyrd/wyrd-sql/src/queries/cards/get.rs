@@ -140,6 +140,14 @@ pub async fn get_card_by_ref(
 }
 
 /// Find a card by identity without turning an absent row into a public 404.
+///
+/// Identity is the tenant's flat `kind`, `name`, and `version`. `Ok(None)`
+/// means no non-deleted row is visible at that identity in the caller's
+/// tenant, which is distinct from a failed lookup.
+///
+/// # Errors
+/// Returns registry unavailability when the query fails, and
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the stored row no longer parses.
 pub async fn find_card_by_ref(
     conn: &mut TenantConn<'_>,
     kind: CardKind,

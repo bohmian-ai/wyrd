@@ -311,6 +311,12 @@ mod merge_tests {
         );
     }
 
+    /// A kind without an override takes the workspace label default, even when
+    /// another kind overrides the same key.
+    ///
+    /// # Panics
+    /// Panics when a static label is invalid or the Model Card's `team` label is
+    /// not the workspace default.
     #[test]
     fn merge_defaults_only_for_unconfigured_kind() {
         let mut cfg = WyrdConfig::empty();

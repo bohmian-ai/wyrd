@@ -256,6 +256,14 @@ impl PromptCard {
         Ok(())
     }
 
+    /// Convert the holder's flat identity and maps into envelope metadata.
+    ///
+    /// The version becomes an exact pin and an empty UID is absent; server
+    /// derived hashes and origin are left unset.
+    ///
+    /// # Errors
+    /// Returns a validation error when the name, version, or non-empty UID is
+    /// not well formed.
     fn to_envelope_metadata(&self) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,

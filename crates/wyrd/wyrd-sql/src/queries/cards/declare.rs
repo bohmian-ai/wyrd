@@ -458,6 +458,16 @@ pub async fn commit_declaration_operation(
 }
 
 /// Resolve exact references to non-terminal cards in one tenant-scoped query.
+///
+/// Each reference matches on flat `kind`, `name`, and `version` within the
+/// caller's tenant transaction. Only Active rows resolve; a reference with no
+/// matching row, or whose row is not Active, is omitted from the result rather
+/// than reported, so callers compare the result against their input.
+///
+/// # Errors
+/// Returns registry unavailability when the query fails or returns an
+/// identity that is not among `refs`, and the Card UID error for an invalid
+/// stored UID.
 pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],

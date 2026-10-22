@@ -147,6 +147,10 @@ mod tests {
         assert!(relationships.inbound.is_empty());
     }
 
+    /// Build an unpinned, spec-free submission fixture named by flat kind and name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
     fn submission(kind: CardKind, name: &str) -> CardSubmission {
         CardSubmission {
             api_version: ApiVersion::v1(),
@@ -167,6 +171,9 @@ mod tests {
         }
     }
 
+    /// Project a submission onto its comparable `(kind, name, version)` order key.
+    ///
+    /// An unpinned version projects as the empty string.
     fn key(submission: &CardSubmission) -> (&str, &str, &str) {
         (
             submission.kind.wire_name(),
@@ -178,6 +185,10 @@ mod tests {
         )
     }
 
+    /// Repeated canonical ordering of one flat submission set is identical.
+    ///
+    /// # Panics
+    /// Panics when a fixture name is invalid or any run differs from the first.
     #[test]
     fn canonical_order_is_deterministic() {
         let submissions = vec![
@@ -200,6 +211,11 @@ mod tests {
         }
     }
 
+    /// Canonical order follows flat `(kind, name, version)` keys, not wire order.
+    ///
+    /// # Panics
+    /// Panics when a fixture name is invalid or any permutation does not
+    /// produce the expected key order.
     #[test]
     fn canonical_order_ignores_wire_order() {
         let entries = [

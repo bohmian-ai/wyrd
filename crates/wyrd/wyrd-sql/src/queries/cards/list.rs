@@ -168,9 +168,15 @@ pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Resul
 
 /// Append all `CardQuery` WHERE predicates to `qb`.
 ///
-/// Does not touch ORDER BY, LIMIT, or the keyset cursor — those are the
-/// caller's responsibility. Returns an error only when a version range cannot
-/// be converted to SQL bounds.
+/// Filters are flat: status (non-deleted by default), `kind`, `name`,
+/// prerelease exclusion, version range, and the metadata query. Does not
+/// touch ORDER BY, LIMIT, or the keyset cursor — those are the caller's
+/// responsibility.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when a version range
+/// cannot be converted to SQL bounds, and the bound-push and metadata-query
+/// compile errors of an unusable range or filter field.
 fn push_card_filters(qb: &mut QueryBuilder<Postgres>, query: &CardQuery) -> Result<(), WyrdError> {
     match &query.status {
         Some(status) => {

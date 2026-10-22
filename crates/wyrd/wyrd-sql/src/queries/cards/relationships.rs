@@ -62,6 +62,14 @@ pub async fn recheck_active_card_refs(
 }
 
 /// Persist exact UID-bearing outbound references in the caller's registration transaction.
+///
+/// Each edge stores the target's flat `kind`/`name`/`version` and its resolved
+/// UID; a repeated edge is a no-op. The helper never commits: the caller's
+/// declaration transaction owns atomicity.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for a reference without a
+/// resolved UID, and registry unavailability when an insert fails.
 pub async fn persist_outbound_relationships(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
@@ -96,6 +104,13 @@ pub async fn persist_outbound_relationships(
 ///
 /// Deleted source cards are excluded so the returned inbound relationship
 /// projection reflects the live registry graph rather than tombstone history.
+/// Each source is returned as a flat, UID-bearing [`CardRef`]. The read runs in
+/// the caller's tenant transaction and never commits.
+///
+/// # Errors
+/// Returns registry unavailability when the query fails, the Card UID error
+/// for an invalid stored UID, and `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a
+/// stored source kind, name, or version no longer decodes.
 pub async fn inbound_relationships(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,

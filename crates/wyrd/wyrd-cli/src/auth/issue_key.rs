@@ -182,6 +182,10 @@ mod tests {
 
     /// Card space is not a CLI coordinate, so `--space` is refused as an
     /// unknown argument rather than ignored.
+    ///
+    /// # Panics
+    /// Panics when Clap accepts `--space` or refuses it with a different error
+    /// kind.
     #[test]
     fn issue_key_refuses_removed_space_flag() {
         let error = Cli::try_parse_from([

@@ -25,6 +25,12 @@ pub(crate) fn apply_repo_defaults(
     );
 }
 
+/// Apply an already-resolved repository config's label and annotation defaults.
+///
+/// Defaults are maps only, and fill only keys the Card does not already set,
+/// with kind overrides taking precedence over workspace defaults. An absent
+/// or malformed config is intentionally a no-op, so local construction never
+/// fails on workspace configuration.
 fn apply_repo_defaults_from(
     kind: &CardKind,
     labels: &mut Labels,
@@ -121,6 +127,10 @@ mod tests {
         annotations.insert(key, value);
     }
 
+    /// Apply `config` to empty label and annotation maps for `kind`.
+    ///
+    /// Returns the resulting maps so a test can assert exactly which defaults
+    /// were filled.
     fn apply_with_config(
         config: Result<Option<wyrd_config::WyrdConfig>, wyrd_config::WyrdConfigError>,
         kind: &CardKind,
@@ -134,6 +144,11 @@ mod tests {
         (labels, annotations)
     }
 
+    /// Card values win over kind overrides, which win over workspace defaults.
+    ///
+    /// # Panics
+    /// Panics when a static label or annotation is invalid or a resolved map
+    /// value differs from that precedence.
     #[test]
     fn repository_defaults_use_kind_then_workspace_precedence() {
         let mut config = wyrd_config::WyrdConfig::empty();
@@ -204,6 +219,11 @@ mod tests {
         );
     }
 
+    /// Workspace map defaults reach every Card kind without a kind override.
+    ///
+    /// # Panics
+    /// Panics when a static label or annotation is invalid or any kind misses
+    /// a default.
     #[test]
     fn repository_defaults_apply_to_each_card_kind() {
         let mut config = wyrd_config::WyrdConfig::empty();
@@ -226,6 +246,10 @@ mod tests {
         }
     }
 
+    /// An absent repository config leaves the Card's maps empty.
+    ///
+    /// # Panics
+    /// Panics when either map gains an entry.
     #[test]
     fn missing_repository_config_keeps_compiled_defaults_available() {
         let (labels, annotations) = apply_with_config(Ok(None), &CardKind::Data);
@@ -233,6 +257,10 @@ mod tests {
         assert!(annotations.is_empty());
     }
 
+    /// A malformed repository config is ignored rather than failing construction.
+    ///
+    /// # Panics
+    /// Panics when either map gains an entry.
     #[test]
     fn malformed_repository_config_is_a_soft_failure() {
         let error = wyrd_config::WyrdConfigError::TomlParse {

@@ -147,6 +147,11 @@ impl CardRefPy {
     /// `Trigger`, `Operator`, `Source`). External
     /// kinds are not constructable from Python in v1.
     /// Identity is `(kind, name, version)`; `uid` optionally pins one row.
+    ///
+    /// # Errors
+    /// Returns a validation error when `kind` is not a registrable Card kind,
+    /// or `name`, `version`, or a non-empty `uid` is not well formed. An empty
+    /// `uid` is treated as absent.
     #[new]
     #[pyo3(signature = (kind, name, version, *, uid=None))]
     fn __new__(

@@ -54,6 +54,12 @@ mod tests {
     use tempfile::TempDir;
     use wyrd_spec::envelope::CardKind;
 
+    /// With no `wyrd.toml` above the entry file, discovery yields empty map
+    /// defaults.
+    ///
+    /// # Panics
+    /// Panics when the temporary entry file cannot be written, discovery
+    /// fails, or a default is present.
     #[test]
     fn config_absent_uses_system_defaults() {
         let temp = TempDir::new().unwrap();
@@ -65,6 +71,12 @@ mod tests {
         assert!(config.defaults.annotations.is_empty());
     }
 
+    /// Discovery loads both workspace and kind label maps; their precedence is
+    /// applied later by `apply_defaults`.
+    ///
+    /// # Panics
+    /// Panics when the temporary files cannot be written, discovery fails, or
+    /// either map is missing.
     #[test]
     fn config_precedence_is_handled_by_apply_defaults() {
         // This is tested in wyrd-config's own tests; loader just calls through

@@ -867,6 +867,11 @@ mod tests {
     /// Flat identity is `Kind/name@version[#uid]`: kind, name, and version
     /// separate identities, the UID does not, and every removed space form is
     /// refused with a message naming the expected shape.
+    ///
+    /// # Panics
+    /// Panics when a flat reference fails to parse or round-trip, identities
+    /// compare wrongly, or a removed space form is accepted or refused without
+    /// naming the expected shape.
     #[test]
     fn flat_card_reference_contract() {
         let card_ref: CardRef = "Service/checkout@1.0.0".parse().expect("flat ref parses");

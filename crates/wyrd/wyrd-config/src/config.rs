@@ -181,6 +181,11 @@ mod parse {
         WyrdConfig::load(Some(tmp.path()))
     }
 
+    /// An empty `wyrd.toml` yields no label defaults and no kind overrides.
+    ///
+    /// # Panics
+    /// Panics when the temporary file cannot be written, the empty file fails
+    /// to load, or the config carries a default.
     #[test]
     fn parse_empty_file_yields_empty_config() {
         let cfg = parse("").unwrap();
@@ -191,6 +196,10 @@ mod parse {
     /// Card space is no longer a config default: `[defaults]` and
     /// `[kind.<Kind>]` refuse it by schema, while label and annotation
     /// defaults still parse.
+    ///
+    /// # Panics
+    /// Panics when the temporary file cannot be written, a `space` default
+    /// loads, its refusal does not name `space`, or the map defaults fail.
     #[test]
     fn removed_space_defaults_are_rejected() {
         for toml in [

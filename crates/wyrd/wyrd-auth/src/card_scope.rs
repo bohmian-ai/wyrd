@@ -312,6 +312,10 @@ mod pg_tests {
 
     use super::*;
 
+    /// Build a flat, UID-free `kind`/`name`@`1.0.0` reference fixture.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
     fn make_card_ref(kind: CardKind, name: &str) -> CardRef {
         CardRef {
             kind,

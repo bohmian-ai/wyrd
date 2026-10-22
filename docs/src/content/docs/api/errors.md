@@ -314,6 +314,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | A tracer provider is already installed | Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry. |
+| `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
 | `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | 504 | Verification execution did not settle in time | Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again. |

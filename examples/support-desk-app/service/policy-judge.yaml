@@ -20,30 +20,4 @@ spec:
     messages:
       - role: user
         content: "Claim: {{claim}}. Letter: {{letter}}"
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties:
-                  lines:
-                    type: object
-                    properties:
-                      start: {type: integer}
-                      end: {type: integer}
-                    required: [start, end]
-                    additionalProperties: false
-                required: [lines]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    response_format: verdict

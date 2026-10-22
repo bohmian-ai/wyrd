@@ -14,23 +14,4 @@ spec:
     messages:
       - role: user
         content: "Claim: {{claim}}. Answer: {{answer}}. Policy findings: {{findings}}. Cite the policy page."
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties: {page: {type: integer}}
-                required: [page]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    response_format: verdict

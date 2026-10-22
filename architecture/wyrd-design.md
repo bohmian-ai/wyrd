@@ -503,14 +503,25 @@ spec:
   system?: string
   messages: [{ role: user | assistant, content: string | [ContentBlock] }]
   settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty, reasoning_effort (chat_completion only)
-  response_format?: JsonSchema
+  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema }
 # Native form: one protocol body passed through unchanged.
 spec:
   provider: ProviderName
   model: string
   format: chat_completion | responses | messages | generate_content | system_one
   body: { ... }                    # that protocol's request body, extension options preserved
+  response_format?: verdict | { kind: verdict, data?: JsonSchema }
 ```
+
+`response_format: verdict` (or `{kind: verdict}`) compiles the closed
+Verdict schema generated from Wyrd's canonical `Verdict` type; `data` adds a
+required custom object with that schema. The card keeps and hashes the
+authored form, never the expanded provider settings. On a native body the
+named format is lowered into that protocol's structured-output settings; a
+body that also sets its own response settings, or a `system_one` body, is
+refused. Skald owns the
+compiler but no format names: Wyrd resolves `verdict` when it compiles a
+Prompt, and an unresolved named format cannot render.
 
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
@@ -1305,8 +1316,8 @@ never a refusal: checks that need it are inconclusive.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` |
-| `code` | Sandboxed Python returning the same Verdict schema |
+| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
+| `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
 Actions read and compute; they never mutate external systems, declare Cards,
@@ -1329,6 +1340,18 @@ infrastructure, and missing-evidence failures inside one check are
 with none applicable the verdict is `inconclusive`. `all` returns failed on
 any failure, else inconclusive on any inconclusive, else passed. `pass_rate`
 divides passes by all applicable requirements, inconclusive included.
+
+A check whose format declares `data` must return a matching non-null
+object; without a declaration it must not return `data`. The server validates
+the whole response against the exact declared schema and bounds `data` to
+65,536 bytes of compact JSON and 16 nested containers. Invalid or oversized
+output is `inconclusive` with no data, and the reason names the location or
+limit, never the content. Accepted data is `RequirementResult.data` on whole
+Verifier and step requirements, retained in the sensitive outcome. SDK
+typed siblings (`verify_typed`, `wait_typed`, `status_typed`, and Rust
+`wait_until_typed`) decode every present `data` as the caller's type after the
+ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
+requirement and field path, and never reruns or changes the result.
 
 A citation names an original input slot and a typed locator (`page`, `slide`,
 `lines`, `json_pointer`, or page `region`); workspace paths map back to their

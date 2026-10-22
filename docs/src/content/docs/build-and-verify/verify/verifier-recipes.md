@@ -216,27 +216,8 @@ spec:
           Claim: {{claim}}  # filled from the check's inputs
           Reply: {{answer}}
           Decide whether the claim holds for the reply, and cite the reply.
-    # The judge must answer with a verdict: an outcome, a reason, and citations.
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties: {json_pointer: {type: string}}
-                required: [json_pointer]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    # The judge answers with a Verdict: an outcome, a reason, and citations.
+    response_format: verdict
 ```
 
 </Tab>
@@ -257,6 +238,37 @@ print(judged.get("citations"))  # where in the reply the judge looked
 </Tabs>
 
 The judge's model calls go through the LLM gateway with your provider key. [Verdicts and citations](/reference/verifier-card/#verdicts-and-citations) explains the locators a citation can use.
+
+### Return scores and labels with the verdict
+
+Declare a schema under `data` and the judge returns that object beside its verdict. The server checks it against the schema; output that does not match is `inconclusive` and keeps no data.
+
+```yaml title="policy-judge.yaml (excerpt)"
+    response_format:
+      kind: verdict
+      data:
+        type: object
+        properties:
+          score: {type: number, minimum: 0, maximum: 1}
+          category: {type: string}
+        required: [score, category]
+        additionalProperties: false
+```
+
+A `code` check declares the same `response_format` beside `entrypoint`, and its function returns `data` with its verdict. Read the data as JSON from `requirements[i]["data"]`, or ask for your own type:
+
+```python
+from pydantic import BaseModel
+
+class JudgeData(BaseModel):
+    score: float
+    category: str
+
+result = run.observe.verify_typed("follows-policy", JudgeData, answer={"text": "Refunds up to 100 dollars follow our policy."})
+data = result.requirements[0].get("data")  # a JudgeData, or None when the check returned none
+```
+
+Data that does not fit your type raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`; the stored result is unchanged.
 
 ## Multi-step
 

@@ -240,7 +240,8 @@ typed columns:
 - `vala.verification.results` carries the generic outcome of one execution:
   execution, Run, Verifier, subject, and binding identity, the verdict, and the
   requirement, step, evidence, and provenance breakdown as the `outcome`
-  Variant. A drift requirement's typed detail lives in that outcome; its
+  Variant. A requirement's custom Verdict `data` stays inside that outcome,
+  with no column of its own. A drift requirement's typed detail lives in that outcome; its
   per-feature method, score, threshold, and verdict are also projected one row
   per feature into `vala.drift.result_features`, joined on `result_id` and
   `requirement_id`.

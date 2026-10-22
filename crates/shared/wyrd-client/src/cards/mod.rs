@@ -31,7 +31,7 @@ pub use wyrd_spec::registry::{
 mod tests {
     use super::{CardSelector, Cards, ListCardsRequest};
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
 
     /// The public handle, selector, and request types compose without staged-card or transport exports.
     #[test]
@@ -40,12 +40,10 @@ mod tests {
         let _ = Cards::connect_with;
         let _ = CardSelector::named(
             CardKind::Prompt,
-            SpaceName::new("prod").expect("test space is valid"),
             CardName::new("prompt").expect("test name is valid"),
         );
         let _ = ListCardsRequest {
             kind: None,
-            space: None,
             name: None,
             version_range: None,
             status: None,

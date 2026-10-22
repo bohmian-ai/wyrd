@@ -103,7 +103,6 @@ mod pg_tests {
             .expect("handle connects")
             .list(ListCardsRequest {
                 kind: None,
-                space: None,
                 name: None,
                 version_range: None,
                 status: None,

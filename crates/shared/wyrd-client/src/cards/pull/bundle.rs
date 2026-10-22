@@ -339,11 +339,7 @@ fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdErro
 #[cfg(test)]
 mod tests {
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::{
-        envelope::CardKind,
-        ids::{CardName, SpaceName},
-        reference::CardRef,
-    };
+    use wyrd_spec::{envelope::CardKind, ids::CardName, reference::CardRef};
 
     use super::{validate_artifact_path, write_yaml};
 
@@ -354,7 +350,6 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new("welcome").expect("test name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some(SpaceName::new("default").expect("test space is valid")),
             uid: None,
         };
         assert!(validate_artifact_path("nested/file.bin", &card_ref).is_ok());

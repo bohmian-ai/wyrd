@@ -27,6 +27,6 @@ export async function deploy(client: WyrdClient, bundle: string = BUNDLE_DIR) {
 
 if (import.meta.main) {
   const receipt = await deploy(WyrdClient.connect());
-  for (const { card_ref: ref } of receipt.outcomes) console.log(`declared ${ref.kind} ${ref.space}/${ref.name} ${ref.version}`);
+  for (const { card_ref: ref } of receipt.outcomes) console.log(`declared ${ref.kind}/${ref.name}@${ref.version}`);
   console.log(`pulled into ${BUNDLE_DIR}`);
 }

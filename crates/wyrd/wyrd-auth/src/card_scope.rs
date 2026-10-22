@@ -433,20 +433,20 @@ mod pg_tests {
     #[test]
     fn scope_hash_is_order_independent() {
         let a = vec![
-            "prod/Service/svc-a@1.0.0".to_owned(),
-            "prod/Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
         ];
         let b = vec![
-            "prod/Service/svc-b@1.0.0".to_owned(),
-            "prod/Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
         ];
         assert_eq!(scope_hash(&a), scope_hash(&b));
     }
 
     #[test]
     fn scope_hash_differs_for_different_members() {
-        let a = vec!["prod/Service/svc-a@1.0.0".to_owned()];
-        let b = vec!["prod/Service/svc-b@1.0.0".to_owned()];
+        let a = vec!["Service/svc-a@1.0.0".to_owned()];
+        let b = vec!["Service/svc-b@1.0.0".to_owned()];
         assert_ne!(scope_hash(&a), scope_hash(&b));
     }
 

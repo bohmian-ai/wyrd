@@ -63,7 +63,7 @@ fixtures.
 
    ```bash
    wyrd declare agents/service.yaml
-   wyrd pull --kind Service --name gateway-agents --version 1.0.0 --space default \
+   wyrd pull --kind Service --name gateway-agents --version 1.0.0 \
      --output-dir gateway-agents
    ```
 

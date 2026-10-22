@@ -1295,9 +1295,9 @@ impl BundleReader<'_> {
                 json!({ "root": manifest.root }),
             ));
         }
-        if manifest.root.space.is_none() || manifest.root.uid.is_none() {
+        if manifest.root.uid.is_none() {
             return Err(state_bundle_error(
-                "Card bundle root must have an exact space and UID",
+                "Card bundle root must have an exact UID",
                 json!({ "root": manifest.root }),
             ));
         }
@@ -1773,18 +1773,12 @@ impl BundleReader<'_> {
 ///
 /// # Errors
 ///
-/// Returns an invalid-state-bundle error when the Card lacks a pinned version,
-/// resolved space, or required UID.
+/// Returns an invalid-state-bundle error when the Card lacks a pinned version
+/// or required UID.
 fn exact_card_ref(card: &Card, path: &Path) -> Result<CardRef, WyrdError> {
     let version = card.metadata.resolved_pin().cloned().ok_or_else(|| {
         state_bundle_error(
             "hydrated Card is missing an exact version pin",
-            json!({ "path": path }),
-        )
-    })?;
-    let space = card.metadata.space.clone().ok_or_else(|| {
-        state_bundle_error(
-            "hydrated Card is missing a resolved space",
             json!({ "path": path }),
         )
     })?;
@@ -1798,7 +1792,6 @@ fn exact_card_ref(card: &Card, path: &Path) -> Result<CardRef, WyrdError> {
         kind: card.kind.clone(),
         name: card.metadata.name.clone(),
         version,
-        space: Some(space),
         uid: Some(uid),
     })
 }
@@ -2059,7 +2052,7 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, WyrdError> {
 /// details for a state error without introducing a second fallible conversion.
 #[must_use]
 fn exact_card_ref_for_error(card: &Card) -> Value {
-    json!({ "kind": card.kind, "name": card.metadata.name, "version": card.metadata.version, "space": card.metadata.space, "uid": card.metadata.uid })
+    json!({ "kind": card.kind, "name": card.metadata.name, "version": card.metadata.version, "uid": card.metadata.uid })
 }
 
 /// Construct the stable error for a duplicate exact Card reference.
@@ -2237,7 +2230,7 @@ pub(crate) mod tests {
     };
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use wyrd_spec::graph::relationships_from_spec;
-    use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::ids::{CardName, CardUid};
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
     use wyrd_spec::registry::{
         BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode,
@@ -2738,7 +2731,6 @@ pub(crate) mod tests {
                 name: card_ref.name.clone(),
                 version: Some(VersionSpec::Pin(card_ref.version.clone())),
                 bump: None,
-                space: card_ref.space.clone(),
                 uid: card_ref.uid.clone(),
                 labels: wyrd_spec::metadata::Labels::default(),
                 annotations: wyrd_spec::metadata::Annotations::default(),
@@ -2813,7 +2805,6 @@ pub(crate) mod tests {
                 .resolved_pin()
                 .cloned()
                 .expect("fixture version is pinned"),
-            space: card.metadata.space.clone(),
             uid: card.metadata.uid.clone(),
         }
     }
@@ -2958,7 +2949,6 @@ pub(crate) mod tests {
             kind,
             name: CardName::new(name).expect("fixture name is valid"),
             version: VersionBlock::parse("1.0.0").expect("fixture version is valid"),
-            space: Some(SpaceName::new("default").expect("fixture space is valid")),
             uid: Some(CardUid::new(uid).expect("fixture UID is valid")),
         }
     }

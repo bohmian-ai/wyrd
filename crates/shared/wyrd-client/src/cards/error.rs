@@ -115,7 +115,6 @@ mod tests {
         let down = cards
             .list(ListCardsRequest {
                 kind: Some(CardKind::Prompt),
-                space: None,
                 name: None,
                 version_range: None,
                 status: None,

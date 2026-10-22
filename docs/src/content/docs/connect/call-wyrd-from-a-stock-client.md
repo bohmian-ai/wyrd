@@ -1,5 +1,5 @@
 ---
-title: Make gateway requests from a framework
+title: Gateway from any client
 description: Run inference through a named Wyrd gateway deployment from the OpenAI, Anthropic, and Google GenAI SDKs, the OpenAI Agents SDK, and Pydantic AI.
 pillar: wyrd
 section: Connect

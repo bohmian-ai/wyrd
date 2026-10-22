@@ -1,5 +1,5 @@
 ---
-title: Write and query custom data with Bifrost
+title: Custom data
 description: Connect to Bifrost directly to register a table, load rows, and query any table you can read with SQL.
 pillar: wyrd
 section: Build and verify

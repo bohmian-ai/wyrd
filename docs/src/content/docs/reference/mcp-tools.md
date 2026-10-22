@@ -3,7 +3,7 @@ title: MCP tools
 description: Wyrd MCP tool names, permissions, shapes, and query limits.
 pillar: wyrd
 section: Reference
-order: 3
+order: 5
 status: runnable
 ---
 

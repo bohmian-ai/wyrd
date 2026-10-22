@@ -31,7 +31,7 @@
 
   // Home and error pages render without the doc shell.
   const isFullWidth = $derived(page.route.id === '/' || page.error !== null);
-  const here = $derived(locate(page.url.pathname, base || '/wyrd'));
+  const here = $derived(locate(page.url.pathname));
   const hasPages = navGroups().length > 0;
   const start = firstPage('Get started');
   const reference = firstPage('Reference');

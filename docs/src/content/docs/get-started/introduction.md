@@ -60,11 +60,11 @@ In CI, `wyrd declare support-reply.yaml` declares the same files from the comman
 
 <WyrdDiagram name="wyrd-in-your-stack" />
 
-1. **Declare.** Describe your Service and the Verifiers bound to it in YAML. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
 2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
 3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
 
-Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each.
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/understand/architecture/) shows what a team deployment runs.
 
 ## Where Wyrd stops
 

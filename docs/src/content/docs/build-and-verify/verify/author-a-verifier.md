@@ -1,5 +1,5 @@
 ---
-title: Author a Verifier
+title: Write a Verifier
 description: Write a Verifier Card from its inputs and requirements, starting with a one-line assertion and working up to a model judge that cites a document.
 pillar: wyrd
 section: Build and verify

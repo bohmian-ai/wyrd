@@ -1,5 +1,5 @@
 ---
-title: Respond to a failed verification
+title: Failures
 description: Page someone when a submitted or scheduled Verifier fails, with an Operator Card, an operator connection, and on_failure, then check that the page was delivered.
 pillar: wyrd
 section: Build and verify

@@ -1,5 +1,5 @@
 ---
-title: Record a run and observations
+title: Runs and observations
 description: Pull your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
 pillar: wyrd
 section: Build and verify

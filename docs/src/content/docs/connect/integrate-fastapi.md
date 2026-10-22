@@ -1,5 +1,5 @@
 ---
-title: Integrate Wyrd with FastAPI
+title: FastAPI
 description: Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
 pillar: wyrd
 section: Connect

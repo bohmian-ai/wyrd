@@ -1,10 +1,10 @@
 ---
-title: Verify a request in real time
+title: Real-time checks
 description: Call a bound Verifier from your service while a request is in flight, act on the verdict, and read the requirement breakdown.
 pillar: wyrd
 section: Build and verify
 topic: Verify
-order: 1
+order: 2
 draft: true
 status: runnable
 ---

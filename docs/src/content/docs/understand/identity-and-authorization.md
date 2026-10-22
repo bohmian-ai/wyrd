@@ -1,9 +1,9 @@
 ---
-title: Identity and authorization
+title: Identity and access
 description: Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
 pillar: wyrd
 section: Understand
-order: 5
+order: 6
 ---
 
 Every call to the Wyrd server is made as a principal, and the principal's roles decide what it may do. Wyrd checks the permission before the operation proceeds and records the decision.

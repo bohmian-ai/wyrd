@@ -1,5 +1,5 @@
 ---
-title: Configure the verification runtime
+title: Verification runtime
 description: Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 pillar: wyrd
 section: Operate

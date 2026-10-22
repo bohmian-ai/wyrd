@@ -157,11 +157,11 @@ In CI, `wyrd declare support-reply.yaml` declares the same files from the comman
 
 _Diagram `wyrd-in-your-stack`: see the web page._
 
-1. **Declare.** Describe your Service and the Verifiers bound to it in YAML. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
 2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
 3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
 
-Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each.
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/wyrd/understand/architecture/) shows what a team deployment runs.
 
 ## Where Wyrd stops
 
@@ -224,7 +224,7 @@ In `quickstart`:
 wyrd init guided
 ```
 
-It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway; press Enter to skip, since the quickstart calls no model. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
 
 **Another agent, or your own:**
 
@@ -596,7 +596,418 @@ The URL is stored in that agent's entry only. Remote servers must use `https://`
 
 [Run your first verification](/wyrd/get-started/quickstart/), then ask your agent to explain its verdicts.
 
-# Integrate Wyrd with FastAPI
+# Recipes
+
+Page: /wyrd/build-and-verify/verify/verifier-recipes/
+
+> Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+
+Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/wyrd/get-started/quickstart/).
+
+| To check | Use |
+| --- | --- |
+| Fields of an answer | [Assertions](#assertions) |
+| That your code took the right steps | [Trace](#trace) |
+| Logic an operator cannot express | [Python check](#python-check) |
+| Meaning, tone, or policy | [Model judge](#model-judge) |
+| An answer against a document | [Multi-step](#multi-step) |
+| A whole conversation, not one reply | [Grouped session](#grouped-session) |
+| Inputs or outputs shifting over time | [Drift](#drift) |
+
+Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
+
+## Assertions
+
+Compare fields of a JSON value with an operator.
+
+**Declare (YAML)**
+
+```yaml title="reply-rules.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: reply-rules, version: 1.0.0}  # the name your code calls
+spec:
+  description: A support reply never promises a refund and stays within the refund limit.
+  inputs:
+    answer: {type: json}  # one named slot for the evidence; json takes any JSON value
+  requirements:  # each requirement gets its own verdict
+    - id: no-guarantee
+      statement: The reply never promises a guaranteed refund  # shown in results
+      # path selects a value from the evidence; operator compares it with expected
+      check: {kind: assert, path: inputs.answer.text, operator: not_contains, expected: guaranteed refund}
+    - id: within-limit
+      statement: The refund offered is at most 100 dollars
+      # operators that take parameters are written as {kind: ..., ...}
+      check: {kind: assert, path: inputs.answer.refund, operator: {kind: in_range, min: 0, max: 100, inclusive: true}}
+```
+
+**Observe (Python)**
+
+```python
+from wyrd import WyrdState
+
+# Declare your Service and the Verifiers it binds, then start a Run.
+run = WyrdState.declare("support-reply.yaml").run()
+
+# Pass the evidence by slot name: answer fills inputs.answer. verify waits for the verdict.
+result = run.observe.verify("reply-rules", answer={"text": "Your refund is approved.", "refund": 40})
+print(result.verdict)  # passed
+for requirement in result.requirements:  # one verdict and reason per requirement
+    print(requirement["id"], requirement["outcome"], requirement["reason"])
+```
+
+[Comparison operators](/wyrd/reference/verifier-card/#comparison-operators) lists every operator.
+
+## Trace
+
+Check the spans your code recorded: that a step ran, in order, with the right attributes.
+
+**Declare (YAML)**
+
+```yaml title="looked-up-policy.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: looked-up-policy, version: 1.0.0}
+spec:
+  description: The reply was drafted after looking up the refunds policy.
+  inputs:
+    trace: {type: trace}  # a trace ID; Wyrd reads the trace's stored spans
+  requirements:
+    - id: looked-up-first
+      statement: The first span is the policy lookup
+      # spans are ordered by start time, so spans[0] is the first one
+      check: {kind: trace, on: inputs.trace, span_selector: "$.spans[0].name", operator: equals, expected: lookup-policy}
+    - id: read-refunds
+      statement: The lookup read the refunds policy
+      # attributes are the ones your code set on the span
+      check: {kind: trace, on: inputs.trace, span_selector: "$.spans[0].attributes.policy_id", operator: equals, expected: refunds}
+```
+
+**Observe (Python)**
+
+```python
+from opentelemetry import trace
+from wyrd import WyrdState
+
+state = WyrdState.declare("support-reply.yaml")
+state.start_telemetry()  # export OpenTelemetry spans to Wyrd
+tracer = trace.get_tracer("support")
+
+# Your code's real work, traced as it runs.
+with tracer.start_as_current_span("lookup-policy", attributes={"policy_id": "refunds"}) as span:
+    with tracer.start_as_current_span("draft-answer"):
+        ...
+state.flush()  # make sure the spans are stored before they are checked
+
+trace_id = format(span.get_span_context().trace_id, "032x")  # 32 hex characters
+result = state.run().observe.verify("looked-up-policy", trace=trace_id)
+print(result.verdict)  # passed
+```
+
+## Python check
+
+Run your own function when no operator fits. It returns a verdict with a reason and a citation.
+
+**Declare (YAML)**
+
+```yaml title="names-the-policy.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: names-the-policy, version: 1.0.0}
+spec:
+  description: A support reply points the customer to the refund policy.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: names-the-policy
+      statement: The reply names the refund policy
+      check:
+        kind: code
+        entrypoint: check  # the function to call
+        inputs: {answer: inputs.answer}  # passed to it as keyword arguments
+        source:
+          inline: |
+            def check(answer):
+                named = "policy" in answer["text"].lower()
+                # Return a verdict: outcome, reason, and the evidence it cites.
+                return {
+                    "outcome": "passed" if named else "failed",
+                    "reason": "names the policy" if named else "does not name the policy",
+                    # slot names an input; json_pointer points inside it
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                }
+```
+
+**Observe (Python)**
+
+```python
+from wyrd import WyrdState
+
+run = WyrdState.declare("support-reply.yaml").run()
+
+# The function runs on the server, not in your process.
+result = run.observe.verify("names-the-policy", answer={"text": "Refunds follow our policy."})
+print(result.verdict)  # passed
+```
+
+The function runs sandboxed, with no files, network, or environment.
+
+## Model judge
+
+Ask a model whether a claim holds. A pass must cite the evidence it relied on, or it counts as `inconclusive`.
+
+**Declare (YAML)**
+
+```yaml title="follows-policy.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: follows-policy, version: 1.0.0}
+spec:
+  description: A model judges whether a support reply follows the refund policy.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: follows-policy
+      statement: The reply follows the refund policy and never promises more than it allows
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml  # the judge, below
+        inputs:  # fill the judge's prompt placeholders
+          claim: requirement.statement  # this requirement's statement
+          answer: inputs.answer.text
+```
+
+```yaml title="policy-judge.yaml"
+apiVersion: wyrd/v1
+kind: Agent
+metadata: {name: policy-judge, version: 1.0.0}
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}  # a deployment in your LLM gateway
+  run_config: {max_iterations: 1}  # one model call, no tools
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: |
+          Refunds of up to 100 dollars are approved within 30 days; larger refunds need a manager.
+          Claim: {{claim}}  # filled from the check's inputs
+          Reply: {{answer}}
+          Decide whether the claim holds for the reply, and cite the reply.
+    # The judge must answer with a verdict: an outcome, a reason, and citations.
+    response_format:
+      type: object
+      properties:
+        outcome: {type: string, enum: [passed, failed, inconclusive]}
+        reason: {type: string}
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: string}
+              locator:
+                type: object
+                properties: {json_pointer: {type: string}}
+                required: [json_pointer]
+                additionalProperties: false
+            required: [slot, locator]
+            additionalProperties: false
+      required: [outcome, reason, citations]
+      additionalProperties: false
+```
+
+**Observe (Python)**
+
+```python
+from wyrd import WyrdState
+
+run = WyrdState.declare("support-reply.yaml").run()
+
+result = run.observe.verify("follows-policy", answer={"text": "Refunds up to 100 dollars follow our policy."})
+judged = result.requirements[0]
+print(judged["outcome"], judged["reason"])  # the judge's verdict and its explanation
+print(judged.get("citations"))  # where in the reply the judge looked
+```
+
+The judge's model calls go through the LLM gateway with your provider key. [Verdicts and citations](/wyrd/reference/verifier-card/#verdicts-and-citations) explains the locators a citation can use.
+
+## Multi-step
+
+Prepare evidence before checking it. Here a step reads the policy PDF, a second step compares the refund with the limit it states, and a requirement checks the result.
+
+**Declare (YAML)**
+
+```yaml title="within-policy.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: within-policy, version: 1.0.0}
+spec:
+  description: The refund offered is within the limit the policy PDF states.
+  inputs:
+    answer: {type: json}
+    policy: {type: media, formats: [pdf]}  # a file, uploaded by your code
+  steps:  # run before the requirements; later steps read earlier outputs
+    - id: policy-text
+      action: {kind: extract, from: inputs.policy}  # PDF to text, page by page
+    - id: compare
+      action:
+        kind: code
+        entrypoint: compare
+        # steps.<id>.output reads a step's result; this step waits for policy-text
+        inputs: {pages: steps.policy-text.output.pages, answer: inputs.answer}
+        source:
+          inline: |
+            def compare(pages, answer):
+                text = " ".join(page["text"] for page in pages)
+                # "Refunds of up to 100 dollars are approved ..."
+                limit = int(text.split("up to ")[1].split(" ")[0])
+                return {"within_limit": answer["refund"] <= limit}
+  requirements:
+    - id: within-limit
+      statement: The refund offered is within the policy limit
+      check: {kind: assert, path: steps.compare.output.within_limit, operator: equals, expected: true}  # reads the step's output
+```
+
+**Observe (Python)**
+
+```python
+from wyrd import WyrdState, verify
+
+run = WyrdState.declare("support-reply.yaml").run()
+
+# One keyword per input slot.
+result = run.observe.verify(
+    "within-policy",
+    answer={"text": "Your refund of 40 dollars is approved.", "refund": 40},
+    policy=verify.File("refund-policy.pdf"),  # your policy document, with "up to N dollars"
+)
+print(result.verdict)  # passed
+for step in result.steps:  # each step's status, for debugging
+    print(step["id"], step["status"])
+```
+
+Steps can also be `agent` actions, which read files with built-in tools. [Actions](/wyrd/reference/verifier-card/#actions) lists each kind.
+
+## Grouped session
+
+Judge a whole conversation after it ends. Each reply is verified on its own; a session Verifier reads every reply's evidence and outcome once the group goes quiet.
+
+**Declare (YAML)**
+
+```yaml title="whole-conversation.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: whole-conversation, version: 1.0.0}
+spec:
+  description: Every reply of a conversation passed reply-rules.
+  inputs:
+    # Every reply-rules answer in the group, in order.
+    replies: verifiers.reply-rules.inputs.answer
+    # Every no-guarantee outcome in the group: passed, failed, or inconclusive.
+    outcomes: verifiers.reply-rules.requirements.no-guarantee.outcome
+  # List order: recorded_at (the default) is the order Wyrd received each reply;
+  # inputs.replies.<field> orders by a field of each reply instead.
+  order_by: recorded_at
+  requirements:
+    - id: every-reply-passed
+      statement: No reply in the conversation promised a guaranteed refund
+      # each checks every item; one failed reply fails the conversation
+      check: {kind: assert, each: "inputs.outcomes[*]", operator: equals, expected: passed}
+```
+
+Bind it beside `reply-rules` with a `group_end` Trigger:
+
+```yaml
+verified_by:
+  - verifier: ./reply-rules.yaml
+  - verifier: ./whole-conversation.yaml
+    runs_on: {kind: group_end, after: 10m}  # judge 10 minutes after the last reply
+```
+
+**Observe (Python)**
+
+```python
+from wyrd import WyrdState
+
+run = WyrdState.declare("support-reply.yaml").run()
+conversation = "conv-1234"  # one ID per conversation
+replies = [
+    {"text": "Let me check your order.", "refund": 0},
+    {"text": "Your refund of 40 dollars is approved.", "refund": 40},
+]
+
+for reply in replies:
+    # Each reply is judged now; group_id also adds it to the conversation.
+    run.observe.verify("reply-rules", answer=reply, group_id=conversation)
+# whole-conversation runs on its own, 10 minutes after the last reply.
+```
+
+New replies in the group push the session check back. Its verdict is stored in `vala.verification.results` with the `group_id`.
+
+## Drift
+
+Compare recent values with a baseline on a schedule. Your code records samples; the schedule judges the window.
+
+**Declare (YAML)**
+
+```yaml title="latency-drift.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: latency-drift, version: 1.0.0}
+spec:
+  description: Request latency stays distributed like the healthy baseline.
+  inputs:
+    latency: {type: samples, features: [latency]}  # values your code records over time
+  requirements:
+    - id: latency-stable
+      statement: Request latency is distributed like the healthy baseline
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Psi  # Population Stability Index: how far a distribution moved
+        signal:
+          kind: Distribution
+          baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0}  # what healthy looks like
+          features: [latency]
+        condition: {kind: Statistical}
+        profile:
+          kind: Psi
+          binning_strategy: {kind: EqualWidth, n_bins: 10}  # compare across 10 equal-width buckets
+          threshold: {kind: Fixed, value: 0.25}  # fail when PSI is above 0.25
+```
+
+Bind it with a schedule:
+
+```yaml
+verified_by:
+  - verifier: ./latency-drift.yaml
+    runs_on: {kind: schedule, cron: "0 0 * * *"}  # judge the day's samples at midnight
+```
+
+**Observe (Python)**
+
+```python
+import pandas as pd
+from wyrd import WyrdState
+from wyrd.cards import Cards
+from wyrd.data import DataCard, PandasInterface
+
+# Declare the baseline once: latencies from healthy traffic, in milliseconds.
+healthy = pd.DataFrame({"latency": [float(ms) for ms in range(100)]})
+Cards().data.declare(DataCard(PandasInterface(data=healthy), name="latency-baseline", version="1.0.0"))
+
+run = WyrdState.declare("support-reply.yaml").run()
+run.observe.submit("latency-drift", latency={"latency": 12.5})  # one sample per request
+```
+
+A drift Verifier refuses `verify`; only the schedule judges it.
+
+## Next
+
+[How verification works](/wyrd/understand/how-verification-works/) explains steps, verdicts, and where each check runs.
+
+# FastAPI
 
 Page: /wyrd/connect/integrate-fastapi/
 
@@ -736,7 +1147,7 @@ Startup or shutdown failures are reported to the server with the Wyrd error code
 
 [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
 
-# Configure the verification runtime
+# Verification runtime
 
 Page: /wyrd/operate/configure-verification-runtime/
 
@@ -771,7 +1182,206 @@ Settings are read at startup; restart to apply a change.
 
 [Verification runtime limits](/wyrd/reference/verification-runtime-limits/) lists every setting, its default, and what happens when a limit is reached.
 
-# Cards, versions, and relationships
+# Architecture
+
+Page: /wyrd/understand/architecture/
+
+> What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
+
+A Wyrd deployment is one server binary, run as one pod or as several pods with different roles, behind one endpoint you own. It stores everything durable in Postgres and object storage, so pods can be replaced, scaled, or split by role without moving data.
+
+_Diagram `wyrd-deployment`: see the web page._
+
+## One binary, several roles
+
+Every pod runs `wyrd-server`. `WYRD_TARGET` chooses what a pod does: `all` runs everything and is a complete deployment on its own; `server`, `scribe`, `oracle`, and `forge-worker` split API, writes, queries, and compaction so each scales on its own load. Splitting changes resource ownership, not the API: clients see one server either way. [Bifrost](/wyrd/understand/bifrost/#where-each-part-runs) shows which part each target runs.
+
+## One endpoint
+
+Your load balancer owns the public address and TLS. It routes requests but never establishes who the caller is; every request carries a Wyrd token, and the server checks its roles and tenant. Pods talk to each other over mutual TLS.
+
+## Postgres and object storage
+
+Postgres holds declarations and their versions, principals and roles, and the coordination state that lets many pods share work. Object storage holds evidence, artifacts, and Bifrost's Parquet tables. Neither lives on a pod, which is why a pod can be lost without losing a verdict.
+
+## Identity
+
+People sign in through your OIDC identity provider. Apps, CI, and agents use API keys or workload identity. [Identity and authorization](/wyrd/understand/identity-and-authorization/) explains principals, roles, and tenants.
+
+## Model calls
+
+The server calls model providers with keys you configure, for model-judged checks and for apps that route their calls through the LLM gateway. Wyrd never hosts a model.
+
+## Next
+
+[How verification works](/wyrd/understand/how-verification-works/) follows one check through the server. [Bifrost](/wyrd/understand/bifrost/) covers the evidence store.
+
+# How verification works
+
+Page: /wyrd/understand/how-verification-works/
+
+> Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
+
+A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. A binding attaches the Verifier to the Card it checks, and the server records every verdict with the exact versions it judged.
+
+## The parts of a Verifier
+
+This is the Verifier from [Run your first verification](/wyrd/get-started/quickstart/):
+
+```yaml title="no-refund-promise.yaml"
+# The Verifier: a support answer never promises a guaranteed refund.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: default
+spec:
+  inputs:
+    answer: { type: json }
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: not_contains
+        expected: guaranteed refund
+
+```
+
+| Part | Holds |
+| --- | --- |
+| `inputs` | Named slots for the evidence, each with a `type` |
+| `steps` | Optional preparation, such as extracting text from a file |
+| `requirements` | Each has an `id`, a `statement`, and one `check`, and gets its own verdict |
+| `decide` | How requirement verdicts combine: `all` (the default) or a `pass_rate` |
+
+A Verifier never names what it checks. A binding supplies the subject, so one Verifier can check many Cards. [Verifier Card](/wyrd/reference/verifier-card/) lists every input type, step, and check.
+
+_Diagram `verification-parts`: see the web page._
+
+`assert`, `trace`, `drift`, and `extract` run in the server's check engine. `code` runs sandboxed Python in the Monty pool, a fresh worker per call that the server starts from its own binary. `agent` runs an Agent whose model calls go through the LLM gateway; a step Agent can call [built-in tools](/wyrd/reference/agent-tools-and-authorization/), and a check Agent only `bifrost.query`.
+
+## Bindings
+
+A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. `support-reply` binds `no-refund-promise` to the whole Service. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+
+## verify and submit
+
+`verify` runs the Verifier now and returns the result. A `failed` verdict is an ordinary value, not an exception:
+
+```python
+result = run.observe.verify("no-refund-promise", answer="Your refund request is approved.")
+```
+
+`submit` queues the work on the server and returns an execution that any process holding it can wait on:
+
+```python
+execution = run.observe.submit("no-refund-promise", answer="You have a guaranteed refund.")
+result = execution.wait(60)
+```
+
+_Diagram `verification-paths`: see the web page._
+
+Drift Verifiers judge samples over a time window, so they refuse `verify`. Their `submit` records samples, and a scheduled binding judges the window.
+
+## Verdicts
+
+With `all`, any failed requirement fails the Verifier. Otherwise any inconclusive requirement makes it inconclusive. Otherwise it passes. Requirements that are `not_applicable` do not count, and a Verifier with no applicable requirement is inconclusive.
+
+`inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
+
+_Diagram `run-lifecycle`: see the web page._
+
+A queued execution has a status before it has a verdict. `completed` means it produced a result; `timed_out` and `errored` mean no check finished, so there is no verdict and no Operator runs.
+
+## Results
+
+Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
+
+## Operators
+
+An Operator reacts when a scheduled execution of a binding returns `failed`, by sending a Slack or PagerDuty notification or calling a URL. `verify` and `submit` never run Operators; your code reads their verdicts.
+
+## Next
+
+[Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/).
+
+# Runs and evidence
+
+Page: /wyrd/understand/runs-observations-and-evidence/
+
+> How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
+
+An observation is a record of what a declared service actually did. Each one is tied to the exact Card version and the run that produced it.
+
+## A run is one invocation
+
+A run is one execution of a service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
+
+**Python**
+
+```python
+with state.run("agent") as run:
+    answer = answer_question(question)
+    run.observe.record("vala.datasets.tickets", {"question": question, "answer": answer})
+```
+
+**Rust**
+
+```rust
+let run = state.run_for_card("agent")?;
+let answer = answer_question(question).await?;
+run.observe()
+    .record("vala.datasets.tickets", &json!({ "question": question, "answer": answer }))
+    .await?;
+```
+
+**TypeScript**
+
+```typescript
+const run = state.run("agent");
+const answer = await answerQuestion(question);
+await run.observe.record("vala.datasets.tickets", { question, answer });
+```
+
+`state` holds the exact Card versions the service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
+
+## Where observations land
+
+Observations go to Bifrost, the Wyrd data plane:
+
+| Recorded with | Lands in |
+| --- | --- |
+| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
+| `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
+| Drift samples, with `observe.submit` | `vala.drift.observations` |
+| OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
+
+Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
+
+## Recording is buffered
+
+`observe.*` calls queue the row; a returned call means the row is queued, not stored. `shutdown` sends everything still queued, so a process that exits without it loses those rows. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
+
+A row the server has stored can take a moment to show up in queries. [Bifrost](/wyrd/understand/bifrost/) explains why.
+
+## Evidence joins on the run
+
+Observations and verdicts share `run_id`, so one SQL query joins what a run saw to how it was judged:
+
+```sql
+SELECT t.question, t.answer, r.verdict, r.verifier_version
+FROM vala.datasets.tickets AS t
+JOIN vala.verification.results AS r ON r.run_id = t.run_id
+```
+
+## Next
+
+[Bifrost](/wyrd/understand/bifrost/).
+
+# Cards and versions
 
 Page: /wyrd/understand/cards-versions-and-relationships/
 
@@ -855,161 +1465,6 @@ Every Card therefore shows what it depends on and what depends on it. A running 
 
 [How verification works](/wyrd/understand/how-verification-works/).
 
-# How verification works
-
-Page: /wyrd/understand/how-verification-works/
-
-> Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
-
-A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. A binding attaches the Verifier to the Card it checks, and the server records every verdict with the exact versions it judged.
-
-## The parts of a Verifier
-
-This is the Verifier from [Run your first verification](/wyrd/get-started/quickstart/):
-
-```yaml title="no-refund-promise.yaml"
-# The Verifier: a support answer never promises a guaranteed refund.
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  name: no-refund-promise
-  version: 1.0.0
-  space: default
-spec:
-  inputs:
-    answer: { type: json }
-  requirements:
-    - id: no-refund-promise
-      statement: The answer never promises a guaranteed refund
-      check:
-        kind: assert
-        path: inputs.answer
-        operator: not_contains
-        expected: guaranteed refund
-
-```
-
-| Part | Holds |
-| --- | --- |
-| `inputs` | Named slots for the evidence, each with a `type` |
-| `steps` | Optional preparation, such as extracting text from a file |
-| `requirements` | Each has an `id`, a `statement`, and one `check`, and gets its own verdict |
-| `decide` | How requirement verdicts combine: `all` (the default) or a `pass_rate` |
-
-A Verifier never names what it checks. A binding supplies the subject, so one Verifier can check many Cards. [Verifier Card](/wyrd/reference/verifier-card/) lists every input type, step, and check.
-
-## Bindings
-
-A Service binds a Verifier under `verified_by`, as `support-reply` binds `no-refund-promise`. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
-
-## verify and submit
-
-`verify` runs the Verifier now and returns the result. A `failed` verdict is an ordinary value, not an exception:
-
-```python
-result = run.observe.verify("no-refund-promise", answer="Your refund request is approved.")
-```
-
-`submit` queues the work on the server and returns an execution that any process holding it can wait on:
-
-```python
-execution = run.observe.submit("no-refund-promise", answer="You have a guaranteed refund.")
-result = execution.wait(60)
-```
-
-Drift Verifiers judge samples over a time window, so they refuse `verify`. Their `submit` records samples, and a scheduled binding judges the window.
-
-## Verdicts
-
-With `all`, any failed requirement fails the Verifier. Otherwise any inconclusive requirement makes it inconclusive. Otherwise it passes. Requirements that are `not_applicable` do not count, and a Verifier with no applicable requirement is inconclusive.
-
-`inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
-
-## Results
-
-Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
-
-## Operators
-
-An Operator reacts when a submitted or scheduled execution of a binding returns `failed`, by sending a Slack or PagerDuty notification or calling a URL. `verify` never runs Operators.
-
-## Next
-
-[Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/).
-
-# Runs, observations, and retained evidence
-
-Page: /wyrd/understand/runs-observations-and-evidence/
-
-> How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
-
-An observation is a record of what a declared service actually did. Each one is tied to the exact Card version and the run that produced it.
-
-## A run is one invocation
-
-A run is one execution of a service, such as answering one question. Every observation recorded inside it shares the same `run_id`:
-
-**Python**
-
-```python
-with state.run("agent") as run:
-    answer = answer_question(question)
-    run.observe.record("vala.datasets.tickets", {"question": question, "answer": answer})
-```
-
-**Rust**
-
-```rust
-let run = state.run_for_card("agent")?;
-let answer = answer_question(question).await?;
-run.observe()
-    .record("vala.datasets.tickets", &json!({ "question": question, "answer": answer }))
-    .await?;
-```
-
-**TypeScript**
-
-```typescript
-const run = state.run("agent");
-const answer = await answerQuestion(question);
-await run.observe.record("vala.datasets.tickets", { question, answer });
-```
-
-`state` holds the exact Card versions the service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
-
-## Where observations land
-
-Observations go to Bifrost, the Wyrd data plane:
-
-| Recorded with | Lands in |
-| --- | --- |
-| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
-| `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
-| Drift samples, with `observe.submit` | `vala.drift.observations` |
-| OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
-
-Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
-
-## Recording is buffered
-
-`observe.*` calls queue the row; a returned call means the row is queued, not stored. `shutdown` sends everything still queued, so a process that exits without it loses those rows. If the queue fills, the call fails with `WYRD_CLIENT_429_QUEUE_FULL` instead of blocking.
-
-A row the server has stored can take a moment to show up in queries. [Bifrost](/wyrd/understand/bifrost/) explains why.
-
-## Evidence joins on the run
-
-Observations and verdicts share `run_id`, so one SQL query joins what a run saw to how it was judged:
-
-```sql
-SELECT t.question, t.answer, r.verdict, r.verifier_version
-FROM vala.datasets.tickets AS t
-JOIN vala.verification.results AS r ON r.run_id = t.run_id
-```
-
-## Next
-
-[Bifrost](/wyrd/understand/bifrost/).
-
 # Bifrost
 
 Page: /wyrd/understand/bifrost/
@@ -1026,6 +1481,8 @@ GROUP BY verdict
 
 ## How it is put together
 
+_Diagram `bifrost-parts`: see the web page._
+
 | Part | Does |
 | --- | --- |
 | Gate | Checks each request's permission and routes it |
@@ -1033,15 +1490,23 @@ GROUP BY verdict
 | Oracle | Runs SQL queries |
 | Forge | Compacts files and applies retention in the background |
 
-One server runs all four. A larger deployment can split them across pods with `WYRD_TARGET`.
+One server runs all four.
 
 Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `vala.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
+
+## Where each part runs
+
+Every pod runs the same `wyrd-server` binary, and `WYRD_TARGET` picks which parts it runs. The default, `all`, runs every part, so a single pod is a complete deployment. A larger team splits writes, queries, and compaction so each scales on its own load.
+
+_Diagram `bifrost-pods`: see the web page._
 
 ## Two ways in
 
 Inside a running service, `run.observe.*` writes rows tied to the run and the exact Card version. For batch jobs, backfills, and notebooks, the `Bifrost` client registers tables, writes rows, and queries them. SQL is read-only.
 
 ## Written versus queryable
+
+_Diagram `bifrost-write-read`: see the web page._
 
 A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read the recent unpublished rows each Scribe still holds, and a row published while the query runs is returned exactly once.
 
@@ -1051,7 +1516,7 @@ Every query ends with a status: `success`; `degraded` when a Scribe could not be
 
 [Identity and authorization](/wyrd/understand/identity-and-authorization/).
 
-# Identity and authorization
+# Identity and access
 
 Page: /wyrd/understand/identity-and-authorization/
 
@@ -1289,128 +1754,6 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |
 | `pass_rate` | `threshold` is not above 0 and at most 1 |
 
-# MCP tools
-
-Page: /wyrd/reference/mcp-tools/
-
-> Wyrd MCP tool names, permissions, shapes, and query limits.
-
-The server serves MCP protocol revision 2026-07-28 over HTTP at `/mcp`; `wyrd mcp proxy` relays the same tools over stdio.
-
-## Discovery
-
-- `tools/list` returns each tool's current input and output JSON Schemas; named shapes below, such as `VerificationRequest`, are those schemas. Unknown argument fields are refused.
-- Read tools and `wyrd.guide` are always listed. Write, revoke, reset, and delete tools are listed only to callers holding their permission. Listing grants nothing.
-- Credentials and secrets are never returned.
-
-## Agent frameworks
-
-Tool names contain dots, which many model providers refuse, so each framework forwards an alias.
-
-| Framework | Tested configuration |
-| --- | --- |
-| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}`; aliases such as `mcp_wyrd__wyrd_guide` |
-| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per tool |
-| Google ADK | `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false`; override `McpToolset.get_tools` to return copies whose `name` is the alias |
-
-## Investigation guide
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `wyrd.guide` | Any caller | `{topic}` → `{topic, steps, examples}` | Static workflow guidance |
-
-`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; angle-bracket placeholders stand for discovered values.
-
-## Cards and verification
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
-| `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
-| `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
-| `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan uploads for files the tenant lacks |
-| `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
-| `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
-
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
-
-## Bifrost
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `bifrost.list_tables` | `bifrost_table:read` | `{}` → `{tables}` | List readable tables |
-| `bifrost.describe_table` | `bifrost_table:read` | `{namespace, name}` → table description | Read one table's schema and layout |
-| `bifrost.query` | scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one bounded `SELECT` |
-
-Gateway request and response payload columns also need `gateway_payload:read`.
-
-### Query limits
-
-| Bound | Default | Maximum |
-| --- | --- | --- |
-| SQL text | Required | 65,536 UTF-8 bytes |
-| `max_rows` | 1,000 | 10,000 |
-| `max_bytes` | 4 MiB | 16 MiB |
-| `deadline_ms` | Server policy | 4,294,967,295 ms; minimum 1 |
-
-`sql` is one DataFusion SQL `SELECT` with fully qualified table names. Rows are positional arrays in `columns` order. A result is complete only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
-
-## Principal credentials
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `principals.list_credentials` | `service_accounts:write` | `{principal_id}` → CredentialListResponse | List credentials, including expired and revoked |
-| `principals.revoke_credential` | `service_accounts:write` | `{principal_id, credential_id}` → CredentialRevoked | Stop token issuance from a credential |
-
-A token already minted from a revoked credential lapses within five minutes.
-
-## Operator connections
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `operator_connections.list` | `operators:read` | `{}` → `{connections}` | List connections |
-| `operator_connections.get` | `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
-| `operator_connections.create` | `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create a Slack, PagerDuty, or HTTP connection |
-| `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
-| `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
-
-## Gateway administration
-
-Gateway tools address resources by exact `name` and never call a model.
-
-| Tool | Permission | Input → output | Purpose |
-| --- | --- | --- | --- |
-| `gateway.list_provider_credentials` | `gateway:read` | `{}` → `{items}` of credential views | List credentials |
-| `gateway.list_provider_deployments` | `gateway:read` | `{}` → `{items}` of deployments | List deployments |
-| `gateway.get_provider_credential` | `gateway:read` | `{name}` → credential view | Read one credential |
-| `gateway.get_provider_deployment` | `gateway:read` | `{name}` → deployment | Read one deployment |
-| `gateway.get_fallback_policy` | `gateway:read` | `{}` → fallback policy | Read the fallback policy |
-| `gateway.get_governance_policy` | `gateway:read` | `{}` → governance policy | Read limits, budgets, and pricing |
-| `gateway.get_capture_policy` | `gateway:read` | `{}` → versioned capture policy | Read the capture policy |
-| `gateway.put_provider_credential` | `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate a credential |
-| `gateway.put_provider_deployment` | `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
-| `gateway.apply_provider_deployments` | `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Write credentials and deployments in one transaction |
-| `gateway.put_fallback_policy` | `gateway:write` | FallbackPolicy → fallback policy | Replace the fallback policy |
-| `gateway.put_governance_policy` | `gateway:write` | GovernancePolicy → governance policy | Replace the governance policy |
-| `gateway.put_capture_policy` | `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace the capture policy |
-| `gateway.revoke_provider_credential` | `gateway:write` | `{name}` → credential view | Revoke permanently |
-| `gateway.delete_provider_credential` | `gateway:delete` | `{name}` → `{}` | Delete an unreferenced credential; absent succeeds |
-| `gateway.delete_provider_deployment` | `gateway:delete` | `{name}` → `{}` | Delete a deployment; absent succeeds |
-| `gateway.delete_fallback_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
-| `gateway.delete_governance_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
-
-A managed secret is write-only. A credential still referenced by a deployment cannot be deleted.
-
-## Errors
-
-A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem with `code` and remediation.
-
-| Code | Cause |
-| --- | --- |
-| `WYRD_QUERY_400_INVALID_SYNTAX` | Malformed `cards.list` filter |
-| `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` | The query result is too large to return |
-
 # Extraction output
 
 Page: /wyrd/reference/extraction-output/
@@ -1532,7 +1875,57 @@ The step fails, and the requirements that need it are `inconclusive`, when:
 
 Limits are in [Verification runtime limits](/wyrd/reference/verification-runtime-limits/). Each result records the extractor version `wyrd-extract/1`.
 
-# Verification runtime limits
+# Agent tools
+
+Page: /wyrd/reference/agent-tools-and-authorization/
+
+> Built-in tools a Verifier's Agent can call and the permissions each call needs.
+
+A Verifier's Agent calls server built-in tools, named in its `tool_names`. There is no fetch tool and no network access.
+
+## Built-in tools
+
+| Tool | Does | Resource permission |
+| --- | --- | --- |
+| `cards.list` | Lists Card summaries by kind, name, space, or metadata | `cards:read` |
+| `cards.get` | Reads one Card by exact kind, name, version, and space, or by kind and UID | `cards:read` |
+| `bifrost.list_tables` | Lists tables | `bifrost_table:read` |
+| `bifrost.describe_table` | Reads one table's schema | `bifrost_table:read` |
+| `bifrost.query` | Runs one read-only SQL query | `bifrost_query:read` on every table it reads |
+| `fs.list` | Lists workspace files | Workspace only |
+| `fs.read` | Reads a bounded span of a workspace file, with locators | Workspace only |
+| `fs.search` | Finds matching locations in workspace files | Workspace only |
+| `code.run` | Runs sandboxed Python against the workspace | Workspace only |
+
+Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
+
+## Rules
+
+- A step Agent with `fs.*` or `code.run` needs a `workspace`, and a `workspace` needs one of them.
+- A check Agent may declare only `bifrost.query` and has no workspace.
+
+## Permissions
+
+Every call needs both a `tool:invoke` grant and the tool's resource permission. Neither implies the other.
+
+```json
+{"resource":"tool","action":"invoke","scope":"all"}
+{"resource":"tool","action":"invoke","scope":{"tool":"bifrost.query"}}
+```
+
+The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
+
+## Errors
+
+| Code | Cause |
+| --- | --- |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The principal lacks `tool:invoke` or the resource permission; the call returns no data |
+| `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
+| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
+| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |
+
+# Runtime limits
 
 Page: /wyrd/reference/verification-runtime-limits/
 
@@ -1604,55 +1997,127 @@ Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / M
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
 | Any other limit in a step or check, including `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |
 
-# Agent tools and authorization
+# MCP tools
 
-Page: /wyrd/reference/agent-tools-and-authorization/
+Page: /wyrd/reference/mcp-tools/
 
-> Built-in tools a Verifier's Agent can call and the permissions each call needs.
+> Wyrd MCP tool names, permissions, shapes, and query limits.
 
-A Verifier's Agent calls server built-in tools, named in its `tool_names`. There is no fetch tool and no network access.
+The server serves MCP protocol revision 2026-07-28 over HTTP at `/mcp`; `wyrd mcp proxy` relays the same tools over stdio.
 
-## Built-in tools
+## Discovery
 
-| Tool | Does | Resource permission |
+- `tools/list` returns each tool's current input and output JSON Schemas; named shapes below, such as `VerificationRequest`, are those schemas. Unknown argument fields are refused.
+- Read tools and `wyrd.guide` are always listed. Write, revoke, reset, and delete tools are listed only to callers holding their permission. Listing grants nothing.
+- Credentials and secrets are never returned.
+
+## Agent frameworks
+
+Tool names contain dots, which many model providers refuse, so each framework forwards an alias.
+
+| Framework | Tested configuration |
+| --- | --- |
+| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}`; aliases such as `mcp_wyrd__wyrd_guide` |
+| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per tool |
+| Google ADK | `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false`; override `McpToolset.get_tools` to return copies whose `name` is the alias |
+
+## Investigation guide
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `wyrd.guide` | Any caller | `{topic}` → `{topic, steps, examples}` | Static workflow guidance |
+
+`topic` is `start`, `overview`, `cards`, `verification`, or `bifrost_sql`; `start` is the entry point for a new agent. Each example has `tool`, `purpose`, and `arguments`; angle-bracket placeholders stand for discovered values.
+
+## Cards and verification
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
+| `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
+| `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
+| `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
+| `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan uploads for files the tenant lacks |
+| `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
+| `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
+
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+
+## Bifrost
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `bifrost.list_tables` | `bifrost_table:read` | `{}` → `{tables}` | List readable tables |
+| `bifrost.describe_table` | `bifrost_table:read` | `{namespace, name}` → table description | Read one table's schema and layout |
+| `bifrost.query` | scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one bounded `SELECT` |
+
+Gateway request and response payload columns also need `gateway_payload:read`.
+
+### Query limits
+
+| Bound | Default | Maximum |
 | --- | --- | --- |
-| `cards.list` | Lists Card summaries by kind, name, space, or metadata | `cards:read` |
-| `cards.get` | Reads one Card by exact kind, name, version, and space, or by kind and UID | `cards:read` |
-| `bifrost.list_tables` | Lists tables | `bifrost_table:read` |
-| `bifrost.describe_table` | Reads one table's schema | `bifrost_table:read` |
-| `bifrost.query` | Runs one read-only SQL query | `bifrost_query:read` on every table it reads |
-| `fs.list` | Lists workspace files | Workspace only |
-| `fs.read` | Reads a bounded span of a workspace file, with locators | Workspace only |
-| `fs.search` | Finds matching locations in workspace files | Workspace only |
-| `code.run` | Runs sandboxed Python against the workspace | Workspace only |
+| SQL text | Required | 65,536 UTF-8 bytes |
+| `max_rows` | 1,000 | 10,000 |
+| `max_bytes` | 4 MiB | 16 MiB |
+| `deadline_ms` | Server policy | 4,294,967,295 ms; minimum 1 |
 
-Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
+`sql` is one DataFusion SQL `SELECT` with fully qualified table names. Rows are positional arrays in `columns` order. A result is complete only when `terminal.outcome` is `"success"`; a result over `max_rows` or `max_bytes` is refused, never truncated.
 
-## Rules
+## Principal credentials
 
-- A step Agent with `fs.*` or `code.run` needs a `workspace`, and a `workspace` needs one of them.
-- A check Agent may declare only `bifrost.query` and has no workspace.
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `principals.list_credentials` | `service_accounts:write` | `{principal_id}` → CredentialListResponse | List credentials, including expired and revoked |
+| `principals.revoke_credential` | `service_accounts:write` | `{principal_id, credential_id}` → CredentialRevoked | Stop token issuance from a credential |
 
-## Permissions
+A token already minted from a revoked credential lapses within five minutes.
 
-Every call needs both a `tool:invoke` grant and the tool's resource permission. Neither implies the other.
+## Operator connections
 
-```json
-{"resource":"tool","action":"invoke","scope":"all"}
-{"resource":"tool","action":"invoke","scope":{"tool":"bifrost.query"}}
-```
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `operator_connections.list` | `operators:read` | `{}` → `{connections}` | List connections |
+| `operator_connections.get` | `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
+| `operator_connections.create` | `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create a Slack, PagerDuty, or HTTP connection |
+| `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
+| `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
 
-The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
+## Gateway administration
+
+Gateway tools address resources by exact `name` and never call a model.
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `gateway.list_provider_credentials` | `gateway:read` | `{}` → `{items}` of credential views | List credentials |
+| `gateway.list_provider_deployments` | `gateway:read` | `{}` → `{items}` of deployments | List deployments |
+| `gateway.get_provider_credential` | `gateway:read` | `{name}` → credential view | Read one credential |
+| `gateway.get_provider_deployment` | `gateway:read` | `{name}` → deployment | Read one deployment |
+| `gateway.get_fallback_policy` | `gateway:read` | `{}` → fallback policy | Read the fallback policy |
+| `gateway.get_governance_policy` | `gateway:read` | `{}` → governance policy | Read limits, budgets, and pricing |
+| `gateway.get_capture_policy` | `gateway:read` | `{}` → versioned capture policy | Read the capture policy |
+| `gateway.put_provider_credential` | `gateway:write` | ProviderCredentialWrite → credential view | Create or rotate a credential |
+| `gateway.put_provider_deployment` | `gateway:write` | ProviderDeployment → deployment | Create or replace a deployment |
+| `gateway.apply_provider_deployments` | `gateway:write` | ProviderDeploymentsApply → applied credentials and deployments | Write credentials and deployments in one transaction |
+| `gateway.put_fallback_policy` | `gateway:write` | FallbackPolicy → fallback policy | Replace the fallback policy |
+| `gateway.put_governance_policy` | `gateway:write` | GovernancePolicy → governance policy | Replace the governance policy |
+| `gateway.put_capture_policy` | `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace the capture policy |
+| `gateway.revoke_provider_credential` | `gateway:write` | `{name}` → credential view | Revoke permanently |
+| `gateway.delete_provider_credential` | `gateway:delete` | `{name}` → `{}` | Delete an unreferenced credential; absent succeeds |
+| `gateway.delete_provider_deployment` | `gateway:delete` | `{name}` → `{}` | Delete a deployment; absent succeeds |
+| `gateway.delete_fallback_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
+| `gateway.delete_governance_policy` | `gateway:write` | `{}` → `{}` | Restore the default |
+
+A managed secret is write-only. A credential still referenced by a deployment cannot be deleted.
 
 ## Errors
 
+A refusal is a JSON-RPC error or an `isError` result carrying a Wyrd problem with `code` and remediation.
+
 | Code | Cause |
 | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The principal lacks `tool:invoke` or the resource permission; the call returns no data |
-| `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
-| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |
+| `WYRD_QUERY_400_INVALID_SYNTAX` | Malformed `cards.list` filter |
+| `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` | The query result is too large to return |
 
 # Error codes
 

@@ -3,7 +3,7 @@ title: Extraction output
 description: The JSON an extract step returns for each media format.
 pillar: wyrd
 section: Reference
-order: 4
+order: 2
 status: runnable
 ---
 

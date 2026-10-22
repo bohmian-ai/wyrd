@@ -1,5 +1,5 @@
 ---
-title: Bind a Verifier
+title: Bindings
 description: Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
 pillar: wyrd
 section: Build and verify

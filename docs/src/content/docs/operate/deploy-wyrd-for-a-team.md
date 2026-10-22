@@ -1,5 +1,5 @@
 ---
-title: Deploy Wyrd for a team
+title: Deploy for a team
 description: Prepare PostgreSQL with a platform login and a tenant login, migrate it, start the server, and create the first tenant.
 pillar: wyrd
 section: Operate

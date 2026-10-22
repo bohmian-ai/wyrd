@@ -1,5 +1,5 @@
 ---
-title: Runs, observations, and retained evidence
+title: Runs and evidence
 description: How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 pillar: wyrd
 section: Understand

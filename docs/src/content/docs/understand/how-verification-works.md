@@ -23,9 +23,13 @@ This is the Verifier from [Run your first verification](/get-started/quickstart/
 
 A Verifier never names what it checks. A binding supplies the subject, so one Verifier can check many Cards. [Verifier Card](/reference/verifier-card/) lists every input type, step, and check.
 
+<WyrdDiagram name="verification-parts" />
+
+`assert`, `trace`, `drift`, and `extract` run in the server's check engine. `code` runs sandboxed Python in the Monty pool, a fresh worker per call that the server starts from its own binary. `agent` runs an Agent whose model calls go through the LLM gateway; a step Agent can call [built-in tools](/reference/agent-tools-and-authorization/), and a check Agent only `bifrost.query`.
+
 ## Bindings
 
-A Service binds a Verifier under `verified_by`, as `support-reply` binds `no-refund-promise`. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. `support-reply` binds `no-refund-promise` to the whole Service. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
 
 ## verify and submit
 
@@ -42,6 +46,8 @@ execution = run.observe.submit("no-refund-promise", answer="You have a guarantee
 result = execution.wait(60)
 ```
 
+<WyrdSequence name="verification-paths" />
+
 Drift Verifiers judge samples over a time window, so they refuse `verify`. Their `submit` records samples, and a scheduled binding judges the window.
 
 ## Verdicts
@@ -50,13 +56,17 @@ With `all`, any failed requirement fails the Verifier. Otherwise any inconclusiv
 
 `inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
 
+<WyrdDiagram name="run-lifecycle" />
+
+A queued execution has a status before it has a verdict. `completed` means it produced a result; `timed_out` and `errored` mean no check finished, so there is no verdict and no Operator runs.
+
 ## Results
 
 Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
 
 ## Operators
 
-An Operator reacts when a submitted or scheduled execution of a binding returns `failed`, by sending a Slack or PagerDuty notification or calling a URL. `verify` never runs Operators.
+An Operator reacts when a scheduled execution of a binding returns `failed`, by sending a Slack or PagerDuty notification or calling a URL. `verify` and `submit` never run Operators; your code reads their verdicts.
 
 ## Next
 

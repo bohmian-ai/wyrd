@@ -1,10 +1,10 @@
 ---
-title: Monitor drift
+title: Drift
 description: Compare the inputs your service sees with a healthy baseline on a schedule, and get paged when they shift.
 pillar: wyrd
 section: Build and verify
 topic: Verify
-order: 3
+order: 4
 draft: true
 status: runnable
 ---

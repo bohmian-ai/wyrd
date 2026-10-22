@@ -1,9 +1,9 @@
 ---
-title: Verification runtime limits
+title: Runtime limits
 description: Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
 pillar: wyrd
 section: Reference
-order: 5
+order: 4
 status: runnable
 ---
 

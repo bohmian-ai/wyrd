@@ -60,7 +60,7 @@ In `quickstart`:
 wyrd init guided
 ```
 
-It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
+It asks which coding agent to use, your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`), and a tenant name, such as `acme`. If a model provider key such as `OPENAI_API_KEY` is set, it also offers to add that provider to the gateway; press Enter to skip, since the quickstart calls no model. Then it starts a local server, connects the agent, and hands over. The agent installs the SDK, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the `passed` and `failed` verdicts it finds. It asks before replacing a file. Leave the terminal open; the server runs until you press Ctrl-C.
 
 <Aside type="note" title="Another agent, or your own">
 

@@ -1,9 +1,9 @@
 ---
-title: Cards, versions, and relationships
+title: Cards and versions
 description: A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 pillar: wyrd
 section: Understand
-order: 1
+order: 4
 ---
 
 A Card is a versioned declaration of one AI system component, or of one Verifier that checks components. Every observation and verdict points back to an exact Card version.

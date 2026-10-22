@@ -20,29 +20,34 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 - [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
 - [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/): Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 
+## Build and verify
+
+- [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+
 ## Connect
 
-- [Integrate Wyrd with FastAPI](/wyrd/connect/integrate-fastapi/): Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
+- [FastAPI](/wyrd/connect/integrate-fastapi/): Start a pulled Service with your FastAPI app, verify inside one Run per request, and drain queued evidence at shutdown, including under Gunicorn.
 
 ## Operate
 
-- [Configure the verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
+- [Verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 
 ## Understand
 
-- [Cards, versions, and relationships](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
+- [Architecture](/wyrd/understand/architecture/): What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
 - [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
-- [Runs, observations, and retained evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
+- [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
+- [Cards and versions](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
-- [Identity and authorization](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
+- [Identity and access](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
 
 ## Reference
 
 - [Verifier Card](/wyrd/reference/verifier-card/): Fields, input slots, steps, checks, operators, references, citations, and refusals of a Verifier spec.
-- [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
 - [Extraction output](/wyrd/reference/extraction-output/): The JSON an extract step returns for each media format.
-- [Verification runtime limits](/wyrd/reference/verification-runtime-limits/): Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
-- [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
+- [Agent tools](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
+- [Runtime limits](/wyrd/reference/verification-runtime-limits/): Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
+- [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
 - [Error codes](/wyrd/api/errors/): Every stable Wyrd error code with its HTTP status, title, and fix.
 - [HTTP API](/wyrd/api/openapi/): Where a Wyrd server serves its OpenAPI document and how to use it.
 

@@ -1,9 +1,9 @@
 ---
-title: Agent tools and authorization
+title: Agent tools
 description: Built-in tools a Verifier's Agent can call and the permissions each call needs.
 pillar: wyrd
 section: Reference
-order: 6
+order: 3
 status: runnable
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: Define a Service
+title: Services
 description: Declare a Service as a folder of Card files, with exact component versions and a table for the rows it records, then validate it locally.
 pillar: wyrd
 section: Build and verify

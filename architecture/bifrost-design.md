@@ -87,6 +87,27 @@ agent traces `started_at`, Drift observations and
 `vala.system.audit_log` `created_at`, and `vala.verification.results`
 `ended_at`. Every caller-supplied `wyrd_*` column is reserved and refused.
 
+A physical layout is that required UTC hour or day time partition plus at most
+two declared extra dimensions, each an Iceberg `identity`, `bucket`, or
+`truncate` transform of an eligible scalar column, and bounded scalar sort and
+Bloom declarations; one validator in `catalog::layout` resolves every
+declaration and refuses anything else with no registration residue. A row's
+physical partition is its complete typed tuple — partition spec id, time
+partition, then each extra value — and a null value is a distinct partition,
+never an alias of a literal, another type, or another spec. Every storage tier
+keys rows by that tuple: seal keys, WAL records, staged manifests, promotion
+records, and `vala.file_list.partition_dimensions`, which records it beside
+independent time bounds.
+
+Schema ids, partition-spec ids, and sort-order ids are distinct retained Iceberg
+identities. Admission binds each batch to the table's committed
+`LayoutRevision { schema_id, sort_order_id }` and spec, and the WAL, staged
+manifest, seal, and published file carry that revision, so a revision committed
+after acceptance never reinterprets accepted rows, and a retry keeps its
+original binding. Scribe stamps the revision schema's field ids on every
+admitted column (`PARQUET:field_id`), and every reader resolves columns by
+field id: a rename keeps its values, and a column a source predates reads null.
+
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
 authenticated principal.
@@ -513,8 +534,9 @@ stage, `Scribe.group_write`, `group_commit`, `group_sync`, `group_fence`, and
 acknowledged.
 
 Every time-column value is accepted; no acceptance window exists. One request
-may touch at most 32 time partitions of its table; a request touching more is
-refused whole with the existing invalid-frame error and stores nothing.
+may touch at most 32 distinct complete partition tuples of its table, a
+repeated tuple counting once; a request touching more is refused whole with the
+existing invalid-frame error before WAL append or fence and stores nothing.
 
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
@@ -548,7 +570,7 @@ keeps WAL and local evidence for reconciliation.
 `StagingAssembler` claims complete ready members under the exact key:
 
 ```text
-(tenant, table, schema_fingerprint, physical_layout,
+(tenant, table, schema_fingerprint, physical_layout, layout_revision,
  physical_partition, node_id, writer_epoch)
 ```
 
@@ -615,7 +637,13 @@ acquires the read-audit durability boundary, pins the published cut, discovers
 relevant online Scribe routes, builds one optimized logical and physical plan,
 admits resources, and streams one terminal-safe result. DataFusion providers
 receive the pinned files and selected Scribe live sources. Tenant authority is
-installed before plan decode or source IO. There is no caller-selected source
+installed before plan decode or source IO. Every source is read under its own
+metadata and projected onto the table's current schema by field id: the
+Iceberg scan binds the current schema rather than the snapshot's, Parquet
+columns resolve by field id, file pruning is re-planned against each file's own
+schema, and the live tail carries the required fields so memtable rows admitted
+under an earlier revision project by id. A column a source predates reads null,
+so filters on it stay exact. There is no caller-selected source
 mode, freshness policy, or query class.
 
 Oracle plans every query once through the pinned `datafusion-distributed`
@@ -1104,8 +1132,11 @@ table file geometry or creates a second grouping algorithm.
 Forge first promotes committed Scribe hot objects unchanged. The promotion
 worker validates the exact footer-derived Iceberg `DataFile` projection against
 the claimed `file_list` row, bound table, partition, path, checksum, and target
-branch. It then performs one fenced duplicate-checking fast-append
-`commit_once`. Promotion writes no data object and invokes no compaction core.
+branch. A record may name any partition spec and sort order the table
+retains, and its footer is decoded against the newest retained schema whose
+field ids it matches, so objects sealed before a revision keep the layout they
+were written with. It then performs one fenced duplicate-checking fast-append
+`commit_once`, which writes one manifest per partition spec. Promotion writes no data object and invokes no compaction core.
 
 On a definite compare-and-swap conflict, Forge refreshes the branch head and
 revalidates the exact `file_list` rows, object/footer evidence, absence of an
@@ -1135,7 +1166,10 @@ attempt (approximately 1 GiB, overridable by environment). Row-group size is
 independent and normally 128 MiB. A physical file rolls from the managed
 writer's encoded estimate after a completed write; partition and end-of-stream
 residue are valid. Neither target is a universal physical object-size
-guarantee.
+guarantee. Planning groups files by their complete physical partition, spec
+included, so a rewrite never crosses a partition boundary to meet a target, and
+each output records the spec, partition tuple, and sort order its rows actually
+have. Forge never rewrites history to the current layout on its own.
 
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent

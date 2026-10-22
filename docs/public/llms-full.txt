@@ -3527,7 +3527,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET` | 400 | Invalid Bifrost compaction target | Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes. |
-| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values. |
+| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare a non-null UTC timestamp time column partitioned by hour or day plus at most two identity, bucket (2 to 1024), or truncate dimensions over string or integer columns, at most four unique scalar sort keys, and at most sixteen string, integer, or binary Bloom columns. |
 | `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | 400 | Reserved system column name | Rename the column; run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved. |
 | `WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING` | 400 | Tenant isolation column missing | Add the server-managed data_tenant_id Utf8 column to the physical table schema. |
 | `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | 400 | Undeclared Bifrost field | Remove the key or declare it on the table; store open data in a Variant field. |

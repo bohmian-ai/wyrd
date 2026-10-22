@@ -218,6 +218,9 @@ pub struct ScribeStagingRuntime {
     /// hands, so this owner is what moves the authority forward. A fixture
     /// runtime built without a pod tracks no authority and none is asked of it.
     hot_sources: Option<Arc<ScribeHotSourceRegistry>>,
+    /// Catalog holding the retained revisions recovered keys are rebuilt
+    /// under; absent only where every table stays at its initial revision.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Read-only record of which shards contributed to each published claim.
     ///
     /// Neither the `file_list` row nor its promotion record names the shard
@@ -261,6 +264,7 @@ impl ScribeStagingRuntime {
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
             hot_sources: None,
+            catalog: None,
             #[cfg(any(test, feature = "test-support"))]
             published_claims: Mutex::new(Vec::new()),
         }
@@ -275,6 +279,14 @@ impl ScribeStagingRuntime {
     pub fn with_hot_sources(mut self, hot_sources: Arc<ScribeHotSourceRegistry>) -> Self {
         self.publisher.set_hot_sources(Arc::clone(&hot_sources));
         self.hot_sources = Some(hot_sources);
+        self
+    }
+
+    /// Installs the catalog whose retained revisions recovered keys are
+    /// rebuilt under.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Option<Arc<crate::catalog::BifrostCatalog>>) -> Self {
+        self.catalog = catalog;
         self
     }
 
@@ -818,14 +830,21 @@ impl ScribeStagingRuntime {
                     ),
                 }
             })?;
-        let layout =
-            crate::scribe::write_recipe::resolve_write_recipe(pool, &binding, schema.as_ref())
-                .await?;
+        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+            pool,
+            self.catalog.as_deref(),
+            &binding,
+            key.revision(),
+            key.partition().spec_id(),
+            schema.as_ref(),
+        )
+        .await?;
         let resolved = ScribeAssemblyKey::new(
             key.tenant(),
             key.table().clone(),
             key.schema_fingerprint(),
             layout.as_ref(),
+            key.revision(),
             key.partition().clone(),
             key.node_id(),
             key.writer_epoch(),

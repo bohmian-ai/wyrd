@@ -727,6 +727,9 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    /// Catalog holding the retained revisions staged members are written
+    /// under; absent only where every table stays at its initial revision.
+    pub(crate) catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -871,7 +874,8 @@ impl PersistenceRuntime {
         );
         Some(Arc::new(
             ScribeStagingRuntime::new(stage, publisher, config)
-                .with_hot_sources(Arc::clone(&context.hot_sources)),
+                .with_hot_sources(Arc::clone(&context.hot_sources))
+                .with_catalog(context.catalog.clone()),
         ))
     }
 
@@ -1417,6 +1421,8 @@ enum ClaimSlotWait {
 struct PersistenceWorker {
     /// Audited operator pool for atomically fenced publication.
     operator_pool: Option<OperatorPool>,
+    /// Catalog holding the retained revision each member is written under.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Shared durable failure ledger consumed by startup recovery.
     failures: Arc<Mutex<Vec<String>>>,
     /// Replacement actor identity used only for publication authority.
@@ -1977,6 +1983,7 @@ impl PersistenceWorker {
         );
         Self {
             operator_pool,
+            catalog: context.catalog,
             failures,
             actor_stream: context.actor_stream,
             wal: context.wal,
@@ -2225,7 +2232,10 @@ impl PersistenceWorker {
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "writer-v2 staging requires the operator control capability".to_owned(),
                 })?,
+            self.catalog.as_deref(),
             binding,
+            generation.seal_key.revision,
+            generation.seal_key.partition.spec_id(),
             &frozen.schema,
         )
         .await?;
@@ -3114,6 +3124,7 @@ mod tests {
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
                     hot_sources: Arc::clone(&hot_sources),
+                    catalog: None,
                     faults: PersistenceFaults::default(),
                 },
                 &Handle::current(),

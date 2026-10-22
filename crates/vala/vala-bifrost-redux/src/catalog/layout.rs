@@ -79,7 +79,9 @@ pub const BIFROST_SCHEMA_ID: i32 = 0;
 /// other two. Admission binds the table's committed revision, and every later
 /// step — seal, staging, recovery, publication — writes the batch under the
 /// retained metadata these ids name, never under the table's current revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct LayoutRevision {
     /// Iceberg schema id the batch's field ids were stamped from.
     pub schema_id: i32,

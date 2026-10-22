@@ -3996,7 +3996,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=bc01647d0c013bc103a30ceaddb27cff3504500d#bc01647d0c013bc103a30ceaddb27cff3504500d"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=6a04f6f1642127eb87b4f62457069e4b835901e9#6a04f6f1642127eb87b4f62457069e4b835901e9"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4055,7 +4055,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=bc01647d0c013bc103a30ceaddb27cff3504500d#bc01647d0c013bc103a30ceaddb27cff3504500d"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=6a04f6f1642127eb87b4f62457069e4b835901e9#6a04f6f1642127eb87b4f62457069e4b835901e9"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4066,7 +4066,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=8cc7bc58477371c5a8ecc33a083546aa8cae1018#8cc7bc58477371c5a8ecc33a083546aa8cae1018"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=aab4c741cdd1c4c97d4389741e3aeced71bec9e2#aab4c741cdd1c4c97d4389741e3aeced71bec9e2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4094,7 +4094,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=bc01647d0c013bc103a30ceaddb27cff3504500d#bc01647d0c013bc103a30ceaddb27cff3504500d"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=6a04f6f1642127eb87b4f62457069e4b835901e9#6a04f6f1642127eb87b4f62457069e4b835901e9"
 dependencies = [
  "anyhow",
  "async-trait",

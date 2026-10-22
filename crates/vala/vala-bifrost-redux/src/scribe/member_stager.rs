@@ -184,6 +184,7 @@ impl ScribeMemberStager {
             request.frozen.seal_key.table.clone(),
             crate::parquet::footer::schema_fingerprint(request.frozen.schema.as_ref()),
             request.layout,
+            request.frozen.seal_key.revision,
             request.frozen.seal_key.partition.clone(),
             request.origin.node_id,
             request.origin.writer_epoch,

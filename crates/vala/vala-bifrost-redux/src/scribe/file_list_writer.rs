@@ -9,7 +9,6 @@ use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
-use crate::catalog::layout::BIFROST_SORT_ORDER_ID;
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::ParquetEncoded;
@@ -246,6 +245,7 @@ pub fn build_artifact_inserts(
         &PublishedArtifactFacts {
             binding,
             partition: encoded.partition.clone(),
+            sort_order_id: frozen.seal_key.revision.sort_order_id,
             node_id,
             writer_epoch,
             wal_lsn_min,
@@ -294,6 +294,7 @@ pub fn build_claim_inserts(
         &PublishedArtifactFacts {
             binding,
             partition: key.partition().clone(),
+            sort_order_id: key.revision().sort_order_id,
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
             wal_lsn_min,
@@ -313,6 +314,8 @@ struct PublishedArtifactFacts<'a> {
     binding: &'a TenantTableBinding,
     /// Physical partition the objects belong to.
     partition: crate::catalog::PhysicalPartition,
+    /// Iceberg sort order the objects were written under.
+    sort_order_id: i32,
     /// Node whose writer produced the rows.
     node_id: Uuid,
     /// Fenced writer epoch that produced the rows.
@@ -405,7 +408,7 @@ fn build_inserts<'a>(
                         file_checksum: &artifact.checksum,
                         partition: &facts.partition,
                         schema_fingerprint: artifact.schema_fingerprint.clone(),
-                        sort_order_id: BIFROST_SORT_ORDER_ID,
+                        sort_order_id: facts.sort_order_id,
                     },
                     artifact.data_file_metrics.clone(),
                 ),

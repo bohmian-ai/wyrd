@@ -246,6 +246,8 @@ struct PersistenceDependencies {
     geometry: geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Catalog holding the retained revisions staged members are written under.
+    catalog: Option<Arc<BifrostCatalog>>,
 }
 
 /// The Scribe engine: the one owner of this node's durable ingest path.
@@ -1105,6 +1107,7 @@ impl ScribeImpl {
             staging_file_publisher,
             geometry,
             hot_sources,
+            catalog,
         } = dependencies;
         persistence::PersistenceRuntime::start(
             config,
@@ -1118,6 +1121,7 @@ impl ScribeImpl {
                 staging_file_publisher,
                 geometry,
                 hot_sources,
+                catalog,
                 #[cfg(any(test, feature = "test-support"))]
                 faults,
             },
@@ -1181,6 +1185,7 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
+                    catalog: catalog.clone(),
                 },
                 &coordination_runtime,
             )

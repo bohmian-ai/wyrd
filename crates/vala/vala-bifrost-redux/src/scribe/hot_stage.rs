@@ -41,8 +41,8 @@ use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::PhysicalPartitionWire;
 
-use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
+use crate::catalog::{LayoutRevision, PhysicalPartition};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::assembly::{
     ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
@@ -309,6 +309,8 @@ pub struct StagedHotSourceRecordV1 {
     schema_fingerprint: String,
     /// Lowercase hex digest of the canonical physical layout.
     layout_fingerprint: String,
+    /// Schema and sort-order revision the rows were accepted under.
+    revision: LayoutRevision,
     /// Exact physical partition of every row.
     partition: PhysicalPartitionWire,
     /// Node whose staging volume holds the runs.
@@ -352,6 +354,7 @@ impl StagedHotSourceRecordV1 {
             table_fqn: key.table().fqn(),
             schema_fingerprint: hex(&key.schema_fingerprint().0),
             layout_fingerprint: hex(&key.layout_fingerprint()),
+            revision: key.revision(),
             partition: key.partition().to_wire(),
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
@@ -448,6 +451,7 @@ impl StagedHotSourceRecordV1 {
             table,
             schema_fingerprint,
             layout_fingerprint,
+            self.revision,
             partition,
             NodeId::new(self.node_id),
             WriterEpoch::new(self.writer_epoch),
@@ -1196,6 +1200,7 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([3; 32]),
             &layout,
+            LayoutRevision::INITIAL,
             TimePartition::new(
                 TimeGranularity::Hour,
                 chrono::DateTime::from_timestamp(1_772_150_400, 0)

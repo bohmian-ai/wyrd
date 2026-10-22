@@ -47,9 +47,9 @@ use sha2::{Digest as _, Sha256};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
 
-use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
 use crate::catalog::layout::{PartitionTransform, PhysicalLayout};
+use crate::catalog::{LayoutRevision, PhysicalPartition};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
 
@@ -72,6 +72,8 @@ pub struct ScribeAssemblyKey {
     schema_fingerprint: SchemaFingerprint,
     /// Digest of the canonical physical layout fixing sort and partitioning.
     layout_fingerprint: [u8; 32],
+    /// Schema and sort-order revision every member was accepted under.
+    revision: LayoutRevision,
     /// Exact physical partition represented by every member.
     partition: PhysicalPartition,
     /// Node whose local staging volume holds the members.
@@ -92,6 +94,7 @@ impl ScribeAssemblyKey {
         table: TableRef,
         schema_fingerprint: SchemaFingerprint,
         layout: &PhysicalLayout,
+        revision: LayoutRevision,
         partition: PhysicalPartition,
         node_id: NodeId,
         writer_epoch: WriterEpoch,
@@ -101,6 +104,7 @@ impl ScribeAssemblyKey {
             table,
             schema_fingerprint,
             layout_fingerprint: layout_fingerprint(layout),
+            revision,
             partition,
             node_id,
             writer_epoch,
@@ -119,6 +123,7 @@ impl ScribeAssemblyKey {
         table: TableRef,
         schema_fingerprint: SchemaFingerprint,
         layout_fingerprint: [u8; 32],
+        revision: LayoutRevision,
         partition: PhysicalPartition,
         node_id: NodeId,
         writer_epoch: WriterEpoch,
@@ -128,6 +133,7 @@ impl ScribeAssemblyKey {
             table,
             schema_fingerprint,
             layout_fingerprint,
+            revision,
             partition,
             node_id,
             writer_epoch,
@@ -185,6 +191,12 @@ impl ScribeAssemblyKey {
         &self.table
     }
 
+    /// Returns the revision every member was accepted under.
+    #[must_use]
+    pub const fn revision(&self) -> LayoutRevision {
+        self.revision
+    }
+
     /// Returns the exact physical partition represented by the members.
     #[must_use]
     pub const fn partition(&self) -> &PhysicalPartition {
@@ -202,6 +214,8 @@ impl ScribeAssemblyKey {
         hasher.update(fqn.as_bytes());
         hasher.update(self.schema_fingerprint.0);
         hasher.update(self.layout_fingerprint);
+        hasher.update(self.revision.schema_id.to_be_bytes());
+        hasher.update(self.revision.sort_order_id.to_be_bytes());
         let partition = self.partition.to_bytes();
         hasher.update((partition.len() as u64).to_be_bytes());
         hasher.update(partition);
@@ -1283,6 +1297,7 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([7; 32]),
             &layout(None),
+            LayoutRevision::INITIAL,
             partition(hours),
             NodeId::new(uuid::Uuid::from_u128(9)),
             WriterEpoch::new(4),
@@ -1518,6 +1533,7 @@ mod tests {
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 SchemaFingerprint([7; 32]),
                 &layout(None),
+                LayoutRevision::INITIAL,
                 partition(0),
                 NodeId::new(uuid::Uuid::from_u128(9)),
                 WriterEpoch::new(4),
@@ -1527,6 +1543,7 @@ mod tests {
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 SchemaFingerprint([7; 32]),
                 &layout(None),
+                LayoutRevision::INITIAL,
                 partition(0),
                 NodeId::new(uuid::Uuid::from_u128(9)),
                 WriterEpoch::new(5),
@@ -2146,6 +2163,7 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([7; 32]),
             &layout(Some(TimeGranularityWire::Hour)),
+            LayoutRevision::INITIAL,
             partition(0),
             NodeId::new(uuid::Uuid::from_u128(9)),
             WriterEpoch::new(4),
@@ -2155,6 +2173,7 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([7; 32]),
             &layout(Some(TimeGranularityWire::Day)),
+            LayoutRevision::INITIAL,
             partition(0),
             NodeId::new(uuid::Uuid::from_u128(9)),
             WriterEpoch::new(4),

@@ -1119,7 +1119,15 @@ mod tests {
             ],
         )
         .unwrap();
+        frozen_from_batch(seal_partition, seal_tenant, batch)
+    }
 
+    /// Freezes one batch of the `bifrost.events` fixture table.
+    fn frozen_from_batch(
+        seal_partition: TimePartition,
+        seal_tenant: DataTenantId,
+        batch: RecordBatch,
+    ) -> FrozenMemtable {
         let seal_key = SealKey::new(
             seal_tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
@@ -1130,7 +1138,7 @@ mod tests {
             seal_id: 0,
             seal_key,
             shard_id: 0,
-            schema: Arc::clone(&schema),
+            schema: batch.schema(),
             batches: vec![batch],
             statistics: Vec::new(),
             metas: vec![],
@@ -2057,6 +2065,196 @@ mod tests {
             col.offset_index_offset().is_some() || col.column_index_offset().is_some(),
             "page index metadata not found"
         );
+    }
+
+    /// Every resolved Bloom set — empty, partial, complete, and reordered —
+    /// encodes the same rows in the resolved scalar sort, Blooms exactly the
+    /// declared columns, and never rules out a value a file holds, so a read
+    /// that prunes by Bloom and one that falls back to scanning a file without
+    /// Blooms return the same rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a layout does not resolve, encoding fails, the file's
+    /// order differs from the declared keys, its Bloom set differs from the
+    /// declared one, or a Bloom rejects a value the file holds.
+    #[test]
+    fn resolved_sort_and_blooms_preserve_exact_reads() {
+        let tenant = DataTenantId::new_v7();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, false),
+            Field::new("environment", DataType::Utf8, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "api", "web", "api", "db", "web", "api",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("prod"),
+                    None,
+                    Some("dev"),
+                    Some("prod"),
+                    Some("dev"),
+                    None,
+                ])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![600, 500, 400, 300, 200, 100])
+                        .with_timezone("+00:00"),
+                ),
+            ],
+        )
+        .unwrap();
+        let frozen = frozen_from_batch(
+            crate::test_support::day_partition(2026, 7, 14),
+            tenant,
+            batch,
+        );
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
+        // Service descending, environment ascending with nulls first, then time.
+        let expected = [
+            ("web", None, 500),
+            ("web", Some("dev"), 200),
+            ("db", Some("prod"), 300),
+            ("api", None, 100),
+            ("api", Some("dev"), 400),
+            ("api", Some("prod"), 600),
+        ];
+
+        for blooms in [
+            &[][..],
+            &["service"][..],
+            &["service", "environment"][..],
+            &["environment", "service"][..],
+        ] {
+            let layout = PhysicalLayout::resolve(
+                "vala.bifrost.test",
+                schema.as_ref(),
+                Some(&crate::tables::hourly_layout(
+                    "event_time",
+                    vec![
+                        crate::tables::sort_desc("service"),
+                        crate::tables::sort_asc_nulls_first("environment"),
+                        crate::tables::sort_asc("event_time"),
+                    ],
+                    blooms,
+                )),
+            )
+            .expect("the layout resolves");
+            let scratch = tempfile::tempdir().expect("test scratch");
+            let encoded = encode_batch(
+                &frozen,
+                &binding,
+                tenant,
+                scratch.path(),
+                "s3://bucket/table/day=2026-07-14/scribe-test-0",
+                &layout,
+                crate::resources::ScribeResources::for_test(),
+            )
+            .expect("Scribe Parquet encode");
+            let path = &encoded.artifacts[0].scratch_path;
+
+            let rows = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(|batch| batch.unwrap())
+                .flat_map(|batch| {
+                    let column = |name| {
+                        batch
+                            .column_by_name(name)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .clone()
+                    };
+                    let (service, environment) = (column("service"), column("environment"));
+                    let time = batch
+                        .column_by_name("event_time")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .clone();
+                    (0..batch.num_rows())
+                        .map(|row| {
+                            (
+                                service.value(row).to_owned(),
+                                arrow::array::Array::is_valid(&environment, row)
+                                    .then(|| environment.value(row).to_owned()),
+                                time.value(row),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                expected
+                    .iter()
+                    .map(|(service, environment, time)| (
+                        (*service).to_owned(),
+                        environment.map(str::to_owned),
+                        *time
+                    ))
+                    .collect::<Vec<_>>(),
+                "blooms {blooms:?}: rows follow the resolved sort"
+            );
+
+            let reader = SerializedFileReader::new_with_options(
+                std::fs::File::open(path).unwrap(),
+                parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                    .with_reader_properties(
+                        parquet::file::properties::ReaderProperties::builder()
+                            .set_read_bloom_filter(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+            let mut bloomed = std::collections::BTreeSet::new();
+            for group in 0..reader.metadata().num_row_groups() {
+                let row_group = reader.get_row_group(group).unwrap();
+                for (index, column) in reader
+                    .metadata()
+                    .row_group(group)
+                    .columns()
+                    .iter()
+                    .enumerate()
+                {
+                    let Some(bloom) = row_group.get_column_bloom_filter(index) else {
+                        continue;
+                    };
+                    let name = column.column_descr().name().to_owned();
+                    for (service, environment, _) in &rows {
+                        let held = if name == "service" {
+                            Some(service)
+                        } else {
+                            environment.as_ref()
+                        };
+                        if let Some(value) = held {
+                            assert!(
+                                bloom.check(&value.as_str()),
+                                "blooms {blooms:?}: {name} never rules out held value {value}"
+                            );
+                        }
+                    }
+                    bloomed.insert(name);
+                }
+            }
+            assert_eq!(
+                bloomed,
+                blooms.iter().map(|name| (*name).to_owned()).collect(),
+                "blooms {blooms:?}: exactly the declared columns carry Blooms"
+            );
+        }
     }
 
     #[test]

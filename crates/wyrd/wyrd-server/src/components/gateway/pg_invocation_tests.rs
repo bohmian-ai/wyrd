@@ -758,8 +758,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         "the rewrap resealed the stored envelope"
     );
     // A replica booting with only the new key after the rewrap opens every
-    // envelope. It is a fresh process, as in the rollout: the retired replica
-    // above keeps its process-local cooldown from the refusal it just served.
+    // envelope. It is a fresh process, as in the rollout.
     let rewrapped = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
     for tenant in tenants {
         invoke_managed(&rewrapped, tenant)
@@ -883,8 +882,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     dispatch.push(Step::Return(failed(1000, 0)));
     dispatch.push(Step::Return(completed(100, 50)));
     let broad = invoker(tenant, 1, [open_access()]);
-    // The failure above holds dep-a in replica-local cooldown; a fresh replica
-    // attempts it again before falling back.
+    // A fresh replica attempts dep-a again before falling back.
     let fresh = scribe.record(replica(&fixture, dispatch.clone()).await);
     let response = GatewayInvocation::new(&fresh)
         .invoke(
@@ -1170,7 +1168,7 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
     assert_cost(actual, "0.012");
     assert_cost(released, "0");
 
-    // A fresh replica has no cooldown, so both deployments are attempted.
+    // A fresh replica attempts both deployments.
     let fresh = replica(&fixture, dispatch.clone()).await;
     dispatch.push(Step::Return(failed_before_dispatch()));
     dispatch.push(Step::Return(failed_before_dispatch()));

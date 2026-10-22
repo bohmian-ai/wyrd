@@ -54,6 +54,10 @@ export class Receiver {
         }, delayMs ?? 0);
       });
     });
+    // Node closes idle keep-alive connections after 5s, while the gateway's
+    // HTTP client reuses them for 90s; a request sent as Node closes one fails
+    // in transit. Outlasting the client keeps connection reuse race-free.
+    server.keepAliveTimeout = 120_000;
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     receiver = new Receiver(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, server);

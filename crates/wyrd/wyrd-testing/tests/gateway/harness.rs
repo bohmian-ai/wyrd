@@ -541,6 +541,27 @@ pub(crate) async fn exchange(server: &WyrdTestServer, key: &SecretString) -> Str
         .unwrap_or_else(|error| panic!("api key exchanges: {error}"))
 }
 
+/// Waits for the next UTC minute when less than `needed` of the current one
+/// remains, so calls made within `needed` share one admission window.
+///
+/// Gateway request and token limits count in fixed calendar-minute windows
+/// stamped by the server's clock, which in these journeys is this host's; two
+/// calls straddling a minute boundary are counted in separate windows.
+///
+/// # Panics
+/// Panics when the system clock is before the Unix epoch.
+pub(crate) async fn within_one_limit_window(needed: Duration) {
+    let into = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("invariant: the system clock is after the Unix epoch")
+        .as_millis()
+        % 60_000;
+    let remaining = Duration::from_millis(u64::try_from(60_000 - into).unwrap_or(60_000));
+    if remaining < needed {
+        tokio::time::sleep(remaining).await;
+    }
+}
+
 /// Token usage list the ledger records.
 pub(crate) fn tokens(input: u64, output: u64) -> Value {
     json!([

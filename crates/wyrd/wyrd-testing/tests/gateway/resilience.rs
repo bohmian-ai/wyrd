@@ -32,7 +32,9 @@ use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::Metrics;
 
-use crate::harness::{INVOKER_ROLE, Journey, api_key, openai_code, refusal};
+use crate::harness::{
+    INVOKER_ROLE, Journey, api_key, openai_code, refusal, within_one_limit_window,
+};
 
 /// Address the failover call requests; its fallback is `acme-second/m`.
 const PROJECTION: &str = "acme-first/m";
@@ -151,6 +153,9 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
         .await;
     let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
 
+    // Both calls must share one fixed per-minute window; the capture check
+    // between them takes a few seconds.
+    within_one_limit_window(Duration::from_secs(30)).await;
     let answered = journey
         .post("/v1/chat/completions", &bearer, &chat(PROJECTION))
         .await;

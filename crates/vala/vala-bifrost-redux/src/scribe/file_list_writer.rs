@@ -243,7 +243,7 @@ pub fn build_artifact_inserts(
         encoded.artifacts.iter(),
         &PublishedArtifactFacts {
             binding,
-            partition: encoded.partition,
+            partition: encoded.partition.time(),
             node_id,
             writer_epoch,
             wal_lsn_min,
@@ -291,7 +291,7 @@ pub fn build_claim_inserts(
         artifacts.iter(),
         &PublishedArtifactFacts {
             binding,
-            partition: key.partition(),
+            partition: key.partition().time(),
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
             wal_lsn_min,

@@ -12,9 +12,9 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use wyrd_spec::request_id::RequestId;
 
+use crate::catalog::PartitionScheme;
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::TimeAxis;
-use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::ScribeMemoryLease;
 use crate::schema::SchemaFingerprint;
@@ -22,9 +22,7 @@ use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::profile::WriteProfile;
-use crate::scribe::seal_key::{
-    SealKey, TimePartitionPlan, plan_time_partitions, split_batch_by_time_partition,
-};
+use crate::scribe::seal_key::{PartitionPlan, SealKey, plan_partitions, split_batch_by_partition};
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
@@ -57,7 +55,7 @@ pub(crate) struct AdmittedAppend {
     pub tenant: DataTenantId,
     pub table: TableRef,
     /// Registered time axis every slice of this append is bucketed by.
-    pub time_axis: TimeAxis,
+    pub partition_scheme: PartitionScheme,
     pub queued_at: Instant,
     /// Completion channel answered once the append is durable in the WAL, or
     /// with the typed error that refused it; `None` for fire-and-forget appends.
@@ -200,7 +198,7 @@ pub(crate) struct NativeSliceProducer {
     /// Logical table used by every produced seal key.
     table: TableRef,
     /// Registered time axis used to bucket every produced slice.
-    time_axis: TimeAxis,
+    partition_scheme: PartitionScheme,
 }
 
 /// One decoded native source and its fixed time-partition cursor.
@@ -209,7 +207,7 @@ struct NativeCurrentSource {
     /// Stamped current source rows.
     rows: RecordBatch,
     /// Immutable current-source partition descriptors.
-    partitions: TimePartitionPlan,
+    partitions: PartitionPlan,
     /// Next partition descriptor to materialize.
     next_partition: usize,
 }
@@ -224,7 +222,7 @@ impl NativeSliceProducer {
         request_id: Uuid,
         tenant: DataTenantId,
         table: TableRef,
-        time_axis: TimeAxis,
+        partition_scheme: PartitionScheme,
     ) -> Self {
         let pending = Buffer::from(Bytes::clone(&source.bytes));
         Self {
@@ -238,7 +236,7 @@ impl NativeSliceProducer {
             output_bytes: 0,
             tenant,
             table,
-            time_axis,
+            partition_scheme,
         }
     }
 
@@ -337,7 +335,7 @@ impl NativeSliceProducer {
                 });
             }
             let rows = stamp_native_source(&rows, &self.source)?;
-            let partitions = plan_time_partitions(&rows, &self.time_axis)?;
+            let partitions = plan_partitions(&rows, &self.partition_scheme)?;
             self.current = Some(NativeCurrentSource {
                 rows,
                 partitions,
@@ -400,7 +398,7 @@ pub(crate) struct PreparedSlice {
 /// length, offset, the validity bitmap, every data buffer, and every child
 /// recursively, so two batches agree only when their Arrow representation
 /// agrees byte-for-byte. `bytes` accumulates the contributed buffer length the
-/// WAL-v6 metadata records alongside the digest.
+/// WAL-v7 metadata records alongside the digest.
 ///
 /// # Errors
 ///
@@ -579,7 +577,7 @@ fn same_identity_inputs(left: &ArrayData, right: &ArrayData) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an internal error when the stable buffer length exceeds its WAL-v6
+/// Returns an internal error when the stable buffer length exceeds its WAL-v7
 /// metadata representation.
 pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
     let mut digest = Sha256::new();
@@ -638,7 +636,7 @@ struct PreparedRowsContext {
     /// Logical table used by every seal key.
     table: TableRef,
     /// Registered time axis used to bucket every slice.
-    time_axis: TimeAxis,
+    partition_scheme: PartitionScheme,
     /// Root bytes retained while the prepared source is live.
     memory_bytes: usize,
 }
@@ -661,7 +659,7 @@ fn prepare_rows(
         request_id,
         tenant,
         table,
-        time_axis,
+        partition_scheme,
         memory_bytes,
     } = context;
     match rows {
@@ -675,17 +673,17 @@ fn prepare_rows(
                     tenant,
                     table: &table,
                 },
-                &time_axis,
+                &partition_scheme,
                 &rows,
                 known.as_ref(),
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-                detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
+                detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
             })?;
             for (slice_index, slice) in slices.iter_mut().enumerate() {
                 let slice_index =
                     u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                        detail: "Scribe batch slice index exceeds the v6 WAL bound".to_owned(),
+                        detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
                     })?;
                 slice
                     .wal_append
@@ -697,7 +695,7 @@ fn prepare_rows(
         }
         AdmittedRows::Native(native) => {
             let mut producer =
-                NativeSliceProducer::new(*native, request_id, tenant, table, time_axis);
+                NativeSliceProducer::new(*native, request_id, tenant, table, partition_scheme);
             let mut slices = Vec::new();
             while let Some(slice) = producer.next_slice()? {
                 slices.push(slice);
@@ -716,14 +714,14 @@ fn prepare_rows(
 ///
 /// # Errors
 ///
-/// Returns an internal error when the slice set exceeds WAL v6 integer bounds.
+/// Returns an internal error when the slice set exceeds WAL v7 integer bounds.
 fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError> {
     let count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-        detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
+        detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
     })?;
     for (index, slice) in slices.iter_mut().enumerate() {
         let index = u32::try_from(index).map_err(|_| ScribeError::Internal {
-            detail: "Scribe batch slice index exceeds the v6 WAL bound".to_owned(),
+            detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
         })?;
         slice.wal_append.assign_slice_ordinal(index, count);
         slice.id.slice_index = index;
@@ -751,7 +749,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         mut memory,
         tenant,
         table,
-        time_axis,
+        partition_scheme,
         queued_at,
         mut durable_ack,
         profile,
@@ -767,7 +765,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             request_id,
             tenant,
             table: table.clone(),
-            time_axis,
+            partition_scheme,
             memory_bytes: memory.bytes(),
         },
     );
@@ -830,11 +828,11 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
 fn append_prepared_slices(
     slices: &mut Vec<PreparedSlice>,
     context: SliceContext<'_>,
-    time_axis: &TimeAxis,
+    partition_scheme: &PartitionScheme,
     rows: &RecordBatch,
     known: Option<&LogicalIdentity>,
 ) -> Result<(), ScribeError> {
-    for slice in split_batch_by_time_partition(rows, time_axis)? {
+    for slice in split_batch_by_partition(rows, partition_scheme)? {
         let (partition, partition_rows) = slice?;
         slices.push(prepare_slice(context, partition, partition_rows, known)?);
     }
@@ -866,7 +864,7 @@ struct SliceContext<'a> {
 /// identity cannot be represented.
 fn prepare_slice(
     context: SliceContext<'_>,
-    partition: TimePartition,
+    partition: PhysicalPartition,
     rows: RecordBatch,
     known: Option<&LogicalIdentity>,
 ) -> Result<PreparedSlice, ScribeError> {
@@ -989,9 +987,9 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// carry fresh per-request timestamps on every attempt and would therefore
 /// make an honest client retry look like a contradiction.
 ///
-/// This is not the WAL v6 `wal_digest`. That digest binds exact payload bytes so
+/// This is not the WAL v7 `wal_digest`. That digest binds exact payload bytes so
 /// a substituted slice cannot be authorized by a valid terminal record. The two
-/// answer different questions, are computed apart, and the v6 COMMIT record
+/// answer different questions, are computed apart, and the v7 COMMIT record
 /// persists both — see [`crate::scribe::wal::WalCommitIdentity`].
 ///
 /// The owner exists so there is one layout for this durable identity. It is
@@ -1105,7 +1103,10 @@ mod tests {
             uuid::Uuid::now_v7(),
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            TimeAxis::new(WYRD_INGESTED_AT, TimeGranularity::Day),
+            crate::catalog::PartitionScheme::time_only(TimeAxis::new(
+                WYRD_INGESTED_AT,
+                TimeGranularity::Day,
+            )),
         )
     }
 

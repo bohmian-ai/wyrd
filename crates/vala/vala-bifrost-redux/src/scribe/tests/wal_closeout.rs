@@ -653,7 +653,7 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
     }
 
     let replayed = replay_wal_directory(wal_root.path()).expect("replay");
-    let state = &replayed[&seal_key.as_path_components()];
+    let state = &replayed[&seal_key.canonical_key()];
     assert_eq!(state.data_records.len(), 10);
     assert!(
         state

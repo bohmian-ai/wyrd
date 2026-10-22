@@ -112,9 +112,9 @@ pub(crate) struct ReplayChunkResponse {
 pub struct ReplayedAppendMeta {
     /// Batch ID for dedup.
     pub batch_id: [u8; 16],
-    /// SHA-256 digest of the exact WAL-v6 slice payload.
+    /// SHA-256 digest of the exact WAL-v7 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v6 slice payload length.
+    /// Exact WAL-v7 slice payload length.
     pub payload_len: u32,
     /// Complete committed batch slice count.
     pub slice_count: u32,
@@ -129,7 +129,7 @@ pub struct ReplayedAppendMeta {
 }
 
 /// Replay the WAL directory and reconstruct per-seal-key state from complete
-/// self-describing v6 slice sets.
+/// self-describing v7 slice sets.
 ///
 /// Reads the manifest (if present), scans all segments, skips sealed LSNs,
 /// truncates torn tails, dedupes by `AppendSliceId`, and groups records by
@@ -331,7 +331,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                         .ok_or_else(|| ScribeError::Internal {
                             detail: "replay accumulator disappeared at segment boundary".to_owned(),
                         })?;
-                // WAL v6 may roll between a SLICE and its terminal COMMIT. Keep
+                // WAL v7 may roll between a SLICE and its terminal COMMIT. Keep
                 // that incomplete batch and its segment refs together, then emit
                 // at the first later boundary where no batch crosses the cut.
                 if accumulator.pending_batches.is_empty()
@@ -424,7 +424,7 @@ struct ReplayAccumulator<'a> {
     shard_id: u8,
     /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
-    /// Incomplete v6 batches retained until their terminal COMMIT is read.
+    /// Incomplete v7 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
     /// Decode ownership retained exclusively by incomplete slice sets.
     pending_memory: Option<ScribeMemoryLease>,
@@ -513,7 +513,7 @@ impl<'a> ReplayAccumulator<'a> {
         }
         if !record.is_slice() {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 contains an unknown record flag".to_owned(),
+                detail: "WAL v7 contains an unknown record flag".to_owned(),
             });
         }
         if self.validate_pending_slice_header(record)? {
@@ -568,10 +568,10 @@ impl<'a> ReplayAccumulator<'a> {
             seal_key: seal_key.clone(),
             slice_index: record.slice_index,
         };
-        let seal_key_path = seal_key.as_path_components();
+        let seal_key_path = seal_key.canonical_key();
         if record.tenant_id != *seal_key.tenant.as_uuid().as_bytes() {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 slice tenant does not match its self-describing seal key"
+                detail: "WAL v7 slice tenant does not match its self-describing seal key"
                     .to_owned(),
             });
         }
@@ -581,7 +581,7 @@ impl<'a> ReplayAccumulator<'a> {
             .or_insert_with(|| PendingBatch::new(record.tenant_id, record.slice_count));
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v7 batch has contradictory slice-set identity".to_owned(),
             });
         }
         pending.slices.insert(
@@ -612,7 +612,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v7 batch has contradictory slice-set identity".to_owned(),
             });
         }
         let Some(existing) = pending.slices.get(&record.slice_index) else {
@@ -620,7 +620,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if !same_slice_retry_facts(&existing.record, record) {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 batch has a contradictory duplicate slice".to_owned(),
+                detail: "WAL v7 batch has a contradictory duplicate slice".to_owned(),
             });
         }
         Ok(true)
@@ -643,7 +643,7 @@ impl<'a> ReplayAccumulator<'a> {
             let retained = committed.identity.clone();
             if !retained.matches_frame(record) || !retained.matches_rows(&identity.logical_digest) {
                 return Err(ScribeError::Internal {
-                    detail: "WAL v6 batch has a contradictory duplicate COMMIT".to_owned(),
+                    detail: "WAL v7 batch has a contradictory duplicate COMMIT".to_owned(),
                 });
             }
             if let Some(pending) = self.pending_batches.remove(&record.batch_id) {
@@ -663,7 +663,7 @@ impl<'a> ReplayAccumulator<'a> {
             .pending_batches
             .remove(&record.batch_id)
             .ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v6 COMMIT has no preceding complete slice set".to_owned(),
+                detail: "WAL v7 COMMIT has no preceding complete slice set".to_owned(),
             })?;
         validate_pending_batch(&pending, record, &identity)?;
         let pending_bytes = pending.memory_bytes()?;
@@ -873,7 +873,7 @@ fn replay_record_memory_bytes(record: &WalRecord) -> Result<usize, ScribeError> 
         })
 }
 
-/// A v6 slice set held until its terminal WAL COMMIT proves it complete.
+/// A v7 slice set held until its terminal WAL COMMIT proves it complete.
 #[derive(Debug)]
 struct PendingBatch {
     /// Tenant copied from every slice and checked against the COMMIT header.
@@ -913,7 +913,7 @@ struct CommittedBatchIdentity {
 struct CommittedBatchEntry {
     /// Stable logical batch key within this WAL stream and shard.
     batch_id: [u8; 16],
-    /// Canonical terminal identity authenticated by WAL v6.
+    /// Canonical terminal identity authenticated by WAL v7.
     identity: CommittedBatchIdentity,
 }
 
@@ -1005,7 +1005,7 @@ struct PendingSlice {
     seal_key_path: String,
 }
 
-/// Computes the v6 COMMIT `wal_digest` over one ordered slice set.
+/// Computes the v7 COMMIT `wal_digest` over one ordered slice set.
 ///
 /// The write path and replay both bind the ordinal, exact payload length, and
 /// SHA-256 payload digest, so a reordered or substituted slice cannot be
@@ -1042,7 +1042,7 @@ fn replayed_commit_identity(
         .values()
         .next()
         .ok_or_else(|| ScribeError::Internal {
-            detail: "WAL v6 COMMIT has no first slice identity".to_owned(),
+            detail: "WAL v7 COMMIT has no first slice identity".to_owned(),
         })?;
     let request_id = uuid::Uuid::from_bytes(commit.commit_identity()?.request_id);
     let segment_sequence = segment_path
@@ -1077,7 +1077,7 @@ fn validate_pending_batch(
 ) -> Result<(), ScribeError> {
     if pending.tenant_id != commit.tenant_id || pending.slice_count != commit.slice_count {
         return Err(ScribeError::Internal {
-            detail: "WAL v6 COMMIT identity does not match its slice set".to_owned(),
+            detail: "WAL v7 COMMIT identity does not match its slice set".to_owned(),
         });
     }
     if usize::try_from(pending.slice_count).ok() != Some(pending.slices.len())
@@ -1088,12 +1088,12 @@ fn validate_pending_batch(
             .any(|(index, slice_index)| usize::try_from(*slice_index).ok() != Some(index))
     {
         return Err(ScribeError::Internal {
-            detail: "WAL v6 COMMIT closes an incomplete or unordered slice set".to_owned(),
+            detail: "WAL v7 COMMIT closes an incomplete or unordered slice set".to_owned(),
         });
     }
     if slice_set_digest(pending.slices.values()) != identity.wal_digest {
         return Err(ScribeError::Internal {
-            detail: "WAL v6 COMMIT digest does not match its slice set".to_owned(),
+            detail: "WAL v7 COMMIT digest does not match its slice set".to_owned(),
         });
     }
     Ok(())
@@ -1143,7 +1143,7 @@ fn merge_replayed_state(
     replayed: &mut HashMap<String, ReplayedSealKey>,
     incoming: ReplayedSealKey,
 ) {
-    let key = incoming.seal_key.as_path_components();
+    let key = incoming.seal_key.canonical_key();
     let Some(existing) = replayed.get_mut(&key) else {
         replayed.insert(key, incoming);
         return;
@@ -1357,17 +1357,15 @@ mod tests {
         .expect("manifest");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
-        assert!(!replayed.contains_key(&first_key.as_path_components()));
+        assert!(!replayed.contains_key(&first_key.canonical_key()));
         assert_eq!(
-            replayed[&second_key.as_path_components()]
-                .data_records
-                .len(),
+            replayed[&second_key.canonical_key()].data_records.len(),
             1,
             "the unsealed seal key keeps its replayed record"
         );
     }
 
-    /// Existing v6 headers, slice/commit identities, and the manifest cursor
+    /// Existing v7 headers, slice/commit identities, and the manifest cursor
     /// reconstruct one stable remaining cohort without a new WAL marker.
     #[test]
     fn replay_reconstructs_cohort_from_v6_segment_without_new_format() {
@@ -1433,9 +1431,9 @@ mod tests {
         .expect("committed A cursor");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("mixed cohort replay");
-        assert!(!replayed.contains_key(&keys[0].as_path_components()));
-        let pending = &replayed[&keys[1].as_path_components()];
-        let active = &replayed[&keys[2].as_path_components()];
+        assert!(!replayed.contains_key(&keys[0].canonical_key()));
+        let pending = &replayed[&keys[1].canonical_key()];
+        let active = &replayed[&keys[2].canonical_key()];
         assert_eq!(pending.append_metas[0].batch_id, batch_ids[1]);
         assert_eq!(active.append_metas[0].batch_id, batch_ids[2]);
         assert_eq!(pending.wal_segments, active.wal_segments);
@@ -1516,7 +1514,7 @@ mod tests {
         }
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
-        let state = &replayed[&seal_key.as_path_components()];
+        let state = &replayed[&seal_key.canonical_key()];
         assert_eq!(state.append_metas.len(), 12);
         assert!(
             state
@@ -1546,7 +1544,7 @@ mod tests {
         }
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
-        let state = &replayed[&seal_key.as_path_components()];
+        let state = &replayed[&seal_key.canonical_key()];
         assert_eq!(state.commits.len(), 2);
         assert_eq!(state.append_metas.len(), 2);
         for commit in &state.commits {
@@ -1628,7 +1626,7 @@ mod tests {
         }));
 
         let merged = replay_wal_directory(temp_dir.path()).expect("merged replay");
-        assert_eq!(merged[&seal_key.as_path_components()].append_metas.len(), 5);
+        assert_eq!(merged[&seal_key.canonical_key()].append_metas.len(), 5);
     }
 
     /// Proves rotated V1 recovery has no unrelated 4,096-commit ceiling.
@@ -1830,7 +1828,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v6 batch has a contradictory duplicate COMMIT"
+                if detail == "WAL v7 batch has a contradictory duplicate COMMIT"
         ));
     }
 
@@ -1863,7 +1861,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v6 batch has a contradictory duplicate slice"
+                if detail == "WAL v7 batch has a contradictory duplicate slice"
         ));
     }
 
@@ -1920,7 +1918,7 @@ mod tests {
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
         let state = replayed
-            .get(&seal_key.as_path_components())
+            .get(&seal_key.canonical_key())
             .expect("same-day replay state");
         assert_eq!(state.append_metas.len(), 2);
         assert_eq!(state.append_metas[0].append_slice_id.slice_index, 0);
@@ -2475,7 +2473,7 @@ mod tests {
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
         let state = replayed
-            .get(&seal_key.as_path_components())
+            .get(&seal_key.canonical_key())
             .expect("replayed state");
         let batch_ids = state
             .append_metas
@@ -2542,6 +2540,6 @@ mod tests {
         writer.sync_data_for_test(&seal_key).expect("sync");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
-        assert!(replayed.contains_key(&seal_key.as_path_components()));
+        assert!(replayed.contains_key(&seal_key.canonical_key()));
     }
 }

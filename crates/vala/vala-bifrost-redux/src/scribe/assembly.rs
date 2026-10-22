@@ -47,8 +47,9 @@ use sha2::{Digest as _, Sha256};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::layout::{PartitionTransform, PhysicalLayout, TimePartition};
+use crate::catalog::layout::{PartitionTransform, PhysicalLayout};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
 
@@ -71,8 +72,8 @@ pub struct ScribeAssemblyKey {
     schema_fingerprint: SchemaFingerprint,
     /// Digest of the canonical physical layout fixing sort and partitioning.
     layout_fingerprint: [u8; 32],
-    /// Exact physical time partition represented by every member.
-    partition: TimePartition,
+    /// Exact physical partition represented by every member.
+    partition: PhysicalPartition,
     /// Node whose local staging volume holds the members.
     node_id: NodeId,
     /// Fenced writer epoch whose LSN stream produced the members.
@@ -91,7 +92,7 @@ impl ScribeAssemblyKey {
         table: TableRef,
         schema_fingerprint: SchemaFingerprint,
         layout: &PhysicalLayout,
-        partition: TimePartition,
+        partition: PhysicalPartition,
         node_id: NodeId,
         writer_epoch: WriterEpoch,
     ) -> Self {
@@ -118,7 +119,7 @@ impl ScribeAssemblyKey {
         table: TableRef,
         schema_fingerprint: SchemaFingerprint,
         layout_fingerprint: [u8; 32],
-        partition: TimePartition,
+        partition: PhysicalPartition,
         node_id: NodeId,
         writer_epoch: WriterEpoch,
     ) -> Self {
@@ -186,8 +187,8 @@ impl ScribeAssemblyKey {
 
     /// Returns the exact physical partition represented by the members.
     #[must_use]
-    pub const fn partition(&self) -> TimePartition {
-        self.partition
+    pub const fn partition(&self) -> &PhysicalPartition {
+        &self.partition
     }
 
     /// Feeds every field of the key into a claim-identity hash.
@@ -201,8 +202,9 @@ impl ScribeAssemblyKey {
         hasher.update(fqn.as_bytes());
         hasher.update(self.schema_fingerprint.0);
         hasher.update(self.layout_fingerprint);
-        hasher.update([self.partition.granularity_tag()]);
-        hasher.update(self.partition.start_unix_micros().to_be_bytes());
+        let partition = self.partition.to_bytes();
+        hasher.update((partition.len() as u64).to_be_bytes());
+        hasher.update(partition);
         hasher.update(self.node_id.as_bytes());
         hasher.update(self.writer_epoch.as_i64().to_be_bytes());
     }
@@ -1216,7 +1218,7 @@ impl StagingAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::layout::TimeGranularity;
+    use crate::catalog::layout::{TimeGranularity, TimePartition};
     use crate::namespaces::BifrostNamespace;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::vala::api::{
@@ -1266,10 +1268,12 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the offset is not an hour boundary.
-    fn partition(hours: i64) -> TimePartition {
+    fn partition(hours: i64) -> PhysicalPartition {
         let start = chrono::DateTime::from_timestamp(1_772_150_400 + hours * 3_600, 0)
             .expect("a fixed representable instant");
-        TimePartition::new(TimeGranularity::Hour, start).expect("a fixed hour boundary")
+        TimePartition::new(TimeGranularity::Hour, start)
+            .expect("a fixed hour boundary")
+            .into()
     }
 
     /// Builds one assembly key over the supplied tenant and partition.

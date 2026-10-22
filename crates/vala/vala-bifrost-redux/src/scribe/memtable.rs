@@ -473,7 +473,7 @@ impl Memtable {
                 rows_accepted,
                 wal_lsn_min: replayed_meta.wal_lsn,
                 wal_lsn_max: replayed_meta.wal_lsn,
-                seal_key: replayed.seal_key.as_path_components(),
+                seal_key: replayed.seal_key.canonical_key(),
             });
         }
 
@@ -954,7 +954,7 @@ impl Memtable {
         let selects = |seal_key: &SealKey| {
             seal_key.tenant == tenant
                 && seal_key.table == *table
-                && partitions.is_none_or(|range| range.contains(&seal_key.partition))
+                && partitions.is_none_or(|range| range.contains(&seal_key.partition.time()))
         };
         for (seal_key, bucket) in writable.iter() {
             if selects(seal_key) {
@@ -1443,7 +1443,7 @@ impl MemtableBucket {
             &self.batches,
             &self.statistics,
             &self.metas,
-            self.seal_key.partition,
+            self.seal_key.partition.clone(),
             None,
             &self.charge,
         )
@@ -1673,7 +1673,7 @@ impl FrozenMemtable {
             &self.batches,
             &self.statistics,
             &self.metas,
-            self.seal_key.partition,
+            self.seal_key.partition.clone(),
             Some(generation),
             &self.charge,
         )
@@ -1744,7 +1744,7 @@ impl LiveCapture {
         let staged = if let Some(registry) = registry {
             let served = memory
                 .iter()
-                .filter_map(|source| source.generation.map(|g| (source.partition_day, g)))
+                .filter_map(|source| source.generation.map(|g| (source.partition.clone(), g)))
                 .collect();
             let Some(capture) =
                 registry
@@ -1759,7 +1759,7 @@ impl LiveCapture {
                 source.generation.is_none_or(|generation| {
                     !capture
                         .superseded
-                        .contains(&(source.partition_day, generation))
+                        .contains(&(source.partition.clone(), generation))
                 })
             });
             publication_revision = capture.publication_revision;
@@ -1804,12 +1804,14 @@ impl LiveCapture {
         let memory = self
             .memory
             .iter()
-            .map(|source| (source.partition_day, source.scoped_bytes(scope)));
+            .map(|source| (source.partition.time(), source.scoped_bytes(scope)));
         let staged = self.staged.iter().flat_map(|lease| {
-            lease
-                .sources()
-                .iter()
-                .map(|source| (source.key.partition, source.footers.scoped_bytes(scope)))
+            lease.sources().iter().map(|source| {
+                (
+                    source.key.partition.time(),
+                    source.footers.scoped_bytes(scope),
+                )
+            })
         });
         for (partition, bytes) in memory.chain(staged) {
             let total = partitions.entry(partition).or_default();
@@ -1839,7 +1841,7 @@ impl LiveCapture {
         let mut batches = Vec::new();
         let mut charges = Vec::new();
         for source in &self.memory {
-            if partitions.contains(&source.partition_day) {
+            if partitions.contains(&source.partition.time()) {
                 source.project(required_columns, &mut batches)?;
                 charges.push(Arc::clone(&source.charge));
             }
@@ -1848,7 +1850,7 @@ impl LiveCapture {
             .staged
             .iter()
             .flat_map(|lease| lease.sources())
-            .filter(|source| partitions.contains(&source.key.partition))
+            .filter(|source| partitions.contains(&source.key.partition.time()))
             .flat_map(|source| source.runs.iter().cloned())
             .collect();
         Ok(CapturedRead {
@@ -1907,7 +1909,7 @@ struct ReadableSource {
     /// Maximum WAL LSN of each append, index-aligned with `batches`.
     wal_lsns: Vec<crate::scribe::wal::WalLsn>,
     /// Exact partition owning every batch.
-    partition_day: crate::catalog::layout::TimePartition,
+    partition: crate::catalog::PhysicalPartition,
     /// Serving immutable generation, or `None` for a writable bucket.
     generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     /// Accounting owner of `batches`, shared with the bucket or generation
@@ -1923,7 +1925,7 @@ impl ReadableSource {
         batches: &[RecordBatch],
         statistics: &[Arc<Statistics>],
         metas: &[ScribeAppendMeta],
-        partition_day: crate::catalog::layout::TimePartition,
+        partition: crate::catalog::PhysicalPartition,
         generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
         charge: &Arc<crate::scribe::memory::RetainedArrowCharge>,
     ) -> Self {
@@ -1932,7 +1934,7 @@ impl ReadableSource {
             batches: batches.to_vec(),
             statistics: statistics.to_vec(),
             wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
-            partition_day,
+            partition,
             generation,
             charge: Arc::clone(charge),
         }
@@ -1982,7 +1984,7 @@ impl ReadableSource {
                 },
             ));
             output.push(ReadableBatch {
-                partition_day: self.partition_day,
+                partition_day: self.partition.time(),
                 wal_lsn_max,
                 batch,
                 statistics,
@@ -2167,7 +2169,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "spans"),
-            first.partition,
+            first.partition.clone(),
         );
         memtable
             .insert(&first, make_test_meta(1), make_test_batch(1))
@@ -2214,12 +2216,12 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "metrics"),
-            first.partition,
+            first.partition.clone(),
         );
         let empty = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "empty"),
-            first.partition,
+            first.partition.clone(),
         );
         for (key, lsn) in [(&first, 1), (&second, 2)] {
             memtable
@@ -2284,8 +2286,8 @@ mod tests {
                 .readable_batches_for_range(
                     key.tenant,
                     &key.table,
-                    key.partition,
-                    key.partition,
+                    key.partition.time(),
+                    key.partition.time(),
                     &[],
                 )
                 .expect("provider cut")
@@ -2811,7 +2813,7 @@ mod tests {
         let peer = SealKey::new(
             key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "nonzero-peer"),
-            key.partition,
+            key.partition.clone(),
         );
         for (candidate, lsn) in [(&key, 4), (&peer, 5)] {
             rotation

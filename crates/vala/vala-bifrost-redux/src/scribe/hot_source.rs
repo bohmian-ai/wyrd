@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 
-use crate::catalog::layout::TimePartition;
 use crate::scan_sizing::{ScanScope, ScanSizer};
 use crate::scribe::assembly::StagedMemberId;
 use crate::scribe::seal_key::SealKey;
@@ -358,7 +357,8 @@ pub struct StagedCapture {
     pub lease: StagedSourceLease,
     /// Memory-served generations whose authority is already a published
     /// object; the capture must drop their memory copy.
-    pub superseded: std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
+    pub superseded:
+        std::collections::HashSet<(crate::catalog::PhysicalPartition, GenerationOrdinal)>,
     /// The table revision this node's last locally completed publication
     /// committed at, read in the same critical section: every generation
     /// the capture omits as published is covered by a cut at least this new.
@@ -890,7 +890,7 @@ impl ScribeHotSourceRegistry {
         self: &Arc<Self>,
         tenant: wyrd_spec::ids::DataTenantId,
         table: &crate::catalog::TableRef,
-        served: &std::collections::HashSet<(TimePartition, GenerationOrdinal)>,
+        served: &std::collections::HashSet<(crate::catalog::PhysicalPartition, GenerationOrdinal)>,
     ) -> Result<Option<StagedCapture>, HotSourceError> {
         let mut state = self.lock()?;
         let publication_revision = self
@@ -912,9 +912,9 @@ impl ScribeHotSourceRegistry {
                 continue;
             }
             for (generation, authority) in &authorities.by_generation {
-                if served.contains(&(key.partition, *generation)) {
+                if served.contains(&(key.partition.clone(), *generation)) {
                     if matches!(authority, HotAuthority::Published { .. }) {
-                        superseded.insert((key.partition, *generation));
+                        superseded.insert((key.partition.clone(), *generation));
                     }
                     continue;
                 }
@@ -1091,7 +1091,7 @@ impl ScribeHotSourceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{TableRef, TimeGranularity, TimePartition};
+    use crate::catalog::{PhysicalPartition, TableRef, TimeGranularity, TimePartition};
     use crate::namespaces::BifrostNamespace;
     use wyrd_spec::ids::DataTenantId;
 
@@ -1369,9 +1369,13 @@ mod tests {
         let other_table = SealKey::new(
             key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "other"),
-            key.partition,
+            key.partition.clone(),
         );
-        let other_tenant = SealKey::new(DataTenantId::new_v7(), key.table.clone(), key.partition);
+        let other_tenant = SealKey::new(
+            DataTenantId::new_v7(),
+            key.table.clone(),
+            key.partition.clone(),
+        );
         for (key, generation) in [
             (&key, 2_u64),
             (&key, 1),
@@ -1412,18 +1416,18 @@ mod tests {
             .capture_staged(key.tenant, &key.table, &std::collections::HashSet::new())
             .expect("locked")
             .expect("no publication is marked");
-        let named: Vec<(TimePartition, u64)> = capture
+        let named: Vec<(PhysicalPartition, u64)> = capture
             .lease
             .sources()
             .iter()
-            .map(|source| (source.key.partition, source.generation.get()))
+            .map(|source| (source.key.partition.clone(), source.generation.get()))
             .collect();
         assert_eq!(
             named,
             vec![
-                (key.partition, 1),
-                (key.partition, 2),
-                (next_day.partition, 3),
+                (key.partition.clone(), 1),
+                (key.partition.clone(), 2),
+                (next_day.partition.clone(), 3),
             ],
             "only staged generations of the requested table are readable, oldest first"
         );

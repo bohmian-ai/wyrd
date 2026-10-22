@@ -186,7 +186,7 @@ async fn scribe_tenant_partition_schema_fencing() {
         .expect("the pod reports where its generations are readable");
     let enclosed: Vec<(u64, u64)> = authorities
         .iter()
-        .filter(|live| live.key.partition == late_partition)
+        .filter(|live| live.key.partition.time() == late_partition)
         .filter_map(|live| match &live.authority {
             vala_bifrost_redux::scribe::hot_source::HotAuthority::StagedRun { wal, .. } => {
                 Some((wal.0.as_u64(), wal.1.as_u64()))

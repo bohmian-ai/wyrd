@@ -17,6 +17,7 @@ mod iceberg_sql;
 pub(crate) mod iceberg_storage;
 pub mod layout;
 mod logical_table_identity;
+pub mod physical_partition;
 mod storage;
 pub mod table_ref;
 pub mod tenant_table;
@@ -37,6 +38,9 @@ pub use layout::{
     TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
+pub use physical_partition::{
+    INITIAL_PARTITION_SPEC_ID, PartitionScheme, PhysicalPartition, PhysicalPartitionError,
+};
 pub use storage::warehouse_uri;
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;

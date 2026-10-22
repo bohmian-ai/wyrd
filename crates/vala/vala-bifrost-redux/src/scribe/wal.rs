@@ -1,6 +1,6 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared partition slice emits one self-describing v6 `SLICE` record.
+//! Every prepared partition slice emits one self-describing v7 `SLICE` record.
 //! After
 //! all ordered slices are durable, one `COMMIT` record authenticates their
 //! complete digest before replay may restore any of them.
@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::seal_key::SealKey;
@@ -149,19 +149,19 @@ pub struct SegmentHeader {
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 /// The only persisted WAL version accepted by this Scribe.
-const WAL_VERSION: u16 = 6;
+const WAL_VERSION: u16 = 7;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
-/// Fixed byte length of every v6 record header before its payload and CRC.
+/// Fixed byte length of every v7 record header before its payload and CRC.
 const RECORD_HEADER_SIZE: usize = 72;
-/// `u16` wire encoding of the immutable v6 record-header length.
+/// `u16` wire encoding of the immutable v7 record-header length.
 const RECORD_HEADER_SIZE_U16: u16 = 72;
-/// Exact v6 record magic.
-const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL6";
-/// Exact magic prefixing every v6 COMMIT payload.
-const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S6CM";
-/// Exact encoded width of a v6 COMMIT payload.
+/// Exact v7 record magic.
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL7";
+/// Exact magic prefixing every v7 COMMIT payload.
+const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
+/// Exact encoded width of a v7 COMMIT payload.
 ///
 /// The layout is fixed and total: magic, WAL digest, logical digest, request
 /// identity. A COMMIT record whose declared payload is any other length is
@@ -169,7 +169,7 @@ const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S6CM";
 /// can never be read as a truncated or extended identity.
 const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
 
-/// Complete batch identity carried by one terminal v6 COMMIT record.
+/// Complete batch identity carried by one terminal v7 COMMIT record.
 ///
 /// A batch has two distinct identities and the terminal record persists both,
 /// because each answers a question the other cannot.
@@ -216,19 +216,19 @@ impl WalCommitIdentity {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the payload is not exactly
-    /// [`COMMIT_PAYLOAD_BYTES`] long or does not carry the v6 COMMIT magic.
+    /// [`COMMIT_PAYLOAD_BYTES`] long or does not carry the v7 COMMIT magic.
     pub fn decode(payload: &[u8]) -> Result<Self, ScribeError> {
         if payload.len() != COMMIT_PAYLOAD_BYTES {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "WAL v6 COMMIT payload is {} bytes, expected {COMMIT_PAYLOAD_BYTES}",
+                    "WAL v7 COMMIT payload is {} bytes, expected {COMMIT_PAYLOAD_BYTES}",
                     payload.len()
                 ),
             });
         }
         if payload[0..4] != COMMIT_PAYLOAD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 COMMIT payload magic mismatch".to_owned(),
+                detail: "WAL v7 COMMIT payload magic mismatch".to_owned(),
             });
         }
         let mut wal_digest = [0_u8; 32];
@@ -292,7 +292,7 @@ impl SegmentHeader {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the magic, version, reserved
-    /// fields, or header checksum violates WAL v6 framing.
+    /// fields, or header checksum violates WAL v7 framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -366,7 +366,7 @@ impl SegmentHeader {
     }
 }
 
-/// WAL record — a v6 slice or commit framed entry.
+/// WAL record — a v7 slice or commit framed entry.
 ///
 /// Its fixed 72-byte little-endian header is followed by its declared payload
 /// and a CRC32C trailer over both. A record never carries a mixed flag set.
@@ -389,7 +389,7 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-/// Validated fixed v6 record header retained while replay selects the next LSN.
+/// Validated fixed v7 record header retained while replay selects the next LSN.
 ///
 /// The header contains no scalable payload allocation. Replay can therefore
 /// peek across the fixed shard set, choose the stream-wide next record, and
@@ -503,7 +503,7 @@ impl PreparedWalAppend {
         }
     }
 
-    /// Builds a terminal v6 commit record carrying the batch's complete identity.
+    /// Builds a terminal v7 commit record carrying the batch's complete identity.
     ///
     /// `identity` is computed once on the live path and is the only place the
     /// batch's logical row identity becomes durable in the WAL. Replay reads it
@@ -554,7 +554,7 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns an internal invariant error when the prepared slice lacks its
-    /// self-describing key or a fixed-width WAL-v6 field cannot represent it.
+    /// self-describing key or a fixed-width WAL-v7 field cannot represent it.
     pub(crate) fn payload_identity(&self) -> Result<ScribeAppendPayloadIdentity, ScribeError> {
         if self.commit_identity.is_some() {
             return Err(ScribeError::Internal {
@@ -595,7 +595,7 @@ impl PreparedWalAppend {
         }
         if let Some(identity) = self.commit_identity {
             let tenant_id = self.commit_tenant.ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v6 commit is missing its authenticated tenant".to_owned(),
+                detail: "WAL v7 commit is missing its authenticated tenant".to_owned(),
             })?;
             return Ok(WalRecord::commit(
                 self.lsn,
@@ -636,7 +636,7 @@ impl PreparedWalAppend {
             })
     }
 
-    /// Returns the exact uncompressed v6 packet payload length.
+    /// Returns the exact uncompressed v7 packet payload length.
     ///
     /// This includes the self-describing seal-key, schema, and Arrow fields
     /// that are part of the durable packet. Rotation must use this value
@@ -646,7 +646,7 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a self-describing field exceeds
-    /// its v6 width or checked packet-length arithmetic overflows.
+    /// its v7 width or checked packet-length arithmetic overflows.
     pub(crate) fn uncompressed_len(&self) -> Result<usize, ScribeError> {
         self.payload_len()
     }
@@ -670,14 +670,15 @@ impl PreparedWalAppend {
         let table_len =
             u16::try_from(seal_key.table.namespace.as_str().len() + 1 + seal_key.table.name.len())
                 .map_err(|_| ScribeError::Internal {
-                    detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
+                    detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
                 })?;
         let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
-            detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
+            detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
         })?;
         let payload_len = 58usize
             .saturating_add(usize::from(table_len))
-            .saturating_add(SLICE_PARTITION_BYTES)
+            .saturating_add(2)
+            .saturating_add(seal_key.partition.to_bytes().len())
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
@@ -696,7 +697,7 @@ fn append_prepared_borrowed(
 ) -> Result<([u8; 32], u32), ScribeError> {
     let payload_len =
         u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
-            detail: "WAL v6 payload exceeds its u32 record bound".to_owned(),
+            detail: "WAL v7 payload exceeds its u32 record bound".to_owned(),
         })?;
     let (flags, tenant_id) = if prepared.commit_identity.is_some() {
         (
@@ -704,7 +705,7 @@ fn append_prepared_borrowed(
             prepared
                 .commit_tenant
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v6 commit is missing its authenticated tenant".to_owned(),
+                    detail: "WAL v7 commit is missing its authenticated tenant".to_owned(),
                 })?,
         )
     } else {
@@ -749,14 +750,18 @@ fn append_prepared_borrowed(
         let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
         let table_len = u16::try_from(namespace.len() + 1 + name.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
+                detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let granularity_tag = [seal_key.partition.granularity_tag()];
-        let partition_start = seal_key.partition.start_unix_micros().to_be_bytes();
+        let partition = seal_key.partition.to_bytes();
+        let partition_len = u16::try_from(partition.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL partition identity exceeds v7 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
         let data_len = u32::try_from(prepared.data.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
+                detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let parts: [&[u8]; 11] = [
@@ -766,8 +771,8 @@ fn append_prepared_borrowed(
             namespace,
             b".",
             name,
-            &granularity_tag,
-            &partition_start,
+            &partition_len,
+            &partition,
             &prepared.schema_fingerprint,
             &data_len,
             &prepared.data,
@@ -777,10 +782,7 @@ fn append_prepared_borrowed(
     Ok((payload_digest, payload_len))
 }
 
-const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S6SL";
-/// Fixed encoded width of the typed partition field: one granularity tag plus
-/// a signed big-endian epoch-microsecond start.
-const SLICE_PARTITION_BYTES: usize = 9;
+const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S7SL";
 
 #[cfg(test)]
 fn encode_slice_payload(
@@ -791,7 +793,7 @@ fn encode_slice_payload(
     encode_slice_payload_parts(
         seal_key.tenant.as_uuid().as_bytes(),
         &seal_key.table.fqn(),
-        seal_key.partition,
+        &seal_key.partition,
         &schema_fingerprint,
         data,
     )
@@ -801,21 +803,26 @@ fn encode_slice_payload(
 fn encode_slice_payload_parts(
     tenant: &[u8; 16],
     table_fqn: &str,
-    partition: TimePartition,
+    partition: &PhysicalPartition,
     schema_fingerprint: &[u8; 32],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     let table_len = u16::try_from(table_fqn.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
+        detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
     })?;
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
+        detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
+    })?;
+    let partition = partition.to_bytes();
+    let partition_len = u16::try_from(partition.len()).map_err(|_| ScribeError::Internal {
+        detail: "WAL partition identity exceeds v7 payload limits".to_owned(),
     })?;
     let capacity = 4usize
         .saturating_add(16)
         .saturating_add(2)
         .saturating_add(table_fqn.len())
-        .saturating_add(SLICE_PARTITION_BYTES)
+        .saturating_add(2)
+        .saturating_add(partition.len())
         .saturating_add(32)
         .saturating_add(4)
         .saturating_add(data.len());
@@ -824,8 +831,8 @@ fn encode_slice_payload_parts(
     payload.extend_from_slice(tenant);
     payload.extend_from_slice(&table_len.to_le_bytes());
     payload.extend_from_slice(table_fqn.as_bytes());
-    payload.push(partition.granularity_tag());
-    payload.extend_from_slice(&partition.start_unix_micros().to_be_bytes());
+    payload.extend_from_slice(&partition_len.to_le_bytes());
+    payload.extend_from_slice(&partition);
     payload.extend_from_slice(schema_fingerprint);
     payload.extend_from_slice(&data_len.to_le_bytes());
     payload.extend_from_slice(data);
@@ -946,27 +953,18 @@ fn decode_slice_table(table_fqn: &str) -> Result<TableRef, ScribeError> {
     })
 }
 
-/// Decode and validate the typed partition encoded as a one-byte granularity
-/// tag followed by a signed big-endian epoch-microsecond start.
+/// Decode and validate the complete partition identity a slice carries.
 ///
-/// A slice that does not name a known granularity, or whose start is not the
-/// exact boundary of that granularity, is unrestorable: replay refuses it
-/// rather than re-bucketing rows into a partition the writer never chose.
+/// A slice whose identity does not decode exactly — an unknown tag, a
+/// noncanonical time start, a malformed value — is unrestorable: replay
+/// refuses it rather than re-partitioning rows into a partition the writer
+/// never chose.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] when the tag is unknown or the start is
-/// out of range or non-canonical.
-fn decode_slice_partition(encoded: &[u8]) -> Result<TimePartition, ScribeError> {
-    let (tag, start) = encoded.split_first().ok_or_else(|| ScribeError::Internal {
-        detail: "WAL v6 slice partition field is truncated".to_owned(),
-    })?;
-    let start: [u8; 8] = start.try_into().map_err(|_| ScribeError::Internal {
-        detail: "WAL v6 slice partition start is truncated".to_owned(),
-    })?;
-    TimePartition::from_durable(*tag, i64::from_be_bytes(start)).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("WAL v6 slice partition is invalid: {error}"),
-        }
+/// Returns [`ScribeError::Internal`] when the identity is malformed.
+fn decode_slice_partition(encoded: &[u8]) -> Result<PhysicalPartition, ScribeError> {
+    PhysicalPartition::decode(encoded).map_err(|error| ScribeError::Internal {
+        detail: format!("WAL v7 slice partition is invalid: {error}"),
     })
 }
 
@@ -976,13 +974,13 @@ struct DecodedSliceMetadata {
     schema_fingerprint: [u8; 32],
 }
 
-/// Validate the v6 marker and decode the tenant/table/partition/schema identity.
+/// Validate the v7 marker and decode the tenant/table/partition/schema identity.
 fn decode_slice_metadata(
     reader: &mut SlicePayloadReader<'_>,
 ) -> Result<DecodedSliceMetadata, ScribeError> {
     if reader.take(SLICE_PAYLOAD_MAGIC.len())? != SLICE_PAYLOAD_MAGIC {
         return Err(ScribeError::Internal {
-            detail: "WAL v6 slice magic mismatch".to_owned(),
+            detail: "WAL v7 slice magic mismatch".to_owned(),
         });
     }
     let tenant = decode_slice_tenant(reader.take(16)?)?;
@@ -994,7 +992,8 @@ fn decode_slice_metadata(
             detail: format!("WAL system owner cannot write `{table_fqn}`"),
         });
     }
-    let partition = decode_slice_partition(reader.take(SLICE_PARTITION_BYTES)?)?;
+    let partition_len = reader.read_u16("WAL partition length decode failed")?;
+    let partition = decode_slice_partition(reader.take(partition_len)?)?;
     let mut schema_fingerprint = [0_u8; 32];
     schema_fingerprint.copy_from_slice(reader.take(32)?);
     Ok(DecodedSliceMetadata {
@@ -1032,7 +1031,7 @@ pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload
 }
 
 impl WalRecord {
-    /// Construct a one-slice v6 record for a test or low-level caller.
+    /// Construct a one-slice v7 record for a test or low-level caller.
     ///
     /// Production writers use [`Self::slice`] with the authenticated tenant.
     #[must_use]
@@ -1132,7 +1131,7 @@ impl WalRecord {
         buf.extend_from_slice(&0_u32.to_le_bytes());
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over the complete v6 header followed by payload.
+        // Compute CRC over the complete v7 header followed by payload.
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -1147,7 +1146,7 @@ impl WalRecord {
     /// # Errors
     ///
     /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, an
-    /// unsupported version, or any invalid v6 header or payload bound.
+    /// unsupported version, or any invalid v7 header or payload bound.
     ///
     /// # Panics
     ///
@@ -1179,7 +1178,7 @@ impl WalRecord {
                 reader
                     .read_exact(&mut header[1..])
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("WAL torn v6 record header: {error}"),
+                        detail: format!("WAL torn v7 record header: {error}"),
                     })?;
             }
             Ok(_) => {
@@ -1195,7 +1194,7 @@ impl WalRecord {
         }
         if header[..8] != RECORD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v6 record magic".to_owned(),
+                detail: "invalid WAL v7 record magic".to_owned(),
             });
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
@@ -1205,13 +1204,13 @@ impl WalRecord {
         let header_len = u16::from_le_bytes([header[10], header[11]]);
         if usize::from(header_len) != RECORD_HEADER_SIZE {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v6 record header length".to_owned(),
+                detail: "invalid WAL v7 record header length".to_owned(),
             });
         }
         let flags = u32::from_le_bytes(header[12..16].try_into().expect("fixed record header"));
         if !matches!(flags, RECORD_FLAG_SLICE | RECORD_FLAG_COMMIT) {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v6 record flags".to_owned(),
+                detail: "invalid WAL v7 record flags".to_owned(),
             });
         }
         let lsn = WalLsn::new(u64::from_le_bytes(
@@ -1237,7 +1236,7 @@ impl WalRecord {
                     || usize::try_from(payload_len).ok() != Some(COMMIT_PAYLOAD_BYTES)))
         {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v6 record bounds".to_owned(),
+                detail: "invalid WAL v7 record bounds".to_owned(),
             });
         }
         Ok(Some(DecodedWalRecordHeader {
@@ -1275,7 +1274,7 @@ impl WalRecord {
         reader
             .read_exact(&mut payload)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v6 record payload: {e}"),
+                detail: format!("WAL torn v7 record payload: {e}"),
             })?;
 
         // Read CRC
@@ -1283,7 +1282,7 @@ impl WalRecord {
         reader
             .read_exact(&mut crc_buf)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v6 record CRC: {e}"),
+                detail: format!("WAL torn v7 record CRC: {e}"),
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
@@ -1644,7 +1643,7 @@ impl WalSegment {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the segment cannot be read or synced, the
-    /// visitor fails, or a committed prefix violates the v6 frame or LSN
+    /// visitor fails, or a committed prefix violates the v7 frame or LSN
     /// invariants. A short final record is the sole truncation case.
     pub(crate) fn for_each_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
@@ -1669,7 +1668,7 @@ impl WalSegment {
                 Ok(Some(record)) => {
                     if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                         return Err(ScribeError::Internal {
-                            detail: "WAL v6 contains non-monotonic committed LSNs".to_owned(),
+                            detail: "WAL v7 contains non-monotonic committed LSNs".to_owned(),
                         });
                     }
                     previous_lsn = Some(record.lsn);
@@ -1745,14 +1744,14 @@ pub(crate) type FenceLookup<'a> =
 /// corruption.
 fn is_bad_record_error(error: &ScribeError) -> bool {
     matches!(error, ScribeError::Internal { detail }
-        if detail.starts_with("invalid WAL v6 record") || detail.starts_with("WAL record CRC mismatch"))
+        if detail.starts_with("invalid WAL v7 record") || detail.starts_with("WAL record CRC mismatch"))
 }
 
 /// A partially written final header, payload, or CRC is a recoverable torn
 /// tail. Structural violations and CRC mismatches in a complete frame are
 /// durable corruption and must fail-stop rather than silently discard data.
 fn is_torn_tail_error(error: &ScribeError) -> bool {
-    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v6"))
+    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v7"))
 }
 
 /// WAL writer — owns one fixed set of shard streams with automatic rollover.
@@ -2162,7 +2161,7 @@ impl WalWriter {
         }
     }
 
-    /// Append one self-describing v6 slice record for test-tier probes.
+    /// Append one self-describing v7 slice record for test-tier probes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
@@ -2173,7 +2172,7 @@ impl WalWriter {
         self.append_and_fsync_for_key(seal_key, batch_id, data_payload)
     }
 
-    /// Append, commit, and fsync one one-slice v6 batch for replay tests.
+    /// Append, commit, and fsync one one-slice v7 batch for replay tests.
     ///
     /// This test-only helper deliberately models the production `SLICE` then
     /// `COMMIT` ordering without changing lower-level WAL tests that need to
@@ -2262,7 +2261,7 @@ impl WalWriter {
         self.append_and_commit_for_replay_test(seal_key, decoded.batch_id, decoded.data)
     }
 
-    /// Append one prepared v6 record without syncing it.
+    /// Append one prepared v7 record without syncing it.
     ///
     /// # Errors
     ///
@@ -2968,7 +2967,7 @@ impl ShardRecordCursor {
             .is_some_and(|previous| record.lsn <= previous)
         {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 contains non-monotonic committed LSNs across ordered segments"
+                detail: "WAL v7 contains non-monotonic committed LSNs across ordered segments"
                     .to_owned(),
             });
         }
@@ -3061,7 +3060,7 @@ impl ShardRecordCursor {
         if let Some(fence) = acknowledged {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "WAL v6 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
+                    "WAL v7 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
                     fence.lsn, fence.segment_sequence
                 ),
             });
@@ -3112,7 +3111,7 @@ impl ShardRecordCursor {
     fn repair_torn_tail(&mut self) -> Result<(), ScribeError> {
         if self.next_segment < self.segments.len() {
             return Err(ScribeError::Internal {
-                detail: "WAL v6 contains a torn record before a later shard segment".to_owned(),
+                detail: "WAL v7 contains a torn record before a later shard segment".to_owned(),
             });
         }
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
@@ -3432,7 +3431,7 @@ impl WalReader {
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                     return Err(ScribeError::Internal {
-                        detail: "WAL v6 contains non-monotonic stream-wide committed LSNs"
+                        detail: "WAL v7 contains non-monotonic stream-wide committed LSNs"
                             .to_owned(),
                     });
                 }
@@ -3519,9 +3518,9 @@ pub struct ScribeAppendMeta {
     pub data_digest: [u8; 32],
     /// Canonical Arrow data length, excluding managed correlation columns.
     pub data_len: u32,
-    /// SHA-256 digest of the exact WAL-v6 slice payload.
+    /// SHA-256 digest of the exact WAL-v7 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v6 slice payload length.
+    /// Exact WAL-v7 slice payload length.
     pub payload_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
     pub slice_index: u32,
@@ -3762,7 +3761,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v6 contains non-monotonic stream-wide committed LSNs"
+                if detail == "WAL v7 contains non-monotonic stream-wide committed LSNs"
         ));
     }
 
@@ -3805,7 +3804,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v6 contains a torn record before a later shard segment"
+                if detail == "WAL v7 contains a torn record before a later shard segment"
         ));
         assert_eq!(
             std::fs::metadata(first_path)
@@ -3849,7 +3848,7 @@ mod tests {
         assert_eq!(decoded.shard_id, 3);
     }
 
-    /// Proves both reserved byte ranges in the v6 segment prologue fail closed.
+    /// Proves both reserved byte ranges in the v7 segment prologue fail closed.
     #[test]
     fn segment_header_rejects_nonzero_reserved_byte_ranges() {
         for reserved_index in [33_usize, 39, 48, 59] {
@@ -3884,7 +3883,7 @@ mod tests {
         ));
     }
 
-    /// Proves the v6 record header carries the required slice identity.
+    /// Proves the v7 record header carries the required slice identity.
     #[test]
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
@@ -3902,7 +3901,7 @@ mod tests {
         assert_eq!(decoded.payload, b"test data");
     }
 
-    /// Proves a v6 commit has the exact fixed header fields and identity payload.
+    /// Proves a v7 commit has the exact fixed header fields and identity payload.
     ///
     /// The terminal record is the only durable carrier of the batch's logical
     /// row identity, so this pins both digests surviving a round trip rather
@@ -3917,7 +3916,7 @@ mod tests {
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
         let encoded = record.encode();
 
-        assert_eq!(&encoded[..8], b"WYRDWAL6");
+        assert_eq!(&encoded[..8], b"WYRDWAL7");
         assert_eq!(encoded.len(), RECORD_HEADER_SIZE + COMMIT_PAYLOAD_BYTES + 4);
         let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
             .expect("decode terminal record")
@@ -3935,7 +3934,7 @@ mod tests {
 
     /// Proves a COMMIT payload of any other shape is refused, not interpreted.
     ///
-    /// The v6 identity is fixed-width and total. A record written under a
+    /// The v7 identity is fixed-width and total. A record written under a
     /// different layout must fail closed rather than be read as a truncated or
     /// extended identity, which is what makes the version bump load-bearing.
     #[test]
@@ -3974,7 +3973,9 @@ mod tests {
         let mut payload = encode_slice_payload_parts(
             tenant.as_uuid().as_bytes(),
             "vala.bifrost.invalid/table",
-            crate::test_support::day_partition(2026, 1, 1),
+            &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
+                2026, 1, 1,
+            )),
             &[0_u8; 32],
             b"data",
         )
@@ -3999,7 +4000,9 @@ mod tests {
         let payload = encode_slice_payload_parts(
             system.as_bytes(),
             &audit_log,
-            crate::test_support::day_partition(2026, 1, 1),
+            &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
+                2026, 1, 1,
+            )),
             &[0_u8; 32],
             b"data",
         )
@@ -4010,7 +4013,9 @@ mod tests {
         let payload = encode_slice_payload_parts(
             system.as_bytes(),
             "vala.bifrost.events",
-            crate::test_support::day_partition(2026, 1, 1),
+            &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
+                2026, 1, 1,
+            )),
             &[0_u8; 32],
             b"data",
         )

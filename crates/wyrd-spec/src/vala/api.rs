@@ -1729,6 +1729,48 @@ impl<'de> Deserialize<'de> for TimePartitionWire {
     }
 }
 
+/// One transformed value of an additional partition dimension.
+///
+/// The variant is the value's stored type, so equal literals of different
+/// types never name the same partition.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionValueWire {
+    /// A string value.
+    Utf8(String),
+    /// A 32-bit integer value, including every bucket ordinal.
+    Int32(i32),
+    /// A 64-bit integer value.
+    Int64(i64),
+}
+
+/// Complete partition identity of one physical slice, file, or claim, carried
+/// by private durable records.
+///
+/// `time` is the required time partition and `values` the additional
+/// dimensions in partition-spec order, `None` for a null source value;
+/// `time_index` is the time field's position among all spec fields.
+/// Identities are equal only when their spec, time, and every typed value
+/// agree.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalPartitionWire {
+    /// Iceberg partition-spec id the identity was computed under.
+    pub spec_id: i32,
+    /// Required time partition.
+    pub time: TimePartitionWire,
+    /// Position of the time field among the spec's fields.
+    pub time_index: u8,
+    /// Additional dimension values in spec order; `None` is a null value.
+    pub values: Vec<Option<PartitionValueWire>>,
+}
+
 /// Reports whether `start_utc` is the exact UTC boundary for `granularity`.
 ///
 /// Shared by the checked constructor and by durable decoders that must reject a

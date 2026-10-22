@@ -23,7 +23,7 @@ use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
-use crate::catalog::layout::{TimePartition, TimePrecision};
+use crate::catalog::layout::TimePrecision;
 use crate::contracts::ScribeError;
 use crate::parquet::footer::BifrostFooterIdentity;
 use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
@@ -82,7 +82,7 @@ pub struct ParquetEncoded {
     /// Row group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
-    pub partition: TimePartition,
+    pub partition: crate::catalog::PhysicalPartition,
     /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
 }
@@ -374,7 +374,7 @@ impl<'a> ParquetBatchEncoder<'a> {
         Ok(ParquetEncoded {
             artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
             row_group_stats,
-            partition: self.frozen.seal_key.partition,
+            partition: self.frozen.seal_key.partition.clone(),
             append_metas: self.frozen.metas.clone(),
         })
     }
@@ -1942,7 +1942,7 @@ mod tests {
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
         let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
-        assert_eq!(encoded.partition, seal_partition);
+        assert_eq!(encoded.partition, seal_partition.into());
     }
 
     #[test]

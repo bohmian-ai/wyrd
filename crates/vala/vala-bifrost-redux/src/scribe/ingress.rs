@@ -136,7 +136,7 @@ struct LogicalFrameContract {
     /// Catalog fingerprint required of the caller-owned source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Registered time axis every slice of this frame is bucketed by.
-    time_axis: crate::catalog::TimeAxis,
+    partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
@@ -149,7 +149,7 @@ struct RootAdmission {
     /// Catalog fingerprint required of the caller-owned source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Registered time axis applied to every prepared slice.
-    time_axis: crate::catalog::TimeAxis,
+    partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
@@ -199,15 +199,17 @@ impl ScribeImpl {
                     })?;
             return Ok(LogicalFrameContract {
                 expected_schema_fingerprint,
-                time_axis: builtin.map_or_else(
+                partition_scheme: builtin.map_or_else(
                     || {
-                        crate::catalog::TimeAxis::new(
-                            wyrd_spec::vala::WYRD_INGESTED_AT,
-                            crate::catalog::TimeGranularity::Hour,
-                        )
+                        Ok(crate::catalog::PartitionScheme::time_only(
+                            crate::catalog::TimeAxis::new(
+                                wyrd_spec::vala::WYRD_INGESTED_AT,
+                                crate::catalog::TimeGranularity::Hour,
+                            ),
+                        ))
                     },
-                    |definition| crate::catalog::TimeAxis::of_wire(&(definition.physical_layout)()),
-                ),
+                    |definition| scheme_of(&(definition.physical_layout)()),
+                )?,
                 registered_schema: None,
             });
         };
@@ -223,7 +225,7 @@ impl ScribeImpl {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
-            time_axis: crate::catalog::TimeAxis::of_wire(&layout),
+            partition_scheme: scheme_of(&layout)?,
             registered_schema: Some(registered_schema),
         })
     }
@@ -391,7 +393,7 @@ impl ScribeImpl {
         let decode_owner = take_transport_decode_owner(&mut frame.payload);
         let LogicalFrameContract {
             expected_schema_fingerprint,
-            time_axis,
+            partition_scheme,
             registered_schema,
         } = self.resolve_logical_frame(frame).await?;
         let receipt_micros = self.admission_instant(frame.principal.tenant_id).await?;
@@ -418,7 +420,7 @@ impl ScribeImpl {
         self.pause_admitted_ingest_for_test().await;
         Ok(RootAdmission {
             expected_schema_fingerprint,
-            time_axis,
+            partition_scheme,
             registered_schema,
             receipt_micros,
             material_plan,
@@ -526,7 +528,7 @@ impl ScribeImpl {
         let admission = profile.admission.timer();
         let RootAdmission {
             expected_schema_fingerprint,
-            time_axis,
+            partition_scheme,
             registered_schema,
             receipt_micros,
             material_plan,
@@ -575,7 +577,7 @@ impl ScribeImpl {
             memory,
             tenant,
             table: binding.table_ref,
-            time_axis,
+            partition_scheme,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
             profile: Arc::clone(&profile),
@@ -757,6 +759,24 @@ impl ScribeImpl {
             stall.release.notified().await;
         }
     }
+}
+
+/// Builds the partition scheme new admission writes a registered layout under.
+///
+/// Every table is admitted under its initial partition spec.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the registered layout's partition
+/// declaration does not form a scheme, which a catalog-resolved layout never
+/// does.
+fn scheme_of(
+    layout: &wyrd_spec::vala::api::PhysicalLayoutWire,
+) -> Result<crate::catalog::PartitionScheme, ScribeError> {
+    crate::catalog::PartitionScheme::of_wire(layout, crate::catalog::INITIAL_PARTITION_SPEC_ID)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("registered partition layout is invalid: {error}"),
+        })
 }
 
 /// Preserves caller-actionable catalog failures across Scribe's private boundary.

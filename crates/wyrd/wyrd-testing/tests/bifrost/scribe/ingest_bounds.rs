@@ -303,3 +303,124 @@ async fn forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire() {
     )
     .await;
 }
+
+/// A composite-partitioned table admits a request spanning 32 distinct
+/// partition tuples within one hour and refuses a 33rd tuple whole, before
+/// any row is durable; the same batch id corrected to 32 tuples then lands.
+///
+/// # Panics
+///
+/// Panics when the 32-tuple request is refused, the 33-tuple request is
+/// admitted or leaves a readable row or published object, or the corrected
+/// retry does not stage, publish, and read back.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composite_partition_fanout_is_atomic() {
+    use arrow::array::{StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
+
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let name = unique_table("composite_fanout");
+    let fqn = format!("vala.datasets.{name}");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("customer", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let config = TableConfig::from_arrow(&fqn, Arc::clone(&schema))
+        .expect("declared table")
+        .with_layout(PhysicalLayoutWire {
+            time_column: Some("event_time".to_owned()),
+            partition_by: vec![
+                PartitionFieldWire::new("event_time", PartitionTransformWire::Hour),
+                PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+            ],
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        });
+    wyrd_client::Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(config),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("the writer connects")
+    .register()
+    .await
+    .expect("the composite table registers");
+    // Two rows per tuple, all within one hour, so only the extra dimension
+    // fans out and repeated tuples count once.
+    let batch = |tuples: i64| {
+        let rows = 0..tuples * 2;
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(
+                        rows.clone().map(|row| 1_791_244_800_000_000 + row),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(StringArray::from_iter_values(
+                    rows.clone().map(|row| format!("c{}", row / 2)),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows)),
+            ],
+        )
+        .expect("fanout batch")
+    };
+    let count = format!("SELECT count(*) AS value FROM {fqn}");
+
+    let retried = uuid::Uuid::now_v7();
+    let refusal = append_batch(&client, &fqn, retried, &batch(33))
+        .await
+        .expect_err("a 33rd distinct tuple is refused");
+    assert_eq!(
+        (refusal.code(), refusal.status()),
+        ("WYRD_VALA_400_OTLP_REQUEST_MALFORMED", 400),
+        "the fanout refusal is a stable invalid request: {refusal:?}"
+    );
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe
+        .flush_writable_for_test()
+        .await
+        .expect("every writable bucket freezes");
+    await_persistence_drained(&scribe).await;
+    server
+        .flush_bifrost()
+        .await
+        .expect("nothing is left to publish");
+    assert_eq!(
+        read_sql(&client, &count).await,
+        [0],
+        "no refused row is readable"
+    );
+    assert_eq!(
+        published_object_count(&server, tenant, BifrostNamespace::Datasets, &name).await,
+        0,
+        "the refusal publishes nothing"
+    );
+
+    append_batch(&client, &fqn, retried, &batch(32))
+        .await
+        .expect("the corrected 32-tuple retry is acknowledged");
+    assert_stages_and_publishes(
+        &server,
+        &client,
+        tenant,
+        &name,
+        &format!("SELECT count(DISTINCT customer) AS value FROM {fqn}"),
+        &[32],
+    )
+    .await;
+    assert_eq!(read_sql(&client, &count).await, [64]);
+}

@@ -410,7 +410,7 @@ impl ScribeStagingRuntime {
                 &crate::scribe::seal_key::SealKey::new(
                     key.tenant(),
                     key.table().clone(),
-                    key.partition(),
+                    key.partition().clone(),
                 ),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
@@ -704,7 +704,7 @@ impl ScribeStagingRuntime {
         let seal_key = crate::scribe::seal_key::SealKey::new(
             key.tenant(),
             key.table().clone(),
-            key.partition(),
+            key.partition().clone(),
         );
         for member in members {
             let id = member.record().member();
@@ -826,7 +826,7 @@ impl ScribeStagingRuntime {
             key.table().clone(),
             key.schema_fingerprint(),
             layout.as_ref(),
-            key.partition(),
+            key.partition().clone(),
             key.node_id(),
             key.writer_epoch(),
         );
@@ -1050,7 +1050,7 @@ fn claim_object_base(
     let wal = runs.wal();
     Ok(ScribeClaimIdentity::new(
         &context.binding,
-        claim.key().partition(),
+        claim.key().partition().clone(),
         &claim.key().node_id().to_string(),
         claim.key().writer_epoch().as_i64(),
         &claim.id(),
@@ -1848,7 +1848,7 @@ mod tests {
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
     ) {
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition().clone());
         for member in member_ids {
             assert_eq!(
                 hot_sources
@@ -2273,7 +2273,7 @@ mod tests {
     ) {
         let claim_id = claim.to_string();
         let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition().clone());
         let ordinal = |member: &StagedMemberId| {
             crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation())
         };

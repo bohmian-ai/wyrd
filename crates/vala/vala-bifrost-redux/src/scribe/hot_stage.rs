@@ -39,10 +39,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::api::TimePartitionWire;
+use wyrd_spec::vala::api::PhysicalPartitionWire;
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::layout::TimePartition;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::assembly::{
     ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
@@ -309,8 +309,8 @@ pub struct StagedHotSourceRecordV1 {
     schema_fingerprint: String,
     /// Lowercase hex digest of the canonical physical layout.
     layout_fingerprint: String,
-    /// Exact physical time partition of every row.
-    partition: TimePartitionWire,
+    /// Exact physical partition of every row.
+    partition: PhysicalPartitionWire,
     /// Node whose staging volume holds the runs.
     node_id: Uuid,
     /// Fenced writer epoch whose LSN stream produced the rows.
@@ -441,7 +441,8 @@ impl StagedHotSourceRecordV1 {
             })?);
         let layout_fingerprint = unhex(&self.layout_fingerprint)
             .ok_or_else(|| invalid("layout fingerprint is not a 32-byte hex digest".to_owned()))?;
-        let partition = TimePartition::from_wire(self.partition);
+        let partition = PhysicalPartition::from_wire(&self.partition)
+            .map_err(|error| invalid(format!("partition is invalid: {error}")))?;
         Ok(ScribeAssemblyKey::from_parts(
             self.tenant,
             table,
@@ -1164,7 +1165,7 @@ fn unhex(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::layout::{PhysicalLayout, TimeGranularity};
+    use crate::catalog::layout::{PhysicalLayout, TimeGranularity, TimePartition};
     use crate::namespaces::BifrostNamespace;
     use crate::tables::DomainTable as _;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -1200,7 +1201,8 @@ mod tests {
                 chrono::DateTime::from_timestamp(1_772_150_400, 0)
                     .expect("a fixed representable instant"),
             )
-            .expect("a fixed hour boundary"),
+            .expect("a fixed hour boundary")
+            .into(),
             NodeId::new(Uuid::from_u128(11)),
             WriterEpoch::new(6),
         )

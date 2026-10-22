@@ -137,7 +137,7 @@ impl ClaimPublisher {
         let seal_key = crate::scribe::seal_key::SealKey::new(
             key.tenant(),
             key.table().clone(),
-            key.partition(),
+            key.partition().clone(),
         );
         let object_keys = if object_identities.is_empty() {
             vec![request.object_base.to_owned()]
@@ -210,7 +210,7 @@ impl ClaimPublisher {
         let seal_key = crate::scribe::seal_key::SealKey::new(
             key.tenant(),
             key.table().clone(),
-            key.partition(),
+            key.partition().clone(),
         );
         for member in claim.members() {
             let authority = hot_sources
@@ -261,7 +261,7 @@ impl ClaimPublisher {
         let seal_key = crate::scribe::seal_key::SealKey::new(
             key.tenant(),
             key.table().clone(),
-            key.partition(),
+            key.partition().clone(),
         );
         let generations: Vec<_> = request
             .claim
@@ -310,7 +310,7 @@ impl ClaimPublisher {
                 &crate::scribe::seal_key::SealKey::new(
                     key.tenant(),
                     key.table().clone(),
-                    key.partition(),
+                    key.partition().clone(),
                 ),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
@@ -351,7 +351,7 @@ impl ClaimPublisher {
                 &crate::scribe::seal_key::SealKey::new(
                     key.tenant(),
                     key.table().clone(),
-                    key.partition(),
+                    key.partition().clone(),
                 ),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
@@ -762,7 +762,7 @@ impl ClaimPublisher {
             &crate::scribe::seal_key::SealKey::new(
                 key.tenant(),
                 key.table().clone(),
-                key.partition(),
+                key.partition().clone(),
             ),
             crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation()),
         ) {

@@ -1889,8 +1889,8 @@ impl ShardOwner {
         )
         .bind(replayed.seal_key.table.namespace.as_str())
         .bind(&replayed.seal_key.table.name)
-        .bind(replayed.seal_key.partition.granularity_str())
-        .bind(replayed.seal_key.partition.start_utc())
+        .bind(replayed.seal_key.partition.time().granularity_str())
+        .bind(replayed.seal_key.partition.time().start_utc())
         .bind(replayed.stream.node_id.as_uuid())
         .bind(replayed.stream.writer_epoch.as_i64())
         .fetch_all(&mut **conn.transaction())
@@ -2992,7 +2992,7 @@ struct BatchCommitIdentity {
     first_index: usize,
     /// Validated cardinality of the closed slice set.
     slice_count: u32,
-    /// Digest over exact WAL payload bytes, carried by the v6 COMMIT record.
+    /// Digest over exact WAL payload bytes, carried by the v7 COMMIT record.
     ///
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
@@ -3338,7 +3338,7 @@ impl ShardOwner {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
             // and frozen member, fail-stop admission, and let startup replay
-            // reconstruct the sole owner from WAL v6.
+            // reconstruct the sole owner from WAL v7.
             self.memory_ownership.poison();
         }
         result
@@ -3560,7 +3560,7 @@ impl ShardOwner {
         }))
     }
 
-    /// Appends one v6 COMMIT record per complete batch, syncs once, then fences.
+    /// Appends one v7 COMMIT record per complete batch, syncs once, then fences.
     ///
     /// The group's SLICE records are written but not yet synced when this
     /// method starts. Every complete batch's COMMIT is appended after them; one
@@ -3616,7 +3616,7 @@ impl ShardOwner {
                 .touched_segments
                 .first()
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v6 batch commit did not retain its segment identity".to_owned(),
+                    detail: "WAL v7 batch commit did not retain its segment identity".to_owned(),
                 })?
                 .header()
                 .clone();
@@ -3701,7 +3701,7 @@ impl ShardOwner {
             slice_set_digest: identity.logical_digest,
             slice_count: i32::try_from(identity.slice_count).map_err(|_| {
                 ScribeError::Internal {
-                    detail: "WAL v6 slice count exceeds SQL integer range".to_owned(),
+                    detail: "WAL v7 slice count exceeds SQL integer range".to_owned(),
                 }
             })?,
             wal_node_id: uuid::Uuid::from_bytes(header.node_id),
@@ -4177,7 +4177,7 @@ impl ShardOwner {
                     rows_accepted: row_count,
                     wal_lsn_min: slice.lsn,
                     wal_lsn_max: slice.lsn,
-                    seal_key: slice.seal_key.as_path_components(),
+                    seal_key: slice.seal_key.canonical_key(),
                 },
                 rows,
             )
@@ -4670,7 +4670,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "owner-test-second"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4757,7 +4757,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "age-owner-peer"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4845,7 +4845,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "pressure-owner-peer"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -5227,7 +5227,7 @@ mod tests {
                 crate::test_support::day_partition(2026, 8, 18),
             );
             chunk.states.insert(
-                seal_key.as_path_components(),
+                seal_key.canonical_key(),
                 crate::scribe::replay::ReplayedSealKey {
                     stream,
                     seal_key,
@@ -5619,7 +5619,7 @@ mod tests {
         let lock_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-identity-lock"),
-            current_key.partition,
+            current_key.partition.clone(),
         );
         owner
             .memtable
@@ -5703,7 +5703,7 @@ mod tests {
         let next_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
-            current_key.partition,
+            current_key.partition.clone(),
         );
         let memtable = Memtable::new();
         memtable
@@ -6258,7 +6258,7 @@ mod tests {
             rows_accepted: 1,
             wal_lsn_min: WalLsn::new(1),
             wal_lsn_max: WalLsn::new(1),
-            seal_key: key.as_path_components(),
+            seal_key: key.canonical_key(),
         }
     }
 
@@ -6573,7 +6573,9 @@ mod tests {
                 memory,
                 tenant: key.tenant,
                 table: key.table,
-                time_axis: crate::catalog::TimeAxis::new("event_time", key.partition.granularity()),
+                partition_scheme: crate::catalog::PartitionScheme::time_only(
+                    crate::catalog::TimeAxis::new("event_time", key.partition.time().granularity()),
+                ),
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
                 profile: Arc::default(),
@@ -7383,8 +7385,8 @@ mod tests {
             .readable_batches_for_range(
                 key.tenant,
                 &key.table,
-                key.partition,
-                key.partition,
+                key.partition.time(),
+                key.partition.time(),
                 &["value".to_owned()],
             )
             .expect("visible owner rows");
@@ -8151,7 +8153,10 @@ mod tests {
         .expect("pending capture")
         .expect("unregistered capture");
         let read = active
-            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .read(
+                &(key.partition.time()..=key.partition.time()),
+                &["value".to_owned()],
+            )
             .expect("projected read");
         drop(active);
         owner
@@ -8233,7 +8238,10 @@ mod tests {
                 .expect("capture")
                 .expect("unregistered capture");
         let read = capture
-            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .read(
+                &(key.partition.time()..=key.partition.time()),
+                &["value".to_owned()],
+            )
             .expect("projected read");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         let (seal_id, arrow_bytes) = (frozen.seal_id, frozen.arrow_bytes);

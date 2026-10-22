@@ -2492,7 +2492,7 @@ impl PersistenceWorker {
         let staging = self.staging()?;
         let mut published = 0;
         for key in staging.ready_keys()? {
-            if key.partition() != partition {
+            if key.partition().time() != partition {
                 continue;
             }
             while let Some(claim) =
@@ -2710,7 +2710,7 @@ impl PersistenceWorker {
         let Ok(binding) = TenantTableBinding::resolve((key.tenant(), key.table().clone())) else {
             return;
         };
-        let event = crate::maintenance::StagingFileCommitted::new(binding, key.partition());
+        let event = crate::maintenance::StagingFileCommitted::new(binding, key.partition().time());
         let _ = publisher.try_publish(event);
     }
 

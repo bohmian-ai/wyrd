@@ -232,14 +232,35 @@ pub(crate) async fn append_values(
         ))],
     )
     .expect("value batch");
+    append_batch(client, table, batch_id, &batch).await
+}
+
+/// Appends one batch carrying an Int64 `value` column through public
+/// authenticated gRPC ingest and returns the rows it must later read back.
+///
+/// # Panics
+///
+/// Panics when the transport cannot connect, the append is refused, or the
+/// batch has no Int64 `value` column.
+pub(crate) async fn append_batch(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+    batch_id: Uuid,
+    batch: &arrow::record_batch::RecordBatch,
+) -> Vec<ManagedRow> {
     let request_id = wyrd_testing::bifrost::write::RawIngest::connect(client)
         .await
         .expect("public ingest transport connects")
-        .insert(table, batch_id, encode_ipc(&batch))
+        .insert(table, batch_id, encode_ipc(batch))
         .await
         .expect("the public append is acknowledged");
     let request_id = Uuid::parse_str(request_id.as_str()).expect("request identity is a UUID");
-    rows.iter()
+    batch
+        .column_by_name("value")
+        .and_then(|values| values.as_any().downcast_ref::<arrow::array::Int64Array>())
+        .expect("the batch carries an Int64 value column")
+        .values()
+        .iter()
         .map(|value| ManagedRow {
             request_id,
             value: *value,

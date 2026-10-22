@@ -168,3 +168,40 @@ Ready with architecture, executability and independent cold rehearsal passing;
 it included separate simplicity and system passes. It did not rerun the original
 findings audit or runtime journeys. Terminal and child cleanup remain obligations
 to prove during implementation.
+
+## Implementation Evidence
+
+Commits `57759179b`, `ac9caaf21`, `6d46eb9ca`, `0cc3ba563` (on `00b614891`).
+
+| Scenario / finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. Abnormal lifespan / FIND-1 | `wyrd/_middleware.py`: one guarded `drain()` runs after the app's teardown; on a raise or cancellation after startup it is attempted off-loop and the primary error is re-raised; a drain failure is logged and does not replace it. The driver in `test_asgi_integration.py` records `raised`. | `test_asgi_lifespan` covers raise-before-reply, cancellation, secondary drain failure, and single drain on normal or explicit terminal paths. RED: `closed(state)` false. GREEN. | PASS |
+| 2. Safe diagnostics / FIND-2 | `_diagnostic` prints a Wyrd error as `code: message`, the exact `_EXPORTER_EXTRA` remedy, or `unexpected <Type>; its message is withheld`. | `test_asgi_lifespan` sends DSN, token and newline secrets through startup and drain faults and asserts that the app's own failure text is unchanged. RED: secret leaked. GREEN. `test_asgi_telemetry_ownership` stays GREEN. | PASS |
+| 3. Manual completion / FIND-3 | `examples/quickstart/stored-verdicts.sql`; Quickstart step "3. Confirm the stored verdicts" (`wyrd get`, `wyrd query --server … --file`); the Setup Manual tab links to it; `llms-full.txt` regenerated. | `test_guided_manual_setup[python,rust,typescript]` runs the published `get` and `query` against the real server and matches the stored `passed`/`failed` results and the Run ID. It also asserts that the SQL equals the prompt's statement and that the docs carry the commands and link. RED: docs lacked the command. GREEN. | PASS |
+| 4. Host launch / FIND-4 | `mcp/hosts.rs` `launcher()` is the one `(program, args)` source for `launch` (display) and `command` (no shell). All seven hosts have a prefix, and the paste-fallback branch in `print_handoff` is gone. | `mcp::hosts::tests::launch_preserves_the_setup_prompt_literally` (all seven, with quotes, newline, `$(id)` and backticks). C2's ordinary run asserts the handoff and that no agent started. | PASS |
+| 5. Rustdoc / FIND-5 | `Spec::json_schema` (`envelope.rs`), the `mcp.rs` tests module, `walk` in `cli.rs` (with `# Panics`). | Static inspection; clippy `-D warnings` on `wyrd-spec` and `wyrd-cli`. | PASS |
+| 6. Guided selection / REQ-037 | `init.rs` `InitMode::Guided` conflicts with `--format` and `--non-interactive`. The agent is chosen before any side effect and started only after readiness and connection. Server output goes to the log file. Help text and the Setup Agent-assisted tab describe the command. | C1 `guided_init_print_prompt_is_offline` covers the conflicts, the no-terminal refusal and help. C2 `pg_tests::guided_init_lifecycle_and_prompt` covers the exact argv, prompt and cwd, refusals for multiple hosts and a missing hermes, the interactive choice, and an ordinary init that starts no agent. RED: `unexpected argument 'guided'`. GREEN (43.5 s). | PASS |
+| 7. Guided lifecycle / REQ-038 | `Agent { child, terminal: SavedTerminal }`. `stop()` settles the agent before the server and UI, then restores termios (`terminal.rs`). An exit status is reported, and the server keeps serving. | C2 covers codex exiting 3 with the server still reachable, a failed pi connection, a failed copilot spawn, an interrupt, and a server killed through `pgrep -P`. Each case leaves the child settled and the terminal usable. | PASS |
+
+Commands run (all GREEN): the five focused selectors above, run exactly as listed in "Focused proof and execution"; `mise run py:format`, `py:lints`, `py:typecheck`, `fmt:check`; `cargo clippy --locked -p wyrd-spec -p wyrd-cli --all-targets --all-features -- -D warnings`; `docs:generate`, `docs:check:commands`, `docs:linkcheck`, `docs:test`; `git diff --check`.
+
+### Diagnosis: C2 "terminal is usable again"
+
+- **Symptom:** the C2 interrupt step failed `usable()` because ECHO and ICANON were cleared after `wyrd init guided` exited.
+- **Evidence:** `FAKE_AGENT` echoed `fake agent started` before `stty raw -echo`. `settle` signals the recorded agent pid only.
+- **Cause:** the test sent SIGINT on the announcement while `sh`'s `stty` child was still running. `sh` was reaped and termios was restored, and then the orphaned `stty` applied raw mode again.
+- **Fix site:** the test fake agent. In wait mode it now announces after `stty` and then `exec sleep`, so the recorded pid is the only process. No product change.
+- **Diagnostician (read-only, given only the command, trace and diff):** it reached the same cause and fix site. It found that the interrupt and server-kill steps were affected and the exit-mode step was not. It advised against process-group signalling in the product, because that would background a real agent on the terminal.
+
+### Reuse and scope
+
+Existing owners were extended: `McpHost`, `DevServer`/`stop`, `Diagnostics`, the lifespan middleware and the C1/C2/C4 harnesses. No second supervisor, harness, transport or provider was added. Non-goals stayed out: no auth or deployment identity work, no TASK-002 edits, no OpenAPI `oneOf` refactor, no framework discovery, and no hard-kill guarantee.
+
+### Limits
+
+- Run on Linux x86_64 only.
+- Cancellation is simulated by raising `CancelledError` inside the lifespan.
+- Grandchildren of a real agent are not signalled. Wyrd settles only the child it launched, per the non-goal.
+- `wyrd query` does not read the saved config, so the Quickstart passes `--server`.
+- Ordinary init no longer prints a paste fallback, because every host now has a command. The docs keep `--print-prompt` for other agents.
+- Full C1–C8 and the docs and SDK aggregates are deferred to change review.

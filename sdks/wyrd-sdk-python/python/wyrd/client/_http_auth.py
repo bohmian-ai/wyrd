@@ -10,8 +10,7 @@ try:
     import httpx2
 except ImportError as missing:
     raise ImportError(
-        "WyrdClient.http_auth needs the gateway extra: pip install 'wyrd[gateway]'"
-        " (httpx and httpx2)"
+        "WyrdClient.http_auth needs the gateway extra: uv add 'wyrd-ai[gateway]' (httpx and httpx2)"
     ) from missing
 
 if TYPE_CHECKING:

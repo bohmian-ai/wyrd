@@ -23,7 +23,7 @@ Every page is one of four types. Pick it before writing.
   options, flags, or every case.
 - Shows how the reader knows each important step worked.
 - Runs project code and the CLI through the reader's tool: `uv run`,
-  `cargo run`, `npx`. Never asks the reader to activate an environment.
+  `cargo run`, `pnpm`. Never asks the reader to activate an environment.
 - Ends with a call to action under `## Next`.
 
 **Concept** (Understand)
@@ -71,7 +71,7 @@ Copy the named page when writing a new one of the same shape.
 
 | Shape | Sections | Copy |
 | --- | --- | --- |
-| Landing | One paragraph → one example (its YAML, the program, and its output) → how it fits → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
+| Landing | One paragraph → how it fits (one diagram) → one example (its YAML, the program, and its output) → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
 | Install | What you need (minimum versions table) → install, one command per language in `<LangTabs>` → start or check → `## If it fails` → `## Next` | `get-started/setup.md` |
 | Quickstart or guide | One-sentence goal → numbered `##` steps, each with its files, command, and output → `## If it fails` → `## Next` | `get-started/quickstart.md` |
 | Integration (a guide for one framework or interface, such as ASGI) | What you capture → Before you start → Install → Usage → Verify it worked → `## If it fails` → Advanced → Reference → `## Next`; Advanced and Reference only when needed | `connect/integrate-asgi.md` |
@@ -90,9 +90,9 @@ Copy the named page when writing a new one of the same shape.
 - Use `<LangTabs langs={['python', 'rust', 'typescript']}>` for anything that
   differs by language, in that order.
 - Pin versions in install commands to the documented release.
-- Public pages use the reader's tools (`uv add`, `cargo add`, `npm install`,
+- Public pages use the reader's tools (`uv add`, `cargo add`, `pnpm add`,
   `wyrd ...`), never repository tasks; `scripts/check_commands.py` enforces it.
-  Python uses uv, not pip.
+  Python uses uv, not pip; TypeScript uses pnpm, not npm.
 
 ## Diagrams
 

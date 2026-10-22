@@ -15,7 +15,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 | --- | --- |
 | OS | macOS on Apple silicon, or Linux (x86_64 or arm64) |
 | PostgreSQL | 16, with a user that owns the database (not a superuser) |
-| Language | Python 3.11, Rust 1.99, or Node.js 22.18 |
+| Language | Python 3.11, Rust 1.95, or Node.js 22.18 |
 
 ## Install
 
@@ -43,11 +43,11 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 
 ```bash
 mkdir quickstart && cd quickstart
-npm init -y && npm pkg set type=module
-npm install wyrd-ai@0.3.0
+pnpm init && pnpm pkg set type=module
+pnpm add wyrd-ai@0.3.0
 ```
 
-Run the CLI as `npx wyrd`.
+Run the CLI as `pnpm wyrd`.
 
 </LangTab>
 </LangTabs>

@@ -17,8 +17,8 @@ The transport is `wyrd.http_auth` in Python, an `httpx.Auth` that also works as 
 - A deployment for each model you call. The examples use `openai-prod`, `claude-prod`, and `gemini-team` from [Set up the LLM gateway](/connect/set-up-the-llm-gateway/). Swap in your own deployment names.
 - The capture policy from [step 5 of the setup](/connect/set-up-the-llm-gateway/#set-up-one-provider). Calls run without it, but none are recorded, so [Check that the call was recorded](#check-that-the-call-was-recorded) finds nothing.
 - A Wyrd credential the client can find: the config `wyrd init` saves, `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or a saved `wyrd auth login`.
-- Python: `pip install 'wyrd-ai[gateway]'`, plus the SDK or framework you use. These examples were checked with `openai` 3.14, `anthropic` 1.6, `google-genai` 2.30, `openai-agents` 0.23, and `pydantic-ai-slim` 2.56.
-- TypeScript: `npm install wyrd-ai`, plus `openai` or `@anthropic-ai/sdk`.
+- Python: `uv add 'wyrd-ai[gateway]'`, plus the SDK or framework you use. These examples were checked with `openai` 3.14, `anthropic` 1.6, `google-genai` 2.30, `openai-agents` 0.23, and `pydantic-ai-slim` 2.56.
+- TypeScript: `pnpm add wyrd-ai`, plus `openai` or `@anthropic-ai/sdk`.
 
 ## OpenAI
 

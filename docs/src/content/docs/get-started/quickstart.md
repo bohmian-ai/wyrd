@@ -79,7 +79,7 @@ Run the program again. Nothing changed, so you get the same verdicts and `uid` v
 
 ## 3. Confirm the stored verdicts
 
-The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `pnpm wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
 
 ```bash
 wyrd get --kind Service --name support-reply --version 1.0.0

@@ -15,8 +15,8 @@ export const wyrdInYourStack: DiagramSpec = {
         { id: 'app', kind: 'client', x: 16, y: 176, w: 188, h: 70, title: 'Your app', sub: 'Python · Rust · TypeScript SDK' },
         { id: 'agent', kind: 'client', x: 16, y: 343, w: 188, h: 58, title: 'Coding agent', sub: 'MCP' },
         { id: 'decl', kind: 'declare', x: 284, y: 40, w: 296, h: 70, title: 'Declarations', sub: 'Services · Verifiers · versions' },
-        { id: 'engine', kind: 'component', x: 284, y: 176, w: 296, h: 70, title: 'Verification engine', sub: 'checks · verdicts' },
-        { id: 'bif', kind: 'evidence', x: 284, y: 312, w: 296, h: 70, title: 'Bifrost', sub: 'runs · observations · evidence' },
+        { id: 'engine', kind: 'declare', x: 284, y: 176, w: 296, h: 70, title: 'Verification engine', sub: 'checks · verdicts' },
+        { id: 'bif', kind: 'declare', x: 284, y: 312, w: 296, h: 70, title: 'Bifrost', sub: 'telemetry · custom data · evidence' },
         { id: 'pg', kind: 'store', x: 660, y: 50, w: 184, h: 130, title: 'Postgres', sub: 'declarations · coordination' },
         { id: 'obj', kind: 'store', x: 660, y: 250, w: 184, h: 130, title: 'Object storage', sub: 'evidence · artifacts' }
       ],
@@ -48,7 +48,7 @@ export const wyrdInYourStack: DiagramSpec = {
       nodes: ['app', 'bif', 'obj', 'pg'],
       edges: ['ao', 'bo', 'bc'],
       caption:
-        'Your app records what it did inside a Run. Bifrost writes those observations to object storage as Parquet and keeps its table catalog in Postgres.'
+        'Your app sends what it does as it runs: telemetry, its own data, and evidence. Bifrost writes it to object storage as Parquet and keeps its table catalog in Postgres.'
     },
     {
       label: 'Verify',

@@ -3,7 +3,7 @@ name = "wyrd-skald-spec"
 version = "0.3.0"
 description = "Native Skald provider types shared end to end: pure Rust, no IO."
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 

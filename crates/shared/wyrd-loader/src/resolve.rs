@@ -74,7 +74,6 @@ fn resolve_card_references(
     state: &mut ResolutionState,
 ) -> Vec<AuthoredCard> {
     let source_path = card.source_path.clone();
-    let parent_space = card.metadata.space.clone();
     let mut discovered = Vec::new();
     let mut resolver = PathResolver {
         sandbox,
@@ -89,7 +88,6 @@ fn resolve_card_references(
             &mut resolver,
             entry.value,
             &source_path,
-            parent_space.as_ref(),
             &mut discovered,
             source_depth,
         );
@@ -99,18 +97,15 @@ fn resolve_card_references(
 
 /// Rewrite one path-bearing slot and retain diagnostics for failed imports.
 ///
-/// Space inheritance and path resolution are identical for every slot shape,
-/// so both go through the canonical [`SlotValue`] accessors rather than one
-/// arm per reference type.
+/// Path resolution is identical for every slot shape, so it goes through the
+/// canonical [`SlotValue`] accessors rather than one arm per reference type.
 fn resolve_reference_slot(
     resolver: &mut PathResolver<'_>,
     mut value: SlotValue<'_>,
     source_path: &Path,
-    parent_space: Option<&wyrd_spec::ids::SpaceName>,
     discovered: &mut Vec<AuthoredCard>,
     source_depth: usize,
 ) {
-    inherit_space(value.as_card_ref_mut(), parent_space);
     let Some(path) = value.as_path().map(Path::to_path_buf) else {
         return;
     };
@@ -235,14 +230,6 @@ impl PathResolver<'_> {
     }
 }
 
-fn inherit_space(card_ref: Option<&mut CardRef>, parent_space: Option<&wyrd_spec::ids::SpaceName>) {
-    if let Some(card_ref) = card_ref
-        && card_ref.space.is_none()
-    {
-        card_ref.space = parent_space.cloned();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,13 +249,13 @@ mod tests {
         let target = root.join("prompt.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = root.join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -296,13 +283,13 @@ mod tests {
         let target = temp.path().join("prompts.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = temp.path().join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n  execution_route:\n    kind: native\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\nspec:\n  prompt: prompts.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -326,18 +313,18 @@ mod tests {
         let root = temp.path();
         std::fs::write(
             root.join("prompt.yaml"),
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         std::fs::write(
             root.join("agent.yaml"),
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
         let entry = root.join("service.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: api\n  components:\n    - alias: agent\n      ref: agent.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  version: 1.0.0\nspec:\n  service_type: api\n  components:\n    - alias: agent\n      ref: agent.yaml\n",
         )
         .unwrap();
 
@@ -369,7 +356,7 @@ mod tests {
             std::fs::write(
                 root.join(format!("service_{index}.yaml")),
                 format!(
-                    "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service-{index}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: api\n{components}"
+                    "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service-{index}\n  version: 1.0.0\nspec:\n  service_type: api\n{components}"
                 ),
             )
             .unwrap();

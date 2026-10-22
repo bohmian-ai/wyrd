@@ -272,7 +272,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cards = temp.path().join("cards");
         std::fs::create_dir(&cards).unwrap();
-        std::fs::write(cards.join("prompt.yaml"), "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  space: default\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n").unwrap();
+        std::fs::write(cards.join("prompt.yaml"), "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n").unwrap();
         symlink(&cards, temp.path().join("linked-cards")).unwrap();
 
         let loaded = crate::parse::parse_path(temp.path()).unwrap();

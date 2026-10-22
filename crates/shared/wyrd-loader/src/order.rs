@@ -136,7 +136,6 @@ fn graph_diagnostic(
         },
         GraphError::DuplicateIdentity { .. }
         | GraphError::Empty
-        | GraphError::MissingSpace
         | GraphError::MultipleRoots { .. }
         | GraphError::InvalidSpec { .. } => WyrdError::LoaderInvalidEnvelope {
             message,
@@ -155,7 +154,7 @@ mod tests {
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::envelope::{CardKind, Metadata, Spec};
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::{CardName};
     use wyrd_spec::reference::Ref;
 
     fn metadata(name: &str) -> Metadata {
@@ -163,7 +162,6 @@ mod tests {
             name: CardName::new(name).unwrap(),
             version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
             bump: None,
-            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
@@ -191,7 +189,6 @@ mod tests {
             kind,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -207,7 +204,6 @@ mod tests {
                             kind: CardKind::Service,
                             name: CardName::new(dependency).unwrap(),
                             version: VersionBlock::parse("1.0.0").unwrap(),
-                            space: Some(SpaceName::new("default").unwrap()),
                             uid: None,
                         },
                     },

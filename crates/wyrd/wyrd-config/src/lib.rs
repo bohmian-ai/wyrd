@@ -94,10 +94,10 @@ mod cache_tests {
     #[test]
     #[serial_test::serial]
     fn valid_repo_config_is_cached() {
-        in_temp_repo(Some("[defaults]\nspace = \"journey\"\n"), || {
+        in_temp_repo(Some("[defaults.labels]\nteam = \"journey\"\n"), || {
             let first = resolve_repo_config().unwrap().unwrap();
             let second = resolve_repo_config().unwrap().unwrap();
-            assert_eq!(first.defaults.space, second.defaults.space);
+            assert_eq!(first.defaults.labels, second.defaults.labels);
             assert_eq!(first.root_path, second.root_path);
         });
     }
@@ -124,15 +124,12 @@ mod e2e {
 
     use tempfile::NamedTempFile;
     use wyrd_spec::envelope::{CardKind, Metadata};
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::{CardName};
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
     use crate::{WyrdConfig, apply_defaults};
 
     const FIXTURE: &str = r#"
-[defaults]
-space = "prod"
-
 [defaults.labels]
 team = "platform"
 env = "production"
@@ -140,15 +137,11 @@ env = "production"
 [defaults.annotations]
 "org.wyrd/owner" = "ml-platform"
 
-[kind.Model]
-space = "ml-prod"
-
 [kind.Model.labels]
 domain = "ml"
 env = "ml-prod"
 
 [kind.Policy]
-space = "gov-prod"
 "#;
 
     fn load_fixture() -> WyrdConfig {
@@ -166,7 +159,6 @@ space = "gov-prod"
             name: CardName::new(name).unwrap(),
             version: None,
             bump: None,
-            space: None,
             uid: None,
             labels: BTreeMap::default(),
             annotations: BTreeMap::default(),
@@ -185,16 +177,11 @@ space = "gov-prod"
     }
 
     #[test]
-    fn e2e_model_card_gets_kind_space_and_merged_labels() {
+    fn e2e_model_card_gets_merged_labels() {
         let cfg = load_fixture();
         let mut meta = fresh_meta("churn-classifier");
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-        assert_eq!(
-            meta.space.as_ref().map(SpaceName::as_str),
-            Some("ml-prod"),
-            "kind override space should win over defaults"
-        );
         assert_eq!(
             meta.labels.get(&lk("domain")).map(LabelValue::as_str),
             Some("ml"),
@@ -220,26 +207,11 @@ space = "gov-prod"
     }
 
     #[test]
-    fn e2e_card_space_wins_over_kind_and_defaults() {
-        let cfg = load_fixture();
-        let mut meta = fresh_meta("churn-classifier");
-        meta.space = Some(SpaceName::new("review").unwrap());
-        apply_defaults(&mut meta, &CardKind::Model, &cfg);
-
-        assert_eq!(
-            meta.space.as_ref().map(SpaceName::as_str),
-            Some("review"),
-            "card-level space must not be overwritten"
-        );
-    }
-
-    #[test]
-    fn e2e_policy_card_gets_policy_kind_space() {
+    fn e2e_policy_card_gets_default_labels() {
         let cfg = load_fixture();
         let mut meta = fresh_meta("data-retention");
         apply_defaults(&mut meta, &CardKind::Policy, &cfg);
 
-        assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("gov-prod"),);
         assert_eq!(
             meta.labels.get(&lk("team")).map(LabelValue::as_str),
             Some("platform"),
@@ -253,11 +225,6 @@ space = "gov-prod"
         let mut meta = fresh_meta("embeddings");
         apply_defaults(&mut meta, &CardKind::Data, &cfg);
 
-        assert_eq!(
-            meta.space.as_ref().map(SpaceName::as_str),
-            Some("prod"),
-            "dataset has no kind override so defaults space applies"
-        );
         assert_eq!(
             meta.labels.get(&lk("team")).map(LabelValue::as_str),
             Some("platform"),

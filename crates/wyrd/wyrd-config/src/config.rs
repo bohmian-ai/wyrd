@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::SpaceName;
 use wyrd_spec::metadata::{Annotations, Labels};
 
 use crate::error::WyrdConfigError;
@@ -33,9 +32,6 @@ pub struct WyrdConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
-    /// Default `metadata.space` for any card that omits it.
-    pub space: Option<SpaceName>,
-
     /// Default labels merged per-key into `metadata.labels`.
     #[serde(default)]
     pub labels: Labels,
@@ -52,8 +48,6 @@ pub struct Defaults {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KindOverride {
-    /// Per-kind override for `metadata.space`.
-    pub space: Option<SpaceName>,
     /// Per-kind labels merged per-key into `metadata.labels`.
     #[serde(default)]
     pub labels: Labels,
@@ -178,7 +172,6 @@ mod parse {
 
     use tempfile::NamedTempFile;
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::SpaceName;
 
     use crate::{WyrdConfig, WyrdConfigError};
 
@@ -191,37 +184,32 @@ mod parse {
     #[test]
     fn parse_empty_file_yields_empty_config() {
         let cfg = parse("").unwrap();
-        assert!(cfg.defaults.space.is_none());
+        assert!(cfg.defaults.labels.is_empty());
         assert!(cfg.kind_overrides.is_empty());
     }
 
+    /// Card space is no longer a config default: `[defaults]` and
+    /// `[kind.<Kind>]` refuse it by schema, while label and annotation
+    /// defaults still parse.
     #[test]
-    fn parse_defaults_only() {
-        let cfg = parse("[defaults]\nspace = \"prod\"\n").unwrap();
-        assert_eq!(
-            cfg.defaults.space.as_ref().map(SpaceName::as_str),
-            Some("prod")
-        );
-        assert!(cfg.kind_overrides.is_empty());
-    }
+    fn removed_space_defaults_are_rejected() {
+        for toml in [
+            "[defaults]\nspace = \"prod\"\n",
+            "[kind.Model]\nspace = \"mls\"\n",
+        ] {
+            let err = parse(toml).unwrap_err();
+            assert!(
+                matches!(&err, WyrdConfigError::Schema { message, .. } if message.contains("unknown field `space`")),
+                "got {err:?}"
+            );
+        }
 
-    #[test]
-    fn parse_kind_only() {
-        let cfg = parse("[kind.Model]\nspace = \"mls\"\n").unwrap();
-        assert!(cfg.defaults.space.is_none());
-        let ko = cfg.kind_overrides.get(&CardKind::Model).unwrap();
-        assert_eq!(ko.space.as_ref().map(SpaceName::as_str), Some("mls"));
-    }
-
-    #[test]
-    fn parse_defaults_and_kind() {
-        let toml = "[defaults]\nspace = \"prod\"\n[kind.Model]\nspace = \"mls\"\n";
-        let cfg = parse(toml).unwrap();
-        assert_eq!(
-            cfg.defaults.space.as_ref().map(SpaceName::as_str),
-            Some("prod")
-        );
-        assert!(cfg.kind_overrides.contains_key(&CardKind::Model));
+        let cfg = parse(
+            "[defaults.labels]\nteam = \"ml\"\n[kind.Model.annotations]\n\"acme.com/owner\" = \"risk\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.labels.len(), 1);
+        assert_eq!(cfg.kind_overrides[&CardKind::Model].annotations.len(), 1);
     }
 
     #[test]
@@ -232,13 +220,7 @@ mod parse {
 
     #[test]
     fn parse_typo_default_singular_rejected() {
-        let err = parse("[default]\nspace = \"prod\"\n").unwrap_err();
-        assert!(matches!(err, WyrdConfigError::Schema { .. }), "got {err:?}");
-    }
-
-    #[test]
-    fn parse_invalid_space_value_rejected() {
-        let err = parse("[defaults]\nspace = \"PROD\"\n").unwrap_err();
+        let err = parse("[default.labels]\nteam = \"ml\"\n").unwrap_err();
         assert!(matches!(err, WyrdConfigError::Schema { .. }), "got {err:?}");
     }
 
@@ -250,19 +232,19 @@ mod parse {
 
     #[test]
     fn parse_lowercase_kind_key_rejected() {
-        let err = parse("[kind.model]\nspace = \"ml\"\n").unwrap_err();
+        let err = parse("[kind.model.labels]\nteam = \"ml\"\n").unwrap_err();
         assert!(matches!(err, WyrdConfigError::Schema { .. }), "got {err:?}");
     }
 
     #[test]
     fn parse_unknown_kind_rejected() {
-        let err = parse("[kind.NotAKind]\nspace = \"ml\"\n").unwrap_err();
+        let err = parse("[kind.NotAKind.labels]\nteam = \"ml\"\n").unwrap_err();
         assert!(matches!(err, WyrdConfigError::Schema { .. }), "got {err:?}");
     }
 
     #[test]
     fn parse_external_kind_rejected() {
-        let toml = "[kind.External]\nspace = \"mls\"\n";
+        let toml = "[kind.External.labels]\nteam = \"ml\"\n";
         let err = parse(toml).unwrap_err();
         match &err {
             WyrdConfigError::Schema { message, .. } => {
@@ -306,7 +288,7 @@ mod parse {
 
     #[test]
     fn parse_syntax_error_returns_toml_parse_variant() {
-        let err = parse("[defaults\nspace = \"prod\"\n").unwrap_err();
+        let err = parse("[defaults\nlabels = {}\n").unwrap_err();
         assert!(
             matches!(err, WyrdConfigError::TomlParse { .. }),
             "got {err:?}"

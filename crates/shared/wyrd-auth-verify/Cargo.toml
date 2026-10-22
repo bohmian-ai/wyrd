@@ -19,8 +19,8 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-wyrd-auth-oidc = { path = "../wyrd-auth-oidc", version = "0.2.0" }
-wyrd-spec = { path = "../../wyrd-spec", version = "0.2.0" }
+wyrd-auth-oidc = { path = "../wyrd-auth-oidc", version = "0.3.0" }
+wyrd-spec = { path = "../../wyrd-spec", version = "0.3.0" }
 wyrd-runtime = { workspace = true }
 
 [dev-dependencies]
@@ -29,7 +29,7 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wiremock = { workspace = true }
-wyrd-semver = { path = "../wyrd-semver", version = "0.2.0" }
+wyrd-semver = { path = "../wyrd-semver", version = "0.3.0" }
 wyrd-tls = { workspace = true }
 
 [lints]

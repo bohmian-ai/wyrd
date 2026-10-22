@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-tonic"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Wyrd-owned tonic facade with the client-safe tonic surface."
 license = { workspace = true }

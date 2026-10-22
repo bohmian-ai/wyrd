@@ -71,7 +71,7 @@ Copy the named page when writing a new one of the same shape.
 
 | Shape | Sections | Copy |
 | --- | --- | --- |
-| Landing | One paragraph → one example (its YAML, the program, and its output) → how it fits → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
+| Landing | One paragraph → how it fits (one diagram) → one example (its YAML, the program, and its output) → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
 | Install | What you need (minimum versions table) → install, one command per language in `<LangTabs>` → start or check → `## If it fails` → `## Next` | `get-started/setup.md` |
 | Quickstart or guide | One-sentence goal → numbered `##` steps, each with its files, command, and output → `## If it fails` → `## Next` | `get-started/quickstart.md` |
 | Integration (a guide for one framework or interface, such as ASGI) | What you capture → Before you start → Install → Usage → Verify it worked → `## If it fails` → Advanced → Reference → `## Next`; Advanced and Reference only when needed | `connect/integrate-asgi.md` |

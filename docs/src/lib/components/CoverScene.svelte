@@ -39,6 +39,9 @@
     };
     const TAU = Math.PI * 2;
     const horizon = H * 0.62;
+    // Under 900px the scene is a band below the copy, so it spreads the sun and
+    // orb apart and drops the left fade that darkens the field behind the type.
+    const narrow = matchMedia('(max-width: 900px)').matches;
     const vx = W * 0.62; // vanishing point
 
     // Sky: deep at the top, cobalt haze, a thin amber band at the horizon.
@@ -70,7 +73,7 @@
     }
 
     // The sun: amber to lime, cut by horizontal bands that thicken toward the horizon.
-    const sx = W * 0.78;
+    const sx = W * (narrow ? 0.7 : 0.78);
     const sr = Math.min(W, H) * 0.3;
     const sy = horizon - sr * 0.08;
     ctx.save();
@@ -92,7 +95,8 @@
       const t = i / 9;
       const y = sy - sr * 0.62 + sr * 0.62 * t * t;
       ctx.fillStyle = C.bg;
-      ctx.fillRect(sx - sr, y, sr * 2, 2 + i * 1.6);
+      // Band height scales with the sun, so a small sun keeps its stripes.
+      ctx.fillRect(sx - sr, y, sr * 2, ((2 + i * 1.6) * sr) / 210);
     }
     ctx.beginPath();
     ctx.arc(sx, sy, sr, 0, TAU);
@@ -167,7 +171,7 @@
     ctx.fill();
 
     // The orb: a wireframe sphere above the grid, amber core, lime equator.
-    const ox = W * 0.52;
+    const ox = W * (narrow ? 0.28 : 0.52);
     const oy = H * 0.38;
     const orr = Math.min(W, H) * 0.1;
     ctx.beginPath();
@@ -221,6 +225,12 @@
     ctx.font = `11px ${getComputedStyle(cv).getPropertyValue('--font-mono')}`;
     ctx.letterSpacing = '2px';
     const callout = (x: number, y: number, tx: number, ty: number, label: string): void => {
+      // A label that would run off the right edge points left instead, and
+      // higher, clear of the labels to its left.
+      if (tx > x && tx + 60 + ctx.measureText(label).width > W - 8) {
+        tx = x - (tx - x);
+        ty -= 40;
+      }
       const right = tx > x;
       ctx.strokeStyle = rgba(C.cream, 0.8);
       ctx.lineWidth = 1;
@@ -243,12 +253,14 @@
     callout(ox + orr * 1.4, horizon + (H - horizon) * 0.5, ox + orr * 2.2, horizon + (H - horizon) * 0.72, 'EVIDENCE');
 
     // Left fade so the type sits on a dark field; grain on top.
-    const fade = ctx.createLinearGradient(0, 0, W * 0.55, 0);
-    fade.addColorStop(0, rgba(C.bg, 0.94));
-    fade.addColorStop(0.6, rgba(C.bg, 0.6));
-    fade.addColorStop(1, rgba(C.bg, 0));
-    ctx.fillStyle = fade;
-    ctx.fillRect(0, 0, W * 0.55, H);
+    if (!narrow) {
+      const fade = ctx.createLinearGradient(0, 0, W * 0.55, 0);
+      fade.addColorStop(0, rgba(C.bg, 0.94));
+      fade.addColorStop(0.6, rgba(C.bg, 0.6));
+      fade.addColorStop(1, rgba(C.bg, 0));
+      ctx.fillStyle = fade;
+      ctx.fillRect(0, 0, W * 0.55, H);
+    }
     const g = document.createElement('canvas');
     g.width = g.height = 160;
     const gc = g.getContext('2d');

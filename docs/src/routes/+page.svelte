@@ -14,7 +14,7 @@
   // Landing: the painted cover and value statement, the Declare → Observe →
   // Verify strip, the platform summary, then one door per published section.
   // Every internal action resolves through published content, so a section or
-  // the quickstart appears here only once its page exists.
+  // a start page appears here only once its page exists.
   const GITHUB_URL = 'https://github.com/bohmian-ai/wyrd';
   const DOORS: Record<Section, { blurb: string; kicker: string }> = {
     'Get started': { blurb: 'Learn what Wyrd verifies and set up a local server.', kicker: 'Start' },
@@ -26,8 +26,8 @@
   };
   const doors = navGroups().map((group) => ({ label: group.label, path: group.items[0].path, ...DOORS[group.label] }));
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];
-  // The CTA opens the quickstart once it is published, else the first Get started page.
-  const start = startPages.find((item) => item.path === '/get-started/quickstart/') ?? firstPage('Get started');
+  // The CTA opens setup, the first step a reader can complete, else the first Get started page.
+  const start = startPages.find((item) => item.path === '/get-started/setup/') ?? firstPage('Get started');
   const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
 </script>
 

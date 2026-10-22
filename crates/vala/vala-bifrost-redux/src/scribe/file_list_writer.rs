@@ -460,13 +460,19 @@ fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError
 /// Atomically publishes a complete writer-v2 artifact set under one actor fence.
 ///
 /// Either every contiguous row commits, or none do. Replays succeed only when
-/// every ordered identity matches exactly. Publication is an engine-internal
-/// generation transition that evaluates no principal permission, so `vala.file_list`
-/// is its whole lineage record and no audit event is appended.
+/// every ordered identity matches exactly. The outcome carries the producer
+/// node's table revision; an exact replay of a set committed before revision
+/// tracking existed finds no revision row and reports revision 0, while a
+/// fresh insert must find the row its trigger advanced.
+///
+/// Publication is an engine-internal generation transition that evaluates no
+/// principal permission, so `vala.file_list` is its whole lineage record and no
+/// audit event is appended.
 ///
 /// # Errors
 /// Returns a SQL invariant error for an empty/noncontiguous/mixed replay set,
-/// a stale actor fence, identity mismatch, or commit failure.
+/// a stale actor fence, identity mismatch, or a fresh insert without a
+/// publication revision, and the SQL error for a failed read or commit.
 pub async fn insert_artifact_set_fenced(
     operator_pool: &OperatorPool,
     actor: StreamIdentity,
@@ -550,7 +556,7 @@ pub async fn insert_artifact_set_fenced(
             detail: "writer-v2 replay identity does not match the complete artifact set".to_owned(),
         });
     }
-    let publication_revision: i64 = sqlx::query_scalar(
+    let publication_revision: Option<i64> = sqlx::query_scalar(
         "SELECT publication_revision FROM vala.bifrost_table_publication_revisions \
          WHERE data_tenant_id=$1 AND namespace_name=$2 AND table_name=$3 AND node_id=$4",
     )
@@ -558,9 +564,20 @@ pub async fn insert_artifact_set_fenced(
     .bind(&first.namespace)
     .bind(&first.table_name)
     .bind(first.node_id)
-    .fetch_one(&mut *transaction)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(SqlError::from)?;
+    // A fresh insert's trigger always creates the row. Only an exact replay of
+    // a set committed before revision tracking finds none, which is revision 0.
+    let publication_revision = match (publication_revision, inserted) {
+        (Some(revision), _) => revision,
+        (None, 0) => 0,
+        (None, _) => {
+            return Err(SqlError::InvariantViolation {
+                detail: "writer-v2 publication committed without a publication revision".to_owned(),
+            });
+        }
+    };
     transaction.commit().await.map_err(SqlError::from)?;
     artifact_set_outcome(first, rows, inserted, publication_revision)
 }

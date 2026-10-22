@@ -437,6 +437,14 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
     }
 }
 
+/// Proves retained-capture cleanup settles by the query deadline.
+///
+/// A real mutually authenticated loopback Scribe, issued by the test peer CA,
+/// accepts every `release_capture` call and never answers it. Admission then
+/// fails after one capture was retained, and its cleanup release, like the
+/// release when live routes drop, must still return by the original query
+/// deadline. The Scribe's counter shows each release reached the peer, and the
+/// unanswered capture is left to its own expiry there.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

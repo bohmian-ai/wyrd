@@ -9,8 +9,9 @@ metadata:
 spec:
   description: A support answer never promises a guaranteed refund.
   inputs:
-    answer: {type: json}
-  requirements:
+    answer: {type: json}  # a named slot your code fills; json takes any JSON value
+  requirements:  # each requirement gets its own verdict
     - id: no-refund-promise
-      statement: The answer never promises a guaranteed refund
+      statement: The answer never promises a guaranteed refund  # shown in results
+      # compare the value at path with expected; no model runs
       check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}

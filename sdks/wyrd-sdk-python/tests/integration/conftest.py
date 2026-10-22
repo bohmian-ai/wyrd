@@ -105,7 +105,6 @@ INVESTIGATE = {
                         "kind": "Service",
                         "name": "policy-desk",
                         "version": "1.0.0",
-                        "space": "default",
                     }
                 },
             ),
@@ -404,9 +403,7 @@ def watching(
         if fitted:
             server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
-        key = cli.issue_key(
-            kind="Service", name=service, version="1.0.0", space="default", client=admin
-        ).key
+        key = cli.issue_key(kind="Service", name=service, version="1.0.0", client=admin).key
         state = WyrdState.from_path(pull(cards, service, tmp_path), client_of(server, key))
         state.start_bifrost()
         [binding_id] = binding_ids(cards, root)

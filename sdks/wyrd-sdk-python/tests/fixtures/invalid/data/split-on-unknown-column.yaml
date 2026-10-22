@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Data
 metadata:
-  space: default
   name: split-on-unknown-column
   version: 1.0.0
 spec:
@@ -35,7 +34,6 @@ spec:
           kind: Artifact
           name: churn-test-rows
           version: 1.0.0
-          space: default
   target_columns:
   - churned
   stats:

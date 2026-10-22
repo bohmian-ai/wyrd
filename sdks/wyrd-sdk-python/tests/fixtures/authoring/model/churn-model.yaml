@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Model
 metadata:
-  space: prod
   name: churn-model
   version: 1.0.0
   uid: 01920000-0000-7000-8000-000000000003

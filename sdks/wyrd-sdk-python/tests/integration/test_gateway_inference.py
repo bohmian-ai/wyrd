@@ -136,9 +136,7 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
     card_uid = str(declare(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid)
-    issued = cli.issue_key(
-        kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
-    )
+    issued = cli.issue_key(kind="Agent", name="ask-agent", version="1.0.0", client=admin)
     agent = openai_client(client_of(server, issued.key))
 
     for headers in ({"wyrd-run-id": "run-alone"}, {"wyrd-card-uid": card_uid}):
@@ -176,9 +174,7 @@ def test_caller_without_gateway_invoke_is_refused(
 def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
     admin: WyrdClient, ask: CardRef
 ) -> None:
-    issued = cli.issue_key(
-        kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
-    )
+    issued = cli.issue_key(kind="Agent", name="ask-agent", version="1.0.0", client=admin)
     view = cli.put_provider_credential(
         {
             "name": "managed-openai-key",
@@ -188,7 +184,7 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
         client=admin,
     )
 
-    assert str(issued.card_ref) == "default/Agent/ask-agent@1.0.0"
+    assert str(issued.card_ref) == "Agent/ask-agent@1.0.0"
     assert issued.key.startswith(issued.prefix)
     assert (view["name"], view["provider"], view["state"]) == (
         "managed-openai-key",
@@ -205,9 +201,7 @@ def test_agent_prompt_routes(
     deploy(server, "openai", name="openai-granted", access="granted")
     declare(Cards(admin), "cards/gateway_inference/ask-service.yaml")
     bundle = pull(Cards(admin), "ask-service", tmp_path)
-    key = cli.issue_key(
-        kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
-    )
+    key = cli.issue_key(kind="Service", name="ask-service", version="1.0.0", client=admin)
     caller = client_of(server, key.key)
     state = WyrdState.from_path(bundle, caller)
 

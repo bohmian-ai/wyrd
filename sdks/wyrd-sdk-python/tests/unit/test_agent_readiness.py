@@ -44,7 +44,7 @@ def judged(
 def complete(**overrides: object) -> Evidence:
     """Evidence holding every milestone, with ``overrides`` replacing fields."""
     evidence = Evidence(
-        service="default/Service/app@1.0.0",
+        service="Service/app@1.0.0",
         kinds=GRAPH,
         telemetry_runs=["r1"],
         custom_runs={"events": ["r1"]},

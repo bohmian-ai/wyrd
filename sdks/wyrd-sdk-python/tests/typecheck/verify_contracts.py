@@ -44,7 +44,7 @@ def the_actual_status_shape_is_accepted() -> ExecutionState:
         "result": {
             "execution_id": "0190b2a4-0000-7000-8000-000000000000",
             "verifier": {"kind": "Verifier", "name": "policy-review", "version": "1.0.0"},
-            "subject": {"kind": "Agent", "name": "desk", "version": "1.0.0", "space": "s"},
+            "subject": {"kind": "Agent", "name": "desk", "version": "1.0.0"},
             "outcome": {
                 "verdict": "passed",
                 "requirements": [

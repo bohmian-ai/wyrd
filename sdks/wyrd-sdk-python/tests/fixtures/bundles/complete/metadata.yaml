@@ -4,7 +4,6 @@ root:
   kind: Service
   name: service
   version: 1.0.0
-  space: default
   uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01
 cards:
 - aliases:
@@ -14,7 +13,6 @@ cards:
     kind: Model
     name: model
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
   card_path: cards/model/card.yaml
   relationships_path: cards/model/relationships.yaml
@@ -31,7 +29,6 @@ cards:
     kind: Model
     name: backup
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03
   card_path: cards/backup/card.yaml
   relationships_path: cards/backup/relationships.yaml
@@ -48,7 +45,6 @@ cards:
     kind: Data
     name: training
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
   card_path: cards/training/card.yaml
   relationships_path: cards/training/relationships.yaml
@@ -65,7 +61,6 @@ cards:
     kind: Prompt
     name: triage
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
   card_path: cards/triage/card.yaml
   relationships_path: cards/triage/relationships.yaml
@@ -77,7 +72,6 @@ cards:
     kind: Agent
     name: triage
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b06
   card_path: cards/triage_agent/card.yaml
   relationships_path: cards/triage_agent/relationships.yaml
@@ -89,7 +83,6 @@ cards:
     kind: Agent
     name: inline
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
   card_path: cards/inline_agent/card.yaml
   relationships_path: cards/inline_agent/relationships.yaml
@@ -101,7 +94,6 @@ cards:
     kind: Verifier
     name: ok-check
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
   card_path: cards/ok_check/card.yaml
   relationships_path: cards/ok_check/relationships.yaml
@@ -113,7 +105,6 @@ cards:
     kind: Service
     name: service
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01
   card_path: cards/service/card.yaml
   relationships_path: cards/service/relationships.yaml

@@ -43,12 +43,57 @@ def test_service_graph_declares_and_pulls(
 def test_latest_version_resolves_to_the_registered_card(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
-    assert (
-        cards.resolve_latest("Service", "default", "support-desk") == support_desk["support-desk"]
-    )
+    assert cards.resolve_latest("Service", "support-desk") == support_desk["support-desk"]
     with pytest.raises(WyrdError) as refused:
-        cards.resolve_latest("Service", "default", "never-registered")
+        cards.resolve_latest("Service", "never-registered")
     assert refused.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+
+SPACED_SERVICE = """\
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: spaced-desk
+  version: 1.0.0{metadata_space}
+spec:
+  service_type: agent
+  components:
+    - alias: model
+      ref:
+        kind: Model
+        name: support-model
+        version: 1.0.0{ref_space}
+"""
+
+
+def test_flat_card_identity_round_trip(
+    cards: Cards, support_desk: dict[str, CardRef], tmp_path: Path
+) -> None:
+    """A Card is named by kind, name, and version alone; a ``space`` anywhere is refused."""
+    desk = support_desk["support-desk"]
+
+    read = cards.get(CardRef("Service", "support-desk", "1.0.0"))
+    pulled = cards.pull(CardRef("Service", "support-desk", "1.0.0"), tmp_path / "bundle")
+    prompt = cards.prompt.get(name="support-prompt", version=support_desk["support-prompt"].version)
+
+    assert read.card_ref == pulled.root == desk
+    assert "space" not in read.metadata
+    assert prompt.as_card_ref() == support_desk["support-prompt"]
+    assert str(desk) == f"Service/support-desk@1.0.0#{desk.uid}"
+    with pytest.raises(TypeError, match="space"):
+        CardRef("Service", "support-desk", "1.0.0", space="default")  # ty: ignore[unknown-argument]
+    with pytest.raises(TypeError, match="space"):
+        cards.prompt.get(space="default", name="support-prompt")  # ty: ignore[unknown-argument]
+    for spaced in (
+        SPACED_SERVICE.format(metadata_space="\n  space: default", ref_space=""),
+        SPACED_SERVICE.format(metadata_space="", ref_space="\n        space: default"),
+    ):
+        path = tmp_path / "spaced-desk.yaml"
+        path.write_text(spaced)
+        with pytest.raises(WyrdError) as refused:
+            cards.declare_from_path(path)
+        assert refused.value.status == 400
+        assert "space" in f"{refused.value} {refused.value.details}"
 
 
 def test_registering_the_graph_again_is_idempotent(
@@ -139,14 +184,11 @@ def test_cli_declare_get_and_pull_round_trip_the_graph(
     client = WyrdClient(credential=wyrd_server.api_key)
     declared = cli.declare(FIXTURES / SUPPORT_DESK, client=client)
 
-    envelope = cli.get(
-        kind="Service", space="default", name="support-desk", version="1.0.0", client=client
-    )
+    envelope = cli.get(kind="Service", name="support-desk", version="1.0.0", client=client)
     assert not any(tmp_path.iterdir())
     summary = cli.pull(
         output_dir=tmp_path,
         kind="Service",
-        space="default",
         name="support-desk",
         version="1.0.0",
         client=client,
@@ -162,13 +204,12 @@ def test_cli_declare_get_and_pull_round_trip_the_graph(
 
 def test_refused_cli_command_raises_its_catalog_code(tmp_path: Path) -> None:
     with pytest.raises(WyrdError) as refused:
-        cli.get(kind="Service", space="default", name="no-such-service", version="1.0.0")
+        cli.get(kind="Service", name="no-such-service", version="1.0.0")
     assert refused.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
     with pytest.raises(WyrdError) as refused_pull:
         cli.pull(
             output_dir=tmp_path,
             kind="Service",
-            space="default",
             name="no-such-service",
             version="1.0.0",
         )

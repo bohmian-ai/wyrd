@@ -38,13 +38,12 @@ class RoleAssignmentChange(TypedDict):
 class _PrincipalCardRefOptional(TypedDict, total=False):
     """Optional fields of ``PrincipalCardRef``."""
 
-    space: str
     uid: str
 
 class PrincipalCardRef(_PrincipalCardRefOptional):
     """The Card a Card-bound Service or Agent principal is bound to.
 
-    The same reference shape Card operations accept; ``space`` and ``uid`` are
+    The same reference shape Card operations accept; ``uid`` is
     omitted when the server reports none.
     """
 

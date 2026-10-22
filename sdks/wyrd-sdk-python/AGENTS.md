@@ -41,12 +41,11 @@ behavior.
 
 ```rust
 #[new]
-#[pyo3(signature = (kind, name, version, *, space, uid=None))]
+#[pyo3(signature = (kind, name, version, *, uid=None))]
 fn __new__(
     kind: &Bound<'_, PyAny>,
     name: &str,
     version: &str,
-    space: &str,
     uid: Option<&str>,
 ) -> WyrdPyResult<Self> {
     let parsed_kind = parse_kind_input(kind)?;

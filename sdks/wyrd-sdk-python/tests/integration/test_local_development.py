@@ -831,7 +831,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
                     *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
-                    *("--version", "1.0.0", "--space", "default"),
+                    *("--version", "1.0.0"),
                     *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
                 )
                 assert issued.returncode == 0, issued.stderr
@@ -858,7 +858,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert applied.returncode == 0, applied.stderr
                 got = wyrd(
                     *("pull", "--kind", "Service", "--name", "gateway-agents"),
-                    *("--version", "1.0.0", "--space", "default", "--output-dir", "gateway-agents"),
+                    *("--version", "1.0.0", "--output-dir", "gateway-agents"),
                 )
                 assert got.returncode == 0, got.stderr
                 agent_env = {
@@ -1241,7 +1241,7 @@ QUICKSTART_RUNNERS = {
 """Language → the command a reader runs in a directory holding the Quickstart files."""
 
 
-GET_SERVICE = "wyrd get --space default --kind Service --name support-reply --version 1.0.0"
+GET_SERVICE = "wyrd get --kind Service --name support-reply --version 1.0.0"
 """The Quickstart's published command that reads the Service, whose ``metadata.uid`` the query needs."""
 
 QUERY_VERDICTS = "wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql"

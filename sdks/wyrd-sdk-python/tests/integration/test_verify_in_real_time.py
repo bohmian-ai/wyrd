@@ -70,9 +70,7 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
 
 def principal(service: str = "assistant") -> str:
     """The ``service`` principal id; ``assistant``'s is the one most judgments here are requested as."""
-    return cli.issue_key(
-        kind="Service", name=service, version="1.0.0", space="default"
-    ).principal_id
+    return cli.issue_key(kind="Service", name=service, version="1.0.0").principal_id
 
 
 def result_with_its_judge_calls(
@@ -763,7 +761,7 @@ def test_grouped_coding_uses_declared_sources(
         assert refused.value.code == code, name
         assert reason in f"{refused.value} {refused.value.details}", name
         with pytest.raises(WyrdError) as absent:
-            cards.resolve_latest(kind, "default", name)
+            cards.resolve_latest(kind, name)
         assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND", name
     declare(cards, "cards/verify_in_real_time/coding-external.yaml")
 
@@ -944,9 +942,7 @@ def test_grouped_conversations_coexist_with_drift(
     )
     b_cards = Cards(tenant_b)
     declare(b_cards, "cards/verify_in_real_time/support.yaml")
-    b_key = cli.issue_key(
-        kind="Service", name="support", version="1.0.0", space="default", client=tenant_b
-    ).key
+    b_key = cli.issue_key(kind="Service", name="support", version="1.0.0", client=tenant_b).key
     b_state = WyrdState.from_path(
         pull(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
     )

@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Data
 metadata:
-  space: prod
   name: missing-default-query
   version: 1.0.0
 spec:

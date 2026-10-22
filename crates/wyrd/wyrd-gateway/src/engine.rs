@@ -1,17 +1,19 @@
 //! Bounded attempt execution over an admitted call plan.
 //!
-//! [`GatewayEngine::execute`] walks candidates in plan order, skipping a
-//! candidate whose deployment this replica recently saw fail. Every attempt
+//! [`GatewayEngine::execute`] walks candidates in plan order, moving a
+//! candidate whose deployment is cooling down on this replica behind the
+//! healthy ones without ever skipping it. Every attempt
 //! resolves its credential first and drops the plaintext when the attempt
 //! ends. The caller deadline and
 //! cancellation bound the whole call, including credential work.
 //!
 //! Retry and fallback rules:
 //!
-//! - a failure before dispatch (credential or connection) moves on and marks
-//!   the deployment unhealthy;
+//! - a failure before dispatch (credential or connection) moves on and counts
+//!   toward the deployment's breaker;
 //! - an upstream failure after dispatch moves on only for idempotent
-//!   operations, and marks the deployment unhealthy;
+//!   operations, and counts toward the deployment's breaker;
+//! - a completed attempt resets the deployment's breaker;
 //! - a rejection of the request or a failure after visible output ends the
 //!   call without another attempt.
 
@@ -558,8 +560,9 @@ impl GatewayEngine {
 
     /// Executes an admitted call and returns its attempt evidence.
     ///
-    /// Never fails: every terminal path, including an empty or wholly
-    /// unhealthy plan, deadline expiry, and cancellation, is an outcome.
+    /// Never fails: every terminal path, including an empty plan, deadline
+    /// expiry, and cancellation, is an outcome. A plan whose deployments are
+    /// all cooling down is still attempted in plan order.
     /// A cancelled or timed-out in-flight attempt is recorded with unknown
     /// usage and is billable only if dispatch had begun. A failed call whose
     /// last attempt the provider refused carries that refusal.
@@ -581,6 +584,10 @@ impl GatewayEngine {
 
     /// Walks the plan's candidates as [`Self::execute`] describes, folding
     /// each attempt's timing into `timing`.
+    ///
+    /// Healthy candidates run first in plan order, then cooling ones in plan
+    /// order, so a breaker only reorders attempts and each candidate runs at
+    /// most once.
     async fn walk(&self, input: &CallInput<'_>, timing: &mut ExecutionTiming) -> CallExecution {
         let mut attempts: Vec<AttemptRecord> = Vec::new();
         let mut refusal = None;
@@ -590,11 +597,13 @@ impl GatewayEngine {
                 | GatewayOperation::Responses
                 | GatewayOperation::Embeddings
         );
-        for candidate in &input.plan.candidates {
+        let (healthy, cooling): (Vec<_>, Vec<_>) =
+            input.plan.candidates.iter().partition(|candidate| {
+                self.health
+                    .is_healthy(input.tenant, &candidate.deployment.name)
+            });
+        for candidate in healthy.into_iter().chain(cooling) {
             let deployment = &candidate.deployment;
-            if !self.health.is_healthy(input.tenant, &deployment.name) {
-                continue;
-            }
             if Instant::now() >= input.deadline {
                 return finish(GatewayCallOutcome::TimedOut, attempts, None, None, None);
             }
@@ -643,6 +652,7 @@ impl GatewayEngine {
                     if !body.is_stream() {
                         span.record("outcome", outcome_name(GatewayCallOutcome::Succeeded));
                     }
+                    self.health.record_success(input.tenant, &deployment.name);
                     attempts.push(record(GatewayCallOutcome::Succeeded, true, usage));
                     return finish(
                         GatewayCallOutcome::Succeeded,
@@ -746,7 +756,8 @@ impl GatewayEngine {
         result
     }
 
-    /// Applies health and retry rules to one failed attempt.
+    /// Counts one failed attempt toward its deployment's breaker and applies
+    /// the retry rules.
     fn after_failure(
         &self,
         tenant: DataTenantId,
@@ -756,11 +767,11 @@ impl GatewayEngine {
     ) -> Next {
         match class {
             FailureClass::BeforeDispatch => {
-                self.health.mark_unhealthy(tenant, &deployment.name);
+                self.health.record_failure(tenant, &deployment.name);
                 Next::Continue
             }
             FailureClass::Upstream => {
-                self.health.mark_unhealthy(tenant, &deployment.name);
+                self.health.record_failure(tenant, &deployment.name);
                 if retry_safe {
                     Next::Continue
                 } else {
@@ -1030,6 +1041,15 @@ mod tests {
         )
     }
 
+    /// Engine over `dispatch` whose breaker trips on the first failure.
+    fn tripping_engine(dispatch: Arc<Recording>) -> GatewayEngine {
+        GatewayEngine::new(
+            CredentialResolver::default(),
+            DeploymentHealth::new(1, Duration::from_secs(30)),
+            dispatch,
+        )
+    }
+
     /// Runs `operation` for `dep-a1/a` against `snap`.
     ///
     /// # Panics
@@ -1076,14 +1096,15 @@ mod tests {
     }
 
     /// Upstream failures of an idempotent call move through deployments and
-    /// then cross to the fallback model with its resolved credential; the
-    /// failed deployment is avoided by the next call.
+    /// then cross to the fallback model with its resolved credential; one
+    /// failure below the breaker threshold leaves the deployment first in
+    /// plan order for the next call.
     ///
     /// # Panics
     /// Panics when the engine dispatches another sequence of attempts or
     /// returns another outcome.
     #[tokio::test]
-    async fn idempotent_failures_fall_back_and_avoid_unhealthy_deployments() {
+    async fn idempotent_failures_fall_back_and_one_failure_keeps_plan_order() {
         let snap = snapshot();
         let dispatch = Recording::new(vec![
             Some(failed(FailureClass::Upstream)),
@@ -1125,7 +1146,68 @@ mod tests {
         .await;
         assert_eq!(
             attempt_outcomes(&second),
-            [("dep-b1".to_owned(), GatewayCallOutcome::Succeeded, true)]
+            [("dep-a1".to_owned(), GatewayCallOutcome::Succeeded, true)]
+        );
+    }
+
+    /// A tripped deployment moves behind healthy candidates, and a plan whose
+    /// deployments are all cooling down is still attempted in plan order
+    /// rather than refused.
+    ///
+    /// # Panics
+    /// Panics when a cooling deployment is skipped or tried before a healthy
+    /// one, or the call does not succeed.
+    #[tokio::test]
+    async fn cooling_deployments_move_last_and_are_never_skipped() {
+        let snap = snapshot();
+        let dispatch = Recording::new(vec![
+            Some(failed(FailureClass::Upstream)),
+            Some(completed()),
+            Some(completed()),
+            Some(failed(FailureClass::Upstream)),
+            Some(failed(FailureClass::Upstream)),
+            Some(failed(FailureClass::Upstream)),
+            Some(completed()),
+        ]);
+        let engine = tripping_engine(Arc::clone(&dispatch));
+        let cancel = CancellationToken::new();
+        for _ in 0..2 {
+            let execution = run(
+                &engine,
+                &snap,
+                GatewayOperation::ChatCompletions,
+                Duration::from_secs(5),
+                &cancel,
+            )
+            .await;
+            assert_eq!(execution.outcome, GatewayCallOutcome::Succeeded);
+        }
+        assert_eq!(
+            dispatch.deployments(),
+            ["dep-a1", "dep-a2", "dep-a2"],
+            "the tripped dep-a1 moves behind dep-a2"
+        );
+        let both_tripped = run(
+            &engine,
+            &snap,
+            GatewayOperation::ChatCompletions,
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .await;
+        assert_eq!(both_tripped.outcome, GatewayCallOutcome::Failed);
+        let cooling = run(
+            &engine,
+            &snap,
+            GatewayOperation::ChatCompletions,
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            attempt_outcomes(&cooling),
+            [("dep-a1".to_owned(), GatewayCallOutcome::Succeeded, true)],
+            "every deployment cooling is still attempted in plan order"
         );
     }
 

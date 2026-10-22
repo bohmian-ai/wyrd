@@ -547,7 +547,7 @@ jobs:
 
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust protoc cmake node pnpm
+          install_args: rust protoc cmake node npm:pnpm
           cache: true
 
       - uses: Swatinem/rust-cache@v2

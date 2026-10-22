@@ -105,6 +105,15 @@ jobs:
           # azure/login and the tests' credential both shell out to `az`.
           large-packages: "false"
 
+      # Azure accepts the GitHub OIDC assertion azure/login hands `az` for only
+      # five minutes, and `az` presents it again for the first storage token,
+      # so every test binary is built before login.
+      - name: Build Azure cloud test binaries
+        run: |
+          mise exec -- cargo nextest run --no-run --locked -p wyrd-sql --test integration
+          mise exec -- cargo nextest run --no-run -p wyrd-storage --features emulator --test integration
+          mise exec -- cargo nextest run --no-run -p wyrd-server --features storage-emulator --test integration
+
       - name: Authenticate to Azure (OIDC)
         uses: azure/login@v3
         with:

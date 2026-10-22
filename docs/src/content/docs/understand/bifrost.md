@@ -35,7 +35,7 @@ Inside a running service, `run.observe.*` writes rows tied to the run and the ex
 
 A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read the recent unpublished rows each Scribe still holds, and a row published while the query runs is returned exactly once.
 
-Every query ends with a status: `success`, `degraded` when an unreachable Scribe's recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/api/errors/).
+Every query ends with a status: `success`; `degraded` when a Scribe could not be reached as the query listed its sources, so that Scribe's recent rows may be missing; or `failed`, which includes losing a Scribe after the query has read its recent rows. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/api/errors/).
 
 ## Next
 

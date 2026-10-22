@@ -363,8 +363,9 @@ bounded Arrow results to Oracle, producing each batch only when Oracle pulls
 it. The scan's memtable references, staged-run leases, and follower admission
 belong to that stream and are released when it completes, is cancelled, or is
 dropped; the query deadline is its only timeout. An unavailable Scribe missing before
-discovery is outside the known live set. A known live source lost before rows
-degrades the result; loss after rows fails the query. Published-source,
+discovery is outside the known live set. A known Scribe that cannot be listed
+degrades the result. Losing a Scribe after its capture was accepted fails the
+query, even before its first row. Published-source,
 security, tenant, schema, resource, cancellation, and deadline failures fail.
 
 All callers, including Verifiers, use this same query service and source
@@ -491,6 +492,16 @@ SLICE record, appends each complete batch's COMMIT record, and makes both
 durable with one sync over every segment the cycle touched before it records
 the batch fences. No request is acknowledged before that sync and its fence
 commit.
+
+An honest retry of a batch that is already fenced and visible is the one
+exception: its data was synced by the earlier attempt, so re-queueing it would
+only make it wait behind fresh writes' syncs before the fence suppressed it.
+After preprocessing, Scribe compares the request with a bounded pod-local index
+of batches its shards fenced and made visible. When the tenant, batch id,
+logical table, logical slice-set digest, and slice count all match, the request
+is acknowledged at once with no first commit and nothing is rewritten. A miss,
+an evicted entry, or any mismatch takes the shard path, where the durable fence
+remains the only authority for first commits and identity contradictions.
 
 Each write request carries one profile in the Oracle query-profile pattern,
 emitted once when the request settles as
@@ -969,7 +980,7 @@ Scribe as a `vala.system.audit_log` row in a per-tenant batch, like every other
 audit event. Rows are not held for that write; a retryable failure is logged,
 counted through `outbox_write_failures_total{outbox="scribe"}`, and retried with
 the identical batch, and a terminal rejection is logged, counted through
-`outbox_events_lost_total{outbox="scribe"}`, and consumed. The
+`outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and consumed. The
 `outbox_pending{outbox="scribe"}` gauge reports writes the process still owns
 before Scribe acknowledges them or their loss is counted, and shutdown drains
 the outbox to its deadline. One logical query produces one read-audit event; distributed stages

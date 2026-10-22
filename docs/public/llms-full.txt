@@ -1126,7 +1126,7 @@ Inside a running service, `run.observe.*` writes rows tied to the run and the ex
 
 A row is stored once a Scribe acknowledges it, which is what `flush` and `shutdown` wait for. It becomes queryable when it is published, shortly after. Queries also read the recent unpublished rows each Scribe still holds, and a row published while the query runs is returned exactly once.
 
-Every query ends with a status: `success`, `degraded` when an unreachable Scribe's recent rows may be missing, or `failed`. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/wyrd/api/errors/).
+Every query ends with a status: `success`; `degraded` when a Scribe could not be reached as the query listed its sources, so that Scribe's recent rows may be missing; or `failed`, which includes losing a Scribe after the query has read its recent rows. The SDKs raise an error on `failed`. Query errors are listed in [Errors](/wyrd/api/errors/).
 
 ## Next
 
@@ -1679,7 +1679,7 @@ Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / M
 | Limit reached | Result |
 | --- | --- |
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
-| Verification staging past three quarters of `scribe.outbox_capacity` | `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After` |
+| The server's verification staging is full (`scribe.outbox_capacity` or `scribe.outbox_bytes`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
 | No Python worker or workspace free | Direct call: `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. Queued: stays queued, attempt not counted |
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |

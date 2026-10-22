@@ -139,6 +139,7 @@ async fn pending_card_and_manifest_share_registration_transaction() {
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
             artifact_hash: Some("artifact-hash"),
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -312,6 +313,7 @@ async fn subject_actor_creation_and_replay() {
             status: CardStatus::Active,
             spec_hash: "spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -391,6 +393,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
             status: CardStatus::Pending,
             spec_hash: "reconcile-bounded-spec",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -596,6 +599,7 @@ async fn manifest_upload_liveness_is_decided_by_postgres() {
             status: CardStatus::Pending,
             spec_hash: "manifest-liveness-spec",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -724,6 +728,7 @@ async fn relationship_rows_preserve_exact_target_identity() {
             status: CardStatus::Active,
             spec_hash: "target-spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -738,6 +743,7 @@ async fn relationship_rows_preserve_exact_target_identity() {
             status: CardStatus::Pending,
             spec_hash: "source-spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -828,6 +834,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
             status: CardStatus::Active,
             spec_hash: "race-target-spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -842,6 +849,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
             status: CardStatus::Pending,
             spec_hash: "race-source-spec-hash",
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -1011,6 +1019,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
             status: CardStatus::Active,
             spec_hash: target_spec_hash.as_str(),
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await
@@ -1025,6 +1034,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
             status: CardStatus::Active,
             spec_hash: source_spec_hash.as_str(),
             artifact_hash: None,
+            reconcile_delay: std::time::Duration::ZERO,
         },
     )
     .await

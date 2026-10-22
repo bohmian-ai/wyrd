@@ -39,7 +39,8 @@ pub type GatewayCaptureError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The captured gateway calls and the JSON the resolved one sent and received.
 pub struct CapturedCall {
-    /// Request id the gateway answered with, which the captured row carries.
+    /// Request id the gateway answered with, which the captured row carries
+    /// in its payload `request_id` column.
     pub request_id: String,
     /// Request id of a second call the upstream refused, so its captured row
     /// has no resolved model.

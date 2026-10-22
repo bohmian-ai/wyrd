@@ -109,9 +109,11 @@ export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform:${platform_password}
 # Journey and e2e lanes boot one WyrdTestServer per test, each retaining an
 # app pool sized for a production server (PoolConfig::app_defaults, 32). A test
 # fixture never needs that, and the per-server cost is what caps how many tests
-# can run at once against one Postgres. Cap the app pool here; the migration and
-# platform-admin pools are already 2 and read their own suffixed vars.
+# can run at once against one Postgres. Cap the app pool and the Vala runtime
+# pool (vala_pool_config, 16) here; the migration and platform-admin pools are
+# already 2 and read their own suffixed vars.
 export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
+export WYRD_DB_MAX_CONNECTIONS_VALA="${WYRD_DB_MAX_CONNECTIONS_VALA:-8}"
 
 # Use the container's own psql so the client always matches the server.
 {

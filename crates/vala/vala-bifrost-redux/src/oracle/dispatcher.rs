@@ -1779,11 +1779,11 @@ fn execution_status_error(status: &Status) -> DispatchError {
 
 /// Classifies a live Scribe fragment's open refusal.
 ///
-/// Live coverage is best effort, so a Scribe that answers `Unavailable` is an
-/// availability loss the caller may degrade before any row — unlike a
-/// published worker, which fails closed. A capacity refusal is a resource
-/// fault and never becomes a live omission. Every other code keeps the
-/// published classification.
+/// A Scribe that answers `Unavailable` classifies as an availability loss and
+/// a capacity refusal as a resource fault; every other code keeps the
+/// published classification. The fragment's capture was already accepted, so
+/// its caller fails the execution on any of them, even before the first row;
+/// only a failed listing degrades the result.
 fn live_execution_status_error(status: &Status) -> DispatchError {
     match status.code() {
         wyrd_tonic::tonic::Code::Unavailable => DispatchError::Unavailable,

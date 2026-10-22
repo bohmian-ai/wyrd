@@ -15,8 +15,9 @@
 //! resources); and any extra environment a benchmark names.
 //! A further replica joins the same Postgres and store on its own ports, as
 //! the configuration guide's peer mode describes.
-//! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` cap is removed, so
-//! the pool runs at the server's default. Every other setting is the server's
+//! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` and
+//! `WYRD_DB_MAX_CONNECTIONS_VALA` caps are removed, so
+//! the pools run at the server's defaults. Every other setting is the server's
 //! default.
 
 use std::collections::BTreeMap;
@@ -906,6 +907,7 @@ fn operator(
         .current_dir(workdir)
         .env("WYRD_STORAGE_URL", storage_url)
         .env_remove("WYRD_DB_MAX_CONNECTIONS")
+        .env_remove("WYRD_DB_MAX_CONNECTIONS_VALA")
         .envs(env.iter().copied());
     if ordinal > 0 {
         command

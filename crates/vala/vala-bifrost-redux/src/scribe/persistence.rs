@@ -514,6 +514,12 @@ pub struct ImmutableGeneration {
     pub row_count: usize,
     /// Estimated Arrow bytes retained by the generation.
     pub arrow_bytes: usize,
+    /// Shared charge of the frozen generation whose buffers `rows` holds.
+    ///
+    /// Conversion from that generation clones this `Arc` instead of creating
+    /// an owner, so retirement keeps the bytes charged while persistence or a
+    /// staging snapshot still holds the rows.
+    pub(crate) charge: Arc<crate::scribe::memory::RetainedArrowCharge>,
     /// Replay-only committed identity retained through publication.
     pub(crate) replay_identity: Mutex<Option<crate::scribe::memory::ReplayIdentityOwnership>>,
     /// Monotonic active-generation open time.
@@ -524,6 +530,10 @@ pub struct ImmutableGeneration {
 
 impl ImmutableGeneration {
     /// Detach a frozen memtable snapshot into a persistence payload.
+    ///
+    /// The payload shares the frozen generation's Arrow buffers and its
+    /// retained charge, so persistence counts as one more holder of the same
+    /// root-backed bytes rather than an uncharged copy.
     #[must_use]
     pub fn from_frozen(
         frozen: &FrozenMemtable,
@@ -559,13 +569,19 @@ impl ImmutableGeneration {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            charge: Arc::clone(&frozen.charge),
             replay_identity: Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
         }
     }
 
-    fn frozen_snapshot(&self) -> FrozenMemtable {
+    /// Rebuilds the frozen generation staging encodes from this payload.
+    ///
+    /// The snapshot shares the payload's buffers and retained charge, so it
+    /// keeps the generation's bytes charged for as long as staging holds it,
+    /// even after every payload `Arc` has dropped.
+    pub(crate) fn frozen_snapshot(&self) -> FrozenMemtable {
         FrozenMemtable {
             seal_id: self.generation_id.0,
             shard_id: self.shard_id,
@@ -578,6 +594,7 @@ impl ImmutableGeneration {
             opened_at: self.opened_at,
             closed_at: self.closed_at,
             arrow_bytes: self.arrow_bytes,
+            charge: Arc::clone(&self.charge),
         }
     }
 }
@@ -3159,6 +3176,7 @@ mod tests {
                 }],
                 row_count: 1,
                 arrow_bytes: 1,
+                charge: Arc::default(),
                 replay_identity: Mutex::new(None),
                 opened_at: std::time::Instant::now(),
                 closed_at: std::time::Instant::now(),
@@ -3448,5 +3466,248 @@ mod tests {
                 .iter()
                 .any(|forbidden| key.contains(&format!("{forbidden}=\"")))
         }));
+    }
+
+    /// Real-SQL recovery state for one Scribe node's staged publications.
+    ///
+    /// Holds the Postgres fixture, the WAL root whose `staged` namespace keeps
+    /// publication manifests, and the same mover, fenced reconciler, and memory
+    /// owner [`PersistenceRuntime::recover_staged_publications`] runs startup
+    /// recovery with.
+    struct PublicationRecoveryFixture {
+        /// Database retained for the test, holding the node's fence row.
+        database: wyrd_dev_fixtures::pg::PgFixture,
+        /// WAL root whose staged namespace holds the publication manifests.
+        wal_root: tempfile::TempDir,
+        /// Startup-recovery mover over the WAL root and an in-memory store.
+        mover: ScribeStageMover,
+        /// Fenced reconciler publishing as `actor`.
+        reconciler: ScribePublicationReconciler,
+        /// Root memory owner charging recovery's transfer buffer.
+        memory: ScribeResources,
+        /// Live publication actor whose fence row is registered.
+        actor: StreamIdentity,
+    }
+
+    impl PublicationRecoveryFixture {
+        /// Starts Postgres and registers `actor`'s live publication fence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture database, its superuser pool, the fence
+        /// row, or the temporary WAL root cannot be set up.
+        async fn start() -> Self {
+            let database = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("Postgres fixture");
+            let node_id = crate::scribe::stream_identity::NodeId::generate();
+            let actor =
+                StreamIdentity::new(node_id, crate::scribe::stream_identity::WriterEpoch::new(1));
+            sqlx::query(
+                "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now())",
+            )
+            .bind(wyrd_spec::DataTenantId::SYSTEM_OWNER.as_uuid())
+            .bind(node_id.as_uuid())
+            .bind(1_i64)
+            .execute(&database.superuser_pool().expect("superuser pool"))
+            .await
+            .expect("register Scribe publication fence");
+            let wal_root = tempfile::tempdir().expect("WAL root");
+            let mover = ScribeStageMover::new(
+                wal_root.path(),
+                Arc::new(object_store::memory::InMemory::new()),
+            );
+            let reconciler = ScribePublicationReconciler::new(
+                database.operator_pool().clone(),
+                actor,
+                PersistenceFaults::default(),
+            );
+            Self {
+                database,
+                wal_root,
+                mover,
+                reconciler,
+                memory: ScribeResources::for_test(),
+                actor,
+            }
+        }
+
+        /// Stages one artifact holding `content` and durably records the
+        /// one-row publication covering WAL LSNs `lsn`, as a process that
+        /// crashed before post-commit cleanup leaves it.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the source file, stage election, or manifest cannot be
+        /// written.
+        async fn persist(&self, generation: &str, content: &[u8], lsn: (i64, i64)) {
+            let source = self.wal_root.path().join(format!("{generation}.parquet"));
+            tokio::fs::write(&source, content)
+                .await
+                .expect("source write");
+            let object_key = format!("tenant/table/{generation}.parquet");
+            let identity = ParquetObjectIdentity::new(object_key.clone()).expect("object key");
+            let digest: [u8; 32] = Sha256::digest(content).into();
+            let length = u64::try_from(content.len()).expect("fixture length");
+            let staging = crate::scribe::staging::ScribeStaging::new(self.wal_root.path());
+            let claim = match staging
+                .stage_and_elect(
+                    &format!("{generation}-artifact-0"),
+                    &source,
+                    &identity,
+                    digest,
+                    length,
+                    &mut [0_u8; 8],
+                )
+                .await
+                .expect("stage election")
+            {
+                crate::scribe::staging::StageElection::Winner(claim)
+                | crate::scribe::staging::StageElection::ExistingWinner(claim) => claim,
+            };
+            let tenant = self.database.data_tenant_id();
+            // Whole seconds survive the Postgres round trip exactly, so the
+            // committed row reads back identical to the replayed one.
+            let now = chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("fixture instant");
+            let partition = crate::catalog::TimeGranularity::Hour
+                .bucket(now)
+                .expect("fixture instant buckets");
+            // Re-staging the same generation rebuilds the identical row.
+            let row_id = uuid::Uuid::from_u128(u128::from(lsn.0.unsigned_abs()));
+            let rows = vec![file_list_writer::FileListArtifactInsert {
+                id: row_id,
+                data_tenant_id: tenant,
+                namespace: "vala.traces".to_owned(),
+                table_name: "spans".to_owned(),
+                file_path: object_key.clone(),
+                file_size: i64::try_from(length).expect("fixture length"),
+                row_count: 1,
+                min_event_time: now,
+                max_event_time: now,
+                partition,
+                node_id: self.actor.node_id.as_uuid(),
+                writer_epoch: self.actor.writer_epoch.as_i64(),
+                wal_lsn_min: lsn.0,
+                wal_lsn_max: lsn.1,
+                file_ordinal: 0,
+                file_checksum: hex::encode(digest),
+                promotion_record: crate::scribe::staging::tests::fixture_promotion_record(
+                    tenant,
+                    &object_key,
+                    &hex::encode(digest),
+                    length,
+                    partition,
+                    row_id,
+                ),
+            }];
+            staging
+                .persist_publication(generation, self.actor, &rows, &[claim])
+                .await
+                .expect("publication manifest");
+        }
+
+        /// Runs startup publication recovery exactly as the runtime does.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recovery refusal unchanged.
+        async fn recover(&self) -> Result<usize, ScribeError> {
+            self.mover
+                .recover_publications(&self.reconciler, &self.memory)
+                .await
+        }
+
+        /// Reads the actor node's `vala.traces.spans` revision row, if any.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the superuser read fails.
+        async fn revision(&self) -> Option<i64> {
+            sqlx::query_scalar(
+                "SELECT publication_revision FROM vala.bifrost_table_publication_revisions WHERE node_id=$1",
+            )
+            .bind(self.actor.node_id.as_uuid())
+            .fetch_optional(&self.database.superuser_pool().expect("superuser pool"))
+            .await
+            .expect("revision read")
+        }
+
+        /// Counts the actor node's committed `vala.file_list` rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the superuser read fails.
+        async fn file_rows(&self) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE node_id=$1")
+                .bind(self.actor.node_id.as_uuid())
+                .fetch_one(&self.database.superuser_pool().expect("superuser pool"))
+                .await
+                .expect("file-list count")
+        }
+    }
+
+    /// A publication committed before revision tracking finishes startup
+    /// recovery at logical revision 0, and later publications still advance.
+    ///
+    /// The first recovery commits the set fresh. Deleting its revision row then
+    /// leaves exactly what the revision migration leaves for an earlier
+    /// commit: matching `vala.file_list` rows and no revision row. Re-staging
+    /// the same manifest is the publication a pre-upgrade process committed
+    /// and crashed before cleaning up. Its exact replay must settle and clean
+    /// up without a revision; the next fresh publication then takes revision
+    /// 1, and replaying that one keeps 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pre-revision replay keeps recovery failing, any replay
+    /// duplicates rows or invents a revision, cleanup leaves a manifest, or a
+    /// fresh publication does not advance the revision.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_publication_committed_before_revision_tracking_recovers_at_revision_zero() {
+        let fixture = PublicationRecoveryFixture::start().await;
+        fixture
+            .persist("generation-1", b"pre-revision set", (1, 2))
+            .await;
+        assert_eq!(fixture.recover().await.expect("fresh recovery"), 1);
+        assert_eq!(fixture.revision().await, Some(1));
+        sqlx::query("DELETE FROM vala.bifrost_table_publication_revisions WHERE node_id=$1")
+            .bind(fixture.actor.node_id.as_uuid())
+            .execute(&fixture.database.superuser_pool().expect("superuser pool"))
+            .await
+            .expect("model the pre-revision committed state");
+
+        fixture
+            .persist("generation-1", b"pre-revision set", (1, 2))
+            .await;
+        assert_eq!(
+            fixture
+                .recover()
+                .await
+                .expect("pre-revision replay recovers"),
+            1
+        );
+        assert_eq!(fixture.file_rows().await, 1, "the replay inserts nothing");
+        assert_eq!(
+            fixture.revision().await,
+            None,
+            "the replay invents no revision"
+        );
+        assert_eq!(fixture.recover().await.expect("cleaned recovery"), 0);
+
+        fixture
+            .persist("generation-2", b"post-revision set", (3, 4))
+            .await;
+        assert_eq!(fixture.recover().await.expect("fresh publication"), 1);
+        assert_eq!(fixture.revision().await, Some(1));
+        fixture
+            .persist("generation-2", b"post-revision set", (3, 4))
+            .await;
+        assert_eq!(fixture.recover().await.expect("exact replay"), 1);
+        assert_eq!(fixture.file_rows().await, 2);
+        assert_eq!(
+            fixture.revision().await,
+            Some(1),
+            "a replay keeps its revision"
+        );
     }
 }

@@ -1126,9 +1126,14 @@ impl DeclarationWriter<'_> {
             {
                 let mut prompt_submission = inline_prompt_submission(&submission, prompt)?;
                 pin_existing_inline_prompt(&mut conn, &submission, &mut prompt_submission).await?;
-                let outcome =
-                    persist_node(&mut conn, self.caller, operation_id, &mut prompt_submission)
-                        .await?;
+                let outcome = persist_node(
+                    &mut conn,
+                    self.state,
+                    self.caller,
+                    operation_id,
+                    &mut prompt_submission,
+                )
+                .await?;
                 agent.prompt = InlineableRef::Ref(outcome.card_ref.clone());
                 if !outcomes
                     .iter()
@@ -1139,8 +1144,14 @@ impl DeclarationWriter<'_> {
             }
             submission.spec =
                 serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
-            let outcome =
-                persist_node(&mut conn, self.caller, operation_id, &mut submission).await?;
+            let outcome = persist_node(
+                &mut conn,
+                self.state,
+                self.caller,
+                operation_id,
+                &mut submission,
+            )
+            .await?;
             sibling_uids.insert(
                 graph_identity(&outcome.card_ref),
                 outcome
@@ -1173,7 +1184,10 @@ impl DeclarationWriter<'_> {
 /// A fresh node writes its Card row, edges, artifact inventory, projected
 /// Card-bound principal, and — through [`BindingProjector`] — its frozen
 /// verification bindings on the caller's declaration transaction; nothing is
-/// committed here, so any failure rolls the whole declaration back.
+/// committed here, so any failure rolls the whole declaration back. A Card
+/// that declares artifacts becomes due for reconciliation only once its
+/// client's presigned upload window has closed, so the reconciler recovers
+/// abandoned uploads without racing the client's own completion.
 ///
 /// # Errors
 /// Returns a registry error when the submission cannot be canonicalized or
@@ -1181,6 +1195,7 @@ impl DeclarationWriter<'_> {
 /// Card, edge, principal, or binding write fails.
 async fn persist_node(
     conn: &mut TenantConn<'_>,
+    state: &AppState,
     caller: &Caller,
     operation_id: DeclarationOperationId,
     submission: &mut CardSubmission,
@@ -1221,6 +1236,11 @@ async fn persist_node(
             status: CardStatus::Pending,
             spec_hash: spec_hash.as_str(),
             artifact_hash: artifact_hash.as_deref(),
+            reconcile_delay: if submission.artifacts.is_empty() {
+                StdDuration::ZERO
+            } else {
+                state.storage.presign_ttl()
+            },
         },
     )
     .await?;

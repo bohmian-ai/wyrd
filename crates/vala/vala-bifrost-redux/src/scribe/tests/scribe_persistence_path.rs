@@ -677,7 +677,8 @@ async fn live_rows(
 ) -> Vec<RecordBatch> {
     let service = scribe.tail_service().expect("tail service");
     let request = crate::scribe::tail_rpc::tests::captured(&service, request).await;
-    let (rows, runs, _lease) = service.open_capture(&request).expect(context).into_parts();
+    let (rows, _charges, runs, _lease) =
+        service.open_capture(&request).expect(context).into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
     rows.into_iter().map(|batch| batch.rows).collect()
 }

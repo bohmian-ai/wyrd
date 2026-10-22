@@ -291,6 +291,28 @@ impl CallCapture {
         })
     }
 
+    /// The call's request correlation ID, which its audit decision carries
+    /// too, so the Scribe outbox writes both in one lane.
+    pub(crate) fn request_id(&self) -> &str {
+        self.payload.request_id.as_str()
+    }
+
+    /// Bytes of captured content this capture holds: both payload columns'
+    /// texts and every referenced object, which the Scribe outbox accounts
+    /// against its byte limit.
+    pub(crate) fn content_bytes(&self) -> usize {
+        let payloads = [
+            &self.payload.request_payload_json,
+            &self.payload.response_payload_json,
+        ];
+        payloads
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            + self.objects.bytes()
+    }
+
     /// Builds one `vala.gateway.calls` batch holding one row per capture, in
     /// order, over the table's user fields followed by its `card_uid` and
     /// `run_id` correlation inputs.
@@ -619,6 +641,11 @@ impl std::fmt::Debug for PayloadObjects {
 }
 
 impl PayloadObjects {
+    /// Total length of every object held.
+    fn bytes(&self) -> usize {
+        self.objects.values().map(Vec::len).sum()
+    }
+
     /// Records `bytes` under their canonical digest and returns the reference
     /// that replaces them in the captured payload.
     ///

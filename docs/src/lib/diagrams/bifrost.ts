@@ -297,7 +297,7 @@ export const bifrostWriteRead: TimelineSpec = {
         { v: '<span class="wd-badge ok">✓ Yes</span>', s: 'Durable once acknowledged' }
       ],
       caption:
-        '<code>flush()</code> has returned, so the row is durable. Oracle reads it from the holding Scribe as live tail. Only if that Scribe is unreachable does the query end degraded without it. The dashed box marks where it will appear in the table.'
+        '<code>flush()</code> has returned, so the row is durable. Oracle reads it from the holding Scribe as live tail. Only if that Scribe cannot be reached when the query lists live sources does the query end degraded without it; losing it after capture fails the query. The dashed box marks where it will appear in the table.'
     },
     {
       from: 58,

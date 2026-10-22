@@ -20,25 +20,32 @@
 //! attempt. Because a write may be retried after an unknown commit outcome,
 //! every sink write must be safe to repeat.
 //!
-//! Every outbox has a finite `capacity` of admitted items: items queued,
-//! waiting, retrying, or being written, plus slots reserved and not yet
-//! staged. An item stays admitted until it is written or lost, never merely
-//! dequeued, and a retried slice is admitted once however often it is
-//! retried. The capacity is split in two shares. A producer that must refuse
-//! its caller rather than lose an item takes a [`Reservation`] first;
-//! [`Outbox::reserve`] refuses with [`OutboxFull`] once reserved slots and
-//! the unwritten items staged through them would exceed [`RESERVED_SHARE`]
-//! of the capacity. Unreserved items from [`Outbox::stage`] hold the rest,
-//! so neither share can crowd out the other. `stage` never fails or waits:
-//! past its share an item is counted lost and logged, so a full outbox never
-//! blocks or fails the operation staging it.
+//! Every outbox has finite [`OutboxLimits`]: a most admitted items and a
+//! most admitted bytes, as each item's [`OutboxSink::weight`]. Admitted
+//! items are those queued, waiting, retrying, or being written, plus slots
+//! reserved and not yet staged. An item stays admitted until it is written
+//! or lost, never merely dequeued, and a retried slice is admitted once
+//! however often it is retried. Both limits are split in two shares. A
+//! producer that must refuse its caller rather than lose an item takes a
+//! [`Reservation`] first; [`Outbox::reserve`] refuses with [`OutboxFull`]
+//! once reserved slots and the unwritten items staged through them would
+//! exceed [`RESERVED_SHARE`] of the item limit, or the bytes of those items
+//! already reach that share of the byte limit. Unreserved items from
+//! [`Outbox::stage`] hold the rest of both, so neither share can crowd out
+//! the other. `stage` never fails or waits: past either unreserved limit an
+//! item is shed, counted lost, and logged at most once per tenant every
+//! [`SHED_LOG_INTERVAL`] with the count shed since the last record, so a
+//! full outbox never blocks or fails the operation staging it.
 //!
-//! Nothing is preallocated. Items are lost when the process stops abruptly,
-//! when graceful shutdown reaches its deadline, when an item is staged after
-//! shutdown begins, or when an unreserved item finds the outbox full; each is
-//! counted in `outbox_events_lost_total{outbox}`. Every failed write attempt
-//! is counted in `outbox_write_failures_total{outbox}`, and the items not yet
-//! written are exported as the `outbox_pending{outbox}` gauge.
+//! Nothing is preallocated. Every lost item is counted once in
+//! `outbox_events_lost_total{outbox, reason}` with its [`LossReason`]: shed at
+//! an unreserved limit, staged after shutdown began or unwritten at its
+//! deadline, or consumed unwritten by the sink. Items lost when the process
+//! stops abruptly are never counted. Written items and their bytes are
+//! counted in `outbox_items_written_total{outbox}` and
+//! `outbox_bytes_written_total{outbox}`, every failed write attempt in
+//! `outbox_write_failures_total{outbox}`, and the items not yet written are
+//! exported as the `outbox_pending{outbox}` gauge.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -47,7 +54,7 @@ use std::future::{Future, pending, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -70,19 +77,66 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// traffic cannot refuse the producer.
 pub const RESERVED_SHARE: (usize, usize) = (3, 4);
 
+/// Shortest time between two shed records of one outbox and tenant.
+///
+/// A saturated producer sheds every item it stages; one record per interval
+/// carrying the count keeps the log readable and its cost flat.
+pub const SHED_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most an [`Outbox`] admits at once, by item count and by accounted
+/// bytes; reaching either limit of a share sheds or refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxLimits {
+    /// Most items admitted, including unspent reserved slots.
+    pub items: usize,
+    /// Most bytes admitted, as the sum of [`OutboxSink::weight`] over the
+    /// admitted items.
+    pub bytes: usize,
+}
+
+/// Why an outbox item was lost, the `reason` label of
+/// `outbox_events_lost_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossReason {
+    /// Refused at an unreserved staging limit.
+    Shed,
+    /// Consumed by the sink without being written: a terminal refusal or an
+    /// item that could not be encoded, which no retry could cure.
+    Rejected,
+    /// The process reaches no destination to write to.
+    Unreachable,
+    /// Staged after shutdown began, or still unwritten at its deadline.
+    Shutdown,
+}
+
+impl LossReason {
+    /// The fixed metric label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shed => "shed",
+            Self::Rejected => "rejected",
+            Self::Unreachable => "unreachable",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// Refusal of a [`Reservation`] because the outbox holds its reserved share.
 ///
 /// Nothing was admitted, so the caller may retry the whole operation later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("outbox {outbox} is full: {admitted} of {limit} reservable items admitted")]
+#[error("outbox {outbox} is full: {admitted} of {limit} reservable {unit} admitted")]
 pub struct OutboxFull {
     /// The refusing outbox's [`OutboxSink::NAME`].
     pub outbox: &'static str,
-    /// Reserved slots and unwritten reserved items when the reservation was
-    /// refused.
+    /// Reserved slots and unwritten reserved items, or the bytes of those
+    /// items, when the reservation was refused.
     pub admitted: usize,
-    /// Items reservations may hold in this outbox.
+    /// Items or bytes reservations may hold in this outbox.
     pub limit: usize,
+    /// Which limit refused: `"items"` or `"bytes"`.
+    pub unit: &'static str,
 }
 
 /// One destination an outbox writes to.
@@ -114,6 +168,18 @@ pub trait OutboxSink: Send + Sync + 'static {
         0
     }
 
+    /// The bytes `item` is accounted as against [`OutboxLimits::bytes`].
+    ///
+    /// At least the length of every payload the item holds, such as captured
+    /// request and response bodies; encoding overhead need not be counted.
+    /// The default of zero suits items bounded by their producer's input
+    /// limits, which the item limit then bounds.
+    #[must_use]
+    fn weight(item: &Self::Item) -> usize {
+        let _ = item;
+        0
+    }
+
     /// Writes one lane's items of one tenant, in order, in one transaction.
     ///
     /// A write may be retried after its commit outcome is unknown, so writing
@@ -131,9 +197,8 @@ pub trait OutboxSink: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// One queued item: its tenant, the item, and whether it was staged on a
-/// reserved slot.
-type Queued<S> = (DataTenantId, <S as OutboxSink>::Item, bool);
+/// One queued item: its tenant, the item, and its admitted [`Load`].
+type Queued<S> = (DataTenantId, <S as OutboxSink>::Item, Load);
 
 /// Sending half of an outbox queue.
 type QueueSender<S> = mpsc::UnboundedSender<Queued<S>>;
@@ -149,8 +214,13 @@ pub struct Outbox<S: OutboxSink> {
     pending: Arc<AtomicUsize>,
     /// Admission counts the writer releases written and lost items from.
     admission: Arc<Admission>,
-    /// Most items this outbox admits at once.
-    capacity: usize,
+    /// Most items and bytes this outbox admits at once.
+    limits: OutboxLimits,
+    /// Per tenant, items shed since the last shed record and when that record
+    /// was written; see [`SHED_LOG_INTERVAL`].
+    // ponytail: one small entry per tenant that ever shed, never pruned;
+    // prune idle entries if tenant counts reach the millions.
+    shed: Mutex<HashMap<DataTenantId, ShedLog>>,
     /// Signalled whenever a settled write or abandonment leaves nothing
     /// pending.
     idle: Arc<Notify>,
@@ -183,16 +253,16 @@ impl<S: OutboxSink> Outbox<S> {
     /// Creates the outbox around `sink` and starts its writer.
     ///
     /// `concurrency` is the most writes run at once across every tenant and
-    /// lane, which bounds the connections the sink may hold; `capacity` is the most items admitted
-    /// at once, which bounds the memory queued, waiting, retrying, and
-    /// in-flight work may hold.
+    /// lane, which bounds the connections the sink may hold; `limits` are the
+    /// most items and bytes admitted at once, which bound the memory queued,
+    /// waiting, retrying, and in-flight work may hold.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime, because the writer task is
     /// spawned immediately.
     #[must_use]
-    pub fn new(sink: S, concurrency: usize, capacity: usize) -> Arc<Self> {
+    pub fn new(sink: S, concurrency: usize, limits: OutboxLimits) -> Arc<Self> {
         // The channel is unbounded because `admission` already bounds it.
         let (queue, requests) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
@@ -223,7 +293,8 @@ impl<S: OutboxSink> Outbox<S> {
             queue: RwLock::new(Some(queue)),
             pending,
             admission,
-            capacity,
+            limits,
+            shed: Mutex::default(),
             idle,
             abandon,
             writer,
@@ -240,17 +311,75 @@ impl<S: OutboxSink> Outbox<S> {
     /// Queues one item for `tenant` without waiting and never fails.
     ///
     /// The item is admitted and counted pending before it is sent, so the
-    /// writer can never release it first. When the unreserved share is full,
-    /// once shutdown has begun, or if the writer is gone, the item never
-    /// enters the queue; it is counted lost and logged instead.
+    /// writer can never release it first. Admission happens under the queue's
+    /// read lock, so nothing is admitted once shutdown has taken the queue.
+    /// When either unreserved limit would be passed the item is shed: counted
+    /// lost with [`LossReason::Shed`] and recorded by [`Self::shed`]. Once
+    /// shutdown has begun, or if the writer is gone, the item is counted lost
+    /// with [`LossReason::Shutdown`] and logged.
     pub fn stage(&self, tenant: DataTenantId, item: impl Into<S::Item>) {
-        let limit = self.capacity - self.reservable();
-        if admit(&self.admission.unreserved, 1, limit).is_err() {
-            count_lost::<S>(1);
-            tracing::error!(outbox = S::NAME, %tenant, capacity = self.capacity, "outbox is full; the staged item was lost");
+        let item = item.into();
+        let bytes = S::weight(&item);
+        let queue = self.queue.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(sender) = queue.as_ref() else {
+            drop(queue);
+            lose_late::<S>(tenant);
+            return;
+        };
+        let admission = &self.admission;
+        if admit(
+            &admission.unreserved,
+            1,
+            self.limits.items - self.reservable(),
+        )
+        .is_err()
+        {
+            drop(queue);
+            self.shed(tenant);
             return;
         }
-        self.send(tenant, item.into(), false);
+        let byte_limit = self.limits.bytes - self.reservable_bytes();
+        if admit(&admission.unreserved_bytes, bytes, byte_limit).is_err() {
+            admission.unreserved.fetch_sub(1, Ordering::AcqRel);
+            drop(queue);
+            self.shed(tenant);
+            return;
+        }
+        self.enqueue(sender, tenant, item, Load::one(false, bytes));
+    }
+
+    /// Counts one shed item of `tenant` and writes a shed record when the
+    /// tenant's last one is at least [`SHED_LOG_INTERVAL`] old; the record
+    /// carries every item shed since the previous one.
+    fn shed(&self, tenant: DataTenantId) {
+        count_lost::<S>(1, LossReason::Shed);
+        let now = Instant::now();
+        let shed = {
+            let mut logs = self.shed.lock().unwrap_or_else(PoisonError::into_inner);
+            let log = logs.entry(tenant).or_default();
+            log.unlogged += 1;
+            if log
+                .logged_at
+                .is_some_and(|at| now.duration_since(at) < SHED_LOG_INTERVAL)
+            {
+                return;
+            }
+            log.logged_at = Some(now);
+            std::mem::take(&mut log.unlogged)
+        };
+        self.log_shed(tenant, shed);
+    }
+
+    /// Writes one shed record for `shed` items of `tenant`.
+    fn log_shed(&self, tenant: DataTenantId, shed: usize) {
+        tracing::error!(
+            outbox = S::NAME,
+            %tenant,
+            shed,
+            max_items = self.limits.items,
+            max_bytes = self.limits.bytes,
+            "outbox is full; staged items were shed"
+        );
     }
 
     /// Reserves `slots` items of capacity for a producer that must refuse its
@@ -266,11 +395,22 @@ impl<S: OutboxSink> Outbox<S> {
     /// Returns [`OutboxFull`], admitting nothing, when the reservation would
     /// take reservations past [`RESERVED_SHARE`] of the capacity.
     pub fn reserve(self: &Arc<Self>, slots: usize) -> Result<Reservation<S>, OutboxFull> {
+        let byte_limit = self.reservable_bytes();
+        let bytes = self.admission.reserved_bytes.load(Ordering::Acquire);
+        if bytes >= byte_limit {
+            return Err(OutboxFull {
+                outbox: S::NAME,
+                admitted: bytes,
+                limit: byte_limit,
+                unit: "bytes",
+            });
+        }
         let limit = self.reservable();
         admit(&self.admission.reserved, slots, limit).map_err(|admitted| OutboxFull {
             outbox: S::NAME,
             admitted,
             limit,
+            unit: "items",
         })?;
         Ok(Reservation {
             outbox: Arc::clone(self),
@@ -279,38 +419,61 @@ impl<S: OutboxSink> Outbox<S> {
     }
 
     /// The most slots reservations may hold: [`RESERVED_SHARE`] of the
-    /// capacity, rounded down.
+    /// item limit, rounded down.
     const fn reservable(&self) -> usize {
-        self.capacity * RESERVED_SHARE.0 / RESERVED_SHARE.1
+        self.limits.items * RESERVED_SHARE.0 / RESERVED_SHARE.1
     }
 
-    /// Sends one admitted item to the writer, counting it pending first;
-    /// `reserved` says which share admitted it.
+    /// The bytes at which reservations are refused: [`RESERVED_SHARE`] of
+    /// the byte limit, rounded down, computed without overflowing.
+    const fn reservable_bytes(&self) -> usize {
+        self.limits.bytes / RESERVED_SHARE.1 * RESERVED_SHARE.0
+    }
+
+    /// Sends one item on a spent reserved slot to the writer.
     ///
-    /// Once shutdown has begun, or if the writer is gone, the item is released
-    /// from its share, counted lost, and logged.
-    fn send(&self, tenant: DataTenantId, item: S::Item, reserved: bool) {
+    /// Its bytes join the reserved share unconditionally, because the slot
+    /// already promised the producer its item is kept; [`Self::reserve`]
+    /// refuses new reservations once that share's bytes reach their limit.
+    /// Once shutdown has begun the item is released from its slot, counted
+    /// lost with [`LossReason::Shutdown`], and logged.
+    fn send_reserved(&self, tenant: DataTenantId, item: S::Item) {
+        let bytes = S::weight(&item);
         let queue = self.queue.read().unwrap_or_else(PoisonError::into_inner);
-        if let Some(queue) = queue.as_ref() {
-            let gauge = metrics::gauge!("outbox_pending", "outbox" => S::NAME);
-            let reserved_count = usize::from(reserved);
-            self.pending.fetch_add(1, Ordering::AcqRel);
-            self.admission
-                .staged_reserved
-                .fetch_add(reserved_count, Ordering::AcqRel);
-            gauge.increment(1.0);
-            if queue.send((tenant, item, reserved)).is_ok() {
-                return;
-            }
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-            self.admission
-                .staged_reserved
-                .fetch_sub(reserved_count, Ordering::AcqRel);
-            gauge.decrement(1.0);
+        let Some(sender) = queue.as_ref() else {
+            drop(queue);
+            self.admission.release(Load::one(true, 0));
+            lose_late::<S>(tenant);
+            return;
+        };
+        self.admission
+            .reserved_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        self.enqueue(sender, tenant, item, Load::one(true, bytes));
+    }
+
+    /// Sends one admitted item to the writer, counting it pending first.
+    ///
+    /// Called under the queue's read lock. If the writer is gone, the item is
+    /// released from its shares, counted lost with [`LossReason::Shutdown`],
+    /// and logged.
+    fn enqueue(&self, sender: &QueueSender<S>, tenant: DataTenantId, item: S::Item, load: Load) {
+        let gauge = metrics::gauge!("outbox_pending", "outbox" => S::NAME);
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        self.admission
+            .staged_reserved
+            .fetch_add(load.reserved, Ordering::AcqRel);
+        gauge.increment(1.0);
+        if sender.send((tenant, item, load)).is_ok() {
+            return;
         }
-        self.admission.release(1, usize::from(reserved));
-        count_lost::<S>(1);
-        tracing::error!(outbox = S::NAME, %tenant, "outbox item staged after shutdown was lost");
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.admission
+            .staged_reserved
+            .fetch_sub(load.reserved, Ordering::AcqRel);
+        gauge.decrement(1.0);
+        self.admission.release(load);
+        lose_late::<S>(tenant);
     }
 
     /// Returns the number of items not yet written.
@@ -344,9 +507,11 @@ impl<S: OutboxSink> Outbox<S> {
     /// The staging sender is dropped before the first await, which is a
     /// one-way fence: everything staged before it drains, and every later
     /// [`Outbox::stage`] is refused and counted lost without entering the
-    /// queue. Items still unwritten at the deadline are abandoned with the
+    /// queue. Shed counts not yet recorded are recorded at the fence.
+    /// Items still unwritten at the deadline are abandoned with the
     /// writer, which cancels any in-flight write; once the writer is gone
-    /// they are counted in `outbox_events_lost_total`, logged, and released
+    /// they are counted in `outbox_events_lost_total` with
+    /// [`LossReason::Shutdown`], logged, and released
     /// from `pending()` and `outbox_pending`, which both end at zero, and
     /// released from their admission shares. When shutdown is called
     /// concurrently, exactly one caller reports the loss and settles both
@@ -359,6 +524,17 @@ impl<S: OutboxSink> Outbox<S> {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
+        let unlogged: Vec<_> = self
+            .shed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+            .filter(|(_, log)| log.unlogged > 0)
+            .map(|(tenant, log)| (*tenant, std::mem::take(&mut log.unlogged)))
+            .collect();
+        for (tenant, shed) in unlogged {
+            self.log_shed(tenant, shed);
+        }
         if timeout_at(deadline.into(), self.writer.wait())
             .await
             .is_err()
@@ -367,15 +543,25 @@ impl<S: OutboxSink> Outbox<S> {
             self.writer.wait().await;
         }
         // With the queue closed and the writer gone nothing else moves these
-        // counts, so the caller that takes a nonzero `pending` also owns its
-        // reserved part and settles both shares alone.
+        // counts, and admission only happens under the queue lock, so the
+        // admitted bytes are exactly the abandoned items'. The caller that
+        // takes a nonzero `pending` owns its reserved part and settles every
+        // share alone.
         let lost = self.pending.swap(0, Ordering::AcqRel);
         if lost == 0 {
             return 0;
         }
-        let reserved = self.admission.staged_reserved.swap(0, Ordering::AcqRel);
-        self.admission.release(lost, reserved);
-        count_lost::<S>(lost);
+        let admission = &self.admission;
+        let reserved = admission.staged_reserved.swap(0, Ordering::AcqRel);
+        let reserved_bytes = admission.reserved_bytes.swap(0, Ordering::AcqRel);
+        let bytes = admission.unreserved_bytes.swap(0, Ordering::AcqRel) + reserved_bytes;
+        admission.release(Load {
+            items: lost,
+            reserved,
+            bytes,
+            reserved_bytes,
+        });
+        count_lost::<S>(lost, LossReason::Shutdown);
         metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(lost as f64);
         tracing::error!(
             outbox = S::NAME,
@@ -412,7 +598,7 @@ impl<S: OutboxSink> Reservation<S> {
                 slots.checked_sub(1)
             });
         if spent.is_ok() {
-            self.outbox.send(tenant, item.into(), true);
+            self.outbox.send_reserved(tenant, item.into());
         } else {
             self.outbox.stage(tenant, item);
         }
@@ -445,7 +631,8 @@ impl<S: OutboxSink> std::fmt::Debug for Reservation<S> {
     }
 }
 
-/// The two shares an [`Outbox`] admits items into, shared with its writer.
+/// The two shares an [`Outbox`] admits items and bytes into, shared with its
+/// writer.
 #[derive(Debug, Default)]
 struct Admission {
     /// Unreserved items not yet written or lost.
@@ -455,16 +642,67 @@ struct Admission {
     /// Reserved items pending in the writer, which shutdown releases from
     /// `reserved` when it abandons them.
     staged_reserved: AtomicUsize,
+    /// Bytes of unreserved items not yet written or lost.
+    unreserved_bytes: AtomicUsize,
+    /// Bytes of reserved items not yet written or lost; unspent slots hold
+    /// none.
+    reserved_bytes: AtomicUsize,
 }
 
 impl Admission {
-    /// Releases `count` written or lost items, `reserved` of them reserved,
-    /// from their shares.
-    fn release(&self, count: usize, reserved: usize) {
-        self.reserved.fetch_sub(reserved, Ordering::AcqRel);
+    /// Releases written or lost items from their shares.
+    fn release(&self, load: Load) {
+        self.reserved.fetch_sub(load.reserved, Ordering::AcqRel);
         self.unreserved
-            .fetch_sub(count - reserved, Ordering::AcqRel);
+            .fetch_sub(load.items - load.reserved, Ordering::AcqRel);
+        self.reserved_bytes
+            .fetch_sub(load.reserved_bytes, Ordering::AcqRel);
+        self.unreserved_bytes
+            .fetch_sub(load.bytes - load.reserved_bytes, Ordering::AcqRel);
     }
+}
+
+/// What a set of admitted items holds of the [`Admission`] shares.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Load {
+    /// Items.
+    items: usize,
+    /// Items admitted on reserved slots.
+    reserved: usize,
+    /// Accounted bytes of every item.
+    bytes: usize,
+    /// Accounted bytes of the reserved items.
+    reserved_bytes: usize,
+}
+
+impl Load {
+    /// The load of one item of `bytes`, `reserved` or not.
+    const fn one(reserved: bool, bytes: usize) -> Self {
+        Self {
+            items: 1,
+            reserved: reserved as usize,
+            bytes,
+            reserved_bytes: if reserved { bytes } else { 0 },
+        }
+    }
+
+    /// Adds `other` into this load.
+    const fn add(&mut self, other: Self) {
+        self.items += other.items;
+        self.reserved += other.reserved;
+        self.bytes += other.bytes;
+        self.reserved_bytes += other.reserved_bytes;
+    }
+}
+
+/// When a tenant's last shed record was written and how many items it has
+/// shed since.
+#[derive(Debug, Default)]
+struct ShedLog {
+    /// When the last record was written; `None` before the first.
+    logged_at: Option<Instant>,
+    /// Items shed since that record.
+    unlogged: usize,
 }
 
 /// Admits `count` items into `share` unless that takes it past `limit`.
@@ -481,8 +719,8 @@ fn admit(share: &AtomicUsize, count: usize, limit: usize) -> Result<(), usize> {
         .map(|_| ())
 }
 
-/// One lane's items in arrival order and how many of them are reserved.
-type Backlog<I> = (Vec<I>, usize);
+/// One lane's items in arrival order and their admitted [`Load`].
+type Backlog<I> = (Vec<I>, Load);
 
 /// A tenant and one of its [`OutboxSink::LANES`]: the unit written in arrival
 /// order, one write at a time.
@@ -510,9 +748,9 @@ struct OutboxWriter<S: OutboxSink> {
     failed: HashMap<Lane, Backlog<S::Item>>,
     /// In-flight lane writes.
     writing: JoinSet<Written<S>>,
-    /// Lane, item count, reserved item count, and dispatch time of each
-    /// in-flight write, keyed by its task.
-    in_flight: HashMap<Id, (Lane, usize, usize, Instant)>,
+    /// Lane, admitted load, and dispatch time of each in-flight write, keyed
+    /// by its task.
+    in_flight: HashMap<Id, (Lane, Load, Instant)>,
     /// Earliest retry time and current backoff of each lane whose last
     /// write failed.
     retry_at: HashMap<Lane, (Instant, Duration)>,
@@ -554,13 +792,12 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 count = self.requests.recv_many(&mut received, usize::MAX), if open => {
                     open = count != 0;
                     let lanes = S::LANES.max(1) as u64;
-                    for (tenant, item, reserved) in received.drain(..) {
+                    for (tenant, item, load) in received.drain(..) {
                         // The remainder is below `LANES`, a `usize`.
                         let lane = usize::try_from(S::lane(&item) % lanes).unwrap_or_default();
-                        let (items, reserved_count) =
-                            self.waiting.entry((tenant, lane)).or_default();
+                        let (items, backlog) = self.waiting.entry((tenant, lane)).or_default();
                         items.push(item);
-                        *reserved_count += usize::from(reserved);
+                        backlog.add(load);
                     }
                 }
                 () = async {
@@ -613,7 +850,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
             if self.writing.len() >= self.concurrency {
                 return;
             }
-            let Some((items, reserved)) = self
+            let Some((items, load)) = self
                 .failed
                 .remove(&lane)
                 .or_else(|| self.waiting.remove(&lane))
@@ -621,7 +858,6 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 continue;
             };
             let (tenant, _) = lane;
-            let count = items.len();
             let sink = Arc::clone(&self.sink);
             let task = self.writing.spawn(async move {
                 // The constructing closure borrows `items`, so it is dropped
@@ -655,7 +891,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 (lane, items, result)
             });
             self.in_flight
-                .insert(task.id(), (lane, count, reserved, Instant::now()));
+                .insert(task.id(), (lane, load, Instant::now()));
         }
     }
 
@@ -682,34 +918,34 @@ impl<S: OutboxSink> OutboxWriter<S> {
     /// Settles one finished write.
     ///
     /// Every joined write, succeeded or failed, records its dispatch-to-settle
-    /// time in `outbox_write_seconds`. Success clears the lane's backoff and
-    /// releases the slots of the items it wrote, which the write task already
-    /// handed to the blocking pool to free. Failure,
+    /// time in `outbox_write_seconds`. Success clears the lane's backoff,
+    /// counts the items and bytes written, and releases the slots of the
+    /// items it wrote, which the write task already handed to the blocking
+    /// pool to free. Failure,
     /// including a contained sink panic, keeps the items as the lane's next
     /// write, unmerged with later arrivals, doubles its backoff, and counts
-    /// and logs the attempt. A task that failed to join lost its items, which are counted
-    /// lost; with sink panics contained that needs a panic that escapes
-    /// containment, such as one raised while dropping a panic payload.
+    /// and logs the attempt. A task that failed to join lost its items, which
+    /// are counted lost with [`LossReason::Rejected`]; with sink panics
+    /// contained that needs a panic that escapes containment, such as one
+    /// raised while dropping a panic payload.
     fn finish(&mut self, done: Result<(Id, Written<S>), JoinError>) {
-        let ((lane, items, result), count, reserved) = match done {
+        let ((lane, items, result), load) = match done {
             Ok((id, written)) => {
-                let (count, reserved) =
+                let load =
                     self.in_flight
                         .remove(&id)
-                        .map_or((0, 0), |(_, count, reserved, started)| {
+                        .map_or_else(Load::default, |(_, load, started)| {
                             metrics::histogram!("outbox_write_seconds", "outbox" => S::NAME)
                                 .record(started.elapsed().as_secs_f64());
-                            (count, reserved)
+                            load
                         });
-                (written, count, reserved)
+                (written, load)
             }
             Err(error) => {
-                if let Some(((tenant, lane), count, reserved, _)) =
-                    self.in_flight.remove(&error.id())
-                {
-                    count_lost::<S>(count);
-                    tracing::error!(outbox = S::NAME, %tenant, lane, %error, lost = count, "outbox write task failed");
-                    self.release(count, reserved);
+                if let Some(((tenant, lane), load, _)) = self.in_flight.remove(&error.id()) {
+                    count_lost::<S>(load.items, LossReason::Rejected);
+                    tracing::error!(outbox = S::NAME, %tenant, lane, %error, lost = load.items, "outbox write task failed");
+                    self.release(load);
                 }
                 return;
             }
@@ -717,7 +953,11 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let error = match result {
             Ok(()) => {
                 self.retry_at.remove(&lane);
-                self.release(count, reserved);
+                metrics::counter!("outbox_items_written_total", "outbox" => S::NAME)
+                    .increment(load.items as u64);
+                metrics::counter!("outbox_bytes_written_total", "outbox" => S::NAME)
+                    .increment(load.bytes as u64);
+                self.release(load);
                 return;
             }
             Err(error) => error,
@@ -738,19 +978,18 @@ impl<S: OutboxSink> OutboxWriter<S> {
             retry_in_ms = backoff.as_millis(),
             "outbox write failed; retrying"
         );
-        self.failed.insert(lane, (items, reserved));
+        self.failed.insert(lane, (items, load));
     }
 
-    /// Releases `count` written or lost items, `reserved` of them reserved,
-    /// from pending and their shares, and wakes settlers when nothing remains
-    /// pending.
-    fn release(&self, count: usize, reserved: usize) {
-        metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(count as f64);
+    /// Releases written or lost items from pending and their shares, and
+    /// wakes settlers when nothing remains pending.
+    fn release(&self, load: Load) {
+        metrics::gauge!("outbox_pending", "outbox" => S::NAME).decrement(load.items as f64);
         self.admission
             .staged_reserved
-            .fetch_sub(reserved, Ordering::AcqRel);
-        self.admission.release(count, reserved);
-        if self.pending.fetch_sub(count, Ordering::AcqRel) == count {
+            .fetch_sub(load.reserved, Ordering::AcqRel);
+        self.admission.release(load);
+        if self.pending.fetch_sub(load.items, Ordering::AcqRel) == load.items {
             self.idle.notify_waiters();
         }
     }
@@ -787,13 +1026,22 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
 }
 
 /// Counts `count` items of outbox `S` as lost in
-/// `outbox_events_lost_total{outbox}`.
+/// `outbox_events_lost_total{outbox, reason}`.
 ///
-/// The outbox counts shutdown and late-staging loss itself; a sink calls this
-/// for items it consumes without writing, such as a terminal rejection that a
-/// retry could never cure.
-pub fn count_lost<S: OutboxSink>(count: usize) {
-    metrics::counter!("outbox_events_lost_total", "outbox" => S::NAME).increment(count as u64);
+/// The outbox counts shed, shutdown, and late-staging loss itself; a sink
+/// calls this for items it consumes without writing, such as a terminal
+/// rejection that a retry could never cure, and a producer for items it
+/// sheds at its own limit before staging.
+pub fn count_lost<S: OutboxSink>(count: usize, reason: LossReason) {
+    metrics::counter!("outbox_events_lost_total", "outbox" => S::NAME, "reason" => reason.as_str())
+        .increment(count as u64);
+}
+
+/// Counts and logs one item of `tenant` lost because it was staged after
+/// shutdown began or the writer is gone.
+fn lose_late<S: OutboxSink>(tenant: DataTenantId) {
+    count_lost::<S>(1, LossReason::Shutdown);
+    tracing::error!(outbox = S::NAME, %tenant, "outbox item staged after shutdown was lost");
 }
 
 #[cfg(test)]
@@ -817,7 +1065,7 @@ mod tests {
     use tokio::sync::Notify;
     use wyrd_spec::DataTenantId;
 
-    use super::{Outbox, OutboxSink};
+    use super::{Outbox, OutboxLimits, OutboxSink};
 
     /// In-memory sink recording each tenant's written items in order.
     #[derive(Default)]
@@ -876,6 +1124,12 @@ mod tests {
         type Item = u32;
         type Error = MemoryError;
         const NAME: &'static str = "test";
+
+        /// Accounts each item as its own value in bytes, so a test sizes
+        /// items by choosing their values.
+        fn weight(item: &u32) -> usize {
+            *item as usize
+        }
 
         /// Writes `items` for `tenant`, applying the injections configured in
         /// [`MemoryState`] in a fixed order the tests depend on.
@@ -1073,7 +1327,15 @@ mod tests {
     }
 
     /// Capacity of test outboxes that do not exercise the bound.
-    const ROOMY: usize = 1_024;
+    const ROOMY: OutboxLimits = items(1_024);
+
+    /// Limits of `items` items and unlimited bytes.
+    const fn items(items: usize) -> OutboxLimits {
+        OutboxLimits {
+            items,
+            bytes: usize::MAX,
+        }
+    }
 
     /// Starts an outbox over a fresh memory sink and returns both.
     fn outbox(concurrency: usize) -> (Arc<Outbox<MemorySink>>, Arc<Mutex<MemoryState>>) {
@@ -1096,31 +1358,46 @@ mod tests {
         (Outbox::new(sink, 4, ROOMY), state, started)
     }
 
-    /// Thread-local metrics recorder keeping every counter and gauge by name.
+    /// Thread-local metrics recorder keeping every counter and gauge by name,
+    /// and by name and `reason` label when it has one.
     ///
     /// Installed with `metrics::set_default_local_recorder` in a
     /// current-thread test, it also sees the outbox writer's updates because
     /// every task runs on the test thread.
     #[derive(Default)]
     struct TestMetrics {
-        /// Raw value of each metric; gauges store `f64` bits.
+        /// Raw value of each metric, keyed `name` or `name{reason=...}`;
+        /// gauges store `f64` bits.
         values: Mutex<HashMap<String, Arc<AtomicU64>>>,
     }
 
     impl TestMetrics {
-        /// The shared value cell of the metric named by `key`.
+        /// The shared value cell of the metric `key` names, one per `reason`
+        /// label value.
         fn cell(&self, key: &Key) -> Arc<AtomicU64> {
+            let name = key
+                .labels()
+                .find(|label| label.key() == "reason")
+                .map_or_else(
+                    || key.name().to_owned(),
+                    |reason| format!("{}{{reason={}}}", key.name(), reason.value()),
+                );
             let mut values = self.values.lock().expect("test metrics are never poisoned");
-            Arc::clone(values.entry(key.name().to_owned()).or_default())
+            Arc::clone(values.entry(name).or_default())
         }
 
-        /// The raw value of metric `name`, zero when it was never touched.
+        /// The raw value of metric `name`, summed over its `reason` labels
+        /// unless `name` names one as `name{reason=...}`; zero when it was
+        /// never touched.
         fn raw(&self, name: &str) -> u64 {
+            let labelled = format!("{name}{{");
             self.values
                 .lock()
                 .expect("test metrics are never poisoned")
-                .get(name)
-                .map_or(0, |value| value.load(Ordering::Acquire))
+                .iter()
+                .filter(|(key, _)| *key == name || key.starts_with(&labelled))
+                .map(|(_, value)| value.load(Ordering::Acquire))
+                .sum()
         }
 
         /// The value of counter `name`.
@@ -1276,7 +1553,7 @@ mod tests {
         let (hang, started) = (Arc::clone(&sink.hang), Arc::clone(&sink.started));
         let state = Arc::clone(&sink.state);
         // Reservations may hold three of these four items.
-        let outbox = Outbox::new(sink, 4, 4);
+        let outbox = Outbox::new(sink, 4, items(4));
         let (hanging, failing) = (DataTenantId::new_v7(), DataTenantId::new_v7());
         {
             let mut state = state.lock().expect("unpoisoned");
@@ -1295,7 +1572,10 @@ mod tests {
         let refused = outbox
             .reserve(1)
             .expect_err("in-flight and retrying work fill the share");
-        assert_eq!((refused.admitted, refused.limit), (3, 3));
+        assert_eq!(
+            (refused.admitted, refused.limit, refused.unit),
+            (3, 3, "items")
+        );
         outbox.stage(failing, 4_u32);
         outbox.stage(failing, 5_u32);
         assert_eq!(
@@ -1341,7 +1621,7 @@ mod tests {
         let _metrics = metrics::set_default_local_recorder(&metrics);
         let sink = MemorySink::default();
         let state = Arc::clone(&sink.state);
-        let outbox = Outbox::new(sink, 4, 4);
+        let outbox = Outbox::new(sink, 4, items(4));
         let tenant = DataTenantId::new_v7();
         state.lock().expect("unpoisoned").hanging.insert(tenant);
 
@@ -1362,9 +1642,9 @@ mod tests {
             "a full unreserved share refuses without waiting"
         );
         assert_eq!(
-            metrics.counter("outbox_events_lost_total"),
+            metrics.counter("outbox_events_lost_total{reason=shed}"),
             1,
-            "the refusal is counted"
+            "the refusal is counted as shed"
         );
 
         drop(unspent);
@@ -1421,7 +1701,11 @@ mod tests {
             .await;
         assert_eq!(lost, 3, "every unwritten item is reported lost");
         assert!(state.lock().expect("unpoisoned").written.is_empty());
-        assert_eq!(metrics.counter("outbox_events_lost_total"), 3, "lost once");
+        assert_eq!(
+            metrics.counter("outbox_events_lost_total{reason=shutdown}"),
+            3,
+            "lost once, at shutdown"
+        );
         assert_eq!(outbox.pending(), 0, "abandoned items are not pending");
         assert!(
             metrics.gauge("outbox_pending").abs() < f64::EPSILON,
@@ -1454,7 +1738,11 @@ mod tests {
         let (first, second) = tokio::join!(outbox.shutdown(deadline), outbox.shutdown(deadline));
         assert_eq!(first + second, 3, "the loss is reported by one caller");
         assert_eq!(first.min(second), 0, "the other caller reports zero");
-        assert_eq!(metrics.counter("outbox_events_lost_total"), 3, "lost once");
+        assert_eq!(
+            metrics.counter("outbox_events_lost_total{reason=shutdown}"),
+            3,
+            "lost once, at shutdown"
+        );
         assert_eq!(outbox.pending(), 0, "abandoned items are not pending");
         assert_eq!(outbox.admission.staged_reserved.load(Ordering::Acquire), 0);
         assert_eq!(outbox.admission.unreserved.load(Ordering::Acquire), 0);
@@ -1545,7 +1833,10 @@ mod tests {
         assert!(begun.await, "shutdown waits for the blocked write");
         outbox.stage(tenant, 3_u32);
         assert_eq!(outbox.pending(), 2, "the late item never entered the queue");
-        assert_eq!(metrics.counter("outbox_events_lost_total"), 1);
+        assert_eq!(
+            metrics.counter("outbox_events_lost_total{reason=shutdown}"),
+            1
+        );
 
         state.lock().expect("unpoisoned").hanging.clear();
         hang.notify_one();
@@ -1557,5 +1848,170 @@ mod tests {
         );
         assert_eq!(outbox.pending(), 0);
         assert!(metrics.gauge("outbox_pending").abs() < f64::EPSILON);
+    }
+
+    /// Large items shed on bytes before the item limit is reached, small ones
+    /// are still admitted in the bytes left, written items release their
+    /// bytes, and reservations are refused on bytes once reserved items hold
+    /// their byte share, while a spent slot always keeps its item.
+    ///
+    /// # Panics
+    /// Panics when an item is admitted past an unreserved byte limit, shed
+    /// within it, counted under another reason, or a reservation is admitted
+    /// or refused against the wrong byte share.
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_items_shed_on_bytes_before_items() {
+        let metrics = TestMetrics::default();
+        let _metrics = metrics::set_default_local_recorder(&metrics);
+        let sink = MemorySink::default();
+        let (hang, state) = (Arc::clone(&sink.hang), Arc::clone(&sink.state));
+        // Unreserved staging holds 100 bytes; reservations 300.
+        let outbox = Outbox::new(
+            sink,
+            4,
+            OutboxLimits {
+                items: 1_024,
+                bytes: 400,
+            },
+        );
+        let tenant = DataTenantId::new_v7();
+        state.lock().expect("unpoisoned").hanging.insert(tenant);
+
+        outbox.stage(tenant, 60_u32);
+        outbox.stage(tenant, 60_u32);
+        assert_eq!(
+            outbox.pending(),
+            1,
+            "the second large item is shed on bytes"
+        );
+        outbox.stage(tenant, 40_u32);
+        assert_eq!(outbox.pending(), 2, "a small item fits the bytes left");
+        assert_eq!(metrics.counter("outbox_events_lost_total{reason=shed}"), 1);
+
+        let reservation = outbox.reserve(2).expect("reserved bytes are free");
+        reservation.stage(tenant, 300_u32);
+        let full = outbox
+            .reserve(1)
+            .expect_err("reserved items hold the reserved byte share");
+        assert_eq!((full.admitted, full.limit, full.unit), (300, 300, "bytes"));
+        reservation.stage(tenant, 50_u32);
+        assert_eq!(
+            outbox.pending(),
+            4,
+            "a spent slot keeps its item past the share"
+        );
+        drop(reservation);
+
+        state.lock().expect("unpoisoned").hanging.clear();
+        hang.notify_one();
+        assert_eq!(outbox.settle(within(10)).await, 0);
+        assert_eq!(metrics.counter("outbox_items_written_total"), 4);
+        assert_eq!(metrics.counter("outbox_bytes_written_total"), 450);
+        assert_eq!(outbox.admission.unreserved_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(outbox.admission.reserved_bytes.load(Ordering::Acquire), 0);
+        outbox.stage(tenant, 100_u32);
+        outbox
+            .reserve(1)
+            .expect("written items release their bytes");
+        assert_eq!(outbox.settle(within(10)).await, 0);
+        assert_eq!(
+            metrics.counter("outbox_events_lost_total"),
+            1,
+            "nothing else was lost"
+        );
+    }
+
+    /// Shed records of one tenant collected by [`ShedRecords`]: the `shed`
+    /// count of every record, in order.
+    #[derive(Default)]
+    struct ShedRecords {
+        /// The `shed` field of each record.
+        counts: Mutex<Vec<u64>>,
+    }
+
+    /// Reads the `shed` field of an event.
+    struct ShedField<'a>(&'a mut Option<u64>);
+
+    impl tracing::field::Visit for ShedField<'_> {
+        /// Keeps the value of the `shed` field.
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "shed" {
+                *self.0 = Some(value);
+            }
+        }
+
+        /// Ignores every field not recorded as a `u64`.
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for ShedRecords {
+        /// Sees every event.
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        /// Assigns every span the same id; spans are not inspected.
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        /// Ignores span records.
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        /// Ignores span links.
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        /// Keeps the `shed` count of every event carrying one.
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut shed = None;
+            event.record(&mut ShedField(&mut shed));
+            if let Some(shed) = shed {
+                self.counts.lock().expect("unpoisoned").push(shed);
+            }
+        }
+
+        /// Ignores span entry.
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        /// Ignores span exit.
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A tenant shedding continuously writes one shed record per interval,
+    /// and shutdown records the rest, so the records' counts sum to the
+    /// `shed` loss counter.
+    ///
+    /// # Panics
+    /// Panics when more than one record is written within the interval, a
+    /// shed item is left unrecorded after shutdown, or the counts disagree.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shed_records_are_aggregated_per_tenant_and_interval() {
+        let metrics = TestMetrics::default();
+        let _metrics = metrics::set_default_local_recorder(&metrics);
+        let records = Arc::new(ShedRecords::default());
+        let _records = tracing::subscriber::set_default(Arc::clone(&records));
+        let sink = MemorySink::default();
+        let state = Arc::clone(&sink.state);
+        let outbox = Outbox::new(sink, 4, items(4));
+        let (tenant, other) = (DataTenantId::new_v7(), DataTenantId::new_v7());
+        state.lock().expect("unpoisoned").hanging.insert(tenant);
+        outbox.stage(tenant, 1_u32);
+        for _ in 0..5 {
+            outbox.stage(tenant, 2_u32);
+        }
+        outbox.stage(other, 3_u32);
+        assert_eq!(
+            *records.counts.lock().expect("unpoisoned"),
+            vec![1, 1],
+            "one record per tenant within the interval"
+        );
+
+        outbox.shutdown(Instant::now()).await;
+        let counts = records.counts.lock().expect("unpoisoned").clone();
+        assert_eq!(counts, vec![1, 1, 4], "shutdown records the rest");
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            metrics.counter("outbox_events_lost_total{reason=shed}")
+        );
     }
 }

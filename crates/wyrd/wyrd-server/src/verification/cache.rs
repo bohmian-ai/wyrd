@@ -337,17 +337,18 @@ impl VerifierCardCache {
 
     /// Listens for target invalidations from `postgres` until `shutdown`.
     ///
-    /// Targets serve only between a successful `LISTEN` and the next lost
-    /// connection; see [`crate::postgres::watch_channel`].
+    /// Targets serve only while the listener is subscribed and its heartbeat
+    /// answers, so a lost or silently stalled listener stops serving within
+    /// the heartbeat bound; see [`wyrd_sql::NotificationListener::watch`].
     pub async fn watch(&self, postgres: &wyrd_sql::WyrdPostgres, shutdown: CancellationToken) {
-        crate::postgres::watch_channel(
-            postgres,
-            TARGET_CHANNEL,
-            shutdown,
-            |live| self.reset(live),
-            |payload| self.invalidate(payload),
-        )
-        .await;
+        postgres
+            .listener(TARGET_CHANNEL)
+            .watch(
+                shutdown,
+                |live| self.reset(live),
+                |payload| self.invalidate(payload),
+            )
+            .await;
     }
 }
 

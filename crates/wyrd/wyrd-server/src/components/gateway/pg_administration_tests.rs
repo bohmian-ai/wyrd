@@ -877,8 +877,11 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     );
 
     settle_audit(&state).await;
-    let decisions = audit_decisions(&scribe, tenant);
-    let expected: Vec<(String, String)> = [
+    // Distinct callers' decisions use different Scribe lanes, so only the
+    // multiset of decisions is promised, not their cross-call commit order.
+    let mut decisions = audit_decisions(&scribe, tenant);
+    decisions.sort();
+    let mut expected: Vec<(String, String)> = [
         ("gateway.provider_credential.list", "denied"),
         ("gateway.provider_deployment.list", "denied"),
         ("gateway.provider_credential.put", "denied"),
@@ -889,6 +892,7 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     .into_iter()
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
+    expected.sort();
     assert_eq!(decisions, expected);
     settle_audit(&state).await;
 }
@@ -1736,13 +1740,16 @@ async fn gateway_apply_is_atomic_and_tenant_scoped() {
 
     settle_audit(&state).await;
     settle_audit(&keyless).await;
-    let applies = audit_decisions(&scribe, tenant)
+    // The reader's denial travels on its own call's lane, so compare outcomes
+    // without assuming cross-call commit order.
+    let mut applies = audit_decisions(&scribe, tenant)
         .into_iter()
         .filter(|(operation, _)| operation == "gateway.provider_deployments.apply")
         .map(|(_, outcome)| outcome)
         .collect::<Vec<_>>();
+    applies.sort();
     assert_eq!(
         applies,
-        ["allowed", "denied", "allowed", "allowed", "allowed"]
+        ["allowed", "allowed", "allowed", "allowed", "denied"]
     );
 }

@@ -335,6 +335,13 @@ pub struct ScribeRuntimeConfig {
     /// all of it, unreserved writes such as audit decisions are counted lost.
     #[serde(default = "default_outbox_capacity")]
     pub outbox_capacity: usize,
+    /// Most accounted bytes this process's Scribe outbox admits at once,
+    /// counting at least every captured payload and object a write holds.
+    /// The same three-quarter reservation share applies: unreserved writes
+    /// such as gateway captures are shed past a quarter of it, and Verifier
+    /// calls are refused once reserved writes hold the rest. Default 1 GiB.
+    #[serde(default = "default_outbox_bytes")]
+    pub outbox_bytes: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
     /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
@@ -1463,6 +1470,11 @@ fn default_outbox_capacity() -> usize {
     crate::scribe_outbox::SCRIBE_CAPACITY
 }
 
+/// Returns the default for [`ScribeRuntimeConfig::outbox_bytes`].
+fn default_outbox_bytes() -> usize {
+    crate::scribe_outbox::SCRIBE_BYTES
+}
+
 /// Bytes in one megabyte of the megabyte-valued Scribe size settings.
 const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
 
@@ -1505,6 +1517,7 @@ impl Default for ScribeRuntimeConfig {
             wal_io_threads: default_scribe_wal_io_threads(),
             ingest_request_bytes: default_ingest_request_bytes(),
             outbox_capacity: default_outbox_capacity(),
+            outbox_bytes: default_outbox_bytes(),
             mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
             max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
@@ -1565,6 +1578,9 @@ impl ScribeRuntimeConfig {
         }
         if self.outbox_capacity == 0 {
             return Err("scribe.outbox_capacity must be at least 1".to_owned());
+        }
+        if self.outbox_bytes == 0 {
+            return Err("scribe.outbox_bytes must be at least 1".to_owned());
         }
         if self
             .ingest_request_bytes

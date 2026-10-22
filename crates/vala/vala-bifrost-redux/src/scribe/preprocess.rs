@@ -134,6 +134,37 @@ pub(crate) struct PreparedAppend {
     pub prepared_at: Instant,
 }
 
+impl PreparedAppend {
+    /// The batch's logical slice-set digest, slice count, and row count, as
+    /// the shard computes them for the durable fence.
+    ///
+    /// Slices are folded in ordinal order through [`LogicalBatchDigest`], so
+    /// an honest retry reproduces the digest its first attempt fenced.
+    /// Returns `None` when the set is not exactly the ordinals `0..count` or a
+    /// count does not fit its field.
+    pub(crate) fn logical_identity(&self) -> Option<([u8; 32], u32, u64)> {
+        let PreparedSliceSet::Materialized(slices) = &self.slices;
+        let mut ordered: Vec<&PreparedSlice> = slices.iter().collect();
+        ordered.sort_unstable_by_key(|slice| slice.id.slice_index);
+        let mut logical = LogicalBatchDigest::new();
+        let mut rows = 0_u64;
+        for (ordinal, slice) in ordered.iter().enumerate() {
+            if usize::try_from(slice.id.slice_index).ok()? != ordinal {
+                return None;
+            }
+            let wal = &slice.wal_append;
+            logical.push_slice(
+                slice.id.slice_index,
+                &wal.schema_fingerprint,
+                &wal.logical_data_digest,
+                wal.logical_data_len,
+            );
+            rows = rows.checked_add(u64::try_from(slice.rows.num_rows()).ok()?)?;
+        }
+        Some((logical.finish(), u32::try_from(ordered.len()).ok()?, rows))
+    }
+}
+
 /// Closed prepared-slice source used by the shard owner.
 #[derive(Debug)]
 pub(crate) enum PreparedSliceSet {

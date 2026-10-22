@@ -605,6 +605,7 @@ impl VerificationFixture {
                 status: CardStatus::Pending,
                 spec_hash: "spec-hash",
                 artifact_hash: None,
+                reconcile_delay: std::time::Duration::ZERO,
             },
         )
         .await

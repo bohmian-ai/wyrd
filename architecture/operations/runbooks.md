@@ -128,7 +128,9 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
    returns toward zero. Scribe's batch-id fence absorbs a slice whose earlier
    acknowledgement was lost, so it is never retained twice.
 3. A terminal rejection is logged, counted in
-   `outbox_events_lost_total{outbox="scribe"}`, and consumed. Writes Scribe has
+   `outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and consumed.
+   Writes shed at the outbox's `scribe.outbox_capacity` or
+   `scribe.outbox_bytes` limit are counted with `reason="shed"`. Writes Scribe has
    not acknowledged are also lost on abrupt process death or when graceful
    shutdown reaches its deadline; the shutdown loss is counted. Record a
    nonzero count with its window as an audit gap. Avoid restarting a replica

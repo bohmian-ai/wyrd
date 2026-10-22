@@ -15,7 +15,9 @@ pub mod queries;
 pub mod row_types;
 
 pub use postgres::ValaPostgres;
-pub use wyrd_sql::{MigrationLease, OperatorPool, RowScope, TenantConn, error::SqlError};
+pub use wyrd_sql::{
+    MigrationLease, NotificationListener, OperatorPool, RowScope, TenantConn, error::SqlError,
+};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";

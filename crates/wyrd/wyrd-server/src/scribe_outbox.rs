@@ -17,10 +17,14 @@
 //!
 //! A retryable refusal fails the write, so the outbox retries the identical
 //! slice and every frame keeps its batch id; Scribe's batch-id dedup absorbs
-//! the frames it already accepted. A terminal refusal, a projection failure,
-//! or a write for a process that can reach no Scribe is logged, counted in
-//! `outbox_events_lost_total{outbox="scribe"}`, and consumed, so later writes
-//! for the tenant continue. Work held here is process memory: abrupt process
+//! the frames it already accepted. A terminal refusal or a projection
+//! failure is logged, counted in
+//! `outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and
+//! consumed, and a write for a process that can reach no Scribe likewise with
+//! `reason="unreachable"`, so later writes for the tenant continue. Each
+//! tenant's writes spread over [`SCRIBE_LANES`] lanes by request, so one
+//! call's decision and capture share a slice while different calls are
+//! written concurrently; Verifier evidence keeps one lane and its order. Work held here is process memory: abrupt process
 //! death or the shutdown deadline loses it without changing the operation
 //! that produced it.
 //!
@@ -39,6 +43,7 @@
 //! outbox.
 
 use std::collections::{BTreeSet, HashMap};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,7 +73,7 @@ use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, SpansTable,
 };
-use wyrd_runtime::outbox::{Outbox, OutboxSink, Reservation, count_lost};
+use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
@@ -79,6 +84,7 @@ use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
+use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
@@ -91,14 +97,24 @@ use crate::verification::submissions::SubmissionSink;
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
 
-/// Most tenants whose slices are written at once.
+/// Most slices written at once, across every tenant and lane.
 const SCRIBE_WRITERS: usize = 4;
+
+/// Lanes each tenant's Scribe writes spread over; see
+/// [`ScribeSink::lane`].
+const SCRIBE_LANES: usize = 4;
 
 /// Default of `scribe.outbox_capacity`: the most writes the process Scribe
 /// outbox admits at once, queued, retrying, or in flight. Every write's rows
 /// are bounded by its producer's input limits, so this also bounds the
 /// outbox's memory.
 pub(crate) const SCRIBE_CAPACITY: usize = 65_536;
+
+/// Default of `scribe.outbox_bytes`: the most accounted bytes the process
+/// Scribe outbox admits at once, as [`ScribeSink::weight`]. A quarter of it,
+/// 256 MiB, holds unreserved writes such as gateway captures, which bounds
+/// the captured content a saturated gateway keeps in memory.
+pub(crate) const SCRIBE_BYTES: usize = 1 << 30;
 
 /// Longest a peer Scribe may take to acknowledge one frame.
 ///
@@ -662,7 +678,7 @@ impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
     /// drops and counts it lost when every permit is held.
     fn stage(&self, route: wyrd_telemetry::TenantSpanRoute, span: ResourceSpans) {
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-            count_lost::<ScribeSink>(1);
+            count_lost::<ScribeSink>(1, LossReason::Shed);
             return;
         };
         self.outbox.stage(
@@ -692,6 +708,14 @@ pub struct ScribeSink {
 }
 
 impl ScribeSink {
+    /// The default outbox limits, [`SCRIBE_CAPACITY`] writes and
+    /// [`SCRIBE_BYTES`] bytes, for outboxes built without a configuration.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) const DEFAULT_LIMITS: OutboxLimits = OutboxLimits {
+        items: SCRIBE_CAPACITY,
+        bytes: SCRIBE_BYTES,
+    };
+
     /// Starts an outbox submitting along `route`, or dropping every write
     /// when `route` is `None`, at the default capacity.
     ///
@@ -705,12 +729,13 @@ impl ScribeSink {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
-        Self::bounded_outbox(route, request_bytes, SCRIBE_CAPACITY, None)
+        Self::bounded_outbox(route, request_bytes, Self::DEFAULT_LIMITS, None)
     }
 
-    /// Starts an outbox like [`Self::outbox`] admitting at most `capacity`
-    /// writes (`scribe.outbox_capacity`) and recording acknowledged grouped
-    /// activity through `groups`, when given.
+    /// Starts an outbox like [`Self::outbox`] admitting at most `limits`
+    /// writes and bytes (`scribe.outbox_capacity` and `scribe.outbox_bytes`)
+    /// and recording acknowledged grouped activity through `groups`, when
+    /// given.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
@@ -719,7 +744,7 @@ impl ScribeSink {
     pub(crate) fn bounded_outbox(
         route: Option<ScribeRoute>,
         request_bytes: usize,
-        capacity: usize,
+        limits: OutboxLimits,
         groups: Option<WyrdPostgres>,
     ) -> Arc<ScribeOutbox> {
         Outbox::new(
@@ -730,7 +755,7 @@ impl ScribeSink {
                 groups,
             },
             SCRIBE_WRITERS,
-            capacity,
+            limits,
         )
     }
 
@@ -746,7 +771,7 @@ impl ScribeSink {
         Self::bounded_outbox(
             Some(ScribeRoute::Local(scribe)),
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            SCRIBE_CAPACITY,
+            Self::DEFAULT_LIMITS,
             groups,
         )
     }
@@ -1259,6 +1284,50 @@ impl OutboxSink for ScribeSink {
     type Item = ScribeWrite;
     type Error = ScribeRefusal;
     const NAME: &'static str = "scribe";
+    /// Lanes one tenant's writes spread over, so its captures and decisions
+    /// are written by several slices at once instead of waiting on one
+    /// slice's acknowledgements.
+    const LANES: usize = SCRIBE_LANES;
+
+    /// A gateway capture and every audit decision lane by their request
+    /// correlation ID, so one call's decision and capture share a lane and
+    /// different calls spread. Every other write takes lane 0: Verifier
+    /// inputs and results keep the arrival order the group read orders
+    /// executions by, and server spans need no spread.
+    fn lane(item: &ScribeWrite) -> u64 {
+        let request_id = match item {
+            ScribeWrite::Capture(capture) => Some(capture.request_id()),
+            ScribeWrite::Audit(Some(batch)) => batch
+                .column_by_name("request_id")
+                .and_then(|column| column.as_string_opt::<i32>())
+                .filter(|column| !column.is_empty() && column.is_valid(0))
+                .map(|column| column.value(0)),
+            _ => None,
+        };
+        request_id.map_or(0, |request_id| {
+            let mut hasher = DefaultHasher::new();
+            request_id.hash(&mut hasher);
+            hasher.finish()
+        })
+    }
+
+    /// Captured content bytes for a capture, the encoded size of a server
+    /// span, and the Arrow memory of every projected row batch.
+    fn weight(item: &ScribeWrite) -> usize {
+        match item {
+            ScribeWrite::Audit(batch) => {
+                batch.as_ref().map_or(0, RecordBatch::get_array_memory_size)
+            }
+            ScribeWrite::Capture(capture) => capture.content_bytes(),
+            ScribeWrite::Result { payload, .. } => payload
+                .batches()
+                .iter()
+                .map(|batch| batch.batch.get_array_memory_size())
+                .sum(),
+            ScribeWrite::ExecutionInputs { row, .. } => row.batch.get_array_memory_size(),
+            ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
+        }
+    }
 
     /// Writes one tenant's slice as destination frames: every detail frame,
     /// then, once all are acknowledged, every result summary frame.
@@ -1295,7 +1364,7 @@ impl OutboxSink for ScribeSink {
         items: &[ScribeWrite],
     ) -> Result<(), ScribeRefusal> {
         let Some(route) = &self.route else {
-            count_lost::<Self>(items.len());
+            count_lost::<Self>(items.len(), LossReason::Unreachable);
             tracing::warn!(outbox = Self::NAME, %tenant, lost = items.len(), "this process reaches no Scribe; writes are dropped");
             return Ok(());
         };
@@ -1309,7 +1378,7 @@ impl OutboxSink for ScribeSink {
                 .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;
-        count_lost::<Self>(lost.len());
+        count_lost::<Self>(lost.len(), LossReason::Rejected);
         for (index, item) in items.iter().enumerate() {
             if let ScribeWrite::ExecutionInputs {
                 queued: Some((reserved, submission)),
@@ -1326,7 +1395,7 @@ impl OutboxSink for ScribeSink {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1340,11 +1409,12 @@ mod tests {
     use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
     use wyrd_runtime::audit::AuditStage;
+    use wyrd_runtime::outbox::OutboxSink as _;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
-    use wyrd_spec::gateway::GatewayCaptureMode;
+    use wyrd_spec::gateway::{GatewayCaptureMode, GatewayPayloadField};
     use wyrd_spec::ids::{CardUid, ExecutionId, FeatureName};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
@@ -1369,7 +1439,7 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        FRAMES_IN_FLIGHT, Outbox, SCRIBE_CAPACITY, SCRIBE_WRITERS, ScribeOutbox, ScribePeers,
+        FRAMES_IN_FLIGHT, Outbox, SCRIBE_LANES, SCRIBE_WRITERS, ScribeOutbox, ScribePeers,
         ScribeRefusal, ScribeRoute, ScribeSink, ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS,
         frame_budget,
     };
@@ -1519,12 +1589,14 @@ mod tests {
     /// naming its own admitting request, and the summary frame is submitted
     /// last although it was staged first. Every frame names the no-caller
     /// marker as its transport principal; the verified pairs live on the rows.
-    /// The capture frames share a phase and arrive in either order.
+    /// The capture frames share a phase and arrive in either order. The
+    /// slice is written straight through the sink, since the outbox spreads
+    /// different calls over lanes.
     ///
     /// # Panics
     ///
-    /// Panics when the frames, the summary's position, rows, requests, or
-    /// attribution differ.
+    /// Panics when the write fails or the frames, the summary's position,
+    /// rows, requests, or attribution differ.
     #[tokio::test]
     async fn writes_group_by_destination_whatever_their_attribution() {
         let scribe = Arc::new(RecordingScribe::default());
@@ -1532,20 +1604,26 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let attribution = background();
         let subjects = [uid(), uid(), uid()];
-        for subject in &subjects {
-            outbox.stage(tenant, result(subject, attribution));
-        }
+        let mut slice: Vec<ScribeWrite> = subjects
+            .iter()
+            .map(|subject| result(subject, attribution))
+            .collect();
         let callers = [background(), background()];
         for caller in callers {
             let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
             facts.tenant = tenant;
             facts.attribution = caller;
-            outbox.stage(
-                tenant,
-                CallCapture::from_facts(facts).expect("metadata projects"),
+            slice.push(
+                CallCapture::from_facts(facts)
+                    .expect("metadata projects")
+                    .into(),
             );
         }
-        settle(&outbox).await;
+        outbox
+            .sink()
+            .write(tenant, &slice)
+            .await
+            .expect("the slice is written");
 
         let received = scribe.received();
         let mut frames = received
@@ -1589,10 +1667,17 @@ mod tests {
         );
     }
 
-    /// One allowed decision for `operation`, attributed to a fresh principal.
+    /// One allowed decision for `operation` in a fresh request, attributed
+    /// to a fresh principal.
     fn decision(operation: &str) -> AuditEvent {
+        decision_in(RequestId::now_v7(), operation)
+    }
+
+    /// One allowed decision for `operation` made while serving `request`,
+    /// attributed to a fresh principal.
+    fn decision_in(request: RequestId, operation: &str) -> AuditEvent {
         AuditEvent::new(
-            RequestId::now_v7(),
+            request,
             None,
             operation.to_owned(),
             "bifrost".to_owned(),
@@ -1604,8 +1689,48 @@ mod tests {
         )
     }
 
+    /// Proves one gateway call's audit decision and capture share a Scribe
+    /// lane while different calls spread over several, writes that carry no
+    /// request take lane 0, and a capture weighs at least its captured
+    /// payload text while a metadata capture holds none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a call's writes split across lanes, calls do not spread,
+    /// or a weight differs.
+    #[test]
+    fn a_calls_writes_share_a_lane_and_calls_spread() {
+        let selected = facts(policy(
+            GatewayCaptureMode::Payload,
+            &[GatewayPayloadField::Request],
+        ));
+        let mut event = decision("gateway.chat");
+        event.request_id = selected.request_id.clone();
+        let call = CallCapture::from_facts(selected).expect("payload projects");
+        let content = call.content_bytes();
+        assert!(content > 0, "the selected request is accounted");
+        let call = ScribeWrite::from(call);
+        assert_eq!(
+            ScribeSink::lane(&call),
+            ScribeSink::lane(&ScribeWrite::from(event))
+        );
+        assert_eq!(ScribeSink::weight(&call), content);
+        assert_eq!(
+            ScribeSink::weight(&ScribeWrite::from(capture(DataTenantId::new_v7()))),
+            0
+        );
+
+        let lanes: BTreeSet<u64> = (0..64)
+            .map(|_| {
+                ScribeSink::lane(&ScribeWrite::from(decision("gateway.chat"))) % SCRIBE_LANES as u64
+            })
+            .collect();
+        assert!(lanes.len() > 1, "one tenant's calls spread over lanes");
+        assert_eq!(ScribeSink::lane(&ScribeWrite::Audit(None)), 0);
+    }
+
     /// Proves audit decisions stage through the [`AuditStage`] seam and frame
-    /// like every other write: each tenant slice's decisions share one
+    /// like every other write: one request's decisions share a lane and one
     /// `vala.system.audit_log` frame under the platform audit principal with
     /// no Card scope, the reserved system owner's decisions travel in their
     /// own frame, and every frame carries a v7 content identity.
@@ -1619,8 +1744,12 @@ mod tests {
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let audit: &dyn AuditStage = &*outbox;
         let tenant = DataTenantId::new_v7();
-        audit.stage(tenant, decision("bifrost.query.read_decision"));
-        audit.stage(tenant, decision("bifrost.record.write"));
+        let request = RequestId::now_v7();
+        audit.stage(
+            tenant,
+            decision_in(request.clone(), "bifrost.query.read_decision"),
+        );
+        audit.stage(tenant, decision_in(request, "bifrost.record.write"));
         audit.stage(DataTenantId::SYSTEM_OWNER, decision("platform.authorize"));
         settle(&outbox).await;
 
@@ -1644,22 +1773,28 @@ mod tests {
     /// Proves frames are sized by the bytes their rows hold, not by each
     /// one-row batch's allocated capacity: a slice of many small decisions
     /// travels as one frame, so it waits for one durable acknowledgement
-    /// rather than one per few hundred rows.
+    /// rather than one per few hundred rows. The slice is written straight
+    /// through the sink, since the outbox spreads different requests over
+    /// lanes.
     ///
     /// # Panics
     ///
-    /// Panics when the slice is split into more than one frame.
+    /// Panics when the write fails or the slice is split into more than one
+    /// frame.
     #[tokio::test]
     async fn a_slice_of_small_writes_travels_as_one_frame() {
         const DECISIONS: usize = 2_000;
         let scribe = Arc::new(RecordingScribe::default());
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
-        let audit: &dyn AuditStage = &*outbox;
         let tenant = DataTenantId::new_v7();
-        for _ in 0..DECISIONS {
-            audit.stage(tenant, decision("bifrost.record.write"));
-        }
-        settle(&outbox).await;
+        let slice: Vec<ScribeWrite> = (0..DECISIONS)
+            .map(|_| decision("bifrost.record.write").into())
+            .collect();
+        outbox
+            .sink()
+            .write(tenant, &slice)
+            .await
+            .expect("the slice is written");
 
         let frames: Vec<_> = scribe
             .audit_frames()
@@ -1914,7 +2049,7 @@ mod tests {
                 groups: None,
             },
             SCRIBE_WRITERS,
-            SCRIBE_CAPACITY,
+            ScribeSink::DEFAULT_LIMITS,
         )
     }
 

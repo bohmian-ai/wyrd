@@ -5,8 +5,12 @@
 //! [`MIN_SAMPLES`] observations (`TARGET` at or under 500 us), no refusal or
 //! invalid answer, one staged capture per arrival with no drop and no loss,
 //! and peak server memory below the limit less [`MEMORY_HEADROOM_BYTES`].
-//! Each step's drain and the run's shutdown get their own rows, each
-//! conditioned on loss-free completion. Every judgment collects all of its
+//! A row that meets all of that except that the outbox shed items at its
+//! staging limit is CAPTURE-SATURATED instead: not PASS and never `TARGET`,
+//! but no failure either; it reports the items shed, their fraction, and the
+//! durable capture throughput, and the report summary lists it. Loss for any
+//! other reason stays FAIL. Each step's drain and the run's shutdown get
+//! their own rows, each conditioned on completion with no loss but shedding. Every judgment collects all of its
 //! misses and is a pure function of the measurements, so the tests below pin
 //! every rule.
 
@@ -52,6 +56,10 @@ pub enum Verdict {
     OutsideSlo,
     /// A capacity window whose evidence cannot judge it.
     Invalid,
+    /// An overhead row that met every target except that the outbox shed
+    /// captures at its staging limit: the measured capture ceiling, neither
+    /// PASS nor a failure.
+    CaptureSaturated,
 }
 
 impl Verdict {
@@ -68,6 +76,7 @@ impl Verdict {
             Self::Sustainable => "SUSTAINABLE",
             Self::OutsideSlo => "OUTSIDE-SLO",
             Self::Invalid => "INVALID",
+            Self::CaptureSaturated => "CAPTURE-SATURATED",
         }
     }
 }
@@ -221,12 +230,18 @@ impl Report {
         }));
         let misses = overhead_misses(step, self.memory_limit_bytes);
         let evidence = overhead_evidence(step);
-        self.push(Row::judged(
-            step.name.clone(),
-            cells(step),
-            &misses,
-            evidence,
-        ));
+        let row = if misses.is_empty() && step.integrity.shed > 0.0 {
+            Row::new(
+                step.name.clone(),
+                cells(step),
+                Verdict::CaptureSaturated,
+                &misses,
+                evidence,
+            )
+        } else {
+            Row::judged(step.name.clone(), cells(step), &misses, evidence)
+        };
+        self.push(row);
         let drained = &step.drained;
         let drain_cells = format!(
             "{} | - | - | - | {:.2} cores | {:.2} GiB | -",
@@ -275,6 +290,23 @@ impl Report {
         ));
     }
 
+    /// The summary line naming every CAPTURE-SATURATED row, or `None` when
+    /// there is none.
+    pub fn saturated(&self) -> Option<String> {
+        let rows: Vec<&str> = self
+            .rows
+            .iter()
+            .filter(|row| row.verdict == Verdict::CaptureSaturated)
+            .map(|row| row.step.as_str())
+            .collect();
+        (!rows.is_empty()).then(|| {
+            format!(
+                "Capture-saturated rows (captures shed at the outbox limit; not PASS): {}",
+                rows.join(", ")
+            )
+        })
+    }
+
     /// Whether every judged row passed.
     pub fn passed(&self) -> bool {
         self.rows.iter().all(|row| !row.verdict.fails())
@@ -290,6 +322,9 @@ impl Report {
         let mut text = format!("# {}\n\n{}\n", self.title, self.header);
         for row in &self.rows {
             let _ = writeln!(text, "{}", row.render());
+        }
+        if let Some(saturated) = self.saturated() {
+            let _ = write!(text, "\n{saturated}\n");
         }
         for note in &self.notes {
             let _ = write!(text, "\n{note}\n");
@@ -344,8 +379,8 @@ pub fn overhead_misses(step: &Step, memory_limit: u64) -> Vec<String> {
 
 /// Every reason any window fails whatever its latency: a refusal or invalid
 /// answer, no arrivals, a capture count other than one staged per arrival,
-/// a dropped capture, a lost outbox item, a counter reset, or peak server
-/// memory within [`MEMORY_HEADROOM_BYTES`] of `memory_limit`.
+/// a dropped capture, an outbox item lost other than shed, a counter reset,
+/// or peak server memory within [`MEMORY_HEADROOM_BYTES`] of `memory_limit`.
 pub fn correctness_misses(step: &Step, memory_limit: u64) -> Vec<String> {
     let mut misses = Vec::new();
     let errors = step.samples.error_count();
@@ -355,7 +390,10 @@ pub fn correctness_misses(step: &Step, memory_limit: u64) -> Vec<String> {
     if step.samples.arrivals == 0 {
         misses.push("no arrivals".to_owned());
     }
-    misses.extend(integrity_misses(&step.integrity, step.samples.arrivals));
+    misses.extend(integrity_misses(
+        &step.integrity.without_shed(),
+        step.samples.arrivals,
+    ));
     if step.traffic.peak_memory_bytes + MEMORY_HEADROOM_BYTES >= memory_limit {
         misses.push(format!(
             "peak memory >= {} GiB",
@@ -392,13 +430,17 @@ pub fn integrity_misses(integrity: &Integrity, arrivals: u64) -> Vec<String> {
 }
 
 /// Every reason a step's drain fails: it did not settle within the limit,
-/// or its captures did not complete loss-free.
+/// or its captures did not complete with no loss but shedding, which the
+/// step's own row reports.
 pub fn drain_misses(step: &Step) -> Vec<String> {
     let mut misses = Vec::new();
     if step.drain.is_none() {
         misses.push("did not drain within 60 s".to_owned());
     }
-    misses.extend(integrity_misses(&step.integrity, step.samples.arrivals));
+    misses.extend(integrity_misses(
+        &step.integrity.without_shed(),
+        step.samples.arrivals,
+    ));
     misses
 }
 
@@ -457,15 +499,18 @@ fn cells(step: &Step) -> String {
 
 /// The server evidence of an overhead step: each point's overhead, server
 /// total, and upstream wait; a stream's client header and first-event
-/// latencies; the client-added means; and capture integrity.
+/// latencies; the client-added means; capture integrity; and, when the
+/// outbox shed, the shed count, fraction, and durable capture throughput.
+/// A step that shed never claims `TARGET`.
 fn overhead_evidence(step: &Step) -> String {
     let mut evidence = Vec::new();
     for point in points(step.stream) {
         let overhead = step.telemetry.histogram(point.overhead);
-        let target = overhead
-            .percentiles()
-            .p99
-            .is_some_and(|p99| p99 <= P99_TARGET_SECONDS);
+        let target = step.integrity.shed <= 0.0
+            && overhead
+                .percentiles()
+                .p99
+                .is_some_and(|p99| p99 <= P99_TARGET_SECONDS);
         evidence.push(format!(
             "{} overhead {}{}; server total {}; upstream {}",
             point.name,
@@ -503,6 +548,16 @@ fn overhead_evidence(step: &Step) -> String {
         ));
     }
     evidence.push(integrity(&step.integrity, samples.arrivals));
+    if step.integrity.shed > 0.0 {
+        let seconds = step.traffic.seconds.max(f64::EPSILON);
+        evidence.push(format!(
+            "{} shed at the outbox limit ({:.1}% of outbox items); durable capture {:.0} items/s, {:.1} MB/s",
+            step.integrity.shed,
+            step.integrity.shed_fraction() * 100.0,
+            step.durable.items / seconds,
+            step.durable.bytes / seconds / 1e6,
+        ));
+    }
     if let Some(gaps) = &step.profile_gaps {
         evidence.push(if gaps.is_empty() {
             "profile complete".to_owned()
@@ -513,11 +568,11 @@ fn overhead_evidence(step: &Step) -> String {
     evidence.join("; ")
 }
 
-/// Capture integrity as `staged s/a, dropped d, lost l`.
+/// Capture integrity as `staged s/a, dropped d, lost l (shed h)`.
 fn integrity(integrity: &Integrity, arrivals: u64) -> String {
     format!(
-        "captures staged {}/{arrivals}, dropped {}, lost {}, scribe writes {}",
-        integrity.staged, integrity.dropped, integrity.lost, integrity.written
+        "captures staged {}/{arrivals}, dropped {}, lost {} (shed {}), scribe writes {}",
+        integrity.staged, integrity.dropped, integrity.lost, integrity.shed, integrity.written
     )
 }
 
@@ -578,7 +633,10 @@ mod tests {
 
     use wyrd_testing::capacity::{Histogram, Telemetry, Usage};
 
-    use super::{Shutdown, Verdict, drain_misses, overhead_misses, shutdown_misses};
+    use super::{
+        OVERHEAD_HEADER, Report, Shutdown, Verdict, drain_misses, overhead_evidence,
+        overhead_misses, shutdown_misses,
+    };
     use crate::gateway::capacity::{
         Arrived, Backlog, Driven, Load, MIN_CALLS, Measured, Ownership, Slo,
     };
@@ -892,22 +950,22 @@ mod tests {
         offered[0].timed.outcome = Outcome::Refused("WYRD_GATEWAY_429_LIMIT_EXCEEDED".to_owned());
         let refused = window(50.0, offered);
         assert_eq!(verdict(&refused), Verdict::OutsideSlo);
-        assert!(capture_misses(&refused, LIMIT).is_empty());
+        assert!(capture_misses(&refused, LIMIT, false).is_empty());
         // Lost, dropped, unstaged, and misattributed captures each fail.
         let mut lost = window(50.0, calls(200, 0, false, 150));
         lost.integrity.lost = 1.0;
         lost.integrity.dropped = 1.0;
-        assert_eq!(capture_misses(&lost, LIMIT).len(), 2);
+        assert_eq!(capture_misses(&lost, LIMIT, false).len(), 2);
         let mut unstaged = window(50.0, calls(200, 0, false, 150));
         unstaged.integrity.staged -= 1.0;
-        assert_eq!(capture_misses(&unstaged, LIMIT).len(), 2);
+        assert_eq!(capture_misses(&unstaged, LIMIT, false).len(), 2);
         let mut moved = window(
             100.0,
             [calls(200, 0, false, 150), calls(200, 1, false, 150)].concat(),
         );
         moved.ownership[0].rows -= 1;
         moved.ownership[1].rows += 1;
-        assert_eq!(capture_misses(&moved, LIMIT).len(), 2);
+        assert_eq!(capture_misses(&moved, LIMIT, false).len(), 2);
         // The envelope reports the highest passing tested rate and the first
         // failing one, never an untested maximum.
         let (text, found) = envelope(
@@ -966,5 +1024,67 @@ mod tests {
         let mut lossy = window(50.0, calls(200, 0, false, 150));
         lossy.integrity.lost = 1.0;
         assert!(!recovered(&lossy).is_empty());
+    }
+
+    /// An overhead row whose only loss is shedding at the outbox limit is
+    /// CAPTURE-SATURATED with its ceiling figures, never TARGET, passes the
+    /// command, and is listed in the summary; any other loss beside it is
+    /// FAIL. Overload forgives shedding, including the durable rows it
+    /// removes, while a rate window and recovery still fail on it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row is classified the wrong way or its evidence omits
+    /// the ceiling.
+    #[test]
+    fn shed_only_rows_are_capture_saturated_and_other_loss_fails() {
+        let mut saturated = step(false, 1_000, 1_000.0, 0.0005, 0.0);
+        saturated.integrity.lost = 250.0;
+        saturated.integrity.shed = 250.0;
+        saturated.integrity.written_items = 1_750.0;
+        saturated.durable.items = 15_000.0;
+        saturated.durable.bytes = 30e6;
+        assert!(overhead_misses(&saturated, LIMIT).is_empty());
+        assert!(drain_misses(&saturated).is_empty());
+        let evidence = overhead_evidence(&saturated);
+        assert!(!evidence.contains("TARGET"), "{evidence}");
+        assert!(
+            evidence.contains(
+                "250 shed at the outbox limit (12.5% of outbox items); durable capture 1500 items/s, 3.0 MB/s"
+            ),
+            "{evidence}"
+        );
+        let mut report = Report::new("overhead".to_owned(), OVERHEAD_HEADER, LIMIT);
+        report.overhead(&saturated);
+        assert!(report.passed(), "saturation does not fail the command");
+        assert_eq!(
+            report.saturated().as_deref(),
+            Some("Capture-saturated rows (captures shed at the outbox limit; not PASS): 1 chat 16")
+        );
+
+        let mut rejected = saturated.clone();
+        rejected.integrity.lost += 1.0;
+        assert_eq!(overhead_misses(&rejected, LIMIT).len(), 1);
+        let mut report = Report::new("overhead".to_owned(), OVERHEAD_HEADER, LIMIT);
+        report.overhead(&rejected);
+        assert!(!report.passed(), "loss beside shedding fails");
+        assert_eq!(report.saturated(), None);
+        let mut slow = saturated;
+        slow.telemetry = step(false, 1_000, 1_000.0, 0.009, 20.0).telemetry;
+        let mut report = Report::new("overhead".to_owned(), OVERHEAD_HEADER, LIMIT);
+        report.overhead(&slow);
+        assert!(
+            !report.passed(),
+            "a saturated row that misses latency fails"
+        );
+
+        let mut shed = window(100.0, calls(200, 0, false, 150));
+        shed.integrity.lost = 30.0;
+        shed.integrity.shed = 30.0;
+        shed.ownership[0].rows -= 15;
+        assert!(capture_misses(&shed, LIMIT, true).is_empty());
+        assert!(!capture_misses(&shed, LIMIT, false).is_empty());
+        shed.integrity.lost += 1.0;
+        assert_eq!(capture_misses(&shed, LIMIT, true).len(), 1);
     }
 }

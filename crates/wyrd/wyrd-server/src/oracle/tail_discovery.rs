@@ -236,7 +236,8 @@ impl RegistryTailStreamDiscovery {
     /// Every answering participant's publication revision is kept, an empty
     /// capture included. The first failure in roster order decides the
     /// result, exactly as a sequential walk would; every capture another
-    /// listing retained is released before it returns.
+    /// listing retained is released before it returns, waiting no later than
+    /// `deadline`, after which an unreleased capture expires on its Scribe.
     ///
     /// # Errors
     /// Returns the first listing failure or [`TailReadError::StaleIdentity`]
@@ -247,6 +248,7 @@ impl RegistryTailStreamDiscovery {
         scribes: &[OracleQueryParticipant],
         query_id: uuid::Uuid,
         listed: Vec<Result<TailCapture, TailReadError>>,
+        deadline: Instant,
     ) -> Result<DiscoveredTail, TailReadError> {
         let mut routes = Vec::new();
         let mut revisions = Vec::with_capacity(scribes.len());
@@ -277,7 +279,7 @@ impl RegistryTailStreamDiscovery {
         let Some(error) = failure else {
             return Ok(DiscoveredTail { routes, revisions });
         };
-        self.release(binding, query_id, &retained).await;
+        self.release(binding, query_id, &retained, deadline).await;
         Err(error)
     }
 }
@@ -336,7 +338,9 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         {
             let listed =
                 Self::list_local(local, scribes, binding, scope, query_id, expires_at).await;
-            return self.admit(binding, scribes, query_id, listed).await;
+            return self
+                .admit(binding, scribes, query_id, listed, deadline)
+                .await;
         }
         let channels = self.channels_for(scribes)?;
         let listings = futures_util::future::join_all(scribes.iter().zip(channels).map(
@@ -359,18 +363,23 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
             scribe_count = scribes.len(),
             "listed frozen Scribe roster"
         );
-        self.admit(binding, scribes, query_id, listed).await
+        self.admit(binding, scribes, query_id, listed, deadline)
+            .await
     }
 
     /// Releases each capture on its Scribe concurrently, in-process for the
     /// local Scribe on a node with no peer channel.
     ///
-    /// A failed release is logged; the capture then expires at its deadline.
+    /// The peer RPCs share the query `deadline`: a Scribe that has not
+    /// answered by then is abandoned, cancelling its in-flight RPC. A failed
+    /// or abandoned release is logged; the capture then expires at that
+    /// deadline on its Scribe.
     async fn release(
         &self,
         binding: &TenantTableBinding,
         query_id: uuid::Uuid,
         captures: &[(OracleQueryParticipant, uuid::Uuid)],
+        deadline: Instant,
     ) {
         if captures.is_empty() {
             return;
@@ -396,7 +405,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 return;
             }
         };
-        futures_util::future::join_all(captures.iter().zip(channels).map(
+        let releases = futures_util::future::join_all(captures.iter().zip(channels).map(
             |((scribe, capture_id), channel)| async move {
                 let released = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel))
                     .release_capture(binding.clone(), query_id, *capture_id)
@@ -409,13 +418,205 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                     );
                 }
             },
-        ))
-        .await;
+        ));
+        if tokio::time::timeout_at(deadline.into(), releases)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                capture_count = captures.len(),
+                "Scribe capture release reached the query deadline"
+            );
+        }
     }
 
     /// Injects or clears the private discovery outage used by test journeys.
     #[cfg(feature = "test-support")]
     fn set_unavailable_for_test(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::Release);
+    }
+}
+
+/// Proves retained-capture cleanup settles by the query deadline.
+///
+/// A real mutually authenticated loopback Scribe, issued by the test peer CA,
+/// accepts every `release_capture` call and never answers it. Admission then
+/// fails after one capture was retained, and its cleanup release, like the
+/// release when live routes drop, must still return by the original query
+/// deadline. The Scribe's counter shows each release reached the peer, and the
+/// unanswered capture is left to its own expiry there.
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+    use vala_bifrost_redux::oracle::{OracleQueryParticipant, TailStreamDiscovery as _};
+    use vala_bifrost_redux::scribe::tail_rpc::{TailCapture, TailReadError};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::vala::api::{
+        ClusterCapabilities, ClusterRole, NodeId, ScribeCapabilitiesV1, TenantTableBinding,
+    };
+    use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
+    use wyrd_tonic::tonic::{Request, Response, Status};
+    use wyrd_tonic::wyrd::v1::scribe_tail_service_server::{
+        ScribeTailService, ScribeTailServiceServer,
+    };
+    use wyrd_tonic::wyrd::v1::{
+        ListActiveStreamsRequest, ListActiveStreamsResponse, ReleaseTailCaptureRequest,
+        ReleaseTailCaptureResponse,
+    };
+
+    use super::RegistryTailStreamDiscovery;
+
+    /// A peer Scribe whose release RPC is received and never answered.
+    #[derive(Clone, Default)]
+    struct StalledRelease {
+        /// Release calls received.
+        received: Arc<AtomicUsize>,
+    }
+
+    #[wyrd_tonic::tonic::async_trait]
+    impl ScribeTailService for StalledRelease {
+        /// Refuses listing; the proof drives admission with a supplied capture.
+        ///
+        /// # Errors
+        ///
+        /// Always returns an unimplemented status.
+        async fn list_active_streams(
+            &self,
+            _request: Request<ListActiveStreamsRequest>,
+        ) -> Result<Response<ListActiveStreamsResponse>, Status> {
+            Err(Status::unimplemented(
+                "listing is not served by this fixture",
+            ))
+        }
+
+        /// Counts the release and never returns.
+        ///
+        /// # Errors
+        ///
+        /// Never returns.
+        async fn release_capture(
+            &self,
+            _request: Request<ReleaseTailCaptureRequest>,
+        ) -> Result<Response<ReleaseTailCaptureResponse>, Status> {
+            self.received.fetch_add(1, Ordering::AcqRel);
+            std::future::pending().await
+        }
+    }
+
+    /// Serves `service` over mutual TLS under `ca` on a loopback port and
+    /// returns the Scribe participant answering there.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the listener, leaf, or TLS server cannot start.
+    async fn serve_scribe(ca: &BifrostPeerCa, service: StalledRelease) -> OracleQueryParticipant {
+        let leaf = ca.issue_leaf("scribe").expect("peer leaf");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _)| stream);
+            }
+        };
+        let server = wyrd_tonic::server::mutual_tls_server(
+            wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+                leaf.certificate_pem().as_bytes(),
+                leaf.private_key_pem().as_bytes(),
+                ca.ca_certificate_pem().as_bytes(),
+            ),
+        )
+        .expect("mutual TLS server builds");
+        tokio::spawn(
+            server
+                .clone()
+                .add_service(ScribeTailServiceServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        OracleQueryParticipant {
+            node_id: NodeId::new(uuid::Uuid::now_v7()),
+            endpoint: format!("https://127.0.0.1:{port}"),
+            role: ClusterRole::Scribe,
+            fencing_token: 1,
+            capabilities: ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
+                tail_protocol_version: 1,
+            }),
+        }
+    }
+
+    /// Proves a stalled release cannot outlive the query: one peer capture
+    /// was retained, another listing failed, and the retaining Scribe never
+    /// answers its release, yet admission refuses with the listing failure by
+    /// the original deadline, and a later detached release is bounded the
+    /// same way.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the release is never sent, admission does not return the
+    /// listing failure, or either cleanup outlives its deadline.
+    #[tokio::test]
+    async fn a_stalled_release_settles_by_the_query_deadline() {
+        let ca = BifrostPeerCa::generate("scribe.peer.test").expect("peer CA");
+        let peer = StalledRelease::default();
+        let retaining = serve_scribe(&ca, peer.clone()).await;
+        let mut failed = retaining.clone();
+        failed.node_id = NodeId::new(uuid::Uuid::now_v7());
+        let leaf = ca.issue_leaf("oracle").expect("oracle leaf");
+        let discovery = RegistryTailStreamDiscovery::new(
+            Some(BifrostPeerTls::new(
+                ca.ca_certificate_pem().as_bytes().to_vec(),
+                ca.server_name().to_owned(),
+                leaf.certificate_pem().as_bytes().to_vec(),
+                secrecy::SecretString::from(leaf.private_key_pem().to_owned()),
+            )),
+            None,
+        );
+        let binding = TenantTableBinding {
+            tenant_id: DataTenantId::new_v7(),
+            namespace: "traces".to_owned(),
+            table: "spans".to_owned(),
+        };
+        let query_id = uuid::Uuid::now_v7();
+        let capture_id = uuid::Uuid::now_v7();
+        let bound = Duration::from_secs(5);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let admitted = tokio::time::timeout(
+            bound,
+            discovery.admit(
+                &binding,
+                &[retaining.clone(), failed],
+                query_id,
+                vec![
+                    Ok(TailCapture {
+                        capture_id: Some(capture_id),
+                        streams: Vec::new(),
+                        publication_revision: 0,
+                    }),
+                    Err(TailReadError::Unavailable {
+                        detail: "fixture listing failure".to_owned(),
+                    }),
+                ],
+                deadline,
+            ),
+        )
+        .await
+        .expect("admission settles by the query deadline");
+        assert!(matches!(admitted, Err(TailReadError::Unavailable { .. })));
+        assert_eq!(peer.received.load(Ordering::Acquire), 1);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        tokio::time::timeout(
+            bound,
+            discovery.release(&binding, query_id, &[(retaining, capture_id)], deadline),
+        )
+        .await
+        .expect("a detached release settles by the query deadline");
+        assert_eq!(peer.received.load(Ordering::Acquire), 2);
     }
 }

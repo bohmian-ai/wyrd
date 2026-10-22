@@ -77,6 +77,7 @@ pub fn setup_prompt(release: &str) -> String {
     format!("# Wyrd {release} setup\n\n{SETUP_PROMPT}")
 }
 
+/// Unit checks of the release-labelled setup prompt projection.
 #[cfg(test)]
 mod tests {
     use super::setup_prompt;

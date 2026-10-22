@@ -265,29 +265,43 @@ pub struct BifrostCatalog {
     metadata_cache: mini_moka::sync::Cache<String, TableMetadataRef>,
     /// Registrations this node has already read, by tenant and table name.
     ///
-    /// A registration row is immutable once written: its UID is minted once,
-    /// `(tenant, fqn)` is unique, and no production path updates or deletes
-    /// it. Only found rows are cached, so a table registered later is still
+    /// A registration's UID is minted once and `(tenant, fqn)` is unique; its
+    /// fingerprint and layout change only with a committed revision, after
+    /// which [`BifrostCatalog::evict_committed_revision`] drops the entry.
+    /// Only found rows are cached, so a table registered later is still
     /// seen on its first lookup. One control-row read fills the UID,
     /// fingerprint, and layout every write and query resolves. Grows with
     /// registered tables, never with writes or queries.
     registrations: Arc<RwLock<HashMap<(DataTenantId, String), CachedRegistration>>>,
-    /// Registered Iceberg schemas this node has already loaded, by tenant and
-    /// table name.
+    /// Committed revisions this node has already loaded, by tenant and table
+    /// name.
     ///
-    /// The schema is the field-id authority Scribe stamps into every Parquet
-    /// object. A registered table's schema never evolves and its registration
-    /// is never dropped, so a loaded schema stays authoritative for the life
-    /// of the node. Grows with registered tables, never with writes.
-    registered_schemas: Arc<RwLock<RegisteredSchemas>>,
+    /// The revision is what new admission binds: its schema is the field-id
+    /// authority Scribe stamps into every Parquet object. An entry stays until
+    /// [`BifrostCatalog::evict_committed_revision`] drops it after a revision
+    /// commits; batches already accepted are unaffected because each carries
+    /// its own revision. Grows with registered tables, never with writes.
+    committed_revisions: Arc<RwLock<CommittedRevisions>>,
     /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
     /// is listening for invalidations.
     cut_cache: Arc<CutCache>,
 }
 
-/// Registered Iceberg schemas a node has loaded, keyed by tenant and table
-/// name; the field-id authority behind [`BifrostCatalog`]'s schema cache.
-type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<spec::Schema>>;
+/// Committed revisions a node has loaded, keyed by tenant and table name.
+type CommittedRevisions = HashMap<(DataTenantId, String), Arc<CommittedRevision>>;
+
+/// The committed physical revision new admission binds for one table.
+#[derive(Debug)]
+pub struct CommittedRevision {
+    /// Schema and sort-order revision accepted batches are bound to.
+    pub revision: crate::catalog::LayoutRevision,
+    /// Default partition-spec id accepted batches are partitioned under.
+    pub spec_id: i32,
+    /// Committed Iceberg schema, the field-id authority Scribe stamps.
+    pub schema: Arc<spec::Schema>,
+    /// Layout the revision declares, rebuilt from the Iceberg metadata.
+    pub layout: PhysicalLayout,
+}
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
 ///
@@ -798,7 +812,7 @@ impl BifrostCatalog {
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
             registrations: Arc::default(),
-            registered_schemas: Arc::default(),
+            committed_revisions: Arc::default(),
             cut_cache: Arc::default(),
         })
     }
@@ -1328,46 +1342,103 @@ impl BifrostCatalog {
         Ok(self.registration(table, tenant).await?.table_uid)
     }
 
-    /// Return the registered Iceberg schema of one tenant/logical table.
+    /// Return the committed revision new admission binds for one table.
     ///
     /// The registered table, not any declaration, assigns every physical field
-    /// id, nested and managed fields included; Scribe stamps exactly these ids
-    /// into the objects it writes so Forge and Oracle resolve its columns by
-    /// the table's own numbering. Answers from the node's cache when this
-    /// table was loaded before, and otherwise loads the tenant-bound Iceberg
-    /// table once and caches its current schema.
+    /// id, nested and managed fields included; Scribe stamps exactly the
+    /// committed schema's ids into the objects it writes so Forge and Oracle
+    /// resolve its columns by the table's own numbering. Answers from the
+    /// node's cache when this table was loaded before, and otherwise loads the
+    /// tenant-bound Iceberg table once and caches its current revision.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
-    /// binding cannot be resolved, and the Iceberg error when the physical
-    /// table cannot be loaded.
+    /// binding cannot be resolved, the Iceberg error when the physical table
+    /// cannot be loaded, and [`BifrostCatalogError::MetadataMismatch`] when
+    /// the committed revision does not rebuild a valid layout.
     ///
     /// # Panics
     /// Panics only if a thread panicked while holding the cache lock.
-    pub async fn registered_schema(
+    pub async fn committed_revision(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<Arc<spec::Schema>, BifrostCatalogError> {
+    ) -> Result<Arc<CommittedRevision>, BifrostCatalogError> {
         let key = (tenant, table.fqn());
         let cached = self
-            .registered_schemas
+            .committed_revisions
             .read()
-            .expect("the registered schema cache lock is never poisoned")
+            .expect("the committed revision cache lock is never poisoned")
             .get(&key)
             .map(Arc::clone);
-        if let Some(schema) = cached {
-            return Ok(schema);
+        if let Some(revision) = cached {
+            return Ok(revision);
         }
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let loaded = self.catalog.load_table(&binding.table_ident()).await?;
-        let schema = Arc::clone(loaded.metadata().current_schema());
-        self.registered_schemas
+        let metadata = loaded.metadata();
+        let revision = crate::catalog::LayoutRevision::current(metadata)
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
+        let spec_id = metadata.default_partition_spec_id();
+        let (layout, schema) = PhysicalLayout::of_iceberg(&key.1, metadata, revision, spec_id)
+            .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))?;
+        let committed = Arc::new(CommittedRevision {
+            revision,
+            spec_id,
+            schema,
+            layout,
+        });
+        self.committed_revisions
             .write()
-            .expect("the registered schema cache lock is never poisoned")
-            .insert(key, Arc::clone(&schema));
-        Ok(schema)
+            .expect("the committed revision cache lock is never poisoned")
+            .insert(key, Arc::clone(&committed));
+        Ok(committed)
+    }
+
+    /// Rebuilds the layout one retained revision of a table declares.
+    ///
+    /// Seal, staged recovery, and publication call this with the revision a
+    /// batch was accepted under, so the batch is written exactly as accepted
+    /// whatever the table's current revision is. See
+    /// [`PhysicalLayout::of_iceberg`].
+    ///
+    /// # Errors
+    /// Returns the Iceberg error when the physical table cannot be loaded and
+    /// [`BifrostCatalogError::MetadataMismatch`] when the revision is not
+    /// retained or does not rebuild a valid layout.
+    pub async fn retained_layout(
+        &self,
+        binding: &TenantTableBinding,
+        revision: crate::catalog::LayoutRevision,
+        spec_id: i32,
+    ) -> Result<PhysicalLayout, BifrostCatalogError> {
+        let loaded = self.catalog.load_table(&binding.table_ident()).await?;
+        PhysicalLayout::of_iceberg(
+            &binding.table_ref.fqn(),
+            loaded.metadata(),
+            revision,
+            spec_id,
+        )
+        .map(|(layout, _)| layout)
+        .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))
+    }
+
+    /// Drops this node's cached registration and committed revision of one
+    /// table, so the next admission reads the revision committed since.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding a cache lock.
+    pub fn evict_committed_revision(&self, table: &TableRef, tenant: DataTenantId) {
+        let key = (tenant, table.fqn());
+        self.committed_revisions
+            .write()
+            .expect("the committed revision cache lock is never poisoned")
+            .remove(&key);
+        self.registrations
+            .write()
+            .expect("the registration cache lock is never poisoned")
+            .remove(&key);
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.

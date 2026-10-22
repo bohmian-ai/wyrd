@@ -208,25 +208,31 @@ impl ScribeImpl {
                             ),
                         ))
                     },
-                    |definition| scheme_of(&(definition.physical_layout)()),
+                    |definition| {
+                        scheme_of(
+                            &(definition.physical_layout)(),
+                            crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
+                        )
+                    },
                 )?,
                 registered_schema: None,
             });
         };
-        let (registered_fingerprint, layout) = catalog
+        let (registered_fingerprint, _) = catalog
             .table_registration(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
-        let registered_schema = catalog
-            .registered_schema(&frame.table, frame.authenticated_tenant)
+        let committed = catalog
+            .committed_revision(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
         Ok(LogicalFrameContract {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
-            partition_scheme: scheme_of(&layout)?,
-            registered_schema: Some(registered_schema),
+            partition_scheme: scheme_of(&committed.layout.to_wire(), committed.spec_id)?
+                .with_revision(committed.revision),
+            registered_schema: Some(Arc::clone(&committed.schema)),
         })
     }
 
@@ -761,22 +767,21 @@ impl ScribeImpl {
     }
 }
 
-/// Builds the partition scheme new admission writes a registered layout under.
-///
-/// Every table is admitted under its initial partition spec.
+/// Builds the partition scheme new admission writes `layout` under `spec_id`.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when the registered layout's partition
-/// declaration does not form a scheme, which a catalog-resolved layout never
-/// does.
+/// Returns [`ScribeError::Internal`] when the layout's partition declaration
+/// does not form a scheme, which a catalog-resolved layout never does.
 fn scheme_of(
     layout: &wyrd_spec::vala::api::PhysicalLayoutWire,
+    spec_id: i32,
 ) -> Result<crate::catalog::PartitionScheme, ScribeError> {
-    crate::catalog::PartitionScheme::of_wire(layout, crate::catalog::INITIAL_PARTITION_SPEC_ID)
-        .map_err(|error| ScribeError::Internal {
+    crate::catalog::PartitionScheme::of_wire(layout, spec_id).map_err(|error| {
+        ScribeError::Internal {
             detail: format!("registered partition layout is invalid: {error}"),
-        })
+        }
+    })
 }
 
 /// Preserves caller-actionable catalog failures across Scribe's private boundary.

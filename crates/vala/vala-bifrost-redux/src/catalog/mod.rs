@@ -34,13 +34,11 @@ pub use bifrost_catalog::{
 };
 pub use error::BifrostCatalogError;
 pub use layout::{
-    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeAxis, TimeColumnValues,
-    TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
+    LayoutRevision, LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeAxis,
+    TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
-pub use physical_partition::{
-    INITIAL_PARTITION_SPEC_ID, PartitionScheme, PhysicalPartition, PhysicalPartitionError,
-};
+pub use physical_partition::{PartitionScheme, PhysicalPartition, PhysicalPartitionError};
 pub use storage::warehouse_uri;
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;

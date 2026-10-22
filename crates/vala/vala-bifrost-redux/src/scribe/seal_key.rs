@@ -18,6 +18,7 @@ use arrow::compute::take;
 use arrow::record_batch::RecordBatch;
 use wyrd_spec::ids::DataTenantId;
 
+use crate::catalog::LayoutRevision;
 use crate::catalog::TableRef;
 use crate::catalog::TenantTableBinding;
 pub use crate::catalog::layout::TimePartition;
@@ -101,21 +102,27 @@ impl ScribeClaimIdentity {
     }
 }
 
-/// Seal key — `(DataTenantId, TableRef, PhysicalPartition)` identifying one
-/// WAL/memtable/seal scope.
+/// Seal key — `(DataTenantId, TableRef, LayoutRevision, PhysicalPartition)`
+/// identifying one WAL/memtable/seal scope.
+///
+/// The revision is part of the scope, so batches accepted under different
+/// schema or sort-order revisions never share a generation and each seals
+/// under the retained metadata it was accepted with.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SealKey {
     /// Tenant ID for this seal scope.
     pub tenant: DataTenantId,
     /// Table reference for this seal scope.
     pub table: TableRef,
+    /// Schema and sort-order revision every batch in the scope is bound to.
+    pub revision: LayoutRevision,
     /// Exact partition for this seal scope.
     pub partition: PhysicalPartition,
 }
 
 impl SealKey {
-    /// Construct a new seal key; a bare [`TimePartition`] is the time-only
-    /// identity.
+    /// Construct a new seal key under the creation revision; a bare
+    /// [`TimePartition`] is the time-only identity.
     #[must_use]
     pub fn new(
         tenant: DataTenantId,
@@ -125,15 +132,24 @@ impl SealKey {
         Self {
             tenant,
             table,
+            revision: LayoutRevision::INITIAL,
             partition: partition.into(),
         }
     }
 
+    /// Rebinds the key to `revision`.
+    #[must_use]
+    pub const fn with_revision(mut self, revision: LayoutRevision) -> Self {
+        self.revision = revision;
+        self
+    }
+
     /// Returns the canonical text identity of this seal scope,
-    /// `{namespace}/{table}/tenant={tenant}/{partition}`.
+    /// `{namespace}/{table}/tenant={tenant}/{revision}/{partition}`.
     ///
     /// WAL manifests and replay indexes key on this text, so it is injective:
-    /// the partition renders its spec, time, and every typed value.
+    /// it renders the revision ids and the partition's spec, time, and every
+    /// typed value.
     #[must_use]
     pub fn canonical_key(&self) -> String {
         self.to_string()
@@ -145,10 +161,11 @@ impl std::fmt::Display for SealKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}/{}/tenant={}/{}",
+            "{}/{}/tenant={}/{}/{}",
             self.table.namespace.as_str(),
             self.table.name,
             self.tenant.as_uuid(),
+            self.revision,
             self.partition
         )
     }
@@ -593,7 +610,7 @@ mod tests {
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             },
-            crate::catalog::INITIAL_PARTITION_SPEC_ID,
+            crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
         )
         .expect("the fixture scheme is valid")
     }

@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
-use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
+use crate::catalog::{LayoutRevision, PhysicalPartition};
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::seal_key::SealKey;
@@ -679,6 +679,7 @@ impl PreparedWalAppend {
             .saturating_add(usize::from(table_len))
             .saturating_add(2)
             .saturating_add(seal_key.partition.to_bytes().len())
+            .saturating_add(REVISION_BYTES)
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
@@ -764,7 +765,8 @@ fn append_prepared_borrowed(
                 detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let parts: [&[u8]; 11] = [
+        let revision = encode_revision(seal_key.revision);
+        let parts: [&[u8]; 12] = [
             &SLICE_PAYLOAD_MAGIC,
             &tenant_id,
             &table_len,
@@ -773,6 +775,7 @@ fn append_prepared_borrowed(
             name,
             &partition_len,
             &partition,
+            &revision,
             &prepared.schema_fingerprint,
             &data_len,
             &prepared.data,
@@ -784,6 +787,17 @@ fn append_prepared_borrowed(
 
 const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S7SL";
 
+/// Encoded width of a slice's [`LayoutRevision`]: two big-endian `i32` ids.
+const REVISION_BYTES: usize = 8;
+
+/// Encodes the schema and sort-order ids one slice was accepted under.
+fn encode_revision(revision: LayoutRevision) -> [u8; REVISION_BYTES] {
+    let mut encoded = [0_u8; REVISION_BYTES];
+    encoded[..4].copy_from_slice(&revision.schema_id.to_be_bytes());
+    encoded[4..].copy_from_slice(&revision.sort_order_id.to_be_bytes());
+    encoded
+}
+
 #[cfg(test)]
 fn encode_slice_payload(
     seal_key: &SealKey,
@@ -794,6 +808,7 @@ fn encode_slice_payload(
         seal_key.tenant.as_uuid().as_bytes(),
         &seal_key.table.fqn(),
         &seal_key.partition,
+        seal_key.revision,
         &schema_fingerprint,
         data,
     )
@@ -804,6 +819,7 @@ fn encode_slice_payload_parts(
     tenant: &[u8; 16],
     table_fqn: &str,
     partition: &PhysicalPartition,
+    revision: LayoutRevision,
     schema_fingerprint: &[u8; 32],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
@@ -823,6 +839,7 @@ fn encode_slice_payload_parts(
         .saturating_add(table_fqn.len())
         .saturating_add(2)
         .saturating_add(partition.len())
+        .saturating_add(REVISION_BYTES)
         .saturating_add(32)
         .saturating_add(4)
         .saturating_add(data.len());
@@ -833,6 +850,7 @@ fn encode_slice_payload_parts(
     payload.extend_from_slice(table_fqn.as_bytes());
     payload.extend_from_slice(&partition_len.to_le_bytes());
     payload.extend_from_slice(&partition);
+    payload.extend_from_slice(&encode_revision(revision));
     payload.extend_from_slice(schema_fingerprint);
     payload.extend_from_slice(&data_len.to_le_bytes());
     payload.extend_from_slice(data);
@@ -994,10 +1012,15 @@ fn decode_slice_metadata(
     }
     let partition_len = reader.read_u16("WAL partition length decode failed")?;
     let partition = decode_slice_partition(reader.take(partition_len)?)?;
+    let revision = reader.take(REVISION_BYTES)?;
+    let revision = LayoutRevision {
+        schema_id: i32::from_be_bytes(revision[..4].try_into().expect("invariant: 4-byte id")),
+        sort_order_id: i32::from_be_bytes(revision[4..].try_into().expect("invariant: 4-byte id")),
+    };
     let mut schema_fingerprint = [0_u8; 32];
     schema_fingerprint.copy_from_slice(reader.take(32)?);
     Ok(DecodedSliceMetadata {
-        seal_key: SealKey::new(tenant, table, partition),
+        seal_key: SealKey::new(tenant, table, partition).with_revision(revision),
         schema_fingerprint,
     })
 }
@@ -3976,6 +3999,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
+            LayoutRevision::INITIAL,
             &[0_u8; 32],
             b"data",
         )
@@ -4003,6 +4027,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
+            LayoutRevision::INITIAL,
             &[0_u8; 32],
             b"data",
         )
@@ -4016,6 +4041,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
+            LayoutRevision::INITIAL,
             &[0_u8; 32],
             b"data",
         )

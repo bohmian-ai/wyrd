@@ -56,20 +56,65 @@ pub const MAX_BLOOM_COLUMNS: usize = 16;
 /// unbounded list and silently truncating it.
 pub const MAX_SORT_KEYS: usize = 4;
 
-/// Partition spec id every Bifrost physical table carries.
+/// Partition spec id table creation installs.
 ///
-/// Table creation installs exactly one partition spec and never evolves it, so
-/// the bound spec is always Iceberg's initial spec. Publication records the id
-/// on every promoted file, and this constant is what makes that recorded id a
-/// stated contract instead of a value copied out of a live table.
+/// Iceberg numbers a table's first spec `0`. A later revision adds a spec under
+/// a new id and retains this one, so files written under it keep naming it.
 pub const BIFROST_PARTITION_SPEC_ID: i32 = 0;
 
-/// Sort order id every Bifrost physical table carries.
+/// Sort order id table creation installs.
 ///
-/// [`PhysicalLayout::iceberg_sort_order`] builds the single order under this
-/// id at table creation, and writers preserve it, so a promoted file that
-/// names this id is asserting the order it was actually written in.
+/// [`PhysicalLayout::iceberg_sort_order`] builds the creation order under this
+/// id. A later revision adds an order under a new id and retains this one, so a
+/// file that names it is asserting the order it was actually written in.
 pub const BIFROST_SORT_ORDER_ID: i32 = 1;
+
+/// Iceberg schema id table creation installs.
+pub const BIFROST_SCHEMA_ID: i32 = 0;
+
+/// The Iceberg schema and sort-order revision one accepted batch is bound to.
+///
+/// The batch's partition-spec revision travels in its
+/// [`PhysicalPartition`](crate::catalog::PhysicalPartition); this carries the
+/// other two. Admission binds the table's committed revision, and every later
+/// step — seal, staging, recovery, publication — writes the batch under the
+/// retained metadata these ids name, never under the table's current revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LayoutRevision {
+    /// Iceberg schema id the batch's field ids were stamped from.
+    pub schema_id: i32,
+    /// Iceberg sort-order id the batch is written and claimed under.
+    pub sort_order_id: i32,
+}
+
+impl LayoutRevision {
+    /// The revision table creation installs.
+    pub const INITIAL: Self = Self {
+        schema_id: BIFROST_SCHEMA_ID,
+        sort_order_id: BIFROST_SORT_ORDER_ID,
+    };
+
+    /// Returns the committed revision `metadata` admits new batches under.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the default sort-order id does not fit the
+    /// `i32` id domain Iceberg data files record.
+    pub fn current(metadata: &iceberg::spec::TableMetadata) -> Result<Self, String> {
+        Ok(Self {
+            schema_id: metadata.current_schema_id(),
+            sort_order_id: i32::try_from(metadata.default_sort_order_id())
+                .map_err(|_| "the default sort-order id exceeds the i32 domain".to_owned())?,
+        })
+    }
+}
+
+impl std::fmt::Display for LayoutRevision {
+    /// Renders `schema={id}.sort={id}`, the revision's segment of a seal key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "schema={}.sort={}", self.schema_id, self.sort_order_id)
+    }
+}
 
 /// Time-partition granularity owned by the engine.
 ///
@@ -883,6 +928,99 @@ impl PhysicalLayout {
             });
         }
         Ok(resolved)
+    }
+
+    /// Rebuilds the layout one retained Iceberg revision declares.
+    ///
+    /// `metadata` retains every schema, partition spec, and sort order the
+    /// table has had, so a batch accepted under an earlier revision is written
+    /// exactly as it was accepted. Every reference is resolved by field id in
+    /// the retained schema, so a later rename never re-points it. The Bloom set
+    /// is the table's current property narrowed to columns the retained schema
+    /// has: Blooms are a pruning aid every reader falls back from, not part of a
+    /// file's identity. The rebuilt declaration then runs through
+    /// [`Self::resolve`], the one validator.
+    ///
+    /// Returns the layout with the retained Iceberg schema it was resolved
+    /// over, the field-id authority for the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::PhysicalDrift`] when a revision id is not
+    /// retained, a field references no retained column, a transform is outside
+    /// the contract, or the Bloom property is malformed, and the resolver's
+    /// error when the rebuilt declaration does not validate.
+    pub fn of_iceberg(
+        table: &str,
+        metadata: &iceberg::spec::TableMetadata,
+        revision: LayoutRevision,
+        spec_id: i32,
+    ) -> Result<(Self, Arc<IcebergSchema>), BifrostError> {
+        let drift = |detail: String| BifrostError::PhysicalDrift {
+            detail: format!("{table} revision {revision} spec {spec_id}: {detail}"),
+        };
+        let schema = metadata
+            .schema_by_id(revision.schema_id)
+            .ok_or_else(|| drift("the schema is not retained".to_owned()))?;
+        let spec = metadata
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| drift("the partition spec is not retained".to_owned()))?;
+        let order = metadata
+            .sort_order_by_id(i64::from(revision.sort_order_id))
+            .ok_or_else(|| drift("the sort order is not retained".to_owned()))?;
+        let name = |id: i32| {
+            schema
+                .name_by_field_id(id)
+                .map(str::to_owned)
+                .ok_or_else(|| drift(format!("field {id} is not in the retained schema")))
+        };
+        let mut time_column = None;
+        let mut partition_by = Vec::with_capacity(spec.fields().len());
+        for field in spec.fields() {
+            let column = name(field.source_id)?;
+            let transform = PartitionTransform::from_iceberg(field.transform)
+                .ok_or_else(|| drift(format!("unsupported transform {}", field.transform)))?;
+            if transform.granularity().is_some() {
+                time_column = Some(column.clone());
+            }
+            partition_by.push(transform.to_wire(&column));
+        }
+        let sort_keys = order
+            .fields
+            .iter()
+            .map(|field| {
+                Ok(SortKeyWire {
+                    column: name(field.source_id)?,
+                    direction: match field.direction {
+                        IcebergSortDirection::Ascending => SortDirectionWire::Asc,
+                        IcebergSortDirection::Descending => SortDirectionWire::Desc,
+                    },
+                    null_order: match field.null_order {
+                        IcebergNullOrder::First => NullOrderWire::First,
+                        IcebergNullOrder::Last => NullOrderWire::Last,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, BifrostError>>()?;
+        let bloom_columns =
+            Self::bloom_columns_from_property(metadata.properties().get(BLOOM_COLUMNS_PROPERTY))
+                .map_err(drift)?
+                .iter()
+                .filter(|column| schema.field_by_name(column).is_some())
+                .cloned()
+                .collect();
+        let arrow = iceberg::arrow::schema_to_arrow_schema(schema)
+            .map_err(|error| drift(error.to_string()))?;
+        let declared = PhysicalLayoutWire {
+            time_column,
+            partition_by,
+            sort_keys,
+            bloom_columns,
+        };
+        Ok((
+            Self::resolve(table, &arrow, Some(&declared))?,
+            Arc::clone(schema),
+        ))
     }
 
     /// Returns the resolved partition granularity.

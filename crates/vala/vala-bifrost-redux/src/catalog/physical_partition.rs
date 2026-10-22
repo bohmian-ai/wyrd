@@ -17,15 +17,9 @@ use iceberg::spec::{Literal, PartitionSpec, PrimitiveLiteral, Struct};
 use wyrd_spec::vala::api::{PartitionValueWire, PhysicalLayoutWire, PhysicalPartitionWire};
 
 use super::layout::{
-    MAX_PARTITION_FIELDS, PartitionTransform, TimeAxis, TimeColumnValues, TimeGranularity,
-    TimePartition, TimePartitionError,
+    BIFROST_PARTITION_SPEC_ID, LayoutRevision, MAX_PARTITION_FIELDS, PartitionTransform, TimeAxis,
+    TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError,
 };
-
-/// Partition-spec id of the spec every Bifrost table is created with.
-///
-/// Iceberg numbers a table's first spec `0`; a table whose partitioning has
-/// never evolved writes every file under it.
-pub const INITIAL_PARTITION_SPEC_ID: i32 = 0;
 
 /// Largest number of additional dimensions one identity carries.
 pub const MAX_PARTITION_DIMENSIONS: usize = MAX_PARTITION_FIELDS - 1;
@@ -86,7 +80,7 @@ impl PhysicalPartition {
     pub const fn time_only(time: TimePartition) -> Self {
         Self {
             time,
-            spec_id: INITIAL_PARTITION_SPEC_ID,
+            spec_id: BIFROST_PARTITION_SPEC_ID,
             time_index: 0,
             values: Vec::new(),
         }
@@ -343,7 +337,7 @@ impl std::fmt::Display for PhysicalPartition {
     /// `<time>/spec=<id>/<values>` otherwise, for logs and errors.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.time)?;
-        if self.values.is_empty() && self.spec_id == INITIAL_PARTITION_SPEC_ID {
+        if self.values.is_empty() && self.spec_id == BIFROST_PARTITION_SPEC_ID {
             return Ok(());
         }
         write!(f, "/spec={}", self.spec_id)?;
@@ -368,14 +362,17 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PhysicalPartitionError
 
 /// The rule that maps a row of one table to its [`PhysicalPartition`].
 ///
-/// Built from the table's registered layout and the partition-spec id
-/// admission writes under; every ingest path plans through this one value.
+/// Built from the committed revision admission writes under; every ingest
+/// path plans through this one value, and every slice it plans is bound to
+/// the scheme's [`LayoutRevision`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionScheme {
     /// Time column and its hour or day granularity.
     axis: TimeAxis,
     /// Iceberg partition-spec id identities are computed under.
     spec_id: i32,
+    /// Schema and sort-order revision planned slices are bound to.
+    revision: LayoutRevision,
     /// Position of the time field among the spec's fields.
     time_index: u8,
     /// Additional dimensions in spec order.
@@ -396,10 +393,24 @@ impl PartitionScheme {
     pub const fn time_only(axis: TimeAxis) -> Self {
         Self {
             axis,
-            spec_id: INITIAL_PARTITION_SPEC_ID,
+            spec_id: BIFROST_PARTITION_SPEC_ID,
+            revision: LayoutRevision::INITIAL,
             time_index: 0,
             dimensions: Vec::new(),
         }
+    }
+
+    /// Binds the scheme's planned slices to `revision`.
+    #[must_use]
+    pub const fn with_revision(mut self, revision: LayoutRevision) -> Self {
+        self.revision = revision;
+        self
+    }
+
+    /// Returns the revision planned slices are bound to.
+    #[must_use]
+    pub const fn revision(&self) -> LayoutRevision {
+        self.revision
     }
 
     /// Builds the scheme a registered layout declares under `spec_id`.
@@ -433,6 +444,7 @@ impl PartitionScheme {
         Ok(Self {
             axis,
             spec_id,
+            revision: LayoutRevision::INITIAL,
             time_index,
             dimensions,
         })

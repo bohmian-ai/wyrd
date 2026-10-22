@@ -1,0 +1,18 @@
+# TASK-001-R1 discovery comparison
+
+Immutable subject: [subject.md](subject.md). Eight required discovery reports are complete: behavior, invariants, standards, maintainer, system, ASGI, process and protocol domains. This comparison routes proposals; it is not independent validation or an intended verdict.
+
+| Behavior or invariant | Current discovery claims | Reconciliation needed |
+| --- | --- | --- |
+| Prior FIND-TASK-001-1 abnormal established-lifespan drain | Both task reviewers, ASGI, system and maintainer trace closure at guarded existing drain owner | Source-backed closure must still be independently validated; actual task.cancel probes supplement submitted raised-CancelledError test. No new timeout/repeated-cancellation guarantee. |
+| Prior FIND-TASK-001-2 safe adapter-created diagnostics | Shared corrected producer traced closed; application-owned failed messages remain preserved | No conflicting proposal or new diagnostic scope requirement. |
+| Prior FIND-TASK-001-3 published manual readback | Both task reviewers/protocol/maintainer trace published get/query/SQL/Run confirmation | No conflicting proposal; actual published completion and old cumulative behavior still require validation. |
+| Prior FIND-TASK-001-4 supported host launch syntax | All branches share one argv source; process/protocol/task reviewers trace closure | Usability probing beyond file presence was considered but not proposed: failed spawn is explicitly handled by approved REQ-038. No invented version/probe contract. |
+| Prior FIND-TASK-001-5 exact rustdoc sites | All applicable reports find original three sites closed | Preserve closed prior ID; new tuple-field proposal must not silently reopen old sites. |
+| Guided human-directed addition | Discovery reports trace selection/readiness/connection/argv/child lifetime/terminal behavior to existing owners and approve within explicit direct-child scope | No proposed behavior defect. Descendants/pre-existing sessions and hard-kill guarantees remain excluded. |
+| C2 unexpected failure diagnosis | System reviewer independently reproduced old echo-before-stty PTY race (1/30), corrected ordering did not reproduce (0/30); source reviewers find diagnosis consistent, retained assertions | Appended task includes diagnosis and attributed diagnostician summary; no separate original diagnostician artifact supplied. Validate credibility without assuming a missing separate file means no report content or requiring process-tree ownership. |
+| New SavedTerminal tuple-field docs | Maintainer MAINT-R1-001 says field at terminal.rs107 violates explicit rustdoc field gate. Standards reports PASS over new terminal/guided items | Material role conflict triggers one focused fresh follow-up on exact rule, current docs and owner conventions. No broad documentation sweep. |
+
+One followup-rev is assigned the tuple-field documentation conflict and interpretation of the no-style-only-round guidance. After it finishes, a fresh structured Ponytail validator receives every report, traces every proposal and prior closure from actual source, and produces the deduplicated ledger. Prior IDs 1–5 are preserved; any independently retained new finding begins at 6. No other focused discovery pass is warranted by current claims.
+
+Independent checks recorded by discovery: real-task-cancellation/off-loop probes, PTY ordering-race probe, 68 observation tests, generated-text/source equality, docs command/link checks, authored stub checks, offline existing-binary prompt comparison and cumulative diff whitespace. Reports distinguish these from submitted runtime/build evidence. Whole Postgres/worker/Cargo/all-SDK/full-docs aggregates were not rerun; runtime remains Linux x86_64 only.

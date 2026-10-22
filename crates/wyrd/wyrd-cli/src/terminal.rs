@@ -104,7 +104,11 @@ impl Terminal {
 /// The invoking terminal's attributes saved before a child takes it over,
 /// restored once that child has been reaped so the terminal stays usable
 /// even if the child left it in raw mode.
-pub(crate) struct SavedTerminal(Termios);
+pub(crate) struct SavedTerminal(
+    /// Standard input's attributes as read by [`SavedTerminal::save`] before
+    /// the child started; [`SavedTerminal::restore`] writes them back.
+    Termios,
+);
 
 impl SavedTerminal {
     /// Save standard input's terminal attributes.

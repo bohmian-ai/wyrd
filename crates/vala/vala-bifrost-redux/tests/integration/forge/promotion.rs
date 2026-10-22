@@ -444,21 +444,22 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
             );
         }),
         ("partition value", |record| {
-            let object = record.as_object_mut().expect("a record object");
-            let partition = object
+            let time = record
                 .get_mut("partition")
+                .and_then(|partition| partition.get_mut("time"))
                 .and_then(serde_json::Value::as_object_mut)
-                .expect("a partition value");
-            partition.insert(
+                .expect("a partition time");
+            time.insert(
                 "start_utc".to_owned(),
                 serde_json::Value::from("1999-01-01T00:00:00Z"),
             );
         }),
         ("partition spec identity", |record| {
             record
-                .as_object_mut()
-                .expect("a record object")
-                .insert("partition_spec_id".to_owned(), serde_json::Value::from(97));
+                .get_mut("partition")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("a partition value")
+                .insert("spec_id".to_owned(), serde_json::Value::from(97));
         }),
         ("schema identity", |record| {
             record.as_object_mut().expect("a record object").insert(

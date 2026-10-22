@@ -249,3 +249,46 @@ conflicts; do not absorb another task's behavior silently.
 - [Development workflow](../../../spec-driven-development.md),
   [execution](../../../implementation-execution.md), and
   [testing](../../../../TESTING.md).
+
+## Implementation Evidence
+
+Commits `659c9ad26`..`ac9de5bdc` on `change/service-identity-and-telemetry`.
+Postgres commands ran under `scripts/postgres/with-test-postgres.sh` after
+`mise run db:migrate:all:inner`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-018; AC-006; INV-001 | Migration `crates/wyrd/wyrd-sql/migrations/20261024000000_flat_card_identity.sql` keys `wyrd.cards` on `(data_tenant_id, kind, name, version)` and removes `space`/`target_space` from cards, relationships, and service accounts; `wyrd-sql` queries (`get`, `version_*`, `list`, `auth_projection`, `service_accounts`, `verifier_executions`) resolve by kind, name, version | `wyrd-sql --test integration pg_cards_declare::flat_registry_identity_is_tenant_and_kind_scoped` 1/1 (no space columns; same-tenant duplicate refused; other kind and other tenant register; exact read by kind/name/version); full `wyrd-sql --all-targets` 205/205 | PASS |
+| REQ-019–020; AC-006 | `wyrd-spec` `CardRef`/`Metadata` deny `space` and parse `Kind/name@version[#uid]`; `wyrd-config` `[defaults]` takes only labels/annotations; loader graph is flat; CLI selectors have no `--space`; Python/TS/Rust SDK signatures drop `space` | `wyrd-spec reference::tests::flat_card_reference_contract` 1/1; `wyrd-config config::parse::removed_space_defaults_are_rejected` 1/1; `wyrd-loader parse::tests::flat_card_graph_loads_without_space` 1/1; `wyrd-cli auth::issue_key::tests::issue_key_refuses_removed_space_flag` in lib 73/73; `py:test:unit` 634 passed (removed `space=` raises `TypeError`, spaced split ref raises `WYRD_DATA_400_INVALID_SPLIT_RULE`) | PASS |
+| REQ-027, 029, 031; AC-009 | New forward migration only; applied migrations untouched; no backfill, alias route, dual read, or compatibility shim (old `/cards/{kind}/{space}/{name}/…` routes deleted) | Fresh fixture databases install flat schema in every Postgres run; `pg_card_declaration_route::flat_card_http_contract` asserts the old space route is 404; source audit `git grep -nwi space` over crates/sdks/examples/architecture finds only unrelated (disk/label/IP) uses and deliberate refusal tests | PASS |
+| REQ-032; AC-010; INV-006 | Server routes/OpenAPI/MCP guide, `wyrd-client`, CLI, Rust/Python/TS SDKs, test harnesses, examples, README, and `architecture/wyrd-design.md`/`AGENTS.md` agree on flat identity; generated TS card types, napi `.d.ts`, error catalog docs regenerated | Rust SDK `declare_and_pull::flat_card_identity_round_trip` 1/1 (journey profile); Python `test_declare_and_pull.py::test_flat_card_identity_round_trip` + state journey 21 passed; TS `declare-and-pull.test.ts -t "^flat card identity round trip$"` 1/1 and edited integration files 92 passed; CLI `card_lifecycle::flat_card_identity_round_trip` within card_lifecycle 23/23; server `pg_card_declaration_route::flat_card_http_contract` 1/1, plus fork run of `pg_card_declaration_route`/`pg_openapi_contract`/`pg_hosted_artifacts` 62/62 and server lib 567/567; `codegen:regen` + `codegen:check`, `ts:napi:check`, `docs:check` clean | PASS |
+
+Owner and static closure: `mise run fmt`, `lints`, `check:deps`,
+`check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`,
+`ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `codegen:check`,
+`test:cards:unit`, `test:cards:integration`, `check:examples`, `docs:check`,
+and `git diff --check` all pass.
+
+Environment-limited failures (not caused by this task, unchanged by it):
+the full CLI, Rust SDK, and Python integration suites additionally fail only
+tests that need the OIDC provider lane (`WYRD_AUTH_503_DISCOVERY_UNAVAILABLE`),
+a built production UI (`wyrd-ui/build/index.js`), or a private
+`~/.config/wyrd` on this host. `identity_e2e` (Keycloak/Dex lane) compiled but
+was not run.
+
+Diagnosis — Python `list(space=...)` raised `WyrdError` instead of `TypeError`:
+- **Symptom:** `test_registry_surface.py::test_*_refuse_a_card_space[list-*]` failed with `Python boundary failed`.
+- **Evidence:** `RegistryListQuery::from_kwargs` returned `CardPyResult`, so its `PyTypeError` crossed `From<PyErr> for WyrdPyError` and was re-projected as an internal error.
+- **Cause:** the list boundary wrapped its own argument error, unlike `RegistryGetQuery::from_kwargs` (`PyResult`).
+- **Fix site:** `sdks/wyrd-sdk-python/src/state/mod.rs` — `from_kwargs`, `optional_i32`, and the four `list` methods return `PyResult`; every caller of `RegistryListQuery::from_kwargs` is one of those four.
+
+Non-goals confirmed excluded: no account/principal behavior change (TASK-002;
+the Card-created service-account projection only lost its `space` column), no
+physical storage change (TASK-004), and `docs/` prose left to TASK-008 except
+two walkthrough commands the Python journeys execute verbatim
+(`get-started/quickstart.md`, `connect/integrate-asgi.md`) plus regenerated
+`api/errors.md` and `llms-full.txt`. `wyrd-ui` had no Card space. Residual risk:
+GET query structs ignore an unknown `?space=` rather than refusing it, matching
+existing behavior for other unknown query keys.
+
+Status: IMPLEMENTED.

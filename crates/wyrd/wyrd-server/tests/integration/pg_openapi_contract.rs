@@ -1615,7 +1615,7 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
 /// invocation bodies accept an optional `group_id`, execution state echoes
 /// it beside the owner and the pinned source snapshot, and a binding's status
 /// publishes its frozen `group_end` settings with each source slot's exact
-/// binding tuple. No alternate spelling of `group_id` is served.
+/// binding tuple and its optional `order_by`. No alternate spelling of `group_id` is served.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, or when a grouped field,
@@ -1672,8 +1672,9 @@ async fn grouped_verification_contract_is_served() {
     let settings = &status["properties"]["group_end"];
     assert_eq!(
         properties(settings),
-        BTreeSet::from(["after", "sources"].map(str::to_owned))
+        BTreeSet::from(["after", "sources", "order_by"].map(str::to_owned))
     );
+    assert!(!required("GroupEndSettings").contains("order_by"));
     let source =
         &resolve_schema(&document, settings)["properties"]["sources"]["additionalProperties"];
     assert_eq!(

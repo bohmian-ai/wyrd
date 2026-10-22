@@ -392,7 +392,7 @@ fn publication_shape<'a>(
             shapes.push(PublishedFileShape {
                 namespace: file.namespace.clone(),
                 table_name: file.table_name.clone(),
-                partition_spec_id: file.partition_spec_id,
+                partition_spec_id: file.partition.spec_id,
                 sort_order_id: file.sort_order_id,
                 record_count: file.data_file.record_count,
                 row_groups: file.data_file.split_offsets.len(),

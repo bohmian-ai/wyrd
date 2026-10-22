@@ -335,15 +335,14 @@ fn validate_promoted_object(
     table: &Table,
 ) -> Result<(), ForgeError> {
     let metadata = table.metadata();
-    if record.partition_spec_id != metadata.default_partition_spec_id() {
-        return Err(ForgeError::Invariant {
+    let spec_id = record.partition.spec_id;
+    let spec = metadata
+        .partition_spec_by_id(spec_id)
+        .ok_or_else(|| ForgeError::Invariant {
             detail: format!(
-                "promotion evidence names partition spec {} but the table now writes {}",
-                record.partition_spec_id,
-                metadata.default_partition_spec_id()
+                "promotion evidence names partition spec {spec_id}, which the table does not retain"
             ),
-        });
-    }
+        })?;
     let table_sort_order = i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
         ForgeError::Invariant {
             detail: "table sort order id is not representable".to_owned(),
@@ -386,15 +385,14 @@ fn validate_promoted_object(
         });
     }
 
-    let partition = crate::catalog::TimePartition::from_durable_columns(
-        &record.partition.granularity,
-        record.partition.start_utc,
-    )
-    .map_err(|error| ForgeError::Invariant {
-        detail: format!("promotion evidence names a non-canonical partition: {error}"),
-    })?;
-    let field_id = crate::catalog::TimeAxis::iceberg_field_id(metadata.default_partition_spec())
-        .ok_or_else(|| ForgeError::Invariant {
+    let partition = record
+        .partition()
+        .map_err(|error| ForgeError::Invariant {
+            detail: error.to_string(),
+        })?
+        .time();
+    let field_id =
+        crate::catalog::TimeAxis::iceberg_field_id(&spec).ok_or_else(|| ForgeError::Invariant {
             detail: "table partition spec has no time partition field".to_owned(),
         })?;
     // Promotion is fail-closed: bounds that would merely retain a file at

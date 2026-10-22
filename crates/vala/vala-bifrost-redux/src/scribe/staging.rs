@@ -1139,9 +1139,8 @@ pub(crate) mod tests {
                 file_list_id,
                 object_key,
                 file_checksum: checksum,
-                partition,
+                partition: &crate::catalog::PhysicalPartition::from(partition),
                 schema_fingerprint: "00".repeat(32),
-                partition_spec_id: crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
             },
             crate::scribe::promotion::ScribeDataFileV1 {

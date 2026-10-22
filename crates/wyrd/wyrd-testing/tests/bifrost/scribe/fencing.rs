@@ -239,7 +239,7 @@ async fn scribe_tenant_partition_schema_fencing() {
     let partition_rows = |start: chrono::DateTime<chrono::Utc>| -> u64 {
         published
             .iter()
-            .filter(|file| file.promotion_record.partition.start_utc == start)
+            .filter(|file| file.promotion_record.partition.time.start_utc == start)
             .map(|file| file.row_count)
             .sum()
     };

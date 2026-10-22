@@ -7494,7 +7494,7 @@ mod tests {
                 &key.table,
                 key.partition.time(),
                 key.partition.time(),
-                &["value".to_owned()],
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
             )
             .expect("visible owner rows");
         assert!(
@@ -8262,7 +8262,7 @@ mod tests {
         let read = active
             .read(
                 &(key.partition.time()..=key.partition.time()),
-                &["value".to_owned()],
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
             )
             .expect("projected read");
         drop(active);
@@ -8347,7 +8347,7 @@ mod tests {
         let read = capture
             .read(
                 &(key.partition.time()..=key.partition.time()),
-                &["value".to_owned()],
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
             )
             .expect("projected read");
         let frozen = memtable.freeze(&key).expect("owner freeze");

@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
-use datafusion::common::Statistics;
+use arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
 use wyrd_spec::DataTenantId;
@@ -23,6 +23,7 @@ use wyrd_spec::DataTenantId;
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
+use crate::tables::fields::PARQUET_FIELD_ID;
 
 /// Estimated Arrow bytes at which the active generation rotates.
 pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
@@ -853,7 +854,7 @@ impl Memtable {
         table: &crate::catalog::TableRef,
         start_partition: crate::catalog::layout::TimePartition,
         end_partition: crate::catalog::layout::TimePartition,
-        required_columns: &[String],
+        required: &[FieldRef],
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         if start_partition > end_partition {
             return Err(ScribeError::Internal {
@@ -864,7 +865,7 @@ impl Memtable {
             tenant,
             table,
             Some(&(start_partition..=end_partition)),
-            required_columns,
+            required,
         )
     }
 
@@ -891,11 +892,11 @@ impl Memtable {
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
         partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
-        required_columns: &[String],
+        required: &[FieldRef],
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required_columns, &mut batches)?;
+            source.project(required, &mut batches)?;
         }
         Ok(batches)
     }
@@ -1821,7 +1822,7 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches projected
-    /// to `required_columns`, the accounting owners of those batches, its
+    /// to `required`, the accounting owners of those batches, its
     /// staged run paths in merge order, and the lease that keeps those runs on
     /// disk.
     ///
@@ -1836,13 +1837,13 @@ impl LiveCapture {
     pub(crate) fn read(
         &self,
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
-        required_columns: &[String],
+        required: &[FieldRef],
     ) -> Result<CapturedRead, ScribeError> {
         let mut batches = Vec::new();
         let mut charges = Vec::new();
         for source in &self.memory {
             if partitions.contains(&source.partition.time()) {
-                source.project(required_columns, &mut batches)?;
+                source.project(required, &mut batches)?;
                 charges.push(Arc::clone(&source.charge));
             }
         }
@@ -1946,39 +1947,82 @@ impl ReadableSource {
         crate::scan_sizing::ScanSizer::new(scope, &self.schema).batch_bytes(&self.statistics)
     }
 
-    /// Appends each captured batch, projected to `required_columns`, to
-    /// `output`, with its bounds projected like its columns.
+    /// Appends each captured batch, projected to `required`, to `output`,
+    /// with its bounds projected like its columns.
+    ///
+    /// Each required field resolves by field id (see [`projection_indices`]),
+    /// so rows admitted under an earlier schema revision are emitted under the
+    /// required field's current name and type. A required field the batch
+    /// predates is filled with nulls and has unknown bounds. An empty
+    /// `required` keeps every column.
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Arrow projection fails.
+    /// when Arrow cast or batch assembly fails.
     fn project(
         &self,
-        required_columns: &[String],
+        required: &[FieldRef],
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
-        let projection = projection_indices(&self.schema, required_columns)?;
+        let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
+            detail: format!("live-tail Arrow projection failed: {error}"),
+        };
+        let projection = projection_indices(&self.schema, required)?;
+        let schema = Arc::new(Schema::new_with_metadata(
+            projection
+                .iter()
+                .map(|(field, _)| Arc::clone(field))
+                .collect::<Vec<_>>(),
+            self.schema.metadata().clone(),
+        ));
         for (index, (batch, wal_lsn_max)) in self
             .batches
             .iter()
             .zip(self.wal_lsns.iter().copied())
             .enumerate()
         {
-            let batch = batch
-                .project(&projection)
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("live-tail Arrow projection failed: {error}"),
-                })?;
+            let rows = batch.num_rows();
+            // A source column keeps its recorded bounds only when it is read
+            // unchanged; a cast or null-filled column's bounds are unknown.
+            let mut kept = Vec::with_capacity(projection.len());
+            let columns = projection
+                .iter()
+                .map(|(field, source)| match source {
+                    Some(column) if batch.column(*column).data_type() == field.data_type() => {
+                        kept.push(Some(*column));
+                        Ok(Arc::clone(batch.column(*column)))
+                    }
+                    Some(column) => {
+                        kept.push(None);
+                        arrow::compute::cast(batch.column(*column), field.data_type())
+                    }
+                    None => {
+                        kept.push(None);
+                        Ok(arrow::array::new_null_array(field.data_type(), rows))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(internal)?;
+            let batch = RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                columns,
+                &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .map_err(internal)?;
             let statistics = Arc::new(self.statistics.get(index).map_or_else(
                 || Statistics::new_unknown(batch.schema_ref()),
                 |bounds| {
                     Statistics {
                         num_rows: bounds.num_rows,
                         total_byte_size: Precision::Absent,
-                        column_statistics: projection
+                        column_statistics: kept
                             .iter()
-                            .map(|column| bounds.column_statistics[*column].clone())
+                            .map(|column| {
+                                column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                    bounds.column_statistics[column].clone()
+                                })
+                            })
                             .collect(),
                     }
                 },
@@ -2042,29 +2086,66 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
     Arc::new(statistics)
 }
 
-/// Resolve and validate the bounded projection requested by Oracle.
+/// Resolves each required field to its column in one captured schema.
+///
+/// A required field carrying a `PARQUET:field_id` matches the column with the
+/// same id when the captured schema carries ids, so a column renamed after the
+/// rows were admitted still resolves, and a column added after them resolves
+/// to `None`. A field without an id selects the captured column of that name
+/// unchanged, and that column must be present. An empty `required` selects
+/// every captured column.
+///
+/// # Errors
+///
+/// Returns an internal error when a field without an id is absent, or when
+/// two required fields resolve to the same column.
 fn projection_indices(
     schema: &SchemaRef,
-    required_columns: &[String],
-) -> Result<Vec<usize>, ScribeError> {
-    if required_columns.is_empty() {
-        return Ok((0..schema.fields().len()).collect());
+    required: &[FieldRef],
+) -> Result<Vec<(FieldRef, Option<usize>)>, ScribeError> {
+    if required.is_empty() {
+        return Ok(schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (Arc::clone(field), Some(index)))
+            .collect());
     }
-    let mut indices = Vec::with_capacity(required_columns.len());
-    for name in required_columns {
-        let Some(index) = schema.index_of(name).ok() else {
-            return Err(ScribeError::Internal {
-                detail: format!("live-tail required column is not in the table schema: {name}"),
-            });
+    let field_id = |field: &FieldRef| field.metadata().get(PARQUET_FIELD_ID).cloned();
+    let schema_has_ids = schema
+        .fields()
+        .iter()
+        .any(|field| field_id(field).is_some());
+    let mut projection: Vec<(FieldRef, Option<usize>)> = Vec::with_capacity(required.len());
+    for field in required {
+        let (target, index) = match field_id(field).filter(|_| schema_has_ids) {
+            Some(id) => (
+                Arc::clone(field),
+                schema
+                    .fields()
+                    .iter()
+                    .position(|column| field_id(column).as_ref() == Some(&id)),
+            ),
+            None => {
+                let index = schema
+                    .index_of(field.name())
+                    .map_err(|_| ScribeError::Internal {
+                        detail: format!(
+                            "live-tail required column is not in the table schema: {}",
+                            field.name()
+                        ),
+                    })?;
+                (Arc::clone(&schema.fields()[index]), Some(index))
+            }
         };
-        if indices.contains(&index) {
+        if index.is_some() && projection.iter().any(|(_, kept)| *kept == index) {
             return Err(ScribeError::Internal {
-                detail: format!("live-tail required column is duplicated: {name}"),
+                detail: format!("live-tail required column is duplicated: {}", field.name()),
             });
         }
-        indices.push(index);
+        projection.push((target, index));
     }
-    Ok(indices)
+    Ok(projection)
 }
 
 /// Returns the bytes one batch adds to the memtable's charged ownership.
@@ -2095,6 +2176,45 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let array = Int64Array::from(vec![1i64; num_rows]);
         RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("batch")
+    }
+
+    /// A required field resolves by field id across a rename, an added field
+    /// resolves to no column, and an id-less field selects by name unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a field resolves to the wrong column or a duplicate is
+    /// accepted.
+    #[test]
+    fn projection_indices_resolve_by_field_id() {
+        let with_id = |name: &str, id: &str| {
+            Arc::new(
+                Field::new(name, DataType::Utf8, true)
+                    .with_metadata([(PARQUET_FIELD_ID.to_owned(), id.to_owned())]),
+            )
+        };
+        let captured: SchemaRef = Arc::new(Schema::new(vec![
+            with_id("id", "1"),
+            with_id("customer", "2"),
+        ]));
+        let required = [with_id("client", "2"), with_id("note", "3")];
+
+        let projection = projection_indices(&captured, &required).expect("projection");
+
+        assert_eq!(
+            projection
+                .iter()
+                .map(|(field, index)| (field.name().as_str(), *index))
+                .collect::<Vec<_>>(),
+            [("client", Some(1)), ("note", None)]
+        );
+        let by_name = projection_indices(
+            &captured,
+            &[Arc::new(Field::new("id", DataType::Null, true))],
+        )
+        .expect("named projection");
+        assert_eq!(by_name[0].0.data_type(), &DataType::Utf8);
+        assert!(projection_indices(&captured, &[with_id("a", "2"), with_id("b", "2")]).is_err());
     }
 
     /// An append batch's bounds are exact for a primitive column and unknown

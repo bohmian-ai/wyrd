@@ -247,17 +247,17 @@ parquet = "60.0"
 parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "6a04f6f1642127eb87b4f62457069e4b835901e9" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "9a1b0eef95427f1bf884dc926ba5be998a29080c" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "6a04f6f1642127eb87b4f62457069e4b835901e9" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "6a04f6f1642127eb87b4f62457069e4b835901e9" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "9a1b0eef95427f1bf884dc926ba5be998a29080c" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "9a1b0eef95427f1bf884dc926ba5be998a29080c" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 60 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "aab4c741cdd1c4c97d4389741e3aeced71bec9e2" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "a0500b1ba49deae61f1106b5b6fdcb19baa6527d" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
@@ -266,25 +266,25 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 
 # One tested revision of the Wyrd DataFusion fork (v55.1.0 rebased onto apache
 # main with Arrow 60, plus nested-field
-# access, UDF input requirements, nested statistics pruning, and the per-file
-# Parquet read planner) replaces these crates for every consumer, including the
+# access, UDF input requirements, nested statistics pruning, the per-file
+# Parquet read planner, and field-id column resolution) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
 # monty-proto's `worker` feature, which wyrd-server needs to serve as its own
 # Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
 # so a stand-in with the same API refuses every check and keeps the checker out.
 monty-type-checking = { path = "crates/patches/monty-type-checking" }
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "b8ec4b1d291cd8e371bb88fc76959d91e8503a1d" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "1eab5493ec60898d94630b627abac4062e465588" }
 # Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix, the same
 # revision the DataFusion fork pins.
 arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }

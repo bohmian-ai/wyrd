@@ -384,11 +384,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
             end_partition: day,
-            required_columns: MANAGED_COLUMNS
-                .iter()
-                .map(|name| (*name).to_owned())
-                .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
-                .collect(),
+            required_fields: crate::scribe::tail_rpc::tests::named_fields(
+                MANAGED_COLUMNS
+                    .iter()
+                    .copied()
+                    .chain(["metric_name", "quantile_values"]),
+            ),
             query_id: Uuid::new_v4(),
             capture_id: Uuid::nil(),
         },
@@ -481,7 +482,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         target_stream: stream,
         start_partition,
         end_partition,
-        required_columns: vec!["value".to_owned()],
+        required_fields: crate::scribe::tail_rpc::tests::named_fields(["value"]),
         query_id: Uuid::new_v4(),
         capture_id: Uuid::nil(),
     };
@@ -600,7 +601,7 @@ fn value_read(
         target_stream: stream,
         start_partition,
         end_partition,
-        required_columns: vec!["value".to_owned()],
+        required_fields: crate::scribe::tail_rpc::tests::named_fields(["value"]),
         query_id: Uuid::new_v4(),
         capture_id: Uuid::nil(),
     }

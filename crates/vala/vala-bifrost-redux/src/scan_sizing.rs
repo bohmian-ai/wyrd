@@ -249,6 +249,8 @@ impl ScanScope {
 pub(crate) struct ScanSizer<'scope> {
     /// Columns and filters of the scan being sized.
     scope: &'scope ScanScope,
+    /// Schema the filters were planned against.
+    schema: arrow::datatypes::SchemaRef,
     /// The scope's filters planned once against the table schema.
     pruning: Option<BatchPruning>,
     /// Indexes of the sized schema's columns the scope covers, in the order
@@ -266,6 +268,7 @@ impl<'scope> ScanSizer<'scope> {
         let metrics = datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new();
         Self {
             scope,
+            schema: Arc::clone(schema),
             pruning: scope.pruning(schema),
             covered: schema
                 .fields()
@@ -287,7 +290,9 @@ impl<'scope> ScanSizer<'scope> {
     /// groups those are.
     ///
     /// A footer whose schema does not convert to Arrow, or a scope with no
-    /// plannable filter, keeps every row group. A column chunk counts when
+    /// plannable filter, keeps every row group. A footer written under another
+    /// schema revision has the filters planned against its own columns, so a
+    /// filter on a column it lacks drops out instead of misreading another. A column chunk counts when
     /// its top-level column is covered, so a Variant column counts every
     /// shredded child.
     #[must_use]
@@ -304,13 +309,27 @@ impl<'scope> ScanSizer<'scope> {
             footer.file_metadata().schema_descr(),
             footer.file_metadata().key_value_metadata(),
         );
-        if let (Some(pruning), Ok(file_schema)) = (&self.pruning, file_schema) {
-            access.prune_by_statistics_with_metadata(
-                &file_schema,
-                footer,
-                pruning.predicate(),
-                &self.metrics,
-            );
+        if let Ok(file_schema) = file_schema {
+            let revised;
+            let pruning = if file_schema
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .eq(self.schema.fields().iter().map(|field| field.name()))
+            {
+                self.pruning.as_ref()
+            } else {
+                revised = self.scope.pruning(&Arc::new(file_schema.clone()));
+                revised.as_ref()
+            };
+            if let Some(pruning) = pruning {
+                access.prune_by_statistics_with_metadata(
+                    &file_schema,
+                    footer,
+                    pruning.predicate(),
+                    &self.metrics,
+                );
+            }
         }
         let kept: Vec<usize> = access.row_group_indexes().collect();
         let bytes = kept

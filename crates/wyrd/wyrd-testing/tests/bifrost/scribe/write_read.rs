@@ -1517,19 +1517,21 @@ fn shifted(batch: &RecordBatch, by: i64) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).expect("shifted batch")
 }
 
-/// Commits a new default sort order — the current keys plus `value`
-/// descending — straight through the table's Iceberg metadata, and returns its
-/// id. The node's cached revision is evicted so the next admission reads it.
+/// Commits the updates `revise` derives from the table's current metadata
+/// straight through its Iceberg catalog, guarded by the current schema, spec,
+/// and sort-order ids, then evicts the node's cached revision so the next
+/// admission reads it.
 ///
 /// # Panics
 ///
 /// Panics when the table cannot be loaded or the revision does not commit.
-async fn commit_sort_revision(
+async fn commit_revision(
     server: &wyrd_testing::WyrdTestServer,
     tenant: wyrd_spec::DataTenantId,
     table: &vala_bifrost_redux::catalog::TableRef,
-) -> i32 {
-    use iceberg::spec::{NullOrder, SortDirection, SortField, SortOrder, Transform};
+    revise: impl FnOnce(&iceberg::spec::TableMetadata) -> Vec<iceberg::TableUpdate>,
+) {
+    use iceberg::TableRequirement;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     let catalog = server.bifrost_catalog();
     let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((tenant, table.clone()))
@@ -1540,50 +1542,168 @@ async fn commit_sort_revision(
         .await
         .expect("physical table loads");
     let metadata = physical.metadata();
-    let order_id = metadata
-        .sort_orders_iter()
-        .map(|order| order.order_id)
-        .max()
-        .expect("a registered table has a sort order")
-        + 1;
-    let value_id = metadata
-        .current_schema()
-        .field_by_name("value")
-        .expect("value is a column")
-        .id;
-    let order = SortOrder::builder()
-        .with_order_id(order_id)
-        .with_fields(
-            metadata
-                .default_sort_order()
-                .fields
-                .iter()
-                .cloned()
-                .chain([SortField {
-                    source_id: value_id,
-                    transform: Transform::Identity,
-                    direction: SortDirection::Descending,
-                    null_order: NullOrder::Last,
-                }])
-                .collect(),
-        )
-        .build_unbound()
-        .expect("sort order builds");
     let transaction = Transaction::new(&physical);
-    let action = transaction
-        .apply_updates()
-        .requirement(iceberg::TableRequirement::DefaultSortOrderIdMatch {
-            default_sort_order_id: metadata.default_sort_order_id(),
-        })
-        .update(iceberg::TableUpdate::AddSortOrder { sort_order: order })
-        .update(iceberg::TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+    let action = revise(metadata).into_iter().fold(
+        transaction
+            .apply_updates()
+            .requirement(TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            })
+            .requirement(TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            })
+            .requirement(TableRequirement::DefaultSortOrderIdMatch {
+                default_sort_order_id: metadata.default_sort_order_id(),
+            }),
+        |action, update| action.update(update),
+    );
     ApplyTransactionAction::apply(action, transaction)
         .expect("revision applies")
         .commit(catalog.iceberg_catalog().as_ref())
         .await
         .expect("revision commits");
     catalog.evict_committed_revision(table, tenant);
+}
+
+/// Commits a new default sort order — the current keys plus `value`
+/// descending — and returns its id.
+///
+/// # Panics
+///
+/// Panics when the revision does not commit.
+async fn commit_sort_revision(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    table: &vala_bifrost_redux::catalog::TableRef,
+) -> i32 {
+    use iceberg::spec::{NullOrder, SortDirection, SortField, SortOrder, Transform};
+    let mut order_id = 0;
+    commit_revision(server, tenant, table, |metadata| {
+        order_id = metadata
+            .sort_orders_iter()
+            .map(|order| order.order_id)
+            .max()
+            .expect("a registered table has a sort order")
+            + 1;
+        let value_id = metadata
+            .current_schema()
+            .field_by_name("value")
+            .expect("value is a column")
+            .id;
+        let fields = metadata
+            .default_sort_order()
+            .fields
+            .iter()
+            .cloned()
+            .chain([SortField {
+                source_id: value_id,
+                transform: Transform::Identity,
+                direction: SortDirection::Descending,
+                null_order: NullOrder::Last,
+            }])
+            .collect();
+        vec![
+            iceberg::TableUpdate::AddSortOrder {
+                sort_order: SortOrder::builder()
+                    .with_order_id(order_id)
+                    .with_fields(fields)
+                    .build_unbound()
+                    .expect("sort order builds"),
+            },
+            iceberg::TableUpdate::SetDefaultSortOrder { sort_order_id: -1 },
+        ]
+    })
+    .await;
     i32::try_from(order_id).expect("sort order id fits i32")
+}
+
+/// Commits a partition spec that keeps the current fields except the `shard`
+/// bucket.
+///
+/// # Panics
+///
+/// Panics when the revision does not commit.
+async fn commit_spec_revision(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    table: &vala_bifrost_redux::catalog::TableRef,
+) {
+    commit_revision(server, tenant, table, |metadata| {
+        let shard = metadata
+            .current_schema()
+            .field_by_name("shard")
+            .expect("shard is a column")
+            .id;
+        let spec = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .filter(|field| field.source_id != shard)
+            .try_fold(
+                iceberg::spec::UnboundPartitionSpec::builder(),
+                |builder, field| {
+                    builder.add_partition_field(
+                        field.source_id,
+                        field.name.clone(),
+                        field.transform,
+                    )
+                },
+            )
+            .expect("spec builds")
+            .build();
+        vec![
+            iceberg::TableUpdate::AddSpec { spec },
+            iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ]
+    })
+    .await;
+}
+
+/// Commits a schema that renames `customer` to `client` under its field id
+/// and adds a nullable `note` string.
+///
+/// # Panics
+///
+/// Panics when the revision does not commit.
+async fn commit_schema_revision(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    table: &vala_bifrost_redux::catalog::TableRef,
+) {
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+    commit_revision(server, tenant, table, |metadata| {
+        let current = metadata.current_schema();
+        let fields = current
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name == "customer" {
+                    let mut renamed = field.as_ref().clone();
+                    renamed.name = "client".to_owned();
+                    Arc::new(renamed)
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .chain([Arc::new(NestedField::optional(
+                metadata.last_column_id() + 1,
+                "note",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .collect::<Vec<_>>();
+        let schema = IcebergSchema::builder()
+            .with_schema_id(current.schema_id() + 1)
+            .with_identifier_field_ids(current.identifier_field_ids())
+            .with_fields(fields)
+            .build()
+            .expect("schema builds");
+        vec![
+            iceberg::TableUpdate::AddSchema { schema },
+            iceberg::TableUpdate::SetCurrentSchema { schema_id: -1 },
+        ]
+    })
+    .await;
 }
 
 /// A batch accepted before a sort-order revision keeps that revision through
@@ -1690,4 +1810,130 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         "a changed payload under an accepted batch id is refused"
     );
     assert_eq!(read_all(client).await, all, "the refusal stores nothing");
+}
+
+/// Rows written under two partition specs and read after an ID-preserving
+/// rename and a nullable addition: every source — published, staged, active,
+/// and restored — answers exact time, equality, null, and membership filters
+/// by stable field id, reads the added column as null, and stays invisible to
+/// another tenant.
+///
+/// # Panics
+///
+/// Panics when any read differs, the added column is not null, or another
+/// tenant reads the table.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn mixed_runtime_specifications_preserve_rows_and_pins() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("mixed_specs");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
+    let client = tenant_client(&server, tenant).await;
+    super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &composite_batch())
+        .await
+        .expect("the spec-0 batch is acknowledged");
+    server.flush_bifrost().await.expect("publishes");
+
+    commit_spec_revision(&server, tenant, &table_ref).await;
+    super::support::append_batch(
+        &client,
+        &table,
+        uuid::Uuid::now_v7(),
+        &shifted(&composite_batch(), COMPOSITE_ROWS),
+    )
+    .await
+    .expect("the staged spec-1 batch is acknowledged");
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    drop(scribe);
+    super::support::append_batch(
+        &client,
+        &table,
+        uuid::Uuid::now_v7(),
+        &shifted(&composite_batch(), 2 * COMPOSITE_ROWS),
+    )
+    .await
+    .expect("the active spec-1 batch is acknowledged");
+
+    commit_schema_revision(&server, tenant, &table_ref).await;
+    assert_mixed_reads(&client, &table, "published, staged, and active").await;
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_mixed_reads(&client, &table, "restored").await;
+    server.flush_bifrost().await.expect("publishes");
+    assert_mixed_reads(&client, &table, "published").await;
+
+    let neighbour = server
+        .seed_tenant("mixed-specs-neighbour")
+        .await
+        .expect("the neighbour tenant is seeded");
+    let foreign = tenant_client(&server, neighbour).await;
+    let refused = match wyrd_client::Bifrost::query_only(&foreign)
+        .query(&BifrostQueryRequest {
+            params: Vec::new(),
+            sql: format!("SELECT value FROM {table}"),
+            deadline_ms: Some(120_000),
+        })
+        .await
+    {
+        Err(_) => true,
+        Ok(mut stream) => {
+            while let Ok(Some(_)) = stream.next_batch().await {}
+            stream.terminal().map(|terminal| terminal.outcome)
+                != Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success)
+        }
+    };
+    assert!(refused, "another tenant never reads the table");
+}
+
+/// Requires the three mixed-spec batches once each, by their renamed column,
+/// with the added column null everywhere.
+///
+/// # Panics
+///
+/// Panics when any read differs.
+async fn assert_mixed_reads(client: &wyrd_client::WyrdClient, table: &str, stage: &str) {
+    let all: Vec<i64> = (0..3 * COMPOSITE_ROWS).collect();
+    let pick = |keep: fn(i64) -> bool| {
+        all.iter()
+            .copied()
+            .filter(|value| keep(*value % COMPOSITE_ROWS))
+            .collect::<Vec<_>>()
+    };
+    for (filter, expected) in [
+        ("TRUE", all.clone()),
+        ("note IS NULL", all.clone()),
+        ("note IS NOT NULL", Vec::new()),
+        ("client IS NULL", pick(|row| row % 3 == 2)),
+        ("client = 'a'", pick(|row| row % 3 == 0)),
+        ("client IN ('a', 'b')", pick(|row| row % 3 != 2)),
+        ("shard = 3", pick(|row| row % 5 == 3)),
+        (
+            &*format!(
+                "event_time >= to_timestamp_micros({})",
+                COMPOSITE_FIRST_HOUR_MICROS + COMPOSITE_HOUR_MICROS
+            ),
+            pick(|row| row % 2 == 1),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "{stage}: `{filter}` returns each matching row once"
+        );
+    }
 }

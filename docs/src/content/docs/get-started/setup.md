@@ -63,7 +63,7 @@ In its own terminal, in `quickstart`:
 wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. To set up with your coding agent, accept the offer to connect it. Decline the other offers.
+When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers. To have your coding agent add Wyrd to your project, run `wyrd init guided` instead, as in [Add Wyrd to your project](#add-wyrd-to-your-project).
 
 </Tab>
 <Tab label="Programmatic">
@@ -119,11 +119,17 @@ An empty list means you're connected.
 <Tabs>
 <Tab label="Agent-assisted">
 
-When `wyrd init` connected a coding agent, it prints the command that starts that agent on the setup prompt in this directory. Run it in a second terminal, in `quickstart`.
+Start your coding agent on the setup prompt instead of plain `wyrd init`. In `quickstart`:
 
-For an agent without such a command, start it in `quickstart` and paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
+```bash
+wyrd init guided
+```
 
-The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear.
+It starts the server as above, asks which installed coding agent to use, connects it to Wyrd, and starts it in `quickstart` on the setup prompt. Name the agent with `--host`, for example `wyrd init guided --host claude-code`, to skip the question. The agent keeps its own permissions and asks for your approvals as usual.
+
+The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear. When it exits, Wyrd keeps serving until you press Ctrl-C. An agent that exits has not proven anything by exiting; its report of the stored verdicts does.
+
+With plain `wyrd init`, a connected agent's start command is printed instead, to run yourself in a second terminal. For any other agent, paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
 
 <Aside type="note" title="The setup prompt">
 
@@ -136,7 +142,7 @@ Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI
 </Tab>
 <Tab label="Manual">
 
-Follow [Run your first verification](/get-started/quickstart/). It is the same steps the setup prompt gives an agent.
+Follow [Run your first verification](/get-started/quickstart/), through [Confirm the stored verdicts](/get-started/quickstart/#3-confirm-the-stored-verdicts). They are the same steps the setup prompt gives an agent.
 
 </Tab>
 </Tabs>
@@ -148,6 +154,7 @@ Follow [Run your first verification](/get-started/quickstart/). It is the same s
 | `is a superuser` or `BYPASSRLS` | Use a database user that isn't a superuser |
 | `WYRD_CLI_503_SERVER_DEV` naming `listener` | Port 8080 is taken: rerun with `--bind 127.0.0.1:18080` |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Unset `WYRD_CONFIG_HOME`, `WYRD_API_KEY`, and `WYRD_SERVER_URL`, or match the server terminal |
+| `WYRD_CLI_503_SERVER_DEV` naming `guided setup` | Install the agent so its command is on `PATH`, or name an installed one with `--host` |
 
 ## Next
 

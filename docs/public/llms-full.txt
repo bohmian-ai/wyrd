@@ -230,7 +230,7 @@ In its own terminal, in `quickstart`:
 wyrd init
 ```
 
-When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. To set up with your coding agent, accept the offer to connect it. Decline the other offers.
+When asked, enter your database URL (`postgresql://USER:PASSWORD@HOST:5432/DATABASE`) and a tenant name, such as `acme`. Decline the other offers. To have your coding agent add Wyrd to your project, run `wyrd init guided` instead, as in [Add Wyrd to your project](#add-wyrd-to-your-project).
 
 **Programmatic**
 
@@ -279,11 +279,17 @@ An empty list means you're connected.
 
 **Agent-assisted**
 
-When `wyrd init` connected a coding agent, it prints the command that starts that agent on the setup prompt in this directory. Run it in a second terminal, in `quickstart`.
+Start your coding agent on the setup prompt instead of plain `wyrd init`. In `quickstart`:
 
-For an agent without such a command, start it in `quickstart` and paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
+```bash
+wyrd init guided
+```
 
-The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear.
+It starts the server as above, asks which installed coding agent to use, connects it to Wyrd, and starts it in `quickstart` on the setup prompt. Name the agent with `--host`, for example `wyrd init guided --host claude-code`, to skip the question. The agent keeps its own permissions and asks for your approvals as usual.
+
+The agent installs the SDK at your CLI's version, writes and runs the program from [Run your first verification](/wyrd/get-started/quickstart/), and reports the stored `passed` and `failed` verdicts it found through MCP. It stops and asks before replacing a file, and when your project's language is unclear. When it exits, Wyrd keeps serving until you press Ctrl-C. An agent that exits has not proven anything by exiting; its report of the stored verdicts does.
+
+With plain `wyrd init`, a connected agent's start command is printed instead, to run yourself in a second terminal. For any other agent, paste the output of `wyrd init --print-prompt`, or select the Wyrd MCP prompt `setup`. Printing the prompt needs no server and changes nothing.
 
 **The setup prompt:**
 
@@ -399,7 +405,7 @@ Each printed copy starts with a `# Wyrd <version> setup` heading naming your CLI
 
 **Manual**
 
-Follow [Run your first verification](/wyrd/get-started/quickstart/). It is the same steps the setup prompt gives an agent.
+Follow [Run your first verification](/wyrd/get-started/quickstart/), through [Confirm the stored verdicts](/wyrd/get-started/quickstart/#3-confirm-the-stored-verdicts). They are the same steps the setup prompt gives an agent.
 
 ## If it fails
 
@@ -408,6 +414,7 @@ Follow [Run your first verification](/wyrd/get-started/quickstart/). It is the s
 | `is a superuser` or `BYPASSRLS` | Use a database user that isn't a superuser |
 | `WYRD_CLI_503_SERVER_DEV` naming `listener` | Port 8080 is taken: rerun with `--bind 127.0.0.1:18080` |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Unset `WYRD_CONFIG_HOME`, `WYRD_API_KEY`, and `WYRD_SERVER_URL`, or match the server terminal |
+| `WYRD_CLI_503_SERVER_DEV` naming `guided setup` | Install the agent so its command is on `PATH`, or name an installed one with `--host` |
 
 ## Next
 
@@ -582,7 +589,38 @@ The second verdict is `failed`, and it is still a successful call: the check ran
 
 Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities.
 
-## 3. Change the requirement
+## 3. Confirm the stored verdicts
+
+The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+
+```bash
+wyrd get --space default --kind Service --name support-reply --version 1.0.0
+```
+
+Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.sql`, with `<uid>` replaced by that value:
+
+```sql title="stored-verdicts.sql"
+-- Replace <uid> with the Service's metadata.uid from wyrd get.
+SELECT result_id, run_id, card_uid, verdict FROM vala.verification.results WHERE card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+
+```
+
+Run it against the address `wyrd init` printed:
+
+```bash
+wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
+```
+
+It prints one JSON row per stored verdict, newest first:
+
+```text
+{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"failed"}
+{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"passed"}
+```
+
+The `failed` and `passed` rows with the same `run_id` are your program's two verdicts, and that `run_id` identifies its Run. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
+
+## 4. Change the requirement
 
 Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program again. It stops with `WYRD_REGISTRY_409_SPEC_DRIFT`: `no-refund-promise@1.0.0` already means the declaration that checks `guaranteed refund`, and a version never changes meaning.
 
@@ -597,6 +635,7 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 | `transport unavailable` | Start the server as in [Set up Wyrd](/wyrd/get-started/setup/#start-the-server) |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
+| No rows after a minute | Check that `<uid>` is the `metadata.uid` that `wyrd get` printed |
 
 ## Next
 

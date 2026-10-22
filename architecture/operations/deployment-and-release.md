@@ -303,7 +303,14 @@ Rotating the signing key requires a CLI release that embeds the new key.
 `wyrd init` runs the installed bundle with inputs resolved as argument,
 environment, saved `[dev]` setting, then prompt, saves them before any tenant
 key is issued, and pins storage and Bifrost data to absolute paths so a restart
-from any directory reuses the same tenant, key, and data.
+from any directory reuses the same tenant, key, and data. Ordinary `wyrd init`
+starts no coding agent. Only the explicit `wyrd init guided` starts one
+user-selected agent, after readiness and its MCP connection, on the terminal,
+with the agent's own permissions and approvals. Wyrd owns that one child: it
+reports the agent's exit and keeps serving, and on interruption or an
+unexpected server or UI exit it stops and reaps the agent before the bounded
+server and UI shutdown, then restores the terminal. It never stops other
+editor or agent processes. Wyrd is not an agent runtime.
 
 ## Release evidence
 

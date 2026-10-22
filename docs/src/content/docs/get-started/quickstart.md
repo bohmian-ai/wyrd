@@ -79,7 +79,34 @@ The second verdict is `failed`, and it is still a successful call: the check ran
 
 Run the program again. Declaring unchanged Cards changes nothing, so you get the same verdicts with the same identities.
 
-## 3. Change the requirement
+## 3. Confirm the stored verdicts
+
+The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+
+```bash
+wyrd get --space default --kind Service --name support-reply --version 1.0.0
+```
+
+Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.sql`, with `<uid>` replaced by that value:
+
+<CodeFromFile file="examples/quickstart/stored-verdicts.sql" lang="sql" title="stored-verdicts.sql" />
+
+Run it against the address `wyrd init` printed:
+
+```bash
+wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
+```
+
+It prints one JSON row per stored verdict, newest first:
+
+```text
+{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"failed"}
+{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"passed"}
+```
+
+The `failed` and `passed` rows with the same `run_id` are your program's two verdicts, and that `run_id` identifies its Run. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
+
+## 4. Change the requirement
 
 Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program again. It stops with `WYRD_REGISTRY_409_SPEC_DRIFT`: `no-refund-promise@1.0.0` already means the declaration that checks `guaranteed refund`, and a version never changes meaning.
 
@@ -94,6 +121,7 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 | `transport unavailable` | Start the server as in [Set up Wyrd](/get-started/setup/#start-the-server) |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
 | `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
+| No rows after a minute | Check that `<uid>` is the `metadata.uid` that `wyrd get` printed |
 
 ## Next
 

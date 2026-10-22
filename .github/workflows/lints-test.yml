@@ -76,8 +76,8 @@ jobs:
   # unresolvable changes take the complete gate as one parallel job per
   # `gate:*` shard in mise.toml, so every lane runs exactly once. Any other
   # change runs format, lint, the boundary checks, and exactly the lanes
-  # selected for its affected packages, with the identity and storage journeys
-  # as their own jobs when selected.
+  # selected for its affected packages, in parallel jobs grouped as the gate
+  # shards group them.
   # Compiles the third-party dependency set once, before any shard starts:
   # building the workspace's tests compiles every dependency with the features
   # the shards' test builds use, and the cache keeps only those dependencies.

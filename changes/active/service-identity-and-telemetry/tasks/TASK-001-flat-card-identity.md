@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: complete
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 12
 requirements: [REQ-018, REQ-019, REQ-020, REQ-027, REQ-029, REQ-031, REQ-032, INV-001, INV-006, AC-006, AC-009, AC-010]
@@ -292,3 +292,7 @@ GET query structs ignore an unknown `?space=` rather than refusing it, matching
 existing behavior for other unknown query keys.
 
 Status: IMPLEMENTED.
+
+## Approval
+
+Approved by the human owner on 2026-10-22 after the TASK-001-2026-10-22-01 review and the TASK-001-R1 remediation (`f5aa6f2cb`, `73843e810`).

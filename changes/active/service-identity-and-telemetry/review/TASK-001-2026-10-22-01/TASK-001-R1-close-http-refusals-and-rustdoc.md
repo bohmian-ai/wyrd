@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R1
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 12
 requirements: [REQ-019, REQ-031, REQ-032, AC-006, AC-010]

@@ -8,6 +8,7 @@ pub mod object_reads;
 /// One in-memory certificate authority minting dual-EKU Bifrost peer leaves.
 pub mod peer_ca;
 pub mod query_fixture;
+pub mod revisions;
 pub mod scribe_workload;
 pub mod telemetry;
 /// The two Bifrost write doors tests are allowed to use.

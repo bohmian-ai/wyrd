@@ -324,7 +324,7 @@ fn first_metric_disagreement(
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the record names a partition spec or
-/// sort order the table no longer carries, the footer cannot be decoded under
+/// sort order the table does not retain, the footer cannot be decoded under
 /// the writer's bounds, the footer's schema fingerprint differs from the
 /// record's, any persisted metric disagrees with the footer, or the object's own
 /// time-column bounds are unusable or fall outside the partition the record claims.
@@ -343,25 +343,25 @@ fn validate_promoted_object(
                 "promotion evidence names partition spec {spec_id}, which the table does not retain"
             ),
         })?;
-    let table_sort_order = i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
-        ForgeError::Invariant {
-            detail: "table sort order id is not representable".to_owned(),
-        }
-    })?;
-    if record.sort_order_id != table_sort_order {
+    if i64::try_from(record.sort_order_id)
+        .ok()
+        .and_then(|order_id| metadata.sort_order_by_id(order_id))
+        .is_none()
+    {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "promotion evidence names sort order {} but the table now writes {table_sort_order}",
+                "promotion evidence names sort order {}, which the table does not retain",
                 record.sort_order_id
             ),
         });
     }
 
-    let schema = metadata.current_schema();
+    let mut schemas = metadata.schemas_iter().cloned().collect::<Vec<_>>();
+    schemas.sort_by_key(|schema| std::cmp::Reverse(schema.schema_id()));
     let footer = crate::parquet::PromotedObjectFooter::decode(
         bytes,
         &record.object_key,
-        std::sync::Arc::clone(schema),
+        &schemas,
         file_size,
     )
     .map_err(|detail| ForgeError::Invariant { detail })?;

@@ -2237,7 +2237,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
             vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
                 &bytes,
                 path,
-                Arc::clone(&registered),
+                &[Arc::clone(&registered)],
                 size,
             )
             .map_err(|refusal| format!("{name}: Forge refuses its own table's ids: {refusal}"))?;
@@ -2245,7 +2245,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
             match vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
                 &bytes,
                 path,
-                Arc::new(renumbered),
+                &[Arc::new(renumbered)],
                 size,
             ) {
                 Err(refusal) if refusal.contains("field id") => {}

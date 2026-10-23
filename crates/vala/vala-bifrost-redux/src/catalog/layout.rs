@@ -2278,6 +2278,11 @@ mod tests {
     /// The declarations the single resolution entry point accepts for the sort
     /// order: the time column declared explicitly replaces the default, managed
     /// columns are legal, and nothing is prepended.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a legal declaration is refused or resolves to a different
+    /// sort order or Bloom list.
     #[test]
     fn canonical_layout_accepts_declared_shapes() {
         let schema = fixture_schema();
@@ -2320,6 +2325,11 @@ mod tests {
     /// The sort-key cap admits exactly `MAX_SORT_KEYS` and refuses the next
     /// one before any per-key validation; unknown and duplicate keys stay
     /// refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declaration at the cap is refused or a faulty one is
+    /// accepted or refused for a different field or column.
     #[test]
     fn canonical_layout_refuses_shape_and_column_faults() {
         let schema = fixture_schema();

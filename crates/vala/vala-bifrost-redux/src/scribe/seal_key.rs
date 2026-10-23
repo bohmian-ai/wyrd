@@ -565,6 +565,10 @@ mod tests {
     }
 
     /// Builds a one-hour batch whose rows carry `customers` and `shards`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `customers` and `shards` differ in length.
     fn composite_batch(customers: Vec<Option<&str>>, shards: Vec<i64>) -> RecordBatch {
         let rows = customers.len();
         let schema = Arc::new(Schema::new(vec![
@@ -592,6 +596,10 @@ mod tests {
     }
 
     /// Builds the scheme of hourly `TIME_COLUMN` plus `dimensions`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dimensions` do not form a valid partition spec.
     fn composite_scheme(
         dimensions: Vec<wyrd_spec::vala::api::PartitionFieldWire>,
     ) -> PartitionScheme {
@@ -615,6 +623,13 @@ mod tests {
         .expect("the fixture scheme is valid")
     }
 
+    /// Composite identities keep typed nulls and spec identity distinct and
+    /// round-trip through the WAL slice payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when two distinct composite identities collide or a WAL round
+    /// trip changes one.
     #[test]
     fn composite_partition_identity_and_wal() {
         use crate::catalog::PhysicalPartitionError;

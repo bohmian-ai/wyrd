@@ -798,6 +798,11 @@ fn encode_revision(revision: LayoutRevision) -> [u8; REVISION_BYTES] {
     encoded
 }
 
+/// Encodes one slice payload for `seal_key`, the test entry to the v7 codec.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when a field exceeds v7 payload limits.
 #[cfg(test)]
 fn encode_slice_payload(
     seal_key: &SealKey,
@@ -814,6 +819,13 @@ fn encode_slice_payload(
     )
 }
 
+/// Encodes one slice payload from raw parts, so tests can write identities
+/// a [`SealKey`] would refuse.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the table FQN, partition or Arrow
+/// payload exceeds v7 payload limits.
 #[cfg(test)]
 fn encode_slice_payload_parts(
     tenant: &[u8; 16],
@@ -993,6 +1005,11 @@ struct DecodedSliceMetadata {
 }
 
 /// Validate the v7 marker and decode the tenant/table/partition/schema identity.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the magic differs, a field is
+/// truncated or malformed, or the system owner names a table it cannot write.
 fn decode_slice_metadata(
     reader: &mut SlicePayloadReader<'_>,
 ) -> Result<DecodedSliceMetadata, ScribeError> {

@@ -354,6 +354,11 @@ impl std::fmt::Display for PhysicalPartition {
 }
 
 /// Reads a fixed-width big-endian field taken from a checked slice.
+///
+/// # Errors
+///
+/// Returns [`PhysicalPartitionError::Truncated`] when `bytes` is not exactly
+/// `N` bytes long.
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PhysicalPartitionError> {
     bytes
         .try_into()
@@ -381,6 +386,7 @@ pub struct PartitionScheme {
 
 /// A bare time partition is the time-only identity under the initial spec.
 impl From<TimePartition> for PhysicalPartition {
+    /// Wraps `time` as the time-only identity under the initial spec.
     fn from(time: TimePartition) -> Self {
         Self::time_only(time)
     }
@@ -526,6 +532,11 @@ impl RowPartitions<'_> {
 
     /// Returns the identity of row `index`, or `None` for a null instant or
     /// one whose time partition is not representable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not a row of the batch the columns were taken
+    /// from.
     #[must_use]
     pub fn partition(&self, index: usize) -> Option<PhysicalPartition> {
         let micros = self.time.floor_micros(index)?;
@@ -571,6 +582,10 @@ impl DimensionValues {
     }
 
     /// Returns row `index`'s typed value, `None` when it is null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not a row of the adopted column.
     fn value(&self, index: usize) -> Option<PartitionValueWire> {
         match self {
             Self::Utf8(values) => (!values.is_null(index))

@@ -1501,7 +1501,8 @@ async fn declare_verifier(
     .await
 }
 
-/// Unknown format names, invalid or non-object data schemas, Prompts that
+/// Unknown format names, invalid or non-object data schemas, data schemas
+/// declaring another draft or a root `$id`, Prompts that
 /// cannot produce a Verdict (including a composed handwritten schema whose
 /// data is optional), and native bodies that set their own response format
 /// are refused with a structured validation error naming the field,
@@ -1545,6 +1546,20 @@ async fn verdict_declarations_validate_before_persistence() {
             judged(
                 &json!({ "type": "object", "properties": { "score": { "type": "number" } },
                          "required": ["score"], "additionalProperties": false }),
+                false,
+            ),
+        ),
+        (
+            "vr-older-draft-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "$schema": "http://json-schema.org/draft-04/schema#", "type": "object" } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-authored-id-data",
+            judged(
+                &json!({ "kind": "verdict", "data": { "$id": "#", "type": "object" } }),
                 false,
             ),
         ),

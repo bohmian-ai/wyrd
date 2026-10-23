@@ -311,12 +311,12 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
     }
 
-    /// A declared data schema keeps its own reference root and dialect once
-    /// embedded in the Verdict envelope: `#/properties/reason` names the
-    /// data's integer field, not the Verdict's string reason; 2020-12
-    /// `prefixItems` still constrains a tuple; a declared draft-07 dialect
-    /// still ignores a `$ref`'s siblings; and definitions named like the
-    /// Verdict's own resolve to the author's.
+    /// A declared data schema keeps its own reference root once embedded in
+    /// the Verdict envelope: `#/properties/reason` names the data's integer
+    /// field, not the Verdict's string reason, with or without a declared
+    /// 2020-12 `$schema`; `prefixItems` still constrains a tuple; a `$ref`'s
+    /// siblings still apply; and definitions named like the Verdict's own
+    /// resolve to the author's.
     ///
     /// # Panics
     /// Panics when a composed schema accepts bad data or refuses good data.
@@ -337,12 +337,18 @@ mod tests {
                 ],
             ),
             (
-                json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
-                    "required": ["cite"],
+                json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                    "required": ["reason", "copy"],
+                    "properties": {"reason": {"type": "integer"}, "copy": {"$ref": "#/properties/reason"}}}),
+                json!({"reason": 1, "copy": 2}),
+                vec![json!({"reason": 1, "copy": "wrong"})],
+            ),
+            (
+                json!({"type": "object", "required": ["cite"],
                     "properties": {"cite": {"$ref": "#/definitions/Citation", "maximum": 1}},
                     "definitions": {"Citation": {"type": "integer"}}}),
-                json!({"cite": 3}),
-                vec![json!({"cite": {"slot": "deck"}})],
+                json!({"cite": 1}),
+                vec![json!({"cite": 3}), json!({"cite": {"slot": "deck"}})],
             ),
             (
                 json!({"type": "object", "required": ["cite"],

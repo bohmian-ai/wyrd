@@ -170,7 +170,7 @@ A citation names the original slot, never an extract step. An invalid citation i
 
 ### Custom data
 
-`response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
+`response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema, written in JSON Schema 2020-12 (omit `$schema` or declare 2020-12) and without a root `$id`. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
 
 The server validates the whole verdict against the declared schema. Data must fit both limits, inclusive:
 

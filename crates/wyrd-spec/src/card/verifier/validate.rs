@@ -1769,7 +1769,8 @@ mod tests {
     /// Agents (inline portable and native Prompts, whole-Verifier and step
     /// position) and code checks, generate the canonical response schema,
     /// keep the authored form, and refuse unknown names, invalid data
-    /// schemas, handwritten `data` that is optional or not an object (also
+    /// schemas, data schemas declaring another draft or a root `$id`,
+    /// handwritten `data` that is optional or not an object (also
     /// behind `allOf` or a local `$ref`, which accept the required-object
     /// form), and a `response_format` on a code action.
     ///
@@ -1884,9 +1885,25 @@ mod tests {
                 "response_format.data.properties.a.type",
             ),
             (
-                json!({"kind": "verdict", "data": {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                json!({"kind": "verdict", "data": {"type": "object",
                     "properties": {"pair": {"type": "array", "items": [{"type": "string"}]}}}}),
                 "response_format.data.properties.pair.items",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}}),
+                "response_format.data.$schema",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"$schema": "http://json-schema.org/draft-04/schema#", "type": "object"}}),
+                "response_format.data.$schema",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"$id": "https://example.test/score", "type": "object"}}),
+                "response_format.data.$id",
+            ),
+            (
+                json!({"kind": "verdict", "data": {"$id": "#", "type": "object"}}),
+                "response_format.data.$id",
             ),
         ] {
             let body = with(

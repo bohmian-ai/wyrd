@@ -409,8 +409,8 @@ pub const MAX_VERDICT_DATA_DEPTH: usize = 16;
 pub const VERDICT_FORMAT: &str = "verdict";
 
 /// The `$id` that makes a declared `data` schema its own resource inside the
-/// Verdict envelope, relative to the envelope's base, when the author set
-/// none: the data's `#` then names the data schema, not the envelope.
+/// Verdict envelope, relative to the envelope's base: the data's `#` then
+/// names the data schema, not the envelope.
 const DATA_RESOURCE: &str = "verdict-data";
 
 /// The closed schema every Agent and code check returns.
@@ -549,18 +549,20 @@ impl Verdict {
     ///
     /// The plain form is the generated closed Verdict without `data`; an
     /// expanded `data` schema becomes the required `data` member, embedded
-    /// as its own JSON Schema 2020-12 resource (`$id`, kept when the author
-    /// set one) so its local `$ref`s and any `$schema` it declares resolve
-    /// exactly as they do standalone. This is the resolver Prompt
-    /// compilation and code-check validation share.
+    /// as its own JSON Schema 2020-12 resource under a private `$id` so its
+    /// local `$ref`s resolve exactly as they do standalone. Data schemas are
+    /// 2020-12 only and carry no root `$id`: an older draft or an authored
+    /// identity could leave those references bound to the envelope. This is
+    /// the resolver Prompt compilation and code-check validation share.
     ///
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] at `response_format` for a name
-    /// other than `verdict`, and at `response_format.data...` for a data
-    /// schema that is not a valid object JSON Schema, or that declares another
-    /// draft and uses syntax 2020-12 refuses, such as a draft-07 tuple
-    /// `items` array.
+    /// other than `verdict`; at `response_format.data.$schema` for a data
+    /// schema declaring a draft other than 2020-12; at
+    /// `response_format.data.$id` for one with a root `$id`; and at
+    /// `response_format.data...` for one that is not a valid object JSON
+    /// Schema.
     ///
     /// # Panics
     ///
@@ -600,23 +602,29 @@ impl Verdict {
         let Some(data) = format.data() else {
             return Ok(schema);
         };
+        if let Some(dialect) = data.get("$schema")
+            && !matches!(
+                dialect.as_str(),
+                Some(
+                    "https://json-schema.org/draft/2020-12/schema"
+                        | "https://json-schema.org/draft/2020-12/schema#"
+                )
+            )
+        {
+            return Err(invalid(
+                "response_format.data.$schema",
+                "a Verdict data schema is JSON Schema 2020-12; omit `$schema` or declare https://json-schema.org/draft/2020-12/schema",
+            ));
+        }
+        if data.contains_key("$id") {
+            return Err(invalid(
+                "response_format.data.$id",
+                "a Verdict data schema is embedded as its own resource; remove the root `$id`",
+            ));
+        }
         check_output_schema(&Value::Object(data.clone()), "response_format.data", true)?;
         let mut data = data.clone();
-        if let Some(dialect) = data.remove("$schema") {
-            check_output_schema(&Value::Object(data.clone()), "response_format.data", true)
-                .map_err(|error| match error {
-                    SkaldError::PromptInvalid { field, message } => SkaldError::PromptInvalid {
-                        field,
-                        message: format!(
-                            "the Verdict envelope is JSON Schema 2020-12, which validates every embedded schema's syntax, so this data schema must also be valid 2020-12: {message}"
-                        ),
-                    },
-                    other => other,
-                })?;
-            data.insert("$schema".to_owned(), dialect);
-        }
-        data.entry("$id")
-            .or_insert_with(|| Value::from(DATA_RESOURCE));
+        data.insert("$id".to_owned(), Value::from(DATA_RESOURCE));
         schema["properties"]["data"] = Value::Object(data);
         schema
             .get_mut("required")

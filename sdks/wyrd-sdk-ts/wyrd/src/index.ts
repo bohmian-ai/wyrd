@@ -2007,13 +2007,8 @@ export class Principals {
    * @returns The principal with its new restriction.
    * @throws {@link WyrdError} `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` when the family already has a runtime account, or for an unknown principal or a transport or authorization failure.
    */
-  async setWorkloadRestriction(
-    principalId: string,
-    restriction: WorkloadRestriction,
-  ): Promise<PrincipalSummary> {
-    return lifecycleValue(
-      await this.#native.setWorkloadRestriction(principalId, JSON.stringify(restriction)),
-    );
+  async setWorkloadRestriction(principalId: string, restriction: WorkloadRestriction): Promise<PrincipalSummary> {
+    return lifecycleValue(await this.#native.setWorkloadRestriction(principalId, JSON.stringify(restriction)));
   }
 
   /**

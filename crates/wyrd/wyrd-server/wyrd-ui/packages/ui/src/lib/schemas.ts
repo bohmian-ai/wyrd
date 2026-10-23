@@ -36,7 +36,6 @@ export const CardRefSchema = z
     version: z
       .string()
       .regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'an exact version such as 1.4.2'),
-    space: z.string().min(1).nullish(),
     uid: z.string().min(1).nullish()
   })
   .strict() satisfies z.ZodType<CardRef>;

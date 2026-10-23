@@ -62,7 +62,7 @@ import {
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui';
-import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, type ChartInput } from 'wyrd-ai-ui/loaders';
+import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
 import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
@@ -239,7 +239,7 @@ test('TASK-003: Validated portable rendering', async () => {
     result: { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } } }
   });
   expect(header.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
-  expect(header.container).toHaveTextContent('search / ranker@1.4.2');
+  expect(header.container).toHaveTextContent('ranker@1.4.2');
   expect(header.container).toHaveTextContent('✓active');
   expect([...header.container.querySelectorAll('option')].map((option) => option.value)).toEqual(['1.4.2', '1.4.1']);
   expect(header.container).toHaveTextContent('showing the newest 2 versions');
@@ -269,7 +269,7 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(loading.getByRole('status')).toHaveAttribute('aria-busy', 'true');
   loading.unmount();
   const chip = render(CardRefChip, { cardRef: card, href: '/cards/x' });
-  expect(chip.getByRole('link')).toHaveTextContent('Model search/ranker@1.4.2');
+  expect(chip.getByRole('link')).toHaveTextContent('Model ranker@1.4.2');
   chip.unmount();
   for (const [verdict, text] of [['passed', '✓passed'], ['failed', '✕failed'], ['inconclusive', '!inconclusive']] as const) {
     const pill = render(VerdictPill, { verdict });
@@ -326,6 +326,7 @@ test('TASK-003: Validated portable rendering', async () => {
   const panels = [{ id: 'a', component: 'Chart', input: timeseries }];
   expect(validateView({ version: 'wyrd.view/v2', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validateView({ version: 'wyrd.view/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('CardHeader', { cardRef: { ...card, space: 'search' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('space') });
   expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).not.toHaveProperty('code');
 });
 
@@ -343,7 +344,7 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   );
   const header = await loadCardHeader({ cardRef: card }, { executor: paged.executor });
   expect(paged.calls).toHaveLength(6);
-  expect(paged.calls[1].request).toMatchObject({ op: 'cards.list', kind: 'Model', name: 'ranker', space: 'search', include_prerelease: true, cursor: null });
+  expect(paged.calls[1].request).toMatchObject({ op: 'cards.list', kind: 'Model', name: 'ranker', include_prerelease: true, cursor: null });
   expect(header.result).toMatchObject({ state: 'populated', data: { versions: { state: 'populated', data: { truncated: true } } } });
   const unlisted = await loadCardHeader({ cardRef: card }, { executor: recording((request) => (request.op === 'cards.list' ? { ok: false, problem: denied } : { ok: true, value: registered })).executor });
   expect(unlisted.result).toMatchObject({ state: 'populated', data: { versions: { state: 'denied' } } });

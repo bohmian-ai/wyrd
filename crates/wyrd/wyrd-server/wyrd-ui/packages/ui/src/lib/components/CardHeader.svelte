@@ -26,7 +26,7 @@
   const card = $derived(result.state === 'populated' ? result.data.card : undefined);
   const versions = $derived(result.state === 'populated' ? result.data.versions : undefined);
   const ref = $derived<CardRef | undefined>(
-    card && { kind: card.kind, name: card.metadata.name, version: input.cardRef.version, space: card.metadata.space ?? input.cardRef.space }
+    card && { kind: card.kind, name: card.metadata.name, version: input.cardRef.version }
   );
   const items = $derived(versions?.state === 'populated' ? versions.data.items : []);
   const current = $derived(items.find((item) => item.version === input.cardRef.version));
@@ -81,7 +81,7 @@
           {#if current}<span class="status"><StatusPill tone={TONES[current.status]} label={current.status} /></span>{/if}
         </div>
         <p class="meta">
-          <span>{ref.space ? `${ref.space} / ` : ''}{ref.name}@{ref.version}</span>
+          <span>{fmtCardRef(ref)}</span>
           {#if card.metadata.uid}
             <span>
               uid {card.metadata.uid}

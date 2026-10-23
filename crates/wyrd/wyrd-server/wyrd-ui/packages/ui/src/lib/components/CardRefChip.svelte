@@ -1,4 +1,4 @@
-<!-- One exact Card identity, `kind space/name@version`; a link only when the host supplies one. -->
+<!-- One exact Card identity, `kind name@version`; a link only when the host supplies one. -->
 <script lang="ts">
   import type { CardRef } from '../contract.js';
   import { fmtCardRef } from '../format.js';

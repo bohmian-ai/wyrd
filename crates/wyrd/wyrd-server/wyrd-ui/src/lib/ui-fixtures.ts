@@ -44,14 +44,14 @@ export const day: QueryResult = {
   terminal: terminal(48)
 };
 export const timeseries: ChartInput = { type: 'timeseries', title: 'Latency', sql: 'SELECT at, model, p95 FROM t WHERE at >= $1::timestamptz AND at < $2::timestamptz', unit: 'ms', x: 'at', y: ['p95'], series: 'model' };
-export const card: CardRef = { kind: 'Model', name: 'ranker', version: '1.4.2', space: 'search' };
+export const card: CardRef = { kind: 'Model', name: 'ranker', version: '1.4.2' };
 export const registered = {
   apiVersion: 'wyrd/v1',
   kind: 'Model',
-  metadata: { name: 'ranker', space: 'search', version: '1.4.2', uid: 'card_01HX' },
+  metadata: { name: 'ranker', version: '1.4.2', uid: 'card_01HX' },
   spec: {}
 } as unknown as RegisteredCard;
-export const summary = (version: string, status = 'active') => ({ version, status, name: 'ranker', kind: 'Model', space: 'search', created_at: '2026-10-19T14:02:00Z' }) as never;
+export const summary = (version: string, status = 'active') => ({ version, status, name: 'ranker', kind: 'Model', created_at: '2026-10-19T14:02:00Z' }) as never;
 export const denied = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
 export const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-20T12:00:00Z' };
 

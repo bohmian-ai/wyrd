@@ -46,7 +46,7 @@ use crate::tables::{
 };
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::reference::CardRefScope;
+use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
@@ -293,7 +293,7 @@ impl<T: AuditStage> GateAudit for T {
             None,
             "bifrost.record.write".to_owned(),
             resource.to_owned(),
-            auth.principal.card_ref().cloned(),
+            None,
             auth.attribution(),
             auth.principal.kind.tag(),
             "bifrost:record:write".to_owned(),
@@ -470,24 +470,35 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Resolves the Cards an unbound writer attributes one frame to.
+    /// Resolves the Cards one frame may attribute to.
     ///
-    /// `cards` collects the frame's distinct Card UIDs; it runs only when a
-    /// registry is composed and the principal is unbound. `None` leaves the
-    /// principal's signed scope in force.
+    /// `cards` collects the frame's distinct Card UIDs. An unbound writer's
+    /// UIDs resolve through the registry when one is composed; a scoped
+    /// writer's signed scope governs. The result falls back to that signed
+    /// scope, and `None` refuses every attributed row downstream.
     ///
     /// # Errors
     ///
-    /// Returns the registry's validation or unavailability error.
+    /// Returns [`IngestError::WorkloadContextRequired`] when a rootless
+    /// family-restricted account names any Card, and the registry's
+    /// validation or unavailability error.
     async fn attributed_cards(
         &self,
         auth: &AuthContext,
         cards: impl FnOnce() -> Vec<wyrd_spec::ids::CardUid>,
     ) -> Result<Option<Vec<wyrd_spec::ids::CardUid>>, IngestError> {
-        match &self.cards {
-            Some(registry) => registry.attributed_cards(auth, cards).await,
-            None => Ok(None),
+        if let CardAttribution::RootRequired(_) = auth.principal.card_attribution() {
+            return if cards().is_empty() {
+                Ok(None)
+            } else {
+                Err(IngestError::WorkloadContextRequired)
+            };
         }
+        let attributed = match &self.cards {
+            Some(registry) => registry.attributed_cards(auth, cards).await?,
+            None => None,
+        };
+        Ok(attributed.or_else(|| auth.principal.card_scope().map(<[_]>::to_vec)))
     }
 
     /// Attaches the sink every write decision is staged on.
@@ -799,8 +810,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::span_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
             attributed.as_deref(),
@@ -838,8 +848,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::metric_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
             attributed.as_deref(),
@@ -877,8 +886,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::log_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
             attributed.as_deref(),

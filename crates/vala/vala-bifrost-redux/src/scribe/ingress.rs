@@ -20,7 +20,6 @@ use vala_sql::ValaPostgres;
 use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::TableVersion;
 
@@ -595,7 +594,7 @@ impl ScribeImpl {
                 AdmittedRowContext {
                     card_scope: frame
                         .attributed_cards
-                        .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids)),
+                        .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,

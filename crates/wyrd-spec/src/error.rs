@@ -4106,6 +4106,16 @@ impl WyrdError {
         }
     }
 
+    /// Construct [`WyrdError::WorkloadContextRequired`] with its stable
+    /// `workload_context_required` reason; `message` names what lacked a root.
+    #[must_use]
+    pub fn workload_context_required(message: impl Into<String>) -> Self {
+        Self::WorkloadContextRequired {
+            message: message.into(),
+            details: serde_json::json!({ "reason": "workload_context_required" }),
+        }
+    }
+
     /// Construct [`WyrdError::RegistryUnavailable`].
     #[must_use]
     pub fn registry_unavailable(message: impl Into<String>) -> Self {

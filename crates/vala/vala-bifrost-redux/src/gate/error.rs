@@ -46,6 +46,10 @@ pub enum IngestError {
     /// A per-row `card_uid` outside the principal's card scope.
     #[error("Card outside principal card scope")]
     CardScopeDenied,
+    /// A family-restricted account attributed rows to Cards without having
+    /// selected a root.
+    #[error("Card attribution requires a selected workload root")]
+    WorkloadContextRequired,
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
     /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
@@ -163,6 +167,7 @@ impl IngestError {
             Self::RbacDenied { .. }
             | Self::ReservedBuiltinWriteDenied { .. }
             | Self::CardScopeDenied
+            | Self::WorkloadContextRequired
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
             Self::RequestValidation(_) | Self::Decode(_) | Self::ContractViolation(_) => {
@@ -217,6 +222,9 @@ impl IngestError {
                 .into()
             }
             Self::CardScopeDenied => BifrostError::CardScopeDenied.into(),
+            Self::WorkloadContextRequired => WyrdError::workload_context_required(
+                "this account is restricted to one workload family; select its release root to attribute evidence to Cards",
+            ),
             Self::CardUnresolved { card_ref } => BifrostError::CardUnresolved {
                 card_ref: card_ref.clone(),
             }
@@ -452,6 +460,12 @@ mod tests {
             (
                 IngestError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+                403,
+                Code::PermissionDenied,
+            ),
+            (
+                IngestError::WorkloadContextRequired,
+                "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
                 403,
                 Code::PermissionDenied,
             ),

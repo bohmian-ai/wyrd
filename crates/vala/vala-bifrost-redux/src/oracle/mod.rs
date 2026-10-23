@@ -752,7 +752,7 @@ fn query_audit_event(
         context.trace_id.clone(),
         operation.to_owned(),
         "bifrost.query".to_owned(),
-        context.principal.card_ref().cloned(),
+        None,
         context.served_subject.map_or_else(
             || {
                 let verified = wyrd_runtime::delegated_attribution(

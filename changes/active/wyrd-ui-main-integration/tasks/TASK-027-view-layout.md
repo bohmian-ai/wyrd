@@ -119,7 +119,7 @@ memory; saving; drag-and-drop libraries or grid-layout dependencies.
 ## Authority Links
 
 `../spec.md` (REQ-030, REQ-036, AC-011, AC-015); `AGENTS.md`;
-`architecture/agent-rules.md`; `architecture/references/languages/testing-workflows.md`;
+`agent_docs/index.md`; `TESTING.md`;
 `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md`.
 
 ## Implementation Evidence

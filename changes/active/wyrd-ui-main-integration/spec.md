@@ -1291,11 +1291,11 @@ reported live-proof blocker, never an assumed capability or silent pass.
   without changing it. Approved by the caller's explicit "yes" to the
   revision as written; no implementation is claimed.
 
-Authorities: `AGENTS.md`; `architecture/agent-rules.md`;
-`architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;
+Authorities: `AGENTS.md`; `agent_docs/index.md`;
+`architecture/wyrd-design.md`;
 `architecture/bifrost-design.md`; `architecture/wyrd-security-posture.md`;
 `architecture/operations/deployment-and-release.md`;
-`architecture/references/languages/spec-driven-development.md`;
-`architecture/references/languages/testing-workflows.md`; repository `wyrd-ui`
+`changes/spec-driven-development.md`;
+`TESTING.md`; repository `wyrd-ui`
 guidance for styling. These are repository-relative authority paths, not copies
 of skill instructions.

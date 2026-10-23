@@ -615,8 +615,7 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
    * fails as `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and is never truncated.
    * {@link BifrostQueryStream.return} during collection stops it.
    *
-   * @param options - Row ceiling (default 1000, 1–10,000) and serialized byte ceiling (default 4 MiB, 1 B–16 MiB);
-   *   a ceiling outside its range fails as `WYRD_SPEC_400_VALIDATION` before any row is read.
+   * @param options - Row ceiling (default 1000) and serialized byte ceiling (default 4 MiB).
    * @returns The complete `{columns, rows, terminal}` result.
    * @throws {@link WyrdError} for a failed or oversized query; the stream is closed either way.
    */

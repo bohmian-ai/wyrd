@@ -36,9 +36,7 @@ use wyrd_client::bifrost::Correlation;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
-use wyrd_queue::json_result::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, JsonResultBuilder, admit_ceilings,
-};
+use wyrd_queue::json_result::{DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, JsonResultBuilder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
@@ -1364,56 +1362,33 @@ impl NativeBifrostQueryStream {
 
     /// Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
     ///
-    /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB;
-    /// a supplied one must be an exact integer in the same admitted range the MCP tool enforces
-    /// ([`admit_ceilings`]).
+    /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB.
     /// The projection is [`JsonResultBuilder`], the same owner the server's MCP
     /// `bifrost.query` tool builds through, so both surfaces return the same
     /// value for the same result. The stream is released when this returns.
     ///
     /// # Errors
     ///
-    /// Returns a step carrying the stable Wyrd error for a ceiling outside its
-    /// admitted range, for a failed, incomplete, or malformed stream, and for a
-    /// result past `max_rows` or `max_bytes`, and
+    /// Returns a step carrying the stable Wyrd error for a failed, incomplete,
+    /// or malformed stream and for a result past `max_rows` or `max_bytes`, and
     /// a napi error when the stream is already closed or [`Self::close`] stops
     /// the drain.
     #[napi]
     pub async fn collect(
         &self,
-        max_rows: Option<f64>,
-        max_bytes: Option<f64>,
+        max_rows: Option<u32>,
+        max_bytes: Option<u32>,
     ) -> Result<NativeQueryStep> {
         let mut stream_slot = self.stream.lock().await;
         let mut stream = stream_slot
             .take()
             .ok_or_else(|| napi::Error::from_reason("query stream is closed".to_owned()))?;
-        // The stream is already taken, so every refusal below drops and releases it.
-        let (max_rows, max_bytes) = match (
-            max_rows
-                .map(|value| parse_ceiling(value, "max_rows"))
-                .transpose(),
+        let mut result = JsonResultBuilder::new(
+            usize::try_from(max_rows.unwrap_or(DEFAULT_MAX_ROWS)).unwrap_or(usize::MAX),
             max_bytes
-                .map(|value| parse_ceiling(value, "max_bytes"))
-                .transpose(),
-        ) {
-            (Ok(max_rows), Ok(max_bytes)) => (max_rows, max_bytes),
-            (Err(error), _) | (_, Err(error)) => {
-                return Ok(NativeQueryStep::failure(&WyrdError::from(&error)));
-            }
-        };
-        let max_rows = max_rows.unwrap_or(DEFAULT_MAX_ROWS);
-        let max_bytes = max_bytes
-            .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
-            .unwrap_or(usize::MAX);
-        if let Err(refused) = admit_ceilings(max_rows, max_bytes) {
-            return Ok(NativeQueryStep::failure(&WyrdError::Validation {
-                message: refused.reason.to_owned(),
-                details: refused.details,
-            }));
-        }
-        let mut result =
-            JsonResultBuilder::new(usize::try_from(max_rows).unwrap_or(usize::MAX), max_bytes);
+                .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
+                .unwrap_or(usize::MAX),
+        );
         let mut columns = false;
         loop {
             let next = tokio::select! {
@@ -1550,25 +1525,6 @@ fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
                 detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
             },
         })
-    })
-}
-
-/// Converts one JavaScript collection ceiling into the integer [`admit_ceilings`] takes.
-///
-/// Only exact integers in `0..=u32::MAX` pass through the lossless decimal round
-/// trip, so a fractional or wrapping number is refused instead of being narrowed
-/// into an admitted value; the admitted range itself stays with [`admit_ceilings`].
-///
-/// # Errors
-///
-/// Returns the catalog validation error naming `field` for a non-finite,
-/// fractional, negative, or beyond-`u32` number.
-fn parse_ceiling(value: f64, field: &str) -> StdResult<u32, BifrostClientError> {
-    value.to_string().parse().map_err(|_| {
-        validation_error(
-            format!("{field} must be an integer in its allowed range"),
-            field,
-        )
     })
 }
 

@@ -43,7 +43,7 @@
             "properties": {
               "last": {
                 "type": "string",
-                "pattern": "^[1-9]\\d*[mhd]$"
+                "pattern": "^[1-9]\\d{0,4}[mhd]$"
               }
             },
             "required": [
@@ -172,7 +172,7 @@
                     "properties": {
                       "last": {
                         "type": "string",
-                        "pattern": "^[1-9]\\d*[mhd]$"
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
                       }
                     },
                     "required": [
@@ -254,7 +254,7 @@
                     "properties": {
                       "last": {
                         "type": "string",
-                        "pattern": "^[1-9]\\d*[mhd]$"
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
                       }
                     },
                     "required": [
@@ -332,7 +332,7 @@
                     "properties": {
                       "last": {
                         "type": "string",
-                        "pattern": "^[1-9]\\d*[mhd]$"
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
                       }
                     },
                     "required": [
@@ -405,7 +405,7 @@
                     "properties": {
                       "last": {
                         "type": "string",
-                        "pattern": "^[1-9]\\d*[mhd]$"
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
                       }
                     },
                     "required": [

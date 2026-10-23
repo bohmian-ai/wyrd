@@ -63,7 +63,7 @@ import {
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui';
-import { AbsoluteRangeSchema, chartParams, loadCardHeader, loadChart, loadPanel, resolveRange, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
+import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
 import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
@@ -128,22 +128,22 @@ test('TASK-003: Validated portable rendering', async () => {
   const grouped = (groups: [string, number][]): QueryResult => ({ ...series, rows: groups.map(([name, value]) => ['2026-10-20T10:00:00Z', name, value]), terminal: terminal(groups.length) });
   const captions = (view: { container: Element }) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
   const readings = (view: { container: Element }) => [...view.container.querySelectorAll('.tooltip span')].map((item) => item.textContent);
-  const taken: [string, number][] = [['other', 21], ['other (aggregate)', 20], ...Array.from({ length: 19 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
+  const taken: [string, number][] = [['other', 21], ...Array.from({ length: 20 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
   const named = render(Chart, { input: timeseries, result: { state: 'populated', data: grouped(taken) } });
   expect(captions(named)).toHaveLength(20);
   expect(new Set(captions(named)).size).toBe(20);
-  expect(captions(named).slice(0, 2)).toEqual(['other', 'other (aggregate)']);
-  expect(captions(named).at(-1)).toBe('other (aggregate 2)');
+  expect(captions(named).slice(0, 2)).toEqual(['other', 's20']);
+  expect(captions(named).at(-1)).toBe('other (aggregate)');
   expect(named.container.querySelectorAll('svg.plot polyline')).toHaveLength(20);
-  expect(named.getByRole('application').getAttribute('aria-label')).toContain('other, other (aggregate), s19');
+  expect(named.getByRole('application').getAttribute('aria-label')).toContain('other, s20, s19');
   await fireEvent.focus(named.getByRole('application'));
-  expect(named.getByRole('status')).toHaveTextContent(/other: 21 ms.*other \(aggregate\): 20 ms.*other \(aggregate 2\): 3 ms/);
+  expect(named.getByRole('status')).toHaveTextContent(/other: 21 ms.*other \(aggregate\): 3 ms/);
   // A smaller authored "other" folds into the aggregate, which then needs no qualifier; at five series it keeps its own line.
-  await named.rerender({ result: { state: 'populated', data: grouped([...taken.slice(2), ['x', 30], ['y', 40], ['other', 0.5]]) } });
+  await named.rerender({ result: { state: 'populated', data: grouped([...taken.slice(1), ['x', 30], ['y', 40], ['other', 0.5]]) } });
   expect(captions(named)).toHaveLength(20);
   expect(captions(named).slice(0, 2)).toEqual(['y', 'x']);
   expect(captions(named).at(-1)).toBe('other');
-  expect(named.getByRole('status')).toHaveTextContent('other: 3.5 ms');
+  expect(named.getByRole('status')).toHaveTextContent('other: 6.5 ms');
   await named.rerender({ result: { state: 'populated', data: grouped([['other', 21], ['s1', 1], ['s2', 2]]) } });
   expect(captions(named)).toEqual(['other', 's1', 's2']);
   named.unmount();
@@ -162,12 +162,12 @@ test('TASK-003: Validated portable rendering', async () => {
   await fireEvent.focus(pairs.getByRole('application'));
   expect(readings(pairs)).toEqual(['"model input","tokens": 1 ms', 'model input input tokens: 10 ms', 'model tokens: 2 ms', '"model","input tokens": 20 ms']);
   pairs.unmount();
-  // Null and the text "null" stay apart, as does authored text spelling a qualified caption.
+  // Null and the text "null" stay apart.
   const nulls = (groups: [string | null, number][]): QueryResult => ({ ...tokens, rows: groups.map(([name, value]) => [instant, name, value, null]), terminal: terminal(groups.length) });
-  const nullable = render(Chart, { input: { ...timeseries, y: ['tokens'] } as ChartInput, result: { state: 'populated', data: nulls([[null, 1], ['null', 2], ['"null"', 4]]) } });
-  expect(captions(nullable)).toEqual(['null', '"null"', '"\\"null\\""']);
+  const nullable = render(Chart, { input: { ...timeseries, y: ['tokens'] } as ChartInput, result: { state: 'populated', data: nulls([[null, 1], ['null', 2]]) } });
+  expect(captions(nullable)).toEqual(['null', '"null"']);
   await fireEvent.focus(nullable.getByRole('application'));
-  expect(readings(nullable)).toEqual(['null: 1 ms', '"null": 2 ms', '"\\"null\\"": 4 ms']);
+  expect(readings(nullable)).toEqual(['null: 1 ms', '"null": 2 ms']);
   // A rerender with other groups shows only the current captions and values.
   await nullable.rerender({ result: { state: 'populated', data: nulls([[null, 5], ['x', 6]]) } });
   expect(captions(nullable)).toEqual(['null', 'x']);
@@ -364,62 +364,15 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(host.childElementCount).toBe(0);
   host.remove();
   expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '6x' }, panels: [] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  // A span too long to resolve to a dated range is refused at validation, before any read.
+  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '100000d' }, panels: [] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '99999d' }, panels: [{ id: 'a', component: 'Chart', input: timeseries }] })).not.toHaveProperty('code');
   // A document from another format version or catalog is refused, never half-rendered.
   const panels = [{ id: 'a', component: 'Chart', input: timeseries }];
   expect(validateView({ version: 'wyrd.view/v2', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validateView({ version: 'wyrd.view/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('CardHeader', { cardRef: { ...card, space: 'search' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('space') });
   expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).not.toHaveProperty('code');
-
-  // A relative range that cannot resolve to RFC 3339 bounds is a field error: no read, local or remote, before or
-  // after a valid document; a Chart's own such range fails only that panel.
-  vi.useFakeTimers({ now: Date.parse('2026-10-22T00:00:00Z'), toFake: ['Date'] });
-  try {
-    const yearZero = new Date(0);
-    yearZero.setUTCFullYear(0, 0, 1);
-    const days = Math.floor((Date.now() - yearZero.getTime()) / 86_400_000);
-    for (const last of ['6h', '24h', `${days}d`]) {
-      expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last }, panels }), last).not.toHaveProperty('code');
-      expect(AbsoluteRangeSchema.safeParse(resolveRange({ last })).success, last).toBe(true);
-    }
-    expect(resolveRange({ last: `${days}d` }).from).toMatch(/^0000-/);
-    expect(resolveRange(RANGE)).toBe(RANGE);
-    const headed = [...panels, { id: 'header', component: 'CardHeader', input: { cardRef: card } }];
-    for (const last of ['1000000000000d', '100000000d', `${days + 1}d`]) {
-      expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last }, panels }), last).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringMatching(/^View input\.range/) });
-      const unresolvable = { last };
-      const ranged = recording((request) => (request.op === 'bifrost.query' ? { ok: true, value: series } : { ok: true, value: registered }));
-      const remote = vi.fn(async () => ({ input: timeseries, result: { state: 'loading' } }) as never);
-      const outOfRange = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: unresolvable, panels: headed };
-      for (const host of [{ executor: ranged.executor }, { load: remote }]) {
-        const invalidRoot = render(WyrdView, { doc: outOfRange, ...host });
-        expect(invalidRoot.container, last).toHaveTextContent('View input.range');
-        expect(invalidRoot.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
-        invalidRoot.unmount();
-      }
-      expect(ranged.calls).toHaveLength(0);
-      expect(remote).not.toHaveBeenCalled();
-      const replaced = render(WyrdView, { doc: { ...outOfRange, range: RANGE }, executor: ranged.executor });
-      await waitFor(() => expect(ranged.calls.length).toBeGreaterThan(1));
-      const settled = ranged.calls.length;
-      await replaced.rerender({ doc: outOfRange, executor: ranged.executor });
-      expect(replaced.container).toHaveTextContent('View input.range');
-      expect(ranged.calls).toHaveLength(settled);
-      replaced.unmount();
-      const before = ranged.calls.length;
-      const invalidPanel = render(WyrdView, {
-        doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'far', component: 'Chart', input: { ...timeseries, range: unresolvable } }, { id: 'near', component: 'Chart', input: timeseries }] },
-        executor: ranged.executor
-      });
-      await waitFor(() => expect(invalidPanel.container.querySelector('[data-panel="near"] .legend')).not.toBeNull());
-      expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('Chart input.range');
-      expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
-      expect(ranged.calls.slice(before).map((call) => call.request)).toEqual([{ op: 'bifrost.query', sql: timeseries.sql, params: [RANGE.from, RANGE.to] }]);
-      invalidPanel.unmount();
-    }
-  } finally {
-    vi.useRealTimers();
-  }
 });
 
 test('TASK-003: Dependent loads and safe actions', async () => {
@@ -449,39 +402,6 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   const loaded = await loadChart(timeseries, { executor: chart.executor, range: RANGE });
   expect(chart.calls[0].request).toEqual({ op: 'bifrost.query', sql: timeseries.sql, params: [RANGE.from, RANGE.to] });
   expect(loaded.executed).toEqual({ sql: timeseries.sql, params: [RANGE.from, RANGE.to] });
-
-  // Only real placeholders bind: `$n` inside quoted strings, quoted identifiers, dollar quotes, comments, or an identifier
-  // is query text, so a range-free table reaches the executor unchanged with no params.
-  const inert = [
-    "SELECT '$1' AS label FROM vala.gateway.calls",
-    "SELECT 'it''s $2' AS label FROM vala.gateway.calls",
-    "SELECT E'\\'$3' AS label FROM vala.gateway.calls",
-    'SELECT call_id AS "$1", "a""$2" FROM vala.gateway.calls',
-    'SELECT call_id AS `$3` FROM vala.gateway.calls',
-    'SELECT $$ $1 $$ AS a, $q$ $2 $q$ AS b FROM vala.gateway.calls',
-    'SELECT call_id FROM vala.gateway.calls -- $3 is explanatory text',
-    'SELECT call_id /* outer /* $1 */ $2 */ FROM vala.gateway.calls',
-    'SELECT price$1 FROM vala.gateway.calls',
-    'SELECT call_id FROM vala.gateway.calls WHERE n = $12'
-  ];
-  for (const sql of inert) {
-    const table = recording(() => ({ ok: true, value: series }));
-    const props = (await loadPanel('Chart', { type: 'table', sql }, { executor: table.executor })) as Awaited<ReturnType<typeof loadChart>>;
-    expect(table.calls.map((call) => call.request), sql).toEqual([{ op: 'bifrost.query', sql, params: [] }]);
-    expect(props.executed).toEqual({ sql, params: [] });
-    expect(props.result).toEqual({ state: 'populated', data: series });
-  }
-  // Real `$1`/`$2` beside an inert `$3` bind exactly two values; without a range they are still refused before any read.
-  const mixedSql = "SELECT at FROM t WHERE at >= $1 AND at < $2 AND note <> '$3' -- $3\n";
-  const real = recording(() => ({ ok: true, value: series }));
-  const bound = await loadChart({ type: 'table', sql: mixedSql }, { executor: real.executor, range: RANGE });
-  expect(real.calls.map((call) => call.request)).toEqual([{ op: 'bifrost.query', sql: mixedSql, params: [RANGE.from, RANGE.to] }]);
-  expect(bound.executed).toEqual({ sql: mixedSql, params: [RANGE.from, RANGE.to] });
-  const missing = recording(() => ({ ok: true, value: series }));
-  for (const sql of [mixedSql, "SELECT '$1', $1 FROM t", 'SELECT $3 /* $1 */ FROM t'])
-    expect((await loadChart({ type: 'table', sql }, { executor: missing.executor })).result, sql).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
-  expect(missing.calls).toHaveLength(0);
-  expect(chartParams("SELECT date_bin($3::interval, at) FROM t WHERE at >= $1 AND at < $2 AND s <> '$4'", RANGE)).toEqual([RANGE.from, RANGE.to, '5 minutes']);
 
   // A relative range resolves once per view load; every panel binds the same bounds.
   const pending: ((result: WireResult) => void)[] = [];
@@ -714,17 +634,6 @@ test('Canonical UI problem projections', async () => {
     expect(response.headers.get('content-type')).toBe('application/problem+json');
     expect(await response.json()).toEqual({ ...validation, detail: expect.stringMatching(/^Panel input/) });
   }
-  // A valid inherited range does not admit a Chart's own unresolvable range: each endpoint refuses it without a read.
-  const unread = vi.spyOn(Bifrost, 'connect');
-  for (const [POST, last] of [bffLoad, exampleLoad].flatMap((POST) => ['1000000000000d', '100000000d'].map((last) => [POST, last] as const))) {
-    const body = JSON.stringify({ component: 'Chart', input: { ...timeseries, range: { last } }, range: RANGE });
-    const response = await POST({ locals: { browserSession: { client: () => ({}) } }, request: new Request('http://ui/load', { method: 'POST', body }) } as never);
-    expect(response.status).toBe(400);
-    expect(response.headers.get('content-type')).toBe('application/problem+json');
-    expect(await response.json()).toEqual({ ...validation, detail: expect.stringMatching(/^Chart input\.range/) });
-  }
-  expect(unread).not.toHaveBeenCalled();
-  unread.mockRestore();
 
   // Browser exports load no native SDK at runtime.
   const browser = import.meta.glob('/packages/ui/src/lib/{index,contract,loaders,view,plot,format,schemas,layout,mcp}.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;

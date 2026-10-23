@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
-use wyrd_queue::json_result::{JsonResultBuilder, admit_ceilings};
+use wyrd_queue::json_result::JsonResultBuilder;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -168,8 +168,18 @@ impl QueryArguments {
                 serde_json::json!({ "deadline_ms": 0 }),
             ));
         }
-        admit_ceilings(self.max_rows, self.max_bytes)
-            .map_err(|refused| invalid(refused.reason, refused.details))?;
+        if self.max_rows == 0 || self.max_rows > MAX_ROWS_CEILING {
+            return Err(invalid(
+                "max_rows is outside the allowed range",
+                serde_json::json!({ "max_rows": self.max_rows, "ceiling": MAX_ROWS_CEILING }),
+            ));
+        }
+        if self.max_bytes == 0 || self.max_bytes > MAX_BYTES_CEILING {
+            return Err(invalid(
+                "max_bytes is outside the allowed range",
+                serde_json::json!({ "max_bytes": self.max_bytes, "ceiling": MAX_BYTES_CEILING }),
+            ));
+        }
         Ok(())
     }
 

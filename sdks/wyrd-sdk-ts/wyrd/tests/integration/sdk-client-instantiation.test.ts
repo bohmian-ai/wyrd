@@ -12,7 +12,7 @@ import { z } from "zod";
 import { Bifrost, Cards, Gateway, OperatorConnections, Principals, TableConfig, WyrdClient } from "wyrd-ai";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
 
-import { serverTest } from "../support/server.js";
+import { rooted, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -111,7 +111,7 @@ test("credential paths preserve exchange and bearer behavior", async ({ server }
 
   for (const { handle } of HANDLES) {
     await expect(handle.connect({ client: forged }), handle.name).rejects.toMatchObject({
-      code: "WYRD_SPEC_400_VALIDATION",
+      code: "WYRD_AUTH_401_API_KEY_INVALID",
       detail: expect.stringContaining("authorization server refused"),
     });
   }
@@ -122,9 +122,10 @@ test("credential paths preserve exchange and bearer behavior", async ({ server }
 
 test("delegated connect uses the subject principal", async ({ server }) => {
   const subject = server.scopedApiKey("instantiation_subject", ["bifrost_query:read"]);
-  const actor = WyrdClient.connect({
-    credential: server.scopedApiKey("instantiation_actor", ["bifrost_query:read", "bifrost_table:read"]),
-  });
+  const actor = await rooted(
+    server.scopedApiKey("instantiation_actor", ["bifrost_query:read", "bifrost_table:read"]),
+    "instantiation_actor",
+  );
   const token = await WyrdClient.connect({ credential: subject }).accessToken();
   const delegated = await actor.onBehalfOf(token, { audience: "bifrost" });
   const principals = await Principals.connect();

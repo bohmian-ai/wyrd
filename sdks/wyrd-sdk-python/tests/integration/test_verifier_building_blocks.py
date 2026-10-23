@@ -42,6 +42,7 @@ from .support import (
     client_of,
     declare,
     pull,
+    rooted,
     service_key,
     timeline,
 )
@@ -586,8 +587,8 @@ def test_delegated_tools_keep_the_narrower_authority(
     policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
 ) -> None:
     subject = WyrdClient(credential=wyrd_server.scoped_api_key("tool_subject", grants("all")))
-    actor = WyrdClient(
-        credential=wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]}))
+    actor = rooted(
+        wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]})), "policy-desk"
     )
     delegated = actor.on_behalf_of(subject.access_token(), audience="wyrd")
 

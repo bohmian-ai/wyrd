@@ -6,7 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   Bifrost,
   type CardRef,
-  type Cards,
+  Cards,
   type DeclarationReceipt,
   Principals,
   type SpanRecord,
@@ -102,6 +102,15 @@ export async function runtimeAccount(
     workload_restriction: { mode: "family", kind: card.kind, name: card.name },
   });
   return { principalId: created.principal_id, key: created.credential };
+}
+
+/** A client acting as `credential`, run as the one registered `service` release. */
+export async function rooted(credential: string, service: string): Promise<WyrdClient> {
+  const [root, ...others] = (await (await Cards.connect()).list({ kind: "Service", name: service })).items;
+  if (root === undefined || others.length > 0) {
+    throw new Error(`expected one registered ${service} release`);
+  }
+  return WyrdClient.connect({ credential, workloadUid: root.card_uid });
 }
 
 /** The one verification binding `owner` declares, read from its served status. */

@@ -218,8 +218,9 @@ def test_a_family_has_one_runtime_account_until_released(server: WyrdTestServer)
     principals.revoke_principal(
         second["principal_id"], {"principal_kind": "service", "reason": "rotated out"}
     )
-    with pytest.raises(WyrdError):
+    with pytest.raises(WyrdError) as revoked:
         Bifrost(client=client_of(server, second["credential"])).sql(TENANT_WIDE, model=Count)
+    assert revoked.value.code == "WYRD_AUTH_401_API_KEY_INVALID"
 
 
 def test_another_familys_account_cannot_run_as_the_root(
@@ -228,8 +229,9 @@ def test_another_familys_account_cannot_run_as_the_root(
     root = next(iter(releases(server, tmp_path)))
     _, foreign = runtime_account("another-service", client=client_of(server))
 
-    with pytest.raises(WyrdError):
+    with pytest.raises(WyrdError) as foreign_root:
         Bifrost(client=client_of(server, foreign, root)).sql(TENANT_WIDE, model=Count)
+    assert foreign_root.value.code == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
     selected = httpx.get(
         f"{server.base_url}/v1/cards/by-uid/Service/{root}",
         headers={

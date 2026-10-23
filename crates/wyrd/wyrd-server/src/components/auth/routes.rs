@@ -116,9 +116,9 @@ async fn token(
 ) -> Result<Response, OAuthError> {
     let client = crate::auth::oauth::identify_client(&headers, &form)?;
     match form.get("grant_type") {
-        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
+        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest, None)),
         Some(grant) if !GRANT_TYPES.contains(&grant) => {
-            return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType));
+            return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType, None));
         }
         Some(_) => {}
     }
@@ -127,7 +127,7 @@ async fn token(
         state: &state,
         request_id: request_id.as_str(),
     };
-    let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient));
+    let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient, None));
     let response = match form.token_request()? {
         TokenRequest::RefreshToken { refresh_token } => grants
             .refresh(&refresh_token, required?)
@@ -135,7 +135,7 @@ async fn token(
             .map_err(OAuthError::from)?,
         TokenRequest::DeviceCode { device_code } => {
             if required? != OAuthClientId::WyrdCli {
-                return Err(OAuthError(OAuthErrorCode::UnauthorizedClient));
+                return Err(OAuthError(OAuthErrorCode::UnauthorizedClient, None));
             }
             crate::auth::cli_login::cli_logins(&state)?
                 .redeem(&device_code, request_id.as_str())
@@ -164,7 +164,7 @@ async fn token(
             .await
             .map_err(OAuthError::request)?,
         TokenRequest::TokenExchange { .. } => {
-            return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+            return Err(OAuthError(OAuthErrorCode::InvalidRequest, None));
         }
         TokenRequest::JwtBearer {
             assertion,

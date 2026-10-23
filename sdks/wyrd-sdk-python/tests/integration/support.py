@@ -128,6 +128,12 @@ def client_of(
     )
 
 
+def rooted(credential: str, service: str) -> WyrdClient:
+    """A client acting as ``credential``, run as the one registered ``service`` release."""
+    [root] = Cards().list(kind="Service", name=service).refs
+    return WyrdClient(credential=credential, workload_uid=str(root.uid))
+
+
 def timeline(server: WyrdTestServer, trace_id: str) -> list[SpanRecord]:
     """Publish every captured row, then read trace ``trace_id``'s spans as ``server``'s administrator."""
     server.flush_bifrost()

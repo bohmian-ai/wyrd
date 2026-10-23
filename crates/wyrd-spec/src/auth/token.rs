@@ -210,6 +210,11 @@ pub struct OAuthErrorResponse {
     /// Human-readable detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_description: Option<String>,
+    /// Stable Wyrd error code of a catalog refusal, an extension member
+    /// (RFC 6749 §8.2) so clients project the same typed error the problem
+    /// surface reports. Absent for a refusal of the OAuth wire itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// RFC 8414 §2 authorization server metadata, served at
@@ -365,6 +370,7 @@ mod tests {
         let error = OAuthErrorResponse {
             error: OAuthErrorCode::AuthorizationPending,
             error_description: None,
+            code: None,
         };
         assert_eq!(
             serde_json::to_value(&error).expect("serializes"),

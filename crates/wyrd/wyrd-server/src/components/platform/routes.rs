@@ -101,8 +101,8 @@ async fn platform_token(
 ) -> Result<Response, OAuthError> {
     match form.get("grant_type") {
         Some(TOKEN_EXCHANGE) => {}
-        Some(_) => return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType)),
-        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
+        Some(_) => return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType, None)),
+        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest, None)),
     }
     let TokenRequest::TokenExchange {
         subject_token,
@@ -113,7 +113,7 @@ async fn platform_token(
         workload_uid: None,
     } = form.token_request()?
     else {
-        return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+        return Err(OAuthError(OAuthErrorCode::InvalidRequest, None));
     };
     let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     let (Some(operator), Some(issuing_key)) = (

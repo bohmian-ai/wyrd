@@ -24,8 +24,9 @@ const AUTHORED = fixture("cards/gateway_inference/ask-prompt.yaml");
 
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
-/** How the token endpoint refuses an unusable key or root (RFC 6749 §5.2 `invalid_request`). */
-const EXCHANGE_REFUSED = { code: "WYRD_SPEC_400_VALIDATION", details: { error: "invalid_request" } };
+const ROOT_REFUSED = { code: "WYRD_AUTH_401_WORKLOAD_UID_REFUSED" };
+
+const KEY_REFUSED = { code: "WYRD_AUTH_401_API_KEY_INVALID" };
 
 /** Create the unrestricted Service account `name` holding only `workload`; its principal id and key. */
 async function issue(name: string): Promise<{ principal: string; key: string }> {
@@ -143,7 +144,7 @@ test("stable accounts preserve execution identity", async ({ bundle, server, rea
   ]);
 
   const component = states[0]?.cardRef("agent").uid ?? "";
-  await expect(family.forWorkload(component).accessToken()).rejects.toMatchObject(EXCHANGE_REFUSED);
+  await expect(family.forWorkload(component).accessToken()).rejects.toMatchObject(ROOT_REFUSED);
 });
 
 test("a tenant admin restricts accounts to one family runtime", async ({ bundle: _ }) => {
@@ -163,7 +164,7 @@ test("a tenant admin restricts accounts to one family runtime", async ({ bundle:
   await expect(own.setWorkloadRestriction(principal, other)).rejects.toMatchObject(DENIED);
 
   await principals.revokePrincipal(principal, { principal_kind: "service", reason: "story retires the account" });
-  await expect(WyrdClient.connect({ credential: key }).accessToken()).rejects.toMatchObject(EXCHANGE_REFUSED);
+  await expect(WyrdClient.connect({ credential: key }).accessToken()).rejects.toMatchObject(KEY_REFUSED);
 });
 
 test("a rooted service acts within its callers authority", async ({ server, state }) => {

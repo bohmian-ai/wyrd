@@ -4,7 +4,7 @@ import { ZodError, z } from "zod";
 
 import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient, record } from "wyrd-ai";
 
-import { serverTest } from "../support/server.js";
+import { rooted, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -220,15 +220,15 @@ test("empty result keeps the selected schema", async ({ reader }) => {
   }
 });
 
-/** Service B's client acting on behalf of A's inbound access token. */
-async function delegatedClient(a: string, b: string): Promise<WyrdClient> {
+/** Service B's client, run as B's own `service` root, acting on behalf of A's inbound access token. */
+async function delegatedClient(a: string, b: string, service: string): Promise<WyrdClient> {
   const token = await WyrdClient.connect({ credential: a }).accessToken();
-  return WyrdClient.connect({ credential: b }).onBehalfOf(token, { audience: "bifrost" });
+  return (await rooted(b, service)).onBehalfOf(token, { audience: "bifrost" });
 }
 
 /** A Bifrost client for {@link delegatedClient}. */
 async function onBehalfOfA(a: string, b: string): Promise<Bifrost> {
-  return Bifrost.connect({ client: await delegatedClient(a, b) });
+  return Bifrost.connect({ client: await delegatedClient(a, b, "delegation_b") });
 }
 
 test("delegated client reads with the callers authority", async ({ reader: _, a, b }) => {
@@ -267,7 +267,7 @@ test.for(["sub_principal_id", "act_principal_id"])(
 
     const clients = [
       WyrdClient.connect({ credential: a }),
-      await delegatedClient(a, b),
+      await delegatedClient(a, b, `actor_${column}`),
       WyrdClient.connect({ credential: b }),
     ];
     for (const [index, client] of clients.entries()) {

@@ -39,7 +39,15 @@ import { spanExporter } from "wyrd-ai/otel";
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { type DeclaredRef, fixture, declared, runtimeAccount, serverTest, timeline } from "../support/server.js";
+import {
+  type DeclaredRef,
+  fixture,
+  declared,
+  rooted,
+  runtimeAccount,
+  serverTest,
+  timeline,
+} from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -599,7 +607,7 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
   const subject = server.scopedApiKey("tool_subject", grants("all"));
   const actor = server.scopedApiKey("tool_delegate", grants({ tool: TOOLS[0] }));
   const token = await WyrdClient.connect({ credential: subject }).accessToken();
-  const delegated = await WyrdClient.connect({ credential: actor }).onBehalfOf(token, { audience: "wyrd" });
+  const delegated = await (await rooted(actor, "policy-desk")).onBehalfOf(token, { audience: "wyrd" });
   const principals = await Principals.connect();
   const [subjectId, actorId] = await Promise.all(
     ["tool_subject", "tool_delegate"].map(

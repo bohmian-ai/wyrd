@@ -594,14 +594,19 @@ fn decode_failure(error: &serde_json::Error) -> AuthError {
 
 /// The catalog error for an RFC 6749 §5.2 / RFC 8628 §3.5 refusal.
 ///
-/// The device-flow codes become [`WyrdError::DeviceAuthorization`] carrying
-/// the code in `details.error`, so a poller can keep polling; the rest map to
-/// the nearest catalog error with the server's description as its message.
+/// A refusal carrying its Wyrd `code` extension member is that catalog error.
+/// Otherwise the device-flow codes become [`WyrdError::DeviceAuthorization`]
+/// carrying the code in `details.error`, so a poller can keep polling; the
+/// rest map to the nearest catalog error. Every error keeps the OAuth code in
+/// `details.error` and the server's description as its message.
 fn oauth_error(error: OAuthErrorResponse) -> WyrdError {
     let message = error
         .error_description
         .unwrap_or_else(|| "the authorization server refused the request".to_owned());
     let details = serde_json::json!({ "error": error.error });
+    if let Some(code) = error.code {
+        return crate::error::code_to_wyrd_error(&code, message, details);
+    }
     match error.error {
         OAuthErrorCode::AuthorizationPending
         | OAuthErrorCode::SlowDown

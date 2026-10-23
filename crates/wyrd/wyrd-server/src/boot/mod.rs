@@ -334,6 +334,7 @@ fn validate_scribe_expanded_request(
 async fn build_bifrost_external_dependencies(
     dsns: &ResolvedDsns,
     config: &crate::config::BifrostRuntimeConfig,
+    forge: &ForgeRuntimeConfig,
     target: crate::config::BifrostTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
     let data_root = BifrostDataRoot::prepare(config.data_dir())?;
@@ -433,7 +434,10 @@ async fn build_bifrost_external_dependencies(
             postgres.vala().clone(),
         )
         .await
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?
+        .with_default_target_file_size_bytes(
+            resolve_forge_config(forge).0.default_target_file_size_bytes,
+        ),
     );
     Ok(BifrostExternalDependencies {
         postgres,
@@ -1169,7 +1173,8 @@ impl StartInputs {
     pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
         let dsns = ResolvedDsns::from_env()?;
         let dependencies =
-            build_bifrost_external_dependencies(&dsns, &config.bifrost, config.role).await?;
+            build_bifrost_external_dependencies(&dsns, &config.bifrost, &config.forge, config.role)
+                .await?;
         Ok(Self {
             dependencies,
             signing_key: resolve_signing_key(config)?,

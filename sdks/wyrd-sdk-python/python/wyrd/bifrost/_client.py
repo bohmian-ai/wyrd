@@ -1402,8 +1402,10 @@ class _TableDescriptionOptional(TypedDict, total=False):
     """Description fields the server omits when they do not apply.
 
     ``canonical_physical_fingerprint`` is present only for built-in signal
-    tables. The compaction keys are present only when the table stores its
-    own value; absent means the server default.
+    tables. ``compaction_target_file_size_bytes`` is the target the table's
+    definition stores: the registered one, or the deployment default resolved
+    at creation. ``compaction_type`` is present only when the table stores
+    its own; absent means ``small-files``.
     """
 
     canonical_physical_fingerprint: str

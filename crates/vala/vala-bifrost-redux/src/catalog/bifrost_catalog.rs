@@ -289,6 +289,9 @@ pub struct BifrostCatalog {
     /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
     /// is listening for invalidations.
     cut_cache: Arc<CutCache>,
+    /// Deployment Forge file target a new table's version-1 definition stores
+    /// when its registration declares none.
+    default_target_file_size_bytes: u64,
 }
 
 /// Current table definitions a node has loaded, keyed by tenant and table
@@ -866,7 +869,19 @@ impl BifrostCatalog {
             registrations: Arc::default(),
             current_definitions: Arc::default(),
             cut_cache: Arc::default(),
+            default_target_file_size_bytes: crate::forge::compact::DEFAULT_TARGET_FILE_SIZE_BYTES,
         })
+    }
+
+    /// Sets the deployment Forge file target that table creation resolves an
+    /// omitted target to; the compiled 1 GiB Forge default until set.
+    ///
+    /// The resolved value is stored in the new definition, so a later change
+    /// to this deployment value never alters an existing table version.
+    #[must_use]
+    pub fn with_default_target_file_size_bytes(mut self, bytes: u64) -> Self {
+        self.default_target_file_size_bytes = bytes;
+        self
     }
 
     /// Borrows the node's one storage owner this catalog binds Iceberg to.
@@ -1183,10 +1198,11 @@ impl BifrostCatalog {
     /// derived from `layout` and `binding`, so the canonical layout stays the
     /// single authority for the table's shape. The Forge data path is written
     /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root. Each option
-    /// `compaction` declares is written as the table's explicit property;
-    /// an omitted option writes nothing, so Forge resolves its default at
-    /// planning time.
+    /// the recipe segment instead of the default data root. The file target
+    /// `compaction` declares, or else this catalog's deployment default, is
+    /// written as `write.target-file-size-bytes`, so the definition fixes it;
+    /// a declared compaction type is written as its property and an omitted
+    /// one writes nothing.
     ///
     /// # Errors
     ///
@@ -1223,7 +1239,7 @@ impl BifrostCatalog {
                 forge_data_location,
             ),
         ]);
-        compaction.write_properties(&mut properties);
+        compaction.write_properties(&mut properties, self.default_target_file_size_bytes);
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
@@ -1887,10 +1903,10 @@ pub const MAX_PHYSICAL_LEAF_COLUMNS: usize = 256;
 /// Iceberg property naming a table's explicit Forge compaction file target.
 const TARGET_FILE_SIZE_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES;
 
-/// Reads the explicit compaction file target a physical table stores.
+/// Reads the compaction file target a physical table's definition stores.
 ///
-/// `None` means the table declares none and follows Forge's deployment
-/// default.
+/// Creation always stores one, declared or resolved from the deployment
+/// default; `None` only for metadata that stores none.
 ///
 /// # Errors
 /// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
@@ -1937,11 +1953,12 @@ fn explicit_compaction_type(
 /// The Forge compaction options one dataset registration declares.
 ///
 /// Every option is optional and independent: a declared option becomes the
-/// new table's explicit Iceberg property in its create transaction, and on a
-/// re-registration must equal the stored explicit value. An omitted option
-/// stores nothing and never conflicts, so the table follows Forge's default
-/// (the deployment file target, the `small-files` type). [`Default`] declares
-/// nothing, which is how built-ins register.
+/// new table's Iceberg property in its create transaction, and on a
+/// re-registration must equal the stored value. An omitted file target is
+/// stored as the deployment default resolved at creation; an omitted type
+/// stores nothing and plans `small-files`. Omission never conflicts on
+/// re-registration. [`Default`] declares nothing, which is how built-ins
+/// register.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionRegistration {
     /// Soft file target Forge compacts toward, stored as
@@ -2015,13 +2032,21 @@ impl CompactionRegistration {
         Ok(())
     }
 
-    /// Adds each declared option to a new table's creation properties.
+    /// Adds the options to a new table's creation properties.
     ///
-    /// Writes nothing for an omitted option.
-    fn write_properties(&self, properties: &mut HashMap<String, String>) {
-        if let Some(bytes) = self.target_file_size_bytes {
-            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
-        }
+    /// An omitted file target resolves to `default_target_file_size_bytes`;
+    /// an omitted compaction type writes nothing.
+    fn write_properties(
+        &self,
+        properties: &mut HashMap<String, String>,
+        default_target_file_size_bytes: u64,
+    ) {
+        properties.insert(
+            TARGET_FILE_SIZE_PROPERTY.to_owned(),
+            self.target_file_size_bytes
+                .unwrap_or(default_target_file_size_bytes)
+                .to_string(),
+        );
         if let Some(kind) = self.compaction_type {
             properties.insert(
                 COMPACTION_TYPE_PROPERTY.to_owned(),
@@ -2194,7 +2219,8 @@ mod tests {
     /// A declared compaction type is written under Forge's own property in
     /// the hyphenated spelling Forge parses back to the same type, every wire
     /// value round-trips through the Forge type, and an empty declaration
-    /// writes nothing so Forge keeps its `small-files` default.
+    /// writes only the resolved file target, so Forge keeps its `small-files`
+    /// default.
     ///
     /// # Panics
     /// Panics when a written property is missing, misspelled, or does not
@@ -2214,8 +2240,8 @@ mod tests {
                 target_file_size_bytes: None,
                 compaction_type: Some(kind),
             }
-            .write_properties(&mut properties);
-            assert_eq!(properties.len(), 1);
+            .write_properties(&mut properties, 1);
+            assert_eq!(properties.len(), 2);
             let settings =
                 ForgeTableSettings::from_properties(&properties).expect("settings parse");
             assert_eq!(settings.compaction_type, kind);
@@ -2225,16 +2251,20 @@ mod tests {
             target_file_size_bytes: None,
             compaction_type: Some(ForgeCompactionType::SmallFiles),
         }
-        .write_properties(&mut properties);
+        .write_properties(&mut properties, 1);
         assert_eq!(
             properties.get(COMPACTION_TYPE_PROPERTY).map(String::as_str),
             Some("small-files")
         );
-        let mut empty = HashMap::new();
-        CompactionRegistration::default().write_properties(&mut empty);
-        assert!(empty.is_empty());
+        let mut omitted = HashMap::new();
+        CompactionRegistration::default().write_properties(&mut omitted, 1);
         assert_eq!(
-            ForgeTableSettings::from_properties(&empty)
+            omitted,
+            HashMap::from([(super::TARGET_FILE_SIZE_PROPERTY.to_owned(), "1".to_owned())]),
+            "an omitted target stores the supplied default and an omitted type nothing"
+        );
+        assert_eq!(
+            ForgeTableSettings::from_properties(&omitted)
                 .expect("defaults parse")
                 .compaction_type,
             ForgeCompactionType::SmallFiles
@@ -2603,6 +2633,112 @@ mod production_pin_tests {
                             .as_bytes()
                     ),
                     registered.table_uid
+                );
+            }
+        });
+    }
+
+    /// An omitted file target is resolved into the version-1 definition.
+    ///
+    /// Creation under deployment default A stores A, so Forge extracts A from
+    /// that definition under both A and a later default B; only a table
+    /// created under B stores B, and re-registering the first under B leaves
+    /// its stored target unchanged.
+    ///
+    /// # Panics
+    /// Panics when the fixture, a registration, or a load fails, or when a
+    /// stored or extracted target differs from the default its table was
+    /// created under.
+    #[test]
+    fn an_omitted_target_is_fixed_by_the_creating_deployment() {
+        const A: u64 = 256 * 1024 * 1024;
+        const B: u64 = 512 * 1024 * 1024;
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let mut catalogs = Vec::new();
+            for bytes in [A, B] {
+                catalogs.push(
+                    BifrostCatalog::new(
+                        fixture.catalog_dsn().expose_secret(),
+                        local_storage_owner(warehouse.path()),
+                        fixture.vala_postgres().clone(),
+                    )
+                    .await
+                    .expect("redux catalog builds over the fixture")
+                    .with_default_target_file_size_bytes(bytes),
+                );
+            }
+            let (under_a, under_b) = (&catalogs[0], &catalogs[1]);
+            let tenant = fixture.data_tenant_id();
+            let register = async |catalog: &BifrostCatalog, name: &'static str| {
+                catalog
+                    .register_dataset(
+                        tenant,
+                        wyrd_spec::auth::Attribution::unresolved(),
+                        TableRef::new(BifrostNamespace::Datasets, name),
+                        vec![arrow::datatypes::Field::new(
+                            "value",
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        )],
+                        None,
+                        CompactionRegistration::default(),
+                    )
+                    .await
+            };
+            let stored = |name: &'static str| {
+                let binding = crate::catalog::TenantTableBinding::resolve((
+                    tenant,
+                    TableRef::new(BifrostNamespace::Datasets, name),
+                ))
+                .expect("binding resolves");
+                let catalog = under_a.iceberg_catalog();
+                async move {
+                    catalog
+                        .load_table(&binding.table_ident())
+                        .await
+                        .expect("physical table loads")
+                        .metadata()
+                        .clone()
+                }
+            };
+            register(under_a, "target_a")
+                .await
+                .expect("registers under A");
+            let created_a = stored("target_a").await;
+            for deployment in [A, B] {
+                let config = crate::forge::ForgeConfig {
+                    default_target_file_size_bytes: deployment,
+                    ..crate::forge::ForgeConfig::default()
+                };
+                assert_eq!(
+                    crate::forge::managed::policy::ForgeTablePolicy::extract(&created_a, &config)
+                        .expect("the stored target is admissible")
+                        .target_file_size_bytes,
+                    A,
+                    "deployment {deployment} does not move the definition's target"
+                );
+            }
+
+            let repeated = register(under_b, "target_a")
+                .await
+                .expect("re-registers under B");
+            assert_eq!(
+                repeated.outcome,
+                wyrd_spec::vala::api::RegisterOutcome::AlreadyExists
+            );
+            register(under_b, "target_b")
+                .await
+                .expect("registers under B");
+            for (name, expected) in [("target_a", A), ("target_b", B)] {
+                assert_eq!(
+                    super::explicit_compaction_target(&stored(name).await)
+                        .expect("stored target parses"),
+                    Some(expected),
+                    "{name} stores the default it was created under"
                 );
             }
         });

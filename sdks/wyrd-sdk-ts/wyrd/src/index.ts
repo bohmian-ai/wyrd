@@ -747,7 +747,8 @@ export class TableConfig {
    *
    * `options.layout` requests the table's physical layout.
    * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
-   * file target; omitted, the table follows the server's deployment default.
+   * file target; omitted, the new table stores the server's deployment
+   * default, resolved once at creation.
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *

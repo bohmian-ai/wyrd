@@ -558,7 +558,7 @@ The principal size boundaries are independent:
 | Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
 | Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
 | Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)`: a key's ready members drain once their summed raw (uncompressed Arrow) bytes reach it, or at dwell, with bounded residue; output objects roll at the same value in encoded bytes |
-| Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
+| Forge rewrite output | the target the table's definition stores: its registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) resolved at creation |
 
 Ingest has exactly one size setting. The wire ceiling bounds encoded request
 bytes; the expanded ceiling is derived, never configured, and bounds decoded

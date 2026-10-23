@@ -43,43 +43,6 @@ pub const MAX_BYTES_CEILING: usize = 16 * 1024 * 1024;
 /// terminal are charged as they are produced.
 pub const STRUCTURED_OVERHEAD_BYTES: usize = 11 + 8 + 2 + 12 + 1;
 
-/// A requested result ceiling outside its admitted range.
-///
-/// Admission is a request refusal, not a result overflow: each surface projects
-/// it through its own invalid-input envelope before reading any rows.
-#[derive(Debug)]
-pub struct RefusedCeiling {
-    /// Fixed reason naming the offending ceiling.
-    pub reason: &'static str,
-    /// The offending value and its upper bound.
-    pub details: JsonValue,
-}
-
-/// Admit the row and byte ceilings one bounded caller requested.
-///
-/// This is the single range policy every bounded surface applies before
-/// collecting: rows in `1..=MAX_ROWS_CEILING` and bytes in
-/// `1..=MAX_BYTES_CEILING`. Out-of-range values are refused, never clamped.
-///
-/// # Errors
-///
-/// Returns [`RefusedCeiling`] when either ceiling is zero or above its maximum.
-pub fn admit_ceilings(max_rows: u32, max_bytes: usize) -> Result<(), RefusedCeiling> {
-    if max_rows == 0 || max_rows > MAX_ROWS_CEILING {
-        return Err(RefusedCeiling {
-            reason: "max_rows is outside the allowed range",
-            details: serde_json::json!({ "max_rows": max_rows, "ceiling": MAX_ROWS_CEILING }),
-        });
-    }
-    if max_bytes == 0 || max_bytes > MAX_BYTES_CEILING {
-        return Err(RefusedCeiling {
-            reason: "max_bytes is outside the allowed range",
-            details: serde_json::json!({ "max_bytes": max_bytes, "ceiling": MAX_BYTES_CEILING }),
-        });
-    }
-    Ok(())
-}
-
 /// Accumulates one bounded result and charges its exact compact-JSON size.
 ///
 /// The builder owns the two caller ceilings and the running byte count, so a

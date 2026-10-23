@@ -29,8 +29,8 @@ export function numeric(value: unknown): number {
  * series column is bound. Groups are keyed by the typed (value, `y`) pair, so
  * distinct groups never merge however their text reads. Past
  * {@link MAX_SERIES}, the largest totals keep their own line and the rest are
- * summed per instant as "other", qualified when an authored series already
- * has that caption.
+ * summed per instant as "other", or "other (aggregate)" when an authored
+ * series is already called "other".
  */
 export function timeSeries(result: QueryResult, x: string, ys: readonly string[], series?: string): Series[] {
   const xi = columnIndex(result, x);
@@ -59,12 +59,8 @@ export function timeSeries(result: QueryResult, x: string, ys: readonly string[]
   }
   const labels = captions(entries, si >= 0, ys.length > 1);
   const plotted = entries.map(({ points }, index) => [labels[index], points] as const);
-  if (other) {
-    // An authored series may already be called "other"; the aggregate's caption must still name only itself.
-    let label = 'other';
-    for (let n = 1; labels.includes(label); n++) label = n === 1 ? 'other (aggregate)' : `other (aggregate ${n})`;
-    plotted.push([label, other]);
-  }
+  // An authored series may already be called "other"; the aggregate's caption must still name only itself.
+  if (other) plotted.push([labels.includes('other') ? 'other (aggregate)' : 'other', other]);
   return plotted.map(([label, points]) => ({
     label,
     points: [...points].sort(([a], [b]) => a - b).map(([x, y]) => ({ x, y }))
@@ -72,24 +68,17 @@ export function timeSeries(result: QueryResult, x: string, ys: readonly string[]
 }
 
 /**
- * Distinct captions for plotted groups. Each reads as before unless it
- * matches another; then it becomes its group's JSON spelling (value, plus `y`
- * when several are bound), which is unique per group and tells null from the
- * text "null". Repeats until no caption matches another, since a JSON spelling
- * can equal some other group's authored text.
+ * Captions for plotted groups. Each reads as its text unless another group
+ * reads the same; then it becomes its group's JSON spelling (value, plus `y`
+ * when several are bound), which tells null from the text "null".
  */
 function captions(groups: readonly { group: unknown; y: string }[], bySeries: boolean, byY: boolean): string[] {
   const labels = groups.map(({ group, y }) => (!bySeries ? y : byY ? `${String(group)} ${y}` : String(group)));
-  const qualified = new Set<number>();
-  for (;;) {
-    const clash = labels.flatMap((label, index) => (!qualified.has(index) && labels.some((other, at) => at !== index && other === label) ? [index] : []));
-    if (clash.length === 0) return labels;
-    for (const index of clash) {
-      const { group, y } = groups[index];
-      labels[index] = byY ? JSON.stringify([group, y]).slice(1, -1) : JSON.stringify(group);
-      qualified.add(index);
-    }
-  }
+  return labels.map((label, index) => {
+    if (labels.indexOf(label) === labels.lastIndexOf(label)) return label;
+    const { group, y } = groups[index];
+    return byY ? JSON.stringify([group, y]).slice(1, -1) : JSON.stringify(group);
+  });
 }
 
 /** Bar rows: one category label with a value per `y`. */

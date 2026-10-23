@@ -24,7 +24,7 @@ import {
   type CardHeaderInput,
   type ChartInput,
   type ComponentName,
-  resolveRange
+  type Range
 } from './schemas.js';
 
 export * from './contract.js';
@@ -66,6 +66,18 @@ export interface ComponentProps {
   CardHeader: CardHeaderProps;
 }
 
+const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+
+/**
+ * Resolve `range` against `now`; a view resolves its relative range once per
+ * load so every panel reads the same bounds.
+ */
+export function resolveRange(range: Range, now: number = Date.now()): AbsoluteRange {
+  if ('from' in range) return range;
+  const amount = Number(range.last.slice(0, -1)) * UNIT_MS[range.last.slice(-1) as keyof typeof UNIT_MS];
+  return { from: new Date(now - amount).toISOString(), to: new Date(now).toISOString() };
+}
+
 /** Bucket intervals a chart may bind as `$3`, finest first. */
 const BUCKETS: readonly [string, number][] = [
   ['1 minute', 60_000],
@@ -82,72 +94,13 @@ export function bucketFor(range: AbsoluteRange): string {
   return (BUCKETS.find(([, width]) => span / width <= 200) ?? BUCKETS[BUCKETS.length - 1])[0];
 }
 
-/** An identifier in the query owner's SQL dialect; a `$` inside one is part of its name. */
-const IDENTIFIER = /[\p{L}_#@][\p{L}0-9_@$#]*/uy;
-/** A `$` and the word after it: a placeholder, or the opening tag of a dollar-quoted string. */
-const DOLLAR = /\$([\p{L}\p{N}_]*)/uy;
-
-/**
- * The highest `$1`..`$3` placeholder `sql` references, read the way the query
- * owner's SQL dialect tokenizes it. Quoted strings (doubled quotes, and
- * backslash escapes in `E'...'`), quoted identifiers, dollar-quoted strings,
- * and line or nested block comments hold no placeholders.
- */
-function highestBind(sql: string): number {
-  let highest = 0;
-  let at = 0;
-  const close = (quote: string, backslash: boolean): number => {
-    let next = at + 1;
-    while (next < sql.length) {
-      if (backslash && sql[next] === '\\') next += 2;
-      else if (sql[next] !== quote) next += 1;
-      else if (sql[next + 1] === quote) next += 2;
-      else return next + 1;
-    }
-    return next;
-  };
-  while (at < sql.length) {
-    const char = sql[at];
-    if ((char === 'e' || char === 'E') && sql[at + 1] === "'") {
-      at += 1;
-      at = close("'", true);
-    } else if (char === "'" || char === '"' || char === '`') {
-      at = close(char, false);
-    } else if (sql.startsWith('--', at)) {
-      const end = sql.indexOf('\n', at);
-      at = end < 0 ? sql.length : end + 1;
-    } else if (sql.startsWith('/*', at)) {
-      let depth = 0;
-      do {
-        if (sql.startsWith('/*', at)) [depth, at] = [depth + 1, at + 2];
-        else if (sql.startsWith('*/', at)) [depth, at] = [depth - 1, at + 2];
-        else at += 1;
-      } while (depth > 0 && at < sql.length);
-    } else if (char === '$') {
-      DOLLAR.lastIndex = at;
-      const [token, tag] = DOLLAR.exec(sql) ?? ['$', ''];
-      at += token.length;
-      if (sql[at] === '$') {
-        const end = sql.indexOf(`$${tag}$`, at + 1);
-        at = end < 0 ? sql.length : end + tag.length + 2;
-      } else if (/^[1-3]$/.test(tag)) {
-        highest = Math.max(highest, Number(tag));
-      }
-    } else {
-      IDENTIFIER.lastIndex = at;
-      at += IDENTIFIER.exec(sql)?.[0].length || 1;
-    }
-  }
-  return highest;
-}
-
 /**
  * The binds an authored chart SQL references: `$1`/`$2` are the range bounds
  * and `$3` the bucket. Only the highest referenced position is bound; the SQL
  * itself is never rewritten.
  */
 export function chartParams(sql: string, range: AbsoluteRange | undefined): QueryParam[] | Problem {
-  const used = highestBind(sql);
+  const used = Math.max(0, ...Array.from(sql.matchAll(/\$([1-3])(?!\d)/g), (match) => Number(match[1])));
   if (used === 0) return [];
   if (range === undefined) return wyrdProblem('validation', 'The SQL binds $1..$3 but no range was supplied.');
   return [range.from, range.to, bucketFor(range)].slice(0, used);

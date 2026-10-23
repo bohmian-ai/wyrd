@@ -285,7 +285,7 @@ Do not require `gate`, broad redux aggregates or full language/journey suites so
 
 ## Implementation evidence
 
-Candidate commits after `c4dd61029`, oldest first: `8088d790c` `d7dae503b` `b100cbe38` `627608d65` `2c9ef1d66` `a3200c4f8` `a1a27d7ce` `2a9135567` `6d8f48f48` `85293685c` `68ed31bf2`. The Iceberg fork is `bohmian-ai/iceberg-rust`, local branch `wyrd-table-version` at `a34f3885c`, with `0ceeb5005` and `cd3a721cd` beneath it, on top of the pinned `486273c9e`. It is **not pushed**. `Cargo.toml:250-253` and `Cargo.lock` still pin `486273c9e`. Every run below patches the three fork crates in through cargo `--config patch` or an equivalent scratch `CARGO_HOME` `[patch]`. Repinning waits on authorization to push the fork.
+Candidate commits after `c4dd61029`, oldest first: `8088d790c` `d7dae503b` `b100cbe38` `627608d65` `2c9ef1d66` `a3200c4f8` `a1a27d7ce` `2a9135567` `6d8f48f48` `85293685c` `68ed31bf2` `4ccec926e` `a3e75cba1` `d5b95e218`. The Iceberg fork `bohmian-ai/iceberg-rust` branch `wyrd-production` is pushed at `a34f3885c` (`0ceeb5005` and `cd3a721cd` beneath it); `bohmian-ai/iceberg-compaction` branch `wyrd-production` is pushed at `1ade704`, repinned to that Iceberg revision. `4ccec926e` pins `iceberg`, `iceberg-catalog-sql` and `iceberg-datafusion` at `a34f3885c` and `iceberg-compaction-core` at `1ade704`; `Cargo.lock` holds one copy of each. Rows below that predate `4ccec926e` ran with the fork patched in; rows from `4ccec926e` on ran on the real pins.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -301,7 +301,10 @@ Candidate commits after `c4dd61029`, oldest first: `8088d790c` `d7dae503b` `b100
 | FIND-7 physical/query evidence | `85293685c` new journey and `WyrdTestServer::commit_bloom_revision` (a Bloom-only commit through the versioned catalog seam) | journey passes; measurements below | PASS |
 | SDK projections | Rust `wyrd-client` carries the version on every frame; Python `TableDescription.table_version` (`68ed31bf2`); TS generated `BifrostTableDescription.table_version` | Python `tests/integration/bifrost/test_table_time_column.py` 2 passed; TS `tests/integration/table-time-column.test.ts` 2 passed; `py:typecheck`, `py:lints`, `ts:typecheck`, `ts:lints` pass | PASS (version 1 only; see limits) |
 | Boundaries and codegen | — | `fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check` pass with the fork patched | PASS |
-| Throughput within 5% | — | not run: another worktree (`guided-setup`) had pytest integration runs alive for about 32 h | UNMEASURED |
+| Time column is zoned | `a3e75cba1`: `bifrost-design.md:79` now states any column may hold `TIMESTAMP_NTZ`/`LTZ`/`TZ`, but the time column must be a zoned `TIMESTAMP_LTZ` (maintainer decision); `oracle/published.rs` registers `timestamptz` and `timestamptz_ns` | full serial `--test oracle`: 60/60 | PASS |
+| Declared writers bind the current version once | `d5b95e218`: `Bifrost::bind_table`/`resolve_table` describe a declared table once when a writer binds it (`bifrost_table:read`), cache it in `described`, and stamp its version through `TableConfig::bind_version` without marking a mismatched declaration resolved; `RecordAdmission` makes `drain` wait for admitted `record` calls; Python resolves outside the binding lock; TypeScript admits before spawning | wyrd-client bifrost lib: 58 passed (new `shutdown_waits_for_an_admitted_record`); journeys on the real pins: SDK 39/39, observe 20/20, Python 197 passed, TypeScript 189 passed | PASS |
+| Boundaries on the real pins | — | `lints`, `check:deps`, `py:lints`, `py:typecheck`, `codegen:check`, `git diff --check` pass at `d5b95e218` | PASS |
+| Throughput within 5% | — | not run: the maintainer deferred benchmarks on this branch while the benchmark harness is restructured (`changes/active/benchmark-experiments/`) | UNMEASURED |
 
 ### FIND-TASK-004-7 measurements
 
@@ -376,7 +379,13 @@ This test is outside the R2 write set and was already failing at `c4dd61029`.
 - **Fix site:** `bifrost-design.md:79-80` plus the test (if refusal stands), or `layout.rs` plus `scribe/describe.rs:409` plus both tasks (if naive is allowed).
 - **Independent diagnostician:** reached the same cause and fix sites. It recommends a maintainer decision and judges that the task intent looks deliberate.
 
-Nothing was changed for this.
+**Resolution (`a3e75cba1`):** the maintainer decided a time-partition column must carry a zone, while any other column may hold any Snowflake-style timestamp. The design now says so and the test registers zoned time columns; `layout.rs` is unchanged.
+
+### Diagnosis: `WYRD_VALA_412_NO_ACTIVE_TABLE` across SDK journeys
+
+- **Symptom:** after R2 required a resolved version on every native frame, five SDK, observe, Python and TypeScript journeys failed with `NoActiveTable` when a writer bound a declared (unregistered-in-this-client) table and wrote.
+- **Cause:** a declared `TableConfig` carries no server version until `register` or a describe resolves it, and Python binds through synchronous `use_table` after connecting, so a connect-time describe never ran for it. The independent diagnostician also found the TypeScript `record` spawn could race shutdown and drop a row, and that the denied-writer journey now fails at bind with the permission error.
+- **Fix site:** the client facade (`wyrd-client/src/bifrost/facade.rs`), shared by every SDK: resolve once at bind (`bind_table`), never on the write path; `RecordAdmission` closes the shutdown race. The Python denied-writer journey now expects `WYRD_PERMISSION_403_DENIED_RBAC` on the first insert and `WYRD_VALA_412_NO_ACTIVE_TABLE` after.
 
 ### Limits
 
@@ -388,6 +397,6 @@ Nothing was changed for this.
 - `set_table_property` (oracle `support.rs:874`) remains a pre-existing direct property write for the Forge row-group size. The new journey does not use it.
 - Python and TypeScript journeys prove only describe version 1 after a write. A stale-version journey per language needs the public PATCH (TASK-005).
 - Every version is retained with no pruning (ponytail note in `forge/compact.rs`) until a retry horizon exists.
-- Throughput is unmeasured.
+- Throughput is unmeasured: benchmarks are deferred on this branch by maintainer decision.
 
-**Verdict:** `BLOCKED` on maintainer authorization: the dependency must pin an immutable pushed commit, and fork branch `wyrd-table-version` at `a34f3885c` is unpushed, so `Cargo.toml` still pins `486273c9e`. Code and evidence are otherwise complete. Throughput is unmeasured because another worktree holds the host. The naive time-column contradiction between `bifrost-design.md:79` and `layout.rs:1226` predates this task and needs a maintainer decision.
+**Verdict:** `IMPLEMENTED`. The forks are pushed and pinned, the time-column contradiction is resolved by maintainer decision, and the declared-writer regression is fixed at the shared client owner. Throughput is recorded as unmeasured, which the acceptance criteria permit when no benchmark run completes.

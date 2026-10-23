@@ -7,7 +7,7 @@ use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::Card;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, DeclarationOperationId};
 use wyrd_sql::queries::cards::{
@@ -27,7 +27,7 @@ fn prompt_card(name: &str) -> Card {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Prompt",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -325,7 +325,7 @@ async fn subject_actor_creation_and_replay() {
     let service: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": "pair-service", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "pair-service", "version": "1.0.0" },
         "spec": {},
     }))
     .expect("service fixture deserializes");
@@ -685,12 +685,11 @@ async fn relationship_rows_preserve_exact_target_identity() {
     let source: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": "relationship-source", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "relationship-source", "version": "1.0.0" },
         "spec": { "prompt": {
             "kind": "Prompt",
             "name": "relationship-target",
             "version": "1.0.0",
-            "space": "default",
             "uid": target_uid
         }, "execution_route": {"kind": "native"}}
     }))
@@ -759,8 +758,8 @@ async fn relationship_rows_preserve_exact_target_identity() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let stored: (String, String, String, String, Uuid) = sqlx::query_as(
-        "SELECT target_kind, target_space, target_name, target_version, target_uid \
+    let stored: (String, String, String, Uuid) = sqlx::query_as(
+        "SELECT target_kind, target_name, target_version, target_uid \
          FROM wyrd.card_relationships WHERE card_uid = $1",
     )
     .bind(source_uid.as_uuid())
@@ -768,10 +767,9 @@ async fn relationship_rows_preserve_exact_target_identity() {
     .await
     .expect("relationship row reads");
     assert_eq!(stored.0, "Prompt");
-    assert_eq!(stored.1, "default");
-    assert_eq!(stored.2, "relationship-target");
-    assert_eq!(stored.3, "1.0.0");
-    assert_eq!(stored.4, target_uid.as_uuid());
+    assert_eq!(stored.1, "relationship-target");
+    assert_eq!(stored.2, "1.0.0");
+    assert_eq!(stored.3, target_uid.as_uuid());
     conn.commit().await.expect("assertion transaction commits");
 }
 
@@ -795,12 +793,11 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
     let source: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": "race-source", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "race-source", "version": "1.0.0" },
         "spec": { "prompt": {
             "kind": "Prompt",
             "name": "race-target",
-            "version": "1.0.0",
-            "space": "default"
+            "version": "1.0.0"
         }, "execution_route": {"kind": "native"}}
     }))
     .expect("agent fixture must deserialize");
@@ -859,8 +856,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
     let target_ref: CardRef = serde_json::from_value(serde_json::json!({
         "kind": "Prompt",
         "name": "race-target",
-        "version": "1.0.0",
-        "space": "default"
+        "version": "1.0.0"
     }))
     .expect("target reference decodes");
     let mut registration_conn = fixture
@@ -967,12 +963,11 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
     let source: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": "delete-source", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "delete-source", "version": "1.0.0" },
         "spec": { "prompt": {
             "kind": "Prompt",
             "name": "delete-target",
             "version": "1.0.0",
-            "space": "default",
             "uid": target_uid
         }, "execution_route": {"kind": "native"}}
     }))
@@ -981,7 +976,6 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         kind: wyrd_spec::envelope::CardKind::Prompt,
         name: CardName::new("delete-target").expect("target name is valid"),
         version: VersionBlock::parse("1.0.0").expect("target version is valid"),
-        space: Some(SpaceName::new("default").expect("target space is valid")),
         uid: Some(target_uid.clone()),
     };
     let target_spec_hash = "a".repeat(64);
@@ -1106,4 +1100,126 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .expect("deleted card reads");
     assert_eq!(status, "deleted");
     conn.commit().await.expect("assertion transaction commits");
+}
+
+/// Card identity is `(tenant, kind, name, version)`: the registry carries no
+/// `space` column, one tenant refuses a second Card with the same identity,
+/// the same name under another kind or in another tenant registers, and an
+/// exact read resolves by kind, name, and version alone.
+///
+/// # Panics
+/// Panics when fixture setup fails or any identity rule above does not hold.
+#[tokio::test]
+async fn flat_registry_identity_is_tenant_and_kind_scoped() {
+    /// Register `card` Active in `tenant` through its own declaration operation.
+    ///
+    /// One tenant transaction inserts a fresh operation and the Card row, then
+    /// commits, returning the new Card UID.
+    ///
+    /// # Errors
+    /// Returns the [`insert_card_row`] error, such as the identity conflict of
+    /// a duplicate `(kind, name, version)` in the tenant; the transaction is
+    /// then dropped uncommitted.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection, the operation insert, or the commit
+    /// fails.
+    async fn register(
+        fixture: &PgFixture,
+        tenant: wyrd_spec::ids::DataTenantId,
+        card: &Card,
+    ) -> Result<CardUid, wyrd_spec::error::WyrdError> {
+        let principal_id = PrincipalId::new(Uuid::now_v7());
+        let operation_id = DeclarationOperationId::new(Uuid::now_v7());
+        let mut conn = fixture
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection opens");
+        insert_declaration_operation(
+            &mut conn,
+            NewDeclarationOperation {
+                operation_id,
+                attribution: Attribution::direct(principal_id),
+                idempotency_key: &operation_id.as_uuid().to_string(),
+                request_hash: "request-hash",
+            },
+        )
+        .await
+        .expect("operation inserts");
+        let row = insert_card_row(
+            &mut conn,
+            NewCardRow {
+                card,
+                card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID"),
+                attribution: Attribution::direct(principal_id),
+                operation_id,
+                status: CardStatus::Active,
+                spec_hash: "spec-hash",
+                artifact_hash: None,
+                reconcile_delay: std::time::Duration::ZERO,
+            },
+        )
+        .await?;
+        conn.commit().await.expect("registration commits");
+        Ok(row.card_uid)
+    }
+
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let other_tenant = fixture
+        .seed_additional_tenant("flat-identity-other")
+        .await
+        .expect("second tenant seeds");
+    let has_space: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'wyrd' AND table_name IN ('cards', 'card_relationships', 'auth_service_accounts') \
+           AND column_name IN ('space', 'target_space'))",
+    )
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("column catalog reads");
+    assert!(!has_space, "Card identity columns must not include space");
+
+    let prompt = prompt_card("flat-identity");
+    let mut service = prompt_card("flat-identity");
+    service.kind = wyrd_spec::envelope::CardKind::Service;
+    service.spec = wyrd_spec::envelope::Spec::from_kind_and_value(
+        &wyrd_spec::envelope::CardKind::Service,
+        serde_json::json!({}),
+    )
+    .expect("service spec decodes");
+
+    let tenant = fixture.data_tenant_id();
+    let prompt_uid = register(&fixture, tenant, &prompt)
+        .await
+        .expect("first identity registers");
+    assert_eq!(
+        register(&fixture, tenant, &prompt)
+            .await
+            .expect_err("duplicate identity is refused")
+            .code(),
+        "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE"
+    );
+    let service_uid = register(&fixture, tenant, &service)
+        .await
+        .expect("same name under another kind registers");
+    register(&fixture, other_tenant, &prompt)
+        .await
+        .expect("same identity in another tenant registers");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let name = CardName::new("flat-identity").expect("static name is valid");
+    let version = VersionBlock::parse("1.0.0").expect("static version is valid");
+    for (kind, uid) in [
+        (wyrd_spec::envelope::CardKind::Prompt, &prompt_uid),
+        (wyrd_spec::envelope::CardKind::Service, &service_uid),
+    ] {
+        let row = wyrd_sql::queries::cards::get_card_by_ref(&mut conn, kind, &name, &version)
+            .await
+            .expect("exact identity resolves");
+        assert_eq!(&row.card_uid, uid);
+    }
+    conn.commit().await.expect("read transaction commits");
 }

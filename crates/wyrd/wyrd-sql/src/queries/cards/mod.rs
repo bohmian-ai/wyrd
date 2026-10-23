@@ -48,7 +48,7 @@ pub use lifecycle::{
 };
 pub use list::{
     CardQuery, ListCursor, ListPage, MAX_LIST_LIMIT, check_uid_exists, find_card_by_spec_hash,
-    get_unique_spaces, query_cards,
+    query_cards,
 };
 pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,

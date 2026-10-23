@@ -325,7 +325,7 @@ mod tests {
     use crate::permission::{Permission, PermissionSet};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     fn service_card_ref() -> CardRef {
@@ -333,7 +333,6 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new("billing").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -525,7 +524,6 @@ mod tests {
             kind: CardKind::Verifier,
             name: CardName::new("drift").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: Some(
                 wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7())
                     .expect("UUIDv7 is a valid card UID"),

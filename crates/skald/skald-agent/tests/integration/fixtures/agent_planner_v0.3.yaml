@@ -3,13 +3,11 @@ kind: Agent
 metadata:
   name: planner-agent
   version: 0.3.0
-  space: research
 spec:
   prompt:
     kind: Prompt
     name: planner-prompt
     version: 0.3.0
-    space: research
   execution_route:
     kind: native
   run_config:

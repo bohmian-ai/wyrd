@@ -7,11 +7,6 @@ class ConfigDefaults:
     """Workspace `[defaults]` merged into every Card's metadata."""
 
     @property
-    def space(self) -> str | None:
-        """Default `metadata.space`, or `None` when unset."""
-        ...
-
-    @property
     def labels(self) -> dict[str, str]:
         """Default labels merged per key into `metadata.labels`."""
         ...
@@ -25,7 +20,7 @@ class WyrdConfig:
     """Workspace defaults loaded from ``wyrd.toml``.
 
     The file holds a ``[defaults]`` table and optional ``[kind.<Kind>]``
-    tables, each with ``space``, ``labels``, and ``annotations``. Nothing is
+    tables, each with ``labels`` and ``annotations``. Nothing is
     applied implicitly; call ``apply_defaults`` on a metadata dict.
     """
 
@@ -63,10 +58,9 @@ class WyrdConfig:
     ) -> None:
         """Merge workspace defaults into a Card ``metadata`` dict in place.
 
-        Values already in ``metadata`` always win. ``space`` is filled only
-        when absent, from the ``[kind.<Kind>]`` table and then ``[defaults]``.
-        ``labels`` and ``annotations`` merge per key with the same
-        precedence. ``name``, ``version``, ``uid``, and the hashes are never
+        Values already in ``metadata`` always win. ``labels`` and
+        ``annotations`` merge per key, from the ``[kind.<Kind>]`` table and
+        then ``[defaults]``. ``name``, ``version``, ``uid``, and the hashes are never
         read or written.
 
         Args:

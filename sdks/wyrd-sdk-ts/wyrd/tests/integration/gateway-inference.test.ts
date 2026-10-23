@@ -297,7 +297,7 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
 });
 
 test("gateway call records a lone run or card", async ({ server, ask }) => {
-  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
+  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0" });
   const caller = WyrdClient.connect({ credential: issued.key });
   const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
   const cardUid = declared(ask, "ask-agent").uid;
@@ -370,7 +370,7 @@ test("caller without gateway invoke cannot run an agents sdk agent", async ({ se
 });
 
 test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {
-  const agent = { kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" } as const;
+  const agent = { kind: "Agent", name: "ask-agent", version: "1.0.0" } as const;
   const issued = await cli.issueKey(agent);
   const view = await cli.putProviderCredential({
     name: "managed-openai-key",
@@ -430,7 +430,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const receipt = await cards.declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0", space: "default" });
+  const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0" });
   const caller = WyrdClient.connect({ credential: issued.key });
   const state = WyrdState.fromPath(bundle, { client: caller });
   const before = provider.received.length;

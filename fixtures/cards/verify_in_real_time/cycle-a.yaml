@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: cycle-a
   version: 1.0.0
-  space: default
 spec:
   description: Reads its own reader's slot, closing a source cycle.
   inputs:

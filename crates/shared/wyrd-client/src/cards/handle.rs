@@ -12,7 +12,7 @@ use wyrd_loader::DeclarationInput;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 #[cfg(feature = "internal")]
 use wyrd_spec::registry::GetCardResponse;
@@ -37,12 +37,10 @@ use crate::cards::{BundleMode, CardGraphPuller, DeclarationReceipt, PullSummary}
 /// exact; optional identity fields are consistency assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CardSelector {
-    /// Select by kind, space, name, and optional exact version.
+    /// Select by kind, name, and optional exact version.
     Named {
         /// Card kind.
         kind: CardKind,
-        /// Card space.
-        space: SpaceName,
         /// Card name.
         name: CardName,
         /// Exact version, or `None` for latest Active reads.
@@ -56,8 +54,6 @@ pub enum CardSelector {
         kind: CardKind,
         /// Exact Card UID.
         uid: CardUid,
-        /// Optional asserted space.
-        space: Option<SpaceName>,
         /// Optional asserted name.
         name: Option<CardName>,
         /// Optional asserted exact version.
@@ -70,13 +66,11 @@ impl CardSelector {
     ///
     /// # Arguments
     /// * `kind` - The Card kind.
-    /// * `space` - The Card space.
     /// * `name` - The Card name.
     #[must_use]
-    pub fn named(kind: CardKind, space: SpaceName, name: CardName) -> Self {
+    pub fn named(kind: CardKind, name: CardName) -> Self {
         Self::Named {
             kind,
-            space,
             name,
             version: None,
         }
@@ -101,7 +95,6 @@ impl CardSelector {
         Self::Uid {
             kind,
             uid,
-            space: None,
             name: None,
             version: None,
         }
@@ -127,24 +120,17 @@ impl CardSelector {
         self
     }
 
-    /// Add optional identity assertions to a UID selector.
+    /// Add an optional name assertion to a UID selector.
     ///
     /// # Arguments
-    /// * `space` - The space the UID's Card must have, or `None`.
     /// * `name` - The name the UID's Card must have, or `None`.
     #[must_use]
-    pub fn with_identity_assertions(
-        mut self,
-        space: Option<SpaceName>,
-        name: Option<CardName>,
-    ) -> Self {
+    pub fn with_identity_assertions(mut self, name: Option<CardName>) -> Self {
         if let Self::Uid {
-            space: selected_space,
             name: selected_name,
             ..
         } = &mut self
         {
-            *selected_space = space;
             *selected_name = name;
         }
         self
@@ -346,7 +332,7 @@ impl Cards {
     /// List metadata-only Card summaries through the typed server query.
     ///
     /// # Arguments
-    /// * `request` - The kind, space, name, version-range, status, and paging filters.
+    /// * `request` - The kind, name, version-range, status, and paging filters.
     ///
     /// # Errors
     /// Returns a Wyrd error when the request is invalid or the server query
@@ -395,7 +381,6 @@ impl Cards {
     ///
     /// # Arguments
     /// * `kind` - The Card kind.
-    /// * `space` - The Card space.
     /// * `name` - The Card name.
     ///
     /// # Errors
@@ -404,10 +389,9 @@ impl Cards {
     pub async fn resolve_latest(
         &self,
         kind: CardKind,
-        space: SpaceName,
         name: CardName,
     ) -> Result<CardRef, WyrdError> {
-        reads::resolve_latest(&self.engine.client, kind, space, name)
+        reads::resolve_latest(&self.engine.client, kind, name)
             .await
             .map_err(Into::into)
     }
@@ -591,7 +575,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::verifier::DriftBaselineState;
     use wyrd_spec::envelope::{CardKind, Spec};
-    use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::ids::{CardName, CardUid};
     use wyrd_spec::reference::CardRef;
 
     /// A client pointed at `server` with a static credential.
@@ -739,7 +723,6 @@ mod tests {
         let baseline_ref = serde_json::json!({
             "kind": "Data",
             "name": "churn-training",
-            "space": "retention",
             "version": "1.0.0",
             "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
         });
@@ -774,7 +757,7 @@ mod tests {
             (
                 CardKind::Agent,
                 serde_json::json!({
-                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"},
+                    "prompt": {"kind": "Prompt", "name": "triage", "version": "1.0.0"},
                     "execution_route": {"kind": "native"}
                 }),
             ),
@@ -839,7 +822,7 @@ mod tests {
                 let card = serde_json::json!({
                     "apiVersion": "wyrd/v1",
                     "kind": kind.wire_name(),
-                    "metadata": {"space": "retention", "name": "subject", "version": "1.0.0"},
+                    "metadata": {"name": "subject", "version": "1.0.0"},
                     "spec": spec,
                     "status": status
                 });
@@ -880,7 +863,7 @@ mod tests {
         let cards = Cards::new(test_client(&server));
 
         for (kind, _) in envelopes {
-            let card_ref: CardRef = format!("retention/{}/subject@1.0.0", kind.wire_name())
+            let card_ref: CardRef = format!("{}/subject@1.0.0", kind.wire_name())
                 .parse()
                 .expect("test card ref is valid");
             let card = cards
@@ -940,7 +923,6 @@ mod tests {
                     "apiVersion": "wyrd/v1",
                     "kind": "Service",
                     "metadata": {
-                        "space": "retention",
                         "name": "subject",
                         "version": "1.0.0",
                         "uid": uid
@@ -963,7 +945,7 @@ mod tests {
         let cards = Cards::new(test_client(&server));
         let parent = tempfile::tempdir().expect("test parent is created");
         let destination = parent.path().join("bundle");
-        let card_ref: CardRef = "retention/Service/subject@1.0.0"
+        let card_ref: CardRef = "Service/subject@1.0.0"
             .parse()
             .expect("test card ref is valid");
 
@@ -989,9 +971,8 @@ mod tests {
     #[test]
     fn selector_constructors_keep_latest_and_exact_distinct() {
         let kind = CardKind::Prompt;
-        let space = SpaceName::new("prod").expect("test space is valid");
         let name = CardName::new("prompt").expect("test name is valid");
-        let latest = CardSelector::named(kind.clone(), space.clone(), name.clone());
+        let latest = CardSelector::named(kind.clone(), name.clone());
         assert!(matches!(latest, CardSelector::Named { version: None, .. }));
         let exact =
             latest.with_version(VersionBlock::parse("1.0.0").expect("test version is valid"));

@@ -68,23 +68,12 @@ impl<'de> Deserialize<'de> for CommitSha {
 }
 
 impl schemars::JsonSchema for CommitSha {
-    fn schema_name() -> String {
-        "CommitSha".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CommitSha".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(40),
-                min_length: Some(7),
-                pattern: Some(r"^[0-9a-f]{7,40}$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 7, "maxLength": 40, "pattern": r"^[0-9a-f]{7,40}$" })
     }
 }
 

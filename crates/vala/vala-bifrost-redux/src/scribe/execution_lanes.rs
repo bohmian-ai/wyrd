@@ -3243,7 +3243,7 @@ mod tests {
     /// exactly one authoritative nullable `run_id` column for the physical record.
     #[test]
     fn native_run_id_is_replaced_by_one_authoritative_nullable_field() {
-        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
         let card = CardRef {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
@@ -3334,7 +3334,7 @@ mod tests {
     /// other than `CardScopeDenied`.
     #[test]
     fn card_scope_rejects_before_writer_admission() {
-        let card = resolved_card("prod/Service/billing@1.0.0");
+        let card = resolved_card("Service/billing@1.0.0");
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
@@ -3552,7 +3552,7 @@ mod tests {
 
     /// Builds a card-scoped service principal used by native ingest arms.
     fn scoped_service_principal() -> (Principal, CardRef) {
-        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
         let card = CardRef {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
@@ -3819,8 +3819,8 @@ mod tests {
     /// or malformed text is admitted.
     #[test]
     fn optional_and_scoped_card_correlations_stamp_signed_uids() {
-        let root = resolved_card("prod/Service/checkout@1.0.0");
-        let secondary = resolved_card("prod/Agent/planner@2.0.0");
+        let root = resolved_card("Service/checkout@1.0.0");
+        let secondary = resolved_card("Agent/planner@2.0.0");
         let principal = scoped_principal(
             &root,
             CardRefScope::from_root_and_members(&root, [secondary.clone()]),
@@ -3861,7 +3861,7 @@ mod tests {
             );
         }
 
-        let unsigned = CardRef::from_str("prod/Service/unsigned@1.0.0").expect("card");
+        let unsigned = CardRef::from_str("Service/unsigned@1.0.0").expect("card");
         let unsigned_principal = scoped_principal(
             &root,
             CardRefScope::from_root_and_members(&root, [unsigned.clone()]),
@@ -3905,7 +3905,7 @@ mod tests {
     /// its signed one, or when a different Verifier's UID is admitted.
     #[test]
     fn system_writer_correlates_only_its_signed_verifier() {
-        let verifier = resolved_card("prod/Verifier/drift@1.0.0");
+        let verifier = resolved_card("Verifier/drift@1.0.0");
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::System {
@@ -3921,7 +3921,7 @@ mod tests {
             .expect("the signed Verifier is admitted");
         assert_eq!(stamped_card_uid(&stamped), Some(uid));
 
-        let forged = uid_text(&resolved_card("prod/Verifier/other@1.0.0"));
+        let forged = uid_text(&resolved_card("Verifier/other@1.0.0"));
         assert!(matches!(
             stamp_card_uid(&principal, SuppliedCardUid::Text(&forged)),
             Err(ScribeError::CardScopeDenied)

@@ -1535,6 +1535,7 @@ mod tests {
                 reason: "x".repeat(reason_bytes),
                 actual: None,
                 citations: Vec::new(),
+                data: None,
                 detail: Some(RequirementDetail::Drift(DriftReport {
                     method: DriftMethod::Psi,
                     features,

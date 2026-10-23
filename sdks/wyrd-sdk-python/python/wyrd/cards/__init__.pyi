@@ -33,7 +33,6 @@ class AgentCard:
         kind: the Card kind, always ``"Agent"``.
     """
 
-    space: str
     name: str
     version: str
     uid: str
@@ -49,7 +48,6 @@ class AgentCard:
         prompt: PromptReference,
         *,
         execution_route: Mapping[str, str],
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -62,9 +60,6 @@ class AgentCard:
             prompt: the inline prompt or declared Prompt Card reference.
             execution_route: the required route, ``{"kind": "native"}`` or
                 ``{"kind": "wyrd_gateway", "deployment": <name>}``.
-            space: the Card space. Omitted, the workspace ``wyrd.toml``
-                ``[kind.Agent]`` or ``[defaults]`` space applies, else
-                ``"default"``.
             name: the Card name. ``"agent"`` if omitted.
             version: the semantic version. ``"0.1.0"`` if omitted.
             uid: the Card UID. A new UUIDv7 is generated if omitted.
@@ -171,7 +166,7 @@ class CardKind:
 class CardRef:
     """Reference to one exact declared Card.
 
-    A reference identifies a kind, space, name, and version. A server-assigned
+    A reference identifies a kind, name, and version. A server-assigned
     `uid` is present after declaration. Use a `CardRef` from `CardSummary` or
     `DeclarationReceipt` when you need to pass an exact identity between
     operations.
@@ -180,7 +175,6 @@ class CardRef:
     kind: CardKind
     name: str
     version: str
-    space: str
     uid: str | None
 
     def __init__(
@@ -189,16 +183,14 @@ class CardRef:
         name: str,
         version: str,
         *,
-        space: str,
         uid: str | None = ...,
     ) -> None:
-        """Build a reference from its kind, name, version, and space.
+        """Build a reference from its kind, name, and version.
 
         Args:
             kind: The Card kind, as a `CardKind` or its wire name.
             name: The Card name.
             version: The exact Card version.
-            space: The Card space.
             uid: The server-assigned Card UID, when known.
 
         Raises:
@@ -209,14 +201,14 @@ class CardRef:
         """Return this reference as its ``CardRef`` mapping, satisfying ``CardRefLike``.
 
         Returns:
-            The ``kind``, ``name``, ``version``, ``space``, and ``uid`` mapping.
+            The ``kind``, ``name``, ``version``, and ``uid`` mapping.
 
         Raises:
             WyrdError: If the reference cannot be converted to Python values.
         """
         ...
     def __str__(self) -> str:
-        """The canonical ``space/Kind/name@version`` text of this reference."""
+        """The canonical ``Kind/name@version[#uid]`` text of this reference."""
         ...
     def __repr__(self) -> str: ...
 
@@ -398,7 +390,7 @@ class Cards:
     from wyrd import Cards
 
     cards = Cards()
-    latest = cards.model.resolve_latest(space="risk", name="fraud-model")
+    latest = cards.model.resolve_latest(name="fraud-model")
     card = cards.model.get(uid=latest.uid)
     ```
 
@@ -496,7 +488,6 @@ class Cards:
             ```python
             card = PromptCard(
                 Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),
-                space="growth",
                 name="welcome",
                 version="0.1.0",
             )
@@ -537,7 +528,7 @@ class Cards:
         hydrated.
 
         Args:
-            card_ref: Exact reference carrying its space and version.
+            card_ref: Exact reference carrying its version.
 
         Returns:
             The declared envelope with server-derived relationships and
@@ -548,7 +539,7 @@ class Cards:
 
         Example:
             ```python
-            card = cards.get(CardRef("Verifier", "churn-drift", "1.0.0", space="ml"))
+            card = cards.get(CardRef("Verifier", "churn-drift", "1.0.0"))
             if card.kind == CardKind.Verifier and card.status is not None:
                 verification = card.status.get("verification")
             ```
@@ -559,7 +550,6 @@ class Cards:
         self,
         *,
         kind: CardKind | str | None = None,
-        space: str | None = ...,
         name: str | None = ...,
         version_range: str | None = ...,
         status: str | None = ...,
@@ -572,7 +562,6 @@ class Cards:
 
         Args:
             kind: Only Cards of this kind. Omitted, every kind.
-            space: Only Cards in this space.
             name: Only Cards with this name.
             version_range: Only versions in this SemVer range.
             status: Only this lifecycle status, as for
@@ -593,19 +582,18 @@ class Cards:
         """
         ...
 
-    def resolve_latest(self, kind: CardKind | str, space: str, name: str) -> CardRef:
+    def resolve_latest(self, kind: CardKind | str, name: str) -> CardRef:
         """Resolve the latest Active version of one named Card.
 
         Args:
             kind: The Card kind.
-            space: The Card space.
             name: The Card name.
 
         Returns:
             The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If `kind`, `space`, or `name` is invalid, or no Active
+            WyrdError: If `kind` or `name` is invalid, or no Active
                 Card matches.
         """
         ...
@@ -616,7 +604,7 @@ class Cards:
         The Card is marked ``deleted`` and its stored artifacts are removed.
 
         Args:
-            card_ref: Exact reference carrying its space and version.
+            card_ref: Exact reference carrying its version.
 
         Raises:
             WyrdError: ``WYRD_REGISTRY_404_CARD_NOT_FOUND`` when no Card
@@ -688,7 +676,7 @@ class DataCardRegistry:
 
     ```python
     cards = Cards()
-    data_card = cards.data.get(space="risk", name="training-data")
+    data_card = cards.data.get(name="training-data")
     data_card.load()
     ```
     """
@@ -727,7 +715,6 @@ class DataCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         interface: None = ...,
@@ -740,23 +727,21 @@ class DataCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         interface: _DataInterfaceT | type[_DataInterfaceT],
     ) -> DataCard[_DataInterfaceT]:
         """Retrieve and validate one complete `DataCard` envelope.
 
-        Pass a `CardRef` alone, `uid` for an exact lookup, or `space` and
-        `name` for a named one.
+        Pass a `CardRef` alone, `uid` for an exact lookup, or `name` for a
+        named one.
 
         Args:
             card_ref: Exact `CardRef` of a Data Card, used alone in place of
                 the other selector fields.
             uid: Exact server-assigned Card UID. When present, it takes
-                precedence over the named selector; supplied `space`, `name`,
-                and `version` are checked against the returned Card.
-            space: Card space, required when `uid` is omitted.
+                precedence over the named selector; supplied `name` and
+                `version` are checked against the returned Card.
             name: Card name, required when `uid` is omitted.
             version: Exact version. Omitted, the latest Active version.
             interface: Built-in or custom `DataInterface` instance or class
@@ -775,7 +760,6 @@ class DataCardRegistry:
     def list(
         self,
         *,
-        space: str | None = ...,
         name: str | None = ...,
         version_range: str | None = ...,
         status: str | None = ...,
@@ -791,7 +775,6 @@ class DataCardRegistry:
         for this operation. Use `get` when you need the full holder.
 
         Args:
-            space: Only Cards in this space.
             name: Only Cards with this name.
             version_range: Only versions in this SemVer range, such as
                 ``"^1.2"``, ``"1.*"``, or ``">=1.0,<2.0"``.
@@ -816,21 +799,20 @@ class DataCardRegistry:
         """
         ...
 
-    def resolve_latest(self, *, space: str, name: str) -> CardRef:
+    def resolve_latest(self, *, name: str) -> CardRef:
         """Resolve the latest Active DataCard version to an exact reference.
 
         This returns identity only. Call `get(reference)` to retrieve the
         complete card envelope.
 
         Args:
-            space: The Card space.
             name: The Card name.
 
         Returns:
             The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If `space` or `name` is invalid or no Active Card
+            WyrdError: If `name` is invalid or no Active Card
                 matches.
         """
         ...
@@ -840,7 +822,6 @@ class DataCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
     ) -> None:
@@ -848,16 +829,15 @@ class DataCardRegistry:
 
         The Card is marked ``deleted`` and its artifacts are removed. Deleting
         an already deleted Card is a no-op. Provide a `CardRef` alone or
-        `uid` for an exact deletion; otherwise provide `space`, `name`, and
-        the exact `version`.
+        `uid` for an exact deletion; otherwise provide `name` and the exact
+        `version`.
 
         Args:
             card_ref: Exact `CardRef` of a Data Card, used alone in place of
                 the other selector fields.
             uid: Exact server-assigned Card UID.
-            space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version, required with `space` and `name`.
+            version: Exact version, required with `name`.
 
         Raises:
             WyrdError: ``WYRD_REGISTRY_400_VERSION_REQUIRED`` for a named
@@ -907,7 +887,6 @@ class ModelCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         interface: None = ...,
@@ -920,7 +899,6 @@ class ModelCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         interface: _ModelInterfaceT | type[_ModelInterfaceT],
@@ -935,7 +913,6 @@ class ModelCardRegistry:
                 the other selector fields.
             uid: Exact server-assigned Card UID. When present, it takes
                 precedence over the named selector.
-            space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
             version: Exact version. Omitted, the latest Active version.
             interface: Built-in or custom `ModelInterface` instance or class
@@ -951,7 +928,6 @@ class ModelCardRegistry:
     def list(
         self,
         *,
-        space: str | None = ...,
         name: str | None = ...,
         version_range: str | None = ...,
         status: str | None = ...,
@@ -965,7 +941,6 @@ class ModelCardRegistry:
         As ``DataCardRegistry.list()``. No model bytes are fetched.
 
         Args:
-            space: Only Cards in this space.
             name: Only Cards with this name.
             version_range: Only versions in this SemVer range.
             status: Only this lifecycle status, as for
@@ -986,20 +961,19 @@ class ModelCardRegistry:
         """
         ...
 
-    def resolve_latest(self, *, space: str, name: str) -> CardRef:
+    def resolve_latest(self, *, name: str) -> CardRef:
         """Resolve the latest Active ModelCard version.
 
         As ``DataCardRegistry.resolve_latest()``.
 
         Args:
-            space: The Card space.
             name: The Card name.
 
         Returns:
             The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If `space` or `name` is invalid or no Active Card
+            WyrdError: If `name` is invalid or no Active Card
                 matches.
         """
         ...
@@ -1009,7 +983,6 @@ class ModelCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
     ) -> None:
@@ -1021,9 +994,8 @@ class ModelCardRegistry:
             card_ref: Exact `CardRef` of a Model Card, used alone in place of
                 the other selector fields.
             uid: Exact server-assigned Card UID.
-            space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version, required with `space` and `name`.
+            version: Exact version, required with `name`.
 
         Raises:
             WyrdError: As for ``DataCardRegistry.delete()``.
@@ -1065,13 +1037,12 @@ class PromptCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
     ) -> PromptCard:
         """Retrieve and validate one complete `PromptCard` envelope.
 
-        As ``DataCardRegistry.get()`` for `uid`, `space`, `name`, and
+        As ``DataCardRegistry.get()`` for `uid`, `name`, and
         `version`. Prompt cards have no separate artifact hydration step.
 
         Args:
@@ -1079,7 +1050,6 @@ class PromptCardRegistry:
                 of the other selector fields.
             uid: Exact server-assigned Card UID. When present, it takes
                 precedence over the named selector.
-            space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
             version: Exact version. Omitted, the latest Active version.
 
@@ -1095,7 +1065,6 @@ class PromptCardRegistry:
     def list(
         self,
         *,
-        space: str | None = ...,
         name: str | None = ...,
         version_range: str | None = ...,
         status: str | None = ...,
@@ -1109,7 +1078,6 @@ class PromptCardRegistry:
         As ``DataCardRegistry.list()``.
 
         Args:
-            space: Only Cards in this space.
             name: Only Cards with this name.
             version_range: Only versions in this SemVer range.
             status: Only this lifecycle status, as for
@@ -1130,20 +1098,19 @@ class PromptCardRegistry:
         """
         ...
 
-    def resolve_latest(self, *, space: str, name: str) -> CardRef:
+    def resolve_latest(self, *, name: str) -> CardRef:
         """Resolve the latest Active PromptCard version.
 
         As ``DataCardRegistry.resolve_latest()``.
 
         Args:
-            space: The Card space.
             name: The Card name.
 
         Returns:
             The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If `space` or `name` is invalid or no Active Card
+            WyrdError: If `name` is invalid or no Active Card
                 matches.
         """
         ...
@@ -1153,7 +1120,6 @@ class PromptCardRegistry:
         card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
     ) -> None:
@@ -1165,9 +1131,8 @@ class PromptCardRegistry:
             card_ref: Exact `CardRef` of a Prompt Card, used alone in place of
                 the other selector fields.
             uid: Exact server-assigned Card UID.
-            space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version, required with `space` and `name`.
+            version: Exact version, required with `name`.
 
         Raises:
             WyrdError: As for ``DataCardRegistry.delete()``.
@@ -1192,7 +1157,6 @@ class CardSummary:
 
     uid: str
     kind: CardKind
-    space: str
     name: str
     version: str
     spec_hash: str

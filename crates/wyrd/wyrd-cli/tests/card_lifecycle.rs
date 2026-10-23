@@ -101,7 +101,7 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         &path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -123,7 +123,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         temp.path().join("shared-prompt.yaml"),
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             prompt_artifact.len()
         ),
     )
@@ -136,7 +136,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         temp.path().join("model.yaml"),
         format!(
-            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: shared-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs:\n      - name: feature\n        dtype: float64\n    outputs:\n      - name: prediction\n        dtype: float64\nartifacts:\n  - relative_path: model.bin\n    sha256: {model_digest}\n    size_bytes: {}\n    content_type: application/octet-stream\n",
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: shared-model\n  version: 1.0.0\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs:\n      - name: feature\n        dtype: float64\n    outputs:\n      - name: prediction\n        dtype: float64\nartifacts:\n  - relative_path: model.bin\n    sha256: {model_digest}\n    size_bytes: {}\n    content_type: application/octet-stream\n",
             model_artifact.len()
         ),
     )
@@ -146,7 +146,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
         std::fs::write(
             temp.path().join(format!("{name}.yaml")),
             format!(
-                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  execution_route:\n    kind: native\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
+                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n  execution_route:\n    kind: native\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
             ),
         )
         .expect("agent writes");
@@ -160,7 +160,6 @@ kind: Service
 metadata:
   name: pulled-service
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:
@@ -169,25 +168,21 @@ spec:
         kind: Agent
         name: agent-one
         version: 1.0.0
-        space: default
     - alias: agent-two
       ref:
         kind: Agent
         name: agent-two
         version: 1.0.0
-        space: default
     - alias: model
       ref:
         kind: Model
         name: shared-model
         version: 1.0.0
-        space: default
     - alias: prompt
       ref:
         kind: Prompt
         name: shared-prompt
         version: 1.0.0
-        space: default
 ",
     )
     .expect("service writes");
@@ -230,13 +225,13 @@ impl RuntimeServiceFixture {
 
     /// Exact alias projection expected from the committed Service graph.
     const EXPECTED_ALIASES: &[&str] = &[
+        "Data-training-1.0.0",
+        "Prompt-inline-prompt-0.1.0",
+        "Prompt-triage-prompt-1.0.0",
+        "Verifier-model-drift-1.0.0",
+        "Verifier-quality-1.0.0",
         "agent_inline",
         "agent_triage",
-        "default-Data-training-1.0.0",
-        "default-Prompt-inline-prompt-0.1.0",
-        "default-Prompt-triage-prompt-1.0.0",
-        "default-Verifier-model-drift-1.0.0",
-        "default-Verifier-quality-1.0.0",
         "model_primary",
         "model_shadow",
         "root",
@@ -387,7 +382,6 @@ kind: Service
 metadata:
   name: invalid-service
   version: 1.0.0
-  space: default
 spec:
   components:
     - alias: quality
@@ -395,7 +389,6 @@ spec:
         kind: Verifier
         name: quality
         version: 1.0.0
-        space: default
 ",
     )
     .expect("invalid Service fixture writes");
@@ -427,7 +420,6 @@ kind: Service
 metadata:
   name: invalid-service
   version: 1.0.0
-  space: default
 spec: {}
 ",
     )
@@ -439,7 +431,6 @@ kind: Verifier
 metadata:
   name: quality
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer:
@@ -561,7 +552,6 @@ kind: Service
 metadata:
   name: missing-component
   version: 1.0.0
-  space: default
 spec:
   components:
     - alias: agent
@@ -624,8 +614,6 @@ fn delete_rejects_ambiguous_named_selector_before_client_construction() {
         "delete",
         "--kind",
         "Prompt",
-        "--space",
-        "default",
         "--name",
         "cli-prompt",
         "--format",
@@ -652,8 +640,6 @@ fn pull_requires_an_output_directory_before_client_construction() {
         "pull",
         "--kind",
         "Prompt",
-        "--space",
-        "default",
         "--name",
         "cli-prompt",
         "--format",
@@ -701,8 +687,6 @@ fn get_help_describes_one_envelope_without_bundle_options() {
         "get",
         "--kind",
         "Prompt",
-        "--space",
-        "default",
         "--name",
         "cli-prompt",
         "--output-dir",
@@ -969,7 +953,7 @@ mod pg_tests {
             ("model_primary", b"primary-model\n".as_slice()),
             ("model_shadow", b"shadow-model\n".as_slice()),
             (
-                "default-Data-training-1.0.0",
+                "Data-training-1.0.0",
                 include_bytes!("fixtures/card_lifecycle/typed_state/data/data.parquet").as_slice(),
             ),
         ] {
@@ -1295,8 +1279,6 @@ mod pg_tests {
             "latest",
             "--kind",
             "Prompt",
-            "--space",
-            "default",
             "--name",
             "cli-prompt",
             "--server",
@@ -1319,8 +1301,6 @@ mod pg_tests {
             "pull",
             "--kind",
             "Prompt",
-            "--space",
-            "default",
             "--name",
             "cli-prompt",
             "--output-dir",
@@ -1579,7 +1559,7 @@ mod pg_tests {
         let receipt = declare.expect("CLI declare succeeds");
         wait_baseline_ready(
             &cards,
-            json!({"kind": "Verifier", "name": "model-drift", "version": "1.0.0", "space": "default"}),
+            json!({"kind": "Verifier", "name": "model-drift", "version": "1.0.0"}),
         )
         .await;
         let service_ref = exact_root_ref(&receipt).expect("declare root is an exact CardRef");
@@ -1622,7 +1602,7 @@ mod pg_tests {
         );
         assert_eq!(
             state
-                .data("default-Data-training-1.0.0")
+                .data("Data-training-1.0.0")
                 .expect("data resolves")
                 .name,
             "training"
@@ -1668,14 +1648,14 @@ mod pg_tests {
         );
         assert_eq!(
             state
-                .verifier("default-Verifier-quality-1.0.0")
+                .verifier("Verifier-quality-1.0.0")
                 .expect("assert verifier resolves")
                 .requirements
                 .len(),
             1
         );
         let drift = state
-            .verifier("default-Verifier-model-drift-1.0.0")
+            .verifier("Verifier-model-drift-1.0.0")
             .expect("drift verifier resolves");
         assert_eq!(drift.description.as_deref(), Some("fixture drift"));
         assert!(matches!(
@@ -1831,7 +1811,6 @@ mod pg_tests {
                 "kind": "Verifier",
                 "name": "churn-classifier-drift",
                 "version": "1.0.0",
-                "space": "wyrd-team",
             }),
         )
         .await;
@@ -1991,11 +1970,10 @@ mod pg_tests {
             "kind": "Service",
             "name": "pulled-service",
             "version": "1.0.0",
-            "space": "default",
             "uid": service_uid_string,
         });
         let service_ref_string = format!(
-            "default/Service/pulled-service@1.0.0#{}",
+            "Service/pulled-service@1.0.0#{}",
             declaration.root.uid.as_ref().expect("service UID exists")
         );
 
@@ -2063,7 +2041,6 @@ mod pg_tests {
                     "kind": "Model",
                     "name": "shared-model",
                     "version": "1.0.0",
-                    "space": "default",
                     "uid": model_uid.clone(),
                 },
                 "alias": "agent-one",
@@ -2163,8 +2140,7 @@ mod pg_tests {
         );
         assert_eq!(
             std::fs::read(
-                full_dir
-                    .join("cards/default-Prompt-shared-prompt-1.0.0/artifacts/shared-prompt.txt")
+                full_dir.join("cards/Prompt-shared-prompt-1.0.0/artifacts/shared-prompt.txt")
             )
             .expect("prompt payload reads"),
             b"shared-prompt-artifact"
@@ -2203,9 +2179,9 @@ mod pg_tests {
         assert_eq!(
             state.aliases().collect::<Vec<_>>(),
             vec![
+                "Prompt-shared-prompt-1.0.0",
                 "agent-one",
                 "agent-two",
-                "default-Prompt-shared-prompt-1.0.0",
                 "model",
                 "prompt",
                 "root",
@@ -2280,7 +2256,7 @@ mod pg_tests {
 
         sqlx::query(
             "UPDATE wyrd.cards SET status = 'deleted' \
-             WHERE kind = 'Prompt' AND space = 'default' AND name = 'shared-prompt' \
+             WHERE kind = 'Prompt' AND name = 'shared-prompt' \
                AND version = '1.0.0'",
         )
         .execute(&superuser)
@@ -2768,7 +2744,7 @@ mod pg_tests {
                 temp.path(),
                 &format!("{name}.yaml"),
                 &format!(
-                    "apiVersion: wyrd/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec: {{}}\n"
+                    "apiVersion: wyrd/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  version: 1.0.0\nspec: {{}}\n"
                 ),
             );
             let plan = run_cli_owned(vec![
@@ -2811,11 +2787,11 @@ mod pg_tests {
         for (name, contents) in [
             (
                 "cli-custom-verifier",
-                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    current:\n      type: samples\n      features: [score]\n  requirements:\n    - id: score-stable\n      statement: The score stays near its baseline.\n      check:\n        kind: drift\n        on: inputs.current\n        method: Custom\n        signal:\n          kind: Metric\n          name: score\n        condition:\n          kind: Statistical\n        profile:\n          kind: Custom\n          metric_name: score\n          baseline_value: 1.0\n          alert_threshold: 0.5\n",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\nspec:\n  inputs:\n    current:\n      type: samples\n      features: [score]\n  requirements:\n    - id: score-stable\n      statement: The score stays near its baseline.\n      check:\n        kind: drift\n        on: inputs.current\n        method: Custom\n        signal:\n          kind: Metric\n          name: score\n        condition:\n          kind: Statistical\n        profile:\n          kind: Custom\n          metric_name: score\n          baseline_value: 1.0\n          alert_threshold: 0.5\n",
             ),
             (
                 "cli-answer-verifier",
-                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-answer-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    answer:\n      type: json\n  requirements:\n    - id: answered\n      statement: The agent produced an answer.\n      check:\n        kind: assert\n        path: inputs.answer\n        operator: is_not_null\n",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-answer-verifier\n  version: 1.0.0\nspec:\n  inputs:\n    answer:\n      type: json\n  requirements:\n    - id: answered\n      statement: The agent produced an answer.\n      check:\n        kind: assert\n        path: inputs.answer\n        operator: is_not_null\n",
             ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);
@@ -3090,5 +3066,176 @@ mod pg_tests {
             "a foreign disable leaves the connection untouched"
         );
         server.shutdown().await.expect("test server shuts down");
+    }
+
+    /// Cards are addressed by kind, name, and version alone: a declared
+    /// Prompt reads back through `get`, `latest`, and `list` without a space,
+    /// its reference text is `Kind/name@version#uid`, the removed `--space`
+    /// flag is a usage error, and an envelope or reference carrying `space`
+    /// is refused locally with a diagnostic naming the field.
+    ///
+    /// # Panics
+    /// Panics when the server cannot start, a command exits unexpectedly, or
+    /// any output carries or accepts `space`.
+    #[tokio::test]
+    async fn flat_card_identity_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-flat-identity-writer", &["editor"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+
+        let declared = run_cli_async_with_token!(
+            &jwt,
+            "declare",
+            path.to_str().expect("prompt path is UTF-8"),
+            "--server",
+            &base_url,
+            "--format",
+            "json",
+        );
+        assert!(
+            declared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&declared.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&declared.stdout).expect("receipt is JSON");
+        assert!(receipt["root"].get("space").is_none(), "{receipt}");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("receipt contains a root UID")
+            .to_owned();
+
+        let got = run_cli_async_with_token!(
+            &jwt,
+            "get",
+            "--kind",
+            "Prompt",
+            "--name",
+            "cli-prompt",
+            "--version",
+            "1.0.0",
+            "--server",
+            &base_url,
+            "--format",
+            "json",
+        );
+        assert!(
+            got.status.success(),
+            "{}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        let envelope: Value = serde_json::from_slice(&got.stdout).expect("envelope is JSON");
+        assert_eq!(envelope["metadata"]["uid"], uid);
+        assert!(envelope["metadata"].get("space").is_none(), "{envelope}");
+
+        let latest = run_cli_async_with_token!(
+            &jwt,
+            "latest",
+            "--kind",
+            "Prompt",
+            "--name",
+            "cli-prompt",
+            "--server",
+            &base_url,
+            "--format",
+            "json",
+        );
+        assert!(
+            latest.status.success(),
+            "{}",
+            String::from_utf8_lossy(&latest.stderr)
+        );
+        let resolved: CardRef = serde_json::from_value(
+            serde_json::from_slice::<Value>(&latest.stdout).expect("latest output is JSON")["card_ref"]
+                .clone(),
+        )
+        .expect("latest names a CardRef");
+        assert_eq!(
+            resolved.to_string(),
+            format!("Prompt/cli-prompt@1.0.0#{uid}")
+        );
+
+        let listed = run_cli_async_with_token!(
+            &jwt,
+            "list",
+            "--kind",
+            "Prompt",
+            "--name",
+            "cli-prompt",
+            "--server",
+            &base_url,
+            "--format",
+            "json",
+        );
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let listed: Value = serde_json::from_slice(&listed.stdout).expect("list output is JSON");
+        let items = listed["items"].as_array().expect("list items");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get("space").is_none(), "{listed}");
+
+        for verb in ["get", "list", "latest"] {
+            let refused = run_cli_async_with_token!(
+                &jwt,
+                verb,
+                "--kind",
+                "Prompt",
+                "--space",
+                "default",
+                "--name",
+                "cli-prompt",
+                "--server",
+                &base_url,
+            );
+            assert_eq!(refused.status.code(), Some(64), "{verb} accepted --space");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("unexpected argument '--space'"),
+                "{verb}: {}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+        }
+
+        let spaced_metadata = temp.path().join("spaced-metadata.yaml");
+        std::fs::write(
+            &spaced_metadata,
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: spaced\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
+        )
+        .expect("spaced metadata writes");
+        let spaced_ref = temp.path().join("spaced-ref.yaml");
+        std::fs::write(
+            &spaced_ref,
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: spaced-agent\n  version: 1.0.0\nspec:\n  prompt:\n    kind: Prompt\n    name: cli-prompt\n    version: 1.0.0\n    space: default\n  execution_route:\n    kind: native\n",
+        )
+        .expect("spaced reference writes");
+        for spaced in [&spaced_metadata, &spaced_ref] {
+            let refused = run_cli_async!(
+                "declare",
+                "--check",
+                spaced.to_str().expect("spaced path is UTF-8"),
+                "--format",
+                "json",
+            );
+            assert_eq!(refused.status.code(), Some(64));
+            let error: Value =
+                serde_json::from_slice(&refused.stderr).expect("stderr is one document");
+            assert_eq!(error["code"], "WYRD_CLI_400_CARD_LOAD");
+            assert!(
+                error["details"]["diagnostics"][0]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("unknown field `space`")),
+                "{error}"
+            );
+        }
+
+        stop_cli_server(server, shutdown, serve_handle).await;
     }
 }

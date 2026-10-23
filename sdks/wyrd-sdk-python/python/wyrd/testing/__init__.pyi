@@ -184,7 +184,7 @@ class WyrdTestServer:
         run may observe the component Cards its spec references.
 
         Args:
-            card_ref: the canonical ``space/Kind/name@version`` identity of a
+            card_ref: the canonical ``Kind/name@version`` identity of a
                 Service already registered in the fixture tenant.
             roles: built-in role names granted to that principal in addition
                 to any it already holds.

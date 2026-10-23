@@ -8,7 +8,6 @@ kind: Verifier
 metadata:
   name: policy-review
   version: 1.0.0
-  space: default
 spec:
   description: A support answer follows its refund policy and was looked up, not guessed.
   inputs:

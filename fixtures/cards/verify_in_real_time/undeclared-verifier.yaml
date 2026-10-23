@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: undeclared-verifier
   version: 1.0.0
-  space: default
 spec:
   description: A conversation Verifier sourcing a slot turn-check does not declare.
   inputs:

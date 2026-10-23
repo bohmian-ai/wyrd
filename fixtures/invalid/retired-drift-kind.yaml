@@ -3,6 +3,5 @@ kind: Drift
 metadata:
   name: retired-drift
   version: 1.0.0
-  space: default
 spec:
   method: Psi

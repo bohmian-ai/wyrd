@@ -149,15 +149,13 @@ def declare(cards: Cards, path: str) -> dict[str, CardRef]:
 
 def pull(cards: Cards, service: str, destination: Path) -> Path:
     """Hydrate the registered ``service`` graph into ``destination``."""
-    ref = CardRef("Service", service, "1.0.0", space="default")
+    ref = CardRef("Service", service, "1.0.0")
     return cards.pull(ref, destination).destination
 
 
 def service_key(service: str, client: WyrdClient | None = None) -> str:
     """Issue the registered ``service``'s own key as ``client``; it holds only the default Card Role."""
-    return cli.issue_key(
-        kind="Service", name=service, version="1.0.0", space="default", client=client
-    ).key
+    return cli.issue_key(kind="Service", name=service, version="1.0.0", client=client).key
 
 
 def hydrated(bundle: Path, client: WyrdClient | None = None) -> WyrdState:

@@ -7317,20 +7317,6 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "chrono",
- "dyn-clone",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
@@ -7350,21 +7336,10 @@ dependencies = [
  "chrono",
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn 2.0.118",
+ "uuid",
 ]
 
 [[package]]
@@ -9946,7 +9921,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "wyrd"
 version = "0.3.0"
 dependencies = [
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
@@ -10207,7 +10182,7 @@ dependencies = [
  "opentelemetry_sdk",
  "reqwest 0.13.4",
  "rustix",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_jcs",
@@ -10359,7 +10334,7 @@ name = "wyrd-loader"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -10540,7 +10515,7 @@ dependencies = [
 name = "wyrd-semver"
 version = "0.3.0"
 dependencies = [
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "semver",
  "serde",
  "serde_json",
@@ -10593,7 +10568,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rmcp",
  "rustix",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_jcs",
@@ -10762,7 +10737,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "regex",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -10775,7 +10750,7 @@ name = "wyrd-skald-tool"
 version = "0.3.0"
 dependencies = [
  "async-trait",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -10797,7 +10772,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "regex",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "secrecy",
  "semver",
  "serde",
@@ -11026,7 +11001,7 @@ dependencies = [
  "arrow-schema",
  "bohmian-parquet-variant-compute",
  "chrono",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "workspace-hack",
@@ -11070,7 +11045,7 @@ dependencies = [
 name = "wyrd-version"
 version = "0.3.0"
 dependencies = [
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "semver",
  "serde",
  "serde_json",

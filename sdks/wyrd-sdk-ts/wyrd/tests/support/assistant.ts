@@ -96,7 +96,7 @@ export async function registerAssistant(client: WyrdClient): Promise<Assistant> 
   const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" }, { client });
+  const issued = await cli.issueKey(receipt.root, { client });
   return {
     bundle,
     key: issued.key,

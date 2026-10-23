@@ -143,23 +143,12 @@ impl<'de> Deserialize<'de> for EntityUid {
 }
 
 impl schemars::JsonSchema for EntityUid {
-    fn schema_name() -> String {
-        "EntityUid".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "EntityUid".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(512),
-                min_length: Some(1),
-                pattern: None,
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": 512 })
     }
 }
 
@@ -260,23 +249,12 @@ impl<'de> Deserialize<'de> for TraceId {
 }
 
 impl schemars::JsonSchema for TraceId {
-    fn schema_name() -> String {
-        "TraceId".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TraceId".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(32),
-                min_length: Some(32),
-                pattern: Some(r"^[0-9a-f]{32}$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 32, "maxLength": 32, "pattern": r"^[0-9a-f]{32}$" })
     }
 }
 
@@ -391,23 +369,12 @@ impl<'de> Deserialize<'de> for SpanId {
 }
 
 impl schemars::JsonSchema for SpanId {
-    fn schema_name() -> String {
-        "SpanId".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SpanId".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(16),
-                min_length: Some(16),
-                pattern: Some(r"^[0-9a-f]{16}$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 16, "maxLength": 16, "pattern": r"^[0-9a-f]{16}$" })
     }
 }
 
@@ -508,23 +475,17 @@ impl<'de> Deserialize<'de> for TableVersion {
 }
 
 impl schemars::JsonSchema for TableVersion {
-    fn schema_name() -> String {
-        "TableVersion".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TableVersion".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(19),
-                min_length: Some(1),
-                pattern: Some(r"^[1-9][0-9]*$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 19,
+            "pattern": "^[1-9][0-9]*$"
+        })
     }
 }
 

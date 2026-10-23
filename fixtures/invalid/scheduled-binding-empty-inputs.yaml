@@ -3,9 +3,8 @@ kind: Service
 metadata:
   name: budget-with-empty-inputs
   version: 1.0.0
-  space: default
 spec:
   verified_by:
-    - verifier: {kind: Verifier, name: latency-error-budget, version: 1.0.0, space: default}
+    - verifier: {kind: Verifier, name: latency-error-budget, version: 1.0.0 }
       runs_on: {kind: schedule, cron: "0 0 * * *"}
       inputs: {}

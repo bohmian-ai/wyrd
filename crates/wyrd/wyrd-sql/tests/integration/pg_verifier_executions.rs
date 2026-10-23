@@ -170,7 +170,7 @@ fn service_card(name: &str) -> Card {
     serde_json::from_value(json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": {},
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -2328,8 +2328,8 @@ async fn failed_settlement_freezes_the_bounded_failure_context() {
         assert_eq!(context.dispatch_id.as_uuid(), dispatch_id);
         assert_eq!(context.execution_id, execution);
         assert_eq!(context.verdict, VerificationVerdict::Failed);
-        assert_eq!(context.verifier_ref, "default/drift@1.0.0");
-        assert_eq!(context.subject_ref, "default/svc@1.0.0");
+        assert_eq!(context.verifier_ref, "Verifier/drift@1.0.0");
+        assert_eq!(context.subject_ref, "Service/svc@1.0.0");
         assert_eq!(context.summary.chars().count(), MAX_SUMMARY_CHARS);
         assert_eq!(context.drift, Some(DRIFT_COUNTS));
     }

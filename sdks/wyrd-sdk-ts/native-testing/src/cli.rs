@@ -34,14 +34,12 @@ pub struct NativeCliConnection {
     pub access_token: String,
 }
 
-/// Card selector for `get` and `pull`: a `uid` with `kind`, or `kind`,
-/// `space`, and `name`; `version` narrows either.
+/// Card selector for `get` and `pull`: a `uid` with `kind`, or `kind` and
+/// `name`; `version` narrows either.
 #[napi(object)]
 pub struct NativeCardSelector {
     /// Card kind, such as `Model` or `Prompt`.
     pub kind: Option<String>,
-    /// Card space.
-    pub space: Option<String>,
     /// Card name.
     pub name: Option<String>,
     /// Exact Card version.
@@ -55,7 +53,6 @@ impl From<NativeCardSelector> for SelectorArgs {
     fn from(selector: NativeCardSelector) -> Self {
         Self {
             kind: selector.kind,
-            space: selector.space,
             name: selector.name,
             version: selector.version,
             uid: selector.uid,
@@ -72,8 +69,6 @@ pub struct NativeIssueKey {
     pub name: String,
     /// Exact Card version.
     pub version: String,
-    /// Card space.
-    pub space: String,
     /// Optional label stored with the key row.
     pub label: Option<String>,
     /// Optional lifetime override in seconds.
@@ -245,7 +240,6 @@ pub async fn cli_issue_key(
                 &options.kind,
                 &options.name,
                 &options.version,
-                &options.space,
                 options.label.as_deref(),
                 options.expires_in_seconds,
                 client,

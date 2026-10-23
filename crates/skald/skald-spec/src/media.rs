@@ -365,26 +365,15 @@ impl<'de> Deserialize<'de> for MediaFormat {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for MediaFormat {
     /// Names the format schema in generated definitions.
-    fn schema_name() -> String {
-        "MediaFormat".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "MediaFormat".into()
     }
 
     /// Describes the format as one of the canonical tokens; aliases are
     /// accepted on input but never generated.
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject};
-
-        SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(
-                Self::ALL
-                    .into_iter()
-                    .map(|format| serde_json::Value::from(format.as_str()))
-                    .collect(),
-            ),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let formats: Vec<&str> = Self::ALL.into_iter().map(Self::as_str).collect();
+        schemars::json_schema!({ "type": "string", "enum": formats })
     }
 }
 

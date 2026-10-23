@@ -3,7 +3,6 @@ kind: Prompt
 metadata:
   name: portable-prompt
   version: 1.0.0
-  space: default
 spec:
   provider: anthropic
   model: claude-sonnet-4-5

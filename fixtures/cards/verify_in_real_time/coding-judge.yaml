@@ -4,7 +4,6 @@ kind: Agent
 metadata:
   name: coding-judge
   version: 1.0.0
-  space: default
 spec:
   prompt: ./judge-prompt.yaml
   execution_route: {kind: wyrd_gateway, deployment: openai}

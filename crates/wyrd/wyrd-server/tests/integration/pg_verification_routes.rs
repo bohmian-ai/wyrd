@@ -676,7 +676,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         .expect("role seeds");
 
     let subject_ref: CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vr-service", "version": "1.0.0", "space": "default"
+        "kind": "Service", "name": "vr-service", "version": "1.0.0"
     }))
     .expect("subject ref decodes");
     let owner = server
@@ -1408,5 +1408,246 @@ async fn system_writer_is_unreachable_through_public_principal_routes() {
         (system, name, status, 0),
         "no public route changed or credentialed the SYSTEM writer"
     );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A code-check Verifier spec over the inline `answer` slot whose check
+/// declares `response_format`, returning a cited Verdict with `data`.
+fn scored(response_format: &Value, data: &Value) -> Value {
+    let source = format!(
+        "def check(answer):\n    return {{\"outcome\": \"failed\", \"reason\": \"scored\", \"citations\": [{{\"slot\": \"answer\", \"locator\": {{\"json_pointer\": \"\"}}}}], \"data\": {data}}}\n"
+    );
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "scored",
+            "statement": "The answer is scored.",
+            "check": {
+                "kind": "code", "entrypoint": "check", "inputs": { "answer": "inputs.answer" },
+                "source": { "inline": source }, "response_format": response_format
+            }
+        }]
+    })
+}
+
+/// The `{kind: verdict}` format whose custom data is one numeric `score`.
+fn score_format() -> Value {
+    json!({ "kind": "verdict", "data": {
+        "type": "object", "properties": { "score": { "type": "number" } },
+        "required": ["score"], "additionalProperties": false
+    } })
+}
+
+/// A check Agent judging `inputs.answer` with an inline Prompt answering in
+/// `response_format`, or, when `native` is set, with a native Responses body
+/// that also sets its own text format.
+fn judged(response_format: &Value, native: bool) -> Value {
+    let prompt = if native {
+        json!({
+            "provider": "openai", "model": "gpt-4o", "format": "responses",
+            "body": {
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "Judge {{answer}}" }] }],
+                "text": { "format": { "type": "json_object" } }
+            },
+            "response_format": response_format
+        })
+    } else {
+        json!({
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Judge {{answer}}" }],
+            "response_format": response_format
+        })
+    };
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "judged",
+            "statement": "The answer is judged.",
+            "check": {
+                "kind": "agent", "inputs": { "answer": "inputs.answer" },
+                "agent": {
+                    "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" },
+                    "run_config": { "max_iterations": 1 },
+                    "prompt": prompt
+                }
+            }
+        }]
+    })
+}
+
+/// Register one Verifier named `name` with `spec` through `POST /v1/cards`
+/// as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn declare_verifier(
+    server: &WyrdTestServer,
+    jwt: &str,
+    name: &str,
+    spec: &Value,
+) -> (StatusCode, Value) {
+    let body = json!({ "submissions": [{
+        "apiVersion": "wyrd/v1", "kind": "Verifier",
+        "metadata": { "name": name, "version": "1.0.0" },
+        "spec": spec, "artifacts": []
+    }] });
+    post(
+        server,
+        jwt,
+        "/v1/cards",
+        body.to_string(),
+        Some(&format!("vr-declare-{name}")),
+    )
+    .await
+}
+
+/// Unknown format names, invalid or non-object data schemas, data schemas
+/// declaring another draft or a root `$id`, Prompts that
+/// cannot produce a Verdict (including a composed handwritten schema whose
+/// data is optional), and native bodies that set their own response format
+/// are refused with a structured validation error naming the field,
+/// and the refused Verifier does not exist afterwards; the valid code and
+/// Agent declarations register.
+///
+/// # Panics
+/// Panics when a refused declaration registers or a valid one is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn verdict_declarations_validate_before_persistence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, jwt) = user(&server, "vr-declarer", &["editor"]).await;
+    let plain = json!({ "outcome": "passed" });
+    let mut optional_data = Value::Object(
+        wyrd_spec::verification::execution::Verdict::response_format(
+            &serde_json::from_value(json!("verdict")).expect("plain format"),
+        )
+        .expect("the plain format resolves"),
+    );
+    optional_data["properties"]["data"] = json!({ "type": "object" });
+    let refused = [
+        ("vr-unknown-name", scored(&json!("score"), &plain)),
+        (
+            "vr-scalar-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "type": "string" } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-invalid-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "type": "object", "properties": { "x": { "type": "nope" } } } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-not-a-verdict",
+            judged(
+                &json!({ "type": "object", "properties": { "score": { "type": "number" } },
+                         "required": ["score"], "additionalProperties": false }),
+                false,
+            ),
+        ),
+        (
+            "vr-older-draft-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "$schema": "http://json-schema.org/draft-04/schema#", "type": "object" } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-authored-id-data",
+            judged(
+                &json!({ "kind": "verdict", "data": { "$id": "#", "type": "object" } }),
+                false,
+            ),
+        ),
+        ("vr-native-conflict", judged(&json!("verdict"), true)),
+        (
+            "vr-composed-optional-data",
+            judged(
+                &json!({ "type": "object", "allOf": [optional_data] }),
+                false,
+            ),
+        ),
+    ];
+    for (name, spec) in refused {
+        let (status, problem) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert!(status.is_client_error(), "{name}: {status} {problem}");
+        assert!(
+            problem["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("WYRD_")),
+            "{name}: {problem}"
+        );
+        assert!(
+            problem.to_string().contains("response_format"),
+            "{name} names the field: {problem}"
+        );
+        let (status, _) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name} was not persisted");
+    }
+    for (name, spec) in [
+        (
+            "vr-scored-code",
+            scored(&score_format(), &json!({ "score": 1 })),
+        ),
+        ("vr-scored-agent", judged(&score_format(), false)),
+        ("vr-plain-agent", judged(&json!("verdict"), false)),
+    ] {
+        let (status, body) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert!(status.is_success(), "{name}: {status} {body}");
+        let (status, card) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {card}");
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A direct execution returns its code check's custom data to the home
+/// tenant, through the execution read too, while another tenant can neither
+/// execute the Verifier nor read the execution.
+///
+/// # Panics
+/// Panics when data is lost at home or any foreign read succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn custom_verdict_data_is_tenant_isolated() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let verifier = fixture
+        .seed
+        .verifier(
+            "vr-scored",
+            &scored(&score_format(), &json!({ "score": 0.5 })),
+        )
+        .await
+        .expect("scored Verifier registers");
+    let (_, jwt) = user(&server, "vr-scorer", &["editor"]).await;
+    let body = fixture.request(&verifier, json!({ "text": "one" }));
+
+    let (status, result) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let requirement = &result["outcome"]["requirements"][0];
+    assert_eq!(requirement["outcome"], "failed", "{result}");
+    assert_eq!(requirement["data"], json!({ "score": 0.5 }), "{result}");
+
+    let other: DataTenantId = server.seed_tenant("vr-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = machine_jwt(&server, &foreign).await;
+    let (status, problem) = execute(&server, &foreign_jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+    assert!(!problem.to_string().contains("score"), "{problem}");
+    let uri = format!(
+        "/v1/verification/executions/{}",
+        result["execution_id"].as_str().expect("id")
+    );
+    let (status, problem) = get(&server, &foreign_jwt, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+    assert!(!problem.to_string().contains("score"), "{problem}");
     server.shutdown().await.expect("test server shuts down");
 }

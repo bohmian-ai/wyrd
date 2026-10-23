@@ -216,27 +216,8 @@ spec:
           Claim: {{claim}}  # filled from the check's inputs
           Reply: {{answer}}
           Decide whether the claim holds for the reply, and cite the reply.
-    # The judge must answer with a verdict: an outcome, a reason, and citations.
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties: {json_pointer: {type: string}}
-                required: [json_pointer]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    # The judge answers with a Verdict: an outcome, a reason, and citations.
+    response_format: verdict
 ```
 
 </Tab>
@@ -257,6 +238,78 @@ print(judged.get("citations"))  # where in the reply the judge looked
 </Tabs>
 
 The judge's model calls go through the LLM gateway with your provider key. [Verdicts and citations](/reference/verifier-card/#verdicts-and-citations) explains the locators a citation can use.
+
+### Return scores and labels with the verdict
+
+Declare a schema under `data` and the judge returns that object beside its verdict. The server checks it against the schema; output that does not match is `inconclusive` and keeps no data.
+
+```yaml title="policy-judge.yaml (excerpt)"
+    response_format:
+      kind: verdict
+      data:
+        type: object
+        properties:
+          score: {type: number, minimum: 0, maximum: 1}
+          category: {type: string}
+        required: [score, category]
+        additionalProperties: false
+```
+
+A `code` check declares the same `response_format` beside `entrypoint`, and its function returns `data` with its verdict. Each requirement carries its own `data`, which stays absent when its check declares none. Read it as JSON, or ask for your own type:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from pydantic import BaseModel
+
+class JudgeData(BaseModel):
+    score: float
+    category: str
+
+result = run.observe.verify_typed("follows-policy", JudgeData, answer={"text": "Refunds up to 100 dollars follow our policy."})
+data = result.requirements[0].get("data")  # a JudgeData, or None when the check returned none
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use serde::Deserialize;
+use serde_json::json;
+use wyrd_ai::verify::{Input, Inputs};
+
+#[derive(Deserialize)]
+struct JudgeData {
+    score: f64,
+    category: String,
+}
+
+let answer = json!({ "text": "Refunds up to 100 dollars follow our policy." });
+let result = run
+    .observe()
+    .verify_typed::<JudgeData>("follows-policy", Inputs::named([("answer", Input::from(answer))]))
+    .await?;
+let data = result.outcome.requirements[0].data.as_ref(); // a JudgeData, or None when the check returned none
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { z } from "zod";
+
+const JudgeData = z.object({ score: z.number(), category: z.string() });
+
+const answer = { text: "Refunds up to 100 dollars follow our policy." };
+const result = await run.observe.verifyTyped("follows-policy", { answer }, JudgeData);
+const data = result.outcome.requirements[0]?.data; // a JudgeData, or undefined when the check returned none
+```
+
+</LangTab>
+</LangTabs>
+
+Data that does not fit your type raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement; the stored result is unchanged and nothing runs again. Its `path` is always `""`, the root of that requirement's data, because a deeper path could name a key the check returned.
 
 ## Multi-step
 

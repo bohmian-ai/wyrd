@@ -143,7 +143,7 @@ services.
     card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
     `Ref`. One exception: declaration materializes a declared Agent's
     inline Prompt as its own Prompt Card named `<agent-name>-prompt` in the
-    Agent's space, versioned on its own registry line, and persists the Agent
+    Agent's tenant, versioned on its own registry line, and persists the Agent
     with that Card's exact UID-bearing reference. Identical inline content in
     differently named Agents is never shared.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
@@ -286,8 +286,9 @@ services.
     wire. Heavy cards (Model, Data, Experiment, Artifact) accept `ref` only —
     `inline` is rejected because identity anchors lineage. Environment/stage is
     target-card metadata (`labels` /
-    `annotations`), never `space`; `space` is team/workspace scope only, and
-    one server may hold development, staging, and production cards side by side.
+    `annotations`), never identity. Card identity is tenant, kind, name, and
+    version, and one server may hold development, staging, and production cards
+    side by side under distinct names or versions.
     See [Reference forms](#reference-forms) for loader rules and the slot inventory.
 20. **User journeys are the primary test contract.** A capability is not done
     until a real user/agent path proves it end-to-end — client → server →
@@ -502,14 +503,27 @@ spec:
   system?: string
   messages: [{ role: user | assistant, content: string | [ContentBlock] }]
   settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty, reasoning_effort (chat_completion only)
-  response_format?: JsonSchema
+  response_format?: JsonSchema | verdict | { kind: verdict, data?: JsonSchema }
 # Native form: one protocol body passed through unchanged.
 spec:
   provider: ProviderName
   model: string
   format: chat_completion | responses | messages | generate_content | system_one
   body: { ... }                    # that protocol's request body, extension options preserved
+  response_format?: verdict | { kind: verdict, data?: JsonSchema }
 ```
+
+`response_format: verdict` (or `{kind: verdict}`) compiles the closed
+Verdict schema generated from Wyrd's canonical `Verdict` type; `data` adds a
+required custom object with that schema. A `data` schema is JSON Schema
+2020-12 (no other `$schema`) without a root `$id`; it is embedded as its own
+resource so its local references resolve as they do standalone. The card keeps and hashes the
+authored form, never the expanded provider settings. On a native body the
+named format is lowered into that protocol's structured-output settings; a
+body that also sets its own response settings, or a `system_one` body, is
+refused. Skald owns the
+compiler but no format names: Wyrd resolves `verdict` when it compiles a
+Prompt, and an unresolved named format cannot render.
 
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
@@ -610,7 +624,7 @@ Closed enums:
 - `PolicyAction = Classify | Gate | Invoke`
 - `Enforcement = Active | Inert`
 - `PolicyScope = OrgGlobal | ServiceLocal`
-- `PolicyTarget = { spaces: [SpaceName], kinds: [CardKind], actions: [PolicyAction] }`
+- `PolicyTarget = { kinds: [CardKind], actions: [PolicyAction] }`
 - `PolicyDecision = Allow | Deny { reason: string }`
 
 ### Runtime identity
@@ -1140,17 +1154,12 @@ ProvenanceQuery:
 | `Downstream` | `card_edges WHERE target ∈ frontier`   | What consumes X / what depends on X. |
 | `Both`       | union                                  | Full neighborhood. |
 
-The query carries no `kinds` or `space` filter. Both were removed by
-design:
+The query carries no `kinds` filter, by design:
 
 - **No `kinds`.** Filtering would silently narrow the pinned subgraph,
   giving later readers a forensic false signal that the investigator
   considered only those kinds. Display filtering is a UI concern; the
   audit pins the whole neighborhood.
-- **No `space`.** Visibility is already RBAC-enforced server-side. A
-  `space` filter at query time would hide cross-space references — which
-  in an investigation are often the finding (e.g. a prod Service
-  referencing a staging Model).
 
 `roots` is a list because multi-version subjects are the common case for
 incident windows: a Service that bumped from `1.0.0` to `1.1.0` mid-window
@@ -1255,7 +1264,6 @@ lifecycle axis** (`subject_refs`, doctrine #8) and **the time axis**
 
 Excluded fields, with reasoning matching `ProvenanceQuery`:
 
-- **No `space`.** Already pinned by version-locked `subject_refs`.
 - **No `kinds`.** Implied by `subject_refs[i].kind`; an explicit filter
   would silently narrow replay and give later readers a forensic false
   signal.
@@ -1310,8 +1318,8 @@ never a refusal: checks that need it are inconclusive.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` |
-| `code` | Sandboxed Python returning the same Verdict schema |
+| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
+| `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
 Actions read and compute; they never mutate external systems, declare Cards,
@@ -1334,6 +1342,19 @@ infrastructure, and missing-evidence failures inside one check are
 with none applicable the verdict is `inconclusive`. `all` returns failed on
 any failure, else inconclusive on any inconclusive, else passed. `pass_rate`
 divides passes by all applicable requirements, inconclusive included.
+
+A check whose format declares `data` must return a matching non-null
+object; without a declaration it must not return `data`. The server validates
+the whole response against the exact declared schema and bounds `data` to
+65,536 bytes of compact JSON and 16 nested containers. Invalid or oversized
+output is `inconclusive` with no data, and the reason names the location or
+limit, never the content. Accepted data is `RequirementResult.data` on whole
+Verifier and step requirements, retained in the sensitive outcome. SDK
+typed siblings (`verify_typed`, `wait_typed`, `status_typed`, and Rust
+`wait_until_typed`) decode every present `data` as the caller's type after the
+ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
+requirement with the data root's empty `path` (a deeper path could hold a
+returned dictionary key), and never reruns or changes the result.
 
 A citation names an original input slot and a typed locator (`page`, `slide`,
 `lines`, `json_pointer`, or page `region`); workspace paths map back to their
@@ -2060,7 +2081,7 @@ required on `POST /v1/cards`. Missing header →
 
 Key derivation (client-side):
 
-1. Canonicalize submissions by `(kind, space, name)`.
+1. Canonicalize submissions by `(kind, name, version)`.
 2. For each submission, compute `spec_hash` = BLAKE3 hex over JCS
    canonical bytes of the spec plus `artifact_manifest_hash` (BLAKE3
    over the manifest, empty if no artifacts).
@@ -2136,7 +2157,7 @@ contain its native child body directly. There is no additional keyed
 
 ```yaml
 # Registered Prompt reference at Agent.prompt.
-prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
+prompt: { kind: Prompt, name: triage, version: "1.0.0" }
 
 # Local full Card envelope, resolved relative to the containing file.
 prompt: ./prompts/triage.yaml
@@ -2154,16 +2175,19 @@ reference discriminator. Service components retain that field for every form:
 ```yaml
 components:
   - alias: agent
-    ref: { kind: Agent, name: support-triage, version: "1.0.0", space: prod }
+    ref: { kind: Agent, name: support-triage, version: "1.0.0" }
   - alias: model
-    ref: { kind: Model, name: churn-classifier, version: "1.0.0", space: prod }
+    ref: { kind: Model, name: churn-classifier, version: "1.0.0" }
   - alias: prompt
     ref: ./prompts/triage-system.yaml
 ```
 
-`CardRef` carries `kind`, `name`, one `version`, optional `space`, and optional
-`uid`; never labels, annotations, or a version requirement. An omitted space
-inherits the containing authored context. Local loading never declares. Declare
+`CardRef` carries `kind`, `name`, one `version`, and optional `uid`; never
+labels, annotations, a version requirement, or `space`. Its canonical text is
+`Kind/name@version[#uid]`. Card identity is tenant, kind, name, and version;
+the tenant comes from the authenticated caller, never from the reference. A
+`space` field or a `space/Kind/name@version` text is refused as a validation
+error, not mapped. Local loading never declares. Declare
 declares path-loaded Cards in the same composite request, projects paths to
 Sibling references, and preserves external refs even at matching identities.
 Inline bodies remain embedded, except a declared Agent's inline Prompt,
@@ -2208,7 +2232,7 @@ relationship derivation, or durable persistence. The server, registry, and
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
 - The referenced file is a **full card envelope** — `kind` + `metadata`
-  (`space`, `name`, `version`) + `spec`, plus `apiVersion`, which authored
+  (`name`, `version`) + `spec`, plus `apiVersion`, which authored
   files may omit and which then defaults to `wyrd/v1`; the declaration wire
   always carries it explicitly. Declaration derives the
   child's identity from that `metadata`, and the parent slot becomes a `ref:`
@@ -2236,7 +2260,7 @@ external-file imports. Durable and read contracts remain the simpler direct
 ## Workspace config (`wyrd.toml`)
 
 Wyrd's wire contract identifies every card by `kind`, `name`, and one version
-field, with optional `space` and `uid`. Authors writing many cards in one bundle
+field, with an optional `uid`. Authors writing many cards in one bundle
 still benefit from consistent metadata defaults. This section formalizes the
 loader-side ergonomic without changing the wire identity shape.
 
@@ -2262,9 +2286,6 @@ loader-side ergonomic without changing the wire identity shape.
 ### Schema
 
 ```toml
-[defaults]
-space = "prod"
-
 [defaults.labels]
 team   = "churn-ml"
 domain = "customer"
@@ -2273,14 +2294,15 @@ domain = "customer"
 "acme.com/owner" = "data-platform"
 
 # Per-kind override; PascalCase keys match CardKind serialization.
-[kind.Model]
-space = "ml-prod"
+[kind.Model.annotations]
+"acme.com/owner" = "ml-platform"
 
 [kind.Policy.labels]
 tier = "governance"
 ```
 
-- Defaultable fields: `space`, `labels`, `annotations`.
+- Defaultable fields: `labels`, `annotations`. `space` is not a field and
+  is refused as an unknown key.
 - **`name` is never defaultable.** Every card's identity must be
   authored. A `name` key under `[defaults]` or any `[kind.<X>]`
   deserializes to a typed error.
@@ -2308,13 +2330,10 @@ tier = "governance"
 1. Value explicit in the card YAML.
 2. `[kind.<Kind>]` table value.
 3. `[defaults]` table value.
-4. System fallback (`space = "default"`, empty `labels` /
-   `annotations`).
+4. System fallback: empty `labels` / `annotations`.
 
 ### Merge rules
 
-- **Scalars** (`space`): set if the card field is `None`; otherwise
-  leave.
 - **Maps** (`labels`, `annotations`): per-key merge. For each key
   present in the config, insert into the card's map only if absent.
   Per-card values always win for their own keys; other config keys
@@ -2324,10 +2343,8 @@ tier = "governance"
   identity or intent; the last three
   are server-derived.
 
-This is the same architectural slot as the loader-side
-`metadata.space` inheritance documented in [Reference forms](#reference-forms):
-the wire payload still arrives at the server fully
-populated; the server never reads `wyrd.toml`.
+The wire payload still arrives at the server fully populated; the server never
+reads `wyrd.toml`.
 
 ### No lockfile by design
 

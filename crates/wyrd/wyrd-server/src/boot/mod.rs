@@ -52,7 +52,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
@@ -182,7 +182,7 @@ pub enum ServerBootError {
         slug: String,
     },
     /// A `[[workload_bindings]]` entry's card target could not be built into a
-    /// [`CardRef`]. This is config malformation (bad kind/name/space/version or
+    /// [`CardRef`]. This is config malformation (bad kind/name/version or
     /// issuer URL), caught at boot so the server fails closed rather than
     /// starting with a mis-built binding. It is not a card-existence check.
     #[error("workload_bindings[{index}] is invalid: {message}")]
@@ -2171,14 +2171,11 @@ fn build_binding_card_ref(
         .map_err(|error| invalid(format!("invalid card name {:?}: {error}", entry.name)))?;
     let version = VersionBlock::parse(entry.version.clone())
         .map_err(|error| invalid(format!("invalid card version {:?}: {error}", entry.version)))?;
-    let space = SpaceName::new(entry.space.clone())
-        .map_err(|error| invalid(format!("invalid card space {:?}: {error}", entry.space)))?;
 
     Ok(CardRef {
         kind,
         name,
         version,
-        space: Some(space),
         uid: None,
     })
 }
@@ -2510,7 +2507,6 @@ mod tests {
             // case-insensitive against the kind wire name.
             kind: "service".to_owned(),
             name: "my-model".to_owned(),
-            space: "prod".to_owned(),
             version: "1.0.0".to_owned(),
         }
     }

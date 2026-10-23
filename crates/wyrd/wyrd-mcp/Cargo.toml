@@ -4,7 +4,7 @@ version = { workspace = true }
 edition = { workspace = true }
 description = "First-party Rust MCP client connectivity for Wyrd."
 license = { workspace = true }
-rust-version = { workspace = true }
+rust-version = "1.95"
 repository = { workspace = true }
 authors = { workspace = true }
 autotests = false

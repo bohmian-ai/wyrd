@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: triage
   version: 1.0.0
-  space: default
 spec:
   prompt: ./triage-prompt.yaml
   execution_route:

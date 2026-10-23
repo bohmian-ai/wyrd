@@ -152,19 +152,26 @@ export interface ArrowMeta {
 /**
  * Public synchronous Oracle query request.
  *
- * Every query reads the same sources: its pinned published cut plus best-effort live rows from selected online Scribes. There is no caller source, freshness, or class selector, and unknown fields are rejected so a client that still sends one learns the contract changed instead of silently receiving different semantics.
+ * Every query reads the same sources: its pinned published cut plus
+ * best-effort live rows from selected online Scribes. There is no caller
+ * source, freshness, or class selector, and unknown fields are rejected so a
+ * client that still sends one learns the contract changed instead of silently
+ * receiving different semantics.
  */
 export interface BifrostQueryRequest {
   /**
    * Optional caller deadline in milliseconds, valid in `1..=u32::MAX`.
    *
-   * The field is a wide signed integer so ordinary below- and above-range values deserialize and reach request validation, which owns the one closed range every client surface shares.
+   * The field is a wide signed integer so ordinary below- and above-range
+   * values deserialize and reach request validation, which owns the one
+   * closed range every client surface shares.
    */
   readonly deadline_ms?: number | null;
   /**
    * Ordered bind values for the `$1..$n` placeholders in `sql`.
    *
-   * Omitted on the wire when empty, so a request without placeholders keeps its original shape.
+   * Omitted on the wire when empty, so a request without placeholders keeps
+   * its original shape.
    */
   readonly params?: readonly QueryParam[];
   /**
@@ -178,29 +185,39 @@ export interface BifrostQueryRequest {
  */
 export interface BifrostTableDescription {
   /**
-   * Lower-case 64-character hex of the complete canonical physical fingerprint, present only for a canonical `OTel` signal built-in.
+   * Lower-case 64-character hex of the complete canonical physical
+   * fingerprint, present only for a canonical `OTel` signal built-in.
    *
-   * [`BifrostTableEntry::fingerprint`] keeps its user-schema meaning for every table; this is the separate whole-physical-schema identity, and it is omitted for a dynamically registered table.
+   * [`BifrostTableEntry::fingerprint`] keeps its user-schema meaning for
+   * every table; this is the separate whole-physical-schema identity, and it
+   * is omitted for a dynamically registered table.
    */
   readonly canonical_physical_fingerprint?: string;
   /**
    * The table's explicit Forge compaction file target, in bytes.
    *
-   * Present only when the table stores its own `write.target-file-size-bytes`; omitted means Forge compacts it toward the deployment default.
+   * Present only when the table stores its own
+   * `write.target-file-size-bytes`; omitted means Forge compacts it toward
+   * the deployment default.
    */
   readonly compaction_target_file_size_bytes?: number;
   /**
    * The table's explicit Forge compaction type.
    *
-   * Present only when the table stores its own `wyrd.forge.compaction.type`; omitted means Forge compacts it `small-files`.
+   * Present only when the table stores its own `wyrd.forge.compaction.type`;
+   * omitted means Forge compacts it `small-files`.
    */
   readonly compaction_type?: CompactionTypeWire;
   /**
    * The correlation inputs a writer supplies alongside its user fields.
    *
-   * Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each with the field id its physical column holds.
+   * Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+   * with the field id its physical column holds.
    *
-   * Card correlation is optional, so a writer may omit `card_uid` entirely; the server then stores the row with its authenticated subject/actor pair and a null `card_uid`. A supplied UID is stored only once the server has confirmed the writer may correlate to that Card.
+   * Card correlation is optional, so a writer may omit `card_uid` entirely;
+   * the server then stores the row with its authenticated subject/actor
+   * pair and a null `card_uid`. A supplied UID is stored only once the server has
+   * confirmed the writer may correlate to that Card.
    */
   readonly correlation_fields: readonly FieldSpec2[];
   /**
@@ -214,13 +231,16 @@ export interface BifrostTableDescription {
   /**
    * The table version this schema and layout describe.
    *
-   * A writer sends it with every batch built from this description; a batch naming a version other than the table's current one is refused.
+   * A writer sends it with every batch built from this description; a
+   * batch naming a version other than the table's current one is refused.
    */
   readonly table_version: TableVersion;
   /**
    * The table's own declared columns, in stored order.
    *
-   * Server-owned correlation and managed columns are not here; they are reported separately so a writer can tell what it declares from what the server appends.
+   * Server-owned correlation and managed columns are not here; they are
+   * reported separately so a writer can tell what it declares from what the
+   * server appends.
    */
   readonly user_fields: readonly FieldSpec2[];
 }
@@ -228,7 +248,9 @@ export interface BifrostTableDescription {
 /**
  * Lightweight table listing entry — one row of the list-tables response.
  *
- * Schema-free by design (review M-04): the stored schema is carried only by the per-table describe contract, [`BifrostTableDescription`], so the list stays small.
+ * Schema-free by design (review M-04): the stored schema is carried only by the
+ * per-table describe contract, [`BifrostTableDescription`], so the list stays
+ * small.
  */
 export interface BifrostTableEntry {
   /**
@@ -262,6 +284,19 @@ export interface BifrostTableEntry {
 }
 
 /**
+ * Durable identity of one projected verification binding.
+ *
+ * A binding is an inline `verified_by` entry on a Service, one of its
+ * component occurrences, or a standalone Agent; it is never authored with
+ * its own name or identifier. Registration mints this `UUIDv7` on the
+ * first projection of the binding's natural key — tenant, exact owner
+ * Card UID, subject occurrence, and exact Verifier UID — and every later
+ * projection of that same key keeps it, so status, runs, and results
+ * address the binding stably.
+ */
+export type BindingId = string;
+
+/**
  * Where an image or document block's media comes from.
  */
 export type BlockSource = string | MediaSource;
@@ -269,7 +304,10 @@ export type BlockSource = string | MediaSource;
 /**
  * One server-owned built-in Agent tool.
  *
- * The closed catalog a Verifier step Agent may name in [`AgentSpec::tool_names`] and the exact object a `tool:invoke` permission may be scoped to. Registration and authorization share this one vocabulary, so a name is either a built-in everywhere or nowhere.
+ * The closed catalog a Verifier step Agent may name in
+ * [`AgentSpec::tool_names`] and the exact object a `tool:invoke` permission
+ * may be scoped to. Registration and authorization share this one
+ * vocabulary, so a name is either a built-in everywhere or nowhere.
  */
 export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "code.run";
 
@@ -394,7 +432,11 @@ export type CardLifecycleStatus = "pending" | "active" | "deprecated" | "failed"
 export type CardName = string;
 
 /**
- * Reference to a registered Card by kind, name, version, optional space, and optional UID.
+ * Reference to a registered Card by kind, name, one version, and optional UID.
+ *
+ * Identity is `(kind, name, version)` within the authenticated tenant; the
+ * canonical text form is `Kind/name@version[#uid]`. Unknown fields, such as
+ * the removed `space`, are refused.
  */
 export interface CardRef {
   /**
@@ -406,15 +448,12 @@ export interface CardRef {
    */
   readonly name: CardName;
   /**
-   * Space pinning identity together with `name` and `version`.
-   *
-   * Authors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.
-   */
-  readonly space?: SpaceName | null;
-  /**
    * Optional server-resolved durable UID.
    *
-   * Authors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.
+   * Authors identify a dependency with `(kind, name, version)` and
+   * may omit this field. The server resolves that reference to a [`CardUid`]
+   * before registration; the UID is then used for durable authorization and
+   * lineage without changing the authored reference identity.
    */
   readonly uid?: CardUid | null;
   /**
@@ -461,10 +500,6 @@ export interface CardSummary {
    * Card name.
    */
   readonly name: CardName;
-  /**
-   * Workspace.
-   */
-  readonly space: SpaceName;
   /**
    * BLAKE3-hex spec hash.
    */
@@ -527,7 +562,8 @@ export interface CheckAgent {
 }
 
 /**
- * Typed comparison over one value (`path`) or every wildcard match (`each`); exactly one is set.
+ * Typed comparison over one value (`path`) or every wildcard match
+ * (`each`); exactly one is set.
  */
 export interface CheckAssert {
   /**
@@ -563,6 +599,11 @@ export interface CheckCode {
   readonly inputs?: Readonly<Record<string, Reference>>;
   readonly kind: "code";
   /**
+   * `verdict`, or `{kind: verdict, data: <schema>}` to require custom
+   * data; omitted means the plain Verdict.
+   */
+  readonly response_format?: NamedResponseFormat | null;
+  /**
    * Execution runtime.
    */
   readonly runtime?: CodeRuntime;
@@ -594,7 +635,8 @@ export interface CheckDrift {
    */
   readonly on: Reference;
   /**
-   * Method-specific math configuration. Required for every executable method/signal pair and must match `method`.
+   * Method-specific math configuration. Required for every executable
+   * method/signal pair and must match `method`.
    */
   readonly profile?: DriftProfile | null;
   /**
@@ -695,7 +737,11 @@ export type CommitSha = string;
 /**
  * Physical compaction strategy a table asks Forge to apply.
  *
- * The public wire spelling is hyphenated (`auto`, `full`, `small-files`, `files-with-delete`), matching the table's stored `wyrd.forge.compaction.type` Iceberg property; underscore spellings are rejected. A table that names no type compacts `small-files`, and a copy-on-write table always compacts `full` whatever it names.
+ * The public wire spelling is hyphenated (`auto`, `full`, `small-files`,
+ * `files-with-delete`), matching the table's stored
+ * `wyrd.forge.compaction.type` Iceberg property; underscore spellings are
+ * rejected. A table that names no type compacts `small-files`, and a
+ * copy-on-write table always compacts `full` whatever it names.
  */
 export type CompactionTypeWire = "auto" | "full" | "small-files" | "files-with-delete";
 
@@ -779,7 +825,9 @@ export interface ContentBlockText {
 /**
  * How a Verifier stores each requirement result's captured `actual` value.
  *
- * Verdict correctness is unaffected by this setting; only the stored snapshot of the extracted value changes. Set on the Verifier spec via `context_capture`; absent means `Full`.
+ * Verdict correctness is unaffected by this setting; only the stored
+ * snapshot of the extracted value changes. Set on the Verifier spec via
+ * `context_capture`; absent means `Full`.
  */
 export type ContextCapture = "full" | "hash" | "redact";
 
@@ -803,7 +851,7 @@ export interface CreateOperatorConnectionRequestHttp {
   /**
    * The only origin these credentials may be sent to.
    */
-  readonly origin: string;
+  readonly origin: HttpsOrigin;
   readonly provider: "http";
 }
 
@@ -844,7 +892,8 @@ export interface CreateOperatorConnectionRequestSlack {
 /**
  * Request to create a tenant-scoped machine principal.
  *
- * The principal binds no Card: it is tenant automation — a CI runner, a deployment agent — rather than a deployed workload with an emit scope.
+ * The principal binds no Card: it is tenant automation — a CI runner, a
+ * deployment agent — rather than a deployed workload with an emit scope.
  */
 export interface CreateServicePrincipalRequest {
   /**
@@ -856,7 +905,8 @@ export interface CreateServicePrincipalRequest {
    */
   readonly name: string;
   /**
-   * Roles to grant. Narrower than tenant administration, so automation never needs the tenant administrative credential.
+   * Roles to grant. Narrower than tenant administration, so automation never
+   * needs the tenant administrative credential.
    */
   readonly roles: readonly string[];
 }
@@ -872,7 +922,7 @@ export interface CreateServicePrincipalResponse {
   /**
    * Durable principal id, stable across credential rotation.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
 }
 
 /**
@@ -893,7 +943,9 @@ export interface CredentialListResponse {
 /**
  * Non-secret metadata for one credential.
  *
- * Rotation works by overlap — issue, verify, then revoke — so a listing shows revoked and expired credentials too; an operator mid-rotation needs to see that the superseded one really is gone.
+ * Rotation works by overlap — issue, verify, then revoke — so a listing shows
+ * revoked and expired credentials too; an operator mid-rotation needs to see
+ * that the superseded one really is gone.
  */
 export interface CredentialMetadata {
   /**
@@ -935,6 +987,11 @@ export interface CredentialRef {
    */
   readonly provider: string;
 }
+
+/**
+ * ISO-4217 alphabetic currency code, such as `USD`.
+ */
+export type CurrencyCode = string;
 
 /**
  * Custom Python loader metadata.
@@ -1162,7 +1219,9 @@ export interface DataStats {
 }
 
 /**
- * Arrow-free logical column type. The exhaustive set Bifrost accepts on the register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the server/engine, never in `wyrd-spec`.
+ * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
+ * register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
+ * server/engine, never in `wyrd-spec`.
  */
 export type DataTypeSpec = "Bool" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Utf8" | "LargeUtf8" | "Binary" | "LargeBinary" | DataTypeSpecFixedSizeBinary | "Date32" | "Date64" | DataTypeSpecTimestamp | DataTypeSpecTime32 | DataTypeSpecTime64 | DataTypeSpecDecimal128 | DataTypeSpecList | DataTypeSpecStruct | DataTypeSpecMap | "Variant";
 
@@ -1199,9 +1258,13 @@ export interface DataTypeSpecFixedSizeBinaryFixedSizeBinary {
 }
 
 /**
- * Variable-length list whose boxed element declaration carries the child's name, nullability, metadata, and stable field id.
+ * Variable-length list whose boxed element declaration carries the child's
+ * name, nullability, metadata, and stable field id.
  *
- * The element is a full [`FieldSpec`] rather than a bare type so a nested child keeps the same identity the physical schema stores; a client that rebuilds an Arrow schema from a description reproduces the stored list child exactly instead of inventing a nullable `item`.
+ * The element is a full [`FieldSpec`] rather than a bare type so a nested
+ * child keeps the same identity the physical schema stores; a client that
+ * rebuilds an Arrow schema from a description reproduces the stored list
+ * child exactly instead of inventing a nullable `item`.
  */
 export interface DataTypeSpecList {
   readonly List: FieldSpec2;
@@ -1210,7 +1273,10 @@ export interface DataTypeSpecList {
 /**
  * Unordered key/value entries, the Iceberg `map` type.
  *
- * Key and value are full [`FieldSpec`]s for the same reason as [`Self::List`]'s element: each keeps its name, nullability, metadata, and stable field id. An Iceberg map key is always required, so register stores a key declared nullable as non-nullable.
+ * Key and value are full [`FieldSpec`]s for the same reason as
+ * [`Self::List`]'s element: each keeps its name, nullability, metadata,
+ * and stable field id. An Iceberg map key is always required, so register
+ * stores a key declared nullable as non-nullable.
  */
 export interface DataTypeSpecMap {
   readonly Map: DataTypeSpecMapMap;
@@ -1281,12 +1347,14 @@ export interface DataTypeSpecTimestampTimestamp {
 }
 
 /**
- * How requirement outcomes combine. Not-applicable requirements are excluded; no applicable requirement is inconclusive.
+ * How requirement outcomes combine. Not-applicable requirements are
+ * excluded; no applicable requirement is inconclusive.
  */
 export type Decide = "all" | DecidePassRate;
 
 /**
- * Passed share of applicable requirements, counting inconclusive ones, must reach `threshold` in `(0, 1]`.
+ * Passed share of applicable requirements, counting inconclusive ones,
+ * must reach `threshold` in `(0, 1]`.
  */
 export interface DecidePassRate {
   readonly pass_rate: DecidePassRatePassRate;
@@ -1307,7 +1375,8 @@ export type DeclarationOutcomeKind = "declared" | "idempotent_noop" | "deduplica
 /**
  * Public SDK receipt after the engine completes all required side effects.
  *
- * Upload plans and operation identifiers remain internal to the declaration engine and are intentionally absent from this projection.
+ * Upload plans and operation identifiers remain internal to the declaration
+ * engine and are intentionally absent from this projection.
  */
 export interface DeclarationReceipt {
   /**
@@ -1323,7 +1392,10 @@ export interface DeclarationReceipt {
 /**
  * Who may invoke a deployment beyond its administrators.
  *
- * Neither value permits anonymous inference: every call still needs a `gateway:invoke` grant of its effective subject. `Open` admits the unscoped `all` grant; `Granted` admits only a grant naming the deployment or one of its exact models.
+ * Neither value permits anonymous inference: every call still needs a
+ * `gateway:invoke` grant of its effective subject. `Open` admits the
+ * unscoped `all` grant; `Granted` admits only a grant naming the deployment
+ * or one of its exact models.
  */
 export type DeploymentAccess = "open" | "granted";
 
@@ -1349,21 +1421,26 @@ export interface DimFixed {
 }
 
 /**
- * Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].
+ * Probability-divergence metric used by
+ * [`ComparisonOperator::DivergenceLessThan`].
  */
 export type DivergenceMetric = "kl" | "js" | "wasserstein";
 
 /**
  * Lifecycle of one PSI or SPC Verifier's server-fitted baseline.
  *
- * Registration creates it `pending`; the fitter claims it `building` and settles it `ready` with the persisted fitted profile or `failed` with a structured error. A failed fit is retried through the same record while attempts remain, so `failed` is visible without being necessarily final.
+ * Registration creates it `pending`; the fitter claims it `building` and
+ * settles it `ready` with the persisted fitted profile or `failed` with a
+ * structured error. A failed fit is retried through the same record while
+ * attempts remain, so `failed` is visible without being necessarily final.
  */
 export type DriftBaselineState = "pending" | "building" | "ready" | "failed";
 
 /**
  * Server-derived fitted-baseline status of a PSI or SPC Drift Verifier.
  *
- * Served on `card.status.verification.baseline`; it never mutates the authored spec.
+ * Served on `card.status.verification.baseline`; it never mutates the
+ * authored spec.
  */
 export interface DriftBaselineStatus {
   /**
@@ -1432,12 +1509,14 @@ export interface DriftConditionStatistical {
 /**
  * Drift detection method.
  *
- * `Agent` is intentionally absent in v1. It can return only after the signal vocabulary, profile, and scoring algorithm are locked in `wyrd-design.md`.
+ * `Agent` is intentionally absent in v1. It can return only after the signal
+ * vocabulary, profile, and scoring algorithm are locked in `wyrd-design.md`.
  */
 export type DriftMethod = "Psi" | "Spc" | "Custom";
 
 /**
- * Method-specific math configuration. Config only; fitted state lives in `vala-drift::baseline`, never here.
+ * Method-specific math configuration. Config only; fitted state lives in
+ * `vala-drift::baseline`, never here.
  */
 export type DriftProfile = DriftProfilePsi | DriftProfileSpc | DriftProfileCustom;
 
@@ -1542,7 +1621,8 @@ export interface DriftSignalMetric {
 /**
  * The verdict of one Drift feature or of a whole Drift report.
  *
- * Serialized in the Drift engine's own spelling (`NoDrift`, `Drift`, `Inconclusive`), so a report reads the same wherever it is stored.
+ * Serialized in the Drift engine's own spelling (`NoDrift`, `Drift`,
+ * `Inconclusive`), so a report reads the same wherever it is stored.
  */
 export type DriftVerdict = "NoDrift" | "Drift" | "Inconclusive";
 
@@ -1563,14 +1643,28 @@ export interface DriftWindow {
 }
 
 /**
+ * Server-issued identity of one exact Verifier execution.
+ *
+ * The server mints it for every real-time or queued execution. One
+ * application Run can own many executions; scheduled executions have no
+ * Run. It keys the execution's `wyrd.verifier_executions` row, its
+ * result and input records, and its Operator dispatches. Retries and
+ * lease reclaims keep it.
+ */
+export type ExecutionId = string;
+
+/**
  * Where an Agent's model calls go.
  *
- * Required on every Agent and replaceable whole for one invocation; it is never inferred from the Prompt provider or model.
+ * Required on every Agent and replaceable whole for one invocation; it is
+ * never inferred from the Prompt provider or model.
  */
 export type ExecutionRoute = ExecutionRouteNative | ExecutionRouteWyrdGateway;
 
 /**
- * The executing host's provider configuration named by the Prompt provider; refused in server-controlled execution. An empty struct variant so `deny_unknown_fields` refuses a stray `deployment`.
+ * The executing host's provider configuration named by the Prompt
+ * provider; refused in server-controlled execution. An empty struct
+ * variant so `deny_unknown_fields` refuses a stray `deployment`.
  */
 export interface ExecutionRouteNative {
   readonly kind: "native";
@@ -1586,6 +1680,16 @@ export interface ExecutionRouteWyrdGateway {
   readonly deployment: ProviderDeploymentName;
   readonly kind: "wyrd_gateway";
 }
+
+/**
+ * Vault KV v2 reference of the form `<path>#<key>`.
+ *
+ * `<path>` is one or more `/`-separated segments inside the operator's KV v2
+ * mount; `<key>` names a member of the secret's `data` object. Segments are
+ * non-empty, never `.` or `..`, and contain no `?`, `#`, `%`, or `\`. The
+ * whole reference is at most 1024 bytes without control characters.
+ */
+export type ExternalSecretReference = string;
 
 /**
  * Ordered fallback candidates for one scope.
@@ -1639,7 +1743,8 @@ export interface FallbackScopeOperationOperation {
  */
 export interface FeatureDriftReport {
   /**
-   * The method's evidence behind a scored PSI or SPC feature: frozen bins with baseline and target counts, or chart limits and signals.
+   * The method's evidence behind a scored PSI or SPC feature: frozen bins
+   * with baseline and target counts, or chart limits and signals.
    */
   readonly evidence?: JsonValue;
   /**
@@ -1647,11 +1752,13 @@ export interface FeatureDriftReport {
    */
   readonly feature: FeatureName;
   /**
-   * PSI score, total SPC chart signals, or absolute Custom delta; absent when the feature is inconclusive.
+   * PSI score, total SPC chart signals, or absolute Custom delta; absent
+   * when the feature is inconclusive.
    */
   readonly score: number | null;
   /**
-   * The threshold `score` was compared against; absent when the feature is inconclusive.
+   * The threshold `score` was compared against; absent when the feature is
+   * inconclusive.
    */
   readonly threshold: number | null;
   /**
@@ -1692,7 +1799,8 @@ export interface FieldSpec {
 }
 
 /**
- * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+ * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
+ * but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
  */
 export interface FieldSpec2 {
   /**
@@ -1702,7 +1810,8 @@ export interface FieldSpec2 {
   /**
    * String metadata carried verbatim through every schema conversion.
    *
-   * [`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored stable field id as decimal text.
+   * [`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored
+   * stable field id as decimal text.
    */
   readonly metadata?: Readonly<Record<string, string>>;
   /**
@@ -1718,7 +1827,10 @@ export interface FieldSpec2 {
 /**
  * A frozen reference to one effective Trigger or Operator.
  *
- * A referenced Card is frozen by its exact UID; an inline body, which has no Card, by the canonical digest of its typed spec. Binding projection, runs, and dispatches store this identity so later Card changes never retarget admitted work.
+ * A referenced Card is frozen by its exact UID; an inline body, which has no
+ * Card, by the canonical digest of its typed spec. Binding projection, runs,
+ * and dispatches store this identity so later Card changes never retarget
+ * admitted work.
  */
 export type FrozenTarget = FrozenTargetUid | FrozenTargetDigest;
 
@@ -1743,11 +1855,11 @@ export interface GatewayBudget {
   /**
    * Positive budget amount.
    */
-  readonly amount: string;
+  readonly amount: GatewayDecimal;
   /**
    * Budget currency.
    */
-  readonly currency: string;
+  readonly currency: CurrencyCode;
   /**
    * Accounting period.
    */
@@ -1801,6 +1913,16 @@ export interface GatewayCapturePolicyWrite {
 }
 
 /**
+ * Non-negative decimal amount carried as canonical text.
+ *
+ * V1 performs no arithmetic in the contract layer, so the value stays an
+ * exact decimal string rather than a lossy float. Decoding normalizes
+ * redundant leading integer zeros and trailing fractional zeros, so `01.50`
+ * and `1.5` are the same amount and compare equal.
+ */
+export type GatewayDecimal = string;
+
+/**
  * Tenant fallback policy; at most one rule per scope, rules never merge.
  */
 export interface GatewayFallbackPolicy {
@@ -1813,7 +1935,8 @@ export interface GatewayFallbackPolicy {
 /**
  * The tenant's single gateway governance policy.
  *
- * The default is the empty policy: no limits or budgets, no active pricing, and `unknown_cost: allow_unpriced`.
+ * The default is the empty policy: no limits or budgets, no active pricing,
+ * and `unknown_cost: allow_unpriced`.
  */
 export interface GatewayGovernancePolicy {
   /**
@@ -1876,7 +1999,7 @@ export interface GatewayLimitSubjectPrincipalPrincipal {
   /**
    * Principal identity.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
 }
 
 /**
@@ -1890,7 +2013,7 @@ export interface GatewayModelPricing {
   /**
    * Pricing currency.
    */
-  readonly currency: string;
+  readonly currency: CurrencyCode;
   /**
    * Admission time from which this entry applies.
    */
@@ -1935,7 +2058,7 @@ export interface GatewayPolicySubjectPrincipalPrincipal {
   /**
    * Principal identity.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
 }
 
 /**
@@ -1996,7 +2119,7 @@ export interface GatewayPriceRate {
   /**
    * Non-negative price per unit.
    */
-  readonly price: string;
+  readonly price: GatewayDecimal;
   /**
    * Billing unit, such as `1m_tokens`.
    */
@@ -2011,7 +2134,8 @@ export type GroupId = string;
 /**
  * The source evidence one group execution pinned when it was enqueued.
  *
- * Every retry of the execution judges exactly this snapshot; later source evidence only ever reaches a later group execution.
+ * Every retry of the execution judges exactly this snapshot; later source
+ * evidence only ever reaches a later group execution.
  */
 export interface GroupSnapshot {
   /**
@@ -2025,9 +2149,11 @@ export interface GroupSnapshot {
  */
 export interface GroupSourceSnapshot {
   /**
-   * The source executions the slot's list holds one value for, in list order: the binding's `order_by` input key when declared, then the server-recorded input time, then execution ID.
+   * The source executions the slot's list holds one value for, in list
+   * order: the binding's `order_by` input key when declared, then the
+   * server-recorded input time, then execution ID.
    */
-  readonly execution_ids: readonly string[];
+  readonly execution_ids: readonly ExecutionId[];
   /**
    * The authored source declaration.
    */
@@ -2037,7 +2163,8 @@ export interface GroupSourceSnapshot {
 /**
  * Credential authority of an HTTP action, bound to a tenant `http` connection.
  *
- * The scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.
+ * The scheme and custom header name must equal the named connection's stored
+ * authority at registration and before every attempt.
  */
 export type HttpAuth = HttpAuthBearer | HttpAuthBasic | HttpAuthHeader;
 
@@ -2160,6 +2287,15 @@ export interface HttpConnectionAuthHeader {
 export type HttpMethod = "get" | "post" | "put" | "patch" | "delete";
 
 /**
+ * A normalized HTTPS origin: `https://host[:port]`, default port elided.
+ *
+ * No path, query, fragment, or userinfo. Plain `http` is accepted only for a
+ * loopback host, matching the repository's local-fixture issuer rule; the
+ * SSRF screen still decides reachability per deployment.
+ */
+export type HttpsOrigin = string;
+
+/**
  * Hugging Face task identifier.
  */
 export type HuggingFaceTask = "TextClassification" | "TokenClassification" | "QuestionAnswering" | "Summarization" | "Translation" | "TextGeneration" | "FillMask" | "ZeroShotClassification" | "ImageClassification" | "ObjectDetection" | "ImageSegmentation" | "ImageToText" | "ImageToImage" | "TextToImage" | "DepthEstimation" | "AudioClassification" | "AutomaticSpeechRecognition" | "AudioToAudio" | "TextToSpeech" | "TabularClassification" | "TabularRegression" | "FeatureExtraction" | "SentenceSimilarity" | "Conversational" | "DocumentQuestionAnswering" | "VisualQuestionAnswering" | "TableQuestionAnswering" | "Embedding" | "MultipleChoice" | "Other";
@@ -2243,7 +2379,9 @@ export type Inequality = "Eq" | "Ne" | "Gt" | "Ge" | "Lt" | "Le" | "In";
 /**
  * A reference position that may carry an embedded child spec.
  *
- * Loaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.
+ * Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+ * the server rejects unresolved paths at the wire boundary. `Inline`
+ * bodies are authored, not synthesized by the loader.
  */
 export type InlineableRef_for_AgentSpec = CardRef | InlineableRef_for_AgentSpecSibling | AgentSpec | string;
 
@@ -2260,7 +2398,9 @@ export interface InlineableRef_for_AgentSpecSibling {
 /**
  * A reference position that may carry an embedded child spec.
  *
- * Loaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.
+ * Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+ * the server rejects unresolved paths at the wire boundary. `Inline`
+ * bodies are authored, not synthesized by the loader.
  */
 export type InlineableRef_for_OperatorSpec = CardRef | InlineableRef_for_OperatorSpecSibling | OperatorSpec | string;
 
@@ -2277,7 +2417,9 @@ export interface InlineableRef_for_OperatorSpecSibling {
 /**
  * A reference position that may carry an embedded child spec.
  *
- * Loaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.
+ * Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+ * the server rejects unresolved paths at the wire boundary. `Inline`
+ * bodies are authored, not synthesized by the loader.
  */
 export type InlineableRef_for_Prompt = CardRef | InlineableRef_for_PromptSibling | Prompt | string;
 
@@ -2294,7 +2436,9 @@ export interface InlineableRef_for_PromptSibling {
 /**
  * A reference position that may carry an embedded child spec.
  *
- * Loaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.
+ * Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+ * the server rejects unresolved paths at the wire boundary. `Inline`
+ * bodies are authored, not synthesized by the loader.
  */
 export type InlineableRef_for_TriggerSpec = CardRef | InlineableRef_for_TriggerSpecSibling | TriggerSpec | string;
 
@@ -2309,7 +2453,8 @@ export interface InlineableRef_for_TriggerSpecSibling {
 }
 
 /**
- * What a caller supplies for one input slot. Execution results echo the pinned declarations as the original evidence identities.
+ * What a caller supplies for one input slot. Execution results echo the
+ * pinned declarations as the original evidence identities.
  */
 export type InputDeclaration = InputDeclarationJson | InputDeclarationFile | InputDeclarationArtifact | InputDeclarationTrace;
 
@@ -2383,7 +2528,10 @@ export type InputSlot = TypedInputSlot | SourceText;
  *
  * Fields:
  *
- * - `name` -- instrumentation library name, such as `wyrd-tracing` or `opentelemetry-instrumentation-requests`. - `version` -- optional library version string. - `attributes` -- rare scope-level attributes.
+ * - `name` -- instrumentation library name, such as `wyrd-tracing` or
+ *   `opentelemetry-instrumentation-requests`.
+ * - `version` -- optional library version string.
+ * - `attributes` -- rare scope-level attributes.
  */
 export interface InstrumentationScope {
   /**
@@ -2501,10 +2649,6 @@ export interface ListCardsRequest {
    * Optional name filter.
    */
   readonly name?: CardName | null;
-  /**
-   * Optional workspace filter.
-   */
-  readonly space?: SpaceName | null;
   /**
    * Optional lifecycle filter.
    */
@@ -2641,7 +2785,8 @@ export interface MediaSourceFile {
 }
 
 /**
- * Remote URL reference. Gemini and Vertex require `mime_type` and accept only `gs://` or Gemini file API URIs.
+ * Remote URL reference. Gemini and Vertex require `mime_type` and accept
+ * only `gs://` or Gemini file API URIs.
  */
 export interface MediaSourceUrl {
   /**
@@ -2658,15 +2803,27 @@ export interface MediaSourceUrl {
 /**
  * Card metadata common to every kind.
  *
- * `version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:
+ * `version` and `bump` capture the author's declarative intent on the
+ * register path. The server resolves both to a concrete pin before the
+ * envelope is returned to the caller:
  *
- * - Pre-register: `version` may be `None` (server bumps absolute latest or seeds `0.1.0`), `Some(VersionSpec::Scope("1.0"))` (server bumps within the prefix line), or `Some(VersionSpec::Pin("1.4.2"))` (exact pin). `bump` selects the bump level applied on the auto-bump paths (defaults to `Patch` if unset). - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`; readers may use [`Metadata::resolved_pin`] to extract the [`VersionBlock`].
+ * - Pre-register: `version` may be `None` (server bumps absolute latest or
+ *   seeds `0.1.0`), `Some(VersionSpec::Scope("1.0"))` (server bumps within
+ *   the prefix line), or `Some(VersionSpec::Pin("1.4.2"))` (exact pin).
+ *   `bump` selects the bump level applied on the auto-bump paths (defaults
+ *   to `Patch` if unset).
+ * - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`;
+ *   readers may use [`Metadata::resolved_pin`] to extract the
+ *   [`VersionBlock`].
  */
 export interface Metadata {
   /**
    * Free-form annotations for automation, UI, and integration metadata.
    *
-   * As of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.
+   * As of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for
+   * Wyrd-owned runtime and registry metadata. User and vendor annotations
+   * MUST use another DNS-style prefix, such as `acme.com/cost-center`, to
+   * avoid collisions.
    */
   readonly annotations?: Readonly<Record<string, AnnotationValue>>;
   /**
@@ -2674,7 +2831,9 @@ export interface Metadata {
    */
   readonly artifact_hash?: string | null;
   /**
-   * Bump level applied on the auto-bump paths (`None` or `Scope` `version`). Defaults to `Patch` when unset. Ignored on the exact-pin path.
+   * Bump level applied on the auto-bump paths (`None` or `Scope`
+   * `version`). Defaults to `Patch` when unset. Ignored on the exact-pin
+   * path.
    */
   readonly bump?: VersionBump | null;
   /**
@@ -2686,23 +2845,24 @@ export interface Metadata {
    */
   readonly name: CardName;
   /**
-   * Code-origin provenance: the repository commit this card was declared from. Populated on the register path for cards authored in a repo; `None` for cards with no code origin (e.g. UI-authored).
+   * Code-origin provenance: the repository commit this card was declared
+   * from. Populated on the register path for cards authored in a repo;
+   * `None` for cards with no code origin (e.g. UI-authored).
    */
   readonly origin?: Origin | null;
   /**
-   * Optional space.
-   */
-  readonly space?: SpaceName | null;
-  /**
    * Spec content hash.
    */
-  readonly spec_hash?: string | null;
+  readonly spec_hash?: SpecHash | null;
   /**
    * Optional resolved UID.
    */
   readonly uid?: CardUid | null;
   /**
-   * Authored version: `None` (auto-bump from absolute latest), a bare partial scope (`"1"` / `"1.0"` — bump within the prefix line), or a full triple pin (`"1.4.2"`). Always populated and always a pin post-register.
+   * Authored version: `None` (auto-bump from absolute latest), a bare
+   * partial scope (`"1"` / `"1.0"` — bump within the prefix line), or a
+   * full triple pin (`"1.4.2"`). Always populated and always a pin
+   * post-register.
    */
   readonly version?: VersionSpec | null;
 }
@@ -2792,7 +2952,10 @@ export interface ModelInterfaceXgboost {
 /**
  * One exact model addressed through one named deployment.
  *
- * Typed surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<deployment>/<model>` address, split on the first `/` so a provider-native model identifier may itself contain slashes. The model half is sent upstream unchanged.
+ * Typed surfaces carry the pair; the OpenAI-compatible `model` string is the
+ * canonical `<deployment>/<model>` address, split on the first `/` so a
+ * provider-native model identifier may itself contain slashes. The model
+ * half is sent upstream unchanged.
  */
 export interface ModelRef {
   /**
@@ -2822,7 +2985,9 @@ export interface ModelSignature {
 /**
  * Body of a Model card.
  *
- * This pure contract describes which framework loads the model, which task it performs, which fields it consumes and produces, and which Artifact cards hold model-related bytes.
+ * This pure contract describes which framework loads the model, which task it
+ * performs, which fields it consumes and produces, and which Artifact cards
+ * hold model-related bytes.
  */
 export interface ModelSpec {
   /**
@@ -2845,6 +3010,29 @@ export interface ModelSpec {
    * Closed Wyrd ML task taxonomy.
    */
   readonly task_type: TaskType;
+}
+
+/**
+ * A named response format, such as Wyrd's `verdict`: the name alone, or
+ * `{kind, data}` with a schema for the format's custom data.
+ *
+ * Skald owns no names; the embedding host resolves them through
+ * [`AuthoredPrompt::compile_with`], and an unresolved Prompt cannot render.
+ */
+export type NamedResponseFormat = string | NamedResponseFormatVariant2;
+
+/**
+ * The expanded form, with an optional host-defined `data` schema.
+ */
+export interface NamedResponseFormatVariant2 {
+  /**
+   * Host-defined schema of the format's custom data.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>> | null;
+  /**
+   * The format name.
+   */
+  readonly kind: string;
 }
 
 /**
@@ -2911,7 +3099,8 @@ export interface NotifyChannelPagerDuty {
   readonly dedup_key?: string | null;
   readonly kind: "pager_duty";
   /**
-   * Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.
+   * Route sent as `payload.custom_details.wyrd_route` for PagerDuty
+   * Service Routes.
    */
   readonly route: string;
   /**
@@ -2986,6 +3175,15 @@ export interface OperatorBudget {
 }
 
 /**
+ * Durable identity of one tenant Operator connection.
+ *
+ * The server mints it on create; secret rotation, metadata updates,
+ * disable, and re-enable keep it, so Cards name the connection by its
+ * immutable name while management surfaces address it by this ID.
+ */
+export type OperatorConnectionId = string;
+
+/**
  * Whether a connection may be used by Operators.
  */
 export type OperatorConnectionStatus = "active" | "disabled";
@@ -3006,7 +3204,7 @@ export interface OperatorConnectionViewHttp {
   /**
    * Connection identity.
    */
-  readonly connection_id: string;
+  readonly connection_id: OperatorConnectionId;
   /**
    * Creation time.
    */
@@ -3018,7 +3216,7 @@ export interface OperatorConnectionViewHttp {
   /**
    * The only origin the credential may be sent to.
    */
-  readonly origin: string;
+  readonly origin: HttpsOrigin;
   readonly provider: "http";
   /**
    * Whether Operators may use it.
@@ -3037,7 +3235,7 @@ export interface OperatorConnectionViewPagerDuty {
   /**
    * Connection identity.
    */
-  readonly connection_id: string;
+  readonly connection_id: OperatorConnectionId;
   /**
    * Creation time.
    */
@@ -3064,7 +3262,7 @@ export interface OperatorConnectionViewSlack {
   /**
    * Connection identity.
    */
-  readonly connection_id: string;
+  readonly connection_id: OperatorConnectionId;
   /**
    * Creation time.
    */
@@ -3089,13 +3287,22 @@ export interface OperatorConnectionViewSlack {
 }
 
 /**
+ * Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
+ *
+ * Settlement of a failed binding-created run mints one per distinct
+ * configured Operator. Every delivery retry keeps it, so it is also the
+ * idempotency key an external destination may honor.
+ */
+export type OperatorDispatchId = string;
+
+/**
  * Current state of one Operator dispatch in an execution status response.
  */
 export interface OperatorDispatchState {
   /**
    * The dispatch.
    */
-  readonly dispatch_id: string;
+  readonly dispatch_id: OperatorDispatchId;
   /**
    * Last delivery error, when one occurred.
    */
@@ -3158,7 +3365,10 @@ export interface OperatorSpecHttp {
    */
   readonly timeout_seconds?: number | null;
   /**
-   * URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.
+   * URL template; its origin is literal and `{{field}}` placeholders may
+   * appear only in the path and query. A template beginning with `/` is
+   * path-only and is sent to the origin stored on the `auth`
+   * connection, read at each attempt; it requires `auth`.
    */
   readonly url: string;
 }
@@ -3188,11 +3398,13 @@ export interface OperatorSpecNotify {
 export type OrderBy = string;
 
 /**
- * Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.
+ * Code-origin provenance for a card: the repository commit it was declared
+ * from, plus the in-repo path for monorepo disambiguation.
  */
 export interface Origin {
   /**
-   * Commit the card was declared from. When `dirty`, this is the base commit of the uncommitted working tree.
+   * Commit the card was declared from. When `dirty`, this is the base commit
+   * of the uncommitted working tree.
    */
   readonly commit: CommitSha;
   /**
@@ -3347,7 +3559,9 @@ export interface ParquetMeta {
 /**
  * One declared partition field.
  *
- * `buckets` is required for and only accepted on a `bucket` transform (2 through 1024); `width` is required for and only accepted on a `truncate` transform (a positive integer counting Unicode code points for strings).
+ * `buckets` is required for and only accepted on a `bucket` transform (2
+ * through 1024); `width` is required for and only accepted on a `truncate`
+ * transform (a positive integer counting Unicode code points for strings).
  */
 export interface PartitionFieldWire {
   /**
@@ -3371,18 +3585,32 @@ export interface PartitionFieldWire {
 /**
  * Transform one declared partition field applies to its source column.
  *
- * `hour` and `day` partition the table's required UTC time column; the `identity`, `bucket`, and `truncate` transforms form at most two additional dimensions over `Utf8`, `Int32`, or `Int64` columns. Each follows Iceberg's transform semantics, including null preservation.
+ * `hour` and `day` partition the table's required UTC time column; the
+ * `identity`, `bucket`, and `truncate` transforms form at most two additional
+ * dimensions over `Utf8`, `Int32`, or `Int64` columns. Each follows Iceberg's
+ * transform semantics, including null preservation.
  */
 export type PartitionTransformWire = "hour" | "day" | "identity" | "bucket" | "truncate";
 
 /**
  * The authoritative physical layout of one Bifrost table.
  *
- * The same shape is used three ways: as the optional declaration on [`RegisterTableRequest`], as the canonical server-resolved layout returned by [`BifrostTableDescription`], and as the exact JSON persisted in the control row. In the latter two it is always fully populated: `time_column` and `partition_by` are named, the sort order carries at least one key, and the Bloom list is the complete resolved set, which may be empty.
+ * The same shape is used three ways: as the optional declaration on
+ * [`RegisterTableRequest`], as the canonical server-resolved layout returned by
+ * [`BifrostTableDescription`], and as the exact JSON persisted in the control
+ * row. In the latter two it is always fully populated: `time_column` and
+ * `partition_by` are named, the sort order carries at least one key, and the
+ * Bloom list is the complete resolved set, which may be empty.
  *
- * `partition_by` holds at most three fields: exactly one `hour` or `day` transform of `time_column`, a required UTC microsecond or nanosecond timestamp, plus at most two `identity`, `bucket`, or `truncate` dimensions. An omitted or empty list resolves to `hour(time_column)`, and an omitted `time_column` to `wyrd_ingested_at`.
+ * `partition_by` holds at most three fields: exactly one `hour` or `day`
+ * transform of `time_column`, a required UTC microsecond or nanosecond
+ * timestamp, plus at most two `identity`, `bucket`, or `truncate` dimensions.
+ * An omitted or empty list resolves to `hour(time_column)`, and an omitted
+ * `time_column` to `wyrd_ingested_at`.
  *
- * On the request path an omitted `sort_keys` and an explicit empty `sort_keys` resolve identically, because the server injects nothing ahead of a declared key and defaults an empty order to the time column descending.
+ * On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
+ * resolve identically, because the server injects nothing ahead of a declared
+ * key and defaults an empty order to the time column descending.
  */
 export interface PhysicalLayoutWire {
   /**
@@ -3398,9 +3626,11 @@ export interface PhysicalLayoutWire {
    */
   readonly sort_keys: readonly SortKeyWire[];
   /**
-   * The table's time column: a required `TIMESTAMP_LTZ` column at microsecond or nanosecond precision.
+   * The table's time column: a required `TIMESTAMP_LTZ` column at
+   * microsecond or nanosecond precision.
    *
-   * Omitted on a request, the time column is `wyrd_ingested_at`. The canonical form in a description and the control row always names it.
+   * Omitted on a request, the time column is `wyrd_ingested_at`. The
+   * canonical form in a description and the control row always names it.
    */
   readonly time_column?: string;
 }
@@ -3464,7 +3694,8 @@ export interface PortableSettings {
   /**
    * Reasoning effort for reasoning models; Chat Completions only.
    *
-   * `none` also lets a model that refuses function tools while reasoning accept them.
+   * `none` also lets a model that refuses function tools while reasoning
+   * accept them.
    */
   readonly reasoning_effort?: ReasoningEffort | null;
   /**
@@ -3490,9 +3721,17 @@ export interface PortableSettings {
 }
 
 /**
+ * Stable principal id on auth wire contracts.
+ */
+export type PrincipalId = string;
+
+/**
  * Principal-kind discriminator without a bound card.
  *
- * Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`, `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire contract for the revoke request body, token claims, and the durable `principal_kind` columns.
+ * Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
+ * `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire
+ * contract for the revoke request body, token claims, and the durable
+ * `principal_kind` columns.
  */
 export type PrincipalKindTag = "global_admin" | "tenant_admin" | "user" | "service" | "agent" | "system";
 
@@ -3503,7 +3742,7 @@ export interface PrincipalPage {
   /**
    * Cursor for the next page, present only when one may exist.
    */
-  readonly next: string | null;
+  readonly next: PrincipalId | null;
   /**
    * Principals ordered by id, which is UUIDv7 and therefore creation order.
    */
@@ -3517,7 +3756,7 @@ export interface PrincipalQuery {
   /**
    * Last `principal_id` of the previous page.
    */
-  readonly after?: string | null;
+  readonly after?: PrincipalId | null;
   /**
    * Exact email; matches users only.
    */
@@ -3543,13 +3782,14 @@ export interface PrincipalQuery {
  */
 export interface PrincipalRoles {
   /**
-   * Principal kind the server resolved from the id: `user`, `service`, or `agent`.
+   * Principal kind the server resolved from the id: `user`, `service`, or
+   * `agent`.
    */
   readonly kind: PrincipalKindTag;
   /**
    * Principal the assignments belong to.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
   /**
    * Assignments ordered by Role name, then source.
    */
@@ -3557,7 +3797,8 @@ export interface PrincipalRoles {
 }
 
 /**
- * Lifecycle status of an assignable principal. Deleted principals are never listed.
+ * Lifecycle status of an assignable principal. Deleted principals are never
+ * listed.
  */
 export type PrincipalStatus = "active" | "suspended";
 
@@ -3584,7 +3825,7 @@ export interface PrincipalSummary {
   /**
    * Durable principal id.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
   /**
    * Lifecycle status.
    */
@@ -3592,9 +3833,12 @@ export interface PrincipalSummary {
 }
 
 /**
- * The authored Prompt: provider and model once, plus portable content or one native protocol body.
+ * The authored Prompt: provider and model once, plus portable content or
+ * one native protocol body.
  *
- * Decoding refuses unknown fields; [`AuthoredPrompt::compile`] refuses a mixed form, an invalid provider/format pair, and invalid settings, media, or schemas. Neither performs IO.
+ * Decoding refuses unknown fields; [`AuthoredPrompt::compile`] refuses a
+ * mixed form, an invalid provider/format pair, and invalid settings, media,
+ * or schemas. Neither performs IO.
  */
 export interface Prompt {
   /**
@@ -3618,9 +3862,10 @@ export interface Prompt {
    */
   readonly provider: ProviderName;
   /**
-   * Portable structured output: one JSON Schema object.
+   * Structured output: one portable JSON Schema object, or a format its
+   * host names, which may also accompany a native `body`.
    */
-  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
+  readonly response_format?: ResponseFormat | null;
   /**
    * Portable generation settings.
    */
@@ -3639,7 +3884,9 @@ export type PromptFormat = "chat_completion" | "responses" | "messages" | "gener
 /**
  * PromptCard spec body: the authored Prompt, portable or native.
  *
- * The wire form is [`skald_spec::AuthoredPrompt`] directly in the spec body; decoding compiles it into the runtime Prompt, and serializing writes the authored form back unchanged.
+ * The wire form is [`skald_spec::AuthoredPrompt`] directly in the spec body;
+ * decoding compiles it into the runtime Prompt, and serializing writes the
+ * authored form back unchanged.
  */
 export interface PromptSpec {
   /**
@@ -3663,9 +3910,10 @@ export interface PromptSpec {
    */
   readonly provider: ProviderName;
   /**
-   * Portable structured output: one JSON Schema object.
+   * Structured output: one portable JSON Schema object, or a format its
+   * host names, which may also accompany a native `body`.
    */
-  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
+  readonly response_format?: ResponseFormat | null;
   /**
    * Portable generation settings.
    */
@@ -3679,7 +3927,10 @@ export interface PromptSpec {
 /**
  * Upstream protocol family a deployment speaks.
  *
- * The built-in variants use Skald's typed provider protocols and authenticate with a credential of their reserved provider identity. `OpenAiCompatible` uses the standard OpenAI routes under `base_url` with a credential of any non-reserved provider identity.
+ * The built-in variants use Skald's typed provider protocols and authenticate
+ * with a credential of their reserved provider identity. `OpenAiCompatible`
+ * uses the standard OpenAI routes under `base_url` with a credential of any
+ * non-reserved provider identity.
  */
 export type ProviderAdapter = "openai" | "anthropic" | "gemini" | ProviderAdapterVertex | "jev" | ProviderAdapterOpenaiCompatible;
 
@@ -3708,17 +3959,18 @@ export interface ProviderAdapterVertexVertex {
   /**
    * Google Cloud location, such as `us-central1`.
    */
-  readonly location: string;
+  readonly location: VertexLocation;
   /**
    * Google Cloud project identifier.
    */
-  readonly project: string;
+  readonly project: VertexLocation;
 }
 
 /**
  * Authentication the gateway presents to an upstream provider.
  *
- * Unrelated to the caller's Wyrd access token, which is never forwarded. The header value is built from the referenced tenant credential at call time.
+ * Unrelated to the caller's Wyrd access token, which is never forwarded. The
+ * header value is built from the referenced tenant credential at call time.
  */
 export type ProviderAuth = "none" | ProviderAuthBearer | ProviderAuthApiKeyHeader;
 
@@ -3737,7 +3989,7 @@ export interface ProviderAuthApiKeyHeaderApiKeyHeader {
   /**
    * Validated non-reserved HTTP field name.
    */
-  readonly header: string;
+  readonly header: ProviderAuthHeader;
 }
 
 /**
@@ -3753,6 +4005,15 @@ export interface ProviderAuthBearerBearer {
    */
   readonly credential: ProviderCredentialName;
 }
+
+/**
+ * HTTP field name for an upstream API-key header.
+ *
+ * Stored lowercase. Authorization, proxy, host, forwarding, connection,
+ * framing, cookie, and Wyrd-owned headers are rejected so a tenant cannot
+ * forward or forge security-sensitive upstream headers.
+ */
+export type ProviderAuthHeader = string;
 
 /**
  * Tenant-unique gateway provider credential name.
@@ -3795,7 +4056,7 @@ export interface ProviderCredentialSourceViewExternalSecretExternalSecret {
   /**
    * Opaque backend reference.
    */
-  readonly reference: string;
+  readonly reference: ExternalSecretReference;
 }
 
 /**
@@ -3844,7 +4105,9 @@ export interface ProviderCredentialView {
 /**
  * One named tenant inference target.
  *
- * Callers address it as `<name>/<model>`; the name selects exactly this adapter and credential binding. The same shape is the `PUT` body and the redacted read view because it carries no secret material.
+ * Callers address it as `<name>/<model>`; the name selects exactly this
+ * adapter and credential binding. The same shape is the `PUT` body and the
+ * redacted read view because it carries no secret material.
  */
 export interface ProviderDeployment {
   /**
@@ -3860,11 +4123,13 @@ export interface ProviderDeployment {
    */
   readonly auth: ProviderAuth;
   /**
-   * Operations narrowing what the adapter serves; absent permits every adapter-supported operation. Never inferred by probing.
+   * Operations narrowing what the adapter serves; absent permits every
+   * adapter-supported operation. Never inferred by probing.
    */
   readonly capabilities?: readonly GatewayOperation[] | null;
   /**
-   * Models callers may address; absent applies no Wyrd allowlist, which promises neither upstream entitlement nor model existence.
+   * Models callers may address; absent applies no Wyrd allowlist, which
+   * promises neither upstream entitlement nor model existence.
    */
   readonly models?: readonly ModelId[] | null;
   /**
@@ -3953,7 +4218,10 @@ export interface PsiThresholdNormal {
 /**
  * Server-derived class of one query: how Oracle admits and executes it.
  *
- * Never a request field. Oracle reads it from the one physical root it built: a distributed root is Analytical, anything else Interactive. The class selects the admission rules and the execution path together, so the terminal's class is also the path that ran.
+ * Never a request field. Oracle reads it from the one physical root it built:
+ * a distributed root is Analytical, anything else Interactive. The class
+ * selects the admission rules and the execution path together, so the
+ * terminal's class is also the path that ran.
  */
 export type QueryClass = "interactive" | "analytical";
 
@@ -3965,7 +4233,12 @@ export type QueryName = string;
 /**
  * One typed scalar bind value for a positional SQL placeholder.
  *
- * `params[i]` binds placeholder `$(i + 1)` in [`BifrostQueryRequest::sql`]. Values travel as data next to the SQL text and are never spliced into it, so a string containing SQL stays a string. On the JSON wire each value is the bare JSON scalar (`null`, `true`, `42`, `1.5`, `"text"`); an integral JSON number is an [`QueryParam::Int`] and any other number a [`QueryParam::Float`].
+ * `params[i]` binds placeholder `$(i + 1)` in [`BifrostQueryRequest::sql`].
+ * Values travel as data next to the SQL text and are never spliced into it,
+ * so a string containing SQL stays a string. On the JSON wire each value is
+ * the bare JSON scalar (`null`, `true`, `42`, `1.5`, `"text"`); an integral
+ * JSON number is an [`QueryParam::Int`] and any other number a
+ * [`QueryParam::Float`].
  */
 export type QueryParam = null | boolean | number | string;
 
@@ -3981,13 +4254,26 @@ export interface QueryTerminalFrame {
   /**
    * Arrow IPC end-of-stream delta closing the query's single IPC stream.
    *
-   * The public query stream is one Arrow IPC stream split across Wyrd frames: the schema frame carries the stream prefix through exactly one schema message, each batch frame carries that write's exact delta, and this field carries the writer's `finish` delta. It is required for [`QueryTerminalOutcome::Success`] and [`QueryTerminalOutcome::Degraded`] and must be empty for [`QueryTerminalOutcome::Failed`], because a failed or cancelled stream never calls `finish` and therefore has no valid EOS to report. Arrow's own `StreamDecoder::finish` cannot prove an explicit EOS was received, so carrying the delta here is what makes an empty successful result (`Schema` then `Terminal`) unambiguous on the wire.
+   * The public query stream is one Arrow IPC stream split across Wyrd
+   * frames: the schema frame carries the stream prefix through exactly one
+   * schema message, each batch frame carries that write's exact delta, and
+   * this field carries the writer's `finish` delta. It is required for
+   * [`QueryTerminalOutcome::Success`] and [`QueryTerminalOutcome::Degraded`]
+   * and must be empty for [`QueryTerminalOutcome::Failed`], because a failed
+   * or cancelled stream never calls `finish` and therefore has no valid EOS
+   * to report. Arrow's own `StreamDecoder::finish` cannot prove an explicit
+   * EOS was received, so carrying the delta here is what makes an empty
+   * successful result (`Schema` then `Terminal`) unambiguous on the wire.
    */
   readonly arrow_ipc_eos: readonly number[];
   /**
    * Catalog error that failed the query, as its RFC 9457 problem.
    *
-   * Required for [`QueryTerminalOutcome::Failed`] and absent otherwise. It is the same problem, code and details included, the query would have returned had it failed before the first frame, so a caller reads one error whatever the row on which the failure happened. A failure with no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+   * Required for [`QueryTerminalOutcome::Failed`] and absent otherwise. It
+   * is the same problem, code and details included, the query would have
+   * returned had it failed before the first frame, so a caller reads one
+   * error whatever the row on which the failure happened. A failure with
+   * no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
    */
   readonly error: WyrdProblem | null;
   /**
@@ -3997,7 +4283,10 @@ export interface QueryTerminalFrame {
   /**
    * Class Oracle derived for this query, which is also the path that ran.
    *
-   * Present on every terminal, successful or failed, so a caller always learns which path ran. A failed terminal on [`QueryClass::Analytical`] is the proof that selection was irreversible: REQ-002 forbids rerunning that query through Interactive.
+   * Present on every terminal, successful or failed, so a caller always
+   * learns which path ran. A failed terminal on [`QueryClass::Analytical`]
+   * is the proof that selection was irreversible: REQ-002 forbids rerunning
+   * that query through Interactive.
    */
   readonly query_class: QueryClass;
   /**
@@ -4027,14 +4316,17 @@ export type QueryWarning = "live_tail_unavailable" | "stale_cut_replanned";
 /**
  * How much a reasoning model reasons before it answers.
  *
- * The levels are the Chat Completions `reasoning_effort` values; a destination without an effort control refuses the setting.
+ * The levels are the Chat Completions `reasoning_effort` values; a
+ * destination without an effort control refuses the setting.
  */
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 /**
  * A reference position that requires durable identity.
  *
- * Loaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card.
+ * Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+ * the server rejects unresolved paths at the wire boundary. Authored `Ref`
+ * values remain external references even when they identify a submitted card.
  */
 export type Ref = CardRef | RefSibling | string;
 
@@ -4541,7 +4833,8 @@ export interface RequirementDetailDrift {
 }
 
 /**
- * One requirement's outcome. Only `not_applicable` leaves the `decide` denominator.
+ * One requirement's outcome. Only `not_applicable` leaves the `decide`
+ * denominator.
  */
 export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
 
@@ -4561,6 +4854,12 @@ export interface RequirementResult {
    * Validated original-evidence citations.
    */
   readonly citations?: readonly Citation[];
+  /**
+   * Custom data an Agent or code check returned under its declared
+   * `verdict` format; absent when none was declared or the output was
+   * rejected.
+   */
+  readonly data?: Readonly<Record<string, JsonValue>>;
   /**
    * Check-specific detail.
    */
@@ -4596,11 +4895,20 @@ export interface RequirementResult {
  *
  * Fields:
  *
- * - `service_name` -- required OTel `service.name` semantic-convention attribute. Empty values are rejected; non-empty values are capped at 256 characters. - `service_namespace` -- optional OTel `service.namespace`. - `service_version` -- optional OTel `service.version`. - `service_instance_id` -- optional OTel `service.instance.id`. - `attributes` -- every other OTel resource attribute the producer emitted, such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or `process.pid`.
+ * - `service_name` -- required OTel `service.name` semantic-convention
+ *   attribute. Empty values are rejected; non-empty values are capped at 256
+ *   characters.
+ * - `service_namespace` -- optional OTel `service.namespace`.
+ * - `service_version` -- optional OTel `service.version`.
+ * - `service_instance_id` -- optional OTel `service.instance.id`.
+ * - `attributes` -- every other OTel resource attribute the producer emitted,
+ *   such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or
+ *   `process.pid`.
  */
 export interface Resource {
   /**
-   * Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and `cloud.*`.
+   * Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and
+   * `cloud.*`.
    */
   readonly attributes: Readonly<Record<string, JsonValue>>;
   /**
@@ -4620,6 +4928,14 @@ export interface Resource {
    */
   readonly service_version?: string | null;
 }
+
+/**
+ * An authored `response_format`.
+ *
+ * A string or an object with `kind` is a [`NamedResponseFormat`]; any other
+ * object is a JSON Schema. Both serialize exactly as authored.
+ */
+export type ResponseFormat = NamedResponseFormat | Readonly<Record<string, JsonValue>>;
 
 /**
  * `POST /v1/principals/{id}/revoke` body.
@@ -4652,11 +4968,13 @@ export interface RoleAssignment {
 /**
  * Response of `PUT` and `DELETE /v1/principals/{principal_id}/roles/{role}`.
  *
- * Both writes are idempotent. A change takes effect at the principal's next token; tokens already issued keep their bounded lifetime.
+ * Both writes are idempotent. A change takes effect at the principal's next
+ * token; tokens already issued keep their bounded lifetime.
  */
 export interface RoleAssignmentChange {
   /**
-   * `true` when this call added or removed the direct assignment, `false` when it already held the requested state.
+   * `true` when this call added or removed the direct assignment, `false`
+   * when it already held the requested state.
    */
   readonly changed: boolean;
   /**
@@ -4666,7 +4984,7 @@ export interface RoleAssignmentChange {
   /**
    * Principal the assignment belongs to.
    */
-  readonly principal_id: string;
+  readonly principal_id: PrincipalId;
   /**
    * Role the call granted or revoked.
    */
@@ -4685,14 +5003,26 @@ export type RoleName = string;
 /**
  * Where one of a principal's Role assignments came from.
  *
- * A user's assignments are owned per source: federated login replaces only `idp` rows on every sign-in, and a tenant administrator grants and revokes only `direct` rows. Service and Agent assignments are always `direct`.
+ * A user's assignments are owned per source: federated login replaces only
+ * `idp` rows on every sign-in, and a tenant administrator grants and revokes
+ * only `direct` rows. Service and Agent assignments are always `direct`.
  */
 export type RoleSource = "idp" | "direct";
 
 /**
+ * Run identifier carried by every observation from one agent invocation.
+ *
+ * UUIDv7 string at the wire boundary. Client-generated so retries converge on
+ * the same id, and so observability surfaces can correlate records emitted
+ * before the server first sees the run.
+ */
+export type RunId = string;
+
+/**
  * The current non-terminal lifecycle state of an admitted Oracle query.
  *
- * The state is projected by live controls only; completed queries are removed from the in-memory registry and are not durable query jobs.
+ * The state is projected by live controls only; completed queries are removed
+ * from the in-memory registry and are not durable query jobs.
  */
 export type RunningQueryLifecycleState = "admitted" | "running" | "cancelling";
 
@@ -4713,7 +5043,8 @@ export interface RunningQueryProgress {
 /**
  * Public summary for one active Oracle query.
  *
- * This contract deliberately excludes SQL text, parameters, Arrow batches, and result rows. A summary is tenant-scoped by the serving boundary.
+ * This contract deliberately excludes SQL text, parameters, Arrow batches,
+ * and result rows. A summary is tenant-scoped by the serving boundary.
  */
 export interface RunningQuerySummary {
   /**
@@ -4780,11 +5111,13 @@ export interface ServiceComponent {
    */
   readonly alias: string;
   /**
-   * Component config. TODO: does this earn its place?
+   * Component config.
+   * TODO: does this earn its place?
    */
   readonly config?: Readonly<Record<string, NonSecretValue>>;
   /**
-   * Component credential references. TODO: does this earn its place?
+   * Component credential references.
+   * TODO: does this earn its place?
    */
   readonly credential_refs?: readonly CredentialRef[];
   /**
@@ -4802,7 +5135,7 @@ export interface ServiceComponent {
 }
 
 /**
- * Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.
+ * Server-side runtime declaration; tenancy is the registering tenant.
  */
 export interface ServiceRuntime {
   /**
@@ -4902,7 +5235,8 @@ export interface ServiceSpec {
   /**
    * Bifrost dataset tables this Service writes.
    *
-   * Registration validates and ensures each one in `vala.datasets` before the Service becomes active; removing the Service never drops them.
+   * Registration validates and ensures each one in `vala.datasets` before
+   * the Service becomes active; removing the Service never drops them.
    */
   readonly tables?: readonly ServiceTable[];
   /**
@@ -4914,7 +5248,9 @@ export interface ServiceSpec {
 /**
  * One Bifrost dataset table a Service declares.
  *
- * `schema` is a JSON Schema object in the subset Bifrost table registration accepts (a Pydantic `model_json_schema()` shape); an existing table of the same name must carry the same fields.
+ * `schema` is a JSON Schema object in the subset Bifrost table registration
+ * accepts (a Pydantic `model_json_schema()` shape); an existing table of the
+ * same name must carry the same fields.
  */
 export interface ServiceTable {
   /**
@@ -4922,7 +5258,8 @@ export interface ServiceTable {
    */
   readonly name: string;
   /**
-   * JSON Schema object describing the table's user fields, whose `properties` order is the table's column order.
+   * JSON Schema object describing the table's user fields, whose
+   * `properties` order is the table's column order.
    */
   readonly schema: JsonValue;
 }
@@ -4999,16 +5336,22 @@ export type SourceCompletionOutcome = "complete" | "unavailable";
 export type SourceText = string;
 
 /**
- * Human-visible namespace for Cards and Runs.
- */
-export type SpaceName = string;
-
-/**
  * OTel-canonical span event.
  *
  * Fields:
  *
- * - `timestamp` — wall-clock time the event occurred. Must lie within the span's `[start_time, end_time]` window; that check is enforced by [`crate::vala::trace::SpanRecord::validate`], not here, because the event itself has no knowledge of its parent span. - `name` — event name. Free-form but non-empty; OTel conventions suggest namespaced names (`exception`, `log`, `gen_ai.evaluation.result`). - `attributes` — typed key/value bag stored as flat JSON. Use the constants in [`crate::vala::trace::attributes`] for known keys. - `dropped_attributes_count` — count of attributes the SDK dropped before sending (OTel default 0 means "none dropped"). Carried for parity with the OTLP proto.
+ * - `timestamp` — wall-clock time the event occurred. Must lie within
+ *   the span's `[start_time, end_time]` window; that check is enforced
+ *   by [`crate::vala::trace::SpanRecord::validate`], not here, because
+ *   the event itself has no knowledge of its parent span.
+ * - `name` — event name. Free-form but non-empty; OTel conventions
+ *   suggest namespaced names (`exception`, `log`,
+ *   `gen_ai.evaluation.result`).
+ * - `attributes` — typed key/value bag stored as flat JSON. Use the
+ *   constants in [`crate::vala::trace::attributes`] for known keys.
+ * - `dropped_attributes_count` — count of attributes the SDK dropped
+ *   before sending (OTel default 0 means "none dropped"). Carried for
+ *   parity with the OTLP proto.
  */
 export interface SpanEvent {
   /**
@@ -5041,7 +5384,18 @@ export type SpanKind = "internal" | "server" | "client" | "producer" | "consumer
  *
  * Fields:
  *
- * - `trace_id` / `span_id` — linked span identity. Both are typed (commit 02); the wire shape is hex strings. - `trace_state` — W3C TraceContext `tracestate` of the linked span (vendor list, comma-separated). Defaults to empty. - `flags` — full OTel proto `Link.flags` fixed32 bitfield. The low byte carries W3C trace flags (bit 0 = `sampled`); the upper bits are reserved by the OTel spec for SDK-internal signaling. Stored as `u32` so we don't truncate non-W3C bits at the contract layer. - `attributes` — typed key/value bag, same shape as [`super::SpanEvent::attributes`]. - `dropped_attributes_count` — count of attributes the SDK dropped before sending.
+ * - `trace_id` / `span_id` — linked span identity. Both are typed
+ *   (commit 02); the wire shape is hex strings.
+ * - `trace_state` — W3C TraceContext `tracestate` of the linked span
+ *   (vendor list, comma-separated). Defaults to empty.
+ * - `flags` — full OTel proto `Link.flags` fixed32 bitfield. The low
+ *   byte carries W3C trace flags (bit 0 = `sampled`); the upper bits
+ *   are reserved by the OTel spec for SDK-internal signaling. Stored
+ *   as `u32` so we don't truncate non-W3C bits at the contract layer.
+ * - `attributes` — typed key/value bag, same shape as
+ *   [`super::SpanEvent::attributes`].
+ * - `dropped_attributes_count` — count of attributes the SDK dropped
+ *   before sending.
  */
 export interface SpanLink {
   /**
@@ -5053,7 +5407,8 @@ export interface SpanLink {
    */
   readonly dropped_attributes_count: number;
   /**
-   * OTel proto `Link.flags` fixed32 bitfield. Bit 0 = `sampled`; upper bits reserved.
+   * OTel proto `Link.flags` fixed32 bitfield. Bit 0 = `sampled`;
+   * upper bits reserved.
    */
   readonly flags: number;
   /**
@@ -5091,7 +5446,8 @@ export interface SpanRecord {
    */
   readonly dropped_links_count: number;
   /**
-   * Query convenience field equal to `(end_time - start_time)` in milliseconds.
+   * Query convenience field equal to `(end_time - start_time)` in
+   * milliseconds.
    */
   readonly duration_ms: number;
   /**
@@ -5181,6 +5537,18 @@ export interface SpanStatusOk {
 export interface SpanStatusUnset {
   readonly code: "unset";
 }
+
+/**
+ * Canonical hash of a [`Spec`] over its RFC 8785 (JCS) canonicalized JSON.
+ *
+ * Two specs that differ only in field ordering, whitespace, or unicode escape
+ * representation produce the same hash. Field deletion, addition, or value
+ * change produces a different hash. This is the registry's drift-detection
+ * primitive.
+ *
+ * Wire form: 64 lowercase hex characters (BLAKE3-256 digest).
+ */
+export type SpecHash = string;
 
 /**
  * DataCard split label.
@@ -5297,7 +5665,8 @@ export interface Status {
   /**
    * Server-derived verification state, absent when the Card has none.
    *
-   * Read-side projection only: it never changes the authored `spec`, and a registration request's own `status` is ignored.
+   * Read-side projection only: it never changes the authored `spec`, and
+   * a registration request's own `status` is ignored.
    */
   readonly verification?: VerificationStatus | null;
 }
@@ -5331,7 +5700,8 @@ export interface Step {
    */
   readonly timeout_seconds?: number | null;
   /**
-   * Gate: the step runs only when the condition holds; otherwise its requirements are not applicable.
+   * Gate: the step runs only when the condition holds; otherwise its
+   * requirements are not applicable.
    */
   readonly when?: Condition | null;
 }
@@ -5438,14 +5808,19 @@ export type TimeUnit = "Second" | "Millisecond" | "Microsecond" | "Nanosecond";
 /**
  * Audience (`aud`) of a Wyrd tenant access token.
  *
- * Every directly issued token is [`Self::Wyrd`] and is accepted on every tenant surface. A [`Self::Bifrost`] token is accepted only on the Bifrost surfaces, so a token delegated for Bifrost cannot be replayed elsewhere.
+ * Every directly issued token is [`Self::Wyrd`] and is accepted on every
+ * tenant surface. A [`Self::Bifrost`] token is accepted only on the Bifrost
+ * surfaces, so a token delegated for Bifrost cannot be replayed elsewhere.
  */
 export type TokenAudience = "wyrd" | "bifrost";
 
 /**
  * One tool call an Agent action made.
  *
- * Records what the model received, never the raw tool output: the digest and size describe the bounded output actually returned. A call that returned no output, such as one that failed, has no digest and zero returned bytes rather than a digest of nothing.
+ * Records what the model received, never the raw tool output: the digest
+ * and size describe the bounded output actually returned. A call that
+ * returned no output, such as one that failed, has no digest and zero
+ * returned bytes rather than a digest of nothing.
  */
 export interface ToolCallRecord {
   /**
@@ -5457,7 +5832,8 @@ export interface ToolCallRecord {
    */
   readonly error?: string | null;
   /**
-   * SHA-256 of the bounded output returned to the model; absent when the call returned none.
+   * SHA-256 of the bounded output returned to the model; absent when the
+   * call returned none.
    */
   readonly output_sha256?: Sha256Hex | null;
   /**
@@ -5525,7 +5901,9 @@ export type TriggerDuration = string;
 export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
 
 /**
- * Activate once per `group_id` group of source executions this long after its latest acknowledged source evidence; new evidence postpones it and, once judged, schedules a later group execution.
+ * Activate once per `group_id` group of source executions this long
+ * after its latest acknowledged source evidence; new evidence postpones
+ * it and, once judged, schedules a later group execution.
  */
 export interface TriggerSpecGroupEnd {
   /**
@@ -5564,7 +5942,8 @@ export interface TriggerSpecSchedule {
 export type TypedCardKind = "Data" | "Model" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
 
 /**
- * One named evidence slot. Slots are required unless `required: false`; samples and source slots are always required.
+ * One named evidence slot. Slots are required unless `required: false`;
+ * samples and source slots are always required.
  */
 export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
 
@@ -5605,7 +5984,9 @@ export interface TypedInputSlotMedia {
 /**
  * Feature measurements or metric samples recorded for a scheduled window.
  *
- * Always required: a schedule binding supplies every samples slot of its Verifier from the subject's recorded measurements, so the slot has no `required` field and no drift check can be omitted by configuration.
+ * Always required: a schedule binding supplies every samples slot of its
+ * Verifier from the subject's recorded measurements, so the slot has no
+ * `required` field and no drift check can be omitted by configuration.
  */
 export interface TypedInputSlotSamples {
   /**
@@ -5634,7 +6015,9 @@ export type UnknownCostPolicy = "reject" | "allow_unpriced";
 /**
  * `PATCH /v1/operator-connections/{connection_id}` body.
  *
- * Omitted fields are preserved; a supplied secret replaces the encrypted secret atomically. The provider tag must equal the stored provider, and the name is not patchable.
+ * Omitted fields are preserved; a supplied secret replaces the encrypted
+ * secret atomically. The provider tag must equal the stored provider, and the
+ * name is not patchable.
  */
 export type UpdateOperatorConnectionRequest = UpdateOperatorConnectionRequestSlack | UpdateOperatorConnectionRequestPagerDuty | UpdateOperatorConnectionRequestHttp;
 
@@ -5649,7 +6032,7 @@ export interface UpdateOperatorConnectionRequestHttp {
   /**
    * Replacement origin.
    */
-  readonly origin?: string | null;
+  readonly origin?: HttpsOrigin | null;
   readonly provider: "http";
   /**
    * New status.
@@ -5694,25 +6077,34 @@ export interface UpdateOperatorConnectionRequestSlack {
 /**
  * One inline declaration attaching a Verifier to its containing subject.
  *
- * Authored on a Service, a Service component occurrence, or a standalone Agent. Registration resolves and UID-pins the Verifier, the effective Trigger, and every effective Operator before the owning Card persists.
+ * Authored on a Service, a Service component occurrence, or a standalone
+ * Agent. Registration resolves and UID-pins the Verifier, the effective
+ * Trigger, and every effective Operator before the owning Card persists.
  */
 export interface VerificationBinding {
   /**
    * Operators dispatched independently after a `failed` verdict.
    *
-   * Empty means a failed result stays durable with no reaction. A `group_end` binding refuses this list; it reacts through [`Self::on_verdict_change`] instead.
+   * Empty means a failed result stays durable with no reaction. A
+   * `group_end` binding refuses this list; it reacts through
+   * [`Self::on_verdict_change`] instead.
    */
   readonly on_failure?: readonly InlineableRef_for_OperatorSpec[];
   /**
-   * Operators dispatched independently when a settled group judgment's verdict differs from the preceding settled judgment of the same binding and group.
+   * Operators dispatched independently when a settled group judgment's
+   * verdict differs from the preceding settled judgment of the same
+   * binding and group.
    *
-   * Valid only on a `group_end` binding. The first judgment of a group is the baseline and dispatches nothing; an unchanged verdict dispatches nothing.
+   * Valid only on a `group_end` binding. The first judgment of a group is
+   * the baseline and dispatches nothing; an unchanged verdict dispatches
+   * nothing.
    */
   readonly on_verdict_change?: readonly InlineableRef_for_OperatorSpec[];
   /**
    * When the bound Verifier runs, inline or as a referenced Trigger Card.
    *
-   * Absent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it.
+   * Absent means explicit-only: the binding attaches the Verifier to its
+   * subject for direct invocation and nothing activates it.
    */
   readonly runs_on?: InlineableRef_for_TriggerSpec | null;
   /**
@@ -5738,11 +6130,15 @@ export interface VerificationError {
 /**
  * `GET /v1/verification/executions/{execution_id}` response.
  *
- * A conflicting idempotent replay settles as `errored` with the idempotency-conflict code and never carries a result. `completed` may briefly lack a visible result.
+ * A conflicting idempotent replay settles as `errored` with the
+ * idempotency-conflict code and never carries a result. `completed` may
+ * briefly lack a visible result.
  */
 export interface VerificationExecutionState {
   /**
-   * Every Operator dispatch of a failed background binding execution or a changed group verdict, in identity order; empty otherwise. Delivery completes independently of the execution and never changes its verdict.
+   * Every Operator dispatch of a failed background binding execution or a
+   * changed group verdict, in identity order; empty otherwise. Delivery
+   * completes independently of the execution and never changes its verdict.
    */
   readonly dispatches: readonly OperatorDispatchState[];
   /**
@@ -5752,13 +6148,14 @@ export interface VerificationExecutionState {
   /**
    * The execution.
    */
-  readonly execution_id: string;
+  readonly execution_id: ExecutionId;
   /**
    * The source snapshot a group execution judges.
    */
   readonly group?: GroupSnapshot | null;
   /**
-   * Caller group the execution belongs to, or the group a group execution judges.
+   * Caller group the execution belongs to, or the group a group execution
+   * judges.
    */
   readonly group_id?: GroupId | null;
   /**
@@ -5778,7 +6175,9 @@ export interface VerificationExecutionState {
 /**
  * Execution state of one Verifier execution.
  *
- * Independent of the verdict: only `completed` has one, and it lives in the result. `cancelled`, `timed_out`, and `errored` never carry a verdict or dispatch an Operator.
+ * Independent of the verdict: only `completed` has one, and it lives in the
+ * result. `cancelled`, `timed_out`, and `errored` never carry a verdict or
+ * dispatch an Operator.
  */
 export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
 
@@ -5806,12 +6205,15 @@ export interface VerificationOutcome {
 
 /**
  * The attributable result of one Verifier execution.
+ *
+ * `T` is the type of each requirement's custom `data`: JSON objects on the
+ * wire, or a caller's type after a typed SDK read.
  */
 export interface VerificationResult {
   /**
    * Server-issued execution identity.
    */
-  readonly execution_id: string;
+  readonly execution_id: ExecutionId;
   /**
    * Verdict, breakdown, and evidence.
    */
@@ -5819,7 +6221,7 @@ export interface VerificationResult {
   /**
    * The caller's application Run, when there is one.
    */
-  readonly run_id?: string | null;
+  readonly run_id?: RunId | null;
   /**
    * The exact subject judged.
    */
@@ -5833,19 +6235,25 @@ export interface VerificationResult {
 /**
  * Server-derived verification state projected onto `card.status`.
  *
- * A Service or standalone Agent owning `verified_by` bindings exposes the stable identity of each projected binding here, so a caller can address a binding without a separate listing resource. The field is read-only: it is derived from the tenant's binding projection on every Card read and is never persisted as Card status.
+ * A Service or standalone Agent owning `verified_by` bindings exposes the
+ * stable identity of each projected binding here, so a caller can address a
+ * binding without a separate listing resource. The field is read-only: it is
+ * derived from the tenant's binding projection on every Card read and is
+ * never persisted as Card status.
  */
 export interface VerificationStatus {
   /**
    * Fitted-baseline readiness of a PSI or SPC Drift Verifier Card version.
    *
-   * Absent on every other Card, including a Custom Drift Verifier, which scores its authored scalar baseline and is ready without fitting.
+   * Absent on every other Card, including a Custom Drift Verifier, which
+   * scores its authored scalar baseline and is ready without fitting.
    */
   readonly baseline?: DriftBaselineStatus | null;
   /**
-   * Stable identities of this owner Card version's projected bindings, ordered by identity so reordering authored bindings changes nothing.
+   * Stable identities of this owner Card version's projected bindings,
+   * ordered by identity so reordering authored bindings changes nothing.
    */
-  readonly binding_ids?: readonly string[];
+  readonly binding_ids?: readonly BindingId[];
 }
 
 /**
@@ -5876,7 +6284,9 @@ export interface VerifierSpec {
    */
   readonly inputs?: Readonly<Record<string, InputSlot>>;
   /**
-   * Order of a group Verifier's source lists: `recorded_at`, or an input key that orders every slot reading the same source binding. Absent means `recorded_at`.
+   * Order of a group Verifier's source lists: `recorded_at`, or an input
+   * key that orders every slot reading the same source binding. Absent
+   * means `recorded_at`.
    */
   readonly order_by?: OrderBy | null;
   /**
@@ -5897,7 +6307,10 @@ export type VersionBlock = string;
 /**
  * Semantic version bump level.
  *
- * `Major`, `Minor`, and `Patch` perform a conventional semver bump and clear any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are additive: they apply the requested pre-release or build metadata to the existing triple without resetting it.
+ * `Major`, `Minor`, and `Patch` perform a conventional semver bump and clear
+ * any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are
+ * additive: they apply the requested pre-release or build metadata to the
+ * existing triple without resetting it.
  */
 export type VersionBump = "major" | "minor" | "patch" | VersionBumpPre | VersionBumpBuild | VersionBumpPreBuild;
 
@@ -5951,6 +6364,11 @@ export interface VersionBumpPrePre {
  * Authored version on the card-declaration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.
  */
 export type VersionSpec = string;
+
+/**
+ * Google Cloud project or location segment used by the Vertex adapter.
+ */
+export type VertexLocation = string;
 
 /**
  * RFC 9457 problem value emitted by every public Wyrd error boundary.

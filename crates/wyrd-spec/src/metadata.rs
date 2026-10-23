@@ -20,6 +20,7 @@ pub type Annotations = BTreeMap<AnnotationKey, AnnotationValue>;
 /// durable Card envelope.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct CardMetadata {
     /// Optional Card name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,9 +28,6 @@ pub struct CardMetadata {
     /// Optional exact Card version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Optional Card space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<String>,
     /// Optional server-assigned Card UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
@@ -356,7 +354,6 @@ mod metadata_tests {
                         .into(),
                 ),
                 bump: None,
-                space: None,
                 uid: None,
                 labels,
                 annotations,

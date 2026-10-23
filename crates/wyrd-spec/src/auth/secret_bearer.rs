@@ -1,8 +1,6 @@
 //! Secret-bearing wire-field wrapper.
 
-use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -60,18 +58,17 @@ impl<'de> Deserialize<'de> for SecretBearer {
 }
 
 impl JsonSchema for SecretBearer {
-    fn schema_name() -> String {
-        "SecretBearer".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SecretBearer".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        serde_json::from_value(serde_json::json!({
+        schemars::json_schema!({
             "type": "string",
             "format": "password",
             "writeOnly": true,
             "description": "Opaque secret. Redacted in logs and audit payloads."
-        }))
-        .expect("SecretBearer schema is valid JSON Schema")
+        })
     }
 }
 
@@ -125,7 +122,7 @@ mod tests {
     #[test]
     fn json_schema_is_opaque_string() {
         let schema = schemars::schema_for!(SecretBearer);
-        let value = serde_json::to_value(schema.schema).expect("schema serializes");
+        let value = serde_json::to_value(schema).expect("schema serializes");
 
         assert_eq!(value["type"], "string");
         assert_eq!(value["format"], "password");

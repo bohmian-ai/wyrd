@@ -10,8 +10,7 @@ try:
     import httpx2
 except ImportError as missing:
     raise ImportError(
-        "WyrdClient.http_auth needs the gateway extra: pip install 'wyrd[gateway]'"
-        " (httpx and httpx2)"
+        "WyrdClient.http_auth needs the gateway extra: uv add 'wyrd-ai[gateway]' (httpx and httpx2)"
     ) from missing
 
 if TYPE_CHECKING:
@@ -41,7 +40,8 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
         self._client = client
 
     # The flows keep their bases' signatures: each base types them with its
-    # own Request class, and one instance serves both.
+    # own Request class, and one instance serves both, so ``auth_flow``,
+    # which both bases also define, is the synchronous flow.
     def sync_auth_flow(self, request):
         """Swap the provider key headers for a fresh token on one synchronous request.
 
@@ -50,6 +50,8 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
         """
         _authenticate(request, self._client.access_token())
         yield request
+
+    auth_flow = sync_auth_flow
 
     async def async_auth_flow(self, request):
         """Swap the provider key headers for a fresh token on one asynchronous request.

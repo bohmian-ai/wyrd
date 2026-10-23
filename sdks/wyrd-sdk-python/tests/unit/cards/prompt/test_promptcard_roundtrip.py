@@ -12,7 +12,6 @@ def card() -> PromptCard:
     """An OpenAI lead-scoring Prompt Card with one unbound variable."""
     return PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Hello {{name}}", model_settings={"seed": 7}),
-        space="growth",
         name="lead-scoring",
         version="0.1.0",
     )

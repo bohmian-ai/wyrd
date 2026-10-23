@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyModule};
 use tokio::time::Instant;
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::WyrdClient;
@@ -196,6 +196,28 @@ impl PyExecution {
         Ok(json_to_pyobject(py, &serde_json::to_value(state)?)?)
     }
 
+    /// [`PyExecution::status`], with a present result's custom `data`
+    /// converted by `data_type.model_validate`.
+    ///
+    /// # Errors
+    /// As [`PyExecution::status`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses.
+    fn status_typed(
+        &self,
+        py: Python<'_>,
+        data_type: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let state = self.status(py)?;
+        if let Some(result) = state.bind(py).cast::<PyDict>()?.get_item("result")? {
+            decode_data(
+                &result.get_item("outcome")?.get_item("requirements")?,
+                data_type,
+            )?;
+        }
+        Ok(state)
+    }
+
     /// Poll until a result, the execution's own error, or `timeout` seconds.
     ///
     /// One deadline starts at the call and bounds the whole wait: a first
@@ -219,42 +241,136 @@ impl PyExecution {
             .get_before(py, deadline, |client| Self::open(id, client))
             .ok_or_else(|| Execution::wait_timed_out(&id, None))??;
         crate::trace::block_on(py, execution.wait_until(deadline))
-            .map(PyVerificationResult)
+            .map(PyVerificationResult::plain)
             .map_err(WyrdPyError::from)
+    }
+
+    /// [`PyExecution::wait`], with the result's custom `data` converted by
+    /// `data_type.model_validate`.
+    ///
+    /// # Errors
+    /// As [`PyExecution::wait`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses.
+    fn wait_typed(
+        &self,
+        py: Python<'_>,
+        timeout: f64,
+        data_type: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<PyVerificationResult> {
+        PyVerificationResult::typed(py, self.wait(py, timeout)?.result, data_type)
     }
 }
 
-/// Read-only Python view of one attributable Verifier result.
-#[pyclass(module = "wyrd._wyrd.verify", name = "VerificationResult", frozen)]
-pub struct PyVerificationResult(
+/// Read-only Python view of one attributable Verifier result, generic over
+/// its requirements' custom `data` type.
+#[pyclass(
+    module = "wyrd._wyrd.verify",
+    name = "VerificationResult",
+    frozen,
+    generic
+)]
+pub struct PyVerificationResult {
     /// The shared client's result, read by every getter and never mutated.
-    pub(crate) VerificationResult,
-);
+    pub(crate) result: VerificationResult,
+    /// The requirements with every present `data` already converted by a
+    /// typed read's `data_type`; `None` for an ordinary result.
+    typed: Option<Py<PyAny>>,
+}
+
+impl PyVerificationResult {
+    /// An ordinary result, whose `data` reads as JSON.
+    pub(crate) const fn plain(result: VerificationResult) -> Self {
+        Self {
+            result,
+            typed: None,
+        }
+    }
+
+    /// `result` with every present requirement `data` converted by
+    /// `data_type.model_validate` before it is returned, so no partially
+    /// typed result exists.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses, and `WYRD_SPEC_400_VALIDATION` when `data_type` has no
+    /// `model_validate`.
+    pub(crate) fn typed(
+        py: Python<'_>,
+        result: VerificationResult,
+        data_type: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<Self> {
+        let requirements =
+            json_to_pyobject(py, &serde_json::to_value(&result.outcome.requirements)?)?;
+        decode_data(requirements.bind(py), data_type)?;
+        Ok(Self {
+            result,
+            typed: Some(requirements),
+        })
+    }
+}
+
+/// Replace every present `data` in the `requirements` wire list with
+/// `data_type.model_validate(data)`.
+///
+/// # Errors
+/// Raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the first refused
+/// requirement with the data root's empty path, never the data, the
+/// validator's message, or its location (which may hold a returned
+/// dictionary key), and `WYRD_SPEC_400_VALIDATION` when `data_type` has no
+/// `model_validate`.
+fn decode_data(requirements: &Bound<'_, PyAny>, data_type: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
+    let validate = data_type
+        .getattr("model_validate")
+        .map_err(|_| invalid_argument("data_type", "it has no `model_validate`"))?;
+    for requirement in requirements.try_iter()? {
+        let requirement = requirement?;
+        let requirement = requirement.cast::<PyDict>()?;
+        let Some(data) = requirement.get_item("data")? else {
+            continue;
+        };
+        let Ok(model) = validate.call1((data,)) else {
+            let id: String = requirement
+                .get_item("id")?
+                .map_or(Ok(String::new()), |id| id.extract())?;
+            return Err(WyrdError::SdkVerificationDataInvalid {
+                message: format!("requirement `{id}` data does not match the requested type"),
+                details: serde_json::json!({"requirement": id, "path": ""}),
+            }
+            .into());
+        };
+        requirement.set_item("data", model)?;
+    }
+    Ok(())
+}
 
 #[pymethods]
 impl PyVerificationResult {
     /// Server-issued execution ID.
     #[getter]
     fn execution_id(&self) -> String {
-        self.0.execution_id.to_string()
+        self.result.execution_id.to_string()
     }
 
     /// The caller's application Run, when there is one.
     #[getter]
     fn run_id(&self) -> Option<String> {
-        self.0.run_id.as_ref().map(|run| run.as_str().to_owned())
+        self.result
+            .run_id
+            .as_ref()
+            .map(|run| run.as_str().to_owned())
     }
 
     /// The exact Verifier executed.
     #[getter]
     fn verifier(&self) -> CardRefPy {
-        CardRefPy(self.0.verifier.clone())
+        CardRefPy(self.result.verifier.clone())
     }
 
     /// The exact subject judged.
     #[getter]
     fn subject(&self) -> CardRefPy {
-        CardRefPy(self.0.subject.clone())
+        CardRefPy(self.result.subject.clone())
     }
 
     /// The overall verdict: `passed`, `failed`, or `inconclusive`.
@@ -264,7 +380,7 @@ impl PyVerificationResult {
     /// string.
     #[getter]
     fn verdict(&self) -> WyrdPyResult<String> {
-        match serde_json::to_value(self.0.outcome.verdict)? {
+        match serde_json::to_value(self.result.outcome.verdict)? {
             serde_json::Value::String(text) => Ok(text),
             other => Err(invalid_argument(
                 "verdict",
@@ -279,9 +395,12 @@ impl PyVerificationResult {
     /// Raises an internal error when the breakdown cannot be converted.
     #[getter]
     fn requirements(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        if let Some(typed) = &self.typed {
+            return Ok(typed.clone_ref(py));
+        }
         Ok(json_to_pyobject(
             py,
-            &serde_json::to_value(&self.0.outcome.requirements)?,
+            &serde_json::to_value(&self.result.outcome.requirements)?,
         )?)
     }
 
@@ -293,7 +412,7 @@ impl PyVerificationResult {
     fn steps(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
-            &serde_json::to_value(&self.0.outcome.steps)?,
+            &serde_json::to_value(&self.result.outcome.steps)?,
         )?)
     }
 
@@ -305,7 +424,7 @@ impl PyVerificationResult {
     fn evidence(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
-            &serde_json::to_value(&self.0.outcome.evidence)?,
+            &serde_json::to_value(&self.result.outcome.evidence)?,
         )?)
     }
 }

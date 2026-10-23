@@ -110,7 +110,6 @@ mod tests {
                 name: "hash-test".parse().expect("test name is valid"),
                 version: Some("1.0.0".parse().expect("test version is valid")),
                 bump: None,
-                space: Some("default".parse().expect("test space is valid")),
                 uid: None,
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),

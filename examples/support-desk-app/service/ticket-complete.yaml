@@ -5,7 +5,6 @@ kind: Verifier
 metadata:
   name: ticket-complete
   version: 1.0.0
-  space: support
 spec:
   description: A support ticket carries the fields the help desk needs.
   inputs:

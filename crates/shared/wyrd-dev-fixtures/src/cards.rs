@@ -25,7 +25,6 @@ pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, cr
             serde_json::json!({
                 "prompt": {
                     "kind": "Prompt",
-                    "space": "prod",
                     "name": "fixture-prompt",
                     "version": "1.0.0"
                 }, "execution_route": {"kind": "native"}
@@ -58,27 +57,20 @@ pub async fn seed_card_with_spec(
     sqlx::query(
         r"
         INSERT INTO wyrd.cards (
-            card_uid, data_tenant_id, kind, space, name, version, spec,
+            card_uid, data_tenant_id, kind, name, version, spec,
             spec_hash, artifact_hash, labels, annotations, status,
             sub_principal_id, act_principal_id
         )
         VALUES (
-            $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
-            $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8, $8
+            $1, wyrd.current_tenant(), $2, $3, $4, $5,
+            $6, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $7, $7
         )
-        ON CONFLICT (data_tenant_id, kind, space, name, version)
+        ON CONFLICT (data_tenant_id, kind, name, version)
             WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
         ",
     )
     .bind(Uuid::now_v7())
     .bind(card_ref.kind.wire_name())
-    .bind(
-        card_ref
-            .space
-            .as_ref()
-            .expect("fixture card refs must have a resolved space")
-            .as_str(),
-    )
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .bind(spec_json)

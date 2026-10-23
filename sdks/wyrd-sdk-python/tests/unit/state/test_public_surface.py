@@ -13,7 +13,7 @@ def test_card_envelope_exposes_complete_registered_card(state: WyrdState) -> Non
     assert envelope.kind.name == "Model"
     assert envelope.aliases == ("model", "primary_model")
     assert envelope.card_ref.name == "model"
-    assert envelope.metadata["space"] == "default"
+    assert "space" not in envelope.metadata
     assert envelope.spec["task_type"] == "Other"
     assert envelope.relationships == {}
     assert envelope.status is None

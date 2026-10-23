@@ -29,7 +29,7 @@ use wyrd_spec::auth::{
     TokenAudience,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
@@ -92,12 +92,11 @@ fn keycloak_workload_issuer() -> IssuerEntry {
 
 /// Build the server-owned `CardRef` a `[[workload_bindings]]` entry resolves to:
 /// the same `uid = None` ref boot's `build_workload_bindings` produces.
-fn binding_card_ref(kind: CardKind, name: &str, space: &str) -> CardRef {
+fn binding_card_ref(kind: CardKind, name: &str) -> CardRef {
     CardRef {
         kind,
         name: CardName::new(name).expect("card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("version is valid"),
-        space: Some(SpaceName::new(space).expect("space name is valid")),
         uid: None,
     }
 }
@@ -156,7 +155,7 @@ async fn card_write_status(srv: &WyrdTestServer, jwt: &str, label: &str) -> Stat
     let name = format!("{label}-probe-{}", Uuid::new_v4().simple());
     let body = serde_json::json!({ "submissions": [{
         "apiVersion": "wyrd/v1", "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": "probe" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": {},
         "artifacts": []
     }] });
@@ -432,7 +431,7 @@ async fn workload_jwt_bearer_journey_keycloak() {
         .expect("workload token carries a subject")
         .to_owned();
 
-    let card_ref = binding_card_ref(CardKind::Service, "wyrd-workload-sa", "prod");
+    let card_ref = binding_card_ref(CardKind::Service, "wyrd-workload-sa");
 
     let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
@@ -442,7 +441,6 @@ async fn workload_jwt_bearer_journey_keycloak() {
             audience: Some("wyrd-workload".to_owned()),
             kind: "service".to_owned(),
             name: "wyrd-workload-sa".to_owned(),
-            space: "prod".to_owned(),
             version: "1.0.0".to_owned(),
         }])
         .start_in_process()
@@ -499,7 +497,6 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
             audience: Some("wyrd-workload".to_owned()),
             kind: "service".to_owned(),
             name: "unbound-sa".to_owned(),
-            space: "prod".to_owned(),
             version: "1.0.0".to_owned(),
         }])
         .start_in_process()
@@ -538,17 +535,17 @@ async fn activated_principals(srv: &WyrdTestServer) -> Vec<Uuid> {
     ids
 }
 
-/// Register an empty Service `name` at 1.0.0 in `space` through the public route.
+/// Register an empty Service `name` at 1.0.0 through the public route.
 ///
 /// Registration projects the Card-bound principal a workload binding selects;
 /// returns the Service's registered UID.
 ///
 /// # Panics
 /// Panics when the route fails to respond, refuses the Card, or returns no UID.
-async fn declare_service(srv: &WyrdTestServer, jwt: &str, name: &str, space: &str) -> Uuid {
+async fn declare_service(srv: &WyrdTestServer, jwt: &str, name: &str) -> Uuid {
     let body = serde_json::json!({ "submissions": [{
         "apiVersion": "wyrd/v1", "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": space },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": {},
         "artifacts": []
     }] });
@@ -559,7 +556,7 @@ async fn declare_service(srv: &WyrdTestServer, jwt: &str, name: &str, space: &st
                 .method(Method::POST)
                 .uri("/v1/cards")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("Idempotency-Key", format!("{name}-{space}"))
+                .header("Idempotency-Key", format!("{name}-registration"))
                 .body(Body::from(body.to_string()))
                 .expect("registration request builds"),
         )
@@ -601,11 +598,11 @@ async fn owner_last_authenticated(srv: &WyrdTestServer, owner: Uuid) -> Option<D
 
 /// A configured workload `jwt-bearer` exchange activates only its exact owner.
 ///
-/// Registers one Service identity in the `prod` and `staging` spaces, binds the
-/// live Keycloak workload subject to the `prod` version, and exchanges the real
-/// assertion twice. The first exchange activates exactly the `prod` owner; the
-/// second, re-presenting the platform assertion as a workload does to renew,
-/// renews that one timestamp. The same-named `staging` owner is never touched.
+/// Registers the bound Service and an unbound sibling Service, binds the live
+/// Keycloak workload subject to the bound one, and exchanges the real assertion
+/// twice. The first exchange activates exactly the bound owner; the second,
+/// re-presenting the platform assertion as a workload does to renew, renews
+/// that one timestamp. The sibling owner is never touched.
 ///
 /// # Panics
 /// Panics when the server fails to boot, a registration or exchange fails, or
@@ -629,7 +626,6 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
             audience: Some("wyrd-workload".to_owned()),
             kind: "service".to_owned(),
             name: "wyrd-workload-live".to_owned(),
-            space: "prod".to_owned(),
             version: "1.0.0".to_owned(),
         }])
         .start_in_process()
@@ -642,16 +638,16 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
     else {
         panic!("user bootstrap returned a non-user principal");
     };
-    let prod = declare_service(&srv, &jwt, "wyrd-workload-live", "prod").await;
-    let staging = declare_service(&srv, &jwt, "wyrd-workload-live", "staging").await;
-    assert_eq!(owner_last_authenticated(&srv, prod).await, None);
+    let bound = declare_service(&srv, &jwt, "wyrd-workload-live").await;
+    let sibling = declare_service(&srv, &jwt, "wyrd-workload-sibling").await;
+    assert_eq!(owner_last_authenticated(&srv, bound).await, None);
 
     let first = post_jwt_bearer(&srv, &assertion).await;
     assert_eq!(first.status(), StatusCode::OK, "first workload exchange");
-    let activated = owner_last_authenticated(&srv, prod)
+    let activated = owner_last_authenticated(&srv, bound)
         .await
         .expect("the workload exchange activates its exact owner");
-    assert_eq!(owner_last_authenticated(&srv, staging).await, None);
+    assert_eq!(owner_last_authenticated(&srv, sibling).await, None);
 
     let renewal = post_jwt_bearer(&srv, &assertion).await;
     assert_eq!(
@@ -659,7 +655,7 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
         StatusCode::OK,
         "renewal workload exchange"
     );
-    let renewed = owner_last_authenticated(&srv, prod)
+    let renewed = owner_last_authenticated(&srv, bound)
         .await
         .expect("renewal keeps activity");
     assert!(
@@ -667,9 +663,9 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
         "renewal never moves activity backward"
     );
     assert_eq!(
-        owner_last_authenticated(&srv, staging).await,
+        owner_last_authenticated(&srv, sibling).await,
         None,
-        "the same-named owner in another space is never activated"
+        "the sibling owner is never activated"
     );
 }
 
@@ -5042,7 +5038,6 @@ fn machine_binding(subject: &str, audience: Option<&str>, name: &str) -> Workloa
         audience: audience.map(ToOwned::to_owned),
         kind: "service".to_owned(),
         name: name.to_owned(),
-        space: "prod".to_owned(),
         version: "1.0.0".to_owned(),
     }
 }
@@ -5121,7 +5116,7 @@ async fn tenant_machine_independence_journey() {
     // The foreign-audience token is refused at the audience check before any
     // principal resolution, so only the accepted workload needs a principal.
     srv.seed_card_principal(
-        &binding_card_ref(CardKind::Service, "machine-sa", "prod"),
+        &binding_card_ref(CardKind::Service, "machine-sa"),
         &["editor"],
     )
     .await
@@ -5251,7 +5246,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         .expect("admin api key exchange succeeds");
 
     // The server-owned card the binding resolves to; seed its principal.
-    let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa", "prod");
+    let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa");
     srv.seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
@@ -5473,7 +5468,7 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
     }
 
     // Bind the subject ONLY in tenant A (CLI), and seed its principal in A only.
-    let card_ref = binding_card_ref(CardKind::Service, "iso-sa", "prod");
+    let card_ref = binding_card_ref(CardKind::Service, "iso-sa");
     assert_cli_succeeded(
         &wyrd_cli(
             workload_binding_add_args(&server_url, &subject, &card_ref),

@@ -25,7 +25,7 @@ import tempfile
 import termios
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -460,7 +460,7 @@ PROVIDER_KEY_VARIABLES = (
 
 
 @contextmanager
-def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
+def local_deployment() -> Generator[tuple[Path, dict[str, str]]]:
     """Own one deployment's empty database and temporary installed files.
 
     The database outlives every CLI and SDK process started for this
@@ -525,7 +525,7 @@ def installed_local_cli(
     terminal: str,
     tenant: str = "local",
     extra: tuple[str, ...] = (),
-) -> Iterator[None]:
+) -> Generator[None]:
     """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends.
 
     ``extra`` appends further ``wyrd init`` arguments, such as a gateway file.
@@ -831,7 +831,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
                     *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
-                    *("--version", "1.0.0", "--space", "default"),
+                    *("--version", "1.0.0"),
                     *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
                 )
                 assert issued.returncode == 0, issued.stderr
@@ -858,7 +858,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 assert applied.returncode == 0, applied.stderr
                 got = wyrd(
                     *("pull", "--kind", "Service", "--name", "gateway-agents"),
-                    *("--version", "1.0.0", "--space", "default", "--output-dir", "gateway-agents"),
+                    *("--version", "1.0.0", "--output-dir", "gateway-agents"),
                 )
                 assert got.returncode == 0, got.stderr
                 agent_env = {
@@ -1241,7 +1241,7 @@ QUICKSTART_RUNNERS = {
 """Language → the command a reader runs in a directory holding the Quickstart files."""
 
 
-GET_SERVICE = "wyrd get --space default --kind Service --name support-reply --version 1.0.0"
+GET_SERVICE = "wyrd get --kind Service --name support-reply --version 1.0.0"
 """The Quickstart's published command that reads the Service, whose ``metadata.uid`` the query needs."""
 
 QUERY_VERDICTS = "wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql"

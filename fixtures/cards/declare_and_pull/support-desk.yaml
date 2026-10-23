@@ -3,7 +3,6 @@ kind: Service
 metadata:
   name: support-desk
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:
@@ -12,7 +11,6 @@ spec:
         kind: Model
         name: support-model
         version: 1.0.0
-        space: default
     - alias: agent
       ref: ./support-agent.yaml
       verified_by:

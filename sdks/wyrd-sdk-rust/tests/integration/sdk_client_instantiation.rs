@@ -72,7 +72,6 @@ fn saved_config(deployment: &Deployment, key: &str) -> TempDir {
 fn prompts() -> ListCardsRequest {
     ListCardsRequest {
         kind: Some(CardKind::Prompt),
-        space: None,
         name: None,
         version_range: None,
         status: None,

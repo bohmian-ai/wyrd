@@ -21,9 +21,6 @@ pub enum GraphError {
     /// No submissions were supplied.
     #[error("empty submission set")]
     Empty,
-    /// A submission has no resolved space identity.
-    #[error("submission metadata.space is required for graph operations")]
-    MissingSpace,
     /// A submission identity was repeated within one request.
     #[error("duplicate submission identity: {candidates:?}")]
     DuplicateIdentity {
@@ -66,7 +63,7 @@ pub enum GraphError {
 /// removes zero-outdegree leaves, which is the reverse of the usual Kahn
 /// emission direction and gives the composite registration pipeline its
 /// dependency-first order. Ready leaves are selected by
-/// `(kind, space, name, version)`.
+/// `(kind, name, version)`.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] for an empty node set and
@@ -152,7 +149,6 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }

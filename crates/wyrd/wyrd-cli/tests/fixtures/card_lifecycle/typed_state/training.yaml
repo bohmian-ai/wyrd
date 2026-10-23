@@ -3,7 +3,6 @@ kind: Data
 metadata:
   name: training
   version: 1.0.0
-  space: default
 spec:
   interface:
     kind: Parquet

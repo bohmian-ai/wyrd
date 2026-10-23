@@ -5,7 +5,6 @@
 apiVersion: wyrd/v1
 kind: Source
 metadata:
-  space: prod
   name: telemetry-warehouse
   version: 1.0.0
 

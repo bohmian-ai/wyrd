@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: path-agent
   version: 1.0.0
-  space: default
 spec:
   prompt: ./desk-prompt.yaml
   execution_route:

@@ -40,7 +40,7 @@ DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 
 HANDLES: list[tuple[Any, Callable[[Any], object]]] = [
     (Bifrost, lambda bifrost: bifrost.list_tables()),
-    (Cards, lambda cards: cards.prompt.list(space="default")),
+    (Cards, lambda cards: cards.prompt.list()),
     (Gateway, lambda gateway: gateway.deployments()),
     (OperatorConnections, lambda connections: connections.list()),
     (Principals, lambda principals: principals.list()),
@@ -142,10 +142,10 @@ def test_local_state_survives_the_first_connection(
     assert "vala.datasets.lazy_bound" in [
         f"{entry['namespace']}.{entry['name']}" for entry in bifrost.list_tables()
     ]
-    prompts.list(space="default")
+    prompts.list()
     monkeypatch.setenv("WYRD_SERVER_URL", UNREACHABLE)
     monkeypatch.delenv("WYRD_API_KEY")
-    cards.prompt.list(space="default")
+    cards.prompt.list()
 
 
 def test_connect_and_lazy_first_call_share_the_no_credentials_error(

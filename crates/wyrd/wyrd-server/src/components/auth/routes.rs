@@ -652,7 +652,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
     use wyrd_storage::{LocalSigner, StorageHandle};
 
@@ -734,7 +734,6 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("issue-key-target").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -789,6 +788,14 @@ mod pg_tests {
         user_id
     }
 
+    /// Insert an active Service principal bound to `card_ref` and return its id.
+    ///
+    /// The row stores the flat reference, its version, and a fresh Card UID,
+    /// created and acted by `creator`. It writes in the caller's tenant
+    /// transaction, which the caller commits.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
     async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
@@ -798,20 +805,13 @@ mod pg_tests {
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, sub_principal_id, act_principal_id)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8, $8)",
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, version, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, 'active', $7, $7)",
         )
         .bind(sa_id)
         .bind(tenant.as_uuid())
         .bind(Uuid::new_v4())
         .bind(SqlxJson(card_ref.clone()))
-        .bind(
-            card_ref
-                .space
-                .as_ref()
-                .expect("fixture service card ref has a resolved space")
-                .as_str(),
-        )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
         .bind(creator)

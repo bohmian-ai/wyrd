@@ -112,7 +112,6 @@ pub(crate) fn exact_ref(row: &ParsedCardRow) -> CardRef {
         kind: row.kind.clone(),
         name: row.name.clone(),
         version: row.version.clone(),
-        space: Some(row.space.clone()),
         uid: Some(row.card_uid.clone()),
     }
 }

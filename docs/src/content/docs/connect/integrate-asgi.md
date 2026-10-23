@@ -28,7 +28,7 @@ uv add "wyrd-ai[otel]==0.3.0" uvicorn
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:
 
 ```bash
-uv run wyrd pull --space default --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
+uv run wyrd pull --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## Usage

@@ -4,7 +4,7 @@ Use :class:`Cards` for registry operations and the kind-specific views for
 typed calls::
 
     cards = Cards()
-    card = cards.model.get(space="risk", name="fraud-model")
+    card = cards.model.get(name="fraud-model")
 
 ``get`` retrieves the persisted Card envelope without downloading artifacts.
 ``pull`` publishes a Service graph bundle that ``WyrdState.from_path`` loads

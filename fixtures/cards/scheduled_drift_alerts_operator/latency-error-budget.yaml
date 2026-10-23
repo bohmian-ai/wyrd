@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: latency-error-budget
   version: 1.0.0
-  space: default
 spec:
   description: Daily check that request latency and error rate stay within budget.
   inputs:

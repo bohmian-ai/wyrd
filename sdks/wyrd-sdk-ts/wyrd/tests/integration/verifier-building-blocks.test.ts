@@ -2,7 +2,8 @@
 // every action kind (`extract`, `agent`, `code`) and every Run check kind
 // (`assert`, `trace`, `agent`, `code`) over an answer, its refund policy PDF,
 // and the trace that produced it; `document-formats` extracts each of the nine
-// extractable formats into its locked output.
+// extractable formats into its locked output; `scored-review` returns custom
+// Verdict data from plain, expanded, Agent, code, and step checks.
 //
 // The local upstream stands in for the model provider: the refund reader first
 // calls `fs.read` on its workspace copy of the policy and then answers a
@@ -25,9 +26,11 @@ import {
   Cards,
   type CardTypes,
   Principals,
+  type RequirementResult,
   verify,
   type VerificationResult,
   type VerifierInputs,
+  WyrdError,
   WyrdClient,
   WyrdState,
 } from "wyrd-ai";
@@ -78,11 +81,14 @@ const VERIFIES = ["verifier:run", "gateway:invoke"];
 /** The investigator's one tool turn: one call of each of {@link TOOLS}, in order. */
 const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
-    card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0", space: "default" },
+    card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
   toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM vala.verification.results LIMIT 1", max_rows: 1 }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
+
+/** The `scored-judge`'s custom data for an answer naming no scripted case. */
+const SCORED = { score: 0.9, category: "refund" };
 
 /** The policy every review reads: the support desk's checked-in refund policy. */
 const POLICY = resolve(import.meta.dirname, "../../../../../examples/support-desk/service/refund-policy.pdf");
@@ -110,6 +116,17 @@ function upstream(request: ReceivedRequest): Reply {
   if (body.includes("INVESTIGATE")) {
     return toolResults ? judgeReply('{"done":true}') : toolTurn(INVESTIGATION);
   }
+  if (body.includes("SCORE:")) {
+    const data = body.includes("BAD-DATA")
+      ? { score: "high", category: "refund" }
+      : body.includes("HUGE-DATA")
+        ? { score: 0.9, category: "x".repeat(70_000) }
+        : SCORED;
+    return judgeReply(JSON.stringify({ outcome: "passed", reason: "scored", citations: ANSWER_TEXT, data }));
+  }
+  if (body.includes("Judge whether")) {
+    return judgeReply(FOLLOWS);
+  }
   for (const [marker, verdict] of [
     ["REFUSE-POLICY", BREAKS],
     ["UNCITED", UNCITED],
@@ -133,7 +150,7 @@ function review(text: string, refund: number, trace?: string): VerifierInputs {
 const ANSWER_TEXT = [{ slot: "answer", locator: { json_pointer: "/text" } }];
 
 /** The requirement `id` of `result`. */
-function requirement(result: VerificationResult, id: string): CardTypes.RequirementResult {
+function requirement<T>(result: VerificationResult<T>, id: string): RequirementResult<T> {
   const found = result.outcome.requirements.find((each) => each.id === id);
   if (found === undefined) {
     throw new Error(`requirement ${id}: ${JSON.stringify(result)}`);
@@ -174,7 +191,7 @@ const test = serverTest({ provider: upstream, verificationRuntime: true, perTest
     await cards.pull(receipt.root, bundle);
     const root = declared(receipt);
     const client = WyrdClient.connect({
-      credential: (await cli.issueKey({ ...root, space: root.space ?? "default" })).key,
+      credential: (await cli.issueKey(root)).key,
     });
     const state = WyrdState.fromPath(bundle, { client });
     await state.startBifrost();
@@ -602,4 +619,187 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
     z.object({ sub_principal_id: z.string(), act_principal_id: z.string() }),
   );
   expect(attributed).toEqual([{ sub_principal_id: subjectId, act_principal_id: actorId }]);
+});
+
+/** The custom data of `scored-review`'s scored checks: a score with its category, or the step check's word count. */
+const Scored = z.union([
+  z.object({ score: z.number(), category: z.string() }).strict(),
+  z.object({ words: z.number().int() }).strict(),
+]);
+
+/** Submit `text` to `scored-review` and return its queued execution. */
+async function submitScored(desk: PolicyDesk, text: string): Promise<verify.Execution> {
+  const submitted = await desk.state.run().observe.submit("scored-review", { text }, { positional: true });
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  return submitted.execution;
+}
+
+/**
+ * Assert `result` carries `scored-review`'s readback for a four-word answer:
+ * the plain `verdict` and `{kind: verdict}` judges pass with no data, and the
+ * scored Agent, code, and step checks keep their exact custom data, failed
+ * requirements included.
+ */
+function assertScored(result: VerificationResult): void {
+  for (const id of ["polite", "on-topic"]) {
+    const plain = requirement(result, id);
+    expect(plain.outcome, id).toBe("passed");
+    expect(plain.citations, id).toEqual(ANSWER_TEXT);
+    expect(plain.data, id).toBeUndefined();
+  }
+  for (const [id, outcome, data] of [
+    ["helpful", "passed", SCORED],
+    ["well-formed", "failed", { score: 0.5, category: "format" }],
+    ["tally-counted", "passed", { words: 4 }],
+  ] as const) {
+    const scored = requirement(result, id);
+    expect(scored.outcome, id).toBe(outcome);
+    expect(scored.citations, id).toEqual(ANSWER_TEXT);
+    expect(scored.data, id).toEqual(data);
+  }
+  expect(requirement(result, "tally-counted").step).toBe("tally");
+}
+
+test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
+  const text = "Refunds follow our policy.";
+
+  assertScored(await desk.state.run().observe.verify("scored-review", { text }, { positional: true }));
+  const execution = await submitScored(desk, text);
+  const waited = await execution.wait({ timeoutMs: WAIT_MS });
+  assertScored(waited);
+  expect((await execution.status()).result).toEqual(waited);
+
+  const retained = async (executionId: string): Promise<unknown> => {
+    server.flushBifrost();
+    const rows = await (await Bifrost.connect()).sql(
+      "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+      [executionId],
+      z.object({ outcome: z.string() }),
+    );
+    expect(rows).toHaveLength(1);
+    return JSON.parse(rows[0]?.outcome ?? "null");
+  };
+  expect(await retained(waited.execution_id), "the retained outcome keeps its data").toEqual(waited.outcome);
+
+  for (const [marker, data] of Object.entries(EXACT_DATA)) {
+    const text = `${marker} refunds`;
+    const direct = await desk.state.run().observe.verify("scored-review", { text }, { positional: true });
+    expect(requirement(direct, "well-formed").data, `${marker}: direct`).toEqual(data);
+    const execution = await submitScored(desk, text);
+    const exact = await execution.wait({ timeoutMs: WAIT_MS });
+    expect(requirement(exact, "well-formed").data, `${marker}: wait`).toEqual(data);
+    expect((await execution.status()).result, `${marker}: status`).toEqual(exact);
+    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(exact.outcome);
+  }
+});
+
+/** A `tree` that, inside its data object, nests `containers` containers. */
+function deep(containers: number): unknown {
+  let tree: unknown = "s3cr3t";
+  for (let level = 1; level < containers; level += 1) {
+    tree = [tree];
+  }
+  return tree;
+}
+
+/** The `well-formed` code check's data at its inclusive bounds, by answer marker. */
+const EXACT_DATA: Record<string, unknown> = {
+  "EXACT-BYTES": { score: 0.5, category: `${"é".repeat(32_000)}\n"\u0001${"x".repeat(1_499)}` },
+  "EXACT-WIDE": { score: 0.5, category: "format", tree: Array<number>(32_747).fill(0) },
+  "DEEP-16": { score: 0.5, category: "format", tree: deep(16) },
+};
+
+test("invalid_custom_verdict_data_is_inconclusive", async ({ desk }) => {
+  for (const marker of ["BAD-DATA", "HUGE-DATA"]) {
+    const result = await desk.state
+      .run()
+      .observe.verify("scored-review", { text: `${marker} refunds` }, { positional: true });
+    for (const id of ["helpful", "well-formed"]) {
+      const refused = requirement(result, id);
+      expect(refused.outcome, `${marker} ${id}`).toBe("inconclusive");
+      expect(refused.data, `${marker} ${id}`).toBeUndefined();
+      expect(refused.reason, `${marker} ${id}`).not.toMatch(/high|xxxx/);
+    }
+    expect(requirement(result, "tally-counted").data, `${marker}: valid data elsewhere is kept`).toEqual({ words: 2 });
+    expect(result.outcome.verdict).toBe("inconclusive");
+  }
+
+  for (const marker of [
+    "MISSING-DATA",
+    "NULL-DATA",
+    "EXTRA-DATA",
+    "EXTRA-FIELD",
+    "OVER-BYTES",
+    "OVER-WIDE",
+    "DEEP-17",
+  ]) {
+    const result = await desk.state
+      .run()
+      .observe.verify("scored-review", { text: `${marker} refunds` }, { positional: true });
+    const refused = requirement(result, "well-formed");
+    expect(refused.outcome, marker).toBe("inconclusive");
+    expect(refused.data, marker).toBeUndefined();
+    expect(refused.reason, marker).not.toMatch(/s3cr3t|xxxx/);
+    expect(requirement(result, "helpful").data, `${marker}: the Agent's valid data is kept`).toEqual(SCORED);
+    expect(requirement(result, "tally-counted").data, `${marker}: valid data elsewhere is kept`).toEqual({ words: 2 });
+  }
+
+  const result = await desk.state
+    .run()
+    .observe.verify("scored-review", { text: "ENVELOPE-DATA refunds" }, { positional: true });
+  const refused = requirement(result, "plainly-checked");
+  expect(refused.outcome).toBe("inconclusive");
+  expect(refused.data).toBeUndefined();
+  expect(refused.reason).not.toMatch(/s3cr3t/);
+  expect(requirement(result, "well-formed").data, "a declared sibling keeps its data").toEqual({
+    score: 0.5,
+    category: "format",
+  });
+});
+
+test("custom_verdict_data_is_typed_on_return", async ({ desk }) => {
+  const text = "Refunds follow our policy.";
+  const expectTyped = (result: VerificationResult<z.infer<typeof Scored>>): void => {
+    expect(requirement(result, "polite").data).toBeUndefined();
+    expect(requirement(result, "helpful").data).toEqual(SCORED);
+    expect(requirement(result, "well-formed").data).toEqual({ score: 0.5, category: "format" });
+    expect(requirement(result, "tally-counted").data).toEqual({ words: 4 });
+  };
+
+  expectTyped(await desk.state.run().observe.verifyTyped("scored-review", { text }, Scored, { positional: true }));
+  const execution = await submitScored(desk, text);
+  expectTyped(await execution.waitTyped({ timeoutMs: WAIT_MS }, Scored));
+  const status = await execution.statusTyped(Scored);
+  if (status.result == null) {
+    throw new Error("a settled result");
+  }
+  expectTyped(status.result);
+});
+
+test("typed_verdict_data_mismatch_keeps_original_result", async ({ provider, desk }) => {
+  const text = "Refunds follow our policy.";
+  const numbersOnly = z.record(z.string(), z.number());
+  const mismatch = async (read: Promise<unknown>): Promise<void> => {
+    const error = await read.then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(WyrdError);
+    const refused = error as WyrdError;
+    expect(refused.code).toBe("WYRD_SDK_422_VERIFICATION_DATA_INVALID");
+    expect(refused.details).toEqual({ requirement: "helpful", path: "" });
+    expect(refused.message).not.toContain("refund");
+  };
+  const scoredCalls = (): number => provider.received.filter((request) => request.body.includes("SCORE:")).length;
+
+  await mismatch(desk.state.run().observe.verifyTyped("scored-review", { text }, numbersOnly, { positional: true }));
+  const execution = await submitScored(desk, text);
+  const ordinary = await execution.wait({ timeoutMs: WAIT_MS });
+  const judged = scoredCalls();
+  await mismatch(execution.waitTyped({ timeoutMs: WAIT_MS }, numbersOnly));
+  await mismatch(execution.statusTyped(numbersOnly));
+  expect((await execution.status()).result, "the stored result is unchanged").toEqual(ordinary);
+  expect(scoredCalls(), "nothing is judged again").toBe(judged);
 });

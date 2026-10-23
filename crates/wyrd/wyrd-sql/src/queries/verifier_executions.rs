@@ -494,9 +494,9 @@ const INSERT_DISPATCH_SQL: &str = r"
                'result_id', e.result_id,
                'binding_id', e.binding_id,
                'verifier_card_uid', e.verifier_card_uid,
-               'verifier_ref', v.space || '/' || v.name || '@' || v.version,
+               'verifier_ref', v.kind || '/' || v.name || '@' || v.version,
                'subject_uid', e.card_uid,
-               'subject_ref', s.space || '/' || s.name || '@' || s.version,
+               'subject_ref', s.kind || '/' || s.name || '@' || s.version,
                'verdict', $7::text,
                'completed_at', e.settled_at,
                'summary', $5::text

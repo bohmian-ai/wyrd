@@ -5,7 +5,6 @@ kind: Agent
 metadata:
   name: policy-reader
   version: 1.0.0
-  space: support
 spec:
   execution_route: {kind: wyrd_gateway, deployment: openai}
   tool_names: [fs.read]

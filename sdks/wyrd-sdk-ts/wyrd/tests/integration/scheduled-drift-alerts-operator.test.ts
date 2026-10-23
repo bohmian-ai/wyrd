@@ -110,7 +110,7 @@ async function record(
 ) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
   await cards.pull(watch.root, bundle);
-  const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
+  const watchKey = await cli.issueKey(watch.root);
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();
   const run = state.run();
@@ -236,7 +236,7 @@ test.for([
     (error: unknown) => error,
   );
   expect(JSON.stringify((refused as WyrdError | undefined)?.details)).toContain(field);
-  await expect(cards.resolveLatest(kind, "default", name)).rejects.toMatchObject({
+  await expect(cards.resolveLatest(kind, name)).rejects.toMatchObject({
     code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
   });
 });

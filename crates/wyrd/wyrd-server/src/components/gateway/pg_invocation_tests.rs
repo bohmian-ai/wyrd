@@ -3423,13 +3423,12 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         )
         .await
         .expect("metadata policy stores");
-    let agent: CardRef = "prod/Agent/support-agent@1.0.0".parse().expect("agent ref");
+    let agent: CardRef = "Agent/support-agent@1.0.0".parse().expect("agent ref");
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     wyrd_dev_fixtures::cards::seed_backing_card(&mut conn, &agent, Uuid::now_v7()).await;
     let uid = wyrd_sql::queries::cards::get_card_by_ref(
         &mut conn,
         agent.kind.clone(),
-        agent.space.as_ref().expect("space"),
         &agent.name,
         &agent.version,
     )
@@ -3482,7 +3481,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     assert_eq!(text("card_uid"), uid.as_str());
     assert_eq!(text("run_id"), run.as_str());
 
-    let unregistered: CardRef = "prod/Agent/ghost@1.0.0".parse().expect("ghost ref");
+    let unregistered: CardRef = "Agent/ghost@1.0.0".parse().expect("ghost ref");
     let scoped = Caller {
         principal: Principal::new(
             principal(2),

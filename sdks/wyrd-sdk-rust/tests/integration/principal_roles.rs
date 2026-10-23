@@ -46,18 +46,10 @@ async fn service_principal() -> (Deployment, PrincipalId, String) {
     let service: CardRef = declare(&cards, "cards/observe_a_run/observed-service.yaml")
         .await
         .root;
-    let [kind, name, version, space] = coordinates(&service);
-    let issued = cli::issue_key(
-        &kind,
-        &name,
-        &version,
-        &space,
-        None,
-        None,
-        Some(deployment.admin()),
-    )
-    .await
-    .expect("the CLI issues the Service key");
+    let [kind, name, version] = coordinates(&service);
+    let issued = cli::issue_key(&kind, &name, &version, None, None, Some(deployment.admin()))
+        .await
+        .expect("the CLI issues the Service key");
     let key = issued.key.expose().to_owned();
     (deployment, issued.principal_id, key)
 }

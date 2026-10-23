@@ -164,7 +164,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::ids::{CardName, CardUid};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::DeclareCardResponse;
     use wyrd_spec::registry::{
@@ -180,7 +180,6 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new(name).expect("test name"),
             version: VersionBlock::parse("1.0.0").expect("test version"),
-            space: Some(SpaceName::new("default").expect("test space")),
             uid: Some(uid),
         };
         let first = CardDeclarationOutcome {
@@ -228,7 +227,6 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new("card-1").expect("test name"),
             version: VersionBlock::parse("1.0.0").expect("test version"),
-            space: Some(SpaceName::new("default").expect("test space")),
             uid: Some(uid.clone()),
         };
         let response = DeclareCardResponse {
@@ -252,7 +250,6 @@ mod tests {
                 kind: CardKind::Prompt,
                 name: CardName::new(name).expect("test name"),
                 version: VersionBlock::parse("1.0.0").expect("test version"),
-                space: Some(SpaceName::new("default").expect("test space")),
                 uid: Some(uid),
             },
             spec_hash: "sha256:spec".to_owned(),

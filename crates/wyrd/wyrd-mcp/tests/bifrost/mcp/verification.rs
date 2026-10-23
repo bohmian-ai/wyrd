@@ -73,10 +73,10 @@ mod pg_tests {
     const SETTLE: Duration = Duration::from_secs(90);
 
     /// A ready Custom Drift Verifier the Service binds on a schedule.
-    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    scores: {type: samples, features: [score]}\n  requirements:\n    - id: score-steady\n      statement: The score stays at or under its alert threshold\n      check:\n        kind: drift\n        on: inputs.scores\n        method: Custom\n        signal: {kind: Metric, name: score}\n        condition: {kind: Statistical}\n        profile: {kind: Custom, metric_name: score, baseline_value: 1.0, alert_threshold: 0.5}\n";
+    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\nspec:\n  inputs:\n    scores: {type: samples, features: [score]}\n  requirements:\n    - id: score-steady\n      statement: The score stays at or under its alert threshold\n      check:\n        kind: drift\n        on: inputs.scores\n        method: Custom\n        signal: {kind: Metric, name: score}\n        condition: {kind: Statistical}\n        profile: {kind: Custom, metric_name: score, baseline_value: 1.0, alert_threshold: 0.5}\n";
 
     /// A Service bound to [`VERIFIER`] on a schedule over its `score` metric.
-    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n";
+    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n";
 
     /// SHA-256 of the five bytes `hello`, the evidence file the journey plans.
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -367,7 +367,7 @@ mod pg_tests {
                 ),
                 (
                     CARDS_GET,
-                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0", "space": "default" } }),
+                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0" } }),
                     "WYRD_REGISTRY_404_CARD_NOT_FOUND",
                 ),
             ] {
@@ -844,6 +844,167 @@ mod pg_tests {
             foreign_rows,
             serde_json::json!([]),
             "no result crosses tenants"
+        );
+        foreign_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A code-check Verifier whose check declares a numeric `score` as its
+    /// custom Verdict data and returns a score its schema refuses for `BAD`.
+    const SCORED: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-scored\n  version: 1.0.0\nspec:\n  inputs:\n    answer: {type: json}\n  requirements:\n    - id: scored\n      statement: The answer is scored\n      check:\n        kind: code\n        entrypoint: check\n        inputs: {answer: inputs.answer}\n        response_format:\n          kind: verdict\n          data:\n            type: object\n            properties: {score: {type: number}}\n            required: [score]\n            additionalProperties: false\n        source:\n          inline: |\n            def check(answer):\n                score = \"high\" if answer == \"BAD\" else 0.5\n                return {\"outcome\": \"failed\", \"reason\": \"scored\", \"citations\": [{\"slot\": \"answer\", \"locator\": {\"json_pointer\": \"\"}}], \"data\": {\"score\": score}}\n";
+
+    /// Custom Verdict data round-trips through every MCP result path: the
+    /// direct `verification.execute` result, a queued execution read through
+    /// `verification.get_execution`, and the retained outcome read through
+    /// `bifrost.query`. Data the declared schema refuses leaves the
+    /// requirement inconclusive with no data and no echoed payload; a caller
+    /// that may run Verifiers but not query Bifrost cannot read the retained
+    /// outcome, and another tenant cannot read the execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures, or an error when the execution never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when data is lost, invented, leaked, or readable without
+    /// authority.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn custom_verdict_data_round_trips() -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-scored-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let fixture = register_fixture(&cards).await?;
+        let root = std::env::temp_dir().join(format!("wyrd-mcp-scored-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("scored.yaml"), SCORED)?;
+        let scored = Box::pin(cards.declare_from_path(&root.join("scored.yaml"))).await?;
+        std::fs::remove_dir_all(&root)?;
+        let request = |answer: &str| -> Result<JsonValue, McpJourneyError> {
+            Ok(serde_json::json!({
+                "verifier_card_uid": scored.root.uid.as_ref().ok_or("a registered Card has a UID")?.to_string(),
+                "card_uid": fixture.service_uid,
+                "inputs": { "answer": { "kind": "json", "value": answer } },
+            }))
+        };
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let agent_client = connect(&server, &agent).await?;
+        let tools = agent_client.list_all_tools().await?;
+        for tool in [EXECUTE, ENQUEUE, GET_EXECUTION, QUERY] {
+            assert!(
+                tools.iter().any(|offered| offered.name == tool),
+                "{tool} is offered"
+            );
+        }
+
+        let judged = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request("fine")?)?)
+                .await?,
+        )?;
+        let requirement = &judged["outcome"]["requirements"][0];
+        assert_eq!(requirement["outcome"], "failed", "{judged}");
+        assert_eq!(
+            requirement["data"],
+            serde_json::json!({ "score": 0.5 }),
+            "{judged}"
+        );
+        let refused = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request("BAD")?)?)
+                .await?,
+        )?;
+        let requirement = &refused["outcome"]["requirements"][0];
+        assert_eq!(requirement["outcome"], "inconclusive", "{refused}");
+        assert!(requirement.get("data").is_none(), "{refused}");
+        assert!(
+            !requirement["reason"].to_string().contains("high"),
+            "the reason never echoes the data: {refused}"
+        );
+
+        let accepted = structured(
+            agent_client
+                .call_tool(call(ENQUEUE, request("fine")?)?)
+                .await?,
+        )?;
+        let execution_id = text(&accepted, "/execution_id")?.to_owned();
+        let state = settle(&agent_client, &execution_id).await?;
+        assert_eq!(
+            state["result"]["outcome"]["requirements"][0]["data"],
+            serde_json::json!({ "score": 0.5 }),
+            "{state}"
+        );
+        server.flush_bifrost().await?;
+        let retained = rows(
+            &agent_client,
+            format!(
+                "SELECT to_json(outcome -> 'requirements' -> 0 -> 'data') \
+                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
+            ),
+        )
+        .await?;
+        let [row] = retained.as_array().ok_or("rows are an array")?.as_slice() else {
+            return Err(format!("one retained result: {retained}").into());
+        };
+        let data: JsonValue = serde_json::from_str(row[0].as_str().ok_or("JSON text")?)?;
+        assert_eq!(data, serde_json::json!({ "score": 0.5 }));
+        agent_client.cancel().await?;
+
+        server
+            .seed_role(
+                "mcp_cards_only",
+                &[Permission::card_read(), Permission::verifier_run_any()],
+            )
+            .await?;
+        let scoped = server
+            .bootstrap_service("mcp-scored-cards-only", &["mcp_cards_only"])
+            .await?;
+        let scoped_client = connect(&server, &scoped).await?;
+        let denied = refusal(
+            scoped_client
+                .call_tool(call(
+                    QUERY,
+                    serde_json::json!({
+                        "sql": format!("SELECT outcome FROM vala.verification.results WHERE execution_id = '{execution_id}'"),
+                        "max_rows": 1
+                    }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            !denied.contains("0.5"),
+            "the payload stays hidden: {denied}"
+        );
+        scoped_client.cancel().await?;
+
+        let other_tenant = server.seed_tenant("mcp-scored-other").await?;
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "mcp-scored-foreign", &["admin"])
+            .await?;
+        let foreign_client = connect(&server, &foreign).await?;
+        let foreign_read = refusal(
+            foreign_client
+                .call_tool(call(
+                    GET_EXECUTION,
+                    serde_json::json!({ "execution_id": execution_id }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            foreign_read.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+            "{foreign_read}"
         );
         foreign_client.cancel().await?;
         server.shutdown().await?;

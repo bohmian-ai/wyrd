@@ -115,6 +115,32 @@ def test_response_format_json_schema_sets_the_response_schema() -> None:
     assert prompt.response_schema_name == "answer"
 
 
+def test_verdict_format_keeps_its_name_and_takes_a_model_for_data() -> None:
+    from pydantic import BaseModel
+
+    class Judge(BaseModel):
+        score: float
+
+    plain = Prompt("Judge", "gpt-4o", provider="openai", response_format="verdict")
+    scored = Prompt.anthropic(
+        "claude-sonnet-4",
+        messages="Judge",
+        response_format={"kind": "verdict", "data": Judge},
+    )
+
+    assert json.loads(str(plain))["response_format"] == "verdict"
+    assert plain.response_schema is not None
+    assert set(plain.response_schema["required"]) == {"outcome", "reason", "citations"}
+    authored = json.loads(str(scored))["response_format"]
+    assert authored["kind"] == "verdict"
+    assert authored["data"]["properties"] == {"score": {"title": "Score", "type": "number"}}
+    assert scored.response_schema is not None
+    assert "data" in scored.response_schema["required"]
+    for refused in ({"kind": "verdict", "extra": 1}, {"kind": "unknown"}, "unknown"):
+        with pytest.raises(WyrdError):
+            Prompt("Judge", "gpt-4o", provider="openai", response_format=refused)
+
+
 @pytest.mark.parametrize(
     ("prompt", "provider"),
     [

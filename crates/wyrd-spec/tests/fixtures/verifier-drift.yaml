@@ -3,7 +3,6 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  space: retention
   name: churn-input-drift
   version: 1.0.0
 
@@ -25,7 +24,6 @@ spec:
           baseline_ref:
             kind: Data
             name: churn-training
-            space: retention
             version: 1.0.0
           features: [tenure_months, monthly_spend]
         condition:

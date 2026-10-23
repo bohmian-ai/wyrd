@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use reqwest::Method;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::time::Instant;
 use wyrd_spec::error::WyrdError;
@@ -166,6 +167,52 @@ impl Execution {
             tokio::time::sleep_until(deadline.min(Instant::now() + pause)).await;
             pause = (pause * 2).min(MAX_POLL);
         }
+    }
+
+    /// [`Execution::status`], with a present result's custom `data` decoded
+    /// as `T`.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::status`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not
+    /// decode as `T`.
+    pub async fn status_typed<T: DeserializeOwned>(
+        &self,
+    ) -> Result<VerificationExecutionState<T>, WyrdError> {
+        self.status().await?.decode_data()
+    }
+
+    /// [`Execution::wait`], with the result's custom `data` decoded as `T`.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::wait`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not
+    /// decode as `T`.
+    ///
+    /// # Cancellation
+    /// Dropping the future stops polling; the execution is unaffected.
+    pub async fn wait_typed<T: DeserializeOwned>(
+        &self,
+        timeout: Duration,
+    ) -> Result<VerificationResult<T>, WyrdError> {
+        self.wait(timeout).await?.decode_data()
+    }
+
+    /// [`Execution::wait_until`], with the result's custom `data` decoded as
+    /// `T`.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::wait_until`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not
+    /// decode as `T`.
+    ///
+    /// # Cancellation
+    /// Dropping the future stops polling; the execution is unaffected.
+    pub async fn wait_until_typed<T: DeserializeOwned>(
+        &self,
+        deadline: Instant,
+    ) -> Result<VerificationResult<T>, WyrdError> {
+        self.wait_until(deadline).await?.decode_data()
     }
 
     /// The `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` error a wait on `id`

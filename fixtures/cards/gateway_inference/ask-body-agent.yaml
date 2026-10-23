@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: ask-body-agent
   version: 1.0.0
-  space: default
 spec:
   prompt: ./ask-body-prompt.yaml
   execution_route:

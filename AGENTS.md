@@ -100,7 +100,7 @@ These are not open for discussion in a task or review.
   `Trigger`, `Operator`. Drift and Agent judging are Verifier check kinds.
   `CardKind::External` is not registrable. `Tool`, `Skill`, and `SubAgent` are
   not Card kinds. `CardRef` is `kind`, `name`, one `version`, optional
-  `space`, optional `uid`.
+  `uid`; Card identity is tenant, kind, name, and version.
 - **Dependencies.** `wyrd-spec` is free of IO, async, tokio, SQL, PyO3, cloud
   SDKs, object stores, Arrow, DataFusion, Iceberg, and Delta. Client-tier
   crates never depend on `sqlx`, cloud SDKs, `datafusion`, or `deltalake`.

@@ -154,6 +154,7 @@ impl EvidenceInvestigation {
                     reason: "seeded failure".to_owned(),
                     actual: None,
                     citations: Vec::new(),
+                    data: None,
                     detail,
                     check: serde_json::from_value::<Check>(check)?,
                     provenance: None,

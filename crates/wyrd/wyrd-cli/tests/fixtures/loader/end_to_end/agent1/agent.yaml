@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
-  space: wyrd-team
   name: churn-triage
   version: "1.0.0"
 spec:

@@ -7,7 +7,6 @@ kind: Verifier
 metadata:
   name: policy-check
   version: 1.0.0
-  space: support
 spec:
   description: A support answer keeps to the refund policy.
   inputs:

@@ -111,7 +111,7 @@ This page is generated from the error definitions in the Wyrd source.
 | --- | ---: | --- | --- |
 | `WYRD_CLI_400_CARD_LOAD` | 400 | Card load failed | Fix the card files and local references, then retry. |
 | `WYRD_CLI_400_CLIENT_CONFIG` | 400 | Client configuration failed | Pass a valid server URL and configure a Wyrd credential. |
-| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --space, --name, and --version. |
+| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --name, and --version. |
 | `WYRD_CLI_400_INVALID_ARGUMENT` | 400 | Invalid CLI argument | Fix the argument and retry. |
 | `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | MCP host selection required | Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected. |
 | `WYRD_CLI_400_QUERY_CONFIG` | 400 | Query configuration missing | Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain. |
@@ -122,7 +122,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_401_NO_REFRESH_TOKEN` | 401 | No refresh token | Set WYRD_REFRESH_TOKEN to the refresh token to rotate. |
 | `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | MCP host installation failed | Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected. |
 | `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | 409 | Server installation incomplete | Remove the named version directory, then rerun `wyrd server install`; nothing was activated. |
-| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry. |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (uv add --upgrade wyrd-ai, or pnpm add wyrd-ai@latest), then retry. |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | Server release unverified | Retry the install; if it fails again, report the release. The current installation is unchanged. |
 | `WYRD_CLI_500_IO` | 500 | CLI filesystem IO failed | Check file paths and permissions, then retry. |
 | `WYRD_CLI_500_OUTPUT` | 500 | CLI output failed | Retry the command or use --format text. |
@@ -266,7 +266,7 @@ This page is generated from the error definitions in the Wyrd source.
 
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
-| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
+| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
 | `WYRD_REGISTRY_400_CURSOR_MISMATCH` | 400 | Cursor does not match filters | Discard the cursor and restart pagination with the current filters. |
 | `WYRD_REGISTRY_400_DEPENDENCY_CYCLE` | 400 | Card dependency cycle | Remove the cyclic CardRef dependency and submit an acyclic card graph. |
 | `WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION` | 400 | Heavy artifact submission must be standalone | Register the artifact-bearing card alone, then reference it from a later composite request. |
@@ -283,7 +283,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` | 400 | Unresolved path CardRef | Expand path references in the loader before submitting the card. |
 | `WYRD_REGISTRY_400_UPLOAD_INTERRUPTED` | 400 | Upload interrupted | Retry the upload while the declaration operation remains pending. |
 | `WYRD_REGISTRY_400_VERSION_REQUIRED` | 400 | `metadata.version` is present but empty | Provide a valid semver string (e.g. `"1.0.0"`) or omit `metadata.version` entirely to let the server auto-assign the next version. |
-| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
+| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key conflict | Use the original request with this key or choose a new key for different content. |
 | `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-declare with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version. |
 | `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Declaration operation expired | Start a new declaration with a new idempotency key. |
@@ -314,6 +314,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | A tracer provider is already installed | Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry. |
+| `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
 | `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | 504 | Verification execution did not settle in time | Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again. |
@@ -344,7 +345,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR` | 400 | Duplicate binding Operator | Remove the duplicate on_failure Operator from this binding. |
-| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, space, name, version) identity at most once per request. |
+| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, name, version) identity at most once per request. |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | 400 | Duplicate verification binding | Remove the duplicate verified_by entry; one subject occurrence binds each Verifier version once. |
 | `WYRD_SPEC_400_INVALID_BINDING_REF_KIND` | 400 | Invalid verification binding reference kind | Set runs_on to a Trigger CardRef or inline TriggerSpec, and each on_failure entry to an Operator CardRef or inline OperatorSpec. |
 | `WYRD_SPEC_400_INVALID_OPERATOR` | 400 | Invalid Operator | Reference only failure-context fields in `{{field}}` templates, keep the URL origin literal https, and do not author server-owned headers. |

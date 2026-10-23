@@ -1,7 +1,6 @@
 //! Principal revocation contracts.
 
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+use schemars::{Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::PrincipalKindTag;
@@ -29,15 +28,7 @@ pub struct RevokePrincipalRequest {
 /// string, so a client cannot publish a revocation with no stated cause or an
 /// unbounded one.
 fn reason_schema(_gen: &mut SchemaGenerator) -> Schema {
-    Schema::Object(SchemaObject {
-        instance_type: Some(InstanceType::String.into()),
-        string: Some(Box::new(StringValidation {
-            min_length: Some(1),
-            max_length: Some(REASON_MAX_BYTES),
-            pattern: None,
-        })),
-        ..Default::default()
-    })
+    json_schema!({ "type": "string", "minLength": 1, "maxLength": REASON_MAX_BYTES })
 }
 
 #[cfg(test)]

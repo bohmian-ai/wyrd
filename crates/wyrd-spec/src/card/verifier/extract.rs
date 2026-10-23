@@ -174,7 +174,7 @@ impl ExtractOutput {
         if let Some(Value::Array(branches)) = schema.get_mut("oneOf") {
             branches.retain(|branch| {
                 branch
-                    .pointer("/properties/format/enum/0")
+                    .pointer("/properties/format/const")
                     .and_then(Value::as_str)
                     .is_some_and(|tag| formats.iter().any(|format| format.as_str() == tag))
             });
@@ -243,9 +243,9 @@ mod tests {
         let schema = ExtractOutput::schema_for(&[MediaFormat::Pptx, MediaFormat::Png]);
         let branches = schema["oneOf"].as_array().expect("oneOf");
         assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0]["properties"]["format"]["enum"], json!(["pptx"]));
+        assert_eq!(branches[0]["properties"]["format"]["const"], json!("pptx"));
         assert_eq!(branches[0]["additionalProperties"], json!(false));
-        let slide = &schema["definitions"]["PptxSlide"];
+        let slide = &schema["$defs"]["PptxSlide"];
         assert!(
             slide["required"]
                 .as_array()

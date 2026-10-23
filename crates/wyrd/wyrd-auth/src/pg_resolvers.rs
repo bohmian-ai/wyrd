@@ -740,7 +740,7 @@ mod pg_tests {
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{upsert_trusted_issuer, upsert_workload_binding};
 
@@ -982,7 +982,6 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("my-model").expect("card name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: Some(SpaceName::new("prod").expect("space")),
             uid: None,
         };
         let binding = WorkloadBinding {

@@ -29,10 +29,6 @@ class CheckCard:
         """Card kind wire name, such as ``"Service"``."""
         ...
     @property
-    def space(self) -> str | None:
-        """Authored space, or ``None`` for the default space."""
-        ...
-    @property
     def name(self) -> str:
         """Card name."""
         ...

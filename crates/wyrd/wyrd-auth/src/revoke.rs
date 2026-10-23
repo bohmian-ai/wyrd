@@ -129,7 +129,7 @@ pub(crate) mod pg_tests {
     use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
         insert_human_refresh_token, insert_refresh_token, insert_service_account, insert_user,
@@ -148,7 +148,6 @@ pub(crate) mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new("test").expect("valid space")),
             uid: None,
         }
     }
@@ -385,7 +384,6 @@ pub(crate) mod pg_tests {
             kind: CardKind::Agent,
             name: CardName::new("agent-revoke-test").expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new("test").expect("valid space")),
             uid: None,
         };
         seed_backing_card(&mut conn, &card_ref, creator).await;

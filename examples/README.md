@@ -21,4 +21,3 @@ Older examples keep their earlier layout until their guides are rewritten:
 - `gateway-setup/` sets up named provider deployments with the installed CLI.
 - `support-desk/` is the verified support-desk Service in Rust, Python, and
   TypeScript; `support-desk-app/` is its API application.
-- `readme/` holds the repository README's examples.

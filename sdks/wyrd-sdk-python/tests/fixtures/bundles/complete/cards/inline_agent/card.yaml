@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
-  space: default
   name: inline
   version: 1.0.0
   uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
@@ -12,7 +11,6 @@ spec:
     kind: Prompt
     name: triage
     version: 1.0.0
-    space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
   execution_route:
     kind: native
@@ -21,13 +19,12 @@ spec:
   verified_by: []
 relationships:
   outbound:
-  - default/Prompt/triage@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+  - Prompt/triage@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
   outbound_refs:
   - ref:
       kind: Prompt
       name: triage
       version: 1.0.0
-      space: default
       uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
     alias: null
   inbound: []

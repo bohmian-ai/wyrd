@@ -84,7 +84,7 @@ def test_stale_login_refreshes_and_saves_the_renewal(
     sso_server.expire_saved_login(config_home, FIXTURE_TENANT)
     assert sso_server.saved_login_is_stale(config_home, FIXTURE_TENANT)
 
-    Cards(WyrdClient(server_url=sso_server.base_url)).prompt.list(space="default")
+    Cards(WyrdClient(server_url=sso_server.base_url)).prompt.list()
 
     assert not sso_server.saved_login_is_stale(config_home, FIXTURE_TENANT)
 
@@ -98,7 +98,7 @@ def test_revoked_login_is_refused(
     sso_server.expire_saved_login(config_home, FIXTURE_TENANT)
 
     with pytest.raises(WyrdError) as refused:
-        Cards(WyrdClient(server_url=sso_server.base_url)).prompt.list(space="default")
+        Cards(WyrdClient(server_url=sso_server.base_url)).prompt.list()
     assert refused.value.code == "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE"
 
 

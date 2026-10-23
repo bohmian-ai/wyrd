@@ -4,7 +4,7 @@
 OTLP/HTTP protobuf exporters for one ``WyrdClient``: every export asks the
 client for its current access token and sends it as ``x-wyrd-access-token``,
 so a long-lived exporter keeps working after any one token expires. They need
-the ``otel`` extra (``pip install 'wyrd-ai[otel]'``).
+the ``otel`` extra (``uv add 'wyrd-ai[otel]'``).
 
 ``Run.__enter__``/``__exit__`` delegate here so spans created inside
 ``with state.run(...)`` carry the record-level ``wyrd.card_uid`` and
@@ -197,7 +197,7 @@ def _exit_run(card_uid: str, run_id: str) -> None:
 
 
 _EXPORTER_EXTRA = (
-    "Wyrd OTLP exporters need the otel extra: pip install 'wyrd-ai[otel]' "
+    "Wyrd OTLP exporters need the otel extra: uv add 'wyrd-ai[otel]' "
     "(opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http)"
 )
 

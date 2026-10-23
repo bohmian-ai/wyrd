@@ -1,0 +1,233 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="430" viewBox="0 0 860 430" role="img" aria-label="Where does Wyrd sit next to my app, CI, and coding agent?"><style>/* SVG grammar */
+text {
+  font-family: "Familjen Grotesk", system-ui, sans-serif;
+}
+.wd-t-title {
+  fill: #e6e4da;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.wd-t-sub {
+  fill: #8f92a5;
+  font: 10.5px "Fragment Mono", ui-monospace, monospace;
+}
+.wd-t-code {
+  fill: #e6e4da;
+  font: 12px "Fragment Mono", ui-monospace, monospace;
+  font-weight: 600;
+}
+.wd-t-ink {
+  fill: #0b0c12;
+}
+.wd-t-col,
+.wd-t-yes {
+  fill: #e6e4da;
+  font: 11px "Fragment Mono", ui-monospace, monospace;
+}
+.wd-t-colk,
+.wd-t-no {
+  fill: #8f92a5;
+  font: 11px "Fragment Mono", ui-monospace, monospace;
+}
+.wd-t-group,
+.wd-t-lane {
+  fill: #8f92a5;
+  font: 10.5px "Fragment Mono", ui-monospace, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.wd-t-target {
+  fill: #e6e4da;
+  font: 12.5px "Fragment Mono", ui-monospace, monospace;
+  font-weight: 600;
+}
+.wd-t-label {
+  fill: #8f92a5;
+  font: 10.5px "Fragment Mono", ui-monospace, monospace;
+  paint-order: stroke;
+  stroke: #12141c;
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.wd-t-x {
+  fill: #e2484d;
+  font: 12px "Fragment Mono", ui-monospace, monospace;
+}
+.wd-t-stage {
+  fill: #e6e4da;
+  font: 11px "Fragment Mono", ui-monospace, monospace;
+}
+.wd-t-stagesub {
+  fill: #8f92a5;
+  font: 10.5px "Familjen Grotesk", system-ui, sans-serif;
+}
+.wd-f-surface {
+  fill: #12141c;
+}
+.wd-f-surface2 {
+  fill: #1a1d28;
+}
+.wd-f-declare {
+  fill: #1a2040;
+}
+.wd-f-evidence {
+  fill: #c5f23b;
+}
+.wd-s-border {
+  stroke: #252838;
+  stroke-width: 1;
+}
+.wd-s-declare {
+  stroke: #7a8cff;
+  stroke-width: 1;
+}
+.wd-s-text {
+  stroke: #e6e4da;
+  stroke-width: 1;
+}
+.wd-s-dash {
+  stroke-dasharray: 4 3;
+}
+.wd-group {
+  fill: none;
+  stroke: #252838;
+  stroke-dasharray: 2 4;
+}
+.wd-tone-progress {
+  stroke: #7a8cff;
+  stroke-width: 2;
+}
+.wd-tone-ok {
+  stroke: #3dbe5a;
+  stroke-width: 2;
+}
+.wd-tone-warn {
+  stroke: #f0a13c;
+  stroke-width: 2;
+}
+.wd-tone-danger {
+  stroke: #e2484d;
+  stroke-width: 2;
+}
+.wd-tone-muted {
+  stroke: #8f92a5;
+  stroke-width: 2;
+}
+.wd-line {
+  fill: none;
+  stroke-width: 1;
+}
+.wd-k-data .wd-line {
+  stroke: #e6e4da;
+}
+.wd-k-control .wd-line {
+  stroke: #7a8cff;
+}
+.wd-k-ref .wd-line {
+  stroke: #8f92a5;
+  stroke-dasharray: 3 3;
+}
+.wd-k-best .wd-line {
+  stroke: #e6e4da;
+  stroke-dasharray: 5 4;
+}
+.wd-mk-data {
+  fill: #e6e4da;
+}
+.wd-mk-control {
+  fill: #7a8cff;
+}
+.wd-mk-ref {
+  fill: #8f92a5;
+}
+.wd-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  cursor: pointer;
+}
+.wd-n,
+.wd-e {
+  transition: opacity 220ms ease-out;
+}
+.wd-focus .wd-n:not(.on),
+.wd-focus .wd-e:not(.on) {
+  opacity: 0.22;
+}
+.wd-e.on .wd-line {
+  stroke-width: 2;
+}
+.wd-n.clickable {
+  cursor: pointer;
+}
+.wd-n:focus-visible {
+  outline: none;
+}
+.wd-n .wd-halo {
+  fill: none;
+}
+.wd-n.sel .wd-halo,
+.wd-n:focus-visible .wd-halo {
+  stroke: #7a8cff;
+  stroke-width: 2;
+}
+.wd-pk-data {
+  fill: #c5f23b;
+  stroke: #0b0c12;
+  stroke-width: 1;
+}
+.wd-pk-control {
+  fill: #7a8cff;
+}
+.wd-lifeline {
+  stroke: #252838;
+  stroke-dasharray: 2 4;
+}
+.wd-lane {
+  fill: #1a1d28;
+}
+.wd-axis {
+  stroke: #252838;
+}
+.wd-tick {
+  stroke: #8f92a5;
+}
+.wd-cursor {
+  stroke: #7a8cff;
+  stroke-width: 1.5;
+}
+.wd-peer {
+  fill: none;
+  stroke: #7a8cff;
+  stroke-dasharray: 2 3;
+}
+.wd-pod > .wd-box {
+  fill: #12141c;
+  stroke: #252838;
+}
+.wd-pod.hl > .wd-box {
+  stroke: #7a8cff;
+  stroke-width: 2;
+}
+.wd-facet .wd-pod.dim,
+.wd-facet .wd-chip.dim {
+  opacity: 0.3;
+}
+.wd-chip rect {
+  fill: #1a1d28;
+  stroke: #252838;
+}
+.wd-chip.off rect {
+  fill: none;
+  stroke-dasharray: 3 3;
+}
+.wd-chip.hl rect {
+  fill: #1a2040;
+  stroke: #7a8cff;
+  stroke-width: 2;
+}
+.wd-pod,
+.wd-chip {
+  transition: opacity 220ms ease-out;
+}
+</style><rect width="100%" height="100%" fill="#12141c"/><defs><marker id="s1-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="wd-mk-data"></path></marker><marker id="s1-control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="wd-mk-control"></path></marker><marker id="s1-ref" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="wd-mk-ref"></path></marker></defs><rect x="252" y="14" width="360" height="402" rx="2" class="wd-group"></rect><text x="262" y="30" class="wd-t-group">wyrd-server</text><g class="wd-e wd-k-control"><path d="M204 59 L284 59" class="wd-line" marker-end="url(#s1-control)"></path><text x="244" y="51" class="wd-t-label" text-anchor="middle">wyrd declare</text></g><g class="wd-e wd-k-control"><path d="M204 190 L240 190 L240 90 L284 90" class="wd-line" marker-end="url(#s1-control)"></path><text x="246" y="140" class="wd-t-label" text-anchor="start">declare</text></g><g class="wd-e wd-k-control"><path d="M204 211 L284 211" class="wd-line" marker-end="url(#s1-control)"></path><text x="262" y="203" class="wd-t-label" text-anchor="middle">verify</text></g><g class="wd-e wd-k-data"><path d="M204 232 L240 232 L240 340 L284 340" class="wd-line" marker-end="url(#s1-data)"></path><text x="246" y="290" class="wd-t-label" text-anchor="start">observe</text></g><g class="wd-e wd-k-control"><path d="M204 372 L284 372" class="wd-line" marker-end="url(#s1-control)"></path><text x="244" y="364" class="wd-t-label" text-anchor="middle">MCP</text></g><g class="wd-e wd-k-ref"><path d="M432 110 L432 176" class="wd-line" marker-end="url(#s1-ref)"></path><text x="440" y="147" class="wd-t-label" text-anchor="start">bindings</text></g><g class="wd-e wd-k-data"><path d="M432 246 L432 312" class="wd-line" marker-end="url(#s1-data)"></path><text x="440" y="283" class="wd-t-label" text-anchor="start">verdicts</text></g><g class="wd-e wd-k-ref"><path d="M580 75 L660 75" class="wd-line" marker-end="url(#s1-ref)"></path></g><g class="wd-e wd-k-ref"><path d="M580 211 L630 211 L630 140 L660 140" class="wd-line" marker-end="url(#s1-ref)"></path></g><g class="wd-e wd-k-ref"><path d="M580 330 L640 330 L640 160 L660 160" class="wd-line" marker-end="url(#s1-ref)"></path></g><g class="wd-e wd-k-data"><path d="M580 360 L660 360" class="wd-line" marker-end="url(#s1-data)"></path><text x="620" y="352" class="wd-t-label" text-anchor="middle">Parquet</text></g><g class="wd-n"><rect x="16" y="30" width="188" height="58" rx="2" class="wd-f-surface2 wd-s-border wd-s-dash"></rect><rect x="12" y="26" width="196" height="66" rx="3" class="wd-halo"></rect><text x="110" y="57" class="wd-t-title" text-anchor="middle">CI</text><text x="110" y="73" class="wd-t-sub" text-anchor="middle">wyrd CLI</text></g><g class="wd-n"><rect x="16" y="176" width="188" height="70" rx="2" class="wd-f-surface2 wd-s-border wd-s-dash"></rect><rect x="12" y="172" width="196" height="78" rx="3" class="wd-halo"></rect><text x="110" y="209" class="wd-t-title" text-anchor="middle">Your app</text><text x="110" y="225" class="wd-t-sub" text-anchor="middle">Python · Rust · TypeScript SDK</text></g><g class="wd-n"><rect x="16" y="343" width="188" height="58" rx="2" class="wd-f-surface2 wd-s-border wd-s-dash"></rect><rect x="12" y="339" width="196" height="66" rx="3" class="wd-halo"></rect><text x="110" y="370" class="wd-t-title" text-anchor="middle">Coding agent</text><text x="110" y="386" class="wd-t-sub" text-anchor="middle">MCP</text></g><g class="wd-n"><rect x="284" y="40" width="296" height="70" rx="2" class="wd-f-declare wd-s-declare"></rect><rect x="280" y="36" width="304" height="78" rx="3" class="wd-halo"></rect><text x="432" y="73" class="wd-t-title" text-anchor="middle">Declarations</text><text x="432" y="89" class="wd-t-sub" text-anchor="middle">Services · Verifiers · versions</text></g><g class="wd-n"><rect x="284" y="176" width="296" height="70" rx="2" class="wd-f-declare wd-s-declare"></rect><rect x="280" y="172" width="304" height="78" rx="3" class="wd-halo"></rect><text x="432" y="209" class="wd-t-title" text-anchor="middle">Verification engine</text><text x="432" y="225" class="wd-t-sub" text-anchor="middle">checks · verdicts</text></g><g class="wd-n"><rect x="284" y="312" width="296" height="70" rx="2" class="wd-f-declare wd-s-declare"></rect><rect x="280" y="308" width="304" height="78" rx="3" class="wd-halo"></rect><text x="432" y="345" class="wd-t-title" text-anchor="middle">Bifrost</text><text x="432" y="361" class="wd-t-sub" text-anchor="middle">telemetry · custom data · evidence</text></g><g class="wd-n"><path d="M660 59 a92 9 0 0 1 184 0 v112 a92 9 0 0 1 -184 0 z" class="wd-f-surface2 wd-s-border"></path><path d="M660 59 a92 9 0 0 0 184 0" class="wd-s-border" fill="none"></path><path d="M657 59 a95 12 0 0 1 190 0 v112 a95 12 0 0 1 -190 0 z" class="wd-halo"></path><text x="752" y="113" class="wd-t-title" text-anchor="middle">Postgres</text><text x="752" y="129" class="wd-t-sub" text-anchor="middle">declarations · coordination</text></g><g class="wd-n"><path d="M660 259 a92 9 0 0 1 184 0 v112 a92 9 0 0 1 -184 0 z" class="wd-f-surface2 wd-s-border"></path><path d="M660 259 a92 9 0 0 0 184 0" class="wd-s-border" fill="none"></path><path d="M657 259 a95 12 0 0 1 190 0 v112 a95 12 0 0 1 -190 0 z" class="wd-halo"></path><text x="752" y="313" class="wd-t-title" text-anchor="middle">Object storage</text><text x="752" y="329" class="wd-t-sub" text-anchor="middle">evidence · artifacts</text></g></svg>

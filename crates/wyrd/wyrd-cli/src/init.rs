@@ -1800,7 +1800,7 @@ async fn proven(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
         .map_err(|_| dev_error("saved credential", "the active tenant has no usable saved credential or its configuration selects another identity; restore its key, correct the selector, or explicitly recover tenant administration through the platform"))?;
     client.access_token().await.map_err(|_| dev_error("saved credential", "the tenant is active but its saved key is missing, invalid, or expired; restore that key or explicitly recover tenant administration through the platform"))?;
     Cards::connect_with(&client).await?.list(ListCardsRequest {
-            kind: None, space: None, name: None, version_range: None,
+            kind: None, name: None, version_range: None,
             status: None, filter: None, include_prerelease: false,
             limit: Some(1), cursor: None,
         }).await

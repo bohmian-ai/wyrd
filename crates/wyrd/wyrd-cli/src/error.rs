@@ -188,7 +188,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_DELETE_SELECTOR_EXACT",
         status = 400,
         title = "Delete selector is not exact",
-        remediation = "Pass --uid, or pass --kind, --space, --name, and --version."
+        remediation = "Pass --uid, or pass --kind, --name, and --version."
     )]
     DeleteSelectorRequiresExact,
 
@@ -258,7 +258,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE",
         status = 409,
         title = "Server version incompatible",
-        remediation = "Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry."
+        remediation = "Upgrade the wyrd CLI to the server's version line (uv add --upgrade wyrd-ai, or pnpm add wyrd-ai@latest), then retry."
     )]
     ServerVersionIncompatible {
         /// This CLI's version.

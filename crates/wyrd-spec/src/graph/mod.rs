@@ -53,11 +53,16 @@ impl Hash for Edge {
     }
 }
 
+/// Feed one graph reference into a [`Node`] or [`Edge`] hash.
+///
+/// It hashes every field `CardRef` equality compares: flat `kind`, `name`,
+/// `version`, and the optional `uid`, keeping `Hash` consistent with `Eq`.
+/// UID-free sibling matching is a separate rule, owned by
+/// [`CardRef::same_identity`].
 fn hash_card_ref<H: Hasher>(card_ref: &CardRef, state: &mut H) {
     card_ref.kind.hash(state);
     card_ref.name.hash(state);
     card_ref.version.hash(state);
-    card_ref.space.hash(state);
     card_ref.uid.hash(state);
 }
 
@@ -79,10 +84,15 @@ pub struct RootPick {
 
 /// Prepare submissions for the pure graph operations.
 ///
-/// Graph identity is `(kind, space, name, version)`. Auto and range version
+/// Graph identity is `(kind, name, version)`. Auto and range version
 /// requests therefore receive a
 /// graph-only placeholder. The authored submissions are cloned and never
 /// mutated; registration keeps their original version selection.
+///
+/// # Errors
+/// Returns [`GraphError::Empty`] when there are no submissions, and
+/// [`GraphError::InvalidSpec`] if the fixed `0.0.0` placeholder cannot be
+/// built.
 pub fn graph_ready_submissions(
     submissions: &[CardSubmission],
 ) -> Result<Vec<CardSubmission>, GraphError> {
@@ -97,9 +107,6 @@ pub fn graph_ready_submissions(
         .iter()
         .cloned()
         .map(|mut submission| {
-            if submission.metadata.space.is_none() {
-                return Err(GraphError::MissingSpace);
-            }
             if !submission
                 .metadata
                 .version
@@ -115,14 +122,14 @@ pub fn graph_ready_submissions(
 
 /// Build the submission graph from typed sibling references in each spec.
 ///
-/// A sibling reference becomes an edge only when its `(kind, space, name, version)`
+/// A sibling reference becomes an edge only when its `(kind, name, version)`
 /// identity matches another submission in the same request. External references are
 /// deliberately ignored, even when they happen to have the same identity as a
 /// submission; external resolution belongs to the server registry boundary.
 ///
 /// The register boundary supplies resolved metadata before calling this helper:
-/// each submission must have a concrete version and space. The graph itself
-/// compares nodes by `(kind, space, name, version)`, so only the server UID
+/// each submission must have a concrete version. The graph itself
+/// compares nodes by `(kind, name, version)`, so only the server UID
 /// does not affect sibling matching.
 ///
 /// # Errors
@@ -185,12 +192,16 @@ pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
     card_ref.identity_key()
 }
 
+/// Build the graph reference of one submission with an exact version pin.
+///
+/// Returns `None` for an auto or range version, which has no exact identity
+/// until [`graph_ready_submissions`] gives it a placeholder. A caller-asserted
+/// `metadata.uid` is preserved so graph equality keeps it.
 pub(super) fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
     Some(CardRef {
         kind: submission.kind.clone(),
         name: submission.metadata.name.clone(),
         version: submission.metadata.resolved_pin()?.clone(),
-        space: Some(submission.metadata.space.clone()?),
         uid: submission.metadata.uid.clone(),
     })
 }
@@ -211,7 +222,6 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }
@@ -224,7 +234,6 @@ mod tests {
                 name: card_ref.name.clone(),
                 version: Some(VersionSpec::Pin(card_ref.version.clone())),
                 bump: None,
-                space: card_ref.space.clone(),
                 uid: card_ref.uid.clone(),
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),

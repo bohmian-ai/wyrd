@@ -105,7 +105,7 @@ dependencies, invariants, or one responsibility. Prefer precise owners
 ## Types
 
 - Durable identifiers are newtypes (`TenantId`, `PrincipalId`, `RunId`,
-  `CardUid`, `CardName`, `SpaceName` in `wyrd_spec::ids` and `wyrd-runtime`).
+  `CardUid`, `CardName` in `wyrd_spec::ids` and `wyrd-runtime`).
   Never leak raw primitives across module boundaries.
 - Closed sets are enums dispatched by `match`, not `Box<dyn Trait>`. See
   `crates/wyrd/wyrd-storage/src/signer.rs::BackendSigner`. No catch-all `_ =>`

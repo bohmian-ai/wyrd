@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: refund-verifier
   version: 1.0.0
-  space: default
 spec:
   description: The order conversation's latest refund fact is within its deadline.
   inputs:

@@ -14,7 +14,9 @@ use serde_json::{Map, Value};
 
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
-use crate::prompt::{Prompt, check_model, check_output_schema, media_placeholder_regex};
+use crate::prompt::{
+    NamedFormat, Prompt, check_model, check_output_schema, media_placeholder_regex,
+};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
@@ -28,6 +30,7 @@ use crate::wire::openai_chat::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiContentPart, OpenAiJsonSchema,
     OpenAiMessageContent, OpenAiReasoningEffort, OpenAiResponseFormat, OpenAiStop,
 };
+use crate::wire::openai_responses::{OpenAiResponsesText, OpenAiTextResponseFormat};
 
 /// Schema name every portable structured-output request carries.
 ///
@@ -64,9 +67,120 @@ pub struct AuthoredPrompt {
     /// Portable generation settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<PortableSettings>,
-    /// Portable structured output: one JSON Schema object.
+    /// Structured output: one portable JSON Schema object, or a format its
+    /// host names, which may also accompany a native `body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<Map<String, Value>>,
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// An authored `response_format`.
+///
+/// A string or an object with `kind` is a [`NamedResponseFormat`]; any other
+/// object is a JSON Schema. Both serialize exactly as authored.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum ResponseFormat {
+    /// A format named by the embedding host, such as Wyrd's `verdict`.
+    Named(NamedResponseFormat),
+    /// One JSON Schema object; portable Prompts only.
+    Schema(Map<String, Value>),
+}
+
+/// A named response format, such as Wyrd's `verdict`: the name alone, or
+/// `{kind, data}` with a schema for the format's custom data.
+///
+/// Skald owns no names; the embedding host resolves them through
+/// [`AuthoredPrompt::compile_with`], and an unresolved Prompt cannot render.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum NamedResponseFormat {
+    /// The scalar form, such as `verdict`.
+    Name(String),
+    /// The expanded form, with an optional host-defined `data` schema.
+    Expanded {
+        /// The format name.
+        kind: String,
+        /// Host-defined schema of the format's custom data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<Map<String, Value>>,
+    },
+}
+
+impl NamedResponseFormat {
+    /// The format name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Expanded { kind: name, .. } => name,
+        }
+    }
+
+    /// The declared custom-data schema, when the expanded form has one.
+    #[must_use]
+    pub fn data(&self) -> Option<&Map<String, Value>> {
+        match self {
+            Self::Name(_) => None,
+            Self::Expanded { data, .. } => data.as_ref(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NamedResponseFormat {
+    /// Decodes a string as the scalar form and an object as the expanded
+    /// form.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for another JSON type, a missing
+    /// `kind`, or a member other than `kind` and `data`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The strict wire shape of the expanded form.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Expanded {
+            /// The format name.
+            kind: String,
+            /// The custom-data schema.
+            #[serde(default)]
+            data: Option<Map<String, Value>>,
+        }
+        match Value::deserialize(deserializer)? {
+            Value::String(name) => Ok(Self::Name(name)),
+            object @ Value::Object(_) => {
+                let Expanded { kind, data } =
+                    serde_json::from_value(object).map_err(serde::de::Error::custom)?;
+                Ok(Self::Expanded { kind, data })
+            }
+            _ => Err(serde::de::Error::custom(
+                "a named response format is a name or an object with `kind`",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseFormat {
+    /// Decodes a string or an object holding `kind` as a named format, and
+    /// any other object as a JSON Schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for another JSON type and for a
+    /// named format [`NamedResponseFormat`] refuses.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Object(schema) if !schema.contains_key("kind") => Ok(Self::Schema(schema)),
+            named @ (Value::String(_) | Value::Object(_)) => {
+                NamedResponseFormat::deserialize(named)
+                    .map(Self::Named)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom(
+                "response_format is a JSON Schema object or a named format",
+            )),
+        }
+    }
 }
 
 /// Native protocol formats a Prompt `body` may take.
@@ -254,15 +368,67 @@ impl AuthoredPrompt {
     /// model that is not literal configuration (blank, control characters, or
     /// placeholder syntax), a mixed or incomplete form, an invalid provider/format
     /// pair, `body.model`, an undecodable body, empty or misplaced content, a
-    /// malformed binding, or an out-of-range or unsupported setting; and the
-    /// media binder's error for a literal source its provider refuses.
+    /// malformed binding, an out-of-range or unsupported setting, or native
+    /// response settings beside a named `response_format`; and the media
+    /// binder's error for a literal source its provider refuses.
+    ///
+    /// A named `response_format` compiles without structured output, and the
+    /// Prompt refuses to render until compiled through
+    /// [`compile_with`](Self::compile_with).
     pub fn compile(&self) -> SkaldResult<Prompt> {
+        self.compile_resolved(None)
+    }
+
+    /// Compiles like [`compile`](Self::compile), resolving a named
+    /// `response_format` to its JSON Schema through the host's `resolve`.
+    ///
+    /// The resolved schema becomes the request's structured output exactly as
+    /// an authored schema would; the Prompt still serializes the authored
+    /// name. `resolve` is not called for a schema or absent format.
+    ///
+    /// # Errors
+    ///
+    /// Returns `resolve`'s refusal, [`SkaldError::PromptInvalid`] at
+    /// `response_format` for a resolved schema that is invalid for its
+    /// destination, and every [`compile`](Self::compile) refusal.
+    pub fn compile_with(
+        &self,
+        resolve: impl FnOnce(&NamedResponseFormat) -> SkaldResult<Map<String, Value>>,
+    ) -> SkaldResult<Prompt> {
+        let resolved = match &self.response_format {
+            Some(ResponseFormat::Named(named)) => Some(resolve(named)?),
+            _ => None,
+        };
+        self.compile_resolved(resolved)
+    }
+
+    /// Compiles with `resolved` as a named format's schema; a named format
+    /// without one compiles without structured output and cannot render.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`compile`](Self::compile) refusal.
+    pub(crate) fn compile_resolved(
+        &self,
+        resolved: Option<Map<String, Value>>,
+    ) -> SkaldResult<Prompt> {
         check_model(&self.model)?;
+        let (named, schema) = match &self.response_format {
+            Some(ResponseFormat::Named(named)) => (Some(named), resolved.clone()),
+            Some(ResponseFormat::Schema(schema)) => (None, Some(schema.clone())),
+            None => (None, None),
+        };
         let mut literals = Vec::new();
         let mut media_kinds = Vec::new();
         let request = match (self.format, &self.body) {
-            (Some(format), Some(body)) => self.native_request(format, body)?,
-            (None, None) => self.portable_request(&mut literals, &mut media_kinds)?,
+            (Some(format), Some(body)) => {
+                let mut request = self.native_request(format, body)?;
+                if named.is_some() {
+                    named_output(&mut request, schema)?;
+                }
+                request
+            }
+            (None, None) => self.portable_request(schema, &mut literals, &mut media_kinds)?,
             (Some(_), None) => return Err(invalid("body", "native `format` requires a `body`")),
             (None, Some(_)) => return Err(invalid("format", "native `body` requires a `format`")),
         };
@@ -272,6 +438,10 @@ impl AuthoredPrompt {
             prompt.bind_media_mut(name, media)?;
         }
         prompt.media_kinds = media_kinds;
+        prompt.named_format = named.map(|named| NamedFormat {
+            name: named.name().to_owned(),
+            schema: resolved,
+        });
         prompt.authored = Some(Box::new(self.clone()));
         Ok(prompt)
     }
@@ -322,8 +492,8 @@ impl AuthoredPrompt {
     ///
     /// # Errors
     ///
-    /// Returns [`SkaldError::PromptInvalid`] for a portable field beside the
-    /// body, a provider/format pair [`check_format`] refuses, `body.model`,
+    /// Returns [`SkaldError::PromptInvalid`] for a portable field (a named
+    /// `response_format` is not one) beside the body, a provider/format pair [`check_format`] refuses, `body.model`,
     /// or a body that does not decode as `format`.
     fn native_request(
         &self,
@@ -334,7 +504,10 @@ impl AuthoredPrompt {
             ("system", self.system.is_some()),
             ("messages", self.messages.is_some()),
             ("settings", self.settings.is_some()),
-            ("response_format", self.response_format.is_some()),
+            (
+                "response_format",
+                matches!(self.response_format, Some(ResponseFormat::Schema(_))),
+            ),
         ]
         .into_iter()
         .find_map(|(field, set)| set.then_some(field))
@@ -391,6 +564,7 @@ impl AuthoredPrompt {
     /// content, or a setting the destination refuses.
     fn portable_request(
         &self,
+        schema: Option<Map<String, Value>>,
         literals: &mut Vec<(String, MediaRef)>,
         media_kinds: &mut Vec<(String, MediaKind)>,
     ) -> SkaldResult<ProviderRequest> {
@@ -405,7 +579,7 @@ impl AuthoredPrompt {
                 ));
             }
         };
-        if let Some(schema) = &self.response_format {
+        if let Some(schema) = &schema {
             check_output_schema(
                 &Value::Object(schema.clone()),
                 "response_format",
@@ -433,7 +607,6 @@ impl AuthoredPrompt {
             ));
         }
         let settings = self.settings.clone().unwrap_or_default();
-        let schema = self.response_format.clone();
         let system = self.system.clone();
         Ok(match format {
             PromptFormat::Messages => ProviderRequest::AnthropicMessage(anthropic(
@@ -581,6 +754,100 @@ impl PortableMessage {
             plain: false,
         })
     }
+}
+
+/// Sets a native request's structured output to a named format's resolved
+/// `schema`, the way the portable lowering would; `None` leaves it unset
+/// until the host resolves the name.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for a body that already declares
+/// response settings, which a named format replaces, and for `system_one`,
+/// which has no structured output.
+fn named_output(
+    request: &mut ProviderRequest,
+    schema: Option<Map<String, Value>>,
+) -> SkaldResult<()> {
+    let conflict = |field: &str| {
+        Err(invalid(
+            field,
+            "remove the body's response settings; the named `response_format` supplies them",
+        ))
+    };
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => {
+            if request.response_format.is_some() {
+                return conflict("body.response_format");
+            }
+            request.response_format = schema.map(|schema| OpenAiResponseFormat::JsonSchema {
+                json_schema: OpenAiJsonSchema {
+                    name: RESPONSE_SCHEMA_NAME.to_owned(),
+                    description: None,
+                    schema: Some(schema),
+                    strict: Some(true),
+                },
+            });
+        }
+        ProviderRequest::OpenAiResponses(request) => {
+            if request
+                .text
+                .as_ref()
+                .is_some_and(|text| text.format.is_some())
+            {
+                return conflict("body.text.format");
+            }
+            if let Some(schema) = schema {
+                request
+                    .text
+                    .get_or_insert(OpenAiResponsesText { format: None })
+                    .format = Some(OpenAiTextResponseFormat::JsonSchema {
+                    name: RESPONSE_SCHEMA_NAME.to_owned(),
+                    description: None,
+                    schema: Some(schema),
+                    strict: Some(true),
+                });
+            }
+        }
+        ProviderRequest::AnthropicMessage(request) => {
+            if request.output_config.is_some() {
+                return conflict("body.output_config");
+            }
+            request.output_config = schema.map(|schema| AnthropicOutputConfig {
+                format: AnthropicOutputFormat::JsonSchema {
+                    schema: Value::Object(schema),
+                },
+            });
+        }
+        ProviderRequest::GeminiGenerateContent(request) => {
+            if let Some(config) = &request.settings.generation_config
+                && let Some(field) = [
+                    ("response_mime_type", config.response_mime_type.is_some()),
+                    ("response_schema", config.response_schema.is_some()),
+                    (
+                        "response_json_schema",
+                        config.response_json_schema.is_some(),
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(field, set)| set.then_some(field))
+            {
+                return conflict(&format!("body.generation_config.{field}"));
+            }
+            if let Some(schema) = schema {
+                let config = request.settings.generation_config.get_or_insert_default();
+                config.response_mime_type = Some("application/json".to_owned());
+                config.response_json_schema = Some(Value::Object(schema));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "response_format",
+                "this native format has no structured output",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a provider/format pair the provider does not speak.
@@ -2001,5 +2268,188 @@ mod tests {
         });
         let prompt = compile(native.clone()).expect("role-less native compiles");
         assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
+    }
+
+    /// Proves a host-named `response_format`: scalar and expanded forms
+    /// resolve through the host into each destination's structured output,
+    /// the Prompt keeps serializing the authored form through binds,
+    /// unresolved names refuse to render, native bodies take the name beside
+    /// `format` and `body` but refuse their own response settings, and a
+    /// malformed expanded form does not decode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, round-trip, or body assertion fails.
+    #[test]
+    fn named_verdict_formats_preserve_authored_forms() {
+        let base = json!({"type": "object", "properties": {"outcome": {"type": "string"}}, "required": ["outcome"], "additionalProperties": false});
+        let resolve =
+            |named: &super::NamedResponseFormat| -> SkaldResult<serde_json::Map<String, Value>> {
+                assert_eq!(named.name(), "verdict");
+                let mut schema = base.as_object().expect("object").clone();
+                if let Some(data) = named.data() {
+                    schema["properties"]["data"] = Value::Object(data.clone());
+                    schema["required"] = json!(["outcome", "data"]);
+                }
+                Ok(schema)
+            };
+        let compile_with = |body: &Value| {
+            serde_json::from_value::<AuthoredPrompt>(body.clone())
+                .expect("authored decodes")
+                .compile_with(resolve)
+        };
+        let data = json!({"type": "object", "properties": {"score": {"type": "number"}}, "required": ["score"], "additionalProperties": false});
+        let portable = |format: Value| json!({"provider": "openai", "model": "m", "messages": [{"role": "user", "content": "{{claim}}"}], "response_format": format});
+
+        for format in [
+            json!("verdict"),
+            json!({"kind": "verdict"}),
+            json!({"kind": "verdict", "data": data}),
+        ] {
+            let authored = portable(format.clone());
+            let prompt = compile_with(&authored).expect("named portable compiles");
+            let ResponseType::JsonSchema { name, schema } = &prompt.response_type else {
+                panic!("a resolved name is structured output");
+            };
+            assert_eq!(name, "response");
+            assert_eq!(
+                schema["properties"].get("data").is_some(),
+                format.get("data").is_some(),
+                "{format}"
+            );
+            assert_eq!(
+                serde_json::to_value(&prompt).expect("json"),
+                authored,
+                "authored form kept"
+            );
+            let bound = prompt.bind(&[("claim", "x")]).expect("binds");
+            assert!(
+                bound.render(&[]).is_ok(),
+                "a resolved name renders after binding"
+            );
+
+            let unresolved = compile(authored.clone()).expect("an unresolved name compiles");
+            assert_eq!(unresolved.response_type, ResponseType::Text);
+            assert_eq!(serde_json::to_value(&unresolved).expect("json"), authored);
+            match unresolved.render(&[("claim", "x")]) {
+                Err(SkaldError::PromptInvalid { field, .. }) => {
+                    assert_eq!(field, "response_format");
+                }
+                other => panic!("an unresolved name must not render: {other:?}"),
+            }
+        }
+
+        let native = |format: &str, provider: &str, body: Value| json!({"provider": provider, "model": "m", "format": format, "body": body, "response_format": "verdict"});
+        let user = json!([{"role": "user", "content": "{{claim}}"}]);
+        for (authored, pointer) in [
+            (
+                native(
+                    "chat_completion",
+                    "openai",
+                    json!({"messages": user, "seed": 7}),
+                ),
+                "/response_format/json_schema/schema",
+            ),
+            (
+                native("responses", "openai", json!({"input": user})),
+                "/text/format/schema",
+            ),
+            (
+                native(
+                    "messages",
+                    "anthropic",
+                    json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "{{claim}}"}]}], "max_tokens": 64}),
+                ),
+                "/output_config/format/schema",
+            ),
+            (
+                native(
+                    "generate_content",
+                    "google",
+                    json!({"contents": [{"role": "user", "parts": [{"text": "{{claim}}"}]}]}),
+                ),
+                "/generation_config/response_json_schema",
+            ),
+        ] {
+            let prompt =
+                compile_with(&authored).unwrap_or_else(|error| panic!("{pointer}: {error}"));
+            assert_eq!(body(&prompt).pointer(pointer), Some(&base), "{pointer}");
+            assert_eq!(
+                serde_json::to_value(&prompt).expect("json"),
+                authored,
+                "authored form kept"
+            );
+        }
+        assert_eq!(
+            body(
+                &compile_with(&native(
+                    "chat_completion",
+                    "openai",
+                    json!({"messages": user, "seed": 7})
+                ))
+                .expect("compiles")
+            )["seed"],
+            7,
+            "unrelated native options survive"
+        );
+
+        for (authored, field) in [
+            (
+                native(
+                    "chat_completion",
+                    "openai",
+                    json!({"messages": user, "response_format": {"type": "json_object"}}),
+                ),
+                "body.response_format",
+            ),
+            (
+                native(
+                    "responses",
+                    "openai",
+                    json!({"input": user, "text": {"format": {"type": "json_object"}}}),
+                ),
+                "body.text.format",
+            ),
+            (
+                native(
+                    "messages",
+                    "anthropic",
+                    json!({"messages": [], "max_tokens": 8, "output_config": {"format": {"type": "json_schema", "schema": base}}}),
+                ),
+                "body.output_config",
+            ),
+            (
+                native(
+                    "generate_content",
+                    "google",
+                    json!({"contents": [], "generation_config": {"response_mime_type": "application/json"}}),
+                ),
+                "body.generation_config.response_mime_type",
+            ),
+            (
+                native("system_one", "jev", json!({"state": "x", "questions": {}})),
+                "response_format",
+            ),
+            (
+                {
+                    let mut both = native("chat_completion", "openai", json!({"messages": user}));
+                    both["response_format"] = base.clone();
+                    both
+                },
+                "response_format",
+            ),
+        ] {
+            match compile_with(&authored) {
+                Err(SkaldError::PromptInvalid { field: refused, .. }) => assert_eq!(refused, field),
+                other => panic!("expected {field} refusal, got {other:?}"),
+            }
+        }
+        assert!(
+            serde_json::from_value::<AuthoredPrompt>(portable(
+                json!({"kind": "verdict", "extra": 1})
+            ))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<AuthoredPrompt>(portable(json!(["verdict"]))).is_err());
     }
 }

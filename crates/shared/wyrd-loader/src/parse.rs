@@ -16,7 +16,7 @@ use super::path::PathSandbox;
 /// `metadata` uses the wire-format [`Metadata`] so downstream stages
 /// (`wyrd-config::apply_defaults`, resolve, validate) operate on the
 /// same type the server sees on the wire. Optional identity fields
-/// (`space`, `version`, `labels`, `annotations`) are filled in from
+/// (`labels`, `annotations`) are filled in from
 /// `wyrd.toml` by `apply_defaults` before validate/order run.
 #[derive(Debug, Clone)]
 pub struct AuthoredCard {
@@ -193,11 +193,27 @@ fn collect_yaml_files(
     Ok(())
 }
 
+/// Decode one authored YAML document into a typed Card with its source path.
+///
+/// This is the loader's diagnostic boundary for envelopes: decode failures
+/// become file-scoped [`Diagnostic`]s rather than raw serde errors. The
+/// envelope is strict, so a removed field such as `metadata.space` is reported
+/// verbatim as an unknown field instead of being misread as a missing one.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic for an unknown field, an invalid
+/// `apiVersion`, a missing `kind`, `metadata`, or `spec`, or a spec that does
+/// not decode for its kind, and a YAML-syntax diagnostic for any other
+/// envelope decode failure.
 fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<AuthoredCard, Diagnostic> {
     let envelope = serde_yaml::from_value::<RawCardEnvelope>(raw).map_err(|e| {
         // Check for missing required envelope fields
         let error_msg = e.to_string();
-        if error_msg.contains("apiVersion") || error_msg.contains("api_version") {
+        if error_msg.contains("unknown field") {
+            // The expected-field list names `spec_hash` and others, so the
+            // missing-field matches below would misreport this as absent.
+            Diagnostic::invalid_envelope(path.into(), format!("Invalid card envelope: {error_msg}"))
+        } else if error_msg.contains("apiVersion") || error_msg.contains("api_version") {
             Diagnostic::invalid_envelope(path.into(), "Invalid field: apiVersion".to_string())
         } else if error_msg.contains("kind") {
             Diagnostic::invalid_envelope(path.into(), "Missing required field: kind".to_string())
@@ -320,6 +336,13 @@ fn is_inlineable_body(key: &str, value: &serde_yaml::Value, agent_action: bool) 
 }
 
 /// Build the exact reference identity required by a resolved spec slot.
+///
+/// The reference is the Card's flat `kind`/`name` and its exact authored
+/// version, without a UID: the server assigns UIDs at declaration.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic when the Card's `metadata.version`
+/// is not an exact pin.
 pub(crate) fn card_ref_for(card: &AuthoredCard) -> Result<CardRef, Diagnostic> {
     let version = card.metadata.resolved_pin().cloned().ok_or_else(|| {
         Diagnostic::invalid_envelope(
@@ -327,18 +350,10 @@ pub(crate) fn card_ref_for(card: &AuthoredCard) -> Result<CardRef, Diagnostic> {
             "Path references require an exact metadata.version pin".to_string(),
         )
     })?;
-    let space = card.metadata.space.clone().ok_or_else(|| {
-        Diagnostic::invalid_envelope(
-            card.source_path.clone(),
-            "Path references require metadata.space or a workspace default".to_string(),
-        )
-    })?;
-
     Ok(CardRef {
         kind: card.kind.clone(),
         name: card.metadata.name.clone(),
         version,
-        space: Some(space),
         uid: None,
     })
 }
@@ -348,6 +363,81 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A space-free graph loads: path references become exact sibling
+    /// `Kind/name@version` identities, external references keep their flat
+    /// identity, and workspace label defaults fill only what the Card omits.
+    /// A removed `metadata.space` or reference `space` is refused.
+    ///
+    /// # Panics
+    /// Panics when the temporary workspace cannot be written or the graph does
+    /// not load as asserted.
+    #[test]
+    fn flat_card_graph_loads_without_space() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, text: &str| std::fs::write(temp.path().join(name), text).unwrap();
+        write(
+            "wyrd.toml",
+            "[defaults.labels]\nteam = \"platform\"\nenv = \"prod\"\n",
+        );
+        write(
+            "prompt.yaml",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: answer\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+        );
+        write(
+            "agent.yaml",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: support\n  version: 1.0.0\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
+        );
+        write(
+            "service.yaml",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: checkout\n  version: 1.0.0\n  labels:\n    team: payments\nspec:\n  service_type: api\n  components:\n    - alias: agent\n      ref: agent.yaml\n    - alias: model\n      ref:\n        kind: Model\n        name: churn\n        version: 1.0.0\n",
+        );
+
+        let tree = crate::load(&temp.path().join("service.yaml")).expect("flat graph loads");
+        let service = &tree
+            .cards
+            .iter()
+            .find(|card| card.submission.kind == CardKind::Service)
+            .expect("service loads")
+            .submission;
+        assert_eq!(
+            service.spec["components"][0]["ref"],
+            serde_json::json!({"sibling": {"kind": "Agent", "name": "support", "version": "1.0.0"}})
+        );
+        assert_eq!(
+            service.spec["components"][1]["ref"],
+            serde_json::json!({"kind": "Model", "name": "churn", "version": "1.0.0"})
+        );
+        let labels = service
+            .metadata
+            .labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, [("env", "prod"), ("team", "payments")]);
+
+        for (name, text) in [
+            (
+                "spaced-card.yaml",
+                "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: answer\n  space: prod\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+            ),
+            (
+                "spaced-ref.yaml",
+                "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: checkout\n  version: 1.0.0\nspec:\n  service_type: api\n  components:\n    - alias: model\n      ref:\n        kind: Model\n        name: churn\n        version: 1.0.0\n        space: prod\n",
+            ),
+        ] {
+            write(name, text);
+            let error = parse_file(&temp.path().join(name)).expect_err("space is refused");
+            assert!(
+                error
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("unknown field `space`")),
+                "{name}: {:?}",
+                error.diagnostics
+            );
+        }
+    }
 
     /// An envelope without `kind` is refused with one invalid-envelope
     /// diagnostic naming the missing field.
@@ -363,14 +453,12 @@ mod tests {
 apiVersion: wyrd/v1
 metadata:
   name: test
-  space: default
   version: "1.0.0"
 spec:
   prompt:
     kind: Prompt
     name: system-prompt
     version: "1.0.0"
-    space: default
   execution_route:
     kind: native
 "#
@@ -406,7 +494,6 @@ apiVersion: wyrd/v1
 kind: {kind}
 metadata:
   name: quality
-  space: default
   version: "1.0.0"
 spec: {{}}
 "#
@@ -437,7 +524,6 @@ apiVersion: wyrd/v1
 kind: Prompt
 metadata:
   name: system-prompt
-  space: default
   version: "1.0.0"
 spec:
   provider: openai
@@ -447,14 +533,12 @@ spec:
 kind: Agent
 metadata:
   name: test-agent
-  space: default
   version: "1.0.0"
 spec:
   prompt:
     kind: Prompt
     name: system-prompt
     version: "1.0.0"
-    space: default
   execution_route:
     kind: native
 "#
@@ -487,7 +571,6 @@ apiVersion: wyrd/v1
 kind: Prompt
 metadata:
   name: test
-  space: default
   version: "1.0.0"
 spec:
   provider: openai
@@ -525,7 +608,6 @@ spec:
 apiVersion: wyrd/v1
 metadata:
   name: test2
-  space: default
   version: "1.0.0"
 spec:
   provider: openai
@@ -564,7 +646,7 @@ spec:
         let source = workspace.path().join("agent.yaml");
         std::fs::write(
             &source,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    provider: google\n    model: gemini-flash-lite\n    format: generate_content\n    body:\n      contents: []\n      system_instruction:\n        role: system\n        parts:\n          - text: !file runbook.txt\n  execution_route:\n    kind: native\n  tool_names: []\n  run_config: {}\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\nspec:\n  prompt:\n    provider: google\n    model: gemini-flash-lite\n    format: generate_content\n    body:\n      contents: []\n      system_instruction:\n        role: system\n        parts:\n          - text: !file runbook.txt\n  execution_route:\n    kind: native\n  tool_names: []\n  run_config: {}\n",
         )
         .unwrap();
 

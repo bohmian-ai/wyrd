@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: jev-agent
   version: 1.0.0
-  space: default
 spec:
   prompt:
     provider: jev

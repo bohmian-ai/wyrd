@@ -10,10 +10,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
 from typing_extensions import assert_type
+from wyrd.state import WyrdState
 from wyrd.verify import Execution, VerificationResult
 
 if TYPE_CHECKING:
+    from wyrd.cards import JsonValue
     from wyrd.verify import (
         Check,
         ExecutionState,
@@ -36,6 +39,23 @@ def returned_records_are_typed(execution: Execution, result: VerificationResult)
         assert_type(state["result"]["outcome"]["verdict"], VerificationVerdict)
 
 
+class Judge(BaseModel):
+    score: float
+
+
+def typed_reads_carry_the_model(state: WyrdState, execution: Execution) -> None:
+    result = state.run().observe.verify_typed("judge", Judge, answer="yes", data_type="slot")
+    assert_type(result, VerificationResult[Judge])
+    assert_type(result.requirements, list[RequirementResult[Judge]])
+    assert_type(result.requirements[0]["data"], Judge)
+    assert_type(result.requirements[0].get("data"), Judge | None)
+    assert_type(execution.wait_typed(1.0, Judge), VerificationResult[Judge])
+    typed = execution.status_typed(Judge)
+    assert_type(typed["result"]["outcome"]["requirements"], list[RequirementResult[Judge]])
+    assert_type(execution.wait(1.0).requirements[0]["data"], dict[str, JsonValue])
+    execution.wait_typed(1.0, int)  # ty: ignore[invalid-argument-type]
+
+
 def the_actual_status_shape_is_accepted() -> ExecutionState:
     return {
         "execution_id": "0190b2a4-0000-7000-8000-000000000000",
@@ -44,7 +64,7 @@ def the_actual_status_shape_is_accepted() -> ExecutionState:
         "result": {
             "execution_id": "0190b2a4-0000-7000-8000-000000000000",
             "verifier": {"kind": "Verifier", "name": "policy-review", "version": "1.0.0"},
-            "subject": {"kind": "Agent", "name": "desk", "version": "1.0.0", "space": "s"},
+            "subject": {"kind": "Agent", "name": "desk", "version": "1.0.0"},
             "outcome": {
                 "verdict": "passed",
                 "requirements": [
@@ -123,6 +143,18 @@ def every_check_kind_is_accepted() -> list[Check]:
             "entrypoint": "check",
         },
         {
+            "kind": "code",
+            "source": {"inline": "def check(): ..."},
+            "entrypoint": "check",
+            "response_format": "verdict",
+        },
+        {
+            "kind": "code",
+            "source": {"inline": "def check(): ..."},
+            "entrypoint": "check",
+            "response_format": {"kind": "verdict", "data": {"type": "object"}},
+        },
+        {
             "kind": "drift",
             "on": "inputs.latency",
             "method": "Spc",
@@ -131,6 +163,12 @@ def every_check_kind_is_accepted() -> list[Check]:
             "profile": {"kind": "Spc", "sample_size": 5},
         },
     ]
+
+
+def code_check_formats_are_optional(check: Check) -> object:
+    if check["kind"] == "code" and "response_format" in check:
+        return check["response_format"]
+    return None
 
 
 def checks_narrow_on_kind(check: Check) -> str:

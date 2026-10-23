@@ -22,9 +22,7 @@ use std::collections::BTreeMap;
 
 use arrow_schema::{DataType, TimeUnit as ArrowTimeUnit};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
-use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{InstanceType, Schema, SchemaObject};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit, UTC_TIME_ZONE};
 
@@ -275,13 +273,13 @@ macro_rules! timestamp_json_schema {
     ($type:ident, $kind:expr) => {
         impl JsonSchema for $type {
             /// Inline the schema so the format sits on the field itself.
-            fn is_referenceable() -> bool {
-                false
+            fn inline_schema() -> bool {
+                true
             }
 
             /// The schema's name.
-            fn schema_name() -> String {
-                stringify!($type).to_owned()
+            fn schema_name() -> Cow<'static, str> {
+                Cow::Borrowed(stringify!($type))
             }
 
             /// The schema's stable identity.
@@ -291,12 +289,7 @@ macro_rules! timestamp_json_schema {
 
             /// A string with this type's `format`.
             fn json_schema(_: &mut SchemaGenerator) -> Schema {
-                SchemaObject {
-                    instance_type: Some(InstanceType::String.into()),
-                    format: Some($kind.json_format().to_owned()),
-                    ..SchemaObject::default()
-                }
-                .into()
+                schemars::json_schema!({ "type": "string", "format": $kind.json_format() })
             }
         }
     };

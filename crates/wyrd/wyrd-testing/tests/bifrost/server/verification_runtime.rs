@@ -132,6 +132,7 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
             reason: "scored by the journey".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: report.map(RequirementDetail::Drift),
             check: serde_json::from_value::<Check>(json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
@@ -823,7 +824,7 @@ impl<'a> ResultLayoutJourney<'a> {
         let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
         let (subject, _) = seed.service("layout-subject").await?;
         let uid = seed.drift_verifier("layout-drift").await?;
-        let verifier: CardRef = format!("default/Verifier/layout-drift@1.0.0#{uid}").parse()?;
+        let verifier: CardRef = format!("Verifier/layout-drift@1.0.0#{uid}").parse()?;
         for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
             server
                 .ensure_builtin_table_for_test(tenant, namespace, name)

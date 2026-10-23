@@ -77,7 +77,7 @@ test("run view exposes its alias", ({ state }) => {
 });
 
 test("card scoped key cannot write another cards observations", async ({ bundle }) => {
-  const agentKey = await cli.issueKey({ kind: "Agent", name: "observed-agent", version: "1.0.0", space: "default" });
+  const agentKey = await cli.issueKey({ kind: "Agent", name: "observed-agent", version: "1.0.0" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: agentKey.key }) });
   await state.startBifrost();
 

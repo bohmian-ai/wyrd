@@ -5,7 +5,6 @@ kind: Service
 metadata:
   name: frames-other
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:

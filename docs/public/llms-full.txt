@@ -19,6 +19,16 @@ Page: /wyrd/get-started/introduction/
 
 You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
+## How Wyrd fits your stack
+
+_Diagram `wyrd-in-your-stack`: see the web page._
+
+1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
+2. **Observe.** Your app sends Bifrost, Wyrd's data plane, everything it produces as it runs: telemetry, its own data, and the evidence it submits to verify. Bifrost keeps all of it queryable with SQL beside every verdict.
+3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
+
+Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/wyrd/understand/architecture/) shows what a team deployment runs.
+
 ## An example
 
 A support agent must never promise a guaranteed refund. The Service describes the agent and binds a Verifier, which states that requirement as an assertion:
@@ -32,7 +42,6 @@ kind: Service
 metadata:
   name: support-reply
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./no-refund-promise.yaml
@@ -48,7 +57,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer: { type: json }
@@ -132,7 +140,7 @@ import { type CardRef, WyrdState } from "wyrd-ai";
 const state = await WyrdState.declare("support-reply.yaml");
 const run = state.run();
 
-const id = (ref: CardRef) => `${ref.space}/${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
+const id = (ref: CardRef) => `${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
 for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
   const result = await run.observe.verify("no-refund-promise", { answer });
   console.log(`${result.outcome.verdict}: ${result.outcome.requirements[0].reason}`);
@@ -152,16 +160,6 @@ failed: operator NotContains returned false
 ```
 
 In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
-
-## How Wyrd fits your stack
-
-_Diagram `wyrd-in-your-stack`: see the web page._
-
-1. **Declare.** Describe what you ship in YAML (a Service and its Agents, Models, and Data) and bind Verifiers to any of them. Declare them from CI with `wyrd declare` or from your code. Each declaration has a version, so a changed prompt is a new version.
-2. **Observe.** Your app records what it did inside a Run. Bifrost, Wyrd's evidence store, keeps those records in object storage.
-3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
-
-Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/wyrd/understand/architecture/) shows what a team deployment runs.
 
 ## Where Wyrd stops
 
@@ -185,7 +183,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 | --- | --- |
 | OS | macOS on Apple silicon, or Linux (x86_64 or arm64) |
 | PostgreSQL | 16, with a user that owns the database (not a superuser) |
-| Language | Python 3.11, Rust 1.99, or Node.js 22.18 |
+| Language | Python 3.11, Rust 1.95, or Node.js 22.18 |
 
 ## Install
 
@@ -210,11 +208,11 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 
 ```bash
 mkdir quickstart && cd quickstart
-npm init -y && npm pkg set type=module
-npm install wyrd-ai@0.3.0
+pnpm init && pnpm pkg set type=module
+pnpm add wyrd-ai@0.3.0
 ```
 
-Run the CLI as `npx wyrd`.
+Run the CLI as `pnpm wyrd`.
 
 ## Agent-guided setup
 
@@ -322,7 +320,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer: { type: json }
@@ -346,7 +343,6 @@ kind: Service
 metadata:
   name: support-reply
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./no-refund-promise.yaml
@@ -432,7 +428,7 @@ import { type CardRef, WyrdState } from "wyrd-ai";
 const state = await WyrdState.declare("support-reply.yaml");
 const run = state.run();
 
-const id = (ref: CardRef) => `${ref.space}/${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
+const id = (ref: CardRef) => `${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`;
 for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
   const result = await run.observe.verify("no-refund-promise", { answer });
   console.log(`${result.outcome.verdict}: ${result.outcome.requirements[0].reason}`);
@@ -465,10 +461,10 @@ Run the program again. Nothing changed, so you get the same verdicts and `uid` v
 
 ## 3. Confirm the stored verdicts
 
-The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `npx wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `pnpm wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
 
 ```bash
-wyrd get --space default --kind Service --name support-reply --version 1.0.0
+wyrd get --kind Service --name support-reply --version 1.0.0
 ```
 
 Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.sql`, with `<uid>` replaced by that value:
@@ -612,7 +608,6 @@ kind: Agent
 metadata:
   name: support-agent
   version: 1.0.0
-  space: default
 spec:
   prompt: ./support-prompt.yaml
   execution_route:
@@ -632,7 +627,6 @@ kind: Prompt
 metadata:
   name: support-prompt
   version: 1.0.0
-  space: default
 spec:
   provider: openai
   model: gpt-4o
@@ -781,7 +775,6 @@ kind: Service
 metadata:
   name: support-desk
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   # The Service's own Verifier checks every answer the desk gives.
@@ -852,7 +845,6 @@ kind: Service
 metadata:
   name: latency-watch
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./latency-shift.yaml
@@ -870,7 +862,6 @@ kind: Trigger
 metadata:
   name: daily
   version: 1.0.0
-  space: default
 spec:
   description: Once a day at midnight UTC.
   kind: schedule
@@ -886,7 +877,6 @@ kind: Operator
 metadata:
   name: alert-on-call
   version: 1.0.0
-  space: default
 spec:
   description: Page the on-call hook when latency shifts. The origin comes from the connection.
   kind: http
@@ -1092,7 +1082,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: support
 spec:
   description: A support answer never promises a guaranteed refund.
   inputs:
@@ -1167,7 +1156,6 @@ kind: Verifier
 metadata:
   name: ticket-complete
   version: 1.0.0
-  space: support
 spec:
   description: A support ticket carries the fields the help desk needs.
   inputs:
@@ -1236,7 +1224,6 @@ kind: Verifier
 metadata:
   name: follows-policy
   version: 1.0.0
-  space: support
 spec:
   description: A refund decision letter follows the refund policy.
   inputs:
@@ -1268,7 +1255,6 @@ kind: Agent
 metadata:
   name: policy-judge
   version: 1.0.0
-  space: support
 spec:
   execution_route: {kind: wyrd_gateway, deployment: openai}
   run_config: {max_iterations: 1}
@@ -1283,33 +1269,7 @@ spec:
     messages:
       - role: user
         content: "Claim: {{claim}}. Letter: {{letter}}"
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties:
-                  lines:
-                    type: object
-                    properties:
-                      start: {type: integer}
-                      end: {type: integer}
-                    required: [start, end]
-                    additionalProperties: false
-                required: [lines]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    response_format: verdict
 
 ```
 
@@ -1537,27 +1497,8 @@ spec:
           Claim: {{claim}}  # filled from the check's inputs
           Reply: {{answer}}
           Decide whether the claim holds for the reply, and cite the reply.
-    # The judge must answer with a verdict: an outcome, a reason, and citations.
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator:
-                type: object
-                properties: {json_pointer: {type: string}}
-                required: [json_pointer]
-                additionalProperties: false
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    # The judge answers with a Verdict: an outcome, a reason, and citations.
+    response_format: verdict
 ```
 
 **Observe (Python)**
@@ -1574,6 +1515,72 @@ print(judged.get("citations"))  # where in the reply the judge looked
 ```
 
 The judge's model calls go through the LLM gateway with your provider key. [Verdicts and citations](/wyrd/reference/verifier-card/#verdicts-and-citations) explains the locators a citation can use.
+
+### Return scores and labels with the verdict
+
+Declare a schema under `data` and the judge returns that object beside its verdict. The server checks it against the schema; output that does not match is `inconclusive` and keeps no data.
+
+```yaml title="policy-judge.yaml (excerpt)"
+    response_format:
+      kind: verdict
+      data:
+        type: object
+        properties:
+          score: {type: number, minimum: 0, maximum: 1}
+          category: {type: string}
+        required: [score, category]
+        additionalProperties: false
+```
+
+A `code` check declares the same `response_format` beside `entrypoint`, and its function returns `data` with its verdict. Each requirement carries its own `data`, which stays absent when its check declares none. Read it as JSON, or ask for your own type:
+
+**Python**
+
+```python
+from pydantic import BaseModel
+
+class JudgeData(BaseModel):
+    score: float
+    category: str
+
+result = run.observe.verify_typed("follows-policy", JudgeData, answer={"text": "Refunds up to 100 dollars follow our policy."})
+data = result.requirements[0].get("data")  # a JudgeData, or None when the check returned none
+```
+
+**Rust**
+
+```rust
+use serde::Deserialize;
+use serde_json::json;
+use wyrd_ai::verify::{Input, Inputs};
+
+#[derive(Deserialize)]
+struct JudgeData {
+    score: f64,
+    category: String,
+}
+
+let answer = json!({ "text": "Refunds up to 100 dollars follow our policy." });
+let result = run
+    .observe()
+    .verify_typed::<JudgeData>("follows-policy", Inputs::named([("answer", Input::from(answer))]))
+    .await?;
+let data = result.outcome.requirements[0].data.as_ref(); // a JudgeData, or None when the check returned none
+```
+
+**TypeScript**
+
+```typescript
+import { z } from "zod";
+
+const JudgeData = z.object({ score: z.number(), category: z.string() });
+
+const answer = { text: "Refunds up to 100 dollars follow our policy." };
+const result = await run.observe.verifyTyped("follows-policy", { answer }, JudgeData);
+const data = result.outcome.requirements[0]?.data; // a JudgeData, or undefined when the check returned none
+```
+
+Data that does not fit your type raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement; the stored result is unchanged and nothing runs again. Its `path` is always `""`, the root of that requirement's data, because a deeper path could name a key the check returned.
 
 ## Multi-step
 
@@ -1897,7 +1904,7 @@ uv add "wyrd-ai[otel]==0.3.0" uvicorn
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:
 
 ```bash
-uv run wyrd pull --space default --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
+uv run wyrd pull --kind Service --name support-reply --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## Usage
@@ -1911,7 +1918,7 @@ Each app loads the pulled Service, adds the middleware, and reads the request's 
 
 It serves the Quickstart's ``support-reply`` Service, pulled once at deploy time:
 
-    wyrd pull --space default --kind Service --name support-reply --version 1.0.0 \
+    wyrd pull --kind Service --name support-reply --version 1.0.0 \
       --output-dir .wyrd-bundle
     uv run uvicorn app:app
 """
@@ -2192,7 +2199,7 @@ The server calls model providers with keys you configure, for model-judged check
 
 ## Next
 
-[How verification works](/wyrd/understand/how-verification-works/) follows one check through the server. [Bifrost](/wyrd/understand/bifrost/) covers the evidence store.
+[How verification works](/wyrd/understand/how-verification-works/) follows one check through the server. [Bifrost](/wyrd/understand/bifrost/) covers the data plane.
 
 # How verification works
 
@@ -2213,7 +2220,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer: { type: json }
@@ -2380,7 +2386,6 @@ kind: Service
 metadata:
   name: support-reply
   version: 1.0.0
-  space: default
 spec:
   verified_by:
     - verifier: ./no-refund-promise.yaml
@@ -2396,7 +2401,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer: { type: json }
@@ -2625,8 +2629,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose `response_format` is a closed [verdict](#verdicts-and-citations) |
-| `code` | `runtime`, `source`, `entrypoint`, `inputs` | A Python function that returns a verdict |
+| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
+| `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
 ## Comparison operators
@@ -2702,6 +2706,19 @@ An `agent` or `code` check returns a verdict:
 
 A citation names the original slot, never an extract step. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
 
+### Custom data
+
+`response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema, written in JSON Schema 2020-12 (omit `$schema` or declare 2020-12) and without a root `$id`. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
+
+The server validates the whole verdict against the declared schema. Data must fit both limits, inclusive:
+
+| Limit | Bound |
+| --- | --- |
+| Size | 65,536 bytes of compact UTF-8 JSON |
+| Depth | 16 containers; the root object is one, each nested object or array adds one |
+
+A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
+
 ## Decide
 
 | Value | Verdict |
@@ -2731,6 +2748,8 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |
 | `pass_rate` | `threshold` is not above 0 and at most 1 |
+| `check_response_format` | A `code` check's `response_format` names an unknown format or an invalid `data` schema |
+| `check_agent_schema` | A check Agent's Prompt cannot produce a verdict, or declares `data` without requiring an object |
 
 # Extraction output
 
@@ -3207,7 +3226,7 @@ This page is generated from the error definitions in the Wyrd source.
 | --- | ---: | --- | --- |
 | `WYRD_CLI_400_CARD_LOAD` | 400 | Card load failed | Fix the card files and local references, then retry. |
 | `WYRD_CLI_400_CLIENT_CONFIG` | 400 | Client configuration failed | Pass a valid server URL and configure a Wyrd credential. |
-| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --space, --name, and --version. |
+| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --name, and --version. |
 | `WYRD_CLI_400_INVALID_ARGUMENT` | 400 | Invalid CLI argument | Fix the argument and retry. |
 | `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | MCP host selection required | Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected. |
 | `WYRD_CLI_400_QUERY_CONFIG` | 400 | Query configuration missing | Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain. |
@@ -3218,7 +3237,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_CLI_401_NO_REFRESH_TOKEN` | 401 | No refresh token | Set WYRD_REFRESH_TOKEN to the refresh token to rotate. |
 | `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | MCP host installation failed | Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected. |
 | `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | 409 | Server installation incomplete | Remove the named version directory, then rerun `wyrd server install`; nothing was activated. |
-| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (pip install -U wyrd-ai, or npm install -g wyrd-ai@latest), then retry. |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | Server version incompatible | Upgrade the wyrd CLI to the server's version line (uv add --upgrade wyrd-ai, or pnpm add wyrd-ai@latest), then retry. |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | Server release unverified | Retry the install; if it fails again, report the release. The current installation is unchanged. |
 | `WYRD_CLI_500_IO` | 500 | CLI filesystem IO failed | Check file paths and permissions, then retry. |
 | `WYRD_CLI_500_OUTPUT` | 500 | CLI output failed | Retry the command or use --format text. |
@@ -3362,7 +3381,7 @@ This page is generated from the error definitions in the Wyrd source.
 
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
-| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
+| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
 | `WYRD_REGISTRY_400_CURSOR_MISMATCH` | 400 | Cursor does not match filters | Discard the cursor and restart pagination with the current filters. |
 | `WYRD_REGISTRY_400_DEPENDENCY_CYCLE` | 400 | Card dependency cycle | Remove the cyclic CardRef dependency and submit an acyclic card graph. |
 | `WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION` | 400 | Heavy artifact submission must be standalone | Register the artifact-bearing card alone, then reference it from a later composite request. |
@@ -3379,7 +3398,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` | 400 | Unresolved path CardRef | Expand path references in the loader before submitting the card. |
 | `WYRD_REGISTRY_400_UPLOAD_INTERRUPTED` | 400 | Upload interrupted | Retry the upload while the declaration operation remains pending. |
 | `WYRD_REGISTRY_400_VERSION_REQUIRED` | 400 | `metadata.version` is present but empty | Provide a valid semver string (e.g. `"1.0.0"`) or omit `metadata.version` entirely to let the server auto-assign the next version. |
-| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
+| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key conflict | Use the original request with this key or choose a new key for different content. |
 | `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-declare with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version. |
 | `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Declaration operation expired | Start a new declaration with a new idempotency key. |
@@ -3410,6 +3429,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | A tracer provider is already installed | Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry. |
+| `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
 | `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | 504 | Verification execution did not settle in time | Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again. |
@@ -3440,7 +3460,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR` | 400 | Duplicate binding Operator | Remove the duplicate on_failure Operator from this binding. |
-| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, space, name, version) identity at most once per request. |
+| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, name, version) identity at most once per request. |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | 400 | Duplicate verification binding | Remove the duplicate verified_by entry; one subject occurrence binds each Verifier version once. |
 | `WYRD_SPEC_400_INVALID_BINDING_REF_KIND` | 400 | Invalid verification binding reference kind | Set runs_on to a Trigger CardRef or inline TriggerSpec, and each on_failure entry to an Operator CardRef or inline OperatorSpec. |
 | `WYRD_SPEC_400_INVALID_OPERATOR` | 400 | Invalid Operator | Reference only failure-context fields in `{{field}}` templates, keep the URL origin literal https, and do not author server-owned headers. |

@@ -761,7 +761,7 @@ fn run_evidence(
 
 /// A passing result body for execution `id`.
 fn result_body(id: &wyrd_spec::ids::ExecutionId) -> Value {
-    let card = json!({ "kind": "Verifier", "space": "support", "name": "policy-check", "version": "1.0.0" });
+    let card = json!({ "kind": "Verifier", "name": "policy-check", "version": "1.0.0" });
     json!({
         "execution_id": id,
         "verifier": card,
@@ -891,10 +891,9 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
         .expect(1)
         .mount(&server)
         .await;
-    let artifact: wyrd_spec::reference::CardRef = serde_json::from_value(
-        json!({ "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }),
-    )
-    .expect("Artifact ref decodes");
+    let artifact: wyrd_spec::reference::CardRef =
+        serde_json::from_value(json!({ "kind": "Artifact", "name": "decks", "version": "1.0.0" }))
+            .expect("Artifact ref decodes");
     let spec = run_verifier();
     let run = run_evidence(
         &spec,
@@ -948,7 +947,7 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
         body("/v1/verification/execute")["inputs"],
         json!({
             "answer": { "kind": "json", "value": { "text": "yes" } },
-            "archive": { "kind": "artifact", "artifact": { "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }, "path": "q3.pdf" },
+            "archive": { "kind": "artifact", "artifact": { "kind": "Artifact", "name": "decks", "version": "1.0.0" }, "path": "q3.pdf" },
             "copy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf" },
             "deck": { "kind": "file", "sha256": deck_sha, "size_bytes": 9, "format": "pdf" },
             "policy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf", "filename": "Policy.pdf" },

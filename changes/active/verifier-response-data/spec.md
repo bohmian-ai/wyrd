@@ -139,8 +139,10 @@ including delayed execution reads and published Bifrost storage. Old results
 and checks without custom output omit the field. No new top-level Bifrost
 column is required.
 
-Data inherits the sensitive outcome's tenant isolation, authorization, elevated
-payload-read protections, retention, and existing durability/visibility
+Data inherits the sensitive outcome's tenant isolation, authorization (the
+results table's query-read permission and tenant scoping; the additional
+gateway payload permission covers only gateway call payload columns, not
+verification outcomes), retention, and existing durability/visibility
 semantics. Do not copy it into lower-privilege metadata, logs, audit records, or
 validation diagnostics, or repurpose `actual` and its capture rules. Existing
 plain outputs, compatible handwritten schemas, and ordinary calls keep working;

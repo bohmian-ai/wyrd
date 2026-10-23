@@ -1532,7 +1532,9 @@ Declare a schema under `data` and the judge returns that object beside its verdi
         additionalProperties: false
 ```
 
-A `code` check declares the same `response_format` beside `entrypoint`, and its function returns `data` with its verdict. Read the data as JSON from `requirements[i]["data"]`, or ask for your own type:
+A `code` check declares the same `response_format` beside `entrypoint`, and its function returns `data` with its verdict. Each requirement carries its own `data`, which stays absent when its check declares none. Read it as JSON, or ask for your own type:
+
+**Python**
 
 ```python
 from pydantic import BaseModel
@@ -1545,7 +1547,40 @@ result = run.observe.verify_typed("follows-policy", JudgeData, answer={"text": "
 data = result.requirements[0].get("data")  # a JudgeData, or None when the check returned none
 ```
 
-Data that does not fit your type raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`; the stored result is unchanged.
+**Rust**
+
+```rust
+use serde::Deserialize;
+use serde_json::json;
+use wyrd_ai::verify::{Input, Inputs};
+
+#[derive(Deserialize)]
+struct JudgeData {
+    score: f64,
+    category: String,
+}
+
+let answer = json!({ "text": "Refunds up to 100 dollars follow our policy." });
+let result = run
+    .observe()
+    .verify_typed::<JudgeData>("follows-policy", Inputs::named([("answer", Input::from(answer))]))
+    .await?;
+let data = result.outcome.requirements[0].data.as_ref(); // a JudgeData, or None when the check returned none
+```
+
+**TypeScript**
+
+```typescript
+import { z } from "zod";
+
+const JudgeData = z.object({ score: z.number(), category: z.string() });
+
+const answer = { text: "Refunds up to 100 dollars follow our policy." };
+const result = await run.observe.verifyTyped("follows-policy", { answer }, JudgeData);
+const data = result.outcome.requirements[0]?.data; // a JudgeData, or undefined when the check returned none
+```
+
+Data that does not fit your type raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement; the stored result is unchanged and nothing runs again. Its `path` is always `""`, the root of that requirement's data, because a deeper path could name a key the check returned.
 
 ## Multi-step
 

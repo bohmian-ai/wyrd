@@ -210,6 +210,32 @@ impl WyrdTestServer {
         catalog.evict_current_definition(table, tenant);
     }
 
+    /// Commits `columns` as the table's complete ordered Bloom list: a
+    /// Bloom-only definition edit that leaves every schema, spec, and sort
+    /// order id unchanged and still advances the table version by one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision does not commit.
+    pub async fn commit_bloom_revision(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        columns: &[&str],
+    ) {
+        let value = serde_json::to_string(columns).expect("a string list serializes");
+        self.commit_table_revision(tenant, table, |_| {
+            vec![iceberg::TableUpdate::SetProperties {
+                updates: [(
+                    vala_bifrost_redux::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+                    value,
+                )]
+                .into(),
+            }]
+        })
+        .await;
+    }
+
     /// Commits a new default sort order — the current keys plus `value`
     /// descending — and returns its id.
     ///

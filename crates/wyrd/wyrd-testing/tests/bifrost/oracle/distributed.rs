@@ -2593,6 +2593,634 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
     Ok(())
 }
 
+/// Rows each Bloom-policy file seals: above the writer's 20,000-row page
+/// limit, so every column of every file spans several pages.
+const POLICY_ROWS_PER_FILE: i64 = 45_000;
+
+/// Files each Bloom-policy table seals, one per committed table version.
+const POLICY_FILES: usize = 4;
+
+/// The Bloom-capable columns of the policy dataset.
+const POLICY_BLOOM_COLUMNS: [&str; 3] = ["service", "environment", "request"];
+
+/// One table's Bloom list per written file: complete, partial, empty, then
+/// complete reordered, so compaction runs under a complete list.
+const POLICIES_ENDING_COMPLETE: [&[&str]; POLICY_FILES] = [
+    &["service", "environment", "request"],
+    &["request"],
+    &[],
+    &["request", "environment", "service"],
+];
+
+/// The other table's Bloom list per written file: complete, reordered,
+/// partial, then empty, so compaction runs under an empty list.
+const POLICIES_ENDING_EMPTY: [&[&str]; POLICY_FILES] = [
+    &["service", "environment", "request"],
+    &["request", "environment", "service"],
+    &["request"],
+    &[],
+];
+
+/// Every Bloom-only definition edit commits its own table version, and the
+/// exact authorized rows never depend on which version wrote a file.
+///
+/// Two caller-registered datasets hold identical mixed-Service/environment
+/// rows in four files, each sealed under its own version's Bloom list: one
+/// table walks complete, partial, empty, and reordered lists; the other
+/// complete, reordered, partial, and empty. Each edit is a Bloom-only commit
+/// through the versioned catalog seam, so every schema, spec, and sort-order
+/// id stays put while describe reports the next version.
+///
+/// In the hot, promoted, and rewritten cuts the journey proves:
+///
+/// - each hot and promoted object keeps exactly its own version's Bloom
+///   filters, so older files miss filters a later version selects;
+/// - each rewrite output carries exactly the compaction-time version's list:
+///   complete on one table, none on the other;
+/// - same-Service selective equality, cross-Service environment equality, a
+///   finite `IN` with an absent member, `IS NULL`, and present and absent
+///   request lookups return the exact rule-derived row identities, equal
+///   across every file's policy and across cuts;
+/// - an absent value inside every group's statistics is excluded by Bloom on
+///   exactly the row groups carrying that column's filter and scanned
+///   exactly on the rest.
+///
+/// Geometry and Oracle step telemetry are printed per object and per query
+/// as task evidence; no speedup is asserted.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, catalog, storage, Forge, telemetry,
+/// or query errors, or a description of the first expectation that does not
+/// hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime or a revision
+/// does not commit.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn bloom_policy_versions_answer_exactly_through_compaction() -> Result<(), JourneyError> {
+    let spec = BifrostClusterSpec::for_targets(&[
+        BifrostTarget::Scribe,
+        BifrostTarget::Oracle,
+        BifrostTarget::ForgeWorker,
+        BifrostTarget::Server,
+    ]);
+    let coordinator = spec
+        .nodes
+        .last()
+        .ok_or("the topology names its delayed coordinator")?
+        .node_id;
+    let mut cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        spec,
+        ForgeConfig::default(),
+        true,
+        true,
+    )
+    .await?;
+    let tables = {
+        let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+        let now = chrono::Utc::now().timestamp_micros();
+        let hour = (now / FILTER_HOUR_MICROS - 2) * FILTER_HOUR_MICROS;
+        let mut writer = writer(scribe, "bloom-policy-writer-0").await?;
+        let tables = [
+            BloomPolicyTable::register(&writer, hour, POLICIES_ENDING_COMPLETE).await?,
+            BloomPolicyTable::register(&writer, hour, POLICIES_ENDING_EMPTY).await?,
+        ];
+        for file in 0..POLICY_FILES {
+            if file > 0 {
+                for table in &tables {
+                    table.commit_policy(scribe, &writer, file).await?;
+                }
+                // A writer bound to the previous version is refused with the
+                // typed conflict; a fresh describe binds the new version.
+                let stale = writer
+                    .write_batch(&tables[0].fqn(), &tables[0].batch(file)?)
+                    .await
+                    .err()
+                    .ok_or("a writer bound to the previous version must be refused")?;
+                if !matches!(
+                    stale,
+                    WyrdError::Vala {
+                        error: BifrostError::TableVersionConflict { .. }
+                    }
+                ) {
+                    return Err(
+                        format!("a stale writer must see a version conflict: {stale:?}").into(),
+                    );
+                }
+                writer =
+                    crate::support::writer(scribe, &format!("bloom-policy-writer-{file}")).await?;
+            }
+            for table in &tables {
+                writer
+                    .write_batch(&table.fqn(), &table.batch(file)?)
+                    .await?;
+            }
+            scribe.flush_bifrost().await?;
+        }
+        tables
+    };
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing Oracle node")?,
+        "bloom-policy-reader",
+    )
+    .await?;
+    let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+    for table in &tables {
+        table
+            .prove_cut(&cluster, scribe, &reader, FilterCut::Hot)
+            .await?;
+    }
+
+    cluster.restart_node(coordinator).await?;
+    let server = cluster
+        .server_by_node(coordinator)
+        .ok_or("the delayed coordinator is running")?;
+    tokio::time::timeout(
+        COMPACTION_PASS_WAIT,
+        server.wait_for_forge_scheduler_passes_for_test(1),
+    )
+    .await
+    .map_err(|_| "the coordinator never completed its boot pass")?;
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    for table in &tables {
+        while file_tier_counts(&cluster, cluster.data_tenant_id(), &table.name).await?
+            != (i64::try_from(POLICY_FILES)?, 0)
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{}: promotion did not finish", table.name).into());
+            }
+            let before = server.completed_forge_scheduler_passes_for_test();
+            server.request_forge_scheduler_pass_for_test();
+            tokio::time::timeout(
+                COMPACTION_PASS_WAIT,
+                server.wait_for_forge_scheduler_passes_for_test(before + 1),
+            )
+            .await
+            .map_err(|_| "a requested scheduler pass did not complete")?;
+        }
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+    for table in &tables {
+        table
+            .prove_cut(&cluster, scribe, &reader, FilterCut::Promoted)
+            .await?;
+    }
+
+    let names: Vec<(BifrostNamespace, &str)> = tables
+        .iter()
+        .map(|table| (BifrostNamespace::Datasets, table.name.as_str()))
+        .collect();
+    await_rewrite(&cluster, scribe, &names).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    for table in &tables {
+        table
+            .prove_cut(&cluster, scribe, &reader, FilterCut::Rewritten)
+            .await?;
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Oracle query-profile steps whose timings the Bloom-policy evidence reports.
+const ORACLE_STEPS: [&str; 7] = [
+    "Oracle.cut_read",
+    "Oracle.cut_materialize",
+    "Oracle.scribe_listing",
+    "Oracle.provider_setup",
+    "Oracle.physical_planning",
+    "Oracle.scan_sizing",
+    "Oracle.admission",
+];
+
+/// One Bloom-policy dataset and the Bloom list each of its files is sealed
+/// under, in file order.
+struct BloomPolicyTable {
+    /// Unqualified dataset name.
+    name: String,
+    /// First microsecond of the fixture hour.
+    hour: i64,
+    /// The Bloom list of the version file `index` is written under.
+    policies: [&'static [&'static str]; POLICY_FILES],
+}
+
+impl BloomPolicyTable {
+    /// Registers the dataset with its first Bloom list through the public
+    /// client and requires describe to report the initial version.
+    ///
+    /// # Errors
+    ///
+    /// Returns registration or describe errors, and an error when the
+    /// resolved Bloom list or version differs from the declaration.
+    async fn register(
+        writer: &BifrostWriter,
+        hour: i64,
+        policies: [&'static [&'static str]; POLICY_FILES],
+    ) -> Result<Self, JourneyError> {
+        let table = Self {
+            name: unique_table("bloom_policy"),
+            hour,
+            policies,
+        };
+        let config = wyrd_client::bifrost::TableConfig::from_arrow(
+            &table.fqn(),
+            timed_schema(&policy_schema()),
+        )?
+        .with_layout(timed_layout_with(
+            vec![SortKeyWire {
+                column: "key_id".to_owned(),
+                direction: SortDirectionWire::Asc,
+                null_order: NullOrderWire::Last,
+            }],
+            policies[0]
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect(),
+        ));
+        wyrd_client::Bifrost::connect_with(
+            writer.client(),
+            BifrostOptions {
+                table: Some(config),
+                ..BifrostOptions::default()
+            },
+        )
+        .await?
+        .register()
+        .await?;
+        table.expect_version(writer, 0).await?;
+        Ok(table)
+    }
+
+    /// The dataset's fully qualified name.
+    fn fqn(&self) -> String {
+        format!("vala.datasets.{}", self.name)
+    }
+
+    /// Requires describe to report the version and Bloom list file `file` is
+    /// written under: the initial version plus one per Bloom-only edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the describe error, or an error naming the observed version
+    /// or Bloom list.
+    async fn expect_version(
+        &self,
+        writer: &BifrostWriter,
+        file: usize,
+    ) -> Result<(), JourneyError> {
+        let described = wyrd_client::Bifrost::query_only(writer.client())
+            .describe_table("vala.datasets", &self.name)
+            .await?;
+        let expected = wyrd_spec::vala::ids::TableVersion::new(i64::try_from(file)? + 1)?;
+        if described.table_version != expected
+            || described.physical_layout.bloom_columns != self.policies[file]
+        {
+            return Err(format!(
+                "{}: file {file} must be written at {expected:?} with Bloom {:?}, \
+                 describe reports {:?} with {:?}",
+                self.name,
+                self.policies[file],
+                described.table_version,
+                described.physical_layout.bloom_columns
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Commits file `file`'s Bloom list as a Bloom-only edit and requires
+    /// describe to report exactly the next version with that list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the describe error, and an error when the version did not
+    /// advance by exactly one.
+    async fn commit_policy(
+        &self,
+        server: &WyrdTestServer,
+        writer: &BifrostWriter,
+        file: usize,
+    ) -> Result<(), JourneyError> {
+        server
+            .commit_bloom_revision(
+                server.data_tenant_id(),
+                &TableRef::new(BifrostNamespace::Datasets, &self.name),
+                self.policies[file],
+            )
+            .await;
+        self.expect_version(writer, file).await
+    }
+
+    /// File `file`'s rows, in its own event-time slice, written in descending
+    /// key order so ascending storage order comes from the sort key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the batch does not assemble.
+    fn batch(&self, file: usize) -> Result<RecordBatch, JourneyError> {
+        let file = i64::try_from(file)?;
+        let keys: Vec<i64> = (file * POLICY_ROWS_PER_FILE..(file + 1) * POLICY_ROWS_PER_FILE)
+            .rev()
+            .collect();
+        let batch = RecordBatch::try_new(
+            policy_schema(),
+            vec![
+                Arc::new(Int64Array::from(keys.clone())),
+                Arc::new(arrow::array::StringArray::from_iter_values(
+                    keys.iter().map(|key| policy_service(*key)),
+                )),
+                Arc::new(arrow::array::StringArray::from_iter_values(
+                    keys.iter().map(|key| policy_environment(*key)),
+                )),
+                Arc::new(arrow::array::StringArray::from(
+                    keys.iter()
+                        .map(|key| policy_request(*key))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+        with_event_time(
+            &batch,
+            keys.iter()
+                .map(|key| {
+                    self.hour + file * FILTER_SLICE_MICROS + (key % POLICY_ROWS_PER_FILE) * 10_000
+                })
+                .collect(),
+        )
+    }
+
+    /// Proves `cut` serves the table, each object's Bloom metadata, and the
+    /// exact query matrix against it.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, catalog, telemetry, or query errors, and a
+    /// description of the first tier, Bloom, result, or pruning expectation
+    /// that does not hold.
+    async fn prove_cut(
+        &self,
+        cluster: &WyrdTestCluster,
+        server: &WyrdTestServer,
+        reader: &WyrdClient,
+        cut: FilterCut,
+    ) -> Result<(), JourneyError> {
+        let tenant = cluster.data_tenant_id();
+        let files = i64::try_from(POLICY_FILES)?;
+        let tiers = file_tier_counts(cluster, tenant, &self.name).await?;
+        let expected_tiers = match cut {
+            FilterCut::Hot => (0, files),
+            FilterCut::Promoted | FilterCut::Rewritten => (files, 0),
+        };
+        if tiers != expected_tiers {
+            return Err(format!(
+                "{}: the {cut:?} cut needs (compacted, hot) = {expected_tiers:?}, saw {tiers:?}",
+                self.name
+            )
+            .into());
+        }
+        let objects = SealedObject::read_tier(
+            cluster,
+            server,
+            tenant,
+            BifrostNamespace::Datasets,
+            &self.name,
+            EVENT_TIME,
+            cut.tier(),
+        )
+        .await?;
+        let rewritten = objects
+            .iter()
+            .filter(|object| object.path.contains(FORGE_DATA_SEGMENT))
+            .count();
+        let planned_as_expected = match cut {
+            FilterCut::Hot | FilterCut::Promoted => objects.len() == POLICY_FILES && rewritten == 0,
+            FilterCut::Rewritten => !objects.is_empty() && rewritten == objects.len(),
+        };
+        if !planned_as_expected {
+            return Err(format!(
+                "{}: the {cut:?} cut planned {:?}",
+                self.name,
+                objects
+                    .iter()
+                    .map(|object| &object.path)
+                    .collect::<Vec<_>>()
+            )
+            .into());
+        }
+        let mut filtered_groups = [0_usize; POLICY_BLOOM_COLUMNS.len()];
+        for (index, object) in objects.iter().enumerate() {
+            let policy = match cut {
+                FilterCut::Hot | FilterCut::Promoted => self.policies[index],
+                FilterCut::Rewritten => self.policies[POLICY_FILES - 1],
+            };
+            for group in object.metadata.row_groups() {
+                for (slot, column) in POLICY_BLOOM_COLUMNS.iter().enumerate() {
+                    let filtered = group
+                        .column(object.column_index(column)?)
+                        .bloom_filter_offset()
+                        .is_some();
+                    if filtered != policy.contains(column) {
+                        return Err(format!(
+                            "{}: {cut:?} object {} must carry Bloom {policy:?}, \
+                             {column} filtered={filtered}",
+                            self.name, object.path
+                        )
+                        .into());
+                    }
+                    filtered_groups[slot] += usize::from(filtered);
+                }
+            }
+            eprintln!(
+                "bloom policy {} {cut:?} object {index}: policy={policy:?} bytes={} \
+                 row_groups={} rows_per_group={:?} fewest_key_pages={}",
+                self.name,
+                object.bytes.len(),
+                object.row_groups(),
+                object
+                    .metadata
+                    .row_groups()
+                    .iter()
+                    .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                    .collect::<Vec<_>>(),
+                object.page_count("key_id")?
+            );
+        }
+        let [service_groups, _, request_groups] = filtered_groups;
+        self.run_matrix(cluster, reader, cut, service_groups, request_groups)
+            .await
+    }
+
+    /// Runs the policy query matrix. Every expectation is derived from the
+    /// per-row-within-file rule that wrote every file alike, so one exact
+    /// answer proves each file's policy returns the same rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns query or telemetry errors, and an error naming the first case
+    /// whose rows differ or whose Bloom exclusion differs from the filters
+    /// the cut's objects carry.
+    async fn run_matrix(
+        &self,
+        cluster: &WyrdTestCluster,
+        reader: &WyrdClient,
+        cut: FilterCut,
+        service_groups: usize,
+        request_groups: usize,
+    ) -> Result<(), JourneyError> {
+        let keys = 0..i64::try_from(POLICY_FILES)? * POLICY_ROWS_PER_FILE;
+        let rows_where = |keep: &dyn Fn(i64) -> bool| -> Vec<i64> {
+            keys.clone().filter(|key| keep(*key)).collect()
+        };
+        let cases = [
+            (
+                "same-Service selective equality",
+                "service = 'svc-2' AND environment = 'staging'".to_owned(),
+                rows_where(&|key| {
+                    policy_service(key) == "svc-2" && policy_environment(key) == "staging"
+                }),
+            ),
+            (
+                "cross-Service environment equality",
+                "environment = 'staging'".to_owned(),
+                rows_where(&|key| policy_environment(key) == "staging"),
+            ),
+            (
+                "finite IN with an absent member",
+                "service IN ('svc-0', 'svc-3', 'svc-6')".to_owned(),
+                rows_where(&|key| matches!(policy_service(key).as_str(), "svc-0" | "svc-6")),
+            ),
+            (
+                "null request",
+                "request IS NULL".to_owned(),
+                rows_where(&|key| policy_request(key).is_none()),
+            ),
+            (
+                "present request",
+                "request = 'req-00001'".to_owned(),
+                rows_where(&|key| policy_request(key).as_deref() == Some("req-00001")),
+            ),
+        ];
+        for (name, predicate, expected) in cases {
+            if expected.is_empty() {
+                return Err(format!("{name}: the fixture must select rows").into());
+            }
+            self.run_case(cluster, reader, cut, name, &predicate, expected)
+                .await?;
+        }
+        for (name, predicate, filtered) in [
+            ("absent Service", "service = 'svc-3'", service_groups),
+            ("absent request", "request = 'req-00007'", request_groups),
+        ] {
+            let evidence = self
+                .run_case(cluster, reader, cut, name, predicate, Vec::new())
+                .await?;
+            let case = format!("{} {cut:?} {name}", self.name);
+            let filtered = f64::from(u32::try_from(filtered)?);
+            expect_measure(&case, "bloom", evidence.bloom_pruned, filtered)?;
+            expect_measure(&case, "pruned", evidence.row_groups_pruned, filtered)?;
+        }
+        Ok(())
+    }
+
+    /// Runs one exact case through [`run_case`] and prints every Oracle query
+    /// family the window recorded, including step timings, as evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns telemetry or query errors, or the case's mismatch.
+    async fn run_case(
+        &self,
+        cluster: &WyrdTestCluster,
+        reader: &WyrdClient,
+        cut: FilterCut,
+        name: &str,
+        predicate: &str,
+        expected: Vec<i64>,
+    ) -> Result<ScanEvidence, JourneyError> {
+        let checkpoint = cluster
+            .telemetry()
+            .checkpoint()
+            .map_err(|error| error.to_string())?;
+        let evidence = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: format!("{} {cut:?} {name}", self.name),
+                sql: format!(
+                    "SELECT key_id AS id FROM {} WHERE {predicate} ORDER BY id",
+                    self.fqn()
+                ),
+                expected,
+            },
+        )
+        .await?;
+        let delta = cluster
+            .telemetry()
+            .delta_since(&checkpoint)
+            .map_err(|error| error.to_string())?;
+        let mut families = std::collections::BTreeMap::<String, f64>::new();
+        for sample in delta
+            .metrics
+            .iter()
+            .filter(|sample| sample.family.starts_with("oracle_query"))
+        {
+            // Oracle step timings are one family split by its `event` label.
+            let event = sample
+                .labels
+                .get("event")
+                .filter(|event| ORACLE_STEPS.contains(&event.as_str()));
+            *families
+                .entry(format!("{}{event:?}:{:?}", sample.family, sample.kind))
+                .or_default() += sample.value;
+        }
+        eprintln!(
+            "bloom policy {} {cut:?} {name} oracle families: {families:?}",
+            self.name
+        );
+        Ok(evidence)
+    }
+}
+
+/// The policy dataset's user schema: a sort key and three Bloom-capable
+/// strings, the last nullable. Registration and batches append
+/// [`EVENT_TIME`] through [`timed_schema`].
+fn policy_schema() -> SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("key_id", DataType::Int64, false),
+        arrow::datatypes::Field::new("service", DataType::Utf8, false),
+        arrow::datatypes::Field::new("environment", DataType::Utf8, false),
+        arrow::datatypes::Field::new("request", DataType::Utf8, true),
+    ]))
+}
+
+/// The Service of `key`: one of four even-numbered names, by row within its
+/// file, so every file holds the same rows and `svc-3` lies inside every
+/// group's bounds without ever being written.
+fn policy_service(key: i64) -> String {
+    format!("svc-{}", 2 * (key % POLICY_ROWS_PER_FILE % 4))
+}
+
+/// The environment of `key`, by row within its file: every third row is
+/// staging.
+fn policy_environment(key: i64) -> &'static str {
+    if key % POLICY_ROWS_PER_FILE % 3 == 0 {
+        "staging"
+    } else {
+        "prod"
+    }
+}
+
+/// The request of `key`, by row within its file: null on every seventh row,
+/// so each such row's own name lies inside every group's bounds unwritten.
+fn policy_request(key: i64) -> Option<String> {
+    let row = key % POLICY_ROWS_PER_FILE;
+    (row % 7 != 0).then(|| format!("req-{row:05}"))
+}
+
 /// The four-table filtering fixture: one hour of deterministic rows written
 /// as three disjoint event-time slices, each sealed as its own hot file.
 ///

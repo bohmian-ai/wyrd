@@ -1550,7 +1550,11 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         .is_err(),
         "a changed payload under an accepted batch id is refused"
     );
-    assert_eq!(read_all(client.clone()).await, all, "the refusal stores nothing");
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "the refusal stores nothing"
+    );
 
     let current = original.next().expect("the revision is version 2");
     assert!(

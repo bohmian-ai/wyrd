@@ -1597,9 +1597,13 @@ impl BifrostCatalog {
 
     /// Describe one tenant-qualified table and its stored physical schema.
     ///
+    /// The version and physical layout are the current metadata's, so a
+    /// definition edit is described with its own Bloom list and layout.
+    ///
     /// # Errors
     /// Returns a catalog error for a missing registration, invalid binding,
-    /// Iceberg load failure, or malformed stored schema.
+    /// Iceberg load failure, or a stored schema or definition that does not
+    /// rebuild.
     pub async fn describe_table(
         &self,
         table: &TableRef,
@@ -1635,16 +1639,18 @@ impl BifrostCatalog {
             )?)
         };
         let described = described_fields_from_stored_schema(&arrow_schema)?;
+        // The version and the layout come from one metadata document, so a
+        // definition edit is never described with another version's layout.
+        let definition = TableDefinition::of_metadata(&fqn, iceberg_table.metadata())?;
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
-            table_version: crate::catalog::layout::table_version(&fqn, iceberg_table.metadata())
-                .map_err(BifrostCatalogError::Registration)?,
+            table_version: definition.table_version,
             user_fields: described.user_fields,
             correlation_fields: described.correlation_fields,
             canonical_physical_fingerprint: builtin
                 .and_then(|definition| (definition.canonical_physical_fingerprint)())
                 .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
-            physical_layout: layout_wire_from_row(&row)?,
+            physical_layout: definition.layout.to_wire(),
             compaction_target_file_size_bytes: explicit_compaction_target(
                 iceberg_table.metadata(),
             )?,

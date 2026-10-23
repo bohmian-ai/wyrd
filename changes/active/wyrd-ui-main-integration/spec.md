@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -587,7 +587,7 @@ not protocol authority.
 
   | WireRequest | MCP tool | `wyrd-ai` call |
   |---|---|---|
-  | `cards.get_by_ref {card_ref: CardRef}` | `cards.get_by_ref` with the exact, space-resolved reference | `Cards.get(card_ref)` |
+  | `cards.get_by_ref {card_ref: CardRef}` | `cards.get_by_ref` with the exact flat reference | `Cards.get(card_ref)` |
   | `cards.list ListCardsRequest` | `cards.list` with the flat generated request, including filters, limit and cursor | `Cards.list(request)` |
   | `bifrost.query {sql, params?, deadline_ms?, max_rows?, max_bytes?}` | existing `bifrost.query`, extended with optional typed parameters | `Bifrost.stream(sql, params, options)` with bounded result collection |
   | `bifrost.list_tables {}` | `bifrost.list_tables` | `Bifrost.listTables()` |
@@ -1290,6 +1290,14 @@ reported live-proof blocker, never an assumed capability or silent pass.
   no catalog component entry changes. Adds AC-015. Builds on uncommitted revision 11
   without changing it. Approved by the caller's explicit "yes" to the
   revision as written; no implementation is claimed.
+
+- Revision 13 (2026-10-22): the UI work is rebased onto the flat Card identity
+  change (service-identity-and-telemetry TASK-001), which removes `space` from
+  `CardRef`, Card metadata and the SDK list requests. The exact reference above
+  is the flat `kind`/`name`/`version` reference with optional `uid`, and UI Card
+  identity renders as `Kind/name@version`. No other requirement changes.
+  Approved by the caller's instruction to carry out the proposed rebase steps,
+  which named this revision; no implementation is claimed.
 
 Authorities: `AGENTS.md`; `agent_docs/index.md`;
 `architecture/wyrd-design.md`;

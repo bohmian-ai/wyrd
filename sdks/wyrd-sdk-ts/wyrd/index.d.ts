@@ -230,7 +230,7 @@ export declare class NativeBifrostQueryStream {
    * Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
    *
    * An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB;
-   * a supplied one must lie in the same admitted range the MCP tool enforces
+   * a supplied one must be an exact integer in the same admitted range the MCP tool enforces
    * ([`admit_ceilings`]).
    * The projection is [`JsonResultBuilder`], the same owner the server's MCP
    * `bifrost.query` tool builds through, so both surfaces return the same

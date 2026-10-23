@@ -5,6 +5,7 @@ from typing import Any
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
 from ..client import WyrdClient
+from ..client._http_auth import HttpAuth
 from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
@@ -254,6 +255,30 @@ class WyrdState:
     @property
     def deployment_environment(self) -> str | None:
         """The configured deployment environment, or ``None`` when unknown; reading it fixes defaults."""
+        ...
+
+    @property
+    def http_auth(self) -> HttpAuth:
+        """An ``httpx.Auth`` / ``httpx2.Auth`` that authenticates to Wyrd in this state's context.
+
+        Hand it to stock provider clients created once, such as
+        ``openai.OpenAI(http_client=openai.DefaultHttpxClient(auth=state.http_auth))``.
+        Each request drops placeholder provider keys and carries a fresh
+        ``X-Wyrd-Access-Token``, the Service as ``x-wyrd-workload-uid``, the
+        configured ``x-wyrd-deployment-environment``, this state's innermost
+        active Run as ``wyrd-card-uid`` and ``wyrd-run-id`` (the Service and no
+        Run outside one), and the active W3C trace context unless the request
+        names its own ``traceparent``. The context is read when the request
+        starts, before any token refresh. Reading it fixes defaults and
+        resolves the client without network IO.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_400_CONFIG_INVALID`` on a request whose
+                explicit identity header differs from that context, before it
+                is sent; the credential error when the client cannot resolve.
+            ImportError: naming the ``gateway`` extra when ``httpx`` or
+                ``httpx2`` is not installed.
+        """
         ...
 
     def run(self, alias: str | None = None) -> Run:

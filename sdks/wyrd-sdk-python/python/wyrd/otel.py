@@ -69,6 +69,22 @@ _SCOPE_VAR: contextvars.ContextVar[tuple[tuple[str, str], ...]] = contextvars.Co
     "wyrd.run_scope", default=()
 )
 
+# Every entered Run as ``(state_token, card_uid, run_id)``, innermost last,
+# kept with or without OpenTelemetry so a state's ``http_auth`` finds its own
+# innermost Run even while another state's Run is nested inside it.
+_STATE_RUNS: contextvars.ContextVar[tuple[tuple[int, str, str], ...]] = contextvars.ContextVar(
+    "wyrd.state_runs", default=()
+)
+
+
+def _active_run(state_token: int) -> tuple[str, str] | None:
+    """Return the innermost entered ``(card_uid, run_id)`` of one state, or ``None``."""
+    for token, card_uid, run_id in reversed(_STATE_RUNS.get()):
+        if token == state_token:
+            return card_uid, run_id
+    return None
+
+
 # Private marker set on a provider object once it accepted the Wyrd processor,
 # so later Run entries skip it. ``_INSTALL_LOCK`` makes the check-and-add
 # atomic, so concurrent first entries register exactly one processor, and a
@@ -149,12 +165,13 @@ def install_run_correlation(provider: Any = None) -> bool:
         return False
 
 
-def _enter_run(card_uid: str, run_id: str) -> None:
-    """Push one Run scope; called by ``Run.__enter__``. Never raises.
+def _enter_run(card_uid: str, run_id: str, state_token: int) -> None:
+    """Push one Run scope of the state ``state_token``; called by ``Run.__enter__``. Never raises.
 
     Stamps the already-active recording span unless it already carries
     ``wyrd.card_uid``, so a nested scope never overwrites an outer correlation.
     """
+    _STATE_RUNS.set((*_STATE_RUNS.get(), (state_token, card_uid, run_id)))
     if not _OTEL_AVAILABLE:
         return
     _SCOPE_VAR.set((*_SCOPE_VAR.get(), (card_uid, run_id)))
@@ -178,12 +195,15 @@ def _carries_card_uid(span: Any) -> bool:
         return False
 
 
-def _exit_run(card_uid: str, run_id: str) -> None:
+def _exit_run(card_uid: str, run_id: str, state_token: int) -> None:
     """Pop this view's Run scope; called by ``Run.__exit__``. Never raises.
 
     Pops only when the innermost scope is exactly ``(card_uid, run_id)``; a
     mismatched top, empty stack, or failing context call changes nothing.
     """
+    runs = _STATE_RUNS.get()
+    if runs and runs[-1] == (state_token, card_uid, run_id):
+        _STATE_RUNS.set(runs[:-1])
     if not _OTEL_AVAILABLE:
         return
     mirrored = _SCOPE_VAR.get()

@@ -22,10 +22,13 @@ from google.genai import types as genai_types
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from wyrd import WyrdError
+from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.state import WyrdState
 
-from ..support import Receiver, client_of
+from ..support import Receiver, client_of, declare, pull, service_key
 from .support import PROVIDER_KEY, assert_upstream_credentials, calls, deploy
 
 if TYPE_CHECKING:
@@ -237,3 +240,80 @@ def test_http_auth_authenticates_from_the_environment_alone(
     completion = client.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
 
     assert completion.choices[0].message.content == "hi"
+
+
+def test_state_http_auth_supplies_service_and_agent_context(
+    backends: tuple[WyrdTestServer, Receiver], tmp_path: Path
+) -> None:
+    server, upstream = backends
+    cards = Cards(client_of(server))
+    declare(cards, "cards/observe_a_run/configured-service.yaml")
+    bundle = pull(cards, "configured-service", tmp_path)
+    key = service_key("configured-service", client=client_of(server))
+
+    def configured(environment: str) -> WyrdState:
+        state = WyrdState.from_path(bundle, client_of(server, key))
+        state.configure(deployment_environment=environment)
+        return state
+
+    prod, staging = configured("prod"), configured("staging")
+    service, agent = prod.root_ref.uid, prod.card_ref("agent").uid
+    assert service is not None and agent is not None
+    openai_client = openai.OpenAI(
+        base_url=f"{server.base_url}/v1",
+        api_key="wyrd",
+        http_client=openai.DefaultHttpxClient(auth=prod.http_auth),
+        max_retries=0,
+    )
+    anthropic_client = anthropic.Anthropic(
+        base_url=server.base_url,
+        api_key="wyrd",
+        http_client=anthropic.DefaultHttpxClient(auth=prod.http_auth),
+        max_retries=0,
+    )
+
+    openai_client.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
+    with prod.run() as service_run:
+        openai_client.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
+    with prod.run("agent") as agent_run, staging.run():
+        with anthropic_client.messages.stream(
+            model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
+        ) as stream:
+            assert stream.get_final_text() == "hi"
+
+    async def concurrent() -> list[str]:
+        async def ask(state: WyrdState) -> str:
+            client = openai.AsyncOpenAI(
+                base_url=f"{server.base_url}/v1",
+                api_key="wyrd",
+                http_client=openai.DefaultAsyncHttpxClient(auth=state.http_auth),
+                max_retries=0,
+            )
+            with state.run("agent") as run:
+                await client.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
+                return run.run_id
+
+        return list(await asyncio.gather(ask(prod), ask(staging)))
+
+    concurrent_runs = asyncio.run(concurrent())
+
+    delivered = len(upstream.deliveries)
+    with prod.run(), pytest.raises(WyrdError) as refused:
+        openai_client.chat.completions.create(
+            model="openai/gpt-4o", messages=MESSAGES, extra_headers={"wyrd-card-uid": agent}
+        )
+    assert refused.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+    assert len(upstream.deliveries) == delivered, "a local conflict sends nothing"
+    for delivery in upstream.deliveries:
+        assert not any(name.startswith(("x-wyrd", "wyrd-")) for name in delivery.headers)
+        assert key not in repr(delivery.headers)
+
+    rows = calls(server, "TRUE", "card_uid, run_id, outcome")
+    assert [(str(row["card_uid"]), row["run_id"], row["outcome"]) for row in rows[:3]] == [
+        (service, None, "succeeded"),
+        (service, service_run.run_id, "succeeded"),
+        (agent, agent_run.run_id, "succeeded"),
+    ]
+    assert sorted((str(row["card_uid"]), row["run_id"]) for row in rows[3:]) == sorted(
+        (agent, run_id) for run_id in concurrent_runs
+    )

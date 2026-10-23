@@ -2234,7 +2234,7 @@ mod tests {
     use wyrd_spec::auth::Attribution;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
@@ -2392,10 +2392,7 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     &Schema::new(cast_table_columns()),
                     CorrelationPolicy::Observation,
@@ -2610,10 +2607,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3170,10 +3164,7 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3222,10 +3213,7 @@ mod tests {
             payload,
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal.card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     schema,
                     CorrelationPolicy::Observation,
@@ -3248,14 +3236,8 @@ mod tests {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
         };
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         let rows = batch(
@@ -3335,14 +3317,8 @@ mod tests {
     #[test]
     fn card_scope_rejects_before_writer_admission() {
         let card = resolved_card("Service/billing@1.0.0");
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         let rows = batch(
@@ -3357,10 +3333,7 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal.card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3410,10 +3383,7 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3455,10 +3425,7 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3514,10 +3481,7 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal().card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3557,14 +3521,8 @@ mod tests {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
         };
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         (principal, card)
@@ -3626,10 +3584,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
+                card_scope: principal.card_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
@@ -3681,10 +3636,7 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     attribution: Attribution::direct(principal.id).into(),
-                    card_scope: principal
-                        .card_ref_scope()
-                        .map(CardRefScope::uids)
-                        .as_deref(),
+                    card_scope: principal.card_scope(),
                     expected_schema_fingerprint: source_schema_fingerprint(
                         rows.schema().as_ref(),
                         CorrelationPolicy::Observation,
@@ -3741,18 +3693,12 @@ mod tests {
         }
     }
 
-    /// Build a service principal whose signed scope is exactly `scope`.
-    fn scoped_principal(root: &CardRef, scope: CardRefScope) -> Principal {
-        Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(root.clone()),
-                card_ref_scope: scope,
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
-            PermissionSet::new(),
-        )
+    /// The signed UIDs of resolved `cards`, in order.
+    fn member_uids(cards: &[&CardRef]) -> Vec<CardUid> {
+        cards
+            .iter()
+            .map(|card| card.uid.clone().expect("resolved card uid"))
+            .collect()
     }
 
     /// How a single-row fixture carries its optional `card_uid` correlation.
@@ -3785,10 +3731,9 @@ mod tests {
             fields.push(Field::new(CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![value])));
         }
-        let scope = principal.card_ref_scope().map(CardRefScope::uids);
         stamp_correlation_columns(
             &batch(fields, columns),
-            &stamping_context(principal, scope.as_deref(), &RequestId::now_v7()),
+            &stamping_context(principal, principal.card_scope(), &RequestId::now_v7()),
         )
     }
 
@@ -3815,15 +3760,15 @@ mod tests {
     ///
     /// Panics when an absent or null correlation does not stamp a null
     /// `card_uid`, when a scoped member's signed UID is not stamped unchanged,
-    /// or when a UID outside the scope, a UID-less membership's reference text,
-    /// or malformed text is admitted.
+    /// or when a UID outside the scope, a member's reference text, or
+    /// malformed text is admitted.
     #[test]
     fn optional_and_scoped_card_correlations_stamp_signed_uids() {
         let root = resolved_card("Service/checkout@1.0.0");
         let secondary = resolved_card("Agent/planner@2.0.0");
-        let principal = scoped_principal(
-            &root,
-            CardRefScope::from_root_and_members(&root, [secondary.clone()]),
+        let principal = crate::test_support::scoped_service(
+            member_uids(&[&root, &secondary]),
+            PermissionSet::new(),
         );
 
         for (label, supplied) in [
@@ -3861,29 +3806,12 @@ mod tests {
             );
         }
 
-        let unsigned = CardRef::from_str("Service/unsigned@1.0.0").expect("card");
-        let unsigned_principal = scoped_principal(
-            &root,
-            CardRefScope::from_root_and_members(&root, [unsigned.clone()]),
-        );
-        for (label, principal, supplied) in [
-            (
-                "a UID-less signed membership's reference",
-                &unsigned_principal,
-                unsigned.to_string(),
-            ),
-            (
-                "malformed correlation text",
-                &principal,
-                "not-a-card-uid".to_owned(),
-            ),
-            (
-                "a UID outside the scope",
-                &principal,
-                Uuid::now_v7().to_string(),
-            ),
+        for (label, supplied) in [
+            ("a member's reference text", root.to_string()),
+            ("malformed correlation text", "not-a-card-uid".to_owned()),
+            ("a UID outside the scope", Uuid::now_v7().to_string()),
         ] {
-            let error = stamp_card_uid(principal, SuppliedCardUid::Text(&supplied))
+            let error = stamp_card_uid(&principal, SuppliedCardUid::Text(&supplied))
                 .expect_err("{label} fails closed");
             assert!(
                 matches!(error, ScribeError::CardScopeDenied),
@@ -3908,12 +3836,16 @@ mod tests {
         let verifier = resolved_card("Verifier/drift@1.0.0");
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier),
-            },
+            PrincipalKind::System,
             crate::test_support::tenant(),
             Vec::new(),
             PermissionSet::new(),
+        )
+        .with_card_access(
+            wyrd_spec::auth::CardAccess::Scoped {
+                cards: member_uids(&[&verifier]),
+            },
+            None,
         );
         let uid = uid_text(&verifier);
 

@@ -2138,14 +2138,13 @@ mod tests {
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
         let temp_dir = TempDir::new().expect("temp dir");
         let scribe = embedded_scribe(temp_dir.path());
-        let principal = wyrd_runtime::Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: wyrd_runtime::PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = wyrd_runtime::Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            wyrd_runtime::PermissionSet::new(),
+        );
         let request_id = RequestId::now_v7();
         let fence_request_id = request_id.clone();
         let batch_id = uuid::Uuid::now_v7();

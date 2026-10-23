@@ -1193,14 +1193,13 @@ mod tests {
     async fn decode_to_memtable_transfers_one_charge() {
         let scribe = ScribeImpl::new();
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::new(),
+        );
         let baseline = scribe.memory_snapshot().scribe_total_bytes;
         let decode_bytes = 4 * 1024 * 1024;
         let mut frame = decoded_size_frame(tenant, &principal, "v".repeat(1024));
@@ -1320,14 +1319,13 @@ mod tests {
         let scribe = ScribeImpl::new();
         scribe.set_decoded_request_limit_for_test(limit);
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::new(),
+        );
         let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);
         let admission_before = scribe.admission_snapshot();
         let memory_before = scribe.memory_snapshot();

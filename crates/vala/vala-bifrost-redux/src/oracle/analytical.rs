@@ -3857,14 +3857,13 @@ mod tests {
     fn context_for_leasing() -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
         AuthorizedQueryContext::try_new(
-            wyrd_runtime::Principal {
-                id: wyrd_runtime::PrincipalId::new(Uuid::now_v7()),
-                kind: wyrd_runtime::PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: wyrd_runtime::permission::PermissionSet::default(),
-                credential_id: None,
-            },
+            wyrd_runtime::Principal::new(
+                wyrd_runtime::PrincipalId::new(Uuid::now_v7()),
+                wyrd_runtime::PrincipalKind::User,
+                tenant,
+                Vec::new(),
+                wyrd_runtime::permission::PermissionSet::default(),
+            ),
             tenant,
             wyrd_spec::request_id::RequestId::now_v7(),
             None,

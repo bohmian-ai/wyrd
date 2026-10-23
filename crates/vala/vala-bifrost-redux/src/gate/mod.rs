@@ -44,9 +44,9 @@ use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
 };
+use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
@@ -1854,23 +1854,11 @@ mod tests {
     /// that exercises `wyrd.card_uid` needs a service principal rather than the
     /// plain user `auth_context` builds.
     fn scoped_auth_context() -> AuthContext {
-        let tenant = DataTenantId::new_v7();
-        let card = wyrd_spec::reference::CardRef {
-            uid: crate::tables::signal::correlation_fixture::scope().pop(),
-            ..crate::tables::signal::correlation_fixture::REFERENCE_TEXT
-                .parse()
-                .expect("fixture card ref")
-        };
-        let principal = Principal::new(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card),
-                card_ref: Some(card),
-            },
-            tenant,
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            crate::tables::signal::correlation_fixture::scope(),
             PermissionSet::from_iter([Permission::bifrost_record_write()]),
         );
+        let tenant = principal.tenant_id;
         AuthContext {
             principal,
             tenant,
@@ -2613,6 +2601,46 @@ mod tests {
         }
     }
 
+    /// A family-restricted Service account authenticated without a selected
+    /// root has no signed Card access, so any frame naming a Card is refused
+    /// as needing workload context rather than attributed or scope-denied,
+    /// while a frame naming no Card passes attribution unattributed.
+    #[tokio::test]
+    async fn rootless_family_account_needs_a_root_to_attribute_cards() {
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(TestScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        );
+        let mut auth = kind_context(
+            PrincipalKind::Service,
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        );
+        auth.principal = auth.principal.with_card_access(
+            wyrd_spec::auth::CardAccess::RootRequired {
+                restriction: wyrd_spec::auth::FamilyRestriction::Family(
+                    wyrd_spec::auth::WorkloadFamily {
+                        kind: wyrd_spec::auth::WorkloadKind::Service,
+                        name: wyrd_spec::ids::CardName::new("checkout").expect("static name"),
+                    },
+                ),
+            },
+            None,
+        );
+
+        let error = gate
+            .attributed_cards(&auth, crate::tables::signal::correlation_fixture::scope)
+            .await
+            .expect_err("a rootless family account cannot attribute a Card");
+        assert!(matches!(error, IngestError::WorkloadContextRequired));
+        assert!(
+            gate.attributed_cards(&auth, Vec::new)
+                .await
+                .expect("a frame naming no Card needs no root")
+                .is_none()
+        );
+    }
+
     /// Every public write to the four server-owned verification tables is refused
     /// as reserved, for every principal kind — a SYSTEM principal and a
     /// wildcard administrator included — before Scribe, with exactly one
@@ -2633,23 +2661,12 @@ mod tests {
             (
                 "card-free service",
                 kind_context(
-                    PrincipalKind::Service {
-                        card_ref: None,
-                        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
-                    },
+                    PrincipalKind::Service,
                     PermissionSet::from_iter([Permission::bifrost_record_write()]),
                 ),
             ),
             ("card-bound service", scoped_auth_context()),
-            (
-                "system",
-                kind_context(
-                    PrincipalKind::System {
-                        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
-                    },
-                    wildcard(),
-                ),
-            ),
+            ("system", kind_context(PrincipalKind::System, wildcard())),
         ];
         for table in [
             "vala.verification.results",

@@ -93,6 +93,23 @@ pub(crate) mod test_support {
         *TENANT.get_or_init(DataTenantId::new_v7)
     }
 
+    /// A Service principal in [`tenant`] whose signed Card access is exactly
+    /// `cards`, rooted at the first member, holding `permissions`.
+    pub(crate) fn scoped_service(
+        cards: Vec<wyrd_spec::ids::CardUid>,
+        permissions: wyrd_runtime::PermissionSet,
+    ) -> wyrd_runtime::Principal {
+        let root = cards.first().cloned();
+        wyrd_runtime::Principal::new(
+            wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::Service,
+            tenant(),
+            Vec::new(),
+            permissions,
+        )
+        .with_card_access(wyrd_spec::auth::CardAccess::Scoped { cards }, root)
+    }
+
     /// Captures exact span field updates and closure for lifecycle unit tests.
     #[derive(Default)]
     pub(crate) struct SpanCaptureSubscriber {

@@ -247,17 +247,17 @@ parquet = "60.0"
 parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "486273c9e0597611ed2f69ce8ab088f60cc88192" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a34f3885cd9652059c76e3fd48e6a511749269e8" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "486273c9e0597611ed2f69ce8ab088f60cc88192" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "486273c9e0597611ed2f69ce8ab088f60cc88192" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a34f3885cd9652059c76e3fd48e6a511749269e8" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a34f3885cd9652059c76e3fd48e6a511749269e8" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 60 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "a561b990b5013563072368eb2fcfea99263f6dfd" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "1ade704bdb316d0d49fd82169b6b6a66d7ec6868" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

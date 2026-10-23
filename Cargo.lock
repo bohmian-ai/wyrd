@@ -3181,7 +3181,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3996,7 +3996,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=486273c9e0597611ed2f69ce8ab088f60cc88192#486273c9e0597611ed2f69ce8ab088f60cc88192"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a34f3885cd9652059c76e3fd48e6a511749269e8#a34f3885cd9652059c76e3fd48e6a511749269e8"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4055,7 +4055,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=486273c9e0597611ed2f69ce8ab088f60cc88192#486273c9e0597611ed2f69ce8ab088f60cc88192"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a34f3885cd9652059c76e3fd48e6a511749269e8#a34f3885cd9652059c76e3fd48e6a511749269e8"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4066,7 +4066,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=a561b990b5013563072368eb2fcfea99263f6dfd#a561b990b5013563072368eb2fcfea99263f6dfd"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=1ade704bdb316d0d49fd82169b6b6a66d7ec6868#1ade704bdb316d0d49fd82169b6b6a66d7ec6868"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4094,7 +4094,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=486273c9e0597611ed2f69ce8ab088f60cc88192#486273c9e0597611ed2f69ce8ab088f60cc88192"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a34f3885cd9652059c76e3fd48e6a511749269e8#a34f3885cd9652059c76e3fd48e6a511749269e8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4347,7 +4347,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5430,7 +5430,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -6504,7 +6504,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7169,7 +7169,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7237,7 +7237,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8310,7 +8310,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9527,7 +9527,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

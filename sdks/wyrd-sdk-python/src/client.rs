@@ -358,6 +358,16 @@ impl PyWyrdClient {
         self.inner.workload_uid().map(CardUid::as_str)
     }
 
+    /// The configured deployment environment this client's requests carry,
+    /// or `None` when unknown.
+    #[getter]
+    fn deployment_environment(&self) -> Option<String> {
+        self.inner
+            .auth()
+            .deployment_environment()
+            .map(str::to_owned)
+    }
+
     /// Return a client that runs as the exact Service root
     /// `workload_uid`, sharing this client's credential and connection pools
     /// but not its token cache. Performs no IO; the server validates the root

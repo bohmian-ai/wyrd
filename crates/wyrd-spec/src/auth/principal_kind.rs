@@ -7,7 +7,7 @@
 //! CLI.
 //!
 //! A principal kind names an account, never an execution root: the exact
-//! Service or Agent version a request runs as is separate workload context.
+//! Service version a request runs as is separate workload context.
 //! The tenant-plane runtime projection is
 //! `wyrd_runtime::principal::PrincipalKind`, which maps to this tag through
 //! its `tag()` method.

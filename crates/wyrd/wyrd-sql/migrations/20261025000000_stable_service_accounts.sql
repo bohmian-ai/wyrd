@@ -1,7 +1,7 @@
 -- Stable Service accounts.
 --
 -- A Service account is created explicitly and outlives every Card version.
--- Which exact Service or Agent version a request runs as is execution context
+-- Which exact Service version a request runs as is execution context
 -- selected per token, never account identity, so accounts lose every Card
 -- column. An account may instead carry one durable workload restriction: a
 -- `(kind, name)` family it is limited to, and for which it is the unique

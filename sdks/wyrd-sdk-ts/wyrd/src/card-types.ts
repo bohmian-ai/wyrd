@@ -893,7 +893,7 @@ export interface CreateOperatorConnectionRequestSlack {
  * Request to create a stable tenant Service account.
  *
  * The account outlives every release: it is never a Card version. The exact
- * Service or Agent version a request runs as is selected per token or
+ * Service version a request runs as is selected per token or
  * request as workload context, within `workload_restriction`.
  */
 export interface CreateServicePrincipalRequest {

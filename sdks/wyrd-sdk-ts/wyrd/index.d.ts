@@ -773,12 +773,17 @@ export declare class NativeWyrdClient {
    */
   onBehalfOf(subjectToken: string, audience: string): Promise<NativeWyrdClientResult>
   /**
-   * Returns the exact Service or Agent Card UID this client runs as, or
+   * Returns the exact Service Card UID this client runs as, or
    * `null` for rootless work.
    */
   get workloadUid(): string | null
   /**
-   * Returns a client that runs as the exact Service or Agent root
+   * Returns the configured deployment environment this client's requests
+   * carry, or `null` when unknown.
+   */
+  get deploymentEnvironment(): string | null
+  /**
+   * Returns a client that runs as the exact Service root
    * `workload_uid`, sharing this client's credential and connection pools
    * but not its token cache. Performs no IO; a `workload_uid` that is not a
    * UUIDv7 is a `WYRD_SPEC_400_VALIDATION` result.
@@ -874,6 +879,25 @@ export declare class NativeWyrdClient {
  * on the first read instead of as an untyped constructor failure.
  */
 export declare class NativeWyrdState {
+  /**
+   * Fixes the state's Service release and deployment environment before
+   * first use, as `WyrdState::configure` does; local, with no IO.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be serialized; the
+   * frozen and invalid-field refusals are returned in the result.
+   */
+  configure(options: NativeConfigureOptions): NativeLifecycleResult
+  /**
+   * The configured deployment environment, or `null` when unknown; reading
+   * it fixes an unconfigured state's defaults.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the value cannot be serialized.
+   */
+  deploymentEnvironment(): NativeLifecycleResult
   /**
    * The client this state's server calls run as, resolving the ambient one
    * once on first use, so a telemetry exporter authenticates as the state.
@@ -1070,6 +1094,16 @@ export interface NativeCardsConnection {
   handle?: NativeCards
   /** Catalog failure otherwise. */
   error?: NativeWyrdError
+}
+
+/** The explicit fields `WyrdState.configure` fixes; omitted ones default. */
+export interface NativeConfigureOptions {
+  /** The loaded Service's name, which must match it. */
+  serviceName?: string
+  /** The loaded Service's exact version, which must match it. */
+  serviceVersion?: string
+  /** The workload's deployment environment. */
+  deploymentEnvironment?: string
 }
 
 /** A local file for a `media` slot, read only when the call pins it. */

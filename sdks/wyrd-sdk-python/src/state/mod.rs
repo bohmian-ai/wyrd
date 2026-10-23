@@ -28,7 +28,7 @@ use wyrd_spec::registry::{
     DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
-use wyrd_client::state::{DeclareOptions, TelemetryFlushFailure, WyrdState};
+use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure, WyrdState};
 
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
@@ -287,6 +287,38 @@ impl PyWyrdState {
     ///
     /// Raises `WYRD_SDK_404_UNKNOWN_ALIAS` when `alias` is not registered in
     /// this bundle; nothing is opened.
+    /// Fix this state's Service release and deployment environment before
+    /// its first use; local, with no network IO.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_409_STATE_CONFIG_FROZEN` once configuration is fixed
+    /// by an earlier configure or first use, even after shutdown, and
+    /// `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a name or
+    /// version that does not match the loaded Service.
+    #[pyo3(signature = (*, service_name=None, service_version=None, deployment_environment=None))]
+    fn configure(
+        &self,
+        service_name: Option<String>,
+        service_version: Option<String>,
+        deployment_environment: Option<String>,
+    ) -> CardPyResult<()> {
+        self.inner
+            .configure(ConfigureOptions {
+                service_name,
+                service_version,
+                deployment_environment,
+            })
+            .map_err(WyrdPyError::from)
+    }
+
+    /// The configured deployment environment, or `None` when unknown;
+    /// reading it fixes an unconfigured state's defaults.
+    #[getter]
+    fn deployment_environment(&self) -> Option<&str> {
+        self.inner.deployment_environment()
+    }
+
     #[pyo3(signature = (alias=None))]
     fn run(&self, alias: Option<&str>) -> CardPyResult<PyRun> {
         let run = match alias {

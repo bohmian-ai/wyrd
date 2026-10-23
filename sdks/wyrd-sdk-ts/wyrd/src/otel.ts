@@ -24,7 +24,7 @@ import type { WyrdClient } from "./index.js";
 
 /**
  * The workload option every exporter factory takes: `workloadUid`, the exact
- * Service or Agent Card UID exports run as; omitted, the client's own root, if
+ * Service Card UID exports run as; omitted, the client's own root, if
  * any. A `workloadUid` that is not a UUIDv7 throws `WYRD_SPEC_400_VALIDATION`.
  */
 export type ExporterOptions = { readonly workloadUid?: string };
@@ -33,11 +33,13 @@ export type ExporterOptions = { readonly workloadUid?: string };
 function config(client: WyrdClient, signal: "traces" | "logs" | "metrics", options: ExporterOptions) {
   const rooted = options.workloadUid === undefined ? client : client.forWorkload(options.workloadUid);
   const workloadUid = rooted.workloadUid;
+  const environment = rooted.deploymentEnvironment;
   return {
     url: `${rooted.serverUrl.replace(/\/+$/, "")}/v1/${signal}`,
     headers: async (): Promise<Record<string, string>> => ({
       "x-wyrd-access-token": `Bearer ${await rooted.accessToken()}`,
       ...(workloadUid === undefined ? {} : { "x-wyrd-workload-uid": workloadUid }),
+      ...(environment === undefined ? {} : { "x-wyrd-deployment-environment": environment }),
     }),
   };
 }

@@ -15,6 +15,13 @@ use crate::ids::{CardName, CardUid};
 /// a rootless bearer.
 pub const WORKLOAD_UID_HEADER: &str = "x-wyrd-workload-uid";
 
+/// The optional request header and gRPC metadata key that carries a configured
+/// workload's deployment environment.
+///
+/// Descriptive invocation context beside [`WORKLOAD_UID_HEADER`], never
+/// permission: it selects no principal, tenant, or grant.
+pub const DEPLOYMENT_ENVIRONMENT_HEADER: &str = "x-wyrd-deployment-environment";
+
 /// Parse a request's optional workload-context selector from every value it
 /// sent under [`WORKLOAD_UID_HEADER`].
 ///

@@ -187,7 +187,7 @@ impl NativeWyrdClient {
         })
     }
 
-    /// Returns the exact Service or Agent Card UID this client runs as, or
+    /// Returns the exact Service Card UID this client runs as, or
     /// `null` for rootless work.
     #[napi(getter)]
     pub fn workload_uid(&self) -> Option<String> {
@@ -196,7 +196,17 @@ impl NativeWyrdClient {
             .map(|uid| uid.as_str().to_owned())
     }
 
-    /// Returns a client that runs as the exact Service or Agent root
+    /// Returns the configured deployment environment this client's requests
+    /// carry, or `null` when unknown.
+    #[napi(getter)]
+    pub fn deployment_environment(&self) -> Option<String> {
+        self.client
+            .auth()
+            .deployment_environment()
+            .map(str::to_owned)
+    }
+
+    /// Returns a client that runs as the exact Service root
     /// `workload_uid`, sharing this client's credential and connection pools
     /// but not its token cache. Performs no IO; a `workload_uid` that is not a
     /// UUIDv7 is a `WYRD_SPEC_400_VALIDATION` result.

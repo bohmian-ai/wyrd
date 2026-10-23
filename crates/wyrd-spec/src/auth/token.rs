@@ -50,7 +50,7 @@ pub enum TokenRequest {
         actor_token_type: Option<ExchangeTokenType>,
         /// Wyrd resource a delegated token is issued for; delegation only.
         audience: Option<TokenAudience>,
-        /// Exact Service or Agent root selecting the API key owner's workload
+        /// Exact Service root selecting the API key owner's workload
         /// context; API-key subject only. It selects context, never another
         /// principal or tenant.
         workload_uid: Option<CardUid>,

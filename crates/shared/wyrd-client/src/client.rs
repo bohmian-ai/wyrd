@@ -496,6 +496,27 @@ impl WyrdClient {
         }
     }
 
+    /// Return a client whose requests run as the exact Service root `uid` in
+    /// `deployment_environment`, as [`Self::for_workload`] does.
+    ///
+    /// Every request also carries the environment on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER)
+    /// as descriptive context; it never changes the grant.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the returned client runs as.
+    /// * `deployment_environment` - The non-empty configured environment, or
+    ///   `None` when unknown.
+    #[must_use]
+    pub fn for_service(&self, uid: CardUid, deployment_environment: Option<String>) -> Self {
+        let auth = self.auth.for_service(uid, deployment_environment);
+        Self {
+            http: self.http.with_auth(Arc::clone(&auth)),
+            auth,
+            grpc_config: self.grpc_config.clone(),
+        }
+    }
+
     /// The exact root this client's requests run as, or `None` for rootless
     /// work: the one [`Self::for_workload`] selected, else `WYRD_WORKLOAD_UID`.
     #[must_use]

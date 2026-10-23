@@ -7,7 +7,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -163,10 +163,8 @@ def pull(cards: Cards, service: str, destination: Path) -> Path:
     return cards.pull(ref, destination).destination
 
 
-def runtime_account(
-    name: str, kind: Literal["Service", "Agent"] = "Service", client: WyrdClient | None = None
-) -> tuple[str, str]:
-    """The ``kind``/``name`` family's runtime account in ``client``'s tenant and one new key.
+def runtime_account(name: str, client: WyrdClient | None = None) -> tuple[str, str]:
+    """The ``name`` Service family's runtime account in ``client``'s tenant and one new key.
 
     Registration creates no principal, so the account restricted to the family
     is created holding only ``workload`` on first use and issued one more key
@@ -182,7 +180,7 @@ def runtime_account(
         {
             "name": account,
             "roles": ["workload"],
-            "workload_restriction": {"mode": "family", "kind": kind, "name": name},
+            "workload_restriction": {"mode": "family", "kind": "Service", "name": name},
         }
     )
     return created["principal_id"], created["credential"]

@@ -511,7 +511,7 @@ pub struct AuditDelegationStep {
     pub principal_id: PrincipalId,
     /// Card-free kind discriminator of the delegating principal.
     pub principal_kind: PrincipalKindTag,
-    /// Exact Service or Agent root the delegator acted under; absent for a
+    /// Exact Service root the delegator acted under; absent for a
     /// rootless hop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_uid: Option<CardUid>,

@@ -668,6 +668,12 @@ pub struct AuthMiddleware {
     ///
     /// [`WORKLOAD_UID_HEADER`]: wyrd_spec::auth::WORKLOAD_UID_HEADER
     workload_uid: Option<CardUid>,
+    /// The configured deployment environment every request carries on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`], or `None` when unknown. Descriptive
+    /// context only: it never enters a grant, so renewal cannot change it.
+    ///
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`]: wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER
+    deployment_environment: Option<String>,
 }
 
 impl Debug for AuthMiddleware {
@@ -682,6 +688,7 @@ impl Debug for AuthMiddleware {
             .field("http_base_url", &self.exchange.origin)
             .field("credentials", &self.credentials)
             .field("workload_uid", &self.workload_uid)
+            .field("deployment_environment", &self.deployment_environment)
             .finish_non_exhaustive()
     }
 }
@@ -770,6 +777,7 @@ impl AuthMiddleware {
             credentials,
             short_ttl_warned: AtomicBool::new(false),
             workload_uid,
+            deployment_environment: None,
         }))
     }
 
@@ -818,6 +826,7 @@ impl AuthMiddleware {
             credentials: None,
             short_ttl_warned: AtomicBool::new(false),
             workload_uid: None,
+            deployment_environment: None,
         })
     }
 
@@ -838,6 +847,25 @@ impl AuthMiddleware {
     /// * `uid` - Exact Service Card UID the derived middleware runs as.
     #[must_use]
     pub fn for_workload(self: &Arc<Self>, uid: CardUid) -> Arc<Self> {
+        self.for_service(uid, self.deployment_environment.clone())
+    }
+
+    /// Derive a middleware whose requests run as the exact Service root
+    /// `uid` in `deployment_environment`, as [`Self::for_workload`] does.
+    ///
+    /// The environment rides beside the root on every request and never
+    /// enters the grant, so the derived token cache is the root's alone.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the derived middleware runs as.
+    /// * `deployment_environment` - The non-empty configured environment, or
+    ///   `None` when unknown.
+    #[must_use]
+    pub fn for_service(
+        self: &Arc<Self>,
+        uid: CardUid,
+        deployment_environment: Option<String>,
+    ) -> Arc<Self> {
         let (credential, workload_uid) = match &self.credential {
             ResolvedCredential::Delegated {
                 subject_token,
@@ -862,7 +890,16 @@ impl AuthMiddleware {
             credentials: None,
             short_ttl_warned: AtomicBool::new(false),
             workload_uid,
+            deployment_environment,
         })
+    }
+
+    /// The configured deployment environment requests carry on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER),
+    /// or `None` when unknown.
+    #[must_use]
+    pub fn deployment_environment(&self) -> Option<&str> {
+        self.deployment_environment.as_deref()
     }
 
     /// The exact root this middleware's requests run as, or `None` for

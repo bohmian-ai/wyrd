@@ -80,9 +80,9 @@ impl ClientScope {
         let auth = &client.auth;
         Self {
             server_url: auth.base_url().trim_end_matches('/').to_owned(),
-            credential_fingerprint: fingerprint_credential(
-                auth.credential(),
-                auth.workload_uid().map(CardUid::as_str),
+            credential_fingerprint: scoped_fingerprint(
+                fingerprint_credential(auth.credential(), auth.workload_uid().map(CardUid::as_str)),
+                auth.deployment_environment(),
             ),
         }
     }
@@ -99,6 +99,22 @@ impl ClientScope {
     #[cfg(feature = "internal")]
     pub fn credential_fingerprint(&self) -> &str {
         &self.credential_fingerprint
+    }
+}
+
+/// `fingerprint` extended with the configured deployment environment, so two
+/// states over one credential and root in different environments never share
+/// a producer pool whose metadata carries the other's environment.
+fn scoped_fingerprint(fingerprint: String, deployment_environment: Option<&str>) -> String {
+    match deployment_environment {
+        Some(environment) => {
+            let mut hasher = Sha256::new();
+            hasher.update(fingerprint);
+            hasher.update([0]);
+            hasher.update(environment);
+            hex::encode(hasher.finalize())
+        }
+        None => fingerprint,
     }
 }
 

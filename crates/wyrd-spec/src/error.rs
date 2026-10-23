@@ -1353,18 +1353,41 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `start_telemetry` found a tracer provider Wyrd did not install.
+    /// `start_telemetry` found a process-global tracer provider Wyrd did not
+    /// install for this state: the application's own, or one bound to
+    /// another state's configured Service.
     ///
     /// Replacing an application's own provider would silently redirect or
-    /// drop its spans, so Wyrd refuses instead of taking over.
+    /// drop its spans, and reusing another state's would export under the
+    /// wrong Service, so Wyrd refuses instead.
     #[error("[WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS] {message}")]
     #[wyrd_error(
         code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
         status = 409,
         title = "A tracer provider is already installed",
-        remediation = "Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry."
+        remediation = "Add each state's Wyrd span exporter to the application's own provider instead of calling start_telemetry."
     )]
     SdkTelemetryProviderExists {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `configure` was called on a state whose Service context is already
+    /// fixed.
+    ///
+    /// The first explicit `configure` or the first Run, client, writer,
+    /// telemetry, or adapter use freezes a state's configured Service name,
+    /// version, and deployment environment, so every later `configure`
+    /// conflicts, including after shutdown.
+    #[error("[WYRD_SDK_409_STATE_CONFIG_FROZEN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_STATE_CONFIG_FROZEN",
+        status = 409,
+        title = "WyrdState configuration is already fixed",
+        remediation = "Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration."
+    )]
+    SdkStateConfigFrozen {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3856,6 +3879,7 @@ impl WyrdError {
             | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
+            | Self::SdkStateConfigFrozen { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
             | Self::SdkTelemetryFlushFailed { message, details }
             | Self::SdkBifrostNotStarted { message, details }

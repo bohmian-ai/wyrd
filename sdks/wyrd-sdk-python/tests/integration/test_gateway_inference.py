@@ -136,9 +136,10 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
-    card_uid = str(declare(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid)
-    principal_id, key = runtime_account("ask-agent", "Agent", admin)
-    agent = openai_client(client_of(server, key, card_uid))
+    declared = declare(Cards(admin), "cards/gateway_inference/ask-service.yaml")
+    card_uid = str(declared["ask-agent"].uid)
+    principal_id, key = runtime_account("ask-service", admin)
+    agent = openai_client(client_of(server, key, str(declared["ask-service"].uid)))
 
     for headers in ({"wyrd-run-id": "run-alone"}, {"wyrd-card-uid": card_uid}):
         completion = agent.chat.completions.create(

@@ -216,6 +216,8 @@ def _session(client: WyrdClient, workload_uid: str | None) -> Any:
         request.headers["x-wyrd-access-token"] = f"Bearer {client.access_token()}"
         if client.workload_uid is not None:
             request.headers["x-wyrd-workload-uid"] = client.workload_uid
+        if client.deployment_environment is not None:
+            request.headers["x-wyrd-deployment-environment"] = client.deployment_environment
         return request
 
     session = requests.Session()
@@ -326,7 +328,7 @@ def span_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTL
 
     Args:
         client: The client whose access token authenticates every export.
-        workload_uid: Exact Service or Agent Card UID the exports run as;
+        workload_uid: Exact Service Card UID the exports run as;
             omitted, the client's own workload root, if any.
 
     Raises:
@@ -347,7 +349,7 @@ def log_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTLP
 
     Args:
         client: The client whose access token authenticates every export.
-        workload_uid: Exact Service or Agent Card UID the exports run as;
+        workload_uid: Exact Service Card UID the exports run as;
             omitted, the client's own workload root, if any.
 
     Raises:
@@ -368,7 +370,7 @@ def metric_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> O
 
     Args:
         client: The client whose access token authenticates every export.
-        workload_uid: Exact Service or Agent Card UID the exports run as;
+        workload_uid: Exact Service Card UID the exports run as;
             omitted, the client's own workload root, if any.
 
     Raises:

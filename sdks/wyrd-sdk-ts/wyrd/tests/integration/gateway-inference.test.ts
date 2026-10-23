@@ -297,9 +297,10 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
 });
 
 test("gateway call records a lone run or card", async ({ server, ask }) => {
+  const service = await (await Cards.connect()).declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const cardUid = declared(ask, "ask-agent").uid;
-  const issued = await runtimeAccount({ kind: "Agent", name: "ask-agent" });
-  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(cardUid);
+  const issued = await runtimeAccount({ kind: "Service", name: "ask-service" });
+  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(declared(service).uid);
   const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
 
   for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {

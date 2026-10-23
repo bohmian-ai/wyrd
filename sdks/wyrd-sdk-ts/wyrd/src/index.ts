@@ -1615,6 +1615,11 @@ export class WyrdClient {
     return this.#native.workloadUid ?? undefined;
   }
 
+  /** The configured deployment environment requests carry, or `undefined` when unknown. */
+  get deploymentEnvironment(): string | undefined {
+    return this.#native.deploymentEnvironment ?? undefined;
+  }
+
   /**
    * Return a client that runs as the exact Service root `workloadUid`.
    *
@@ -2845,6 +2850,16 @@ function suppliedAttributes(supplied: Record<string, unknown>): Record<string, s
   return attributes;
 }
 
+/** The explicit fields {@link WyrdState.configure} fixes; omitted ones default. */
+export type ConfigureOptions = {
+  /** The loaded Service's name; must match it. */
+  readonly serviceName?: string;
+  /** The loaded Service's exact version; must match it. */
+  readonly serviceVersion?: string;
+  /** The workload's deployment environment. */
+  readonly deploymentEnvironment?: string;
+};
+
 /**
  * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
  *
@@ -3130,6 +3145,37 @@ export class WyrdState {
    */
   run(alias?: string): Run {
     return Run.fromOpen(this.#native.run(alias));
+  }
+
+  /**
+   * Fix this state's Service release and deployment environment before its
+   * first use. Local, with no network IO.
+   *
+   * Omitted `serviceName` and `serviceVersion` default to the loaded Service;
+   * an omitted `deploymentEnvironment` defaults to a non-empty
+   * `WYRD_DEPLOYMENT_ENVIRONMENT`, else stays unknown. Without a call, the
+   * first Run, client, Bifrost, telemetry, or shutdown use applies the same
+   * defaults. Another loaded state keeps its own configuration.
+   *
+   * @param options - The explicit name, version, and environment.
+   * @throws {@link WyrdError} `WYRD_SDK_409_STATE_CONFIG_FROZEN` once
+   * configuration is fixed, even after shutdown, or
+   * `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a mismatched name
+   * or version.
+   */
+  configure(options: ConfigureOptions = {}): void {
+    lifecycleValue<null>(
+      this.#native.configure({
+        serviceName: options.serviceName,
+        serviceVersion: options.serviceVersion,
+        deploymentEnvironment: options.deploymentEnvironment,
+      }),
+    );
+  }
+
+  /** The configured deployment environment, or `undefined` when unknown; reading it fixes defaults. */
+  get deploymentEnvironment(): string | undefined {
+    return lifecycleValue<string | null>(this.#native.deploymentEnvironment()) ?? undefined;
   }
 
   /**

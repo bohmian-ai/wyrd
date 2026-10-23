@@ -39,7 +39,7 @@ class WyrdClient:
             grpc_url: the gRPC endpoint. Resolved from ``WYRD_GRPC_URL`` and
                 then the effective server URL's scheme and host on port
                 ``50051`` if omitted.
-            workload_uid: the exact Service or Agent Card UID the client runs
+            workload_uid: the exact Service Card UID the client runs
                 as, as ``for_workload`` selects it. Resolved from
                 ``WYRD_WORKLOAD_UID`` if omitted; without either, work is
                 rootless.
@@ -68,11 +68,16 @@ class WyrdClient:
 
     @property
     def workload_uid(self) -> str | None:
-        """The exact Service or Agent Card UID this client runs as, or ``None`` for rootless work."""
+        """The exact Service Card UID this client runs as, or ``None`` for rootless work."""
+        ...
+
+    @property
+    def deployment_environment(self) -> str | None:
+        """The configured deployment environment requests carry, or ``None`` when unknown."""
         ...
 
     def for_workload(self, workload_uid: str) -> WyrdClient:
-        """Return a client that runs as the exact Service or Agent root ``workload_uid``.
+        """Return a client that runs as the exact Service root ``workload_uid``.
 
         The returned client shares this client's credential and connection
         pools but keeps its own token cache: an API key or workload token
@@ -81,7 +86,7 @@ class WyrdClient:
         server validates the root on first use.
 
         Args:
-            workload_uid: the exact Service or Agent Card UID to run as.
+            workload_uid: the exact Service Card UID to run as.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``workload_uid`` is

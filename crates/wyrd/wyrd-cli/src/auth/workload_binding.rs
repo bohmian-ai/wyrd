@@ -37,7 +37,7 @@ pub struct AddArgs {
     /// Active Service account the bound workload authenticates as.
     #[arg(long, value_name = "UUID")]
     pub principal: String,
-    /// Optional default workload root (a Service or Agent Card uid) selected
+    /// Optional default workload root (a Service Card uid) selected
     /// when the assertion exchange names none.
     #[arg(long, value_name = "CARD_UID")]
     pub workload_uid: Option<CardUid>,

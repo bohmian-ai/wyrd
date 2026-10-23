@@ -65,6 +65,6 @@ pub use token::{
     OAuthErrorResponse, TokenAudience, TokenRequest, TokenResponse, TokenType,
 };
 pub use workload::{
-    CardAccess, FamilyRestriction, MAX_SCOPED_CARDS, WORKLOAD_UID_HEADER, WorkloadFamily,
-    WorkloadKind, WorkloadRestriction, workload_uid_selector,
+    CardAccess, DEPLOYMENT_ENVIRONMENT_HEADER, FamilyRestriction, MAX_SCOPED_CARDS,
+    WORKLOAD_UID_HEADER, WorkloadFamily, WorkloadKind, WorkloadRestriction, workload_uid_selector,
 };

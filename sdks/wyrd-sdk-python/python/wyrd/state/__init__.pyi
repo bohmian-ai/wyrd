@@ -224,6 +224,38 @@ class WyrdState:
         """
         ...
 
+    def configure(
+        self,
+        *,
+        service_name: str | None = None,
+        service_version: str | None = None,
+        deployment_environment: str | None = None,
+    ) -> None:
+        """Fix this state's Service release and deployment environment before first use.
+
+        Local, with no network IO. Omitted name and version default to the
+        loaded Service; an omitted environment defaults to a non-empty
+        ``WYRD_DEPLOYMENT_ENVIRONMENT``, else stays unknown. Without a call,
+        the first Run, client, Bifrost, telemetry, or shutdown use applies the
+        same defaults. Another loaded state keeps its own configuration.
+
+        Args:
+            service_name: the loaded Service's name; must match it.
+            service_version: the loaded Service's exact version; must match it.
+            deployment_environment: the workload's deployment environment.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_409_STATE_CONFIG_FROZEN`` once configuration
+                is fixed, even after shutdown; ``WYRD_CLIENT_400_CONFIG_INVALID``
+                for an empty field or a mismatched name or version.
+        """
+        ...
+
+    @property
+    def deployment_environment(self) -> str | None:
+        """The configured deployment environment, or ``None`` when unknown; reading it fixes defaults."""
+        ...
+
     def run(self, alias: str | None = None) -> Run:
         """Open one invocation whose first view observes ``alias``.
 

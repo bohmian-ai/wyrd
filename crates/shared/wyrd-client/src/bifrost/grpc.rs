@@ -298,6 +298,18 @@ impl BifrostGrpcTransport {
                 .metadata_mut()
                 .insert(wyrd_spec::auth::WORKLOAD_UID_HEADER, uid);
         }
+        if let Some(environment) = self.connection.auth().deployment_environment() {
+            let environment =
+                MetadataValue::try_from(environment).map_err(|_| WyrdError::Internal {
+                    message:
+                        "bifrost deployment environment cannot be represented as gRPC metadata"
+                            .to_owned(),
+                    details: serde_json::json!({}),
+                })?;
+            request
+                .metadata_mut()
+                .insert(wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER, environment);
+        }
 
         let request_id = self
             .connection

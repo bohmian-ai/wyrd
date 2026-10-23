@@ -14,7 +14,7 @@
 //! exporter, stamping every span started inside a `Run::scope` with that Run
 //! and Card.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
@@ -31,6 +31,7 @@ use tokio::runtime::Handle;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use wyrd_client::WyrdClient;
+use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::observe::current_run_scope;
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
@@ -38,8 +39,9 @@ use wyrd_spec::error::WyrdError;
 /// Header the Wyrd OTLP collector reads the bearer from.
 const ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
-/// The provider [`start_telemetry`] installed, which every later call returns.
-static INSTALLED: OnceLock<SdkTracerProvider> = OnceLock::new();
+/// The provider [`start_telemetry`] installed and the pinned middleware of the
+/// state it exports as, which every later call for that state returns.
+static INSTALLED: OnceLock<(Arc<AuthMiddleware>, SdkTracerProvider)> = OnceLock::new();
 
 /// The `tracing` pipeline [`start_telemetry`] installed for this process.
 #[derive(Clone, Debug)]
@@ -79,25 +81,34 @@ impl Telemetry {
 /// spans export, and only tracing is installed. The W3C trace-context
 /// propagator becomes the global propagator, so standard HTTP and gRPC
 /// instrumentation carries the caller's trace to the next service. A later
-/// call in the same process returns the installed pipeline.
+/// call for the same state, or a clone of it, returns the installed pipeline.
+/// Startup is a use of the state, fixing its configuration.
 ///
 /// # Errors
 /// Returns `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
-/// already installed a global subscriber (add [`span_exporter`] to its own
-/// pipeline instead), the credential error when the state's client cannot
+/// already installed a global subscriber, or another state's pipeline is
+/// installed, so no span exports under the wrong Service (add each state's
+/// [`span_exporter`] to the application's own pipeline instead), the
+/// credential error when the state's client cannot
 /// resolve, and `WYRD_CLIENT_400_CONFIG_INVALID` when the exporter cannot be
 /// built, such as outside a Tokio runtime.
 pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
-    if let Some(provider) = INSTALLED.get() {
+    let client = state.client()?;
+    if let Some((auth, provider)) = INSTALLED.get() {
+        if !Arc::ptr_eq(auth, &client.auth()) {
+            return Err(WyrdError::SdkTelemetryProviderExists {
+                message: "another WyrdState's telemetry pipeline is already installed".to_owned(),
+                details: json!({ "root": state.root_ref() }),
+            });
+        }
         return Ok(Telemetry {
             provider: provider.clone(),
         });
     }
-    let exporter =
-        span_exporter(state.client()?).map_err(|error| WyrdError::ClientConfigInvalid {
-            message: format!("the telemetry span exporter cannot be built: {error}"),
-            details: json!({ "field": "telemetry" }),
-        })?;
+    let exporter = span_exporter(client).map_err(|error| WyrdError::ClientConfigInvalid {
+        message: format!("the telemetry span exporter cannot be built: {error}"),
+        details: json!({ "field": "telemetry" }),
+    })?;
     let provider = SdkTracerProvider::builder()
         .with_span_processor(RunCorrelation)
         .with_batch_exporter(exporter)
@@ -115,7 +126,7 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
-    let _ = INSTALLED.set(provider.clone());
+    let _ = INSTALLED.set((client.auth(), provider.clone()));
     Ok(Telemetry { provider })
 }
 
@@ -255,6 +266,12 @@ impl TokenHttpClient {
             request.headers_mut().insert(
                 wyrd_spec::auth::WORKLOAD_UID_HEADER,
                 uid.as_str().try_into()?,
+            );
+        }
+        if let Some(environment) = client.auth().deployment_environment() {
+            request.headers_mut().insert(
+                wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER,
+                environment.try_into()?,
             );
         }
         let response = http.execute(reqwest::Request::try_from(request)?).await?;

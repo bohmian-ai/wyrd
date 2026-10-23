@@ -341,6 +341,7 @@ class VerificationResultWire(TypedDict, Generic[DataT]):
     verifier: CardRefWire
     subject: CardRefWire
     outcome: VerificationOutcome[DataT]
+    deployment_environment: NotRequired[str]
 
 class VerificationError(TypedDict):
     """A settled execution's secret-free stable error."""
@@ -470,6 +471,11 @@ class VerificationResult(Generic[DataT]):
     @property
     def subject(self) -> CardRef:
         """The exact subject judged."""
+        ...
+
+    @property
+    def deployment_environment(self) -> str | None:
+        """The effective deployment environment, or ``None`` when unscoped."""
         ...
 
     @property

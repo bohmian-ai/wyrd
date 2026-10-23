@@ -373,6 +373,13 @@ impl PyVerificationResult {
         CardRefPy(self.result.subject.clone())
     }
 
+    /// The effective deployment environment the execution was accepted
+    /// under, or `None` when unscoped.
+    #[getter]
+    fn deployment_environment(&self) -> Option<&str> {
+        self.result.deployment_environment.as_deref()
+    }
+
     /// The overall verdict: `passed`, `failed`, or `inconclusive`.
     ///
     /// # Errors

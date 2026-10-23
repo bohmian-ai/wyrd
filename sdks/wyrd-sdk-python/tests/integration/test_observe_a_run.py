@@ -16,7 +16,15 @@ from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .support import BASELINE_TIMEOUT_SECONDS, binding_ids, hydrated, scheduled_result
+from .support import (
+    BASELINE_TIMEOUT_SECONDS,
+    binding_ids,
+    declare,
+    hydrated,
+    pull,
+    scheduled_result,
+    service_key,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -94,3 +102,38 @@ def test_unsealable_byte_budget_is_refused_at_connect(observed: WyrdState) -> No
     with pytest.raises(WyrdError) as refused:
         observed.start_bifrost(client_byte_limit_bytes=1024)
     assert refused.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+
+
+def test_configured_service_context_reaches_both_verification_subjects(
+    wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
+) -> None:
+    declare(cards, "cards/observe_a_run/configured-service.yaml")
+    bundle = pull(cards, "configured-service", tmp_path)
+    key = service_key("configured-service")
+    for environment in ("prod", "staging"):
+        state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+        state.configure(deployment_environment=environment)
+        run = state.run()
+        agent = run.for_card("agent")
+
+        result = agent.observe.verify("agent-check", "yes")
+        assert result.subject == state.card_ref("agent")
+        assert result.deployment_environment == environment
+        execution = agent.observe.submit("agent-check", "yes")
+        assert isinstance(execution, verify.Execution)
+        queued = execution.wait(60.0)
+        assert queued.subject == state.card_ref("agent")
+        assert queued.deployment_environment == environment
+
+        if environment == "prod":
+            root = run.observe.verify("service-check", "yes")
+            assert root.subject == state.root_ref
+            assert root.deployment_environment == "prod"
+        else:
+            with pytest.raises(WyrdError) as refused:
+                run.observe.verify("service-check", "yes")
+            assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
+            assert refused.value.details["field"] == "deployment_environment"
+        with pytest.raises(WyrdError) as frozen:
+            state.configure()
+        assert frozen.value.code == "WYRD_SDK_409_STATE_CONFIG_FROZEN"

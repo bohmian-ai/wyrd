@@ -712,8 +712,8 @@ pub enum AuditDetail {
         subject_principal_id: PrincipalId,
         /// Principal that performed the exchange.
         actor_principal_id: PrincipalId,
-        /// Typed delegation chain.
-        delegation_chain: Vec<CardRef>,
+        /// Earlier actors the exchange nested, initiator first.
+        delegation_chain: Vec<AuditDelegationStep>,
         /// Token expiry.
         expires_at: chrono::DateTime<chrono::Utc>,
     },
@@ -749,8 +749,8 @@ pub enum AuditDetail {
     /// Authorization decision metadata; the event's subject/actor pair names
     /// who was authorized.
     AuthzCheck {
-        /// Typed delegation chain.
-        delegation_chain: Vec<CardRef>,
+        /// Verified initiator-first delegation chain.
+        delegation_chain: Vec<AuditDelegationStep>,
         /// Authorization outcome.
         outcome: AuditOutcome,
         /// Stable denial reason, present only for a denial.
@@ -1335,8 +1335,8 @@ mod tests {
                 r#"{"api_key_id":"00000000-0000-0000-0000-000000000002","expires_at":"2026-01-02T03:04:05Z","kind":"credential_issuance","target_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
             ),
             (
-                r#"{"kind":"token_exchange","expires_at":"2026-01-02T03:04:05Z","delegation_chain":[{"version":"1.0.0","name":"worker","kind":"Agent"}],"actor_principal_id":"00000000-0000-0000-0000-000000000001","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
-                r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"kind":"token_exchange","expires_at":"2026-01-02T03:04:05Z","delegation_chain":[{"workload_uid":"019a7c00-0000-7000-8000-000000000001","principal_kind":"service","principal_id":"00000000-0000-0000-0000-000000000003"}],"actor_principal_id":"00000000-0000-0000-0000-000000000001","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"principal_id":"00000000-0000-0000-0000-000000000003","principal_kind":"service","workload_uid":"019a7c00-0000-7000-8000-000000000001"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
             ),
             (
                 r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"outcome":"denied","kind":"authz_check"}"#,

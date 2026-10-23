@@ -12,6 +12,7 @@ use wyrd_runtime::{DelegationStep, PrincipalRef, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
     ApiKeyLookupRow, ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix,
@@ -103,8 +104,8 @@ pub enum DelegateError {
     #[error("actor token invalid")]
     InvalidActorToken(AuthError),
     /// The identity input cannot express one actor acting for one subject:
-    /// a delegated actor token, an actor that is not a Card-bound Service or
-    /// Agent, or a party exchanging with itself.
+    /// a delegated actor token, an actor that is not a rooted Service, or a
+    /// party exchanging with itself.
     #[error("token exchange identity input is malformed: {0}")]
     MalformedIdentity(&'static str),
     /// The actor's principal is missing or inactive at issuance.
@@ -150,7 +151,8 @@ impl ExchangeApiKey {
     /// Verifies the key itself — format, tenant, an unexpired unrevoked row
     /// for its prefix, and the SHA-256 verifier — records the key's use, then
     /// mints through the shared issuance workflow, which refuses an inactive
-    /// tenant or principal and resolves current grants.
+    /// tenant or principal, resolves current grants, and validates the
+    /// explicitly selected `workload_uid` under the account's restriction.
     ///
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
@@ -160,6 +162,7 @@ impl ExchangeApiKey {
         &self,
         conn: &mut TenantConn<'_>,
         api_key: SecretString,
+        workload_uid: Option<CardUid>,
         request_id: &str,
     ) -> Result<ExchangedToken, ExchangeError> {
         let row = verify_api_key(conn, &api_key).await?;
@@ -171,6 +174,7 @@ impl ExchangeApiKey {
                 row.principal_id,
                 TenantGrant::ApiKey {
                     credential_id: row.api_key_id,
+                    workload_uid,
                 },
                 request_id,
             )
@@ -191,6 +195,7 @@ impl ExchangeApiKey {
         &self,
         conn: &mut TenantConn<'_>,
         api_key: &SecretString,
+        workload_uid: Option<CardUid>,
     ) -> Result<VerifiedToken, ExchangeError> {
         let row = verify_api_key(conn, api_key).await?;
         touch_api_key_last_used(conn, row.api_key_id).await?;
@@ -201,6 +206,7 @@ impl ExchangeApiKey {
                 row.principal_id,
                 TenantGrant::ApiKey {
                     credential_id: row.api_key_id,
+                    workload_uid,
                 },
             )
             .await?)
@@ -285,12 +291,15 @@ impl DelegateToken {
             .verifier
             .verify(&actor_token, &tenant)
             .map_err(DelegateError::InvalidActorToken)?;
-        let chain = delegation_chain(&subject, &actor)?;
+        let (chain, actor_workload_uid) = delegation_chain(&subject, &actor)?;
         let grant = TenantGrant::Delegation {
             subject: Box::new(TokenPrincipalRef::from(&subject.principal)),
             subject_roles: subject.principal.roles.clone(),
             subject_permissions: subject.principal.effective_permissions.clone(),
-            prior_act: act_from_chain(&subject.delegation_chain, tenant),
+            subject_card_access: subject.principal.card_access.clone(),
+            subject_workload_uid: subject.principal.workload_uid.clone(),
+            actor_workload_uid,
+            prior_act: act_from_chain(&subject.delegation_chain, tenant)?,
             audience,
             actor_credential_id: actor.principal.credential_id,
         };
@@ -335,7 +344,7 @@ impl DelegateToken {
             TOKEN_EXCHANGE_OPERATION,
             wyrd_runtime::delegated_attribution(subject, chain),
             subject.kind.tag(),
-            subject.card_ref().cloned(),
+            None,
             AuditOutcome::Allowed,
             AuditDetail::DelegationAttribution {
                 delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
@@ -349,20 +358,21 @@ impl DelegateToken {
 
 /// Validate the exchange identity and build its actor chain, earliest first.
 ///
-/// The actor must present a direct token for a Card-bound Service or Agent,
-/// and must not be the subject itself; the subject must not be the internal
+/// The actor must present a direct Service token that selected a root, and
+/// must not be the subject itself; the subject must not be the internal
 /// SYSTEM writer, which takes part in no delegation or impersonation flow and
 /// can never hold a delegated tenant token. The subject's earlier actors
-/// precede the new actor in the chain.
+/// precede the new actor in the chain. Returns the chain and the actor's
+/// root, which issuance revalidates and never replaces.
 ///
 /// # Errors
 /// Returns [`DelegateError::MalformedIdentity`] for a SYSTEM subject, a
-/// delegated actor token, an actor without a Service or Agent Card, or a
+/// delegated actor token, a rootless or non-Service actor, or a
 /// self-exchange.
 fn delegation_chain(
     subject: &VerifiedToken,
     actor: &VerifiedToken,
-) -> Result<Vec<DelegationStep>, DelegateError> {
+) -> Result<(Vec<DelegationStep>, CardUid), DelegateError> {
     if matches!(
         subject.principal.kind,
         wyrd_runtime::PrincipalKind::System { .. }
@@ -375,17 +385,23 @@ fn delegation_chain(
     if actor.principal.id == subject.principal.id {
         return Err(DelegateError::MalformedIdentity("actor_is_subject"));
     }
-    if actor.principal.card_ref().is_none() {
-        return Err(DelegateError::MalformedIdentity("actor_not_card_bound"));
-    }
-    Ok(subject
+    let Some(actor_root) = actor
+        .principal
+        .workload_uid
+        .clone()
+        .filter(|_| actor.principal.kind == wyrd_runtime::PrincipalKind::Service)
+    else {
+        return Err(DelegateError::MalformedIdentity("actor_has_no_root"));
+    };
+    let chain = subject
         .delegation_chain
         .iter()
         .cloned()
         .chain(std::iter::once(DelegationStep {
             principal: PrincipalRef::from_principal(&actor.principal),
         }))
-        .collect())
+        .collect();
+    Ok((chain, actor_root))
 }
 
 /// Convert stored role names into runtime role references.
@@ -401,23 +417,33 @@ pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     match value {
         "tenant_admin" => Some(PrincipalKindTag::TenantAdmin),
         "service" => Some(PrincipalKindTag::Service),
-        "agent" => Some(PrincipalKindTag::Agent),
         _ => None,
     }
 }
 
 /// Rebuild an RFC 8693 `act` chain (current actor outermost) from a verified
 /// earliest-first actor chain.
+///
+/// # Errors
+/// Returns [`DelegateError::MalformedIdentity`] for a step without a root,
+/// which no verified actor layer lacks.
 fn act_from_chain(
     chain: &[wyrd_runtime::DelegationStep],
     tenant_id: wyrd_spec::DataTenantId,
-) -> Option<Box<ActClaim>> {
-    chain.iter().fold(None, |act, step| {
-        Some(Box::new(ActClaim {
+) -> Result<Option<Box<ActClaim>>, DelegateError> {
+    chain.iter().try_fold(None, |act, step| {
+        let workload_uid = step
+            .principal
+            .workload_uid
+            .clone()
+            .ok_or(DelegateError::MalformedIdentity("actor_has_no_root"))?;
+        Ok(Some(Box::new(ActClaim {
             sub: step.principal.id.to_string(),
             principal: TokenPrincipalRef::from((&step.principal, tenant_id)),
+            workload_uid,
+            cid: step.principal.credential_id.map(|id| id.to_string()),
             act,
-        }))
+        })))
     })
 }
 

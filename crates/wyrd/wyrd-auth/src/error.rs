@@ -99,14 +99,6 @@ pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             message: "token expired".to_owned(),
             details: json!({}),
         },
-        AuthError::InvalidCardRef => WyrdError::InvalidCardRef {
-            message: "non-user token card_ref claim is absent or malformed".to_owned(),
-            details: json!({}),
-        },
-        AuthError::CardScopeMissingRoot => WyrdError::InvalidCardRef {
-            message: "card-bound token scope is missing its root card_ref".to_owned(),
-            details: json!({ "field": "card_ref_scope" }),
-        },
         AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
             message: format!(
                 "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"

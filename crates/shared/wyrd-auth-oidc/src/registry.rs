@@ -7,8 +7,9 @@ use std::time::Duration;
 use secrecy::SecretString;
 use url::Url;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 
 use crate::error::OidcError;
 
@@ -61,10 +62,10 @@ impl std::fmt::Display for ClaimPath {
 
 /// Mapping from standard OIDC claim paths to Wyrd's normalized claim names.
 ///
-/// # F04 — no `card_ref` here
+/// # F04 — no account or root here
 ///
-/// External token claims identify the external subject only. A Wyrd `CardRef`
-/// is never injected from token claims; it is resolved server-side via
+/// External token claims identify the external subject only. A Wyrd account
+/// or root is never injected from token claims; it is resolved server-side via
 /// [`WorkloadBindingResolver`] using the verified subject as the lookup key.
 #[derive(Debug, Clone)]
 pub struct ClaimMapping {
@@ -164,15 +165,16 @@ pub struct IssuerVerification {
 // WorkloadBinding
 // --------------------------------------------------------------------------
 
-/// Server-owned mapping from a verified external subject to a registered card.
+/// Server-owned mapping from a verified external subject to a stable Service
+/// account and an optional pinned default root.
 ///
-/// # F04 — authoritative source of card binding
+/// # F04 — authoritative source of the account
 ///
 /// A workload token carries `sub` (the external subject identity, e.g.
 /// a Kubernetes service account or SPIFFE ID). The server looks up the
-/// corresponding registered card via [`WorkloadBindingResolver`]. The token
-/// itself never carries a `card_ref`; allowing it to do so would let a
-/// compromised workload claim any card's permissions.
+/// corresponding account via [`WorkloadBindingResolver`]. The token itself
+/// never names an account or root; allowing it to do so would let a
+/// compromised workload claim any account's permissions.
 #[derive(Debug, Clone)]
 pub struct WorkloadBinding {
     /// Tenant that owns this binding.
@@ -183,17 +185,20 @@ pub struct WorkloadBinding {
     pub subject: String,
     /// Optional audience constraint for additional precision.
     pub audience: Option<String>,
-    /// The registered Wyrd card (Service or Agent) that this subject maps to.
-    pub card_ref: CardRef,
+    /// The stable Service account this subject authenticates as.
+    pub principal_id: PrincipalId,
+    /// Root used when the exchange selects none; validated at issuance under
+    /// the account's restriction like an explicit selection.
+    pub workload_uid: Option<CardUid>,
 }
 
-/// Resolves a verified external subject to its registered Wyrd card.
+/// Resolves a verified external subject to its workload binding.
 ///
 /// Implementations are provided by the server layer: a config-file impl for
 /// self-hosted deployments, a per-tenant SQL impl for cloud multi-tenant.
 /// This crate stays SQL-free.
 pub trait WorkloadBindingResolver: Send + Sync + std::fmt::Debug {
-    /// Look up the registered card for a verified external subject.
+    /// Look up the binding for a verified external subject.
     ///
     /// Returns `Ok(None)` when no binding exists for this subject (the server
     /// should respond with a `PrincipalNotFound` error). The token cannot
@@ -204,7 +209,7 @@ pub trait WorkloadBindingResolver: Send + Sync + std::fmt::Debug {
         issuer: &IssuerUrl,
         subject: &str,
         audience: Option<&str>,
-    ) -> impl Future<Output = Result<Option<CardRef>, OidcError>> + Send;
+    ) -> impl Future<Output = Result<Option<WorkloadBinding>, OidcError>> + Send;
 }
 
 // --------------------------------------------------------------------------

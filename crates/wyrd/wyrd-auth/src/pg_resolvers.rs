@@ -34,7 +34,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::HUMAN_SUBJECT_CLAIM;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
@@ -232,7 +233,7 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
         issuer: &IssuerUrl,
         subject: &str,
         audience: Option<&str>,
-    ) -> Result<Option<CardRef>, OidcError> {
+    ) -> Result<Option<WorkloadBinding>, OidcError> {
         let mut conn = self.postgres.tenant_conn(*tenant).await.map_err(|error| {
             tracing::warn!(error = %error, "binding resolver failed to acquire tenant connection");
             OidcError::JwksUnavailable {
@@ -249,7 +250,28 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
                     message: error.to_string(),
                 }
             })?;
-        Ok(row.map(|row| row.card_ref))
+        row.map(|row| {
+            let workload_uid = row
+                .workload_uid
+                .map(CardUid::from_uuid)
+                .transpose()
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "stored binding root is not a Card UID");
+                    OidcError::JwksUnavailable {
+                        issuer: issuer.as_str().to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+            Ok(WorkloadBinding {
+                tenant_id: *tenant,
+                issuer: issuer.clone(),
+                subject: row.subject,
+                audience: row.audience,
+                principal_id: PrincipalId::new(row.principal_id),
+                workload_uid,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -707,19 +729,15 @@ pub fn issuer_write_from_trusted(
 }
 
 /// Encode a [`WorkloadBinding`] into a [`WorkloadBindingWrite`] for boot seeding.
-///
-/// # Errors
-/// Returns a [`serde_json::Error`] when the structured `card_ref` cannot be
-/// serialized to JSONB.
-pub fn binding_write_from_binding(
-    binding: &WorkloadBinding,
-) -> Result<WorkloadBindingWrite, serde_json::Error> {
-    Ok(WorkloadBindingWrite {
+#[must_use]
+pub fn binding_write_from_binding(binding: &WorkloadBinding) -> WorkloadBindingWrite {
+    WorkloadBindingWrite {
         issuer_url: binding.issuer.as_str().to_owned(),
         subject: binding.subject.clone(),
         audience: binding.audience.clone(),
-        card_ref: serde_json::to_value(&binding.card_ref)?,
-    })
+        principal_id: binding.principal_id.as_uuid(),
+        workload_uid: binding.workload_uid.as_ref().map(CardUid::as_uuid),
+    }
 }
 
 #[cfg(test)]

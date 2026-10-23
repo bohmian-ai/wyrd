@@ -151,23 +151,24 @@ services.
     Auth-plane routes, authorized by the same JWT and a
     `Permission { resource, action, scope }` like every other call. The legacy
     per-card **governance token is removed** — the JWT proves the principal and
-    bounds its emittable **card scope**. For card-bound principals, the scope is
-    the principal's own `card_ref` plus the **observation-target** cards reachable
-    through the transitive card-ref graph declared in that card's spec. A card
+    bounds its emittable **card scope** through its signed `card_access`. A
+    token with a selected root (`workload_uid`) is `scoped`: the root plus the
+    **observation-target** cards reachable through the transitive card-ref graph
+    declared in that root's spec. A card
     enters the scope only if its kind is an observation target — a kind a client
     (`wyrd.observer`, Bifrost, drift samples) attributes records to: `Data`,
     `Model`, `Experiment`, `Prompt`, `Agent`, `Service`, `Mcp`, `Artifact`,
     `Source`. `Verifier` and control-plane kinds (`Policy`,
     `Audit`, `Operator`, `Trigger`) may be referenced for governance or
-    verification but never enter the emit scope. Service principals start from their Service card and
-    therefore include declared `Service.components`; Agent principals start from
-    their Agent card and include its declared card refs. Every token mint —
-    including the re-exchange a machine performs when its access token expires
-    — resolves those bounded scope identities to Card UIDs and signs that
-    mapping. A principal bound to no Card — a User, a tenant administrator, or
-    an unbound Service — has no bounded scope: it may attribute to any
-    declared observation-target Card in its tenant, which ingest resolves
-    against the tenant registry.
+    verification but never enter the emit scope. A Service root therefore
+    includes declared `Service.components`; an Agent root includes its declared
+    card refs. Every token mint — including the re-exchange a machine performs
+    when its access token expires — resolves the selected root's bounded graph
+    to Card UIDs and signs that set. A rootless User, tenant administrator, or
+    unrestricted Service is `any_registered`: it may attribute to any declared
+    observation-target Card in its tenant, which ingest resolves against the
+    tenant registry. A rootless family-restricted Service is `root_required`
+    and may attribute to no Card until a root is selected.
     An observation may carry its subject `card_uid`; when present, the
     server authorizes it against that scope's mapped UIDs and stores it.
     Generic telemetry may omit it and retains the authenticated publisher through
@@ -191,26 +192,24 @@ services.
       replacement in this design.
 
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
-    tenant_id, roles, effective_permissions, credential_id }`. `PrincipalId`
+    tenant_id, roles, effective_permissions, credential_id, card_access,
+    workload_uid }`. `PrincipalId`
     is a `Uuid` newtype; no string-prefix encoding (no `user:`, `sa:`,
     `agent:`) — discrimination lives on the kind. The closed wire set is
     `PrincipalKindTag`: `GlobalAdmin`, `TenantAdmin`, `User`, `Service`,
-    `Agent`, `System`, serialized as `global_admin`, `tenant_admin`, `user`,
-    `service`, `agent`, `system`. A `GlobalAdmin` is a platform-plane principal
+    `System`, serialized as `global_admin`, `tenant_admin`, `user`,
+    `service`, `system`. A `GlobalAdmin` is a platform-plane principal
     and has no tenant,
     carried at runtime as `PlatformPrincipal { id, kind,
     effective_permissions, credential_id }`; a platform-plane human is a
     `User` with no tenant. Every tenant-plane principal has exactly one
-    tenant and carries the card-bearing `PrincipalKind`: `TenantAdmin`,
-    `User`, `Service { card_ref: Option<CardRef>, card_ref_scope }`,
-    `Agent { card_ref, card_ref_scope }`, or the internal-only
-    `System { card_ref_scope }`. Card binding is a property of a
-    machine principal, not a precondition for being one: an Agent is always
-    card-bound and a deployed Service carries its Card, each projecting a
-    `card_ref_scope` authorization set derived at mint time, while a tenant
-    administrative or tenant-created automation principal is representable
-    with no Card and therefore no emit scope. `User` is the marker for human
-    identity. `System` is a tenant-local server identity that attributes
+    tenant and a Card-free `PrincipalKind`: `TenantAdmin`, `User`, `Service`,
+    or the internal-only `System`. Agent is a Card kind only. A Card root is
+    request execution context — the optional `workload_uid` and its
+    `card_access` limit — never part of the account's identity, so one stable
+    Service account runs every release of its workload and a tenant
+    administrative or automation account needs no Card at all. `User` is
+    the marker for human identity. `System` is a tenant-local server identity that attributes
     verification results and authorizes Verifier input reads in-process. It
     never appears in a token: no issuer mints one, every verifier rejects a
     `system` claim set, and it has no public credential, role, refresh,
@@ -240,16 +239,15 @@ services.
     any principal resolves (no credential, a malformed bearer token, or one
     failing signature or claim verification) records no audit decision; the
     credential-exchange refusals audit records keep the sentinel pair when no
-    identity is verified. `wyrd declare service.yaml` (or an Agent card) creates
-    or updates the principal row idempotently, keyed on
-    `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
-    `principal_id`. No secret is returned. Credentials are issued out-of-band
-    by `wyrd auth issue-key <card_ref>`, which mints a card-bound API key
-    against the existing principal. The caller uploads the key to the deploy
+    identity is verified. `wyrd declare service.yaml` (or an Agent card)
+    writes Card versions only; it creates no principal and returns no secret.
+    An administrator creates the stable Service account and its first
+    credential explicitly at `POST /v1/principals`. The caller uploads the key to the deploy
     environment's secret store (Vault, AWS Secrets Manager, GCP Secret
     Manager); deploy-time secret injection puts it into the pod as
-    `WYRD_API_KEY`. The SDK exchanges it at `POST /auth/token` for a short-lived
-    JWT and re-exchanges the same durable key whenever that token expires or
+    `WYRD_API_KEY`, optionally with `WYRD_WORKLOAD_UID` naming the exact
+    release root. The SDK exchanges it at `POST /auth/token` for a short-lived
+    JWT and re-exchanges the same durable key and root whenever that token expires or
     the server refuses it; a machine holds no refresh token. `/auth/token` derives `tenant_id` and
     `principal_id` from the verified API-key record — never from a
     client-supplied header. The JWT carries top-level `principal` (the subject;
@@ -598,8 +596,8 @@ rule shape; the `action` field on each rule says when it fires:
   - `classify` (declare-time): rule derives attrs onto the card (e.g.
                                 `risk.tier = "high"`). Never blocks.
   - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
-                                credential issuance (`wyrd auth issue-key`),
-                                and thus its emit eligibility. Blocks when Deny.
+                                deployment, and thus its emit eligibility.
+                                Blocks when Deny.
   - `invoke`   (runtime, per cross-service call): declared but unenforced.
                                 The runtime evaluation surface this action
                                 referenced (`POST /v1/authz/check`) was
@@ -670,22 +668,32 @@ stamps as `sub_principal_id` and `act_principal_id`; each row names the verified
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. Gate refuses every public write to
 `vala.gateway.calls` and the three result tables.
-`Service` and
-`Agent` principal is always card-bound and a deployed `Service` carries its
-Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a
-mint-time `card_ref_scope` derived from the transitive card-ref graph rooted at
-that card — but a `Service` binding is optional, and the administrative and
-automation principals a tenant creates for itself hold no Card at all. `wyrd declare` for a Service or Agent card creates or updates the
-principal row idempotently (keyed on `(tenant_id, card_kind, card_uid)`);
-re-apply preserves the same
-`principal_id`. No secret is returned. The declarative and credential
-operations are separated, matching the kubectl pattern (`apply` then
-`create token`):
+Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
+internal credentialless `System` actor. Agent is a Card kind, not a principal
+kind. A `Service` principal is a stable nonhuman account for Services, Agents,
+CI, and automation: an administrator creates it explicitly once, the server
+assigns its id, and it outlives every release. Registering or re-declaring a
+Service or Agent Card creates Card versions only, never a principal, role
+grant, or credential. Exact versions are request execution context, not
+account identity.
 
-| Operation | Wyrd command | What it does |
+A Service account carries one `workload_restriction`, a closed union:
+`{"mode":"unrestricted"}` (the default) or
+`{"mode":"family","kind":"Service"|"Agent","name":<card name>}`. A family
+restriction limits Card-attributed emission and verification to roots of that
+family, and makes the account that family's unique scheduled runtime account
+in the tenant; a second live account for the same family conflicts. Setting a
+family restriction, at creation or later, additionally requires
+tenant-administrative wildcard permission; a role name never proves it.
+Restrictions grant no operation authority and do not filter unrelated
+registry or table operations.
+
+| Operation | Surface | What it does |
 |---|---|---|
-| Declare card + create principal | `wyrd declare service.yaml` | Idempotent. Writes card, upserts the Service/Agent principal keyed on `(tenant_id, card_kind, card_uid)`. Re-declaring preserves `principal_id`. No secret. |
-| Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Requires an applied principal. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
+| Create account | `POST /v1/principals`, `wyrd principal credential create-principal` | Atomically creates the account, its roles, optional restriction, and first credential, returned once. |
+| Replace restriction | `PUT /v1/principals/{principal_id}/workload-restriction`, `wyrd principal credential set-restriction` | Service only; idempotent for an unchanged value; atomically releases and acquires the family association. Id, roles, and credentials are unchanged. |
+| Rotate credentials | `POST`/`GET`/`DELETE /v1/principals/{principal_id}/credentials[/{credential_id}]` | Issue, verify, deploy, then revoke the old key; overlap is allowed and releases never require rotation. |
+| Register a release | `wyrd declare service.yaml` | Writes Card versions; no principal and no secret. |
 
 #### API key → JWT flow
 
@@ -698,11 +706,20 @@ secret store is the only renewable authority and revoking it ends renewal.
 Renewal authority is a human concern: only a tenant human login returns a
 refresh token (a platform login is access-only), and only the public CLI client's refresh token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
-no client-supplied tenant header is accepted. The JWT carries the principal
-as the top-level `principal` claim, the `permissions` resolved from its current
-grants at issuance as its only authority, and for delegated tokens (token
-exchange) an RFC 8693 `act` chain naming the actors, the outermost being the
-current one. A delegated token's audience is `wyrd` or `bifrost`; a `bifrost`
+no client-supplied tenant header is accepted. The exchange takes an optional
+`workload_uid` naming the exact Service or Agent root the account runs as; it
+selects context only and never changes the account, permissions, or tenant.
+The JWT carries the account as the top-level `principal` claim
+(`{id, kind, tenant_id}`, no Card), the `permissions` resolved from its current
+grants at issuance as its only operation authority, an optional `workload_uid`
+root, and a required `card_access` limit: `any_registered` for a rootless
+User, administrator, or unrestricted Service; `root_required` with the family
+snapshot for a rootless family-restricted Service, which permits generic
+authorized work but no Card-attributed work; or `scoped` with the exact Card
+UID graph of the selected root (depth 16, at most 32 Cards). An unusable root
+is refused, never ignored. For delegated tokens (token exchange) an RFC 8693
+`act` chain names the actors, the outermost being the current one, each with
+its own `workload_uid`. A delegated token's audience is `wyrd` or `bifrost`; a `bifrost`
 token is accepted only on the Bifrost ingest and query surfaces.
 
 OTLP is the one exception to exchange-first. A stock OpenTelemetry exporter
@@ -732,7 +749,8 @@ Env vars in deployed services:
 
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
-| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
+| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (a credential of the stable Service account) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. The JWT names the account, never a Card. |
+| `WYRD_WORKLOAD_UID` | OPTIONAL | Deployment config or the loaded WyrdState bundle | Exact Service or Agent root the client runs as, sent as the exchange's `workload_uid` and the `x-wyrd-workload-uid` request header. Selects context only. |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:8080`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
 
@@ -920,8 +938,8 @@ each correlated row names its own exact subject Card. A telemetry row may omit
 Card correlation; when supplied, the `(card_uid, run_id)` pair anchors it to
 that subject and invocation. The server owns resolution of that identity.
 
-**A principal is not a card.** A Service or Agent principal is bound to one card
-(its `card_ref`), but a Service card *nests components* — each a card in its own
+**A principal is not a card.** A Service account runs as one selected root
+Card (its `workload_uid`) per request context, but a Service card *nests components* — each a card in its own
 right (e.g. Model A, Model B, a Prompt; `Service.components`). One
 `state.run()` opens one invocation and one `run_id`, initially scoped to the
 root Service Card. The first-class SDKs may select an initial hydrated Card
@@ -929,7 +947,7 @@ alias when opening the run, and `for_card(alias)` returns an immutable
 Card-scoped view of that same invocation for multi-component work. Views for
 different components share the `run_id` and the JWT, but each row carries its
 view's exact subject `card_uid`. Switching Cards never requires a distinct Run
-ID, and the principal's root Card cannot say which card a correlated record
+ID, and the request's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
 
@@ -1009,29 +1027,32 @@ Consequences, stated so they stop drifting:
   generic telemetry and produces null `card_uid`; the authenticated publisher
   remains available through non-null `sub_principal_id` and `act_principal_id`.
   When present, the server checks the asserted
-  `card_uid` against the principal's **card scope**. For Service and Agent
-  principals, the scope is the principal's own `card_ref` plus the
+  `card_uid` against the token's **card scope**. A rooted token's scope is its
+  `workload_uid` root plus the
   **observation-target** cards reachable through the transitive card-ref graph
-  declared in that card's spec. A card is in scope only if its kind is an
+  declared in that root's spec. A card is in scope only if its kind is an
   observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
   `Service`, `Mcp`, `Artifact`, `Source`); `Verifier` and
   control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
   extraction rules. A `card_uid` outside that set is rejected: a principal may
-  not attribute records to a card outside its declared graph. The scope can be resolved from the
-  signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Every
+  not attribute records to a card outside its root's declared graph. The scope
+  is the signed `card_access` claim minted into the JWT at `/auth/token`. Every
   token mint — a first exchange, a machine's re-exchange, or a human refresh
   rotation — resolves each bounded member against the tenant Card registry and
-  signs its authoritative UID with the identity. Ingest uses that verified
-  in-memory mapping and performs no Card-registry Postgres or cache lookup.
-  A principal bound to no Card (User, tenant administrator, unbound Service)
-  carries no bounded scope; its scope is every declared observation-target
-  Card in its tenant. Gate looks the distinct `card_uid` values of each
-  frame (at most 32) up in the tenant registry before dispatch and hands
-  Scribe the declared observation-target UIDs as that frame's scope, so an
-  undeclared or non-observation Card is refused exactly like a UID outside
-  a signed scope.
+  signs its authoritative UID. Ingest uses that verified
+  in-memory set and performs no Card-registry Postgres or cache lookup.
+  A rootless `any_registered` token (User, tenant administrator, unrestricted
+  Service) carries no bounded scope; its scope is every declared
+  observation-target Card in its tenant. Gate looks the distinct `card_uid`
+  values of each frame (at most 32) up in the tenant registry before dispatch
+  and hands Scribe the declared observation-target UIDs as that frame's scope,
+  so an undeclared or non-observation Card is refused exactly like a UID
+  outside a signed scope. A rootless `root_required` token may attribute to no
+  Card; native Bifrost accepts only the signed root and refuses a
+  `x-wyrd-workload-uid` selector it cannot resolve, so such a client exchanges
+  its credential with `workload_uid` first.
 - **This is not the governance token.** `card_uid` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).

@@ -572,8 +572,7 @@ async fn composite_fixture(table_name: &str) -> PromotionIntegrationFixture {
                 Arc::new(Int64Array::from(vec![value, value + 10])),
                 Arc::new(StringArray::from(vec![customer, customer])),
                 Arc::new(
-                    TimestampMicrosecondArray::from(vec![noon, noon + 1_000])
-                        .with_timezone("UTC"),
+                    TimestampMicrosecondArray::from(vec![noon, noon + 1_000]).with_timezone("UTC"),
                 ),
             ],
         )

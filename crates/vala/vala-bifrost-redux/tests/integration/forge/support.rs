@@ -1429,7 +1429,8 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
-        let binding = create_table(&self.catalog, self.tenant, name, value_fields(), Vec::new()).await;
+        let binding =
+            create_table(&self.catalog, self.tenant, name, value_fields(), Vec::new()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {

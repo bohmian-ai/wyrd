@@ -431,6 +431,20 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
   const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(declared(receipt).uid);
   const before = provider.received.length;
+  // The Service family's one runtime account is shared with earlier tests in this file.
+  const deployments = async (): Promise<unknown[]> => {
+    server.flushBifrost();
+    const calls = (
+      await (
+        await Bifrost.connect()
+      ).sql(
+        "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
+        [issued.principalId],
+      )
+    ).toArrow();
+    return columnValues(calls.getChild("deployment")) as unknown[];
+  };
+  const earlier = (await deployments()).length;
 
   const asked: string[] = [];
   for (const alias of ["agent", "body-agent"]) {
@@ -448,16 +462,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   expect(upstream.map(({ model }) => model)).toEqual(Array(4).fill("gpt-4o"));
   expect(upstream.map(({ messages }) => messages)).toEqual(asked.map((content) => [{ role: "user", content }]));
 
-  server.flushBifrost();
-  const calls = (
-    await (
-      await Bifrost.connect()
-    ).sql(
-      "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
-      [issued.principalId],
-    )
-  ).toArrow();
-  expect(columnValues(calls.getChild("deployment"))).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
+  expect((await deployments()).slice(earlier)).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
 
   await expect(askAgent(state, caller, "agent", "openai-granted", "denied")).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",

@@ -1,7 +1,7 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { mkdtempSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -79,8 +79,19 @@ test("run view exposes its alias", ({ state }) => {
   expect(agentRun.runId).not.toBe(run.runId);
 });
 
-test("card scoped key cannot write another cards observations", async ({ bundle }) => {
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect() });
+test("stale bundle cannot write outside its service graph", async ({ bundle }) => {
+  const model = WyrdState.fromPath(bundle).cardRef("model").uid ?? "";
+  const cards = await Cards.connect();
+  const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/configured-service.yaml"));
+  const stale = mkdtempSync(join(tmpdir(), "wyrd-ts-stale-"));
+  cpSync(bundle, stale, { recursive: true });
+  for (const file of readdirSync(stale, { recursive: true, encoding: "utf8" })) {
+    if (file.endsWith(".yaml")) {
+      const path = join(stale, file);
+      writeFileSync(path, readFileSync(path, "utf8").replaceAll(model, root.uid ?? ""));
+    }
+  }
+  const state = WyrdState.fromPath(stale, { client: WyrdClient.connect() });
   await state.startBifrost();
 
   expect(await state.run().forCard("model").observe.submit("observed-drift", { latency: 12.5 })).toEqual({

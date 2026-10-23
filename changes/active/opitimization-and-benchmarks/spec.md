@@ -6,6 +6,8 @@ status: draft
 
 # Bifrost read and write performance within striking distance of ClickHouse
 
+Benchmark structure, recording, and criteria are owned by [benchmark-experiments](../benchmark-experiments/spec.md), which takes precedence for that scope.
+
 ## Objective and user value
 
 Bifrost is the analytical store behind every Wyrd verification read and every

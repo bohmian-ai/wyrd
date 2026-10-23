@@ -390,4 +390,4 @@ Nothing was changed for this.
 - Every version is retained with no pruning (ponytail note in `forge/compact.rs`) until a retry horizon exists.
 - Throughput is unmeasured.
 
-**Verdict:** `IMPLEMENTED` pending the fork push and repin, with throughput unmeasured.
+**Verdict:** `BLOCKED` on maintainer authorization: the dependency must pin an immutable pushed commit, and fork branch `wyrd-table-version` at `a34f3885c` is unpushed, so `Cargo.toml` still pins `486273c9e`. Code and evidence are otherwise complete. Throughput is unmeasured because another worktree holds the host. The naive time-column contradiction between `bifrost-design.md:79` and `layout.rs:1226` predates this task and needs a maintainer decision.

@@ -4459,3 +4459,240 @@ async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
     }
     Ok(())
 }
+
+/// A client of `server` authenticating with `credential`, an API key or an
+/// access token.
+///
+/// # Errors
+/// Returns an error when the client cannot be assembled.
+fn native_client(
+    server: &WyrdTestServer,
+    credential: &str,
+) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {
+    Ok(wyrd_client::bifrost::client_from_options(
+        server.base_url(),
+        Some(credential),
+        server.grpc_url().as_deref(),
+    )?)
+}
+
+/// Send one row of the `(id, value)` table `fqn` over the native ingest wire
+/// as `client`, correlated to `card` when given, and return the server's
+/// answer.
+///
+/// # Errors
+/// Returns the server's stable refusal, or a harness error when the ingest
+/// channel cannot be dialled.
+///
+/// # Panics
+/// Panics when the row does not prepare against `preflight`.
+async fn native_row(
+    client: &wyrd_client::WyrdClient,
+    fqn: &str,
+    preflight: &wyrd_queue::RowPreflight,
+    card: Option<&CardUid>,
+) -> Result<(), WyrdError> {
+    let rows = preflight
+        .prepare(&[r#"{"id": 1, "value": "native"}"#], card, None)
+        .expect("the row prepares");
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
+        .await?
+        .insert(
+            fqn,
+            uuid::Uuid::now_v7(),
+            rows.to_ipc().expect("the row encodes"),
+        )
+        .await
+        .map(|_request_id| ())
+}
+
+/// A normal User bearer with a loaded `WyrdState` writes native observations:
+/// the state selects its Service root on every frame, the server narrows the
+/// rootless User bearer to that validated root before Gate admission, and the
+/// row lands correlated to the bundle's Model under the User's own identity.
+///
+/// Selection only ever narrows. An unknown root and a non-Service root are
+/// refused as unusable, a bearer signed for one root that selects another is
+/// refused as mismatched, a User without a write grant is refused, and a row
+/// correlated to a Card outside the selected root's graph is refused, each
+/// before any ACK. A rooted machine and a rootless User sending no selector
+/// keep their native behavior.
+///
+/// # Errors
+/// Returns server, fixture, bundle, client, state, flush, or query failures.
+///
+/// # Panics
+/// Panics when an accepted write is refused, a refused write is accepted or
+/// refused with another code, or the observation lands under another identity
+/// or Card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let admin_key = server
+        .bootstrap_service("native-user-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root;
+    let service_uid = service.uid.clone().ok_or("the Service has a UID")?;
+    let other = Box::pin(cards.declare_from_path(&fixtures.join("configured-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the other Service has a UID")?;
+    let bundle = tempfile::tempdir()?;
+    Box::pin(
+        wyrd_client::cards::CardGraphPuller::new(cards.registry_context()).pull(
+            &wyrd_client::cards::CardSelector::exact(service.clone()),
+            &bundle.path().join("bundle"),
+            wyrd_client::cards::BundleMode::Complete,
+        ),
+    )
+    .await?;
+    let user = |name: &'static str, role: &'static str| {
+        let server = &server;
+        async move {
+            match server.bootstrap_user(name, &[role]).await? {
+                Bootstrap::User { id, jwt } => Ok::<_, ServerJourneyError>((id, jwt)),
+                Bootstrap::Machine { .. } => Err("a user bootstraps as a user".into()),
+            }
+        }
+    };
+    let (editor_id, editor_jwt) = user("native-user-editor", "editor").await?;
+    let editor = native_client(&server, &editor_jwt)?;
+
+    let state = wyrd_client::state::WyrdState::from_path_with(
+        bundle.path().join("bundle"),
+        editor.clone(),
+    )?;
+    state
+        .start_bifrost_with_config(None, wyrd_client::QueueConfig::default())
+        .await?;
+    state
+        .run()
+        .for_card("model")?
+        .observe()
+        .submit("observed-drift", json!({ "latency": 12.5 }))
+        .await?;
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let landed: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            "SELECT CAST(card_uid AS VARCHAR) AS card_uid, \
+             CAST(sub_principal_id AS VARCHAR) AS sub_principal_id \
+             FROM vala.drift.observations",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        landed,
+        vec![json!({ "card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })],
+        "the User's state observation lands on its Model under the User"
+    );
+
+    let fqn = format!(
+        "vala.datasets.native_user_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(
+                &fqn,
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ])),
+            )?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the table is qualified")?;
+    let preflight = wyrd_queue::RowPreflight::from_description(
+        &Bifrost::query_only(&admin)
+            .describe_table(namespace, name)
+            .await?,
+    )?;
+
+    let (_, viewer_jwt) = user("native-user-viewer", "viewer").await?;
+    let runtime = server
+        .credential_registered_service(&service, &["workload"])
+        .await?;
+    let runtime_key = runtime.api_key().ok_or("the runtime has an API key")?;
+    let signed = server
+        .exchange_api_key_for_workload(runtime_key, &service_uid)
+        .await?;
+    let unknown = CardUid::from_uuid(uuid::Uuid::now_v7())?;
+    let refusals = [
+        (
+            editor.for_workload(unknown.clone()),
+            &unknown,
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        ),
+        (
+            editor.for_workload(model.clone()),
+            &model,
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        ),
+        (
+            native_client(&server, &signed)?.for_workload(other.clone()),
+            &other,
+            "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+        ),
+        (
+            native_client(&server, &viewer_jwt)?.for_workload(service_uid.clone()),
+            &service_uid,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+        (
+            editor.for_workload(service_uid.clone()),
+            &other,
+            "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        ),
+    ];
+    for (client, card, code) in refusals {
+        let refused = native_row(&client, &fqn, &preflight, Some(card))
+            .await
+            .expect_err("the write is refused before any ACK");
+        assert_eq!(refused.code(), code, "{card}: {refused:?}");
+    }
+
+    native_row(
+        &editor.for_workload(service_uid.clone()),
+        &fqn,
+        &preflight,
+        Some(&service_uid),
+    )
+    .await?;
+    native_row(
+        &native_client(&server, runtime_key.expose_secret())?.for_workload(service_uid.clone()),
+        &fqn,
+        &preflight,
+        Some(&service_uid),
+    )
+    .await?;
+    native_row(&editor, &fqn, &preflight, None).await?;
+    server.shutdown().await?;
+    Ok(())
+}

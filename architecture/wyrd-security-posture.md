@@ -491,9 +491,12 @@ one is refused as `signed_workload_mismatch`. On a rootless bearer the
 server resolves the root under the token's signed `card_access` and the
 account restriction, with no broader live-grant lookup and no activity
 recorded; an unknown and a foreign root are refused identically. A
-repeated or malformed selector is refused. Native Bifrost verification stays
-store-free, so it accepts only a signed root and refuses a selector it would
-have to resolve.
+repeated or malformed selector is refused. Native Bifrost and OTLP gRPC
+apply the same server-owned selection before Gate admission, so a User bearer
+driving a loaded state writes natively under its validated root; signature
+verification stays store-free, and Gate itself, without that server-resolved
+caller, accepts only a signed root and refuses a selector it would have to
+resolve.
 
 ### Permission model
 

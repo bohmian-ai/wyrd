@@ -86,6 +86,18 @@ impl AuthContext {
     }
 }
 
+/// A caller the hosting server already verified and narrowed to its request's
+/// selected workload root, handed to Gate in the request extensions.
+///
+/// Gate verifies bearers store-free, so it cannot resolve a root for a
+/// rootless bearer and [`authenticate`] refuses such a selector. The hosting
+/// server owns the registry: it verifies the bearer, applies the selector
+/// through its one root-selection owner, and inserts the narrowed token here.
+/// Extensions never come from the wire, so only that server produces one; a
+/// request without it is verified by [`authenticate`] as usual.
+#[derive(Clone, Debug)]
+pub struct ResolvedCaller(pub VerifiedToken);
+
 /// Read the bearer token from the `x-wyrd-access-token` metadata, stripping an
 /// optional `Bearer ` prefix.
 ///
@@ -141,7 +153,8 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 /// payload only to select the expected tenant, and the verifier refuses a token
 /// whose signed tenant differs. An `x-wyrd-workload-uid` selector equal to the
 /// bearer's signed root is idempotent; resolving a root for a rootless bearer
-/// needs the registry, so native ingest refuses it rather than dropping it.
+/// needs the registry, so this refuses it rather than dropping it, and a
+/// hosting server resolves it first and supplies a [`ResolvedCaller`].
 ///
 /// # Errors
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not

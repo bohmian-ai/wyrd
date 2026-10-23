@@ -31,15 +31,24 @@ use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use tower::Service;
 use vala_bifrost_redux::gate::IngestError;
+use vala_bifrost_redux::gate::auth::{ResolvedCaller, extract_bearer};
+use wyrd_auth_verify::VerifiedToken;
+use wyrd_spec::ids::CardUid;
+use wyrd_tonic::error::wyrd_error_to_status;
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::body::Body;
-use wyrd_tonic::tonic::codegen::http::{Request, Response};
+use wyrd_tonic::tonic::codegen::http::{HeaderValue, Request, Response};
+use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::AppState;
+use crate::components::auth::token_extract::{
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_WORKLOAD_UID_HEADER, verify_access_token,
+};
+use crate::http::error::WyrdErrorResponse;
 
 /// Encoded bytes occupied by the gRPC compression flag and big-endian length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -322,6 +331,106 @@ where
     }
 }
 
+/// Verify `metadata`'s Bifrost-audience bearer and narrow it to the request's
+/// selected workload `root`.
+///
+/// Native and OTLP gRPC ingest both select through here, and from here
+/// through the same
+/// [`select_root`](crate::components::auth::AuthenticatedPrincipal::select_root)
+/// every HTTP bearer ingress uses: signature checks stay store-free, a bearer
+/// already signing `root` is returned without a store read, and a rootless
+/// bearer is narrowed under its signed Card access.
+///
+/// # Errors
+/// Returns the canonical status of a missing or invalid bearer, and of a
+/// mismatched, unknown, foreign, or otherwise unusable root.
+async fn select_bearer_root(
+    state: &AppState,
+    metadata: &MetadataMap,
+    root: &CardUid,
+) -> Result<VerifiedToken, Status> {
+    let status = |error| wyrd_error_to_status(error, None);
+    let token = extract_bearer(metadata).map_err(Status::from)?;
+    Ok(verify_access_token(
+        state.auth.token_verifier.as_deref(),
+        token,
+        wyrd_auth_verify::TokenAudience::Bifrost,
+    )
+    .map_err(|WyrdErrorResponse(error)| status(error))?
+    .select_root(state, Some(root))
+    .await
+    .map_err(status)?
+    .into_verified())
+}
+
+/// Native ingest's server-owned workload-root selection, run before Gate.
+///
+/// Gate verifies bearers without a store, so it refuses a selector that
+/// needs the registry to resolve, such as a User bearer driving a loaded
+/// state. A bearer request carrying `x-wyrd-workload-uid` is therefore
+/// verified and narrowed here through [`select_bearer_root`], and Gate admits
+/// the result as a [`ResolvedCaller`] under its own readiness, frame, and
+/// permission rules. A refused selection never reaches Gate. A request with
+/// no bearer or no well-formed selector reaches Gate unchanged and is
+/// verified, or refused, there.
+#[derive(Clone)]
+struct NativeRootSelection<S> {
+    /// The Gate's generated ingest service.
+    inner: S,
+    /// Server state holding the token verifier and the tenant store.
+    state: AppState,
+}
+
+impl<S> NamedService for NativeRootSelection<S>
+where
+    S: NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S> Service<Request<Body>> for NativeRootSelection<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        let state = self.state.clone();
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let headers = request.headers();
+            let selector = wyrd_spec::auth::workload_uid_selector(
+                headers
+                    .get_all(WYRD_WORKLOAD_UID_HEADER)
+                    .iter()
+                    .map(HeaderValue::as_bytes),
+            );
+            if headers.contains_key(WYRD_ACCESS_TOKEN_HEADER)
+                && let Ok(Some(root)) = selector
+            {
+                let metadata = MetadataMap::from_headers(headers.clone());
+                match select_bearer_root(&state, &metadata, &root).await {
+                    Ok(verified) => {
+                        request.extensions_mut().insert(ResolvedCaller(verified));
+                    }
+                    Err(status) => return Ok(status.into_http()),
+                }
+            }
+            inner.call(request).await
+        })
+    }
+}
+
 /// Build the **public** application gRPC router.
 ///
 /// The public listener carries client-facing traffic only: health, optional
@@ -360,7 +469,10 @@ where
     let transport = state.bifrost.transport_admission();
     Ok(router
         .add_service(GrpcTransportAdmissionService::new(
-            state.bifrost.gate().clone().into_server(),
+            NativeRootSelection {
+                inner: state.bifrost.gate().clone().into_server(),
+                state: state.clone(),
+            },
             transport.clone(),
         ))
         .add_service(GrpcTransportAdmissionService::new(

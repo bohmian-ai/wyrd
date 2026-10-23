@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use secrecy::SecretString;
 use tower::Service;
 use vala_bifrost_redux::contracts::DecodedOtlp;
-use vala_bifrost_redux::gate::auth::{extract_bearer, read_or_mint_request_id};
+use vala_bifrost_redux::gate::auth::read_or_mint_request_id;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_tonic::error::wyrd_error_to_status;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
@@ -33,9 +33,8 @@ use crate::AppState;
 use crate::auth::exchange_api_key::api_key_invalid;
 use crate::components::auth::routes::TokenGrants;
 use crate::components::auth::token_extract::{
-    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER, verify_access_token,
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
 };
-use crate::http::error::WyrdErrorResponse;
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
@@ -264,9 +263,9 @@ impl OtlpGrpcAuthentication {
     ///
     /// A bearer without `x-wyrd-workload-uid` is Gate's to verify. With one,
     /// the server verifies the bearer and applies the selector through
-    /// [`select_root`](crate::components::auth::AuthenticatedPrincipal::select_root),
-    /// like OTLP/HTTP, and Gate
-    /// admits the result; an API key is exchanged under the selected root.
+    /// [`select_bearer_root`](super::select_bearer_root), like OTLP/HTTP and
+    /// native ingest, and Gate admits the result; an API key is exchanged
+    /// under the selected root.
     ///
     /// # Errors
     /// Returns the API-key, bearer, or selector refusal as its canonical gRPC
@@ -290,18 +289,9 @@ impl OtlpGrpcAuthentication {
                         .authenticate_otlp_metadata(metadata)
                         .map_err(ingest_status);
                 };
-                let token = extract_bearer(metadata).map_err(ingest_status)?;
-                let verified = verify_access_token(
-                    self.state.auth.token_verifier.as_deref(),
-                    token,
-                    wyrd_auth_verify::TokenAudience::Bifrost,
-                )
-                .map_err(|WyrdErrorResponse(error)| status(error))?
-                .select_root(&self.state, Some(&root))
-                .await
-                .map_err(status)?;
+                let verified = super::select_bearer_root(&self.state, metadata, &root).await?;
                 return gate
-                    .admit_otlp_verified(verified.into_verified(), metadata)
+                    .admit_verified(verified, metadata)
                     .map_err(ingest_status);
             }
         };
@@ -314,7 +304,7 @@ impl OtlpGrpcAuthentication {
         .api_key_principal(&SecretString::from(api_key.to_owned()), workload_uid)
         .await
         .map_err(status)?;
-        gate.admit_otlp_verified(verified, metadata)
+        gate.admit_verified(verified, metadata)
             .map_err(ingest_status)
     }
 }

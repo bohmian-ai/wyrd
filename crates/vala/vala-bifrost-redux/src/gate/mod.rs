@@ -695,18 +695,19 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.authenticate(metadata)
     }
 
-    /// Admit one server-owned OTLP adapter request whose caller the server
-    /// already verified, before tonic codec work.
+    /// Admit one request whose caller the hosting server already verified,
+    /// before tonic codec work.
     ///
-    /// The API-key form of [`Self::authenticate_otlp_metadata`]: the server
-    /// authenticated a stock exporter's API key, and Gate keeps its readiness
-    /// authority and builds the same [`AuthContext`] a bearer would yield.
+    /// The server authenticated a stock exporter's API key, or narrowed a
+    /// bearer to its selected workload root, which store-free Gate
+    /// verification cannot do. Gate keeps its readiness authority and builds
+    /// the same [`AuthContext`] a bearer would yield.
     ///
     /// # Errors
     ///
     /// Returns the ingress-closed refusal when the Gate is closed or its
     /// Scribe is not ready.
-    pub fn admit_otlp_verified(
+    pub fn admit_verified(
         &self,
         verified: VerifiedToken,
         metadata: &MetadataMap,
@@ -1138,6 +1139,10 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// Authenticate, validate, and dispatch one native batch, recording the
     /// request outcome on the current span.
     ///
+    /// A caller the hosting server already narrowed to its selected root
+    /// arrives as an [`auth::ResolvedCaller`] extension and is admitted as
+    /// verified; any other request's bearer is verified here.
+    ///
     /// # Errors
     ///
     /// Returns the canonical ingest status for an authentication, validation,
@@ -1148,10 +1153,14 @@ impl<A: GateAudit + 'static> Gate<A> {
     ) -> Result<Response<InsertBatchResponse>, Status> {
         let lifecycle = GateRequestLifecycle::begin("write");
         let result: Result<Response<InsertBatchResponse>, Status> = async {
-            let auth = self
-                .authenticate(request.metadata())
-                .inspect_err(|_| record_gate_rejection("write", "auth"))
-                .map_err(Status::from)?;
+            let auth = match request.extensions().get::<auth::ResolvedCaller>() {
+                Some(auth::ResolvedCaller(verified)) => {
+                    self.admit_verified(verified.clone(), request.metadata())
+                }
+                None => self.authenticate(request.metadata()),
+            }
+            .inspect_err(|_| record_gate_rejection("write", "auth"))
+            .map_err(Status::from)?;
             let frame = request.into_inner();
             validate_batch(&frame, &self.limits)
                 .inspect_err(record_write_rejection)

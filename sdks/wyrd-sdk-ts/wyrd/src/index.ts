@@ -92,6 +92,7 @@ import type {
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
+  connectBrowserSessionClient,
   connectWyrdClient,
   openWyrdState,
   storedTimestampText,
@@ -462,6 +463,22 @@ async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   }
 }
 
+/** One result column, in engine order; names may repeat. `data_type` is the Arrow type's display. */
+export interface QueryColumn {
+  readonly name: string;
+  readonly data_type: string;
+  readonly nullable: boolean;
+}
+
+/** A complete bounded query result: positional rows, returned only after a valid terminal. */
+export interface BoundedQueryResult {
+  readonly columns: readonly QueryColumn[];
+  readonly rows: readonly (readonly unknown[])[];
+  readonly terminal: Omit<QueryTerminal, "arrow_ipc_eos" | "error" | "outcome"> & {
+    readonly outcome: Exclude<QueryTerminal["outcome"], "failed">;
+  };
+}
+
 /**
  * One running query's Arrow batches, iterated as they arrive.
  *
@@ -587,6 +604,29 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     }
     this.#done = true;
     return { done: true, value: undefined };
+  }
+
+  /**
+   * Read the whole result as one bounded JSON value with positional rows.
+   *
+   * Rows are encoded by the same Rust projection the server's MCP
+   * `bifrost.query` tool uses, so both return the same value for one result.
+   * Returned only after the validated terminal; a result past either ceiling
+   * fails as `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and is never truncated.
+   * {@link BifrostQueryStream.return} during collection stops it.
+   *
+   * @param options - Row ceiling (default 1000) and serialized byte ceiling (default 4 MiB).
+   * @returns The complete `{columns, rows, terminal}` result.
+   * @throws {@link WyrdError} for a failed or oversized query; the stream is closed either way.
+   */
+  async collect(options: { maxRows?: number; maxBytes?: number } = {}): Promise<BoundedQueryResult> {
+    this.#done = true;
+    const step = await this.#native.collect(options.maxRows, options.maxBytes);
+    const error = projectedError(step);
+    if (error !== undefined) {
+      throw error;
+    }
+    return JSON.parse(step.terminalJson as string) as BoundedQueryResult;
   }
 
   /**
@@ -1575,6 +1615,35 @@ export class WyrdClient {
     options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
   ): WyrdClient {
     const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl);
+    return new WyrdClient(nativeHandle(result.client, result.error));
+  }
+
+  /**
+   * Build a client that acts as one forwarded browser session, without IO.
+   *
+   * For a server-side web host, such as the Wyrd UI's server, serving a
+   * browser signed in through Wyrd's Rust-owned browser sessions. Each request
+   * presents the browser's tenant session cookie and the public origin it was
+   * issued at; nothing is minted, cached, or renewed, and no ambient
+   * credential is consulted. The client reaches the tenant `/v1` HTTP
+   * surface only, so Cards, Bifrost queries, and verification reads work,
+   * while gRPC ingest, MCP, and {@link WyrdClient.accessToken} refuse it.
+   * Never construct one in browser code: the cookie is the browser's
+   * credential and must not leave the server.
+   *
+   * @param options - `serverUrl`, the Wyrd server's HTTP base URL; `cookie`,
+   * the single `wyrd_session_<tenant>=<value>` cookie pair; `origin`, the
+   * browser-facing origin the session was issued at.
+   * @returns The client.
+   * @throws {@link WyrdError} `WYRD_CLIENT_400_CONFIG_INVALID` for a malformed
+   * cookie, origin, or server URL.
+   */
+  static forBrowserSession(options: {
+    readonly serverUrl: string;
+    readonly cookie: string;
+    readonly origin: string;
+  }): WyrdClient {
+    const result = connectBrowserSessionClient(options.serverUrl, options.cookie, options.origin);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 

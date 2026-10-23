@@ -30,7 +30,8 @@ use crate::config::ClientConfig;
 use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::global_config::GlobalConfig;
-use crate::transport::config::GrpcConfig;
+use crate::transport::config::{GrpcConfig, HttpConfig};
+use crate::transport::credential::{BrowserSession, ResolvedCredential};
 #[cfg(feature = "internal")]
 use crate::transport::http::ArrowResponse;
 use crate::transport::http::HttpTransport;
@@ -128,8 +129,60 @@ impl WyrdClient {
     /// Returns the server's stable error when it refuses the exchange, or a
     /// transport error when `/auth/token` cannot be reached.
     pub(crate) async fn connected(&self) -> Result<Self, WyrdError> {
-        self.access_token().await?;
+        // A browser session is presented as itself; it has no exchange to complete.
+        if !self.is_browser_session() {
+            self.access_token().await?;
+        }
         Ok(self.clone())
+    }
+
+    /// Whether this client acts as a forwarded browser session.
+    ///
+    /// Such a client reaches the tenant `/v1` HTTP surface only, so handles
+    /// that would otherwise open a bearer-only channel, such as Bifrost's gRPC
+    /// ingest, skip it.
+    pub(crate) fn is_browser_session(&self) -> bool {
+        matches!(
+            self.auth.credential(),
+            ResolvedCredential::BrowserSession(_)
+        )
+    }
+
+    /// Build a client that acts as one forwarded browser session.
+    ///
+    /// For a server-side web host, such as the Wyrd UI's server, that serves a
+    /// browser signed in through Rust-owned browser sessions. Every request
+    /// presents the session's cookie and trusted public origin; nothing is
+    /// minted, cached or renewed, and no ambient credential is consulted. The
+    /// client reaches the tenant `/v1` HTTP surface only: gRPC, MCP and
+    /// [`Self::access_token`] refuse it because a session is not a bearer.
+    /// No network call is made here.
+    ///
+    /// # Arguments
+    /// * `server_url` - The Wyrd server's HTTP base URL.
+    /// * `session` - The validated session cookie and its public origin.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] for an invalid `server_url`, or
+    /// [`WyrdClientError::TransportDown`] when the HTTP client cannot be built.
+    pub fn for_browser_session(
+        server_url: &str,
+        session: BrowserSession,
+    ) -> Result<Self, WyrdClientError> {
+        let config = ClientConfig {
+            http: HttpConfig {
+                base_url: server_url.trim_end_matches('/').to_owned(),
+                ..HttpConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        let auth = AuthMiddleware::new(&config, ResolvedCredential::BrowserSession(session))?;
+        let http = HttpTransport::new(&config.http, Arc::clone(&auth))?;
+        Ok(Self {
+            auth,
+            http,
+            grpc_config: config.grpc,
+        })
     }
 
     /// Build a client from an explicit [`ClientConfig`].
@@ -554,7 +607,7 @@ mod tests {
     use crate::operator_connections::OperatorConnections;
     use crate::platform::Platform;
     use crate::principals::Principals;
-    use crate::transport::credential::ResolvedCredential;
+    use crate::transport::credential::{BrowserSession, ResolvedCredential};
     use crate::transport::http::HttpTransport;
 
     /// Build a client against `server` presenting `credential`, with an
@@ -702,5 +755,100 @@ mod tests {
             !format!("{first:?}").contains("gateway-bearer"),
             "Debug must redact the bearer"
         );
+    }
+
+    /// A browser session's Bifrost handle is query-only: connecting dials no
+    /// gRPC ingest channel, which would refuse a session that is not a
+    /// bearer. Nothing listens on the derived gRPC port, so a dial would fail.
+    ///
+    /// # Panics
+    /// Panics when the session or client is refused, or when connecting the
+    /// Bifrost handle fails because it dialled the ingest channel.
+    #[tokio::test]
+    async fn browser_session_bifrost_connects_without_an_ingest_channel() {
+        let session = BrowserSession::new(
+            "wyrd_session_acme=opaque.1".to_owned().into(),
+            "https://ui.example.com",
+        )
+        .expect("a well-formed session");
+        let client =
+            WyrdClient::for_browser_session("http://127.0.0.1:1", session).expect("client builds");
+        crate::bifrost::Bifrost::connect_with(&client, crate::bifrost::BifrostOptions::default())
+            .await
+            .expect("a browser session connects without dialling ingest");
+    }
+
+    /// A browser-session client presents exactly the forwarded session cookie
+    /// and its trusted public origin (never a bearer), connects a handle
+    /// without any exchange, refuses to produce a bearer, and redacts the
+    /// cookie in `Debug`. Malformed cookies and origins are refused before
+    /// any request.
+    ///
+    /// # Panics
+    /// Panics when the client sends a bearer, omits a session header, or
+    /// accepts a malformed session.
+    #[tokio::test]
+    async fn browser_session_client_presents_only_the_forwarded_session() {
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/cards"))
+            .and(header("cookie", "wyrd_session_acme=opaque.1"))
+            .and(header("origin", "https://ui.example.com:8443"))
+            .and(header("x-forwarded-host", "ui.example.com:8443"))
+            .and(header("x-forwarded-proto", "https"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = BrowserSession::new(
+            "wyrd_session_acme=opaque.1".to_owned().into(),
+            "https://ui.example.com:8443",
+        )
+        .expect("a well-formed session");
+        let client =
+            WyrdClient::for_browser_session(&server.uri(), session).expect("client builds");
+        Cards::connect_with(&client)
+            .await
+            .expect("a browser session connects without an exchange");
+        let _: serde_json::Value = client
+            .http
+            .request_json::<(), _>(reqwest::Method::GET, "/v1/cards", None)
+            .await
+            .expect("the session reaches /v1");
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.headers.contains_key("x-wyrd-access-token")),
+            "a browser session never sends a bearer"
+        );
+        assert!(
+            client.access_token().await.is_err(),
+            "a browser session has no bearer to hand out"
+        );
+        assert!(
+            !format!("{client:?}").contains("opaque.1"),
+            "Debug redacts the cookie"
+        );
+
+        for (cookie, origin) in [
+            (
+                "wyrd_session_acme=a; wyrd_session_beta=b",
+                "https://ui.example.com",
+            ),
+            ("theme=dark", "https://ui.example.com"),
+            ("wyrd_session_=a", "https://ui.example.com"),
+            ("wyrd_session_acme=", "https://ui.example.com"),
+            ("wyrd_session_acme=a", "https://ui.example.com/path"),
+            ("wyrd_session_acme=a", "https://user@ui.example.com"),
+            ("wyrd_session_acme=a", "ftp://ui.example.com"),
+        ] {
+            assert!(
+                BrowserSession::new(cookie.to_owned().into(), origin).is_err(),
+                "{cookie} at {origin} must be refused"
+            );
+        }
     }
 }

@@ -1,0 +1,9 @@
+# Discovery comparison
+
+All six independent discovery reports are complete. Every role supports current-source closure of prior FIND-027-1..4 for their diagnosed paths. Behavior, standards, maintainer, system and interaction report PASS; invariant proposes I027-R3-01 on the R2 reset boundary.
+
+Focused follow-up IS required. Behavior/system explicitly interpret new supplied document as replacement identity and describe existing shipped hosts assigning new values; invariant demonstrates installed-runtime deep-state updates changing validated authored values without changing that identity, leaving retained overrides. The issue is both a reachable public direct-Svelte-host path not covered by other reset traces and a material scope/authority disagreement: is that transition part of approved host-owned document semantics, and does source actually produce the claimed observable result?
+
+A fresh focused reviewer must inspect original/spec and applicable Svelte/public contract authority, actual complete reset/placement/commit/load owners and callers, and the reported proxy probe. It must establish required reachability rather than infer a requirement merely from absence of an immutable-only restriction. If required, select the smallest complete reset correction that preserves the R2 same-document/handler-only fix and prior gesture lifecycle, without introducing a new host/API protocol. If unsupported or out of scope, explain why from authority and source. No intended verdict is supplied.
+
+No other material proposals remain. Prior closure and the follow-up outcome still go to a separate fresh structured validator, including an explicitly empty ledger if no proposal survives. Preserve old FIND IDs and assign next unused FIND-027-5 only for a genuinely new independently validated cause.

@@ -1,7 +1,7 @@
 # TASK-006 — Query component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md).
 Mapped obligations: REQ-030, REQ-014, REQ-022, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value

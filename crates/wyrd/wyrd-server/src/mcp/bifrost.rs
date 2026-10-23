@@ -258,8 +258,9 @@ mod tests {
         DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, MAX_BYTES_CEILING, MAX_ROWS_CEILING, MAX_SQL_BYTES,
         QueryArguments,
     };
+    use wyrd_spec::vala::api::QueryParam;
 
-    /// The query tool accepts exactly six bounded fields and no path selector.
+    /// The query tool accepts exactly five bounded fields and no path selector.
     ///
     /// The closed schema is the whole security claim of the input surface: a
     /// caller cannot name a tenant, principal, delegation, role, execution
@@ -284,8 +285,12 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            vec!["deadline_ms", "max_bytes", "max_rows", "sql"],
-            "the query input is exactly the four closed fields"
+            vec!["deadline_ms", "max_bytes", "max_rows", "params", "sql"],
+            "the query input is exactly the five closed fields"
+        );
+        assert_eq!(
+            properties["params"]["items"]["type"],
+            serde_json::json!(["null", "boolean", "number", "string"])
         );
 
         assert_eq!(properties["sql"]["minLength"], serde_json::json!(1));
@@ -349,6 +354,7 @@ mod tests {
         let request = defaults.to_request();
         assert_eq!(request.sql, "SELECT 1");
         assert_eq!(request.deadline_ms, None);
+        assert!(request.params.is_empty(), "omitted params bind nothing");
         assert_eq!(defaults.max_rows, DEFAULT_MAX_ROWS);
         assert_eq!(defaults.max_bytes, DEFAULT_MAX_BYTES);
 
@@ -362,6 +368,39 @@ mod tests {
         named.validate().expect("every field at its bound is valid");
         let request = named.to_request();
         assert_eq!(request.deadline_ms, Some(i64::from(u32::MAX)));
+
+        let bound = parse(serde_json::json!({
+            "sql": "SELECT $1, $2, $3, $4, $5",
+            "params": [null, true, 42, 1.5, "x'; DROP TABLE t; --"],
+        }))
+        .expect("typed scalar binds parse");
+        bound.validate().expect("typed scalar binds are valid");
+        assert_eq!(
+            bound.to_request().params,
+            vec![
+                QueryParam::Null,
+                QueryParam::Bool(true),
+                QueryParam::Int(42),
+                QueryParam::Float(1.5),
+                QueryParam::String("x'; DROP TABLE t; --".to_owned()),
+            ],
+            "binds reach the query request in order and unchanged"
+        );
+        assert_eq!(
+            bound.to_request().sql,
+            "SELECT $1, $2, $3, $4, $5",
+            "binds are never spliced into the SQL"
+        );
+        for malformed in [
+            serde_json::json!({"sql": "SELECT $1", "params": [{"nested": 1}]}),
+            serde_json::json!({"sql": "SELECT $1", "params": [[1]]}),
+            serde_json::json!({"sql": "SELECT $1", "params": "1"}),
+        ] {
+            assert!(
+                parse(malformed.clone()).is_err(),
+                "a non-scalar bind must be refused: {malformed}"
+            );
+        }
 
         for (case, arguments) in [
             ("blank sql", serde_json::json!({"sql": "   "})),

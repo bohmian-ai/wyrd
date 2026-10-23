@@ -1,4 +1,5 @@
 import type { Cookies } from '@sveltejs/kit';
+import { WyrdClient } from 'wyrd-ai';
 import { serverUrl } from '../upstream';
 import { problemKind } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
@@ -147,6 +148,15 @@ export class BrowserSession {
       cookie: this.#cookie,
       body
     });
+  }
+
+  /**
+   * An SDK client acting as this session: the Rust client forwards only this
+   * tenant's session cookie and the trusted origin, so the server authorizes
+   * every read exactly as it does this session's `/v1` calls.
+   */
+  client(): WyrdClient {
+    return WyrdClient.forBrowserSession({ serverUrl: serverUrl(), cookie: this.#cookie, origin: this.#url.origin });
   }
 }
 
